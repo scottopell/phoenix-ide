@@ -397,6 +397,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 destination.write_bytes((ROOT / source).read_bytes())
             def stage(_staging, tx, helper_path, files, **kwargs):
                 captured.update(json.loads(dict(files)["manifest.json"].read_text()))
+                captured["stage_kwargs"] = kwargs
                 captured["helper_contents"] = helper_path.read_bytes()
                 captured["registry_contents"] = dict(files)["migrations.rs"].read_bytes()
                 return self.dev.SYSTEMD_TRANSACTION_ROOT / tx / "manifest.json"
@@ -423,6 +424,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             self.assertEqual("c" * 40, captured["controller_source_commit"])
             self.assertEqual(2, captured["manifest_version"])
             self.assertEqual("systemd_schema65_to128", captured["mode"])
+            self.assertFalse(captured["stage_kwargs"]["bind_bundle"])
             import hashlib
             self.assertEqual(hashlib.sha256(captured["helper_contents"]).hexdigest(), captured["controller_helper"]["sha256"])
             self.assertEqual(hashlib.sha256(captured["registry_contents"]).hexdigest(), captured["registry"]["sha256"])
@@ -687,6 +689,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 destination.write_bytes((ROOT / source).read_bytes())
             def stage(_staging, tx, helper_path, files, **kwargs):
                 captured["manifest"] = json.loads(dict(files)["manifest.json"].read_text())
+                captured["stage_kwargs"] = kwargs
                 captured["files"] = dict(files)
                 captured["receipt_bytes"] = dict(files)[self.dev.SYSTEMD_PREPARED_RECEIPT].read_bytes()
                 return self.dev.SYSTEMD_TRANSACTION_ROOT / tx / "manifest.json"
@@ -708,6 +711,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             manifest = captured["manifest"]
             self.assertEqual("prepared_artifact", manifest["source_kind"])
             self.assertEqual(3, manifest["manifest_version"])
+            self.assertTrue(captured["stage_kwargs"]["bind_bundle"])
             self.assertNotIn("release_asset_name", manifest)
             self.assertNotIn("release_asset_sha256", manifest)
             self.assertNotIn("release_tag", manifest)

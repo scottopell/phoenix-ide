@@ -8653,7 +8653,7 @@ def native_prod_deploy(
             helper,
             files,
             noninteractive=controller.enabled,
-            bind_bundle=controller.systemd_current_schema_upgrade,
+            bind_bundle=prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT,
         )
 
     _launch_systemd_activation(
