@@ -1976,14 +1976,29 @@ def _read_legacy_bundle(bundle_path: Path) -> dict:
     return bundle
 
 
-def stage_handoff(bundle_path: Path, expected_bundle_sha256: str, source_uid: int, policy: ValidationPolicy) -> Path:
+def stage_handoff(
+    bundle_path: Path,
+    expected_bundle_sha256: str,
+    expected_preparation_receipt_sha256: Optional[str],
+    source_uid: int,
+    policy: ValidationPolicy,
+) -> Path:
+    if (expected_preparation_receipt_sha256 is not None
+            and SHA256_RE.fullmatch(expected_preparation_receipt_sha256) is None):
+        raise ValidationError("prepared receipt authority must be an exact SHA-256")
     policy.activation_lock_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     with policy.activation_lock_path.open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another deployment is staging or activating") from exc
-        return _stage_handoff_locked(bundle_path, expected_bundle_sha256, source_uid, policy)
+        return _stage_handoff_locked(
+            bundle_path,
+            expected_bundle_sha256,
+            expected_preparation_receipt_sha256,
+            source_uid,
+            policy,
+        )
 
 
 def stage_handoff_legacy(bundle_path: Path, source_uid: int, policy: ValidationPolicy) -> Path:
@@ -1993,12 +2008,13 @@ def stage_handoff_legacy(bundle_path: Path, source_uid: int, policy: ValidationP
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another deployment is staging or activating") from exc
-        return _stage_handoff_locked(bundle_path, None, source_uid, policy)
+        return _stage_handoff_locked(bundle_path, None, None, source_uid, policy)
 
 
 def _stage_handoff_locked(
     bundle_path: Path,
     expected_bundle_sha256: Optional[str],
+    expected_preparation_receipt_sha256: Optional[str],
     source_uid: int,
     policy: ValidationPolicy,
 ) -> Path:
@@ -2031,6 +2047,9 @@ def _stage_handoff_locked(
     names = [item.get("name") for item in files]
     if len(names) != len(set(names)) or set(names) - set(allowed):
         raise ValidationError("handoff bundle contains duplicate or non-allowlisted artifacts")
+    has_preparation_receipt = PREPARED_RECEIPT in names
+    if has_preparation_receipt != (expected_preparation_receipt_sha256 is not None):
+        raise ValidationError("prepared receipt presence does not match independent admission authority")
     if not {"candidate-binary", "candidate.service", "candidate.socket", "helper.py", "manifest.json"} <= set(names):
         raise ValidationError("handoff bundle is missing required artifacts")
     transaction = acquire_claim(transaction_id, policy, retire_staging=True)
@@ -2042,8 +2061,13 @@ def _stage_handoff_locked(
         manifest = Manifest.load(manifest_path)
         if manifest.mode not in {"ordinary", PROTECTED_MODE}:
             raise ValidationError("unknown systemd deployment mode")
-        if manifest.source_kind == "prepared_artifact" and expected_bundle_sha256 is None:
-            raise ValidationError("prepared systemd staging requires a controller-bound bundle")
+        if manifest.source_kind == "prepared_artifact":
+            if expected_bundle_sha256 is None or expected_preparation_receipt_sha256 is None:
+                raise ValidationError("prepared systemd staging requires controller-bound authority")
+            if sha256(transaction / PREPARED_RECEIPT) != expected_preparation_receipt_sha256:
+                raise ValidationError("prepared receipt does not match independent admission authority")
+        elif expected_preparation_receipt_sha256 is not None:
+            raise ValidationError("prepared receipt authority is invalid for non-prepared staging")
         capture_rollback(transaction, policy, manifest_path)
         manifest = Manifest.load(manifest_path)
         if manifest.previous is None:
@@ -2363,6 +2387,7 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--bundle-sha256")
+    parser.add_argument("--expected-preparation-receipt-sha256")
     parser.add_argument("--source-uid", type=int)
     args = parser.parse_args()
     if args.protected_prepared_protocol_version:
@@ -2379,10 +2404,18 @@ def main() -> int:
     if args.action == "stage":
         if args.bundle is None or args.source_uid is None:
             parser.error("staging requires stage --bundle PATH --source-uid UID")
+        if args.expected_preparation_receipt_sha256 is not None and args.bundle_sha256 is None:
+            parser.error("prepared receipt authority requires a controller-bound bundle")
         try:
             policy = ValidationPolicy.production()
             manifest_path = (
-                stage_handoff(args.bundle, args.bundle_sha256, args.source_uid, policy)
+                stage_handoff(
+                    args.bundle,
+                    args.bundle_sha256,
+                    args.expected_preparation_receipt_sha256,
+                    args.source_uid,
+                    policy,
+                )
                 if args.bundle_sha256 is not None
                 else stage_handoff_legacy(args.bundle, args.source_uid, policy)
             )

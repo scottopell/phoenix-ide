@@ -8158,6 +8158,7 @@ def _stage_systemd_root_handoff(
     noninteractive: bool = False,
     bind_bundle: bool = True,
     expected_helper_sha256: str | None = None,
+    expected_preparation_receipt_sha256: str | None = None,
 ) -> Path:
     if re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
         raise SystemExit("systemd handoff requires an exact transaction id")
@@ -8212,6 +8213,11 @@ def _stage_systemd_root_handoff(
     ]
     if bind_bundle:
         stage_command.extend(("--bundle-sha256", bundle_sha256))
+    if expected_preparation_receipt_sha256 is not None:
+        stage_command.extend((
+            "--expected-preparation-receipt-sha256",
+            expected_preparation_receipt_sha256,
+        ))
     stage_command.extend(("--source-uid", str(os.getuid())))
     result = subprocess.run(
         stage_command,
@@ -8513,17 +8519,24 @@ def native_prod_deploy(
         if controller_commit is None:
             raise SystemExit("prepared systemd deployment requires an exact controller source commit")
         _require_exact_clean_controller_checkout(controller_commit)
+    prepared_systemd_request = (
+        controller.enabled
+        and controller.systemd_current_schema_upgrade
+        and controller.prepared_artifact is not None
+    )
     if controller.enabled:
         if controller.prepared_artifact is None:
             release, _expected_full_commit = controller.require_exact_release(release)
-        _require_noninteractive_sudo_ready()
+        if not prepared_systemd_request:
+            _require_noninteractive_sudo_ready()
     elif not check_systemd_available():
         raise SystemExit("systemd is not available on this Linux host")
 
-    env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
-    env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
-    _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
-    service_user = detect_service_user()
+    if not prepared_systemd_request:
+        env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
+        env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
+        _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
+        service_user = detect_service_user()
     transaction_id = controller.transaction_id or uuid.uuid4().hex
 
     with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
@@ -8548,6 +8561,12 @@ def native_prod_deploy(
                 ),
             )
         )
+        if prepared_systemd_request:
+            _require_noninteractive_sudo_ready()
+            env_snapshot = _read_systemd_installed_env(noninteractive=True)
+            env_file_loaded = str(PROD_ENV_FILE)
+            _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
+            service_user = detect_service_user()
         candidate_binary = staging / "candidate-binary"
         if prepared.binary != candidate_binary:
             shutil.copy2(prepared.binary, candidate_binary)
@@ -8697,7 +8716,12 @@ def native_prod_deploy(
         if env_snapshot:
             files.append(("candidate.env", candidate_env))
         prepared_stage_kwargs = (
-            {"expected_helper_sha256": expected_helper_sha256} if is_prepared else {}
+            {
+                "expected_helper_sha256": expected_helper_sha256,
+                "expected_preparation_receipt_sha256": controller.expected_preparation_receipt_sha256,
+            }
+            if is_prepared
+            else {}
         )
         root_manifest = _stage_systemd_root_handoff(
             staging,

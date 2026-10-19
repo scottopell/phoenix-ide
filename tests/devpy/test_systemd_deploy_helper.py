@@ -33,8 +33,14 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def stage_handoff(bundle, source_uid, policy):
-    return helper.stage_handoff(bundle, digest(bundle), source_uid, policy)
+def stage_handoff(bundle, source_uid, policy, expected_preparation_receipt_sha256=None):
+    return helper.stage_handoff(
+        bundle,
+        digest(bundle),
+        expected_preparation_receipt_sha256,
+        source_uid,
+        policy,
+    )
 
 
 def write_manual_tls_fixture(directory: Path, stem: str = "manual") -> tuple[Path, Path]:
@@ -494,6 +500,27 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         self.assertEqual("prepared", status["state"])
         self.assertEqual(self.transaction_id, status["transaction_id"])
 
+    def test_nonprepared_staging_rejects_preparation_receipt_artifact(self):
+        sources = self.staging_sources()
+        source_manifest = self.base / "source-manifest.json"
+        source_manifest.write_text(json.dumps(self.raw))
+        receipt = self.base / helper.PREPARED_RECEIPT
+        receipt.write_text("unreferenced prepared evidence")
+        sources.extend((
+            {"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)},
+            {"name": helper.PREPARED_RECEIPT, "source": str(receipt), "sha256": digest(receipt)},
+        ))
+        bundle = self.bundle(sources)
+        policy = self.staging_policy()
+        for bound in (False, True):
+            with self.subTest(bound=bound), self.assertRaisesRegex(
+                helper.ValidationError, "presence does not match independent admission authority"
+            ):
+                if bound:
+                    stage_handoff(bundle, os.getuid(), policy)
+                else:
+                    helper.stage_handoff_legacy(bundle, os.getuid(), policy)
+
     def test_stage_handoff_rejects_bundle_mutation_after_controller_binding(self):
         sources = self.staging_sources()
         source_manifest = self.base / "source-manifest.json"
@@ -510,6 +537,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
             helper.stage_handoff(
                 bundle,
                 expected_bundle_sha256,
+                None,
                 os.getuid(),
                 self.staging_policy(),
             )
@@ -2742,9 +2770,19 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         with mock.patch.object(helper, "copy_handoff_file", side_effect=copy), \
              mock.patch.object(helper, "installed_runtime_identity", side_effect=identity), \
              mock.patch.object(helper, "prepare_data_directory", side_effect=AssertionError("preserve live data ownership")):
-            with self.assertRaisesRegex(helper.ValidationError, "controller-bound bundle"):
+            wrong_receipt_sha256 = (
+                "0" * 64 if manifest.prepared_artifact_receipt.sha256 != "0" * 64 else "1" * 64
+            )
+            with self.assertRaisesRegex(helper.ValidationError, "does not match independent admission authority"):
+                stage_handoff(bundle, os.getuid(), policy, wrong_receipt_sha256)
+            with self.assertRaisesRegex(helper.ValidationError, "independent admission authority"):
                 helper.stage_handoff_legacy(bundle, os.getuid(), policy)
-            staged_path = stage_handoff(bundle, os.getuid(), policy)
+            staged_path = stage_handoff(
+                bundle,
+                os.getuid(),
+                policy,
+                manifest.prepared_artifact_receipt.sha256,
+            )
             staged = helper.Manifest.load(staged_path)
             helper.validate_manifest(staged_path, staged, policy)
         self.assertEqual(manifest.prepared_artifact_receipt.sha256, staged.prepared_artifact_receipt.sha256)

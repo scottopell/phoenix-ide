@@ -54,6 +54,9 @@ class SystemdDeployCommandTests(unittest.TestCase):
             staging = Path(td)
             artifact = staging / "candidate"
             artifact.write_text("candidate")
+            receipt = staging / self.dev.SYSTEMD_PREPARED_RECEIPT
+            receipt.write_text("authenticated receipt")
+            receipt_sha256 = self.dev._file_sha256(receipt)
             helper_sha256 = self.dev._file_sha256(artifact)
             results = [
                 subprocess.CompletedProcess([], 0, "", ""),
@@ -68,7 +71,12 @@ class SystemdDeployCommandTests(unittest.TestCase):
                         staging,
                         "a" * 32,
                         artifact,
-                        [("candidate-binary", artifact), ("helper.py", artifact)],
+                        [
+                            ("candidate-binary", artifact),
+                            ("helper.py", artifact),
+                            (receipt.name, receipt),
+                        ],
+                        expected_preparation_receipt_sha256=receipt_sha256,
                     )
             self.assertTrue(all("systemd-run" not in call.args[0] for call in run.call_args_list))
             stage_command = run.call_args_list[3].args[0]
@@ -77,6 +85,8 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 self.dev._file_sha256(staging / "bundle.json"),
                 stage_command[digest_index],
             )
+            receipt_index = stage_command.index("--expected-preparation-receipt-sha256") + 1
+            self.assertEqual(receipt_sha256, stage_command[receipt_index])
 
     def test_root_staging_rejects_bootstrap_outside_exact_controller_digest(self):
         with tempfile.TemporaryDirectory() as td:
@@ -575,6 +585,22 @@ class SystemdDeployCommandTests(unittest.TestCase):
         checkout.assert_called_once_with(expected)
         sudo.assert_not_called()
         prepare.assert_not_called()
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(sys, "platform", "linux"), \
+             mock.patch.object(platform, "machine", return_value="x86_64"), \
+             mock.patch.object(self.dev, "_require_exact_clean_controller_checkout"), \
+             mock.patch.object(
+                 self.dev,
+                 "_prepare_linux_artifact",
+                 side_effect=SystemExit("receipt authority mismatch"),
+             ) as prepare, \
+             mock.patch.object(self.dev, "_require_noninteractive_sudo_ready") as sudo, \
+             mock.patch.object(self.dev, "_read_systemd_installed_env") as read_env:
+            with self.assertRaisesRegex(SystemExit, "receipt authority mismatch"):
+                self.dev.native_prod_deploy(controller=self.linux_prepared_options(Path(td)))
+        prepare.assert_called_once()
+        sudo.assert_not_called()
+        read_env.assert_not_called()
+
 
     def test_linux_prepared_options_reject_mixed_modes_before_sudo_or_preparation(self):
         import platform
