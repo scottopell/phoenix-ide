@@ -447,6 +447,14 @@ impl WorkflowRepository {
         .await
         .map_err(map_constraint)?;
         insert_prepared_turn_attachments_tx(&mut tx.tx, turn_id, &prepared_payload).await?;
+        if input.disposition == AcceptedDisposition::Runtime {
+            let execution = phoenix_core::domain::conversation_goal::GoalExecution::parse(
+                to_i64(workflow_id.0, "workflow_id")?,
+                to_i64(turn_id.0, "turn_id")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx.tx, execution).await?;
+        }
         if cut == TransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(injected_cut(cut));
@@ -4213,6 +4221,8 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod goal_capture;
     use crate::migrations::run_pending_migrations;
     use crate::sqlite_telemetry::test_support::EventCapture;
     use crate::Database;

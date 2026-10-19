@@ -1,5 +1,11 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## New-turn atomic observation source increment
+
+Ordinary Runtime turn admission now authors Goal/NoGoal capture with the actual turn/workflow transaction, before materialization and the existing crash cuts; exact replay does not recapture. Inactive goal statuses capture explicit NoGoal at their version, so unrelated turns do not resume Blocked or terminal goals. Accepted Steering has no execution binding. Read API requires exact workflow+turn and does not backfill. Five actual-admission regressions authored/unexecuted;54total authored,0proved passing. No132 SQL/registry change, new DDL, provider context/public tool/follow-through/Stop activation. M2 sourcec8e8bf536 normal run39290326736/Rust118189160877 failed on inherited federation compile defects; parent coordinates real owner correction.
+
+Next report attribution work is structurally mapped/parent-reviewed: typed pending goal intent in existing persisted ToolResult/ToolRound, one shared goal-specific finalizer in owning full-round transactions, truthful semantic rejection under savepoint, only committed finalized result published/model-visible, exact payload-bound replay. No early unpaired assistant insert, weakened132 actor trigger, generic outbox or precomputed success. Genuine user-facing control requires later additive UserControl actor (authenticated host request UUID, no chat) plus stable-owner Stop latch/version; parent has not allocated later slot after133. Do not guess a slot or edit132. Concrete schema/upgrade proof and atomic/replay/Stop race tests remain owed.
+
 ## Active M2 source integration and exact qualification evidence
 
 - Same retained single writer, allocated worktree and parent b477b7e7. M1 checkpoint remains `c7d9794f5c8beb06cd634e8de1a3458b268be3a3`; migration132 SQL/registration are unchanged. Exact c7 run39287295698 failed before goal tests compiled on inherited federation missing `presentation` source, with separate inherited Clippy/UI/test-timing/e2e blockers. Zero goal passing tests established. Actual owner fixes/import remain parent-coordinated; do not fake a module or edit federation unilaterally.

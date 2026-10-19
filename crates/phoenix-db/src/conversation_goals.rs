@@ -339,6 +339,26 @@ impl Database {
         Ok(entries)
     }
 
+    /// Read the immutable observation for one exact execution; never capture a missing one here.
+    ///
+    /// # Errors
+    /// Rejects a mismatched workflow or malformed persisted binding and database failures.
+    pub async fn conversation_goal_execution_binding(
+        &self,
+        execution: GoalExecution,
+    ) -> Result<Option<GoalExecutionBinding>> {
+        let mut tx = self.pool().begin().await?;
+        let binding = binding_tx(&mut tx, execution.turn_id()).await?;
+        if binding
+            .as_ref()
+            .is_some_and(|binding| binding.execution != execution)
+        {
+            return Err(GoalDbError::BindingConflict);
+        }
+        tx.commit().await?;
+        Ok(binding)
+    }
+
     /// Apply a trusted host command after the application holds product-message then
     /// transcript-acceptance gates, or an exact in-flight report without those wait gates.
     /// No public adapter is installed by this method.
@@ -430,9 +450,26 @@ impl Database {
     }
 }
 
-/// Dormant storage primitive; this cannot prove transaction co-creation of its turn.
-/// Atomic capture by the actual admission owner is not installed here.
-#[allow(dead_code)]
+pub(crate) async fn capture_goal_at_new_turn_tx(
+    tx: &mut GoalTx<'_>,
+    execution: GoalExecution,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO conversation_goal_bindings (turn_id,workflow_id,owner_id,observed_version,goal_id)
+         SELECT t.turn_id,t.workflow_id,p.id,h.version,
+             CASE WHEN h.state='underway' THEN h.goal_id ELSE NULL END
+         FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
+         JOIN product_conversations p ON p.id=c.product_conversation_id
+         LEFT JOIN conversation_goal_history h ON h.owner_id=p.id
+             AND h.version=(SELECT MAX(version) FROM conversation_goal_history WHERE owner_id=p.id)
+         WHERE t.turn_id=? AND t.workflow_id=? AND p.kind='ordinary'",
+    )
+    .bind(execution.turn_id()).bind(execution.workflow_id())
+    .execute(&mut **tx).await?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) async fn bind_goal_at_admission_tx(
     tx: &mut GoalTx<'_>,
     binding: &GoalExecutionBinding,

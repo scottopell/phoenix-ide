@@ -88,7 +88,15 @@ THE SYSTEM SHALL reject a goal-bearing report binding to an inactive goal state.
 WHEN a stored observation is no-goal
 THE SYSTEM SHALL NOT convert that observation into a later goal-bearing binding.
 
-The storage primitive's ability to insert an immutable observation does not establish when the runtime captured it. Actual turn admission owns atomic capture; an absent binding is never proof that a late current-goal attachment is valid.
+WHEN an ordinary Runtime turn is accepted
+THE SYSTEM SHALL atomically capture its immutable observation with the accepted turn and workflow, before message materialization or any model request.
+
+THE SYSTEM SHALL bind an Underway goal by its exact fence and SHALL record an explicit no-goal observation at the observed owner version when no goal is Underway.
+
+THE SYSTEM SHALL NOT mint an execution report binding for accepted steering alone or retrofit an absent binding from a current-goal lookup.
+
+WHEN exact accepted-turn replay is requested
+THE SYSTEM SHALL reuse the retained observation without recapture.
 
 ### REQ-GOAL-006 — Immutable objective and explicit status transitions
 
@@ -105,7 +113,7 @@ THE SYSTEM SHALL distinguish creating a new current identity from modifying or r
 
 THE SYSTEM SHALL NOT treat goal status, supersession or a replacement's Underway marker as permission to release a protected user Stop, override security or admit execution.
 
-The dormant Suspended representation supports historical fencing and has no status-release operation. Durable runtime Stop enforcement and authorized admission are separate prerequisites; storage alone does not establish them.
+The Suspended representation supports historical fencing and has no status-release operation. Durable runtime Stop enforcement and authorized admission are separate prerequisites; storage alone does not establish them.
 
 THE SYSTEM SHALL NOT infer completion from Idle, final prose, a WorkScope attachment, command dispatch or unrelated successful checks.
 
