@@ -129,6 +129,7 @@ class RemoteResolution(TypedDict):
     work_scope: dict
     path_owner_instance_id: str | None
     related_references: list[QualifiedReference]
+    source_call: dict | None
     summary: str
 
 
@@ -184,12 +185,26 @@ def _text(value: object, nonempty: bool = False) -> str:
     return cast(str, value)
 
 
+def _source_tool_call(value: object) -> None:
+    if value is not None:
+        call = _fields(value, 'message_id tool_use_id')
+        for key in ('message_id', 'tool_use_id'):
+            _text(call[key], True)
+            _require(len(call[key].encode('utf-8')) <= 1024)
+
+
 def _uuid(value: object) -> str:
     _text(value, True)
     try:
         return str(UUID(value))
     except (ValueError, AttributeError, TypeError):
         raise PhoenixError('Invalid UUID.') from None
+
+
+def _instance_id(value: object) -> str:
+    identity = _uuid(value)
+    _require(UUID(identity).version == 4)
+    return identity
 
 
 def _nonnegative(value: object) -> int:
@@ -221,7 +236,7 @@ def _target(value: object, send: bool = False) -> ReadTarget:
 
 def _reference(value: object, instance: str | None = None) -> QualifiedReference:
     value = _fields(value, 'instance_id target')
-    identity = _uuid(value['instance_id'])
+    identity = _instance_id(value['instance_id'])
     _require(instance is None or identity == instance)
     _target(value['target'])
     return cast(QualifiedReference, value)
@@ -239,19 +254,14 @@ def _navigation(value: object, optional: bool = False) -> None:
         return
     _require(isinstance(value, dict))
     kind = value.get('kind')
-    _require(kind in ('app_local', 'peer'))
-    key = 'path' if kind == 'app_local' else 'url'
-    _fields(value, 'kind ' + key)
-    _text(value[key], True)
-    if kind == 'peer':
-        _peer_url(value[key])
-    else:
-        _require(value[key].startswith('/') and not value[key].startswith('//'))
+    _require(kind == 'peer')
+    _fields(value, 'kind url')
+    _peer_url(value['url'])
 
 
 def _subscription_reference(value: object) -> SubscriptionReference:
     value = _fields(value, 'instance_id product_conversation_id')
-    _uuid(value['instance_id'])
+    _instance_id(value['instance_id'])
     _text(value['product_conversation_id'], True)
     return cast(SubscriptionReference, value)
 
@@ -281,7 +291,7 @@ def _subscription(value: object, watch: bool = False) -> RemoteSubscription:
 def _openapi_document(value: object, instance: str | None = None) -> OpenApiDocument:
     _require(isinstance(value, dict))
     _require(value.get('openapi') == '3.1.0')
-    identity = _uuid(value.get('x-phoenix-instance-id'))
+    identity = _instance_id(value.get('x-phoenix-instance-id'))
     _require(instance is None or identity == instance)
     _require(isinstance(value.get('paths'), dict) and bool(value['paths']))
     _require(isinstance(value.get('info'), dict) and isinstance(value.get('components'), dict))
@@ -351,7 +361,7 @@ def _validate_send_receipt(receipt: object, peer: str, target: SendTarget) -> No
     acceptance = _fields(receipt['acceptance'], 'accepting_transcript stable_destination stable_navigation accepting_transcript_navigation accepting_message_navigation disposition')
     _text(acceptance['accepting_transcript'], True)
     destination = _subscription_reference(acceptance['stable_destination'])
-    _require(_uuid(destination['instance_id']) == peer)
+    _require(_instance_id(destination['instance_id']) == peer)
     if target['kind'] == 'product_conversation':
         _require(destination['product_conversation_id'] == target['product_conversation_id'])
     if target['kind'] == 'transcript':
@@ -568,7 +578,7 @@ class PhoenixClient:
             identities = set()
             for row in rows:
                 _fields(row, 'peer_instance_id peer_display_name base_url created_at')
-                identity = _uuid(row['peer_instance_id'])
+                identity = _instance_id(row['peer_instance_id'])
                 _require(identity not in identities)
                 identities.add(identity)
                 for key in ('peer_display_name', 'base_url', 'created_at'):
@@ -579,14 +589,15 @@ class PhoenixClient:
     def _peer_instance(self, instance: str) -> str:
         if not isinstance(instance, str) or not instance.strip():
             raise PhoenixError('A nonempty instance is required; no local fallback.')
+        selector = instance.strip()
         try:
-            return str(UUID(instance))
-        except ValueError:
+            return _instance_id(selector)
+        except PhoenixError:
             matches = [peer['peer_instance_id'] for peer in self.list_peer_connections()
-                       if peer['peer_display_name'] == instance]
+                       if peer['peer_display_name'] == selector]
             if len(matches) != 1:
                 raise PhoenixError('Unknown or ambiguous peer instance; no local fallback.')
-            return _uuid(matches[0])
+            return _instance_id(matches[0])
 
     def get_peer_notes(self, instance: str) -> PeerNotes:
         peer = self._peer_instance(instance)
@@ -623,8 +634,8 @@ class PhoenixClient:
                 f'{self.base_url}/api/federation/query-database',
                 json={'instance': peer, 'sql': sql},
             )), 'destination_instance_id caller_instance_id result')
-            _require(_uuid(value['destination_instance_id']) == peer)
-            _require(_uuid(value['caller_instance_id']) != peer)
+            _require(_instance_id(value['destination_instance_id']) == peer)
+            _require(_instance_id(value['caller_instance_id']) != peer)
             result = _fields(value['result'], 'columns rows truncated row_limit byte_limit elapsed_ms')
             columns = _items(result['columns'])
             for column in columns:
@@ -647,7 +658,7 @@ class PhoenixClient:
                 f'{self.base_url}/api/federation/search-conversations',
                 json={'instance': peer, 'query': query},
             )), 'destination_instance_id hits')
-            _require(_uuid(value['destination_instance_id']) == peer)
+            _require(_instance_id(value['destination_instance_id']) == peer)
             for hit in _items(value['hits']):
                 _fields(hit, 'source source_navigation stable_conversation stable_navigation role sender created_at snippet')
                 _reference(hit['source'], peer)
@@ -656,13 +667,17 @@ class PhoenixClient:
                     _reference(hit['stable_conversation'], peer)
                     _require(hit['stable_conversation']['target']['kind'] == 'product_conversation')
                 _navigation(hit['source_navigation'], optional=True)
-                _navigation(hit['stable_navigation'], optional=True)
+                _navigation(hit['stable_navigation'], optional=hit['stable_conversation'] is None)
+                _require((hit['stable_conversation'] is None) == (hit['stable_navigation'] is None))
                 for key in ('role', 'created_at', 'snippet'):
                     _text(hit[key])
                 if hit['sender'] is not None:
-                    sender = _fields(hit['sender'], 'stable exact')
+                    sender = _fields(hit['sender'], 'stable exact source_call')
                     _reference(sender['stable'])
-                    _reference(sender['exact'], _uuid(sender['stable']['instance_id']))
+                    _reference(sender['exact'], _instance_id(sender['stable']['instance_id']))
+                    _require(sender['stable']['target']['kind'] in ('product_conversation', 'coordinator'))
+                    _require(sender['exact']['target']['kind'] == 'transcript')
+                    _source_tool_call(sender['source_call'])
             return cast(RemoteSearchResult, value)
 
     def remote_read_conversation(self, target: ReadTarget, cursor: int, instance: str) -> RemoteReadResult:
@@ -684,13 +699,17 @@ class PhoenixClient:
             if value['stable_conversation'] is not None:
                 _reference(value['stable_conversation'], peer)
                 _require(value['stable_conversation']['target']['kind'] == 'product_conversation')
+            if target['kind'] == 'product_conversation':
+                _require(value['stable_conversation'] is not None
+                         and value['stable_conversation']['target'] == target)
             for reference in _items(value['evidence']):
                 _reference(reference, peer)
             _text(value['content'])
             if value['next_cursor'] is not None:
                 _require(_nonnegative(value['next_cursor']) > cursor)
             _navigation(value['source_navigation'])
-            _navigation(value['stable_navigation'], optional=True)
+            _navigation(value['stable_navigation'], optional=value['stable_conversation'] is None)
+            _require((value['stable_conversation'] is None) == (value['stable_navigation'] is None))
             return cast(RemoteReadResult, value)
 
     def remote_resolve_reference(self, reference: str, instance: str) -> RemoteResolution:
@@ -701,7 +720,8 @@ class PhoenixClient:
             value = _fields(_owner_json(self.http.post(
                 f'{self.base_url}/api/federation/resolve-reference',
                 json={'instance': peer, 'reference': reference},
-            )), 'reference href title work_scope path_owner_instance_id related_references summary')
+            )), 'reference href title work_scope path_owner_instance_id related_references source_call summary')
+            _source_tool_call(value['source_call'])
             _reference(value['reference'], peer)
             resolved_target = value['reference']['target']
             if reference.startswith('@conv:'):
@@ -723,7 +743,7 @@ class PhoenixClient:
             _text(value['summary'])
             _validate_work_scope(value['work_scope'])
             if value['path_owner_instance_id'] is not None:
-                _require(_uuid(value['path_owner_instance_id']) == peer)
+                _require(_instance_id(value['path_owner_instance_id']) == peer)
             _require((value['work_scope']['status'] == 'available')
                      == (value['path_owner_instance_id'] is not None))
             return cast(RemoteResolution, value)
@@ -742,8 +762,8 @@ class PhoenixClient:
                     f'{self.base_url}/api/federation/send-conversation-message',
                     json={'instance': peer, 'target': target, 'message': message, 'message_id': message_id},
                 )), 'destination_instance_id caller_instance_id target message_id receipt')
-                _require(_uuid(value['destination_instance_id']) == peer)
-                _require(_uuid(value['caller_instance_id']) != peer)
+                _require(_instance_id(value['destination_instance_id']) == peer)
+                _require(_instance_id(value['caller_instance_id']) != peer)
                 _target(value['target'], send=True)
                 _require(value['target'] == target and _uuid(value['message_id']) == identity)
                 _validate_send_receipt(value['receipt'], peer, target)
@@ -778,7 +798,7 @@ class PhoenixClient:
             identities = set()
             for row in rows:
                 _subscription(row)
-                key = (_uuid(row['reference']['instance_id']), _uuid(row['subscription_id']))
+                key = (_instance_id(row['reference']['instance_id']), _uuid(row['subscription_id']))
                 _require(key not in identities)
                 identities.add(key)
             return cast(list[RemoteSubscription], rows)
@@ -826,7 +846,7 @@ class PhoenixClient:
             value = _fields(_owner_json(self.http.post(
                 f'{self.base_url}/api/federation/openapi', json={'instance': peer},
             )), 'destination_instance_id document')
-            _require(_uuid(value['destination_instance_id']) == peer)
+            _require(_instance_id(value['destination_instance_id']) == peer)
             _openapi_document(value['document'], peer)
             return cast(PeerOpenApi, value)
 

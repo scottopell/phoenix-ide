@@ -297,7 +297,7 @@ class PhoenixClientFederationTests(unittest.TestCase):
                                'environment_kind': 'allocated_worktree', 'cwd': '~/server-only',
                                'worktree_path': 'Z:\\remote\\work', 'effective_path': '~/server-only',
                                'path_semantics': 'server_filesystem'},
-                'path_owner_instance_id': self.PEER, 'related_references': [], 'summary': 'resolved'}
+                'path_owner_instance_id': self.PEER, 'related_references': [], 'source_call': None, 'summary': 'resolved'}
 
     def send_result(self, outcome='accepted'):
         return {'destination_instance_id': self.PEER, 'caller_instance_id': self.OWNER,
@@ -372,7 +372,8 @@ class PhoenixClientFederationTests(unittest.TestCase):
 
     def test_qualified_search_read_and_server_paths(self):
         hit = {'source': self.ref({'kind': 'message', 'transcript_id': 't', 'message_id': 'm'}),
-               'source_navigation': None, 'stable_conversation': None, 'stable_navigation': None,
+               'source_navigation': {'kind': 'peer', 'url': 'https://peer.example/c/t?source_transcript=t#message-m'},
+               'stable_conversation': None, 'stable_navigation': None,
                'role': 'user', 'sender': None, 'created_at': '2026-10-19T00:00:00Z', 'snippet': 'hit'}
         self.responses['/api/federation/search-conversations'] = {'destination_instance_id': self.PEER, 'hits': [hit]}
         self.assertEqual(self.client.remote_search_messages('q', self.PEER)['hits'], [hit])
@@ -527,6 +528,7 @@ class PhoenixClientFederationTests(unittest.TestCase):
     def test_related_sender_references_keep_their_own_instance_identity(self):
         value = self.resolution()
         value['related_references'] = [self.ref(instance=self.OWNER)]
+        value['source_call'] = {'message_id': 'recorded-source', 'tool_use_id': 'exact-tool'}
         self.responses['/api/federation/resolve-reference'] = value
         self.assertEqual(self.client.remote_resolve_reference('@transcript:opaque/transcript', self.PEER), value)
 
@@ -559,6 +561,110 @@ class PhoenixClientFederationTests(unittest.TestCase):
             self.assertIn('no local fallback', stderr.getvalue())
             self.assertNotIn(self.SECRET, stderr.getvalue() + stdout.getvalue())
             self.assertEqual(stdout.getvalue(), '')
+
+    def test_remote_navigation_requires_peer_and_required_source_links(self):
+        for navigation in (None, {'kind': 'app_local', 'path': '/c/local'}, 'missing'):
+            read = self.read_result()
+            read['source_navigation'] = navigation
+            if navigation == 'missing':
+                del read['source_navigation']
+            self.responses['/api/federation/read-conversation'] = read
+            with self.subTest(operation='read', navigation=navigation), self.assertRaises(phoenix_client.PhoenixError):
+                self.client.remote_read_conversation(self.TARGET, 0, self.PEER)
+            hit = {'source': self.ref({'kind': 'message', 'transcript_id': 't', 'message_id': 'm'}),
+                   'source_navigation': navigation, 'stable_conversation': None, 'stable_navigation': None,
+                   'role': 'user', 'sender': None, 'created_at': '', 'snippet': ''}
+            if navigation == 'missing':
+                del hit['source_navigation']
+            self.responses['/api/federation/search-conversations'] = {'destination_instance_id': self.PEER, 'hits': [hit]}
+            with self.subTest(operation='search', navigation=navigation):
+                if navigation is None:
+                    self.assertEqual(self.client.remote_search_messages('q', self.PEER)['hits'], [hit])
+                else:
+                    with self.assertRaises(phoenix_client.PhoenixError):
+                        self.client.remote_search_messages('q', self.PEER)
+            for key in ('stable_navigation', 'accepting_transcript_navigation', 'accepting_message_navigation'):
+                send = self.send_result()
+                send['receipt']['acceptance'][key] = navigation
+                if navigation == 'missing':
+                    del send['receipt']['acceptance'][key]
+                self.responses['/api/federation/send-conversation-message'] = send
+                with self.subTest(operation='send', key=key, navigation=navigation), self.assertRaises(phoenix_client.PhoenixError):
+                    self.client.remote_send_conversation_message(self.TARGET, 'hello', self.MESSAGE, self.PEER)
+
+    def test_search_preserves_deleted_source_and_exact_sender_call(self):
+        hit = {'source': self.ref({'kind': 'message', 'transcript_id': 'same', 'message_id': 'same'}),
+               'source_navigation': None, 'stable_conversation': None, 'stable_navigation': None,
+               'role': 'user', 'created_at': '', 'snippet': '',
+               'sender': {'stable': self.ref({'kind': 'coordinator'}, self.OWNER),
+                          'exact': self.ref({'kind': 'transcript', 'transcript_id': 'same'}, self.OWNER),
+                          'source_call': {'message_id': 'same', 'tool_use_id': 'exact-tool'}}}
+        response = {'destination_instance_id': self.PEER, 'hits': [hit]}
+        self.responses['/api/federation/search-conversations'] = response
+        self.assertEqual(self.client.remote_search_messages('q', self.PEER)['hits'], [hit])
+        for call in ({'message_id': '', 'tool_use_id': 'tool'},
+                     {'message_id': 'message', 'tool_use_id': ' '},
+                     {'message_id': 'm' * 1025, 'tool_use_id': 'tool'},
+                     {'message_id': 'message', 'tool_use_id': '雪' * 342},
+                     {'message_id': 'message'}):
+            hit['sender']['source_call'] = call
+            with self.subTest(call=call), self.assertRaises(phoenix_client.PhoenixError):
+                self.client.remote_search_messages('q', self.PEER)
+
+    def test_stable_read_identity_and_navigation_match_requested_product(self):
+        target = {'kind': 'product_conversation', 'product_conversation_id': 'requested-product'}
+        good = self.read_result()
+        good['requested'] = self.ref(target)
+        good['stable_conversation'] = self.ref(target)
+        good['stable_navigation'] = {'kind': 'peer', 'url': 'https://peer.example/c/renamed-slug'}
+        self.responses['/api/federation/read-conversation'] = good
+        self.assertEqual(self.client.remote_read_conversation(target, 0, self.PEER), good)
+        for stable, navigation in (
+            (self.ref({'kind': 'product_conversation', 'product_conversation_id': 'wrong-product'}), good['stable_navigation']),
+            (None, None),
+            (good['stable_conversation'], None),
+            (good['stable_conversation'], {'kind': 'app_local', 'path': '/c/local'}),
+            (None, good['stable_navigation']),
+        ):
+            bad = {**good, 'stable_conversation': stable, 'stable_navigation': navigation}
+            self.responses['/api/federation/read-conversation'] = bad
+            with self.subTest(stable=stable, navigation=navigation), self.assertRaises(phoenix_client.PhoenixError):
+                self.client.remote_read_conversation(target, 0, self.PEER)
+
+    def test_instance_uuidv4_validation_does_not_restrict_general_uuids_or_saved_names(self):
+        other_uuid = '123e4567-e89b-12d3-a456-426614174000'
+        non_rfc_uuid = '123e4567-e89b-42d3-0456-426614174000'
+        for identity in (other_uuid, non_rfc_uuid):
+            with self.subTest(identity=identity):
+                with self.assertRaises(phoenix_client.PhoenixError):
+                    phoenix_client._instance_id(identity)
+                self.responses['/api/federation/peers'] = [{**self.summary, 'peer_instance_id': identity}]
+                with self.assertRaises(phoenix_client.PhoenixError):
+                    self.client.list_peer_connections()
+                self.responses['/openapi.json'] = self.openapi(identity)
+                with self.assertRaises(phoenix_client.PhoenixError):
+                    self.client.get_openapi()
+                self.responses['/api/federation/query-database'] = {**self.query_result(), 'caller_instance_id': identity}
+                with self.assertRaises(phoenix_client.PhoenixError):
+                    self.client.remote_query_database('SELECT 1', self.PEER)
+                self.responses['/api/federation/peers'] = [{**self.summary, 'peer_display_name': identity}]
+                self.responses['/api/federation/search-conversations'] = {'destination_instance_id': self.PEER, 'hits': []}
+                self.client.remote_search_messages('q', '  ' + identity + '  ')
+                self.assertEqual(self.body()['instance'], self.PEER)
+                self.responses['/api/federation/peers'] = [self.summary]
+                with self.assertRaises(phoenix_client.PhoenixError):
+                    self.client.remote_search_messages('q', identity)
+                self.assert_route('GET', '/api/federation/peers')
+        send = self.send_result()
+        send['message_id'] = other_uuid
+        self.responses['/api/federation/send-conversation-message'] = send
+        self.assertEqual(self.client.remote_send_conversation_message(self.TARGET, 'hello', other_uuid, self.PEER), send)
+        row = {**self.row, 'subscription_id': other_uuid}
+        self.responses['/api/federation/subscriptions'] = [row]
+        self.assertEqual(self.client.list_remote_subscriptions(), [row])
+        self.responses['/api/federation/subscriptions/sync-once'] = {'synced_once': True}
+        self.client.sync_remote_subscription(other_uuid)
+        self.assertEqual(self.body()['subscription_id'], other_uuid)
 
     def test_remote_methods_require_instance_before_any_request(self):
         operations = [lambda i: self.client.remote_query_database('SELECT 1', i),
