@@ -1948,6 +1948,8 @@ impl MessageStore for InMemoryStorage {
         assistant: &Message,
         tool_results: &[Message],
         proposal: &crate::db::ForkProposal,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
         {
             let mut messages = self.messages.lock().unwrap();
@@ -1958,7 +1960,8 @@ impl MessageStore for InMemoryStorage {
             }
         }
         self.fork_proposals.lock().unwrap().push(proposal.clone());
-        Ok(())
+        self.update_state(origin_conv_id, state, state_updated_at)
+            .await
     }
 
     async fn persist_tool_round(

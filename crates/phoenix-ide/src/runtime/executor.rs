@@ -9112,7 +9112,7 @@ where
                             &update,
                         )
                         .await?;
-                } else if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
+                } else {
                     self.storage
                         .persist_tool_round_and_state(
                             &conv_id,
@@ -9121,10 +9121,6 @@ where
                             &self.state,
                             self.state_updated_at,
                         )
-                        .await?;
-                } else {
-                    self.storage
-                        .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                         .await?;
                 }
 
@@ -9254,7 +9250,14 @@ where
         };
 
         self.storage
-            .persist_fork_proposal_with_tool_round(&conv_id, &agent_msg, &tool_msgs, &proposal)
+            .persist_fork_proposal_with_tool_round(
+                &conv_id,
+                &agent_msg,
+                &tool_msgs,
+                &proposal,
+                &self.state,
+                self.state_updated_at,
+            )
             .await?;
 
         // Broadcast the now-durable rows so connected clients render the

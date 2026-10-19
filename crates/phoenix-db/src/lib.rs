@@ -10094,6 +10094,8 @@ impl Database {
         assistant: &Message,
         tool_results: &[Message],
         proposal: &ForkProposal,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
 
@@ -10102,15 +10104,8 @@ impl Database {
             insert_message_tx(&mut tx, msg).await?;
         }
 
-        // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
-        // `updated_at` so list-ordering stays current.
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(Utc::now().to_rfc3339())
-            .bind(origin_conv_id)
-            .execute(&mut *tx)
-            .await?;
-
         insert_fork_proposal_tx(&mut tx, proposal).await?;
+        persist_tool_round_state_tx(&mut tx, origin_conv_id, state, state_updated_at).await?;
 
         tx.commit().await?;
         Ok(())
@@ -10185,21 +10180,7 @@ impl Database {
         for msg in tool_results {
             insert_message_tx(&mut tx, msg).await?;
         }
-        coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state).unwrap();
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-        )
-        .bind(state_json)
-        .bind(conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
-        }
+        persist_tool_round_state_tx(&mut tx, conversation_id, state, state_updated_at).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -15592,6 +15573,30 @@ fn build_materialized_tool_round(
     }
 
     (agent_msg, tool_msgs)
+}
+
+async fn persist_tool_round_state_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<()> {
+    coordinator_watches::record_wait_entry_tx(tx, conversation_id, state).await?;
+    let state_json = serde_json::to_string(state).unwrap();
+    let result = sqlx::query(
+        "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
+    )
+    .bind(state_json)
+    .bind(conv_state_kind(state))
+    .bind(state_updated_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+    }
+    Ok(())
 }
 
 async fn insert_message_tx(
@@ -29771,14 +29776,47 @@ mod tests {
         };
 
         let proposal = fork_proposal_fixture("fp-tr", "origin-tr");
+        let selected_state = ConvState::ContextExhausted {
+            summary: "selected fork state".into(),
+        };
+        sqlx::query("CREATE TRIGGER reject_fork_state BEFORE UPDATE OF state ON conversations WHEN NEW.id='origin-tr' BEGIN SELECT RAISE(ABORT,'fork state write failed'); END")
+            .execute(db.pool()).await.unwrap();
+        assert!(db
+            .persist_fork_proposal_with_tool_round(
+                "origin-tr",
+                &assistant,
+                std::slice::from_ref(&tool_result),
+                &proposal,
+                &selected_state,
+                Utc::now(),
+            )
+            .await
+            .is_err());
+        assert!(db.get_messages("origin-tr").await.unwrap().is_empty());
+        assert!(db.get_fork_proposal("fp-tr").await.unwrap().is_none());
+        assert!(matches!(
+            db.get_conversation("origin-tr").await.unwrap().state,
+            ConvState::Idle
+        ));
+        sqlx::query("DROP TRIGGER reject_fork_state")
+            .execute(db.pool())
+            .await
+            .unwrap();
         db.persist_fork_proposal_with_tool_round(
             "origin-tr",
             &assistant,
             &[tool_result],
             &proposal,
+            &selected_state,
+            Utc::now(),
         )
         .await
         .unwrap();
+
+        assert_eq!(
+            db.get_conversation("origin-tr").await.unwrap().state,
+            selected_state
+        );
 
         // The control-plane row committed.
         let got = db.get_fork_proposal("fp-tr").await.unwrap().unwrap();

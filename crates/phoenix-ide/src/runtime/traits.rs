@@ -381,6 +381,8 @@ pub trait MessageStore: Send + Sync {
         assistant: &crate::db::Message,
         tool_results: &[crate::db::Message],
         proposal: &crate::db::ForkProposal,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
 
     /// Atomically persist a completed tool round (REQ-BED-007): the assistant
@@ -1064,6 +1066,8 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         assistant: &crate::db::Message,
         tool_results: &[crate::db::Message],
         proposal: &crate::db::ForkProposal,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         (**self)
             .persist_fork_proposal_with_tool_round(
@@ -1071,6 +1075,8 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 assistant,
                 tool_results,
                 proposal,
+                state,
+                state_updated_at,
             )
             .await
     }
@@ -2169,6 +2175,8 @@ impl MessageStore for DatabaseStorage {
         assistant: &crate::db::Message,
         tool_results: &[crate::db::Message],
         proposal: &crate::db::ForkProposal,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         self.db
             .persist_fork_proposal_with_tool_round(
@@ -2176,6 +2184,8 @@ impl MessageStore for DatabaseStorage {
                 assistant,
                 tool_results,
                 proposal,
+                state,
+                state_updated_at,
             )
             .await
             .map_err(|e| e.to_string())
