@@ -1,12 +1,291 @@
-import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useRef } from 'react';
-import { InputArea } from './InputArea';
+import { InputArea, ConnectedInputArea } from './InputArea';
+import { DraftStore } from '../conversation/DraftStore';
+import { DraftContext } from '../conversation/DraftContext';
 import { AgentMessage } from './MessageComponents';
 import { VoicePermission } from './VoiceInput/VoicePermission';
 import type { ComposerQuickAction, InputAreaHandle } from './InputArea';
 import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
+import { describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useState } from 'react';
+import { ExpansionError } from '../api';
+import type { FileAttachment, ImageData } from '../api';
+import type { ComponentProps } from 'react';
+
+const voice = vi.hoisted(() => ({ props: null as ComponentProps<typeof import('./VoiceInput').VoiceRecorder> | null }));
+vi.mock('./VoiceInput', async () => {
+  const { forwardRef, useImperativeHandle } = await import('react');
+  return {
+    isWebSpeechSupported: () => true,
+    VoiceRecorder: forwardRef<import('./VoiceInput/VoiceRecorder').VoiceRecorderHandle, ComponentProps<typeof import('./VoiceInput').VoiceRecorder>>((props, ref) => {
+      voice.props = props;
+      useImperativeHandle(ref, () => ({ retire() {} }));
+      return null;
+    }),
+  };
+});
+
+function deferredSend() {
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((_resolve, rejectPromise) => { reject = rejectPromise; });
+  return { send: vi.fn(() => promise), reject };
+}
+
+const rejectedFile: FileAttachment = {
+  original_name: 'notes.txt', stored_path: '/uploads/a/notes.txt', media_type: 'text/plain', size_bytes: 42,
+};
+
+function RecoveryHarness({ send, scope = 'a', initialDraft = '  @missing.ts\n', initialImages = [] }: {
+  send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
+  scope?: string;
+  initialDraft?: string;
+  initialImages?: ImageData[];
+}) {
+  const [draft, setDraft] = useState(initialDraft);
+  const [images, setImages] = useState<ImageData[]>(initialImages);
+  const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
+  return <InputArea cwd={undefined} scopeKey={scope} convState={idleState}
+    draft={draft} onDraftChange={setDraft} images={images} setImages={setImages}
+    files={files} setFiles={setFiles} isOffline={false} failedMessages={[]}
+    onSend={send} onCancel={() => {}} onRetry={() => {}} />;
+}
+
+function ConnectedRecoveryHarness({ store, send, scope = 'a' }: {
+  store: DraftStore;
+  send: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void>;
+  scope?: string;
+}) {
+  const [images, setImages] = useState<ImageData[]>([]);
+  const [files, setFiles] = useState<FileAttachment[]>([rejectedFile]);
+  return <DraftContext.Provider value={store}>
+    <button onClick={() => setFiles([{ ...rejectedFile, original_name: 'new.txt', stored_path: '/uploads/a/new.txt' }])}>Attach newer file</button>
+    <ConnectedInputArea slug={scope} cwd={undefined} scopeKey={scope} convState={idleState}
+      images={images} setImages={setImages} files={files} setFiles={setFiles}
+      isOffline={false} failedMessages={[]} onSend={send} onCancel={() => {}} onRetry={() => {}} />
+  </DraftContext.Provider>;
+}
+
+async function rejectExpansion(pending: ReturnType<typeof deferredSend>) {
+  await act(async () => pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' })));
+}
+
+describe('InputArea rejected submission ownership', () => {
+  it('restores raw text and attachments to an untouched cleared composer', async () => {
+    const pending = deferredSend();
+    render(<RecoveryHarness send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts\n');
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
+  });
+
+  it('preserves whitespace and both image and file payloads on an attachment-only rejection', async () => {
+    const pending = deferredSend();
+    const image = { media_type: 'image/png', data: 'YWJj' };
+    render(<RecoveryHarness send={pending.send} initialDraft={'  \n'} initialImages={[image]} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(pending.send).toHaveBeenCalledWith('', [image], [rejectedFile]);
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('  \n');
+    expect(screen.getByAltText('Attachment 1')).toBeInTheDocument();
+    expect(screen.getByLabelText('Attached files')).toHaveTextContent('notes.txt');
+  });
+
+  it('keeps newer text separate and offers explicit recovery after it is cleared', async () => {
+    const pending = deferredSend();
+    render(<RecoveryHarness send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'newer draft' } });
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('newer draft');
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled();
+    fireEvent.click(screen.getByText('Unsent message'));
+    expect(screen.getByRole('button', { name: 'Restore unsent message' })).toBeDisabled();
+    expect(screen.queryByLabelText('Attached files')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Restore unsent message' }));
+    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts\n');
+    expect(screen.getByLabelText('Attached files')).toHaveTextContent('notes.txt');
+  });
+
+  it('does not auto-restore after typing and deleting back to empty (ABA)', async () => {
+    const pending = deferredSend();
+    render(<RecoveryHarness send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'newer' } });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } });
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.getByText('Unsent message')).toBeInTheDocument();
+  });
+
+  it('recovers submitted voice final plus interim as ordinary text and ignores retired callbacks', async () => {
+    const pending = deferredSend();
+    render(<RecoveryHarness send={pending.send} />);
+    act(() => voice.props?.onStart?.());
+    act(() => voice.props?.onSpeech?.('final'));
+    act(() => voice.props?.onInterim?.('partial'));
+    const retired = voice.props;
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    act(() => { retired?.onSpeech?.('late'); retired?.onInterim?.('late'); retired?.onEnd?.(); });
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('  @missing.ts final partial');
+  });
+
+  it('uses the atomic store revision even when external insertion and deletion have not rendered', async () => {
+    const pending = deferredSend();
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'original' });
+    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await act(async () => {
+      store.dispatch('a', { type: 'append_draft', text: 'external' });
+      store.dispatch('a', { type: 'clear_draft' });
+      pending.reject(new ExpansionError({ error: 'Missing file', error_type: 'file_not_found', reference: '@missing.ts' }));
+    });
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(store.getRejected('a')).toHaveLength(1);
+  });
+
+  it.each([false, true])('keeps late rejection on its original conversation (return before rejection: %s)', async returnFirst => {
+    const pending = deferredSend();
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'original A' });
+    store.dispatch('b', { type: 'set_draft', text: 'draft B' });
+    const view = render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    view.rerender(<ConnectedRecoveryHarness store={store} send={pending.send} scope="b" />);
+    if (returnFirst) view.rerender(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    await rejectExpansion(pending);
+    expect(store.getSnapshot('a').draft).toBe('');
+    expect(store.getSnapshot('b').draft).toBe('draft B');
+    expect(store.getRejected('a')[0]?.files).toEqual([rejectedFile]);
+    expect(store.getRejected('b')).toEqual([]);
+    if (!returnFirst) {
+      expect(screen.getByRole('textbox')).toHaveValue('draft B');
+      expect(screen.queryByText('Unsent message')).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('Attached files')).not.toBeInTheDocument();
+      view.rerender(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    }
+    expect(screen.getByText('Unsent message')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('');
+  });
+
+  it.each(['', 'new conversation draft'])('does not resurrect a pending send after hard-delete (fresh draft: %j)', async freshDraft => {
+    const pending = deferredSend();
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: '  deleted @missing.ts\n' });
+    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(pending.send).toHaveBeenCalledWith('deleted @missing.ts', [], [rejectedFile]);
+
+    act(() => {
+      // The hard-delete cascade removes the draft lifetime, not just its text.
+      store.remove('a');
+      if (freshDraft) store.dispatch('a', { type: 'set_draft', text: freshDraft });
+    });
+    const freshRevision = store.getSnapshot('a');
+    await rejectExpansion(pending);
+
+    expect(store.getSnapshot('a')).toBe(freshRevision);
+    expect(store.getRejected('a')).toEqual([]);
+    expect(screen.getByRole('textbox')).toHaveValue(freshDraft);
+    expect(screen.queryByText('Unsent message')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Attached files')).not.toBeInTheDocument();
+  });
+
+  it('retains a rejection across unmount and restores attachments only on explicit recovery', async () => {
+    const pending = deferredSend();
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: 'original' });
+    const view = render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    view.unmount();
+    await rejectExpansion(pending);
+    expect(store.getRejected('a')).toHaveLength(1);
+    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove attachment notes.txt' }));
+    fireEvent.click(screen.getByText('Unsent message'));
+    fireEvent.click(screen.getByRole('button', { name: 'Restore unsent message' }));
+    expect(screen.getByRole('textbox')).toHaveValue('original');
+    expect(screen.getByLabelText('Attached files')).toHaveTextContent('notes.txt');
+    expect(store.getRejected('a')).toEqual([]);
+  });
+
+  it('does not replace newer attachments and permits copying the rejected raw text', async () => {
+    const pending = deferredSend();
+    const store = new DraftStore();
+    store.dispatch('a', { type: 'set_draft', text: '  original\n' });
+    const copy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
+    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Attach newer file' }));
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.getByLabelText('Attached files')).toHaveTextContent('new.txt');
+    expect(screen.getByLabelText('Attached files')).not.toHaveTextContent('notes.txt');
+    fireEvent.click(screen.getByText('Unsent message'));
+    expect(screen.getByRole('button', { name: 'Restore unsent message' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Copy text' }));
+    expect(copy).toHaveBeenCalledWith('  original\n');
+  });
+
+  it('keeps multiple out-of-order rejections independently recoverable', async () => {
+    const first = deferredSend();
+    const second = deferredSend();
+    const send = vi.fn().mockImplementationOnce(first.send).mockImplementationOnce(second.send);
+    render(<RecoveryHarness send={send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'second' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await rejectExpansion(first);
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    await rejectExpansion(second);
+    expect(screen.getByRole('textbox')).toHaveValue('second');
+    expect(screen.getAllByText('Unsent message')).toHaveLength(1);
+    expect(screen.queryByLabelText('Attached files')).not.toBeInTheDocument();
+  });
+
+  it('does not change transport failure handling', async () => {
+    const pending = deferredSend();
+    render(<RecoveryHarness send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await act(async () => pending.reject(new Error('offline')));
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.queryByText('Unsent message')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('does not auto-restore after a newer silent recording starts and ends', async () => {
+    const pending = deferredSend();
+    render(<RecoveryHarness send={pending.send} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    act(() => voice.props?.onStart?.());
+    act(() => voice.props?.onEnd?.());
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.getByText('Unsent message')).toBeInTheDocument();
+  });
+
+  it('preserves a newer recording instead of reviving a submitted voice session', async () => {
+    const pending = deferredSend();
+    render(<RecoveryHarness send={pending.send} />);
+    act(() => voice.props?.onStart?.());
+    act(() => voice.props?.onInterim?.('first'));
+    const retired = voice.props;
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    act(() => voice.props?.onStart?.());
+    act(() => voice.props?.onInterim?.('new recording'));
+    act(() => { retired?.onSpeech?.('late final'); retired?.onInterim?.('late interim'); retired?.onEnd?.(); });
+    await rejectExpansion(pending);
+    expect(screen.getByRole('textbox')).toHaveValue('new recording');
+    fireEvent.click(screen.getByText('Unsent message'));
+    expect(screen.getByRole('button', { name: 'Restore unsent message' })).toBeDisabled();
+  });
+});
 
 const idleState: ConversationState = { type: 'idle' };
 

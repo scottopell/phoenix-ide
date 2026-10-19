@@ -19,5 +19,15 @@ Implementation uses the Web Speech API where available, with automatic fallback 
 | **REQ-VOICE-005:** Error Handling | ✅ Complete | `VoicePermission.tsx` with `permission`/`not-supported`/`unknown` error types and retry |
 | **REQ-VOICE-006:** Integration with Message Composition | ✅ Complete | `voiceBase` appended to existing draft on stop; cleared on send; image attachments preserved |
 | **REQ-VOICE-007:** Mobile Optimization | ⚠️ Manual verification only | CSS has `@media (max-width: 480px)` and 44×44px touch target; keyboard suppression and orientation/interruption handling not found in code |
+| **REQ-VOICE-008:** Voice Ownership During Late Expansion Recovery | Candidate — hosted verification pending | `InputArea` captures final + interim text and retires the submitted recorder; `VoiceRecorder` guards retired callbacks. Recovery produces an ordinary editable draft under REQ-IR-009. |
 
-**Progress:** 6 of 7 complete (1 partial)
+**Progress:** 6 of 8 complete (1 partial, 1 candidate)
+
+## Candidate Verification and Scope
+
+The implementation owner reports 83 focused tests plus a draft-lifetime regression passing. Hosted verification is pending; this is not a shipped or production-acceptance claim. Candidate coverage includes late expansion rejection, newer drafts and attachments, independent recording, retired callbacks, and scope/lifetime/revision guards. Transport retry queues and Close behavior are unchanged.
+
+## Adjacent TODOs — Outside This Candidate
+
+- External draft insertion during an active recording can be overwritten by the existing voice-end composition path. Investigate separately; this candidate only fences submitted/retired recordings and late expansion recovery.
+- The existing asynchronous `addImages` path uses a captured attachment list and can lose a concurrent attachment update. Investigate separately; no attachment-upload redesign is included.
