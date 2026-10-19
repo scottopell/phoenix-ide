@@ -584,22 +584,29 @@ class WorkflowTests(unittest.TestCase):
             base_env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", RUNNER_TEMP=temp,
                             GITHUB_SHA="b" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
                             GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_REF="refs/heads/main",
-                            GITHUB_WORKSPACE=temp)
+                            GITHUB_WORKSPACE=temp, GITHUB_OUTPUT=str(root / "outputs"))
             receipt = artifact_dir / controller.LINUX_RECEIPT
             for overrides in [{}, {"FAKE_PROGRAM_HEADERS": " INTERP 0x0000"},
                               {"FAKE_ELF_HEADER": "Class: ELF32\nMachine: Advanced Micro Devices X86-64"},
                               {"FAKE_ELF_HEADER": "Class: ELF64\nMachine: AArch64"}]:
                 receipt.unlink(missing_ok=True)
+                output = root / "outputs"
+                output.write_text("")
                 result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell],
                                         env={**base_env, **overrides}, capture_output=True, text=True)
                 # First case succeeds; remaining cases fail before the receipt and artifact upload.
                 if not overrides:
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    digest = hashlib.sha256(receipt.read_bytes()).hexdigest()
+                    self.assertEqual(output.read_text(), f"receipt_sha256={digest}\n")
+                    self.assertEqual({p.name for p in artifact_dir.iterdir()},
+                                     {controller.LINUX_RECEIPT, controller.LINUX_PREPARED_ASSET})
                     receipt.unlink()
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(receipt.exists())
-            upload = WORKFLOW.index("      - uses: actions/upload-artifact@", WORKFLOW.index("Validate Linux artifact"))
+                    self.assertEqual(output.read_text(), "")
+            upload = WORKFLOW.index("      - id: upload", WORKFLOW.index("Validate Linux artifact"))
             self.assertGreater(upload, WORKFLOW.index("Validate Linux artifact"))
             self.assertNotIn("publish:", WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0])
 
@@ -652,6 +659,47 @@ class WorkflowTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
+
+
+
+
+class LinuxReceiptEvidenceTests(unittest.TestCase):
+    def test_post_upload_summary_binds_exact_evidence_and_rejects_missing_upload(self):
+        job = WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0]
+        evidence = job.split("      - name: Publish authenticated Linux receipt evidence", 1)[1]
+        self.assertIn("if: ${{ success() && steps.upload.outcome == 'success' }}", evidence)
+        self.assertLess(job.index("id: upload"), job.index("id: evidence"))
+        self.assertIn("receipt_sha256: ${{ steps.evidence.outputs.receipt_sha256 }}", job)
+        self.assertIn("artifact_id: ${{ steps.evidence.outputs.artifact_id }}", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotIn("always()", evidence)
+        shell = step_shell("Publish authenticated Linux receipt evidence")
+        with tempfile.TemporaryDirectory() as temp:
+            summary, output = Path(temp) / "summary", Path(temp) / "output"
+            env = dict(os.environ, RECEIPT_SHA256="a" * 64, ARTIFACT_ID="42",
+                       APP_COMMIT=controller.CANDIDATE, CONTROLLER_COMMIT="b" * 40,
+                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
+                       GITHUB_REPOSITORY="scottopell/phoenix-ide",
+                       GITHUB_STEP_SUMMARY=str(summary), GITHUB_OUTPUT=str(output))
+            for overrides in [{"ARTIFACT_ID": ""}, {"RECEIPT_SHA256": ""}, {}]:
+                summary.unlink(missing_ok=True)
+                output.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell],
+                                        env={**env, **overrides}, capture_output=True, text=True)
+                if overrides:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(summary.exists())
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for value in [f"receipt_sha256: `{'a' * 64}`", "artifact_id: `42`",
+                                  "run_id: `123`", "run_attempt: `2`",
+                                  f"app_commit: `{controller.CANDIDATE}`",
+                                  f"controller_commit: `{'b' * 40}`",
+                                  f"receipt_basename: `{controller.LINUX_RECEIPT}`",
+                                  "--expected-preparation-receipt-sha256", "NOT the artifact archive digest"]:
+                        self.assertIn(value, summary.read_text())
+                    self.assertEqual(output.read_text(), f"receipt_sha256={'a' * 64}\nartifact_id=42\n")
 
 
 if __name__ == "__main__":

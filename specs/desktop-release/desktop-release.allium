@@ -292,7 +292,14 @@ surface DesktopReleaseWorkflow {
 --   and checks. Operation/target/version/commit/controller/registry/event/ref
 --   are fixed by REQ-DESKTOP-REL-013. sha256 has only the prepared basename;
 --   checks has only clean_source/static_elf/embedded_identity, each verified.
---   No manifest, extra receipt field, or runtime data is retained.
+--   No manifest, extra receipt field, or runtime data is retained. Exact finalized
+--   receipt bytes are hashed. Only after successful upload, authenticated run
+--   evidence and successful job outputs publish receipt_sha256 and artifact_id,
+--   bound to repository/workflow, run ID/attempt, full app/controller commits and
+--   receipt basename. Failed validation/upload publishes no success evidence.
+--   The independent receipt-byte expectation is not an archive digest, self-hash
+--   or third payload file, and is obtained from authenticated selected run evidence
+--   rather than the mutable local payload directory.
 -- linux_incident_has_no_release_or_deployment_authority(incident) -> Boolean
 --   No tag creation/move, release mutation/publication, deployment, installation,
 --   compatibility admission, or general Linux/other-candidate preparation is
