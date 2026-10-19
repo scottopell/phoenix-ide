@@ -306,3 +306,55 @@ active-run absence is checked again. Production emitter remains `None`; actual
 auth/control-fenced admission installation, UserControl/stable-Stop DDL ownership,
 and subsequent Drive lifecycle acceptance remain parent-owned critical-path gates,
 not delivered by the source/test fixture sweep.
+
+### 0e hosted result, own API repairs, and exact declaration inventory
+
+Run `39341564702` at `0e75336b8da88f585b40dbd7a737e2b99c197e5f` is terminal
+FAILED. Rust artifact `12228873612` again contains no goal-test execution: the
+IDE lib-test build exposed six stale fixture references. Earlier source sweeps
+missed these; they did not establish API or compile completeness. The corrections
+use the actual constructors/enum export listed below, without widening any API.
+
+On-path Clippy fixes preserve assertions: two long DB tests extract private
+setup/settlement/replay helpers; the race assertion binds `Err` directly; wrong
+actor roles use explicit `let` destructuring while retaining the fabricated
+user-channel case. Long runtime tests similarly extract fixture/commit-evidence
+helpers. The previously combined rollback/retirement test is split into two
+independent tests, each retaining its assertions and its own exact settlement
+fixture. No `allow` was added to suppress these diagnostics. The introduced
+panic doc's `SQLite` token is now correctly backticked.
+
+The following is a source declaration audit for parent review, **not** passing
+compiler/test evidence. All paths below are under `crates/`:
+
+| Journey reference | Actual declaration and resolved contract |
+| --- | --- |
+| `ModeKind::Branch` | `phoenix-core/src/domain/sm_state.rs::ModeKind`; not re-exported by the IDE `state_machine` module |
+| `ToolInput::from_name_and_value` | `phoenix-core/src/domain/sm_state.rs::ToolInput`; accepts `(&str, serde_json::Value)`, returns `ToolInput`; no `parse` constructor |
+| Branch persistence strings | `phoenix-core/src/domain/db_schema.rs::NonEmptyString::new(impl Into<String>) -> Result`; no `TryFrom<&str/String>` |
+| Branch mode projection | `db_schema::ConvMode::Branch` has three `NonEmptyString` fields; `mode_context::ModeContext::Branch` has three `String` fields |
+| `RenderingAnthropicClient::new/scripted` | `phoenix-ide/src/runtime/executor/provider_tool_policy_tests.rs`; `scripted(Vec<LlmResponse>)`; no `Default` implementation |
+| Provider response | `phoenix-core/src/domain/llm_types.rs::LlmResponse`: `content`, `end_turn`, `usage`, `stream_telemetry`, `provider_replay` |
+| Non-streaming telemetry | `phoenix-llm::ProviderStreamTelemetry::non_streaming()`; `Usage::default()` is the domain usage constructor |
+| Advertised tools | `llm_types::LlmRequest.tool_availability` and `tool_availability::ToolAvailability::declarations() -> &[ToolDefinition]`; no raw `tools/available_tools` field |
+| Actual proposal definition | `phoenix-tools::ProposeTaskTool` public re-export and `Tool` trait methods `name/description/input_schema`; fixture adds this actual definition |
+| Provider-outcome processing | `executor::process_generation_tagged_llm_outcome` returns `()`; no `.unwrap()` |
+| Internal-event processing | `executor::process_event(Event) -> Result<(), String>`; no returned event list |
+| Stop | `sm_event::Event::UserCancel { reason, cause }`, `sm_event::CancelCause::UserRequested`; workflow `TurnCommand::Cancel` has only turn ID and expected generation |
+| Parent-only report event | `sm_event::SubAgentEvent::try_from(Event)` rejects `GoalReportPrepared`; private `GoalReportEmitter` is installed only by tests and parent guard returns `None` for child/coordinator contexts |
+| Report admission | `conversation_goal/pending_report.rs::GoalReportBinding` has private `execution/goal`; `TryFrom<GoalAdmissionBinding>` validates it; emitter description does not read fabricated public metadata |
+| Report input | `GoalReportOutcome::parse_input(Value)` validates tagged `status` plus reason and rejects extras; advertised schema uses the same supported statuses |
+| Report execution | `pending_report.rs::GoalPendingReport::execution() -> GoalExecution` reads the existing private admission; no second stored representation |
+| Durable user fixture | `phoenix-db::Database::add_message(message_id, conversation_id, &MessageContent, metrics, created_at)` is the five-argument API |
+| Exact terminal obligation | `workflow::load_active_terminal_obligation(&ConversationAuthority)`; fixture verifies returned turn ID and expected generation |
+| Trusted skill overlay | `NonEmptyString::as_str()` and `executor::PendingTrustedToolResult.output`; no `instructions` field |
+| Public replay | `provider_replay::AnthropicResponseSet::with_public_content` and `ProviderReplayUpdate::Anthropic`; replay owns `response_sets`, `owner_message_id`, and `public_content` |
+| Durable tool content | `db_schema::MessageContent::Tool(ToolContent)` owns `tool_use_id/content/is_error`; the helper returns its committed content for next-request comparison |
+| Bound runtime factory | `provider_tool_policy_tests::runtime_for_context` accepts the actual `ConvContext`, client and `ToolExecutor`; `DeferredMcpCatalog::with_proposals` is test-only |
+
+The remaining 15 base-test Clippy diagnostics are a separate PR blocker packet,
+not wholesale-edited here. Exact blame attributes the direct-turn and DB remote
+origin test lines to `a4ff45f4b7`, not the goals owner additions. The direct-turn
+file is goals-touched elsewhere, so that classification is line-specific rather
+than a claim the whole file is unrelated. Parent review of this exact new test
+API/lint head is required before another hosted dispatch.

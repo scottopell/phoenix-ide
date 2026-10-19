@@ -6,7 +6,7 @@ use phoenix_core::domain::{
         GoalPendingReport, GoalReportCall, GoalReportOutcome, GoalState, GoalText, GoalTimestampUs,
         GoalVersion, ToolRoundResult,
     },
-    db_schema::MessageType,
+    db_schema::{MessageType, NonEmptyString},
     sm_event::{
         PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
         SubmittedDirectTurnIdentity,
@@ -20,6 +20,42 @@ use phoenix_workflow::{
 
 fn text(value: &str) -> GoalText {
     GoalText::parse(value).unwrap()
+}
+
+fn goal_report_round_state(report: &GoalPendingReport) -> (AssistantMessage, ConvState) {
+    let assistant = AssistantMessage::new(
+        "runtime-assistant".into(),
+        vec![
+            ContentBlock::ToolUse {
+                id: "report".into(),
+                name: "goal_report".into(),
+                input: serde_json::to_value(report.outcome()).unwrap(),
+            },
+            ContentBlock::ToolUse {
+                id: "other".into(),
+                name: "think".into(),
+                input: serde_json::json!({"thoughts":"retain normal tool output"}),
+            },
+        ],
+        None,
+        None,
+    );
+    let state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            "other",
+            ToolInput::Think(ThinkInput {
+                thoughts: "retain normal tool output".into(),
+            }),
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![ToolRoundResult::PendingGoalReport {
+            report: report.clone(),
+            duration_ms: 4,
+        }],
+        pending_sub_agents: vec![],
+        assistant_message: assistant.clone(),
+    };
+    (assistant, state)
 }
 
 async fn goal_fixture() -> (Database, AssistantMessage, GoalPendingReport, ConvState) {
@@ -111,38 +147,7 @@ async fn goal_fixture() -> (Database, AssistantMessage, GoalPendingReport, ConvS
         },
         GoalReportOutcome::Complete(text("objective is complete")),
     );
-    let assistant = AssistantMessage::new(
-        "runtime-assistant".into(),
-        vec![
-            ContentBlock::ToolUse {
-                id: "report".into(),
-                name: "goal_report".into(),
-                input: serde_json::to_value(report.outcome()).unwrap(),
-            },
-            ContentBlock::ToolUse {
-                id: "other".into(),
-                name: "think".into(),
-                input: serde_json::json!({"thoughts":"retain normal tool output"}),
-            },
-        ],
-        None,
-        None,
-    );
-    let state = ConvState::ToolExecuting {
-        current_tool: ToolCall::new(
-            "other",
-            ToolInput::Think(ThinkInput {
-                thoughts: "retain normal tool output".into(),
-            }),
-        ),
-        remaining_tools: vec![],
-        completed_results: vec![ToolRoundResult::PendingGoalReport {
-            report: report.clone(),
-            duration_ms: 4,
-        }],
-        pending_sub_agents: vec![],
-        assistant_message: assistant.clone(),
-    };
+    let (assistant, state) = goal_report_round_state(&report);
     db.update_conversation_state(CONVERSATION, &state)
         .await
         .unwrap();
@@ -509,7 +514,7 @@ async fn conversation_goal_mixed_legacy_trusted_payload_keeps_live_authority_and
     };
     *current_tool = ToolCall::new(
         "other",
-        ToolInput::parse("skill", serde_json::json!({"skill_name":"phoenix-api"})),
+        ToolInput::from_name_and_value("skill", serde_json::json!({"skill_name":"phoenix-api"})),
     );
     *assistant_message = assistant.clone();
     db.update_conversation_state(CONVERSATION, &original)
@@ -577,11 +582,83 @@ fn db_assistant(assistant: &AssistantMessage) -> crate::db::Message {
     }
 }
 
+async fn block_goal_before_report(db: &Database, report: &GoalPendingReport) {
+    use phoenix_core::domain::conversation_goal::GoalDisposition;
+    let mut mutation = report.mutation();
+    let actor = GoalActor::GeneratedHost {
+        action_id: text("block-before-report"),
+    };
+    mutation.action_id = text("block-before-report");
+    mutation.attribution = GoalAttribution {
+        requested_by: actor.clone(),
+        applied_by: actor,
+    };
+    let GoalChange::Report { binding, .. } = &mutation.change else {
+        panic!("report binding")
+    };
+    let phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(fence) =
+        &binding.observation
+    else {
+        panic!("goal observation")
+    };
+    mutation.change = GoalChange::SetDisposition {
+        goal_id: fence.goal_id.clone(),
+        disposition: GoalDisposition::Blocked(text("waiting on an external prerequisite")),
+    };
+    db.apply_conversation_goal(&mutation, CONVERSATION, GoalTimestampUs::parse(11).unwrap())
+        .await
+        .unwrap();
+}
+
+async fn assert_report_after_settlement(
+    db: &Database,
+    checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    evidence: &phoenix_db::workflow::TerminalEvidenceExpectation,
+    obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+) {
+    use crate::runtime::traits::classify_goal_terminal_mutation;
+    db.workflow_repository()
+        .terminalize_authoritative_turn(&phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+            command: phoenix_workflow::TurnCommand::Complete {
+                turn_id: obligation.turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(obligation.projection.clone()),
+            provider_replay_settlement: ProviderReplaySettlement::Preserve,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        classify_goal_terminal_mutation(
+            db,
+            checkpoint,
+            evidence,
+            obligation,
+            "retry after settlement".into()
+        )
+        .await,
+        TerminalMutationEstablishment::Established { .. }
+    ));
+    db.update_conversation_state(CONVERSATION, &ConvState::LlmRequesting { attempt: 4 })
+        .await
+        .unwrap();
+    assert!(matches!(
+        classify_goal_terminal_mutation(
+            db,
+            checkpoint,
+            evidence,
+            obligation,
+            "projection changed".into()
+        )
+        .await,
+        TerminalMutationEstablishment::Unclassifiable(_)
+    ));
+}
+
 #[tokio::test]
 async fn conversation_goal_terminal_response_loss_reconstructs_exact_success_or_refusal_without_reapplying(
 ) {
     use crate::runtime::traits::classify_goal_terminal_mutation;
-    use phoenix_core::domain::conversation_goal::GoalDisposition;
     use phoenix_db::{
         conversation_goals::round::GoalRoundCheckpoint,
         workflow::{
@@ -592,34 +669,7 @@ async fn conversation_goal_terminal_response_loss_reconstructs_exact_success_or_
     for refuse in [false, true] {
         let (db, assistant, report, _) = goal_fixture().await;
         if refuse {
-            let mut mutation = report.mutation();
-            let actor = GoalActor::GeneratedHost {
-                action_id: text("block-before-report"),
-            };
-            mutation.action_id = text("block-before-report");
-            mutation.attribution = GoalAttribution {
-                requested_by: actor.clone(),
-                applied_by: actor,
-            };
-            let GoalChange::Report { binding, .. } = &mutation.change else {
-                panic!("report binding")
-            };
-            let phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(fence) =
-                &binding.observation
-            else {
-                panic!("goal observation")
-            };
-            mutation.change = GoalChange::SetDisposition {
-                goal_id: fence.goal_id.clone(),
-                disposition: GoalDisposition::Blocked(text("waiting on an external prerequisite")),
-            };
-            db.apply_conversation_goal(
-                &mutation,
-                CONVERSATION,
-                GoalTimestampUs::parse(11).unwrap(),
-            )
-            .await
-            .unwrap();
+            block_goal_before_report(&db, &report).await;
         }
         let assistant = db_assistant(&assistant);
         let results = [
@@ -694,50 +744,12 @@ async fn conversation_goal_terminal_response_loss_reconstructs_exact_success_or_
                 .get(),
             2
         );
-        db.workflow_repository()
-            .terminalize_authoritative_turn(
-                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
-                    command: phoenix_workflow::TurnCommand::Complete {
-                        turn_id: obligation.turn_id,
-                        expected_generation: 0,
-                    },
-                    projection: Some(obligation.projection.clone()),
-                    provider_replay_settlement: ProviderReplaySettlement::Preserve,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            classify_goal_terminal_mutation(
-                &db,
-                &checkpoint,
-                &evidence,
-                &obligation,
-                "retry after settlement".into()
-            )
-            .await,
-            TerminalMutationEstablishment::Established { .. }
-        ));
-        db.update_conversation_state(CONVERSATION, &ConvState::LlmRequesting { attempt: 4 })
-            .await
-            .unwrap();
-        assert!(matches!(
-            classify_goal_terminal_mutation(
-                &db,
-                &checkpoint,
-                &evidence,
-                &obligation,
-                "projection changed".into()
-            )
-            .await,
-            TerminalMutationEstablishment::Unclassifiable(_)
-        ));
+        assert_report_after_settlement(&db, &checkpoint, &evidence, &obligation).await;
     }
 }
 
 #[tokio::test]
-async fn conversation_goal_terminal_late_replay_failure_is_known_rollback_and_retirement_is_not_fatal(
-) {
+async fn conversation_goal_terminal_late_replay_failure_is_known_rollback() {
     let (db, assistant, report, original) = goal_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let current = active(&report);
@@ -820,8 +832,20 @@ async fn conversation_goal_terminal_late_replay_failure_is_known_rollback_and_re
         db.get_conversation(CONVERSATION).await.unwrap().state,
         original
     );
+}
 
+#[tokio::test]
+async fn conversation_goal_terminal_retirement_after_cancel_is_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
     let (db, assistant, report, _) = goal_fixture().await;
+    let settlement = ActiveDirectTurnSettlement {
+        turn: active(&report),
+        conversation_id: CONVERSATION.into(),
+        terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+        state: ConvState::Idle,
+        state_updated_at: Utc::now(),
+        execution_occurrence_message_id: None,
+    };
     db.workflow_repository()
         .terminalize_authoritative_turn(&phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
             command: phoenix_workflow::TurnCommand::Cancel {
@@ -930,6 +954,58 @@ fn enable_admitted_report(rt: &mut TestRuntime, report: &GoalPendingReport) {
     });
 }
 
+async fn assert_actual_report_committed(
+    db: &Database,
+    report: &GoalPendingReport,
+    rt: &TestRuntime,
+) -> String {
+    let committed = db.get_messages(CONVERSATION).await.unwrap();
+    assert_eq!(committed.len(), 3);
+    let stored_result = committed
+        .iter()
+        .find_map(|message| {
+            let MessageContent::Tool(result) = &message.content else {
+                return None;
+            };
+            (result.tool_use_id == "actual-report").then_some(result)
+        })
+        .unwrap();
+    assert!(!stored_result.is_error);
+    assert_eq!(
+        db.get_conversation(CONVERSATION).await.unwrap().state,
+        rt.state
+    );
+    assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    let replay = db
+        .load_provider_replay_state(CONVERSATION)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.response_sets.len(), 1);
+    let assistant = committed
+        .iter()
+        .find(|message| matches!(&message.content, MessageContent::Agent(_)))
+        .unwrap();
+    assert_eq!(
+        replay.response_sets[0].owner_message_id,
+        assistant.message_id
+    );
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        unreachable!()
+    };
+    assert_eq!(&replay.response_sets[0].public_content, blocks);
+    assert_eq!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        2
+    );
+    stored_result.content.clone()
+}
+
 #[tokio::test]
 async fn conversation_goal_actual_internal_emitter_processes_round_before_next_model_request_and_output(
 ) {
@@ -976,48 +1052,7 @@ async fn conversation_goal_actual_internal_emitter_processes_round_before_next_m
         1
     );
     journey_report_step(&mut rt).await;
-    let committed = db.get_messages(CONVERSATION).await.unwrap();
-    assert_eq!(committed.len(), 3);
-    let stored_result = committed
-        .iter()
-        .find_map(|message| match &message.content {
-            MessageContent::Tool(result) if result.tool_use_id == "actual-report" => Some(result),
-            _ => None,
-        })
-        .unwrap();
-    assert!(!stored_result.is_error);
-    assert_eq!(
-        db.get_conversation(CONVERSATION).await.unwrap().state,
-        rt.state
-    );
-    assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
-    let replay = db
-        .load_provider_replay_state(CONVERSATION)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(replay.response_sets.len(), 1);
-    let assistant = committed
-        .iter()
-        .find(|message| matches!(&message.content, MessageContent::Agent(_)))
-        .unwrap();
-    assert_eq!(
-        replay.response_sets[0].owner_message_id,
-        assistant.message_id
-    );
-    let MessageContent::Agent(blocks) = &assistant.content else {
-        unreachable!()
-    };
-    assert_eq!(&replay.response_sets[0].public_content, blocks);
-    assert_eq!(
-        db.conversation_goal(&report.mutation().owner)
-            .await
-            .unwrap()
-            .unwrap()
-            .version
-            .get(),
-        2
-    );
+    let stored_result = assert_actual_report_committed(&db, &report, &rt).await;
     journey_provider_step(&mut rt).await;
     let requests = client.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
@@ -1043,7 +1078,7 @@ async fn conversation_goal_actual_internal_emitter_processes_round_before_next_m
         .contains("recorded complete at owner version 2"));
     assert!(results[0]["content"]
         .to_string()
-        .contains(&stored_result.content));
+        .contains(stored_result.as_str()));
     let messages = db.get_messages(CONVERSATION).await.unwrap();
     assert_eq!(messages.len(), 4);
     assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Agent(blocks) if blocks.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "Delivered the completed result.")))));
@@ -1215,7 +1250,7 @@ async fn conversation_goal_internal_binding_is_parent_only_even_when_injected_in
     let mut rt = runtime(
         db,
         dir.path(),
-        Arc::new(RenderingAnthropicClient::default()),
+        Arc::new(RenderingAnthropicClient::new()),
         Arc::new(DeferredMcpCatalog::new(false)),
     );
     assert!(rt.parent_goal_report_emitter().is_none());
@@ -1304,6 +1339,33 @@ async fn conversation_goal_actual_mixed_proposal_and_report_are_all_paired_error
     assert_eq!(client.requests.lock().unwrap().len(), 2);
 }
 
+async fn goal_proposal_context(db: &Database, dir: &tempfile::TempDir) -> ConvContext {
+    let path = dir.path().to_str().unwrap().to_owned();
+    db.update_conversation_mode(
+        CONVERSATION,
+        &crate::db::ConvMode::Branch {
+            branch_name: NonEmptyString::new("goal-journey").unwrap(),
+            worktree_path: NonEmptyString::new(path.clone()).unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut context = ConvContext::new(
+        CONVERSATION,
+        dir.path().to_path_buf(),
+        "claude-opus-5-5",
+        200_000,
+    );
+    context.mode = phoenix_core::domain::sm_state::ModeKind::Branch;
+    context.mode_context = Some(phoenix_core::domain::mode_context::ModeContext::Branch {
+        branch_name: "goal-journey".into(),
+        base_branch: "main".into(),
+        worktree_path: path,
+    });
+    context
+}
+
 #[tokio::test]
 async fn conversation_goal_report_then_separate_valid_proposal_round_preserves_both_real_exchanges()
 {
@@ -1317,17 +1379,7 @@ async fn conversation_goal_report_then_separate_valid_proposal_round_preserves_b
         "# Follow-up\n\nContinue the next bounded unit of work.\n",
     )
     .unwrap();
-    let path = dir.path().to_str().unwrap().to_owned();
-    db.update_conversation_mode(
-        CONVERSATION,
-        &crate::db::ConvMode::Branch {
-            branch_name: "goal-journey".try_into().unwrap(),
-            worktree_path: path.clone().try_into().unwrap(),
-            base_branch: "main".try_into().unwrap(),
-        },
-    )
-    .await
-    .unwrap();
+
     let client = Arc::new(RenderingAnthropicClient::scripted(vec![
         journey_response(
             vec![ContentBlock::ToolUse {
@@ -1346,18 +1398,7 @@ async fn conversation_goal_report_then_separate_valid_proposal_round_preserves_b
             false,
         ),
     ]));
-    let mut context = ConvContext::new(
-        CONVERSATION,
-        dir.path().to_path_buf(),
-        "claude-opus-5-5",
-        200_000,
-    );
-    context.mode = crate::state_machine::ModeKind::Branch;
-    context.mode_context = Some(phoenix_core::domain::mode_context::ModeContext::Branch {
-        branch_name: "goal-journey".into(),
-        base_branch: "main".into(),
-        worktree_path: path,
-    });
+    let context = goal_proposal_context(&db, &dir).await;
     let mut rt = runtime_for_context(
         db.clone(),
         context,

@@ -214,7 +214,7 @@ impl Database {
     /// Returns an error for a changed binding, invalid cursor, inactive enrollment, or failed transaction.
     ///
     /// # Panics
-    /// Panics if `REPLAY_BATCH` cannot be represented by a SQLite integer.
+    /// Panics if `REPLAY_BATCH` cannot be represented by a `SQLite` integer.
     pub async fn replay_federation_subscription(
         &self,
         enrollment_id: Uuid,

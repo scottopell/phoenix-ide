@@ -255,8 +255,8 @@ async fn all_actor_writes_compete_on_observed_version() {
         db.mutate_conversation_goal(&global, at())
     );
     assert_ne!(a.is_ok(), b.is_ok());
-    let error = if a.is_err() {
-        a.unwrap_err()
+    let error = if let Err(error) = a {
+        error
     } else {
         b.unwrap_err()
     };
@@ -278,19 +278,19 @@ async fn all_actor_writes_compete_on_observed_version() {
 #[tokio::test]
 async fn wrong_owner_role_and_fabricated_user_channel_roll_back_every_row() {
     let (_dir, db) = fixture().await;
+    let GoalActor::OwningAgent(owning) = agent(false) else {
+        unreachable!()
+    };
+    let GoalActor::Coordinator(coordinator) = agent(true) else {
+        unreachable!()
+    };
     for actor in [
-        GoalActor::Coordinator(match agent(false) {
-            GoalActor::OwningAgent(s) => s,
-            _ => unreachable!(),
-        }),
+        GoalActor::Coordinator(owning),
         GoalActor::UserApi {
             transcript_id: t("root"),
             message_id: t("agent-call"),
         },
-        GoalActor::OwningAgent(match agent(true) {
-            GoalActor::Coordinator(s) => s,
-            _ => unreachable!(),
-        }),
+        GoalActor::OwningAgent(coordinator),
     ] {
         let mut request = create();
         request.attribution.requested_by = actor;

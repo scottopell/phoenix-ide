@@ -190,21 +190,11 @@ async fn committed_success_response_loss_reuses_the_original_result_after_replac
     );
 }
 
-#[tokio::test]
-async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on_replay() {
-    let (db, command, pending) = pending_fixture(GoalReportOutcome::Complete(t("done"))).await;
-    let GoalChange::Report { binding, .. } = pending.mutation().change else {
-        panic!("report")
-    };
-    let first = GoalPendingReport::new(
-        binding.try_into().unwrap(),
-        GoalReportCall {
-            transcript_id: t("full-root"),
-            message_id: t("report-message"),
-            tool_use_id: t("prior-call"),
-        },
-        GoalReportOutcome::Blocked(t("access unavailable")),
-    );
+async fn install_semantic_refusal_calls(
+    db: &Database,
+    first: &GoalPendingReport,
+    pending: &GoalPendingReport,
+) {
     let blocks = vec![
         ContentBlock::ToolUse {
             id: "prior-call".into(),
@@ -227,6 +217,24 @@ async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on
         .execute(db.pool())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on_replay() {
+    let (db, command, pending) = pending_fixture(GoalReportOutcome::Complete(t("done"))).await;
+    let GoalChange::Report { binding, .. } = pending.mutation().change else {
+        panic!("report")
+    };
+    let first = GoalPendingReport::new(
+        binding.try_into().unwrap(),
+        GoalReportCall {
+            transcript_id: t("full-root"),
+            message_id: t("report-message"),
+            tool_use_id: t("prior-call"),
+        },
+        GoalReportOutcome::Blocked(t("access unavailable")),
+    );
+    install_semantic_refusal_calls(&db, &first, &pending).await;
     let assistant = round_assistant(&db).await;
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     let accepted = finalize_report_tx(

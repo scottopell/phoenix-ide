@@ -309,6 +309,43 @@ async fn assert_no_round(db: &Database, report: &GoalPendingReport) {
     assert_eq!(side_rows, 0);
 }
 
+async fn assert_owner_replay_state(owner: Owner, db: &Database) {
+    if matches!(owner.replay(), Some(Owner::Anthropic)) {
+        assert_eq!(
+            db.load_provider_replay_state("full-root")
+                .await
+                .unwrap()
+                .unwrap()
+                .response_sets
+                .len(),
+            1
+        );
+    }
+    if matches!(owner.replay(), Some(Owner::Responses)) {
+        assert_eq!(
+            db.load_responses_replay_state("full-root")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+async fn terminalize_goal_owner_fixture(db: &Database, checkpoint: &GoalRoundCheckpoint<'_>) {
+    db.workflow_repository()
+        .terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Complete {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+            },
+            projection: Some(obligation(checkpoint).projection),
+            provider_replay_settlement: ProviderReplaySettlement::Preserve,
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewinding_state() {
     for owner in OWNERS {
@@ -327,17 +364,12 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
         };
         let (original, replayed) = persist(owner, &db, &checkpoint).await.unwrap();
         assert!(!replayed, "{owner:?}");
-        assert!(
-            matches!(
-                db.conversation_goal(&report.mutation().owner)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                GoalState::Complete(_)
-            ),
-            "{owner:?}"
-        );
+        let goal = db
+            .conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(goal.state, GoalState::Complete(_)), "{owner:?}");
         let MessageContent::Tool(result) = &original[0].content else {
             panic!("finalized")
         };
@@ -348,17 +380,7 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
                 ConvState::LlmRequesting { attempt: 1 },
                 "terminal obligation must not project Idle early"
             );
-            db.workflow_repository()
-                .terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
-                    command: TurnCommand::Complete {
-                        turn_id: TurnAuthorityId(1),
-                        expected_generation: 0,
-                    },
-                    projection: Some(obligation(&checkpoint).projection),
-                    provider_replay_settlement: ProviderReplaySettlement::Preserve,
-                })
-                .await
-                .unwrap();
+            terminalize_goal_owner_fixture(&db, &checkpoint).await;
             assert_eq!(
                 db.get_conversation("full-root").await.unwrap().state,
                 ConvState::Idle
@@ -376,26 +398,7 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
                 "{owner:?}"
             );
         }
-        if matches!(owner.replay(), Some(Owner::Anthropic)) {
-            assert_eq!(
-                db.load_provider_replay_state("full-root")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .response_sets
-                    .len(),
-                1
-            );
-        }
-        if matches!(owner.replay(), Some(Owner::Responses)) {
-            assert_eq!(
-                db.load_responses_replay_state("full-root")
-                    .await
-                    .unwrap()
-                    .len(),
-                1
-            );
-        }
+        assert_owner_replay_state(owner, &db).await;
         let later = ConvState::LlmRequesting { attempt: 3 };
         db.update_conversation_state("full-root", &later)
             .await
