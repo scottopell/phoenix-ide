@@ -4102,7 +4102,8 @@ where
             ))
             .await?;
         } else {
-            let mut state_committed = false;
+            let mut committed_state: Option<(ConvState, DateTime<Utc>)> = None;
+            let mut persist_state_effect_satisfied = false;
             let mut new_turn_input_persisted = false;
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
                 let is_new_turn_input = match &effect {
@@ -4114,23 +4115,34 @@ where
                 };
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-                let checkpoint_commits_state = matches!(
+                let checkpoint_satisfies_persist_state = matches!(
                     effect,
                     Effect::PersistCheckpoint { .. }
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
                             || (clears_pending_trusted_after_commit
                                 && !terminal_direct_turn_transition)
                 );
+                let checkpoint_commits_state = checkpoint_satisfies_persist_state
+                    || matches!(effect, Effect::PersistCheckpoint { .. } if !terminal_direct_turn_transition)
+                    || matches!(effect, Effect::PersistForkProposal { .. });
+                let has_specialized_state_work = self.pending_sub_agent_activation.is_some()
+                    || self.pending_sub_agent_terminal.is_some()
+                    || self.pending_sub_agent_acceptance.is_some()
+                    || self.pending_direct_turn_terminal.is_some()
+                    || self.pending_provider_replay_update.is_some();
                 let approval_commits_state = matches!(effect, Effect::ApproveTask { .. })
                     && task_approval_execution.is_some();
                 let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
-                    && (state_committed || approval_commits_state);
-                let is_state_persist = matches!(
+                    && !has_specialized_state_work
+                    && (persist_state_effect_satisfied || approval_commits_state);
+                let satisfies_persist_state = matches!(
                     effect,
                     Effect::PersistState
                         | Effect::CompleteCreation { .. }
                         | Effect::MaterializeCreation { .. }
-                ) || checkpoint_commits_state;
+                ) || (checkpoint_satisfies_persist_state
+                    && !has_specialized_state_work);
+                let is_state_persist = satisfies_persist_state || checkpoint_commits_state;
                 if redundant_approval_state_persist {
                     continue;
                 }
@@ -4138,7 +4150,8 @@ where
                     && self.handoff_completion_authority.is_some()
                     && matches!(self.state, ConvState::HandedOff { .. })
                 {
-                    state_committed = true;
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
                     continue;
                 }
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
@@ -4384,7 +4397,7 @@ where
                     )
                     .await
                 };
-                if state_committed
+                if committed_state.is_some()
                     && clears_pending_trusted_after_commit
                     && !pending_trusted_cleared
                 {
@@ -4397,7 +4410,10 @@ where
                         if is_state_persist && new_turn_input_persisted {
                             self.ordinary_skill_catalog = None;
                         }
-                        state_committed |= is_state_persist;
+                        if is_state_persist {
+                            committed_state = Some((self.state.clone(), self.state_updated_at));
+                        }
+                        persist_state_effect_satisfied |= satisfies_persist_state;
                         if is_state_persist && clears_pending_trusted_after_commit {
                             self.pending_trusted_tool_results.clear();
                             pending_trusted_cleared = true;
@@ -4413,19 +4429,22 @@ where
                             || is_sub_agent_result_persist
                             || ((terminal_subagent_transition
                                 || terminal_direct_turn_transition)
-                                && !state_committed) =>
+                                && committed_state.is_none()) =>
                     {
                         let failed_state = self.state.clone();
+                        let (retained_state, retained_timestamp) = committed_state
+                            .clone()
+                            .unwrap_or_else(|| (old_state.clone(), old_state_updated_at));
                         if terminal_direct_turn_transition {
-                            self.state = old_state.clone();
-                            self.state_updated_at = old_state_updated_at;
+                            self.state = retained_state;
+                            self.state_updated_at = retained_timestamp;
                             self.manage_deadline(&failed_state);
                         } else {
-                            self.install_live_state(old_state.clone(), old_state_updated_at, true)?;
+                            self.install_live_state(retained_state, retained_timestamp, true)?;
                             self.manage_deadline(&failed_state);
                         }
                         if (terminal_subagent_transition || terminal_direct_turn_transition)
-                            && !state_committed
+                            && committed_state.is_none()
                         {
                             self.schedule_terminal_transition_retry(
                                 terminal_subagent_transition,
@@ -4466,11 +4485,9 @@ where
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
                 }
-                if checkpoint_commits_state {
-                    state_committed = true;
-                }
                 if approval_commits_state {
-                    state_committed = true;
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
                 }
                 if self.creation_settlement_disposition
                     == CreationSettlementDisposition::StaleAuthority
@@ -25584,6 +25601,76 @@ mod fork_proposal_persist_tests {
             Some(proposal_id),
             "ack display_data must carry the fork_proposal_id handle"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_commit_survives_a_later_state_effect_failure() {
+        for kind in ["ordinary", "provider", "fork"] {
+            let (_tmp, root) = init_repo();
+            let (mut rt, storage) = runtime_in_dir("committed-state", &root);
+            let old_timestamp = Utc::now() - chrono::Duration::seconds(2);
+            rt.state_updated_at = old_timestamp;
+            storage
+                .update_state("committed-state", &rt.state, old_timestamp)
+                .await
+                .unwrap();
+            let (watch_tx, watch_rx) = watch::channel(rt.state.clone());
+            rt.state_watcher = Some(watch_tx);
+            if kind == "provider" {
+                rt.pending_provider_replay_update =
+                    Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear);
+            }
+            let effect = if kind == "fork" {
+                fork_effect("committed-fork", "tasks/00042-p1-ready--fix-thing.md")
+            } else {
+                let assistant = AssistantMessage::new(
+                    "state-round".into(),
+                    vec![ContentBlock::tool_use(
+                        "state-tool",
+                        "bash",
+                        serde_json::json!({"command":"pwd"}),
+                    )],
+                    None,
+                    None,
+                );
+                let data = CheckpointData::tool_round(
+                    assistant,
+                    vec![ToolResult::success("state-tool".into(), "done".into())],
+                )
+                .unwrap();
+                Effect::PersistCheckpoint { data }
+            };
+            let selected = ConvState::LlmRequesting { attempt: 2 };
+            let transition =
+                crate::state_machine::transition::TransitionResult::new(selected.clone())
+                    .with_effect(effect)
+                    .with_effect(Effect::PersistState);
+            let (entered, release) = storage.gate_state_update();
+            let task = tokio::spawn(async move {
+                let result = rt.apply_transition_result(transition).await;
+                (rt, result)
+            });
+            entered.await.unwrap();
+            storage.set_fail_state_update(true);
+            release.send(()).unwrap();
+            let (rt, result) = task.await.unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("injected state update failure"),
+                "{kind}"
+            );
+            let persisted = storage.get_state_snapshot("committed-state").await.unwrap();
+            assert_eq!(persisted.state, selected, "{kind}");
+            assert_eq!(rt.state, selected, "{kind}");
+            assert_eq!(*watch_rx.borrow(), selected, "{kind}");
+            assert_eq!(rt.state_updated_at, persisted.state_updated_at, "{kind}");
+            assert!(persisted.state_updated_at > old_timestamp, "{kind}");
+            assert!(
+                !storage.get_all_messages("committed-state").is_empty(),
+                "{kind}"
+            );
+        }
     }
 
     /// Worktree-top origin: `working_dir` IS the repo root, so the stored
