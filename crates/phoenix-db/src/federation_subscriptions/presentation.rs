@@ -24,7 +24,7 @@ impl Database {
         source_path: &str,
     ) -> Result<(), crate::DbError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        self.save_remote_notification_navigation_tx(
+        Self::save_remote_notification_navigation_tx(
             &mut tx,
             remote,
             admission_id,
