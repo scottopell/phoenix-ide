@@ -128,6 +128,7 @@ async fn blocked_goal_does_not_gain_report_permission_from_an_unrelated_turn() {
         expected_version: created.version,
         action_id: text("blocked"),
         change: GoalChange::SetDisposition {
+            goal_id: created.goal_id,
             disposition: GoalDisposition::Blocked(text("environment requires access")),
         },
         ..command
