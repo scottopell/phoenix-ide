@@ -708,6 +708,31 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
+    async fn persist_tool_round_messages(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+    ) -> Result<(), String> {
+        if *self.fail_tool_round_persist.lock().unwrap() {
+            return Err("injected tool round persist failure".to_string());
+        }
+        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.tool_round_persist_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let mut messages = self.messages.lock().unwrap();
+        let bucket = messages.entry(conv_id.to_string()).or_default();
+        bucket.push(assistant.clone());
+        for msg in tool_results {
+            bucket.push(msg.clone());
+        }
+        Ok(())
+    }
+
     pub fn seed_tool_admission_policy(
         &self,
         conversation_id: &str,
@@ -1964,31 +1989,6 @@ impl MessageStore for InMemoryStorage {
             .await
     }
 
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &Message,
-        tool_results: &[Message],
-    ) -> Result<(), String> {
-        if *self.fail_tool_round_persist.lock().unwrap() {
-            return Err("injected tool round persist failure".to_string());
-        }
-        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
-            let _ = started.send(());
-        }
-        let release = self.tool_round_persist_release.lock().unwrap().take();
-        if let Some(release) = release {
-            let _ = release.await;
-        }
-        let mut messages = self.messages.lock().unwrap();
-        let bucket = messages.entry(conv_id.to_string()).or_default();
-        bucket.push(assistant.clone());
-        for msg in tool_results {
-            bucket.push(msg.clone());
-        }
-        Ok(())
-    }
-
     async fn persist_tool_round_and_state(
         &self,
         conv_id: &str,
@@ -1997,7 +1997,7 @@ impl MessageStore for InMemoryStorage {
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
-        self.persist_tool_round(conv_id, assistant, tool_results)
+        self.persist_tool_round_messages(conv_id, assistant, tool_results)
             .await?;
         self.update_state(conv_id, state, state_updated_at).await
     }
@@ -2020,7 +2020,7 @@ impl MessageStore for InMemoryStorage {
             establishment => return establishment,
         }
         if let Err(error) = self
-            .persist_tool_round(conv_id, assistant, tool_results)
+            .persist_tool_round_messages(conv_id, assistant, tool_results)
             .await
         {
             return crate::runtime::traits::TerminalMutationEstablishment::Unclassifiable(error);

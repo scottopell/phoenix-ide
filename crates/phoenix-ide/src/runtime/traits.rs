@@ -385,19 +385,6 @@ pub trait MessageStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
 
-    /// Atomically persist a completed tool round (REQ-BED-007): the assistant
-    /// message and every paired tool-result message commit in a single
-    /// transaction, or none do. The caller pre-builds the message rows
-    /// (seq-allocated and content-mapped) so the broadcast seq ordering matches
-    /// the persisted rows. A partial write would leave an unpaired `tool_use`
-    /// that 400s every later LLM request.
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-    ) -> Result<(), String>;
-
     async fn persist_tool_round_and_state(
         &self,
         conv_id: &str,
@@ -1078,17 +1065,6 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 state,
                 state_updated_at,
             )
-            .await
-    }
-
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-    ) -> Result<(), String> {
-        (**self)
-            .persist_tool_round(conv_id, assistant, tool_results)
             .await
     }
 
@@ -2187,18 +2163,6 @@ impl MessageStore for DatabaseStorage {
                 state,
                 state_updated_at,
             )
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-    ) -> Result<(), String> {
-        self.db
-            .persist_tool_round(conv_id, assistant, tool_results)
             .await
             .map_err(|e| e.to_string())
     }
