@@ -1,4 +1,4 @@
-# ADR-138: Qualify exact prepared Linux systemd candidate
+# ADR-129: Qualify exact prepared Linux systemd candidate
 
 - **Status:** Accepted
 - **Date:** 2026-10-18
