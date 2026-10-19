@@ -27,6 +27,7 @@ import shutil
 import signal
 import stat
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -9906,6 +9907,25 @@ class PreparedCandidate:
 
 
 @dataclasses.dataclass(frozen=True)
+class DisposableLaunchdValidationInputs:
+    prepared_artifact: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class DisposableLaunchdValidationReceipt:
+    transaction_id: str
+    root: Path
+    transaction_path: Path
+    manifest_path: Path
+    candidate_identity: RuntimeIdentity
+    rollback_identity: RuntimeIdentity
+    controller_source_commit: str
+    controller_helper_sha256: str
+    candidate_registry_sha256: str
+    database_ledger: tuple[tuple[int, str], ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class ValidatedLinuxPreparedCandidate:
     binary: Path
     receipt: Path
@@ -9917,8 +9937,6 @@ class ValidatedLinuxPreparedCandidate:
     identity: RuntimeIdentity = RuntimeIdentity(SYSTEMD_PREPARED_VERSION, SYSTEMD_PREPARED_COMMIT)
     release_tag: None = None
     release_commit: None = None
-
-
 
 
 @dataclasses.dataclass(frozen=True)
@@ -10569,6 +10587,25 @@ PREPARED_SOURCE114_COMMIT = "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
 PREPARED_SOURCE114_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
 
 
+def _macos_prepared_target() -> str:
+    machine = platform.machine().lower()
+    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
+    if target is None:
+        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    return target
+
+
+def _prepared_artifact_bundle_names(target: str) -> dict[str, str]:
+    short_commit = PREPARED_SOURCE114_COMMIT[:12]
+    return {
+        "receipt": f"PREPARATION-RECEIPT-{target}.json",
+        "standalone": f"phoenix_ide-{target}-prepared-{short_commit}",
+        "archive": f"Phoenix-macos-{target}-prepared-{short_commit}.zip",
+        "checksums": f"PREPARATION-SHA256SUMS-{target}",
+        "headless_acceptance": f"HEADLESS-ACCEPTANCE-{target}.json",
+    }
+
+
 def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> PreparedCandidate:
     """Validate one protected prepare-main standalone artifact without resigning it."""
     if sys.platform != "darwin":
@@ -10577,10 +10614,7 @@ def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> Pr
         raise SystemExit("--expected-full-commit must be a full 40-character lowercase git SHA")
     if not directory.is_dir() or directory.is_symlink():
         raise SystemExit("prepared artifact must be a real directory")
-    machine = platform.machine().lower()
-    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
-    if target is None:
-        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    target = _macos_prepared_target()
     receipt = directory / f"PREPARATION-RECEIPT-{target}.json"
     if not receipt.is_file() or receipt.is_symlink():
         raise SystemExit(f"prepared artifact is missing {receipt.name}")
@@ -10773,6 +10807,15 @@ def _status_is_terminal_for_owner(
         return False
 
 
+def _deploy_unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
 class DeployManifestKind(enum.Enum):
     ORDINARY = "ordinary"
     ORDINARY_FORWARD = "ordinary_forward"
@@ -10794,8 +10837,10 @@ def _deploy_manifest_kind(transaction: Path) -> DeployManifestKind:
     if manifest_path.is_symlink() or not manifest_path.is_file():
         return DeployManifestKind.UNKNOWN
     try:
-        payload = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(
+            manifest_path.read_text(), object_pairs_hook=_deploy_unique_json_object
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
         return DeployManifestKind.UNKNOWN
     if not isinstance(payload, dict) or not isinstance(payload.get("source_kind"), str):
         return DeployManifestKind.UNKNOWN
@@ -11387,6 +11432,351 @@ def _materialize_helper(source_commit: str, destination: Path, source_kind: str)
         "scripts/launchd_deploy_helper.py",
         destination,
         source_kind,
+    )
+
+
+def _stage_disposable_validation_file(source: Path, destination: Path, mode: int) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with source.open("rb") as input_stream, os.fdopen(fd, "wb") as output_stream:
+            fd = -1
+            shutil.copyfileobj(input_stream, output_stream)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(destination.parent)
+
+
+def _write_disposable_validation_bytes(
+    destination: Path, content: bytes, mode: int
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(destination.parent)
+
+
+def _fsync_disposable_validation_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    _fsync_directory(path.parent)
+
+
+def _disposable_launchd_validation_plist(
+    *, label: str, target_binary: Path, database: Path, port: int
+) -> bytes:
+    return plistlib.dumps(
+        {
+            "Label": label,
+            "ProgramArguments": [str(target_binary)],
+            "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
+            "KeepAlive": True,
+            "Sockets": {
+                "Listeners": {"SockServiceName": str(port), "SockType": "stream"}
+            },
+        },
+        fmt=plistlib.FMT_XML,
+    )
+
+
+def _create_disposable_source114_database(
+    database: Path, target_ledger: tuple[tuple[int, str], ...]
+) -> tuple[tuple[int, str], ...]:
+    import sqlite3
+
+    source_ledger = tuple(item for item in target_ledger if item[0] <= 114)
+    if not source_ledger or source_ledger[-1][0] != 114:
+        raise SystemExit("exact candidate registry lacks the source114 baseline")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO _migrations (version, name) VALUES (?, ?)", source_ledger
+        )
+        connection.executescript(
+            """
+            CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                product_conversation_id TEXT
+                    REFERENCES product_conversations(id) ON DELETE CASCADE
+            );
+            CREATE TABLE product_conversation_sources (
+                target_product_conversation_id TEXT PRIMARY KEY
+                    REFERENCES product_conversations(id) ON DELETE CASCADE,
+                source_product_conversation_id TEXT NOT NULL,
+                source_conversation_id TEXT NOT NULL,
+                relation_kind TEXT NOT NULL,
+                relation_key TEXT NOT NULL,
+                created_at_us INTEGER NOT NULL
+            );
+            """
+        )
+    database.chmod(0o600)
+    _fsync_disposable_validation_file(database)
+    return source_ledger
+
+
+def _disposable_validation_tree_witness(
+    root: Path,
+) -> tuple[tuple[str, str, int, int, int], ...]:
+    witness = []
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item))]:
+        relative = str(path.relative_to(root))
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            content = f"symlink:{os.readlink(path)}"
+        elif stat.S_ISREG(metadata.st_mode):
+            content = f"file:{_file_sha256(path)}"
+        elif stat.S_ISDIR(metadata.st_mode):
+            content = "directory"
+        else:
+            content = f"other:{stat.S_IFMT(metadata.st_mode)}"
+        witness.append(
+            (
+                relative,
+                content,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+        )
+    return tuple(witness)
+
+
+def prepare_disposable_launchd_validation(
+    inputs: DisposableLaunchdValidationInputs,
+) -> DisposableLaunchdValidationReceipt:
+    """Stage and validate one exact prepared handoff without activation authority."""
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if dirty:
+        raise SystemExit("disposable validation requires a clean controller source tree")
+    controller_source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", controller_source_commit) is None
+        or controller_source_commit == PREPARED_SOURCE114_COMMIT
+    ):
+        raise SystemExit("disposable validation requires an independent controller commit")
+    root = Path(tempfile.mkdtemp(prefix="phoenix-launchd-validation-"))
+    try:
+        root = root.resolve()
+        root.chmod(0o700)
+        return _prepare_disposable_launchd_validation(inputs, root, controller_source_commit)
+    except BaseException:
+        shutil.rmtree(root)
+        raise
+
+
+def _prepare_disposable_launchd_validation(
+    inputs: DisposableLaunchdValidationInputs,
+    root: Path,
+    controller_source_commit: str,
+) -> DisposableLaunchdValidationReceipt:
+    import runpy
+
+    target = _macos_prepared_target()
+    bundle_names = _prepared_artifact_bundle_names(target)
+    expected_names = set(bundle_names.values())
+    source = inputs.prepared_artifact
+    if not stat.S_ISDIR(source.lstat().st_mode):
+        raise SystemExit("prepared artifact must be a real directory")
+    entries = {entry.name: entry for entry in source.iterdir()}
+    if entries.keys() != expected_names:
+        raise SystemExit("disposable prepared artifact does not match the exact retained bundle")
+    if any(not stat.S_ISREG(entry.lstat().st_mode) for entry in entries.values()):
+        raise SystemExit("disposable prepared artifact entries must be regular non-symlink files")
+
+    checksum_entries: dict[str, str] = {}
+    for line in entries[bundle_names["checksums"]].read_text().splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            raise SystemExit("prepared artifact checksum manifest is malformed")
+        digest, name = fields[0].lower(), fields[1].lstrip("*")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or name in checksum_entries:
+            raise SystemExit("prepared artifact checksum manifest is malformed")
+        checksum_entries[name] = digest
+    payload_names = {bundle_names["standalone"], bundle_names["archive"]}
+    if checksum_entries.keys() != payload_names:
+        raise SystemExit("prepared artifact checksum manifest has the wrong payload set")
+    try:
+        receipt = json.loads(entries[bundle_names["receipt"]].read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("prepared artifact receipt is unreadable") from exc
+    if not isinstance(receipt, dict) or receipt.get("sha256") != checksum_entries:
+        raise SystemExit("prepared artifact receipt and checksum manifest disagree")
+    for name, digest in checksum_entries.items():
+        if _file_sha256(entries[name]) != digest:
+            raise SystemExit(f"prepared artifact payload checksum mismatch: {name}")
+
+    staged_artifact = root / "prepared-artifact"
+    staged_artifact.mkdir(mode=0o700)
+    for name in (bundle_names["receipt"], bundle_names["standalone"]):
+        _stage_disposable_validation_file(entries[name], staged_artifact / name, 0o600)
+    prepared = _prepare_prepared_artifact(staged_artifact, PREPARED_SOURCE114_COMMIT)
+    token = hashlib.sha256(f"{root}:{controller_source_commit}".encode()).hexdigest()[:20]
+    transaction_id = f"validation-{token}"
+    transactions = root / "transactions"
+    transactions.mkdir(mode=0o700)
+    transaction = transactions / transaction_id
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "candidate-phoenix-ide"
+    rollback = transaction / "rollback-phoenix-ide"
+    candidate_plist = transaction / "candidate.plist"
+    rollback_plist = transaction / "rollback.plist"
+    target_binary = root / "target" / "phoenix-ide"
+    target_plist = root / "target" / "phoenix.plist"
+    helper = transaction / "activate.py"
+    registry = transaction / "migrations.rs"
+    database = transaction / "application.sqlite3"
+    manifest_path = transaction / "manifest.json"
+    _stage_disposable_validation_file(prepared.binary, candidate, 0o755)
+    rollback_identity = RuntimeIdentity(version="0.0.0", git_sha="a" * 40)
+    _write_disposable_validation_bytes(
+        rollback, b"disposable rollback witness; never executable\n", 0o600
+    )
+    label = f"test.disposable.phoenix.validation.{token}"
+    first_port = 40_000 + int(token[:4], 16) % 10_000
+    _write_disposable_validation_bytes(
+        candidate_plist,
+        _disposable_launchd_validation_plist(
+            label=label, target_binary=target_binary, database=database, port=first_port
+        ),
+        0o600,
+    )
+    _write_disposable_validation_bytes(
+        rollback_plist,
+        _disposable_launchd_validation_plist(
+            label=label, target_binary=target_binary, database=database, port=first_port + 1
+        ),
+        0o600,
+    )
+    _materialize_helper(controller_source_commit, helper, "local_head")
+    _materialize_source_file(
+        PREPARED_SOURCE114_COMMIT,
+        "crates/phoenix-db/src/migrations.rs",
+        registry,
+        "local_head",
+    )
+    registry.chmod(0o600)
+    _fsync_disposable_validation_file(helper)
+    _fsync_disposable_validation_file(registry)
+    if _file_sha256(registry) != PREPARED_SOURCE114_REGISTRY_SHA256:
+        raise SystemExit(
+            "disposable candidate registry differs from exact source114 evidence"
+        )
+    helper_protocol = subprocess.run(
+        [sys.executable, str(helper), "--protocol-version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if helper_protocol != str(LAUNCHD_HANDOFF_PROTOCOL_VERSION):
+        raise SystemExit("disposable retained helper protocol is unsupported")
+    policy = runpy.run_path(str(helper))
+    target_ledger = policy["migration_registry"](registry)
+    source_ledger = _create_disposable_source114_database(database, target_ledger)
+    helper_label = f"com.phoenix-ide.deploy.{transaction_id}"
+    upgrade = {
+        "database_path": str(database),
+        "backup_path": str(transaction / "database-backup.sqlite3"),
+        "proof_path": str(transaction / "database-proof.json"),
+        "controller_source_commit": controller_source_commit,
+        "controller_helper_path": str(helper),
+        "controller_helper_sha256": _file_sha256(helper),
+        "migration_registry_path": str(registry),
+        "migration_registry_sha256": _file_sha256(registry),
+        "prepared_source_baseline": 114,
+        "candidate_registry_expected_sha256": PREPARED_SOURCE114_REGISTRY_SHA256,
+    }
+    manifest = {
+        "manifest_version": LAUNCHD_HANDOFF_PROTOCOL_VERSION,
+        "transaction_id": transaction_id,
+        "source_kind": prepared.source_kind.value,
+        "source_commit": prepared.source_commit,
+        "release_tag": prepared.release_tag,
+        "release_commit": prepared.release_commit,
+        "expected": dataclasses.asdict(prepared.identity),
+        "previous": dataclasses.asdict(rollback_identity),
+        "previous_deployed_sha": rollback_identity.git_sha,
+        "candidate_binary": str(candidate),
+        "candidate_binary_sha256": _file_sha256(candidate),
+        "candidate_plist": str(candidate_plist),
+        "candidate_plist_sha256": _file_sha256(candidate_plist),
+        "rollback_binary": str(rollback),
+        "rollback_binary_sha256": _file_sha256(rollback),
+        "rollback_plist": str(rollback_plist),
+        "rollback_plist_sha256": _file_sha256(rollback_plist),
+        "target_binary": str(target_binary),
+        "target_plist": str(target_plist),
+        "label": label,
+        "helper_label": helper_label,
+        "uid": os.getuid(),
+        "health_url": f"http://127.0.0.1:{first_port}/api/version",
+        "health_insecure_tls": False,
+        "previous_health_url": f"http://127.0.0.1:{first_port + 1}/api/version",
+        "previous_health_insecure_tls": False,
+        "previous_health_json": True,
+        "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
+        "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
+        "active_path": str(root / "evidence" / "active"),
+        "status_path": str(root / "evidence" / "status.json"),
+        "deployed_sha_path": str(root / "evidence" / "deployed.sha"),
+        "lock_path": str(root / "evidence" / "deploy.lock"),
+        "claim_lock_path": str(root / "evidence" / "claim.lock"),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "current_schema_upgrade": upgrade,
+    }
+    _write_json_atomic(manifest_path, manifest)
+    if _deploy_manifest_kind(transaction) is not DeployManifestKind.CURRENT_SCHEMA:
+        raise SystemExit(
+            "disposable manifest was not classified as exact current-schema evidence"
+        )
+    tree_before_validation = _disposable_validation_tree_witness(root)
+    loaded = policy["Manifest"].load(manifest_path)
+    validated = policy["validate_pre_disruption_handoff"](loaded)
+    if _disposable_validation_tree_witness(root) != tree_before_validation:
+        raise SystemExit("disposable helper validation mutated retained evidence")
+    if (
+        validated.candidate_binary != candidate
+        or validated.candidate_plist != candidate_plist
+        or validated.rollback != (rollback, rollback_plist)
+    ):
+        raise SystemExit("disposable helper validation returned mismatched evidence")
+    return DisposableLaunchdValidationReceipt(
+        transaction_id=transaction_id,
+        root=root,
+        transaction_path=transaction,
+        manifest_path=manifest_path,
+        candidate_identity=prepared.identity,
+        rollback_identity=rollback_identity,
+        controller_source_commit=controller_source_commit,
+        controller_helper_sha256=_file_sha256(helper),
+        candidate_registry_sha256=_file_sha256(registry),
+        database_ledger=source_ledger,
     )
 
 

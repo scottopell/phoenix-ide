@@ -1,0 +1,39 @@
+[package]
+name = "phoenix-deployment-controller"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Standalone Phoenix deployment orchestration and durable controller state"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "phoenix-deployment-controller"
+path = "src/main.rs"
+
+[[bin]]
+name = "phoenix-deployment-guardian"
+path = "src/bin/phoenix-deployment-guardian.rs"
+
+[[bin]]
+name = "phoenix-deployment-runner"
+path = "src/bin/phoenix-deployment-runner.rs"
+
+[dependencies]
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+sha2 = "0.10"

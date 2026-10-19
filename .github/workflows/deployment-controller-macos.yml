@@ -1,0 +1,277 @@
+name: Deployment controller macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      validate_prepared_source114:
+        description: "Owner-authorized exact PreparedSource114 validation"
+        required: true
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - "crates/phoenix-deployment-controller/**"
+      - "specs/standalone-deployment-controller/**"
+      - "specs/adrs/README.md"
+      - "specs/adrs/125_qualify-exact-prepared-source114-candidate.md"
+      - "specs/adrs/133_standalone-controller-owns-durability-and-supervision.md"
+      - "specs/adrs/134_controller-loss-detaches-and-fences-surviving-guardian.md"
+      - "specs/adrs/135_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md"
+      - "specs/adrs/136_retained-native-results-use-application-only-recovery.md"
+      - "specs/adrs/137_owned-root-child-enumeration-is-distinct-native-authority.md"
+      - "specs/adrs/138_exact-root-identity-observation-is-distinct-native-authority.md"
+      - "specs/adrs/139_retained-exact-root-identity-results-use-application-only-recovery.md"
+      - "specs/adrs/140_already-durable-native-sampling-failures-use-explicit-custody-settlement.md"
+      - "specs/adrs/141_disposable-launchd-validation-precedes-installer-adoption.md"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/integration/launchd_validation_harness.py"
+      - "tests/integration/README-launchd-validation.md"
+      - ".github/artifacts/prepared-source114-aarch64.json"
+      - ".github/workflows/deployment-controller-macos.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - "crates/phoenix-deployment-controller/**"
+      - "specs/standalone-deployment-controller/**"
+      - "specs/adrs/README.md"
+      - "specs/adrs/125_qualify-exact-prepared-source114-candidate.md"
+      - "specs/adrs/133_standalone-controller-owns-durability-and-supervision.md"
+      - "specs/adrs/134_controller-loss-detaches-and-fences-surviving-guardian.md"
+      - "specs/adrs/135_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md"
+      - "specs/adrs/136_retained-native-results-use-application-only-recovery.md"
+      - "specs/adrs/137_owned-root-child-enumeration-is-distinct-native-authority.md"
+      - "specs/adrs/138_exact-root-identity-observation-is-distinct-native-authority.md"
+      - "specs/adrs/139_retained-exact-root-identity-results-use-application-only-recovery.md"
+      - "specs/adrs/140_already-durable-native-sampling-failures-use-explicit-custody-settlement.md"
+      - "specs/adrs/141_disposable-launchd-validation-precedes-installer-adoption.md"
+      - "dev.py"
+      - "scripts/launchd_deploy_helper.py"
+      - "tests/integration/launchd_validation_harness.py"
+      - "tests/integration/README-launchd-validation.md"
+      - ".github/artifacts/prepared-source114-aarch64.json"
+      - ".github/workflows/deployment-controller-macos.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+concurrency:
+  group: deployment-controller-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-controller:
+    name: native controller (macOS)
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Verify ARM64 runner
+        run: test "$(uname -m)" = arm64
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify exact checked-out head
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Set up isolated validation Python
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download exact prepared Source114 artifact by ID
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+          PHOENIX_PREPARED_ARTIFACT_ROOT: ${{ runner.temp }}/prepared-source114
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import subprocess
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          manifest = json.loads(
+              Path(".github/artifacts/prepared-source114-aarch64.json").read_text()
+          )
+          assert manifest["schema_version"] == 1
+          assert manifest["record_kind"] == "prepared_source114_actions_artifact_provenance"
+          repository = manifest["repository"]
+          expected = manifest["artifact"]
+          producer = manifest["producer"]
+          candidate = manifest["candidate"]
+          assert repository["full_name"] == os.environ["EXPECTED_REPOSITORY"]
+          assert repository["id"] == int(os.environ["EXPECTED_REPOSITORY_ID"])
+          assert type(expected["id"]) is int and expected["id"] > 0
+          assert type(producer["workflow_run_id"]) is int
+          assert type(producer["qualified_job"]["id"]) is int
+          assert re.fullmatch(r"[0-9a-f]{40}", candidate["source_commit"])
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", expected["api_digest"])
+
+          def api_json(endpoint: str) -> dict:
+              result = subprocess.run(
+                  ["gh", "api", endpoint], check=True, stdout=subprocess.PIPE
+              )
+              value = json.loads(result.stdout)
+              assert isinstance(value, dict)
+              return value
+
+          prefix = f"repos/{repository['full_name']}/actions"
+          artifact = api_json(f"{prefix}/artifacts/{expected['id']}")
+          run = api_json(f"{prefix}/runs/{producer['workflow_run_id']}")
+          job = api_json(f"{prefix}/jobs/{producer['qualified_job']['id']}")
+          job_log = subprocess.run(
+              [
+                  "gh",
+                  "api",
+                  "--allow-escape-sequences",
+                  f"{prefix}/jobs/{producer['qualified_job']['id']}/logs",
+              ],
+              check=True,
+              stdout=subprocess.PIPE,
+          ).stdout
+          workflow_source = subprocess.run(
+              [
+                  "git",
+                  "show",
+                  f"{producer['workflow_commit']}:{producer['workflow_file']}",
+              ],
+              check=True,
+              stdout=subprocess.PIPE,
+          ).stdout
+          assert artifact["id"] == expected["id"]
+          assert artifact["name"] == expected["name"]
+          assert artifact["size_in_bytes"] == expected["size_in_bytes"]
+          assert artifact["digest"] == expected["api_digest"]
+          assert artifact["expires_at"] == expected["expires_at"]
+          assert artifact["created_at"] == expected["created_at"]
+          assert artifact["expired"] is False
+          expires = datetime.datetime.fromisoformat(expected["expires_at"].replace("Z", "+00:00"))
+          assert expires > datetime.datetime.now(datetime.timezone.utc)
+          assert artifact["workflow_run"]["id"] == producer["workflow_run_id"]
+          assert artifact["workflow_run"]["head_sha"] == candidate["source_commit"]
+          assert artifact["workflow_run"]["repository_id"] == repository["id"]
+          assert run["id"] == producer["workflow_run_id"]
+          assert run["repository"]["id"] == repository["id"]
+          assert run["repository"]["full_name"] == repository["full_name"]
+          assert run["path"] == producer["workflow_file"]
+          assert run["head_sha"] == producer["workflow_commit"] == candidate["source_commit"]
+          assert run["event"] == producer["workflow_run_event"]
+          assert run["head_branch"] == producer["workflow_run_branch"]
+          assert run["display_title"] == producer["workflow_run_display_title"]
+          assert run["run_attempt"] == producer["workflow_run_attempt"]
+          assert run["status"] == "completed"
+          assert run["conclusion"] == producer["workflow_run_conclusion"]
+          assert job["id"] == producer["qualified_job"]["id"]
+          assert job["run_id"] == producer["workflow_run_id"]
+          assert job["run_attempt"] == producer["workflow_run_attempt"]
+          assert job["head_sha"] == candidate["source_commit"]
+          assert job["name"] == producer["qualified_job"]["name"]
+          assert job["conclusion"] == producer["qualified_job"]["conclusion"] == "success"
+          assert producer["operation"] == "prepare-main"
+          assert producer["inputs"] == {"operation": "prepare-main"}
+          assert producer["operation_log_marker"].encode() in job_log
+          assert (
+              hashlib.sha256(workflow_source).hexdigest()
+              == producer["workflow_file_sha256"]
+          )
+
+          archive = Path("${{ runner.temp }}/prepared-source114.zip")
+          with archive.open("wb") as output:
+              subprocess.run(
+                  ["gh", "api", f"{prefix}/artifacts/{expected['id']}/zip"],
+                  check=True,
+                  stdout=output,
+              )
+          archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          assert f"sha256:{archive_digest}" == expected["api_digest"]
+          root = Path(os.environ["PHOENIX_PREPARED_ARTIFACT_ROOT"])
+          root.mkdir(mode=0o700)
+          expected_files = {item["name"]: item for item in manifest["bundle"]["files"]}
+          with zipfile.ZipFile(archive) as bundle:
+              entries = bundle.infolist()
+              assert len(entries) == len(expected_files)
+              assert {entry.filename for entry in entries} == expected_files.keys()
+              for entry in entries:
+                  path = PurePosixPath(entry.filename)
+                  mode = entry.external_attr >> 16
+                  assert not path.is_absolute() and ".." not in path.parts
+                  assert len(path.parts) == 1 and not entry.is_dir()
+                  assert not stat.S_ISLNK(mode)
+                  destination = root / entry.filename
+                  with bundle.open(entry) as source, destination.open("xb") as output:
+                      while chunk := source.read(1024 * 1024):
+                          output.write(chunk)
+
+          observed = {}
+          for name in sorted(expected_files):
+              digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              observed[name] = digest
+              print(f"prepared-source114-file-sha256 name={name} sha256={digest}")
+          errors = []
+          for name, item in expected_files.items():
+              recorded = item["sha256"]
+              if not isinstance(recorded, str) or re.fullmatch(r"[0-9a-f]{64}", recorded) is None:
+                  errors.append(f"manifest has no sealed SHA-256 for {name}")
+              elif observed[name] != recorded:
+                  errors.append(f"SHA-256 mismatch for {name}")
+          if errors:
+              raise SystemExit("; ".join(errors))
+          PY
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+          shared-key: deployment-controller-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Validate ready controller handoff with exact PreparedSource114
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        env:
+          PHOENIX_PREPARED_ARTIFACT_ROOT: ${{ runner.temp }}/prepared-source114
+        run: |
+          cargo test \
+            -p phoenix-deployment-controller \
+            --test native_launchd_process \
+            installed_ready_controller_validates_prepared_source114_handoff_without_effects \
+            -- \
+            --ignored \
+            --exact \
+            --nocapture \
+            --test-threads=1
+      - name: Remove retrieved PreparedSource114 bytes
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.validate_prepared_source114
+        run: |
+          rm -rf -- \
+            "${{ runner.temp }}/prepared-source114" \
+            "${{ runner.temp }}/prepared-source114.zip"
+      - name: Run deployment controller tests serially
+        run: cargo nextest run -p phoenix-deployment-controller --test-threads 1
+      - name: Lint deployment controller
+        run: cargo clippy -p phoenix-deployment-controller --all-targets -- -D warnings
+      - name: Check workspace formatting
+        run: cargo fmt --all -- --check
