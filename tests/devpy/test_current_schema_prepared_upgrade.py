@@ -77,14 +77,16 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         )
         self.assertIsNotNone(registry_match)
         entries = registry_match.group(2)
-        historical_entries, removed = re.subn(
-            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
-            "",
+        suffix_boundaries = list(re.finditer(
+            rf"^    Migration\s*\{{\s*version:\s*{QUALIFIED_TARGET + 1},",
             entries,
-            count=1,
-            flags=re.DOTALL,
+            flags=re.MULTILINE,
+        ))
+        self.assertEqual(
+            len(suffix_boundaries), 1,
+            "historical registry fixture requires exactly one successor boundary",
         )
-        self.assertEqual(removed, 1, "historical registry fixture requires migration 129")
+        historical_entries = entries[:suffix_boundaries[0].start()]
         self.registry = self.root / "qualified-128-migrations.rs"
         self.registry.write_text(
             source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
