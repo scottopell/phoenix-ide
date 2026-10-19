@@ -99,6 +99,16 @@ AND SHALL NOT abandon an initialization future that may own an unregistered Chro
 
 **Rationale:** Idle expiry preserves active work. Explicit shutdown releases resources promptly while retaining ownership across initialization and cancellation.
 
+### REQ-BCLI-006a: Initialization Ownership and CLI Profile Lifetimes
+
+**While** a browser launch is reserved, initializing, partially initialized, or unresolved, the manager shall retain one typed launch slot under the same resource scope, actor authority, and retirement identity before invoking a potentially spawning operation. Caller cancellation shall not release that slot or cancel its owned initialization driver.
+
+**If** partial initialization or cleanup fails after a browser handle is returned, **then** the slot shall retain the actual browser child, handler, process-group authority when adopted, profile path, and marker state. A subsequent close shall retry the same retained authority; another launch shall remain prohibited until authoritative stop and required profile cleanup succeed. Unadopted handles shall not manufacture group authority from a PID or old marker.
+
+**If** the launch operation fails or times out without returning recoverable child authority, **then** the slot shall remain an unobservable-attempt barrier. Absence of a handle shall not establish process absence, authorize deletion, release retirement, or permit fallback spawning. A failure established before any potentially spawning call may retire without deleting an untrusted or pre-existing profile.
+
+The standalone CLI shall select an explicit transient-profile policy: each genuinely fresh or authoritatively retired browser lifetime receives a new profile path, and cleanup uses that actual path. Neither retained-owned nor unobservable barriers may be bypassed by selecting another path. This exception does not change IDE scope-derived profile paths, shared continuation ownership, or the prohibition on adopting or deleting untrusted profiles.
+
 ### REQ-BCLI-007: Actionable Navigation Result
 
 WHEN `open` successfully navigates

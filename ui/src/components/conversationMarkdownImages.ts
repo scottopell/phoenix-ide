@@ -35,6 +35,10 @@ function conversationMarkdownUrlTransform(url: string, key: string): string | nu
   )) {
     return trimmed;
   }
+  if (key === 'href') {
+    const conversation = /^@conv:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(trimmed);
+    if (conversation) return `/c/${conversation[1]}`;
+  }
   return defaultUrlTransform(url);
 }
 

@@ -1,0 +1,4 @@
+.conversation-nav-item.boundary {
+  border-inline-start: 2px solid var(--text-muted, #888);
+  font-size: 0.85em;
+}

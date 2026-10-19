@@ -186,7 +186,7 @@ pub(crate) fn event_messages(event: &crate::runtime::SseEvent) -> Vec<&Message> 
                 .chain(pending_events.iter().flat_map(event_messages))
                 .collect()
         }
-        SseEvent::Message { message } => vec![message],
+        SseEvent::Message { message, .. } => vec![message],
         SseEvent::MessageUpdated { .. }
         | SseEvent::StateChange { .. }
         | SseEvent::Token { .. }

@@ -130,6 +130,56 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
         builtin = (ROOT / "crates/phoenix-skills/src/builtin.rs").read_text()
         self.assertNotIn('assert!(reference.contains("Current APIs do not provide"))', builtin)
 
+    def test_literal_recipe_uses_existing_chat_and_five_known_receiver_steps(self):
+        recipe = self.reference.split("## Public literal chat with a known receiver\n", 1)[1].split(
+            "## Respond to a pending structured question", 1
+        )[0]
+        self.assertEqual(re.findall(r"^(\d)\. ", recipe, re.M), ["1", "2", "3", "4", "5"])
+        self.assertIn('"/api/conversations/:id/chat",', self.handlers)
+        self.assertIn("post(send_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES))", self.handlers)
+        self.assertIn("POST /api/conversations/{original_transcript_id}/chat", recipe)
+        body = json.loads(re.search(r"```json\s+(.*?)\s+```", recipe, re.S).group(1))
+        self.assertEqual(body["expansion_policy"], "literal_text")
+        self.assertEqual(set(body), {"text", "message_id", "expansion_policy", "images", "files", "user_agent"})
+        self.assertEqual(body["images"], [])
+        self.assertEqual(body["files"], [])
+        for text in ("full `git_sha`", "immutable commit independently verified", "source-inspected, accepted descendant",
+                     "stop before POST", "no redirects", "same original destination/transcript",
+                     "not itself proof of owner authentication", "each exact retry", "harmless `literal steering smoke test`",
+                     "materialized text bytes", "Smoke HTTP success alone does not prove policy support"):
+            self.assertIn(text, recipe)
+        self.assertLess(recipe.index("GET /api/version"), recipe.index("literal steering smoke test"))
+        self.assertLess(recipe.index("literal steering smoke test"), recipe.index("4. Recheck"))
+        for identity_rule in ("{original_transcript_id}:{client_message_id}", "Retain the original raw UUID for retries",
+                              "omitted `steering` means false", "drained steering messages retain the raw"):
+            self.assertIn(identity_rule, recipe)
+        self.assertNotRegex(recipe, r"[0-9a-f]{40}")
+
+    def test_literal_policy_stays_closed_and_needs_no_extra_endpoint_or_version_field(self):
+        self.assertNotIn("async fn send_literal_chat(", self.handlers)
+        self.assertNotIn("/chat/literal", self.handlers)
+        self.assertNotIn("chat_literal_text_v1", self.handlers)
+        self.assertNotIn("chat_literal_text_v1", (ROOT / "ui/src/api.ts").read_text())
+        types = (ROOT / "crates/phoenix-ide/src/api/types.rs").read_text()
+        policy = types.split("pub enum ChatExpansionPolicy {", 1)[1].split("}", 1)[0]
+        self.assertEqual(re.findall(r"^\s+(\w+),$", policy, re.M), ["ExpandReferences", "LiteralText"])
+        self.assertIn("#[default]\n    ExpandReferences", policy)
+        service = (ROOT / "crates/phoenix-ide/src/send_chat_service.rs").read_text()
+        replay = service.split("async fn lookup_durable_steering_replay(", 1)[1].split(
+            "async fn lookup_persisted_message_replay(", 1
+        )[0]
+        self.assertIn("} else if req.expansion_policy != MessageExpansionPolicy::ExpandReferences {", replay)
+        self.assertIn("Err(SendChatServiceError::IdempotencyConflict)", replay)
+        for path in ("specs/api/requirements.md", "specs/builtin-skills/builtin-skills.allium"):
+            text = (ROOT / path).read_text()
+            self.assertIn("git_sha", text)
+            self.assertIn("literal steering smoke test", text)
+            self.assertNotIn("/chat/literal", text)
+            self.assertNotIn("chat_literal_text_v1", text)
+        compatibility = (ROOT / "specs/compatibility/requirements.md").read_text()
+        self.assertNotIn("/chat/literal", compatibility)
+        self.assertNotIn("chat_literal_text_v1", compatibility)
+
     def test_non_exhaustive_policy_keeps_public_contract_and_scope_boundaries(self):
         skill = (REFERENCE.parent.parent / "SKILL.md").read_text()
         prompt = (ROOT / "crates/phoenix-ide/src/system_prompt.rs").read_text().split(

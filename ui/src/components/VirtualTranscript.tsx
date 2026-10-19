@@ -41,6 +41,8 @@ export interface VirtualTranscriptAnchor {
   offset: number;
 }
 
+type PhysicalAnchor = VirtualTranscriptAnchor & { intent: 'directional_start' | 'continuity' };
+
 export type VirtualTranscriptTarget = string | ((row: HTMLElement) => Range | null);
 
 function resolveTarget(row: HTMLElement | undefined, target: VirtualTranscriptTarget | undefined): Element | Range | null {
@@ -54,7 +56,19 @@ export interface VirtualTranscriptHandle {
     align: 'start' | 'end',
     viewportStartOffset?: number,
     targetSelector?: VirtualTranscriptTarget,
+    startPolicy?: 'directional' | 'continuity',
   ): void;
+  scrollToOwnedIndex(
+    commandKey: string,
+    index: number,
+    align: 'start' | 'end',
+    viewportStartOffset?: number,
+    targetSelector?: VirtualTranscriptTarget,
+    startPolicy?: 'directional' | 'continuity',
+  ): void;
+  completePosition(commandKey: string): void;
+  interruptPosition(): void;
+  cancelPosition(commandKey: string): void;
   scrollToTail(): void;
   scrollBy(delta: number): void;
   /** Grant or withdraw tail-following. The scroll policy owns this intent;
@@ -72,10 +86,19 @@ export interface VirtualTranscriptHandle {
   physicalSnapshot(targetIndex?: number, targetSelector?: string): VirtualTranscriptPhysicalSnapshot;
 }
 
+export type VirtualTranscriptPositioningAuthority =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'command'; readonly commandKey: string };
+
+const NO_POSITIONING_AUTHORITY: VirtualTranscriptPositioningAuthority = { kind: 'absent' };
+
 export interface VirtualTranscriptProps<T> {
   items: readonly T[];
   getKey: (item: T, index: number) => string;
   renderItem: (item: T, index: number) => ReactNode;
+  /** Omission denies owned writes; generic scroll operations remain unowned. */
+  readonly positioningAuthority?: VirtualTranscriptPositioningAuthority;
+  positioningViewKey?: string;
   header?: ReactNode;
   empty?: ReactNode;
   overscan?: number;
@@ -92,6 +115,10 @@ export interface VirtualTranscriptProps<T> {
   onPinnedChange?: (pinned: boolean) => void;
 }
 
+type PositionOwner = { kind: 'unowned' }
+  | { kind: 'command'; commandKey: string }
+  | { kind: 'settled'; commandKey: string; viewKey: string | null };
+
 interface PhysicalStore<T> {
   items: readonly T[];
   keys: string[];
@@ -104,19 +131,23 @@ interface PhysicalStore<T> {
   viewportTop: number;
   viewportExtent: number;
   overscan: number;
-  activeAnchor: VirtualTranscriptAnchor | null;
+  revealPublicationPending: boolean;
+  activeAnchor: PhysicalAnchor | null;
   scroller: HTMLDivElement | null;
   headerElement: HTMLDivElement | null;
   rowElements: Map<string, HTMLDivElement>;
   resizeObserver: ResizeObserver | null;
   initialTailPending: boolean;
   preservedViewport: { top: number; firstKey: string | null } | null;
+  positionOwner: PositionOwner;
+  positioningAuthority: VirtualTranscriptPositioningAuthority;
+  positioningViewKey: string | null;
   pendingTarget: {
-    index: number;
     key: string;
     align: 'start' | 'end';
     viewportStartOffset: number;
-    selector: VirtualTranscriptTarget;
+    startPolicy: 'directional' | 'continuity';
+    selector: VirtualTranscriptTarget | undefined;
   } | null;
   pinned: boolean;
   revision: number;
@@ -176,16 +207,28 @@ function tailFollows<T>(store: PhysicalStore<T>): boolean {
 }
 
 /** Null selects tail-following; an anchor preserves the current position. */
-function anchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+function anchorForChange<T>(store: PhysicalStore<T>): PhysicalAnchor | null {
   return tailFollows(store) ? null : (store.activeAnchor ?? captureTopAnchor(store));
 }
 
-function topAnchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
-  return tailFollows(store) ? null : captureTopAnchor(store);
+function topAnchorForChange<T>(store: PhysicalStore<T>): PhysicalAnchor | null {
+  if (tailFollows(store)) return null;
+  const captured = captureTopAnchor(store);
+  const active = store.activeAnchor;
+  return captured && active?.intent === 'directional_start' && active.key === captured.key
+    ? { ...captured, intent: 'directional_start' }
+    : captured;
 }
 
 function clampNonNegative(value: number): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function isLayoutHidden(element: Element | null): boolean {
+  for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+    if (getComputedStyle(ancestor).display === 'none') return true;
+  }
+  return false;
 }
 
 function viewportExtentForScroller(scroller: HTMLElement, measuredExtent = scroller.clientHeight): number {
@@ -216,7 +259,9 @@ function buildPhysicalSnapshot<T>(
   targetIndex?: number,
   targetSelector?: string,
 ): VirtualTranscriptPhysicalSnapshot {
-  const visibleRange = computeVisibleRange(store);
+  const hidden = isLayoutHidden(store.scroller);
+  if (hidden) store.revealPublicationPending = true;
+  const visibleRange = hidden ? null : computeVisibleRange(store);
   const baseSnapshot = {
     renderedRange: normalizeRange(store.range),
     visibleRange: normalizeRange(visibleRange),
@@ -239,8 +284,8 @@ function buildPhysicalSnapshot<T>(
   return {
     ...baseSnapshot,
     targetIndex,
-    targetOffset: offset === undefined ? null : offset - settledViewportTop(store),
-    targetMeasured: store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
+    targetOffset: hidden || offset === undefined ? null : offset - settledViewportTop(store),
+    targetMeasured: !hidden && store.pendingTarget?.key !== key && store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
   };
 }
 
@@ -249,9 +294,21 @@ function synchronizedPhysicalSnapshot<T>(
   targetIndex?: number,
   targetSelector?: string,
 ): VirtualTranscriptPhysicalSnapshot {
-  store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
-  store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
-  recompute(store);
+  retireUnauthorizedPosition(store);
+  if (!isLayoutHidden(store.scroller)) {
+    store.viewportExtent = store.scroller ? viewportExtentForScroller(store.scroller) : store.viewportExtent;
+    if (store.revealPublicationPending) {
+      const anchor = anchorForChange(store);
+      const wasPinned = store.pinned;
+      if (measureMountedExtents(store)) applyPhysicalChange(store, anchor, wasPinned);
+    }
+    resolvePendingTarget(store);
+    if (store.revealPublicationPending && store.pendingScrollTop !== null) {
+      setScrollerScrollTop(store, store.pendingScrollTop);
+    }
+    store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
+    recompute(store);
+  }
   return buildPhysicalSnapshot(store, targetIndex, targetSelector);
 }
 
@@ -351,7 +408,8 @@ function computeRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
   });
 }
 
-function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void {
+function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): boolean {
+  if (retireUnauthorizedPosition(store)) return false;
   const scroller = store.scroller;
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
   const scrollTop = Math.max(0, Math.min(nextTop, maxScrollTop));
@@ -359,12 +417,112 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   // Placing the viewport somewhere absolute retires that position, so the
   // correction goes with it — applied afterwards it would displace the
   // caller's chosen position by the drift (REQ-VT-004).
-  store.pendingScrollTop = null;
   store.viewportTop = scrollTop;
+  if (isLayoutHidden(scroller)) {
+    store.pendingScrollTop = scrollTop;
+    store.revealPublicationPending = true;
+    return false;
+  }
+  store.pendingScrollTop = null;
   if (scroller && scroller.scrollTop !== scrollTop) {
     store.pendingProgrammaticTop = scrollTop;
     scroller.scrollTop = scrollTop;
+    return true;
   }
+  return false;
+}
+
+function retirePosition<T>(current: PhysicalStore<T>): void {
+  current.positionOwner = { kind: 'unowned' };
+  current.pendingTarget = null;
+  current.pendingScrollTop = null;
+  current.pendingProgrammaticTop = null;
+}
+
+function positionIsAuthorized<T>(store: PhysicalStore<T>, owner: PositionOwner = store.positionOwner): boolean {
+  return owner.kind === 'unowned'
+    || (owner.kind === 'settled' && owner.viewKey === store.positioningViewKey && store.positioningAuthority.kind === 'absent')
+    || (store.positioningAuthority.kind === 'command' && store.positioningAuthority.commandKey === owner.commandKey
+      && (owner.kind !== 'settled' || owner.viewKey === store.positioningViewKey));
+}
+
+function retireUnauthorizedPosition<T>(store: PhysicalStore<T>): boolean {
+  if (positionIsAuthorized(store)) return false;
+  retirePosition(store);
+  store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
+  store.activeAnchor = captureTopAnchor(store);
+  recompute(store);
+  return true;
+}
+
+function applyAlignedPosition<T>(
+  current: PhysicalStore<T>, index: number, key: string, physicalOffset: number,
+  target: number, align: 'start' | 'end', startPolicy: 'directional' | 'continuity',
+): void {
+  const intent = align === 'start' && startPolicy === 'directional' ? 'directional_start' : 'continuity';
+  current.activeAnchor = { index, key, offset: physicalOffset - target, intent };
+  let wrotePosition = setScrollerScrollTop(current, target);
+  if (align !== 'start' || startPolicy === 'continuity' || !current.scroller || isLayoutHidden(current.scroller)) return;
+  const ceiling = Math.max(0, Math.min(target, Math.max(0, totalPhysicalExtent(current) - current.viewportExtent)));
+  const applied = current.scroller.scrollTop;
+  if (applied > ceiling && applied - ceiling <= 1) {
+    wrotePosition = setScrollerScrollTop(current, Math.max(0, ceiling - 1)) || wrotePosition;
+  }
+  const finalTop = current.scroller.scrollTop;
+  current.viewportTop = finalTop;
+  if (wrotePosition) current.pendingProgrammaticTop = finalTop;
+  current.activeAnchor = { index, key, offset: physicalOffset - finalTop, intent };
+}
+
+function positionAtIndex<T>(
+  current: PhysicalStore<T>,
+  owner: PositionOwner,
+  index: number,
+  align: 'start' | 'end',
+  viewportStartOffset: number,
+  targetSelector: VirtualTranscriptTarget | undefined,
+  startPolicy: 'directional' | 'continuity',
+): void {
+  if (!positionIsAuthorized(current, owner)) return;
+  const unit = current.layout.itemAt(index);
+  if (!unit) return;
+  current.positionOwner = owner;
+  const row = current.rowElements.get(unit.key);
+  const targetElement = resolveTarget(row, targetSelector);
+  const intraRowOffset = targetElement && row
+    ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
+    : 0;
+  current.pendingTarget = isLayoutHidden(current.scroller) || (targetSelector && !targetElement)
+    ? { key: unit.key, align, viewportStartOffset, selector: targetSelector, startPolicy }
+    : null;
+  const physicalOffset = current.headerExtent + unit.offset + current.drift;
+  const physicalEnd = current.headerExtent + unit.end + current.drift;
+  const target = align === 'end'
+    ? physicalEnd - current.viewportExtent + viewportStartOffset
+    : physicalOffset + intraRowOffset - viewportStartOffset;
+  applyAlignedPosition(current, index, unit.key, physicalOffset, target, align, startPolicy);
+  recompute(current);
+}
+
+function resolvePendingTarget<T>(current: PhysicalStore<T>): boolean {
+  if (retireUnauthorizedPosition(current)) return false;
+  const pending = current.pendingTarget;
+  if (!pending || isLayoutHidden(current.scroller)) return false;
+  const key = pending.key;
+  const element = current.rowElements.get(key);
+  const index = current.keys.indexOf(key);
+  const targetElement = pending.selector ? resolveTarget(element, pending.selector) : element;
+  const unit = current.layout.itemAt(index);
+  if (!element || !targetElement || !unit) return false;
+  current.pendingTarget = null;
+  const intraRowOffset = targetElement.getBoundingClientRect().top - element.getBoundingClientRect().top;
+  const physicalOffset = current.headerExtent + unit.offset + current.drift;
+  const physicalEnd = current.headerExtent + unit.end + current.drift;
+  const target = pending.align === 'end'
+    ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
+    : physicalOffset + intraRowOffset - pending.viewportStartOffset;
+  applyAlignedPosition(current, index, key, physicalOffset, target, pending.align, pending.startPolicy);
+  return true;
 }
 
 function isProgrammaticScrollTop<T>(store: PhysicalStore<T>, scrollTop: number): boolean {
@@ -372,7 +530,7 @@ function isProgrammaticScrollTop<T>(store: PhysicalStore<T>, scrollTop: number):
     && Math.abs(scrollTop - store.pendingProgrammaticTop) <= 1;
 }
 
-function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+function captureTopAnchor<T>(store: PhysicalStore<T>): PhysicalAnchor | null {
   if (store.layout.count === 0) return null;
   const index = store.layout.indexAtOffset(rowViewportOffset(store));
   const unit = store.layout.itemAt(index);
@@ -381,20 +539,26 @@ function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor |
     index,
     key: unit.key,
     offset: store.headerExtent + unit.offset + store.drift - settledViewportTop(store),
+    intent: 'continuity',
   };
 }
 
-function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null): void {
+function applyAnchor<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null): PhysicalAnchor | null {
   if (!anchor) {
     setScrollerScrollTop(store, settledViewportTop(store));
-    return;
+    return null;
   }
   const nextOffset = store.layout.offsetForKey(anchor.key);
   if (nextOffset === undefined) {
     setScrollerScrollTop(store, settledViewportTop(store));
-    return;
+    return null;
   }
   const target = store.headerExtent + nextOffset + store.drift - anchor.offset;
+  if (anchor.intent === 'directional_start') {
+    const index = store.keys.indexOf(anchor.key);
+    applyAlignedPosition(store, index, anchor.key, store.headerExtent + nextOffset + store.drift, target, 'start', 'directional');
+    return store.activeAnchor;
+  }
   const delta = target - settledViewportTop(store);
   // Mid-scroll absorption (REQ-VT-004); requires leading-spacer room and no
   // correction already owed as a write — a correction lives in the spacer or
@@ -404,10 +568,11 @@ function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor
     const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
     if (firstOffset + driftNext >= 0) {
       store.drift = driftNext;
-      return;
+      return anchor;
     }
   }
   setScrollerScrollTop(store, target);
+  return anchor;
 }
 
 function recompute<T>(store: PhysicalStore<T>): void {
@@ -427,20 +592,43 @@ function updateMeasuredExtent<T>(store: PhysicalStore<T>, key: string, nextExten
   return true;
 }
 
-function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null, wasPinned: boolean): void {
+function measureMountedExtents<T>(store: PhysicalStore<T>): boolean {
+  let changed = false;
+  if (store.headerElement && !isLayoutHidden(store.headerElement)) {
+    const extent = measureElementExtent(store.headerElement);
+    changed = store.headerExtent !== extent;
+    store.headerExtent = extent;
+  }
+  for (const [key, row] of store.rowElements) {
+    if (!isLayoutHidden(row)) changed = updateMeasuredExtent(store, key, measureElementExtent(row)) || changed;
+  }
+  return changed;
+}
+
+function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: PhysicalAnchor | null, wasPinned: boolean): void {
   store.layout = buildStoreLayout(store);
   const followTail = wasPinned && store.tailFollowAllowed;
-  if (store.scroller && (followTail || store.initialTailPending)) {
+  if (resolvePendingTarget(store)) {
+    // The resolved selector supplies the new physical anchor.
+    anchor = store.activeAnchor;
+  } else if (store.scroller && (followTail || store.initialTailPending)) {
     store.initialTailPending = false;
     setScrollerScrollTop(store, totalPhysicalExtent(store));
+    anchor = null;
   } else if (!store.initialTailPending) {
-    applyAnchor(store, anchor);
+    anchor = applyAnchor(store, anchor);
   }
   store.activeAnchor = anchor;
   recompute(store);
 }
 
 function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: ResizeObserverEntry[]): void {
+  if (isLayoutHidden(store.scroller)) {
+    store.revealPublicationPending = true;
+    return;
+  }
+  const revealed = store.revealPublicationPending;
+  store.revealPublicationPending = false;
   let physicalChanged = false;
   let viewportChanged = false;
   const anchor = anchorForChange(store);
@@ -455,7 +643,7 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
         store.viewportExtent = clampNonNegative(nextExtent);
         viewportChanged = true;
       }
-      const nextTop = store.scroller?.scrollTop ?? store.viewportTop;
+      const nextTop = (revealed ? store.pendingScrollTop : null) ?? store.scroller?.scrollTop ?? store.viewportTop;
       if (store.viewportTop !== nextTop) {
         store.viewportTop = nextTop;
         viewportChanged = true;
@@ -480,14 +668,20 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
     }
   }
 
+  if (revealed) physicalChanged = measureMountedExtents(store) || physicalChanged;
   if (physicalChanged) {
     applyPhysicalChange(store, anchor, wasPinned);
     publish();
     return;
   }
 
-  if (viewportChanged) {
-    if (wasPinned && (store.tailFollowAllowed || store.scroller?.classList.contains('reaction-dock-reserved'))) {
+  if (revealed) resolvePendingTarget(store);
+  if (revealed && store.pendingScrollTop !== null) {
+    setScrollerScrollTop(store, store.pendingScrollTop);
+  }
+
+  if (viewportChanged || revealed) {
+    if (viewportChanged && wasPinned && (store.tailFollowAllowed || store.scroller?.classList.contains('reaction-dock-reserved'))) {
       setScrollerScrollTop(store, totalPhysicalExtent(store));
     }
     recompute(store);
@@ -525,6 +719,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     viewportTop: 0,
     viewportExtent: 0,
     overscan: clampNonNegative(props.overscan ?? 0),
+    revealPublicationPending: false,
     activeAnchor: null,
     scroller: null,
     headerElement: null,
@@ -532,6 +727,9 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     resizeObserver: null,
     initialTailPending: props.initialTail ?? true,
     preservedViewport: null,
+    positionOwner: { kind: 'unowned' },
+    positioningAuthority: props.positioningAuthority ?? NO_POSITIONING_AUTHORITY,
+    positioningViewKey: props.positioningViewKey ?? null,
     pendingTarget: null,
     pinned: true,
     revision: 0,
@@ -572,6 +770,9 @@ function VirtualTranscriptInner<T>(
     storeRef.current = createStore(props);
   }
   const store = storeRef.current;
+  store.positioningAuthority = props.positioningAuthority ?? NO_POSITIONING_AUTHORITY;
+  store.positioningViewKey = props.positioningViewKey ?? null;
+  retireUnauthorizedPosition(store);
   const resolvedPhysicalKeys = useMemo(
     () => resolvePhysicalKeys(items, getKey),
     [getKey, items],
@@ -630,29 +831,16 @@ function VirtualTranscriptInner<T>(
       current.rowElements.set(key, element);
       const anchor = anchorForChange(current);
       const wasPinned = current.pinned;
-      const changed = updateMeasuredExtent(current, key, measureElementExtent(element));
+      const changed = !isLayoutHidden(element)
+        && updateMeasuredExtent(current, key, measureElementExtent(element));
       observeElement(current, publish, element);
       if (changed) {
         applyPhysicalChange(current, anchor, wasPinned);
         publish();
       }
-      const pending = current.pendingTarget;
-      if (pending?.key === key) {
-        const targetElement = resolveTarget(element, pending.selector);
-        const unit = current.layout.itemAt(pending.index);
-        if (targetElement && unit) {
-          current.pendingTarget = null;
-          const intraRowOffset = targetElement.getBoundingClientRect().top - element.getBoundingClientRect().top;
-          const physicalOffset = current.headerExtent + unit.offset + current.drift;
-          const physicalEnd = current.headerExtent + unit.end + current.drift;
-          const target = pending.align === 'end'
-            ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
-            : physicalOffset + intraRowOffset - pending.viewportStartOffset;
-          current.activeAnchor = { index: pending.index, key, offset: physicalOffset - target };
-          setScrollerScrollTop(current, target);
-          recompute(current);
-          publish();
-        }
+      if (resolvePendingTarget(current)) {
+        recompute(current);
+        publish();
       }
     };
     rowRefCallbacks.current.set(key, callback);
@@ -668,7 +856,9 @@ function VirtualTranscriptInner<T>(
     current.headerElement = element;
     const anchor = topAnchorForChange(current);
     const wasPinned = current.pinned;
-    const nextExtent = element ? measureElementExtent(element) : 0;
+    const nextExtent = element
+      ? isLayoutHidden(element) ? current.headerExtent : measureElementExtent(element)
+      : 0;
     const changed = current.headerExtent !== nextExtent;
     current.headerExtent = nextExtent;
     if (element) observeElement(current, publish, element);
@@ -692,8 +882,10 @@ function VirtualTranscriptInner<T>(
 
     current.scroller = element;
     if (element) {
-      current.viewportTop = element.scrollTop;
-      current.viewportExtent = viewportExtentForScroller(element);
+      if (!isLayoutHidden(element)) {
+        current.viewportTop = element.scrollTop;
+        current.viewportExtent = viewportExtentForScroller(element);
+      }
       observeElement(current, publish, element);
       if (current.initialTailPending && current.layout.count > 0) {
         current.initialTailPending = false;
@@ -808,32 +1000,47 @@ function VirtualTranscriptInner<T>(
   }, [onPinnedChange, pinned]);
 
   useImperativeHandle(ref, () => ({
-    scrollToIndex(index, align, viewportStartOffset = 0, targetSelector) {
+    scrollToIndex(index, align, viewportStartOffset = 0, targetSelector, startPolicy = 'directional') {
       const current = storeRef.current;
       if (!current) return;
-      const unit = current.layout.itemAt(index);
-      if (!unit) return;
-      const row = current.rowElements.get(unit.key);
-      const targetElement = resolveTarget(row, targetSelector);
-      const intraRowOffset = targetElement && row
-        ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
-        : 0;
-      current.pendingTarget = targetSelector && !targetElement
-        ? { index, key: unit.key, align, viewportStartOffset, selector: targetSelector }
-        : null;
-      const physicalOffset = current.headerExtent + unit.offset + current.drift;
-      const physicalEnd = current.headerExtent + unit.end + current.drift;
-      const target = align === 'end'
-        ? physicalEnd - current.viewportExtent + viewportStartOffset
-        : physicalOffset + intraRowOffset - viewportStartOffset;
-      current.activeAnchor = { index, key: unit.key, offset: physicalOffset - target };
-      setScrollerScrollTop(current, target);
+      positionAtIndex(current, { kind: 'unowned' }, index, align, viewportStartOffset, targetSelector, startPolicy);
+      publish();
+    },
+    scrollToOwnedIndex(commandKey, index, align, viewportStartOffset = 0, targetSelector, startPolicy = 'directional') {
+      const current = storeRef.current;
+      if (!current) return;
+      positionAtIndex(current, { kind: 'command', commandKey }, index, align, viewportStartOffset, targetSelector, startPolicy);
+      publish();
+    },
+    completePosition(commandKey) {
+      const current = storeRef.current;
+      if (!current || current.positionOwner.kind !== 'command' || current.positionOwner.commandKey !== commandKey
+        || !positionIsAuthorized(current, current.positionOwner)) return;
+      current.pendingTarget = null;
+      current.positionOwner = { kind: 'settled', commandKey, viewKey: current.positioningViewKey };
+    },
+    interruptPosition() {
+      const current = storeRef.current;
+      if (!current) return;
+      retirePosition(current);
+      current.viewportTop = current.scroller?.scrollTop ?? current.viewportTop;
+      current.activeAnchor = captureTopAnchor(current);
+      recompute(current);
+    },
+    cancelPosition(commandKey) {
+      const current = storeRef.current;
+      if (!current || current.positionOwner.kind === 'unowned' || current.positionOwner.commandKey !== commandKey) return;
+      retirePosition(current);
+      current.viewportTop = current.scroller?.scrollTop ?? current.viewportTop;
+      current.activeAnchor = captureTopAnchor(current);
       recompute(current);
       publish();
     },
     scrollToTail() {
       const current = storeRef.current;
       if (!current) return;
+      current.positionOwner = { kind: 'unowned' };
+      current.pendingTarget = null;
       current.activeAnchor = null;
       setScrollerScrollTop(current, totalPhysicalExtent(current));
       recompute(current);
@@ -842,6 +1049,8 @@ function VirtualTranscriptInner<T>(
     scrollBy(delta) {
       const current = storeRef.current;
       if (!current?.scroller || !Number.isFinite(delta) || delta === 0) return;
+      current.positionOwner = { kind: 'unowned' };
+      current.pendingTarget = null;
       current.viewportExtent = viewportExtentForScroller(current.scroller);
       setScrollerScrollTop(current, current.scroller.scrollTop + delta);
       current.activeAnchor = captureTopAnchor(current);
@@ -864,7 +1073,7 @@ function VirtualTranscriptInner<T>(
       current.activeAnchor = anchor;
       recompute(current);
       publish();
-      return anchor;
+      return anchor ? { index: anchor.index, key: anchor.key, offset: anchor.offset } : null;
     },
     preserveViewportOnNextItemsChange() {
       const current = storeRef.current;
@@ -912,7 +1121,7 @@ function VirtualTranscriptInner<T>(
       publish();
       return;
     }
-    current.pendingProgrammaticTop = null;
+    retirePosition(current);
     current.lastScrollAtMs = Date.now();
     current.viewportTop = current.scroller.scrollTop;
     if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
@@ -929,10 +1138,9 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
-    if (current.pendingScrollTop !== null) {
-      const target = current.pendingScrollTop;
-      current.pendingScrollTop = null;
-      setScrollerScrollTop(current, target);
+    if (current.pendingScrollTop !== null && !isLayoutHidden(current.scroller)) {
+      if (current.revealPublicationPending) synchronizedPhysicalSnapshot(current);
+      else if (!resolvePendingTarget(current)) setScrollerScrollTop(current, current.pendingScrollTop);
       recompute(current);
       publish();
       return;

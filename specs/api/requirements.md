@@ -76,9 +76,11 @@ WHEN client sends chat message while conversation is idle or in error state
 THE SYSTEM SHALL forward message to state machine for processing
 AND return acknowledgment immediately
 
-WHEN client sends chat message while agent is busy
-THE SYSTEM SHALL return error indicating agent is busy
-AND inform user they can cancel current operation
+WHEN client sends chat message while agent is busy and accepts steering
+THE SYSTEM SHALL durably queue the message as steering and report that admission outcome
+
+WHEN the target cannot accept direct input or steering
+THE SYSTEM SHALL return the applicable admission refusal without claiming delivery
 
 WHEN client sends chat message with inline images
 THE SYSTEM SHALL accept base64-encoded image data in message payload
@@ -87,7 +89,7 @@ WHEN client requests cancellation
 THE SYSTEM SHALL forward cancel event to state machine
 AND return acknowledgment
 
-**Rationale:** Users interact with agent via messages and can interrupt operations. Rejecting messages while busy simplifies the state machine and makes message ordering explicit.
+**Rationale:** Users interact with the agent via messages and can interrupt operations. Direct delivery, steering admission, and refusal are distinct outcomes.
 
 ---
 
@@ -301,10 +303,12 @@ WHEN the browser successfully completes an initial ProductConversation detail op
 THE SYSTEM SHALL assign an opaque per-open identifier and pass it with the detail request
 AND SHALL emit content-free server stage telemetry for pool wait, read-transaction start, reference resolution, aggregate hydration, bounded message-page hydration, read rollback, post-snapshot projection, and total detail handling
 AND SHALL correlate the detail request's server stages by the opaque open identifier and server-resolved durable product reference
-AND SHALL correlate the browser snapshot receipt, committed store readiness, and—when the open starts visible—first-paint timing to that detail request by the opaque open identifier
-AND SHALL record hidden-at-start opens without fabricating a first-paint duration
+AND SHALL correlate the browser snapshot receipt, committed store readiness, and—when the open starts visible—a frame-based presentation estimate to that detail request by the opaque open identifier
+AND SHALL treat the `first_paint_ms` field as a scheduling estimate, not proof of compositor paint
+AND SHALL record hidden-at-start opens without fabricating a presentation duration
 AND SHALL validate that reported browser durations are finite, non-negative, ordered, and no greater than five minutes
-AND SHALL permit only the opaque open identifier and server-resolved durable product reference as high-cardinality trace correlation attributes
+AND SHALL permit only the opaque open identifier and server-resolved durable product reference as high-cardinality trace correlation attributes for this detail-open report
+AND SHALL apply the separately bounded conversation-view correlation contract in `specs/conversation-view-telemetry/requirements.md` to journey reports
 AND SHALL NOT emit message content, SQL text, credentials, filesystem paths, caller-defined trace attributes, or dynamic metric labels in this telemetry.
 
 WHEN the browser loads older ProductConversation pages or performs a background refresh
@@ -322,3 +326,67 @@ AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, 
 AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
 
 **Rationale:** Automatic continuation configuration is aggregate-scoped so a continuation cannot silently replace the configured identity, and its write response does not claim that existing exhausted work was scheduled.
+
+
+### REQ-API-031: Explicit Public Literal Chat
+
+WHEN an authorized client sends `POST /api/conversations/{id}/chat`
+THE SYSTEM SHALL accept only `expand_references` and `literal_text` as the public `expansion_policy` values
+AND SHALL use `expand_references` when the field is omitted
+AND SHALL reject unknown, null, or non-string policy values rather than mapping them to a default
+AND SHALL NOT expose internal generated-predecessor-context policy.
+
+WHEN literal text is admitted for direct delivery or steering
+THE SYSTEM SHALL preserve the decoded text unchanged for display and model input
+AND SHALL perform no slash-command, skill, @ mention or file-reference expansion
+AND SHALL create no skill invocation or expanded-text overlay
+AND SHALL preserve normal attachment validation, UserApi provenance, close/history fences and direct-versus-steering routing.
+AND for a reserved continuation opening SHALL reject an already-transcript-prefixed client identity or changed submitted text/user agent before canonicalization, retaining the original raw reserved identity.
+
+WHEN the client retries an admitted message identity
+THE SYSTEM SHALL compare expansion policy as part of exact submitted intent along with original transcript, text, ordered attachments, origin and user agent
+AND SHALL return HTTP 409 `idempotency_conflict` for changed policy
+AND SHALL require durable policy-bearing evidence for nondefault-policy replay rather than inferring it from transcript content alone
+AND SHALL preserve historical transcript-only replay only for default `expand_references` intent with matching content and provenance.
+
+Public literal-chat guidance SHALL require complete HTTP-200 `GET /api/version` JSON from the exact authenticated verified-TLS destination, with no redirects, whose full `git_sha` exactly matches an immutable commit independently verified to support this literal mode or a source-inspected accepted descendant. It SHALL re-read immediately before use and each exact retry, stop before POST on unknown, malformed or mismatched receivers, and never infer support from semver, local capability assumptions or smoke HTTP success alone. After known-version verification, it SHALL confirm one harmless `literal steering smoke test` on the exact authorized idle target with a retained message ID and materialized bytes before sending expandable content. It SHALL use existing `/chat` with explicit `literal_text`, preserve original target and intent for retries, and never fall back to default expansion. This recipe grants no additional authority or live-replacement guarantee.
+
+
+### REQ-API-030: Bounded Global Aggregate History
+
+WHEN an owner requests `GET /api/global/coordinator/history/:reference`
+THE SYSTEM SHALL resolve the reference only within Coordinator aggregate membership
+AND SHALL read reference resolution, ordered topology, message-page contents, and cursor watermarks from one database snapshot
+AND SHALL reuse the aggregate cursor's message limits, deterministic ordering, ceiling fencing, and generation validation
+AND SHALL return original continuation message records with their exact identity and transcript-local coordinates
+AND SHALL return content-free boundary navigation metadata for the aggregate, including boundaries outside the acquired page
+AND SHALL identify the exact accepted successor opening already represented by each original boundary, or explicitly report no represented opening, so live hydration cannot restore a duplicate summary
+AND SHALL suppress a represented opening only when persisted opening authority identifies generated predecessor context
+AND SHALL retain every user-authorized accepted opening, including unchanged summary text, and messages with distinct identities even when their text matches a boundary summary
+AND SHALL identify the newest writable Coordinator member independently of the requested historical member
+AND SHALL NOT create a Coordinator, admit a turn, or expose ordinary lifecycle, Close, or work actions as a side effect of the read
+
+WHEN an ordinary aggregate, sub-agent, or nonmember reference is supplied to this endpoint
+THE SYSTEM SHALL reject it rather than substituting the current Coordinator.
+
+Ordinary aggregate reads SHALL retain their ordinary lifecycle and mutation boundaries.
+
+WHEN an ordinary aggregate read selects `boundary_representation=original_messages`
+THE SYSTEM SHALL return original continuation messages and content-free boundary navigation metadata using the same history representation as the Global read
+AND SHALL omit handoff-summary metadata from those history segments.
+
+WHEN an ordinary aggregate read omits `boundary_representation` or selects `handoff_metadata`
+THE SYSTEM SHALL return handoff-summary metadata and exclude the represented continuation messages from segment message arrays
+AND SHALL omit the boundary navigation roster.
+
+THE SYSTEM SHALL reject unknown boundary representations.
+
+WHEN a caller requests Coordinator route membership for an exact row ID or member slug
+THE SYSTEM SHALL return the immutable Coordinator root identity for a member rather than its changing newest member identity
+AND SHALL return no Coordinator identity for a nonmember
+AND SHALL preserve that membership identity across continuation so independent exact-source validations compare the same aggregate.
+
+THE SYSTEM SHALL keep the newest transcript identity distinct from write readiness
+AND SHALL NOT advertise a reserved successor as writable before its continuation opening is accepted.
+
+Web consumption is specified by `specs/conversation-ui` REQ-CONV-023 and REQ-CONV-026.

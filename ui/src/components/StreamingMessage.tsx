@@ -14,6 +14,7 @@ import { inlineCodeTokenKind } from './conversationMarkdownTableSemantics';
 import { CONVERSATION_MARKDOWN_URL_TRANSFORM, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { formatMessageTime } from './MessageComponents';
+import { AssistantMessageChrome, AssistantMessageMetadata } from './AssistantMessageChrome';
 
 type StreamingMarkdownComponentsContext = {
   rootDir?: string | undefined;
@@ -113,15 +114,11 @@ export function StreamingMessageView({ buffer, isFirstInTurn = true, rootDir, on
   if (!buffer) return null;
   const startedAtIso = new Date(buffer.startedAt).toISOString();
   return (
-    <div className="message agent">
-      {isFirstInTurn && (
-        <div className="message-header">
-          <span className="message-sender">Phoenix</span>
-          <span className="message-time" title={new Date(buffer.startedAt).toLocaleString()}>
-            {formatMessageTime(startedAtIso)}
-          </span>
-        </div>
-      )}
+    <div className="message agent assistant-message">
+      <AssistantMessageChrome
+        isFirstInTurn={isFirstInTurn}
+        metadata={<AssistantMessageMetadata timestamp={startedAtIso} formattedTime={formatMessageTime(startedAtIso)} />}
+      />
       <div className="message-content">
         <StreamingBlocks text={buffer.text ?? ''} rootDir={rootDir} onOpenFile={onOpenFile} />
       </div>
@@ -238,5 +235,9 @@ const StreamingCode = memo(function StreamingCode({ content, lang, complete }: {
   const { theme } = useTheme();
   if (!complete) return <pre className="streaming-code-pre"><code className="streaming-code">{content}</code></pre>;
   if (lang?.toLowerCase() === 'mermaid') return <MemoMermaid code={content} />;
-  return <SyntaxHighlighter style={theme === 'light' ? oneLight : oneDark} language={lang || 'text'} PreTag="div">{content}</SyntaxHighlighter>;
+  if (!lang) {
+    const children = content ? `${content}\n` : '';
+    return <pre><code data-token-kind={inlineCodeTokenKind(children)}>{children}</code></pre>;
+  }
+  return <pre><SyntaxHighlighter style={theme === 'light' ? oneLight : oneDark} language={lang} PreTag="div">{content}</SyntaxHighlighter></pre>;
 });

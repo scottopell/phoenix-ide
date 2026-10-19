@@ -83,6 +83,7 @@ interface CompletedContinuationBoundaryProps {
   revealedSummary?: ReactNode;
   revealSummary?: boolean;
   onOpenContinuation?: () => void;
+  provenance?: { predecessor: string; successor?: string; messageId: string };
 }
 
 export function CompletedContinuationBoundary({
@@ -90,16 +91,17 @@ export function CompletedContinuationBoundary({
   revealedSummary,
   revealSummary = false,
   onOpenContinuation,
+  provenance,
 }: CompletedContinuationBoundaryProps) {
   return (
-    <section className="context-exhausted-handoff context-exhausted-banner context-exhausted-banner--continued" aria-label="Conversation continuation boundary">
-      <div className="context-exhausted-header context-exhausted-header--static">
-        <span className="context-exhausted-icon" aria-hidden="true"><AlertTriangle /></span>
-        <span className="context-exhausted-title">Context compacted</span>
-        <span className="context-exhausted-subtitle">Conversation continued in the next segment</span>
-      </div>
-      <details className="context-exhausted-summary context-exhausted-summary--historical" open={revealSummary || undefined}>
-        <summary>Review handoff</summary>
+    <section className="conversation-history-boundary" aria-label="Conversation continuation boundary">
+      <details open={revealSummary || undefined}>
+        <summary>Context boundary · Review handoff</summary>
+        {provenance && <dl className="conversation-history-boundary-provenance">
+          <dt>From</dt><dd>{provenance.predecessor}</dd>
+          {provenance.successor && <><dt>To</dt><dd>{provenance.successor}</dd></>}
+          <dt>Message</dt><dd>{provenance.messageId}</dd>
+        </dl>}
         <pre className="context-exhausted-content" data-fragment-id="message-text">
           {revealedSummary ?? summary}
         </pre>

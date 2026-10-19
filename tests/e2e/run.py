@@ -52,8 +52,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import os
+import re
 try:
     import resource
 except ImportError:  # Windows: profiling unavailable; normal E2E remains usable.
@@ -64,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from unittest import mock
 import uuid
@@ -1171,6 +1174,156 @@ def scenario_text_streaming(base_url: str) -> None:
     )
 
 
+def _post_public_literal_chat(
+    base_url: str, conv_id: str, body: dict, expected_receiver_sha: str,
+) -> httpx.Response:
+    """Expected SHA comes from the inspected fixture source, never the receiver read."""
+    assert re.fullmatch(r"[0-9a-f]{40}", expected_receiver_sha), "full expected receiver SHA required"
+    version = httpx.get(f"{base_url}/api/version", follow_redirects=False, timeout=10.0)
+    assert version.status_code == 200, "receiver version read failed"
+    identity = version.json()
+    assert isinstance(identity, dict) and identity.get("git_sha") == expected_receiver_sha, "unknown or mismatched receiver"
+    assert body.get("expansion_policy") == "literal_text", "literal policy required"
+    return httpx.post(
+        f"{base_url}/api/conversations/{conv_id}/chat",
+        json=body, follow_redirects=False, timeout=10.0,
+    )
+
+
+async def _post_literal_chat_observing_queue_async(
+    base_url: str, conv_id: str, body: dict, expected_receiver_sha: str,
+) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        async with asyncio.timeout(10.0):
+            async with aconnect_sse(client, "GET", f"{base_url}/api/conversations/{conv_id}/stream") as source:
+                source.response.raise_for_status()
+                events = source.aiter_sse()
+                init = await anext(events)
+                assert init.event == "init", f"expected init, got {init.event!r}"
+                response = _post_public_literal_chat(base_url, conv_id, body, expected_receiver_sha)
+                assert response.status_code == 200 and response.json().get("steering") is True, response.text
+                async for event in events:
+                    if event.event != "steer_message_queued":
+                        continue
+                    entry = json.loads(event.data)["message"]
+                    if entry.get("message_id") != body["message_id"]:
+                        continue
+                    assert entry["text"] == body["text"], entry
+                    assert entry["origin"] == {"kind": "user_api"}, entry
+                    assert not entry.get("llm_text") and not entry.get("skill_invocation"), entry
+                    return response
+                raise AssertionError("SSE closed before literal queue event")
+
+
+def _queue_literal_behind_gated_turn(
+    base_url: str, conv_id: str, body: dict, expected_receiver_sha: str,
+) -> httpx.Response:
+    # The mock cannot finish this request until we observe the queue event and release it.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10.0)
+        port = listener.getsockname()[1]
+        print("[public_literal_chat:running] gated setup POST", flush=True)
+        setup = httpx.post(f"{base_url}/api/conversations/{conv_id}/chat", json={
+            "text": f"[[scenario:plain_text]] [[stream-gate:{port}]] literal queue setup",
+            "message_id": str(uuid.uuid4()),
+        }, follow_redirects=False, timeout=10.0)
+        assert setup.status_code == 200 and setup.json().get("steering", False) is False, setup.text
+        print("[public_literal_chat:running] setup accepted; waiting for mock gate connection", flush=True)
+        connection, _ = listener.accept()
+        with connection:
+            print("[public_literal_chat:running] mock gate connected; observing literal queue admission", flush=True)
+            try:
+                response = asyncio.run(_post_literal_chat_observing_queue_async(base_url, conv_id, body, expected_receiver_sha))
+                print("[public_literal_chat:running] matching live queue event observed", flush=True)
+            finally:
+                print("[public_literal_chat:running] releasing mock gate", flush=True)
+                connection.sendall(b"R")
+    return response
+
+
+def scenario_public_literal_chat(base_url: str) -> None:
+    try:
+        _scenario_public_literal_chat(base_url)
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        raise
+
+
+def _scenario_public_literal_chat(base_url: str) -> None:
+    """Real compiled HEAD: independent source identity, smoke, then idle/running literal bytes."""
+    print("[public_literal_chat] source identity preflight", flush=True)
+    expected_receiver_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert not dirty, "public_literal_chat requires a clean committed build fixture; commit before building/running it"
+    for running in (False, True):
+        phase = "running" if running else "idle"
+        print(f"[public_literal_chat:{phase}] create conversation and await setup completion", flush=True)
+        conv_id = _new_conv_and_stream(
+            base_url, "[[scenario:plain_text]] literal idle setup", SCENARIO_TIMEOUT_SECONDS
+        )
+        smoke = {
+            "text": "literal steering smoke test", "message_id": str(uuid.uuid4()),
+            "expansion_policy": "literal_text",
+        }
+        print(f"[public_literal_chat:{phase}] harmless literal smoke POST", flush=True)
+        accepted = _post_public_literal_chat(base_url, conv_id, smoke, expected_receiver_sha)
+        assert accepted.status_code == 200 and accepted.json().get("steering", False) is False, accepted.text
+        print(f"[public_literal_chat:{phase}] await smoke materialization", flush=True)
+        smoke_id = f"{conv_id}:{smoke['message_id']}"
+        materialized = _poll_to_idle_with_messages(
+            base_url, conv_id,
+            lambda messages: any(m.get("message_id") == smoke_id for m in _user_messages(messages)),
+            "harmless literal smoke materialization", timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        smoke_messages = [m for m in _user_messages(materialized["messages"]) if m.get("message_id") == smoke_id]
+        assert len(smoke_messages) == 1 and smoke_messages[0]["content"]["text"] == smoke["text"], smoke_messages
+        text = "/spears @Cargo.toml @file:missing @someone\n  café exact bytes  \n[[scenario:plain_text]]"
+        body = {
+            "text": text,
+            "message_id": str(uuid.uuid4()),
+            "expansion_policy": "literal_text",
+            "images": [], "files": [], "user_agent": None,
+        }
+        print(f"[public_literal_chat:{phase}] literal admission", flush=True)
+        if running:
+            response = _queue_literal_behind_gated_turn(base_url, conv_id, body, expected_receiver_sha)
+        else:
+            response = _post_public_literal_chat(base_url, conv_id, body, expected_receiver_sha)
+        assert response.status_code == 200, f"literal POST failed: {response.status_code} {response.text}"
+        assert response.json().get("queued") is True
+        assert response.json().get("steering", False) is running, response.json()
+
+        materialized_id = body["message_id"] if running else f"{conv_id}:{body['message_id']}"
+
+        def has_literal(messages: list[dict]) -> bool:
+            return any(m.get("message_id") == materialized_id for m in _user_messages(messages))
+
+        print(f"[public_literal_chat:{phase}] await literal materialization", flush=True)
+        final = _poll_to_idle_with_messages(
+            base_url, conv_id, has_literal, "literal message materialization",
+            timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+        matches = [m for m in _user_messages(final["messages"]) if m.get("message_id") == materialized_id]
+        assert len(matches) == 1, f"literal message was not materialized once: {matches!r}"
+        assert matches[0]["content"]["text"] == text, matches[0]
+        assert not matches[0]["content"].get("llm_text"), "unexpected expansion overlay"
+        print(f"[public_literal_chat:{phase}] exact replay POST", flush=True)
+        retry = _post_public_literal_chat(base_url, conv_id, body, expected_receiver_sha)
+        assert retry.status_code == 200 and retry.json().get("already_persisted") is True
+        changed = {**body, "expansion_policy": "expand_references"}
+        print(f"[public_literal_chat:{phase}] changed-policy conflict POST", flush=True)
+        conflict = httpx.post(f"{base_url}/api/conversations/{conv_id}/chat", json=changed,
+                              follow_redirects=False, timeout=10.0)
+        assert conflict.status_code == 409 and conflict.json().get("error_type") == "idempotency_conflict"
+        print(f"[public_literal_chat:{phase}] complete", flush=True)
+
+
 def scenario_multi_tool(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:multi_tool]] go")
     final = _poll_to_idle_with_messages(
@@ -1726,6 +1879,7 @@ SCENARIOS = [
     ("coordinator_home", scenario_coordinator_home),
     ("list_models", scenario_list_models),
     ("text_streaming", scenario_text_streaming),
+    ("public_literal_chat", scenario_public_literal_chat),
     ("multi_tool", scenario_multi_tool),
     ("think_tool", scenario_think_tool),
     ("read_file", scenario_read_file),
@@ -2024,6 +2178,193 @@ class StreamReadinessTests(unittest.TestCase):
         self.assertFalse(_is_llm_first_byte_witness("init", {"pending_events": [{}]}))
 
 
+class PublicLiteralChatPreflightTests(unittest.TestCase):
+    def test_scenario_matches_exact_materialized_ids_and_retries_original_client_ids(self):
+        submitted = {}
+        last_post = {}
+        polls = []
+        retries = []
+
+        def post(base_url, conv_id, body, expected_receiver_sha):
+            self.assertEqual(expected_receiver_sha, "a" * 40)
+            key = (conv_id, body["message_id"])
+            snapshot = json.loads(json.dumps(body))
+            last_post[conv_id] = snapshot
+            if key in submitted:
+                self.assertEqual(body, submitted[key])
+                retries.append(key)
+                return httpx.Response(200, json={"queued": True, "already_persisted": True})
+            submitted[key] = snapshot
+            return httpx.Response(200, json={"queued": True})
+
+        def queue(base_url, conv_id, body, expected_receiver_sha):
+            post(base_url, conv_id, body, expected_receiver_sha)
+            return httpx.Response(200, json={"queued": True, "steering": True})
+
+        def poll(base_url, conv_id, predicate, description, **kwargs):
+            body = last_post[conv_id]
+            client_id = body["message_id"]
+            steering = conv_id == "running-conv" and description == "literal message materialization"
+            expected_id = client_id if steering else f"{conv_id}:{client_id}"
+
+            def message(message_id, message_type="user", text="wrong message"):
+                return {"message_id": message_id, "message_type": message_type, "content": {"text": text}}
+
+            decoys = [
+                message(f"other-conv:{client_id}"),
+                message(f"prefix:{expected_id}"),
+                message(expected_id, "agent"),
+                message(f"{conv_id}:{client_id}" if steering else client_id),
+            ]
+            self.assertFalse(predicate(decoys), description)
+            messages = [*decoys, message(expected_id, text=body["text"])]
+            self.assertTrue(predicate(messages), description)
+            polls.append((conv_id, expected_id))
+            return {"messages": messages}
+
+        conflict = httpx.Response(409, json={"error_type": "idempotency_conflict"})
+        with mock.patch.dict(globals(), {
+            "_new_conv_and_stream": mock.Mock(side_effect=["idle-conv", "running-conv"]),
+            "_post_public_literal_chat": post,
+            "_queue_literal_behind_gated_turn": mock.Mock(side_effect=queue),
+            "_poll_to_idle_with_messages": poll,
+        }), mock.patch("subprocess.run", side_effect=[
+            mock.Mock(stdout="a" * 40), mock.Mock(stdout=""),
+        ]), mock.patch("uuid.uuid4", side_effect=["smoke-idle", "literal-idle", "smoke-running", "literal-running"]), \
+                mock.patch("httpx.post", return_value=conflict) as changed_policy:
+            scenario_public_literal_chat("http://local.test")
+
+        self.assertEqual(polls, [
+            ("idle-conv", "idle-conv:smoke-idle"),
+            ("idle-conv", "idle-conv:literal-idle"),
+            ("running-conv", "running-conv:smoke-running"),
+            ("running-conv", "literal-running"),
+        ])
+        self.assertEqual(len(submitted), 4)
+        self.assertEqual(retries, [("idle-conv", "literal-idle"), ("running-conv", "literal-running")])
+        self.assertEqual(changed_policy.call_count, 2)
+        for call, (conv_id, client_id) in zip(changed_policy.call_args_list, [
+            ("idle-conv", "literal-idle"), ("running-conv", "literal-running"),
+        ]):
+            body = call.kwargs["json"]
+            self.assertEqual(body, {**submitted[(conv_id, client_id)], "expansion_policy": "expand_references"})
+            self.assertEqual(call.args[0], f"http://local.test/api/conversations/{conv_id}/chat")
+
+    def test_scenario_failure_prints_causal_stage_and_traceback_then_reraises(self):
+        error = httpx.ReadError("connection reset by peer")
+        output = io.StringIO()
+        with mock.patch.dict(globals(), {
+            "_new_conv_and_stream": mock.Mock(side_effect=error),
+        }), mock.patch("subprocess.run", side_effect=[
+            mock.Mock(stdout="a" * 40), mock.Mock(stdout=""),
+        ]), contextlib.redirect_stdout(output):
+            with self.assertRaises(httpx.ReadError) as raised:
+                scenario_public_literal_chat("http://local.test")
+        self.assertIs(raised.exception, error)
+        self.assertIn("[public_literal_chat:idle] create conversation", output.getvalue())
+        self.assertIn("Traceback (most recent call last):", output.getvalue())
+        self.assertIn("_new_conv_and_stream", output.getvalue())
+        self.assertIn("ReadError: connection reset by peer", output.getvalue())
+
+    def test_running_gate_diagnostics_distinguish_setup_post_from_gate_accept(self):
+        output = io.StringIO()
+        with mock.patch("socket.socket") as socket_mock, \
+                mock.patch("httpx.post", return_value=httpx.Response(200, json={"queued": True})), \
+                contextlib.redirect_stdout(output):
+            listener = socket_mock.return_value.__enter__.return_value
+            listener.getsockname.return_value = ("127.0.0.1", 12345)
+            listener.accept.side_effect = TimeoutError("mock did not connect")
+            with self.assertRaisesRegex(TimeoutError, "mock did not connect"):
+                _queue_literal_behind_gated_turn("http://local.test", "conv", {}, "a" * 40)
+        stages = output.getvalue()
+        self.assertLess(stages.index("gated setup POST"), stages.index("setup accepted; waiting"))
+        self.assertNotIn("mock gate connected", stages)
+
+    def test_running_literal_subscribes_before_post_and_consumes_live_queue_event(self):
+        order = []
+        body = {"message_id": "literal-id", "text": "/spears @missing\n café  \n", "expansion_policy": "literal_text"}
+
+        async def events():
+            order.append("init")
+            yield mock.Mock(event="init", data="{}")
+            self.assertEqual(order, ["init", "post"])
+            yield mock.Mock(event="steer_message_queued", data=json.dumps({"message": {
+                "message_id": f"conv:{body['message_id']}", "text": "wrong namespaced queue entry",
+            }}))
+            order.append("queue")
+            yield mock.Mock(event="steer_message_queued", data=json.dumps({"message": {
+                "message_id": body["message_id"], "text": body["text"], "origin": {"kind": "user_api"},
+                "llm_text": None, "skill_invocation": None,
+            }}))
+
+        @contextlib.asynccontextmanager
+        async def source(*args, **kwargs):
+            yield mock.Mock(response=mock.Mock(), aiter_sse=events)
+
+        def post(base_url, conv_id, submitted, expected_receiver_sha):
+            self.assertEqual(order, ["init"])
+            self.assertEqual(submitted, body)
+            order.append("post")
+            return httpx.Response(200, json={"queued": True, "steering": True})
+
+        with mock.patch.dict(globals(), {"aconnect_sse": source, "_post_public_literal_chat": post}):
+            response = asyncio.run(_post_literal_chat_observing_queue_async("http://local.test", "conv", body, "a" * 40))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(order, ["init", "post", "queue"])
+
+    def test_running_literal_fails_if_stream_closes_without_queue_evidence(self):
+        async def events():
+            yield mock.Mock(event="init", data="{}")
+
+        @contextlib.asynccontextmanager
+        async def source(*args, **kwargs):
+            yield mock.Mock(response=mock.Mock(), aiter_sse=events)
+
+        with mock.patch.dict(globals(), {
+            "aconnect_sse": source,
+            "_post_public_literal_chat": mock.Mock(return_value=httpx.Response(200, json={"steering": True})),
+        }):
+            with self.assertRaisesRegex(AssertionError, "closed before literal queue event"):
+                asyncio.run(_post_literal_chat_observing_queue_async("http://local.test", "conv", {
+                    "message_id": "id", "text": "literal",
+                }, "a" * 40))
+
+    def test_missing_malformed_mismatched_or_redirected_receiver_never_posts(self):
+        expected_receiver_sha = "a" * 40
+        fixtures = [
+            (200, "{}"), (200, '{"git_sha": null}'), (200, '{"git_sha": 1}'),
+            (200, '{"git_sha": "unknown"}'), (200, '{"git_sha": "aaaaaaa"}'),
+            (200, json.dumps({"git_sha": "b" * 40})),
+            (200, json.dumps({"git_sha": expected_receiver_sha + "-dirty"})),
+            (200, "null"), (200, "[]"), (200, '{"git_sha":'),
+            (302, json.dumps({"git_sha": expected_receiver_sha})), (401, "{}"),
+        ]
+        for status, text in fixtures:
+            with self.subTest(status=status, text=text), \
+                    mock.patch("httpx.get", return_value=httpx.Response(status, text=text)) as get, \
+                    mock.patch("httpx.post") as post:
+                with self.assertRaises((AssertionError, ValueError)):
+                    _post_public_literal_chat("https://destination.test", "original", {
+                        "message_id": "same-id", "text": "/spears @file", "expansion_policy": "literal_text",
+                    }, expected_receiver_sha)
+                get.assert_called_once_with("https://destination.test/api/version", follow_redirects=False, timeout=10.0)
+                post.assert_not_called()
+
+    def test_known_receiver_is_rechecked_for_each_exact_retry_without_fallback(self):
+        expected_receiver_sha = "a" * 40
+        with mock.patch("httpx.get", side_effect=[
+            httpx.Response(200, json={"git_sha": expected_receiver_sha}),
+            httpx.Response(200, json={"git_sha": "b" * 40}),
+        ]) as get, mock.patch("httpx.post", return_value=httpx.Response(200)) as post:
+            body = {"message_id": "same-id", "text": "literal steering smoke test", "expansion_policy": "literal_text"}
+            _post_public_literal_chat("https://destination.test", "original", body, expected_receiver_sha)
+            with self.assertRaisesRegex(AssertionError, "mismatched receiver"):
+                _post_public_literal_chat("https://destination.test", "original", body, expected_receiver_sha)
+            self.assertEqual(get.call_count, 2)
+            post.assert_called_once_with("https://destination.test/api/conversations/original/chat",
+                                         json=body, follow_redirects=False, timeout=10.0)
+
+
 class ScenarioSelectorTests(unittest.TestCase):
     def test_select_scenarios_defaults_to_all(self):
         self.assertEqual([name for name, _ in SCENARIOS], [name for name, _ in _select_scenarios([])])
@@ -2094,6 +2435,7 @@ def _run_self_tests() -> int:
             CpuProfilingTests,
             StartupRetryTests,
             StreamReadinessTests,
+            PublicLiteralChatPreflightTests,
             ScenarioSelectorTests,
         )
     )

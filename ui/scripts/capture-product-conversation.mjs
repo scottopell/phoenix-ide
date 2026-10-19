@@ -1,5 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import process from 'node:process';
 import { buildLadleStoryUrl, runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 const measurements = [];
@@ -7,7 +8,7 @@ const journeys = [];
 
 async function assertSourceCall(page, id, viewport, outDir) {
   await page.evaluate(() => { window.__sourcePulseSeen = false; const observer = new MutationObserver(() => { if (document.querySelector('[data-tool-id="source-send-call"].jump-highlight')) window.__sourcePulseSeen = true; }); observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["class"] }); });
-  const expectedPath = id === 'source-call-global' ? '/global/source-member' : '/product-conversations/source-product';
+  const expectedPath = id === 'source-call-global' ? '/global/source-member' : '/c/source-member';
   await page.getByRole('link', { name: /transcript ID .* · source call$/ }).click();
   await page.waitForFunction(path => document.documentElement.dataset.sourceFixtureLocation?.startsWith(path), expectedPath);
   const target = page.locator('[data-tool-id="source-send-call"]');
@@ -25,6 +26,92 @@ async function assertSourceCall(page, id, viewport, outDir) {
   await page.locator('[data-tool-id="source-send-call"]').waitFor({ state: 'visible' });
   if (await page.locator('[role="alert"]').count()) throw new Error('Source jump exposed an error alert');
   journeys.push(`${id}/${viewport.name}: receiver click and cold reload reach expanded exact source call`);
+}
+
+async function assertSupersededBoundary(page, id, viewport, outDir) {
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-hold-older')));
+  await page.getByRole('button', { name: 'Load context boundary 2', exact: true }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureOlderSnapshotRequests === '1');
+  await page.getByRole('button', { name: /Member 3 request$/ }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-history-prompt-3'));
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-release-older')));
+  await page.getByRole('button', { name: 'Context boundary 2', exact: true }).waitFor();
+  await page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('.virtual-transcript [data-render-unit-key]')].find(element => element.textContent.includes('Member 3 request'));
+    const viewport = document.querySelector('.product-conversation-page__transcript .chat-main-area');
+    if (!row || !viewport) return false;
+    const rect = row.getBoundingClientRect(); const bounds = viewport.getBoundingClientRect();
+    return document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-history-prompt-3') && rect.bottom > bounds.top && rect.top < bounds.bottom;
+  });
+  if (await fixtureValue(page, 'older-snapshot-requests') !== '1') throw new Error('Superseded boundary caused an unnecessary second page read');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--superseded-boundary.png`, fullPage: true });
+  if (!await page.locator('.product-conversation-page__composer #message-input').isEnabled() || !(await fixtureValue(page, 'event-source-last-url'))?.includes('history-3')) throw new Error('Reader selection changed newest-member composer ownership');
+  journeys.push(`${id}/${viewport.name}: delayed unloaded-boundary read resolves after loaded prompt selection; actual shared reader retains new prompt URL and visible prompt, with newest composer unchanged`);
+  const cleanUrl = new URL(page.url()); cleanUrl.hash = '';
+  cleanUrl.searchParams.set('fixturePass', 'normal-history');
+  await page.goto(cleanUrl.href);
+  await page.waitForSelector(`[data-product-conversation-fixture-ready="${id}"]`);
+}
+
+async function assertLazyHistory(page, id, viewport, outDir) {
+  const initialLocation = await page.locator('html').getAttribute('data-source-fixture-location');
+  if (await fixtureValue(page, 'older-snapshot-requests') !== null) throw new Error('Older history was acquired before navigation');
+  await page.getByRole('button', { name: 'Load context boundary 1', exact: true }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureOlderSnapshotRequests === '2');
+  await page.getByRole('button', { name: 'Context boundary 1', exact: true }).waitFor();
+  const boundary = page.locator('[data-render-unit-key="continue-history-1"] .conversation-history-boundary');
+  await boundary.waitFor({ state: 'visible' });
+  const disclosure = boundary.locator('details');
+  if (await disclosure.getAttribute('open') !== null) throw new Error('Historical summary is not compact by default');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--boundary-collapsed.png`, fullPage: true });
+  await disclosure.locator('summary').click();
+  await boundary.getByText('Preserved summary from member 1', { exact: true }).waitFor({ state: 'visible' });
+  for (const value of ['history-1', 'history-2', 'continue-history-1']) await boundary.getByText(value, { exact: true }).waitFor();
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--boundary-expanded.png`, fullPage: true });
+  await page.getByRole('button', { name: 'Context boundary 2', exact: true }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-continue-history-2'));
+  if (await fixtureValue(page, 'older-snapshot-requests') !== '2') throw new Error('Loaded boundary requested a duplicate cursor page');
+  await page.goBack();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-continue-history-1'));
+  await page.goBack();
+  await page.waitForFunction(expected => document.documentElement.dataset.sourceFixtureLocation === expected, initialLocation);
+  await page.goForward();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-continue-history-1'));
+  await page.goForward();
+  await page.waitForFunction(() => document.documentElement.dataset.sourceFixtureLocation?.endsWith('#message-continue-history-2'));
+  await page.getByRole('button', { name: /Member 2 answer/ }).click();
+  const historicalSummary = page.locator('summary').filter({ hasText: /^Historical nonnested investigation$/ });
+  await historicalSummary.waitFor({ state: 'visible' });
+  const historicalDisclosure = historicalSummary.locator('..');
+  if (await historicalDisclosure.getAttribute('open') !== null) throw new Error('Authored historical disclosure is not collapsed initially');
+  await historicalSummary.click();
+  await historicalDisclosure.locator('strong').filter({ hasText: /^historical prose marker$/ }).waitFor({ state: 'visible' });
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--authored-historical-disclosure.png`, fullPage: true });
+  await page.getByRole('button', { name: /Member 1 answer/ }).click();
+  const rejectedNested = page.locator('[data-render-unit-key="history-answer-1"]');
+  await rejectedNested.getByText('<details><summary>Historical investigation</summary>', { exact: true }).waitFor({ state: 'visible' });
+  await rejectedNested.locator('strong').filter({ hasText: /^nested prose marker$/ }).waitFor({ state: 'visible' });
+  if (await rejectedNested.locator('.markdown-details').count()) throw new Error('Unsupported nested authored envelope was promoted');
+  if (await fixtureValue(page, 'older-snapshot-requests') !== '2') throw new Error('Authored disclosure navigation reacquired loaded history');
+  await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--nested-historical-fallback.png`, fullPage: true });
+  journeys.push(`${id}/${viewport.name}: loaded historical prose uses one native nonnested Markdown disclosure; unsupported nested envelope remains visible literal syntax with ordinary Markdown body, independently of the literal persisted handoff summary and history-owned outer disclosure`);
+  if (id.includes('global-lazy-history')) {
+    await page.evaluate(() => { location.hash = '/global/history-3?source_transcript=history-1#message-history-answer-1'; });
+    await page.waitForFunction(() => document.querySelector('.coordinator-conversation')?.hidden === false
+      && document.documentElement.dataset.sourceFixtureLocation?.includes('source_transcript=history-1'));
+    await page.getByRole('button', { name: /Member 2 request/ }).click();
+    await page.waitForFunction(() => document.querySelector('.coordinator-conversation')?.hidden === false
+      && document.documentElement.dataset.sourceFixtureLocation?.includes('source_transcript=history-2'));
+    if (await fixtureValue(page, 'older-snapshot-requests') !== '2') throw new Error('Changing a validated Global source pin discarded acquired history');
+    await page.getByRole('button', { name: /Member 1 request/ }).waitFor({ state: 'visible' });
+    journeys.push(`${id}/${viewport.name}: changing validated Global member pins retains the acquired prefix and aggregate owner`);
+  }
+  const input = page.locator('.product-conversation-page__composer #message-input');
+  await input.fill('Newest member remains writable after historical navigation');
+  await input.press('Enter');
+  await page.waitForFunction(() => document.documentElement.dataset.productConversationFixtureSendCount === '1');
+  if (!(await fixtureValue(page, 'event-source-last-url'))?.includes('history-3')) throw new Error('Historical selection moved live/composer ownership');
+  journeys.push(`${id}/${viewport.name}: unloaded exact boundary acquires two pages; collapsed/expanded original summary and provenance; loaded selection avoids duplicate read; browser Back/Forward crosses hashless entry using fixture HashRouter transport; newest member receives send`);
 }
 
 async function fixtureValue(page, name) {
@@ -316,7 +403,7 @@ async function writeReport(outDir) {
     '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |',
     ...measurements.map((item) => `| ${item.id} | ${item.viewport} | ${item.theme} | ${item.transcript.height} | ${item.mainArea.height} | ${item.chatView.height} | ${item.virtualTranscript.height} | ${item.positiveRows} | ${item.horizontalOverflow ? 'yes' : 'no'} |`),
     '', '## Deterministic interaction coverage', ...journeys.map((journey) => `- ${journey}`), '',
-    'Screenshots: every scenario in light/dark at desktop/mobile, plus open viewer and Recall states. Viewport containment and CSS safe-area token use are checked separately; emulated zero-inset viewports cannot prove physical notch geometry. Shared runner fails on unexpected console, page, request, and >=400 response failures.',
+    'Screenshots and journeys cover only the scenarios selected for this run. Geometry, viewer, and Recall coverage is present only where recorded above. Lazy-history fixtures use HashRouter so browser Back/Forward exercises actual browser history without a Phoenix server; this is not production-path cold-reload or physical-device acceptance. Emulated zero-inset viewports cannot prove physical notch geometry. Shared runner fails on unexpected console, page, request, and >=400 response failures.',
     `Browser engine: ${process.env.PLAYWRIGHT_BROWSER ?? 'chromium'}.`, '',
   ].join('\n');
   await writeFile(path.join(outDir, 'UAT_REPORT.md'), report);
@@ -334,10 +421,20 @@ runSurfaceCapture({
     const theme = viewport.name.endsWith('-light') ? 'light' : 'dark';
     const fixtureHash = id === 'long-history-110-messages' ? '#message-long-older-target' : '';
     const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${process.env.LADLE_PORT ?? 61123}/`;
-    return buildLadleStoryUrl(baseUrl, storyKey, { fixtureTheme: theme, fixtureHash });
+    return buildLadleStoryUrl(baseUrl, storyKey, { fixtureTheme: theme, fixtureHash,
+      ...(['ordinary-lazy-history', 'global-lazy-history'].includes(id) ? { fixtureBrowserHistory: '1' } : {}),
+    });
+  },
+  preparePage: async ({ page }) => {
+    await page.route('**/api/**', route => route.abort('blockedbyclient'));
   },
   captureStory: async ({ page, id, outDir, viewport }) => {
     const theme = await fixtureValue(page, 'theme') ?? 'dark';
+    if (id === 'ordinary-lazy-history' || id === 'global-lazy-history') {
+      await assertSupersededBoundary(page, id, viewport, outDir);
+      await assertLazyHistory(page, id, viewport, outDir);
+      return false;
+    }
     if (id === 'source-call-global' || id === 'source-call-ordinary') { await assertSourceCall(page, id, viewport, outDir); return false; }
     if (!['loading', 'error'].includes(id)) await assertTranscriptGeometry(page, id, viewport, theme);
     await page.screenshot({ path: `${outDir}/${id}--${viewport.name}--${theme}--initial.png`, fullPage: true });

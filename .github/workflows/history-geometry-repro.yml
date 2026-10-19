@@ -1,0 +1,74 @@
+name: Bounded artifact geometry reproduction
+on:
+  push:
+    branches: [qualification/history-geometry-once]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: history-geometry-once
+  cancel-in-progress: false
+jobs:
+  geometry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      APP_ROOT: ${{ github.workspace }}/pinned-app
+      GEOMETRY_ARTIFACT: ${{ github.workspace }}/retained-artifact
+      GEOMETRY_OUTPUT: ${{ github.workspace }}/geometry-evidence
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 191dacb3e7bcd671990298be8896d6cdcdb2015c
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 302a3733e9013bb09beb1e83c92b29b616ab0706
+          path: pinned-app
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - uses: astral-sh/setup-uv@v6
+      - name: Reuse exact retained artifact (no builds)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir retained-artifact geometry-evidence
+          gh api repos/scottopell/phoenix-ide/actions/artifacts/12084070461 > geometry-evidence/github-artifact.json
+          python3 - <<'PYMETA'
+          import json
+          from pathlib import Path
+          a=json.loads(Path('geometry-evidence/github-artifact.json').read_text())
+          assert a['id']==12084070461 and a['workflow_run']['id']==38986752552
+          assert a['name']=='opening-codegen-98718c5c05b8191a1cfbf418652a1d08ec401c6c-1'
+          assert a['size_in_bytes']==96401945 and a['expired'] is False
+          PYMETA
+          gh run download 38986752552 --repo scottopell/phoenix-ide --name opening-codegen-98718c5c05b8191a1cfbf418652a1d08ec401c6c-1 --dir retained-artifact
+      - name: Frozen runtime dependencies only
+        working-directory: pinned-app/ui
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm exec playwright install --with-deps chromium
+      - name: One ordinary fixture geometry observation (not acceptance)
+        working-directory: harness
+        run: timeout --signal=TERM --kill-after=5s 210s uv run --with opentelemetry-proto==1.39.0 tests/e2e/history_geometry_repro.py
+      - name: Retain only private-safe geometry evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-geometry-diagnostic-not-acceptance
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            geometry-evidence/geometry.json
+            geometry-evidence/messages.png
+            geometry-evidence/provenance.json
+            geometry-evidence/completion.json
+            geometry-evidence/driver-exit.json
+            geometry-evidence/github-artifact.json
+            geometry-evidence/server-completion.json

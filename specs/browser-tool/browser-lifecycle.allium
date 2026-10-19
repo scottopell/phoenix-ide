@@ -85,13 +85,19 @@ enum BrowserLifecycleKind {
     | teardown_failed
 }
 
--- Session lifecycle status. The HashMap membership is the single source of
--- truth — `live` or `teardown_failed` iff the manager holds a map entry for the scope.
+-- Every non-retired reservation occupies the manager's existing registry key.
 enum SessionStatus {
     uninitialized
     | live
+    | pre_spawn_failed
+    | unobservable_attempt
     | teardown_failed
     | torn_down
+}
+
+enum BrowserProfilePolicy {
+    stable_scope
+    | cli_transient
 }
 
 ------------------------------------------------------------
@@ -105,9 +111,16 @@ entity BrowserSession {
     scope: WorkScope
 
     status: SessionStatus
+    profile_policy: BrowserProfilePolicy
+    user_data_dir: String
 
     transitions status {
         uninitialized -> live
+        uninitialized -> pre_spawn_failed
+        uninitialized -> unobservable_attempt
+        uninitialized -> teardown_failed
+        pre_spawn_failed -> torn_down
+        unobservable_attempt -> unobservable_attempt
         live -> teardown_failed
         live -> torn_down
         teardown_failed -> teardown_failed
@@ -115,9 +128,22 @@ entity BrowserSession {
         terminal: torn_down
     }
 
-    -- The Chrome process this session owns. Created on the transition to
-    -- live, dropped on the transition to torn_down.
-    chrome: ChromeProcess
+    chrome: ChromeProcess?
+
+    @invariant CliTransientProfileAdmission
+        -- CLI transient profiles are selected only by the standalone CLI policy. A
+        -- genuinely fresh or authoritatively retired lifetime receives a new actual
+        -- path; cleanup follows that path. A retained owned or unobservable attempt
+        -- prevents any replacement lifetime regardless of its proposed path. IDE
+        -- managers retain the stable_scope policy and scope-derived path.
+
+    @invariant InitializationAuthority
+        -- The reservation exists before any potentially spawning operation. A
+        -- returned browser, handler, adopted group, actual profile path, and marker
+        -- state remain owned across partial initialization and cleanup failure.
+        -- Caller cancellation does not cancel the manager-owned driver. Close
+        -- retries retained authority; an unobservable attempt cannot prove absence
+        -- or authorize deletion, fallback spawning, or a new profile lifetime.
 }
 
 ------------------------------------------------------------
@@ -129,7 +155,10 @@ entity BrowserSession {
 invariant OneSessionPerScope {
     for s in BrowserSession where s.status != torn_down:
         count(BrowserSession{scope: s.scope, status: live})
-            + count(BrowserSession{scope: s.scope, status: teardown_failed}) <= 1
+            + count(BrowserSession{scope: s.scope, status: teardown_failed})
+            + count(BrowserSession{scope: s.scope, status: uninitialized})
+            + count(BrowserSession{scope: s.scope, status: pre_spawn_failed})
+            + count(BrowserSession{scope: s.scope, status: unobservable_attempt}) <= 1
 }
 
 -- Disjoint namespaces: a Worktree scope with the same `inner` as a
@@ -143,9 +172,19 @@ invariant ScopeNamespaceDisjoint {
 -- The user data dir is derived from WorkScope::stable_key(). Two sessions
 -- that share a scope therefore share the on-disk Chrome profile (which is
 -- precisely why continuations inherit cookies / localStorage / open tabs).
+invariant ReadyHasRetainedChrome {
+    for s in BrowserSession where s.status = live or s.status = teardown_failed:
+        s.chrome != null
+}
+
+invariant RetainedChromeUsesActualProfile {
+    for s in BrowserSession where s.chrome != null:
+        s.chrome.user_data_dir = s.user_data_dir
+}
+
 invariant UserDataDirDerivedFromScope {
-    for s in BrowserSession:
-        s.chrome.user_data_dir = user_data_dir_for_scope(s.scope)
+    for s in BrowserSession where s.profile_policy = stable_scope:
+        s.user_data_dir = user_data_dir_for_scope(s.scope)
 }
 
 ------------------------------------------------------------
@@ -154,27 +193,71 @@ invariant UserDataDirDerivedFromScope {
 
 -- REQ-BROWSER-WS-001 / REQ-BT-010: lazy creation on first get_session for
 -- a given scope.
+-- Helpers:
+-- user_data_dir_for_scope(scope: WorkScope) -> String: the stable IDE path.
+-- actual_user_data_dir_for_scope(scope: WorkScope) -> String: the path captured
+-- from the uniquely owned reservation before cleanup, independent of policy.
+
 rule SessionCreatedOnFirstGet {
-    when: AgentCallsBrowserSession(scope)
+    when: AgentCallsBrowserSession(scope, profile_policy, user_data_dir)
 
     requires: not exists BrowserSession{scope: scope, status: live}
     requires: not exists BrowserSession{scope: scope, status: teardown_failed}
+    requires: not exists BrowserSession{scope: scope, status: uninitialized}
+    requires: not exists BrowserSession{scope: scope, status: pre_spawn_failed}
+    requires: not exists BrowserSession{scope: scope, status: unobservable_attempt}
 
     ensures: BrowserSession.created(
         scope: scope,
-        status: live
-    )
-    ensures: BrowserSessionLifecycleEvent.emitted(
-        work_scope: scope,
-        kind: active
+        profile_policy: profile_policy,
+        user_data_dir: user_data_dir,
+        status: uninitialized
     )
 
     @guidance
-        -- Probe under read lock; on miss, acquire write lock and
-        -- double-check before launching Chrome. The user_data_dir name
-        -- comes from WorkScope::stable_key() with `/` sanitized.
-        -- Emit the lifecycle event AFTER releasing the write lock so
-        -- subscribers can re-enter the manager without deadlocking.
+        -- Reserve under the existing scope/actor fence before spawning. IDE callers
+        -- select stable_scope; only standalone CLI construction selects
+        -- cli_transient. The retained driver owns initialization and listener setup.
+
+}
+
+rule InitializationBecomesReady {
+    when: BrowserInitializationSucceeded(session, chrome)
+    requires: session.status = uninitialized
+    ensures: session.status = live
+    ensures: session.chrome = chrome
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: session.scope,
+        kind: active
+    )
+}
+
+rule InitializationFailsBeforeSpawn {
+    when: BrowserPreparationFailed(session)
+    requires: session.status = uninitialized
+    ensures: session.status = pre_spawn_failed
+}
+
+rule InitializationFailsWithRetainedBrowser {
+    when: BrowserPartialInitializationFailed(session, chrome)
+    requires: session.status = uninitialized
+    ensures: session.status = teardown_failed
+    ensures: session.chrome = chrome
+}
+
+rule InitializationFailsWithoutRecoverableHandle {
+    when: BrowserLaunchAuthorityUnobservable(session)
+    requires: session.status = uninitialized
+    ensures: session.status = unobservable_attempt
+}
+
+rule PreSpawnFailureRetires {
+    when: BrowserPreSpawnReservationClosed(session)
+    requires: session.status = pre_spawn_failed
+    ensures: session.status = torn_down
+    @guidance
+        -- Do not delete a pre-existing or untrusted profile. No potentially spawning
+        -- operation occurred for this reservation.
 }
 
 -- REQ-BROWSER-WS-002: a continuation member calling get_session with the
@@ -183,7 +266,7 @@ rule SessionCreatedOnFirstGet {
 -- was already active and the UI's initial enriched view will reflect it
 -- via is_active(&scope).
 rule ContinuationReusesSession {
-    when: AgentCallsBrowserSession(scope)
+    when: AgentCallsBrowserSession(scope, profile_policy, user_data_dir)
 
     requires: exists BrowserSession{scope: scope, status: live}
 
@@ -254,7 +337,7 @@ rule CascadeTearsDownWhenNoInheritor {
         work_scope: work_scope,
         kind: inactive
     )
-    ensures: UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+    ensures: UserDataDirRemoved(actual_user_data_dir_for_scope(work_scope))
 
     @guidance
         -- The kill awaits explicit Chrome termination before removing the
@@ -282,7 +365,7 @@ rule CascadeTeardownFailureRetained {
         work_scope: work_scope,
         kind: teardown_failed
     )
-    ensures: not UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+    ensures: not UserDataDirRemoved(actual_user_data_dir_for_scope(work_scope))
 }
 
 rule FailedTeardownRetryStarts {
@@ -312,7 +395,7 @@ rule FailedTeardownRetrySucceeds {
         work_scope: work_scope,
         kind: inactive
     )
-    ensures: UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+    ensures: UserDataDirRemoved(actual_user_data_dir_for_scope(work_scope))
 }
 
 rule FailedTeardownRetryFails {
@@ -325,7 +408,7 @@ rule FailedTeardownRetryFails {
         work_scope: work_scope,
         kind: teardown_failed
     )
-    ensures: not UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+    ensures: not UserDataDirRemoved(actual_user_data_dir_for_scope(work_scope))
 }
 
 -- REQ-BROWSER-WS-003: cleanup-cascade preservation when a live conversation
@@ -383,7 +466,7 @@ rule IdleSessionCleanedUp {
             work_scope: session.scope,
             kind: inactive
         )
-        ensures: UserDataDirRemoved(user_data_dir_for_scope(session.scope))
+        ensures: UserDataDirRemoved(session.user_data_dir)
 }
 
 rule IdleSessionTeardownFailureRetained {
@@ -399,7 +482,7 @@ rule IdleSessionTeardownFailureRetained {
         work_scope: session.scope,
         kind: teardown_failed
     )
-    ensures: not UserDataDirRemoved(user_data_dir_for_scope(session.scope))
+    ensures: not UserDataDirRemoved(session.user_data_dir)
 }
 
 -- REQ-BT-010: the skip path. An idle session whose scope is still live — a

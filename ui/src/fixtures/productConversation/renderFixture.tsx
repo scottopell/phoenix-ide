@@ -1,8 +1,8 @@
 import { ProductConversationAliasRedirect } from '../../App';
 import { CoordinatorPage } from '../../pages/CoordinatorPage';
 import { FocusScopeProvider } from '../../hooks/useFocusScope';
-import { useEffect, useRef, useState } from 'react';
-import { MemoryRouter, Route, Routes, useParams, useLocation } from 'react-router-dom';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { HashRouter, MemoryRouter, Navigate, Route, Routes, useParams, useLocation } from 'react-router-dom';
 import { ChainProvider } from '../../chain';
 import { useDocumentViewportOwnership } from '../../components/viewportRoutes';
 import { FileExplorerProvider } from '../../components/FileExplorer';
@@ -14,6 +14,12 @@ import { ProductConversationPage } from '../../pages/ProductConversationPage';
 import '../../index.css';
 import { installProductConversationFixtureApi } from './mockApi';
 import type { ProductConversationScenario } from './types';
+
+function FixtureRouter({ initialEntry, children }: { initialEntry: string; children: ReactNode }) {
+  return new URLSearchParams(window.location.search).get('fixtureBrowserHistory') === '1'
+    ? <HashRouter>{children}</HashRouter>
+    : <MemoryRouter initialEntries={[initialEntry]}>{children}</MemoryRouter>;
+}
 
 function FixtureLocation() {
   const location = useLocation();
@@ -46,7 +52,7 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
   const page = root.querySelector('[data-testid="product-conversation-page"]');
   if (!page) return false;
   const hasConversation = page.querySelector('#chat-view') !== null;
-  if (scenario.snapshot?.ordinary_lifecycle === 'history') {
+  if (scenario.kind !== 'coordinator' && scenario.snapshot?.ordinary_lifecycle === 'history') {
     return hasConversation
       && page.querySelector('[data-testid="product-conversation-history"]') !== null;
   }
@@ -101,7 +107,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       data-product-conversation-fixture={scenario.id}
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
     >
-      <MemoryRouter initialEntries={[new URLSearchParams(window.location.search).get('fixtureEntry') ?? `${scenario.initialEntry ?? '/product-conversations/fixture-product-conversation'}${fixtureHash}`]}>
+      <FixtureRouter initialEntry={new URLSearchParams(window.location.search).get('fixtureEntry') ?? (scenario.initialEntry ?? (scenario.kind === 'coordinator' ? `/global/${scenario.snapshot.latest_transcript_row_id}${fixtureHash}` : `/product-conversations/fixture-product-conversation${fixtureHash}`))}>
         <FixtureLocation />
         <FocusScopeProvider>
           <ConversationProvider>
@@ -113,6 +119,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
                 <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>
                   <FileExplorerProvider>
                     <Routes>
+                      <Route path="/" element={<Navigate replace to={new URLSearchParams(window.location.search).get('fixtureEntry') ?? (scenario.kind === 'coordinator' ? `/global/${scenario.snapshot.latest_transcript_row_id}${fixtureHash}` : `/product-conversations/fixture-product-conversation${fixtureHash}`)} />} />
                       <Route path="/c/:slug" element={<FixtureAlias />} />
                       <Route path="/global/:slug" element={<CoordinatorPage />} />
                       <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
@@ -123,7 +130,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
             </ConversationReadinessProvider>
           </ConversationProvider>
         </FocusScopeProvider>
-      </MemoryRouter>
+      </FixtureRouter>
     </main>
   );
 }
@@ -133,9 +140,12 @@ export function ProductConversationFixture({ scenario }: Props) {
 
   useEffect(() => {
     const restoreApi = installProductConversationFixtureApi(scenario);
+    const originalUrl = window.location.href;
+    const params = new URLSearchParams(window.location.search);
     setInstalled(true);
     return () => {
       restoreApi();
+      if (params.get('fixtureBrowserHistory') === '1') window.history.replaceState(null, '', originalUrl);
       setInstalled(false);
     };
   }, [scenario]);
