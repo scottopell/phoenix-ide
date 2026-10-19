@@ -1,6 +1,33 @@
 use super::*;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+fn goal_count_sql(table: &str, owner_scoped: bool) -> &'static str {
+    let (all, owner) = match table {
+        "conversation_goal_ids" => (
+            "SELECT count(*) FROM conversation_goal_ids",
+            "SELECT count(*) FROM conversation_goal_ids WHERE owner_id=?",
+        ),
+        "conversation_goal_history" => (
+            "SELECT count(*) FROM conversation_goal_history",
+            "SELECT count(*) FROM conversation_goal_history WHERE owner_id=?",
+        ),
+        "conversation_goal_actors" => (
+            "SELECT count(*) FROM conversation_goal_actors",
+            "SELECT count(*) FROM conversation_goal_actors WHERE owner_id=?",
+        ),
+        "conversation_goal_bindings" => (
+            "SELECT count(*) FROM conversation_goal_bindings",
+            "SELECT count(*) FROM conversation_goal_bindings WHERE owner_id=?",
+        ),
+        _ => panic!("not a goal fixture table: {table}"),
+    };
+    if owner_scoped {
+        owner
+    } else {
+        all
+    }
+}
+
 fn p(value: &str) -> ProductConversationId {
     ProductConversationId::parse(value).unwrap()
 }
@@ -271,7 +298,7 @@ async fn wrong_owner_role_and_fabricated_user_channel_roll_back_every_row() {
             "conversation_goal_actors",
             "conversation_goal_history",
         ] {
-            let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            let count: i64 = sqlx::query_scalar(goal_count_sql(table, false))
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
@@ -468,7 +495,7 @@ async fn agent_locator_must_name_a_real_assistant_tool_call_for_both_actor_roles
                 "conversation_goal_actors",
                 "conversation_goal_history",
             ] {
-                let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+                let count: i64 = sqlx::query_scalar(goal_count_sql(table, false))
                     .fetch_one(db.pool())
                     .await
                     .unwrap();
@@ -489,7 +516,7 @@ async fn failed_history_insert_rolls_back_both_actor_rows() {
         "conversation_goal_actors",
         "conversation_goal_history",
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        let count: i64 = sqlx::query_scalar(goal_count_sql(table, false))
             .fetch_one(db.pool())
             .await
             .unwrap();
@@ -556,9 +583,9 @@ async fn superseded_goal_identity_cannot_be_reused_or_bypass_owner_version() {
 async fn timestamp_constraints_reject_text_and_negative_integers() {
     let (_dir, db) = fixture().await;
     db.mutate_conversation_goal(&create(), at()).await.unwrap();
-    for timestamp in ["'not-an-integer'", "-1", "1.5"] {
-        let sql = format!("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,'blocked','input needed','timestamp-test','state',NULL,requested_actor_id,applied_actor_id,{timestamp} FROM conversation_goal_history WHERE version=1");
-        assert!(sqlx::query(&sql).execute(db.pool()).await.is_err());
+    for timestamp in ["not-an-integer", "-1", "1.5"] {
+        assert!(sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,'blocked','input needed','timestamp-test','state',NULL,requested_actor_id,applied_actor_id,? FROM conversation_goal_history WHERE version=1")
+            .bind(timestamp).execute(db.pool()).await.is_err());
     }
     assert_eq!(
         db.conversation_goal_history(&p("owner"), GoalVersion::INITIAL)
@@ -587,9 +614,9 @@ async fn raw_report_row_cannot_reference_another_owner_or_wrong_version() {
     };
     bind(&db, &other).await.unwrap();
     for turn in [1, 2] {
-        let sql = format!("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,'complete','done','raw-report','report',{turn},requested_actor_id,applied_actor_id,10 FROM conversation_goal_history WHERE version=1");
         // turn=1 also fails: the copied requester is UserApi, not the admitted owning agent.
-        assert!(sqlx::query(&sql).execute(db.pool()).await.is_err());
+        assert!(sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,'complete','done','raw-report','report',?,requested_actor_id,applied_actor_id,10 FROM conversation_goal_history WHERE version=1")
+            .bind(turn).execute(db.pool()).await.is_err());
     }
     let second = db
         .mutate_conversation_goal(
@@ -648,12 +675,11 @@ async fn real_migrations_user_goal_supersession_and_supported_hard_delete_do_not
         "conversation_goal_history",
         "conversation_goal_actors",
     ] {
-        let count: i64 =
-            sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE owner_id=?"))
-                .bind(owner.as_str())
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let count: i64 = sqlx::query_scalar(goal_count_sql(table, true))
+            .bind(owner.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(count, 0, "{table}");
     }
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
@@ -948,12 +974,11 @@ async fn real_migrations_terminal_and_superseded_goals_do_not_pin_supported_hard
             "conversation_goal_actors",
             "conversation_goal_bindings",
         ] {
-            let count: i64 =
-                sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE owner_id=?"))
-                    .bind(owner.as_str())
-                    .fetch_one(db.pool())
-                    .await
-                    .unwrap();
+            let count: i64 = sqlx::query_scalar(goal_count_sql(table, true))
+                .bind(owner.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
             assert_eq!(count, 0, "{table}");
         }
     }
