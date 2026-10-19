@@ -20,5 +20,14 @@ Expansion references route through a `MessageExpander` layer in `send_chat` (and
 | **REQ-IR-006:** Preserve Original Shorthand in Conversation History | ✅ Complete | `display_text`/`llm_text` separation in DB schema, state machine, and handlers |
 | **REQ-IR-007:** Graceful Handling of Unresolvable Expansion References | ✅ Complete | `ExpansionError` enum (backend), HTTP 422, `ExpansionError` class in `ui/src/api.ts` |
 | **REQ-IR-008:** Reference Files by Path Without Expansion | ✅ Complete | `./` mode inserts literal path only; no server-side expansion |
+| **REQ-IR-009:** Recover a Late Expansion Rejection Without Replacing New Work | Candidate — hosted verification pending | `InputArea.restoreSubmission` checks composer ownership; `DraftStore.recovery` binds raw payload recovery to draft revision and lifetime. Newer work remains untouched; rejected submissions remain separately recoverable. |
 
-**Progress:** 8 of 8 complete
+**Progress:** 8 of 9 complete (1 candidate)
+
+## Candidate Verification and Scope
+
+The implementation owner reports 83 focused tests plus a draft-lifetime regression passing. Hosted verification is pending; no deployment or production acceptance is claimed. The candidate covers unchanged post-clear restoration, preservation of newer text/attachments/independent recording, separate rejected-payload recovery, and scope/lifetime/revision guards, including edit-away-and-back and removed/recreated draft lifetimes. Voice-specific behavior is defined by REQ-VOICE-008 in `../voice-input/requirements.md`.
+
+This is a bounded late-expansion-error correction, not a generic queue framework. Transport failure/retry queues and Close behavior are unchanged. Recovery remains in memory within the originating draft lifetime. The existing Allium model covers expansion and autocomplete, not composer recovery; REQ-IR-009 is specified in requirements prose without adding a parallel composer state machine.
+
+Adjacent out-of-scope `addImages` captured-list and external-draft-insertion/voice-end overwrite risks are recorded in `../voice-input/executive.md` under Adjacent TODOs; neither is fixed by this candidate.

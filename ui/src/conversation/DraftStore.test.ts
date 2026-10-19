@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { DraftStore, draftReducer } from './DraftStore';
 
 describe('draftReducer', () => {
@@ -84,6 +84,98 @@ describe('draftReducer', () => {
 });
 
 describe('DraftStore', () => {
+  it('conditionally restores only the exact empty revision, including ABA and attachment-only sends', () => {
+    const store = new DraftStore();
+    const recovery = store.recovery('a');
+    const first = recovery.clearForSubmission();
+    expect(recovery.restoreIfUnchanged(first, 'raw rejected')).toBe(true);
+    const second = recovery.clearForSubmission();
+    store.dispatch('a', { type: 'append_draft', text: 'external insertion' });
+    store.dispatch('a', { type: 'clear_draft' });
+    expect(recovery.restoreIfUnchanged(second, 'must not restore')).toBe(false);
+    const third = recovery.clearForSubmission();
+    const fourth = recovery.clearForSubmission();
+    expect(third).not.toBe(fourth);
+    expect(recovery.restoreIfUnchanged(third, 'older attachment-only send')).toBe(false);
+    expect(recovery.restoreIfUnchanged(fourth, 'latest')).toBe(true);
+  });
+
+  it('retains rejected payloads separately by original slug without changing the text revision', () => {
+    const store = new DraftStore();
+    const recovery = store.recovery('a');
+    const revision = recovery.clearForSubmission();
+    const payload = { id: 'one', text: '  raw\n', images: [{ media_type: 'image/png', data: 'YWJj' }], files: [], error: 'missing' };
+    recovery.retainRejected(payload);
+    expect(recovery.readRevision()).toBe(revision);
+    expect(store.getRejected('a')).toEqual([payload]);
+    expect(store.getRejected('b')).toEqual([]);
+    recovery.removeRejected('one');
+    expect(store.getRejected('a')).toEqual([]);
+  });
+
+  it('invalidates revisions and drops rejected payloads on removal', () => {
+    const store = new DraftStore();
+    const recovery = store.recovery('a');
+    const revision = recovery.clearForSubmission();
+    recovery.retainRejected({ id: 'one', text: 'raw', images: [], files: [], error: 'missing' });
+    store.remove('a');
+    expect(recovery.restoreIfUnchanged(revision, 'stale')).toBe(false);
+    expect(store.getRejected('a')).toEqual([]);
+  });
+
+  it('makes every old recovery operation inert after removal without recreating an atom', () => {
+    const store = new DraftStore();
+    const recovery = store.recovery('a');
+    const revision = recovery.clearForSubmission();
+    store.remove('a');
+    const snapshot = vi.spyOn(store, 'getSnapshot');
+    const notified = vi.fn();
+    store.subscribe('a', notified);
+
+    const invalid = recovery.readRevision();
+    expect(recovery.clearForSubmission()).toBe(invalid);
+    expect(recovery.restoreIfUnchanged(revision, 'stale')).toBe(false);
+    expect(recovery.restoreIfUnchanged(invalid, 'also stale')).toBe(false);
+    recovery.retainRejected({ id: 'one', text: 'deleted', images: [], files: [], error: 'missing' });
+    recovery.removeRejected('one');
+
+    expect(snapshot).not.toHaveBeenCalled();
+    expect(notified).not.toHaveBeenCalled();
+    expect(store.getRejected('a')).toEqual([]);
+  });
+
+  it('keeps old handles inert after a fresh lifetime reuses the same slug', () => {
+    const store = new DraftStore();
+    const old = store.recovery('a');
+    expect(store.recovery('a')).toBe(old);
+    const oldRevision = old.clearForSubmission();
+    store.remove('a');
+    const fresh = store.recovery('a');
+    expect(fresh).not.toBe(old);
+    expect(store.recovery('a')).toBe(fresh);
+    const freshRevision = fresh.clearForSubmission();
+    const payload = { id: 'one', text: 'fresh', images: [], files: [], error: 'missing' };
+    fresh.retainRejected(payload);
+    const notified = vi.fn();
+    store.subscribe('a', notified);
+
+    expect(old.restoreIfUnchanged(oldRevision, 'deleted')).toBe(false);
+    expect(old.restoreIfUnchanged(freshRevision, 'deleted')).toBe(false);
+    old.retainRejected({ ...payload, text: 'deleted' });
+    old.removeRejected('one');
+    old.clearForSubmission();
+    expect(old.readRevision()).not.toBe(freshRevision);
+
+    expect(notified).not.toHaveBeenCalled();
+    expect(fresh.readRevision()).toBe(freshRevision);
+    expect(store.getRejected('a')).toEqual([payload]);
+    expect(fresh.restoreIfUnchanged(freshRevision, 'new conversation')).toBe(true);
+    old.clearForSubmission();
+    expect(store.getSnapshot('a').draft).toBe('new conversation');
+    fresh.removeRejected('one');
+    expect(store.getRejected('a')).toEqual([]);
+  });
+
   it('routes dispatches by slug — different slugs do not interfere', () => {
     const store = new DraftStore();
     store.dispatch('alpha', { type: 'set_draft', text: 'A' });

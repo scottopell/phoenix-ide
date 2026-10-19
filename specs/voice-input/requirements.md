@@ -100,3 +100,18 @@ AND maintain the recording state indicator visibility
 
 **Rationale:** Mobile users are the primary beneficiaries of voice input and need an optimized experience.
 
+---
+
+### REQ-VOICE-008: Voice Ownership During Late Expansion Recovery
+
+WHEN the user sends while dictation is active
+THE SYSTEM SHALL capture the composed raw text, including submitted final and interim transcription
+AND SHALL retire that recording's callbacks so they cannot repopulate the cleared composer or mutate a later recording.
+
+WHEN that submission receives a late expansion rejection
+THE SYSTEM SHALL apply [REQ-IR-009](../inline-references/requirements.md#req-ir-009-recover-a-late-expansion-rejection-without-replacing-new-work)
+AND SHALL restore eligible voice text as ordinary editable draft text, not as an active recording
+AND SHALL NOT overwrite newer text, attachments, or an independent recording with the rejected transcription.
+
+WHEN the composer changes scope or the recording is retired
+THE SYSTEM SHALL prevent callbacks owned by that recording from modifying the successor composer or recording.
