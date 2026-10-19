@@ -7,7 +7,7 @@ export const bashLaunchOutcomes: UnregisteredBashResponse[] = (
 ).flatMap((launch_error): UnregisteredBashResponse[] => {
   const run = {
     cmd: 'side-effecting-command', label: null, launch_error,
-    descendants: 'unverified', output_complete: false, duration_ms: 12,
+    descendants: 'unverified' as const, output_complete: false, duration_ms: 12,
     start_offset: 1, end_offset: 1, truncated_before: false,
     lines: [{ offset: 1, bytes: 'retained-tail' }],
   };
