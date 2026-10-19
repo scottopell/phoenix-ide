@@ -192,11 +192,28 @@ async fn turn_and_goal_observation_share_both_admission_crash_cuts() {
 #[tokio::test]
 async fn accepted_steering_does_not_mint_an_execution_goal_binding() {
     let (db, repo, _) = fixture().await;
+    let runtime = repo
+        .accept_authoritative_turn(&input("capture-root", "runtime-owner", 1))
+        .await
+        .unwrap();
+    let TurnOutcome::Created {
+        turn_id: runtime_turn,
+        ..
+    } = runtime.outcome
+    else {
+        panic!("expected the runtime owner before steering");
+    };
+    let runtime_execution = execution(&repo, runtime_turn).await;
+    let runtime_binding = db
+        .conversation_goal_execution_binding(runtime_execution)
+        .await
+        .unwrap()
+        .expect("runtime admission must capture its observation");
     let turn = repo
         .accept_authoritative_turn(&input_with_disposition(
             "capture-root",
             "steering",
-            1,
+            2,
             AcceptedDisposition::Steering,
         ))
         .await
@@ -209,4 +226,10 @@ async fn accepted_steering_does_not_mint_an_execution_goal_binding() {
         .await
         .unwrap()
         .is_none());
+    assert_eq!(
+        db.conversation_goal_execution_binding(runtime_execution)
+            .await
+            .unwrap(),
+        Some(runtime_binding),
+    );
 }
