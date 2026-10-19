@@ -451,16 +451,21 @@ async fn history_and_binding_rows_cannot_be_rewritten_or_deleted() {
 }
 
 #[tokio::test]
-async fn staged_schema_applies_after_real_migrations_without_rewriting_existing_data() {
+async fn registered_schema_exists_after_fresh_normal_initialization_and_replay_is_noop() {
     let db = Database::open_in_memory().await.unwrap();
     let before: i64 = sqlx::query_scalar("SELECT count(*) FROM product_conversations")
         .fetch_one(db.pool())
         .await
         .unwrap();
-    sqlx::raw_sql(include_str!("schema.sql"))
-        .execute(db.pool())
-        .await
-        .unwrap();
+    assert_eq!(
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('conversation_goal_ids','conversation_goal_actors','conversation_goal_history','conversation_goal_bindings')")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(tables, 4);
     let after: i64 = sqlx::query_scalar("SELECT count(*) FROM product_conversations")
         .fetch_one(db.pool())
         .await
@@ -636,10 +641,15 @@ async fn raw_report_row_cannot_reference_another_owner_or_wrong_version() {
 
 async fn full_substrate() -> (Database, ProductConversationId) {
     let db = Database::open_in_memory().await.unwrap();
-    sqlx::raw_sql(include_str!("schema.sql"))
-        .execute(db.pool())
-        .await
-        .unwrap();
+    assert_eq!(
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('conversation_goal_ids','conversation_goal_actors','conversation_goal_history','conversation_goal_bindings')")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(tables, 4);
     let conversation = db
         .create_conversation("full-root", "full-goal", "/tmp", true, None, None)
         .await
@@ -981,5 +991,181 @@ async fn real_migrations_terminal_and_superseded_goals_do_not_pin_supported_hard
                 .unwrap();
             assert_eq!(count, 0, "{table}");
         }
+    }
+}
+
+#[tokio::test]
+async fn real_migrations_goal_binding_successful_report_and_hard_delete_remove_all_goal_rows() {
+    let (db, owner) = full_substrate().await;
+    let mut request = create();
+    request.owner = owner.clone();
+    request.attribution.requested_by = GoalActor::UserApi {
+        transcript_id: t("full-root"),
+        message_id: t("full-input"),
+    };
+    let first = db
+        .mutate_conversation_goal(&request, at())
+        .await
+        .unwrap()
+        .snapshot;
+    let execution = GoalExecution::parse(1, 1).unwrap();
+    let captured = GoalExecutionBinding {
+        owner: owner.clone(),
+        execution,
+        observation: GoalAdmissionObservation::Goal(first.fence()),
+    };
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("INSERT INTO workflows (workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'direct_turn',1,1,1,0,0,'Active','direct_turn',1,X'00',0,0)")
+        .execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO durable_turns (turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation) VALUES (1,1,'full-root','full-turn','fixture',X'00','Runtime',0,1)")
+        .execute(&mut *tx).await.unwrap();
+    bind_goal_at_admission_tx(&mut tx, &captured).await.unwrap();
+    tx.commit().await.unwrap();
+    let blocks = serde_json::to_string(&vec![
+        phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+            id: "full-report-call".into(),
+            name: "goal_report".into(),
+            input: serde_json::json!({}),
+        },
+    ])
+    .unwrap();
+    sqlx::query("INSERT INTO messages (conversation_id,message_id,sequence_id,message_type,content,created_at,origin_kind) VALUES ('full-root','full-report-message',2,'agent',?,'2026-10-19T00:00:01Z','unknown_historical')")
+        .bind(blocks).execute(db.pool()).await.unwrap();
+    let report = GoalMutation {
+        owner: owner.clone(),
+        expected_version: first.version,
+        action_id: t("full-report"),
+        attribution: GoalAttribution {
+            requested_by: GoalActor::OwningAgent(GoalAgentSource {
+                product_conversation_id: owner.clone(),
+                transcript_id: t("full-root"),
+                execution,
+                message_id: t("full-report-message"),
+                tool_use_id: t("full-report-call"),
+            }),
+            applied_by: generated(),
+        },
+        change: GoalChange::Report {
+            binding: captured,
+            disposition: GoalDisposition::Complete(t("prepared")),
+        },
+    };
+    let completed = db.mutate_conversation_goal(&report, at()).await.unwrap();
+    assert!(matches!(completed.snapshot.state, GoalState::Complete(_)));
+    let history = db
+        .conversation_goal_history(&owner, GoalVersion::INITIAL)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1], completed);
+    db.delete_conversation("full-root").await.unwrap();
+    for table in [
+        "conversation_goal_ids",
+        "conversation_goal_history",
+        "conversation_goal_actors",
+        "conversation_goal_bindings",
+    ] {
+        let count: i64 = sqlx::query_scalar(goal_count_sql(table, true))
+            .bind(owner.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+}
+
+#[tokio::test]
+async fn prior_schema_upgrade_adds_empty_goal_storage_preserves_source_rows_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prior-goals.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    let db = Database::from_pool_for_tests(pool, path.to_string_lossy().into_owned());
+    db.run_migrations().await.unwrap();
+    crate::migrations::run_before_goal_storage_for_test(db.pool())
+        .await
+        .unwrap();
+    let goal_tables_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'conversation_goal_%'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(goal_tables_before, 0);
+    let conversation = db
+        .create_conversation("upgrade-root", "before goals", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO messages (conversation_id,message_id,sequence_id,message_type,content,created_at,origin_kind) VALUES ('upgrade-root','prior-input',1,'user',?,'2026-10-19T00:00:00Z','user_api')")
+        .bind(serde_json::json!({"text":"prior instruction","llm_text":null,"is_meta":false}).to_string())
+        .execute(db.pool()).await.unwrap();
+    let before: (String,String,String,String) = sqlx::query_as("SELECT c.id,c.product_conversation_id,m.message_id,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.id='upgrade-root'")
+        .fetch_one(db.pool()).await.unwrap();
+    db.pool().close().await;
+    let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+    let after: (String,String,String,String) = sqlx::query_as("SELECT c.id,c.product_conversation_id,m.message_id,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.id='upgrade-root'")
+        .fetch_one(reopened.pool()).await.unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        crate::migrations::run_pending_migrations(reopened.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    let ledger: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM _migrations WHERE name='durable_conversation_goal_storage'",
+    )
+    .fetch_one(reopened.pool())
+    .await
+    .unwrap();
+    assert_eq!(ledger, 1);
+    for table in [
+        "conversation_goal_ids",
+        "conversation_goal_history",
+        "conversation_goal_actors",
+        "conversation_goal_bindings",
+    ] {
+        let count: i64 = sqlx::query_scalar(goal_count_sql(table, false))
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    assert!(reopened
+        .conversation_goal(&conversation.product_conversation_id)
+        .await
+        .unwrap()
+        .is_none());
+    let mut request = create();
+    request.owner = conversation.product_conversation_id.clone();
+    request.attribution.requested_by = GoalActor::UserApi {
+        transcript_id: t("upgrade-root"),
+        message_id: t("prior-input"),
+    };
+    reopened
+        .mutate_conversation_goal(&request, at())
+        .await
+        .unwrap();
+    reopened.delete_conversation("upgrade-root").await.unwrap();
+    for table in [
+        "conversation_goal_ids",
+        "conversation_goal_history",
+        "conversation_goal_actors",
+        "conversation_goal_bindings",
+    ] {
+        let count: i64 = sqlx::query_scalar(goal_count_sql(table, true))
+            .bind(conversation.product_conversation_id.as_str())
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
     }
 }

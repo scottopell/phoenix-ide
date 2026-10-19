@@ -111,6 +111,17 @@ THE SYSTEM SHALL NOT infer completion from Idle, final prose, a WorkScope attach
 
 THE SYSTEM SHALL store concise objective-specific report reasons without requiring a universal artifact/proof form.
 
+#### Execution-suspension composition boundary
+
+THE SYSTEM SHALL represent pending structured questions and task approvals independently of goal status; awaiting either SHALL NOT by itself change an Underway goal to Blocked.
+
+WHEN a goal consumer encounters pending question or approval suspension
+THE SYSTEM SHALL preserve that suspension without admitting a competing goal follow-up.
+
+For the same impediment, the agent either asks and awaits a structured response, or explicitly reports the goal Blocked and finishes; it does not combine both paths. An explicit environmental Blocked report identifies the reason and needed action without secrets. Goal storage does not infer such a report from execution suspension.
+
+A Blocked attention notification uses the existing subscribed watch path and does not grant the Coordinator authority to answer a question or approve a task. Such action requires independently verified standing user scope. These composition constraints do not supply runtime wiring, new watch machinery or a replacement-at-idle policy.
+
 ### REQ-GOAL-007 — Retention follows owner deletion
 
 WHEN a source transcript, message or execution is deleted independently of a goal's ordinary owner

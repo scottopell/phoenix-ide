@@ -672,6 +672,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "bounded_federated_terminal_subscriptions",
         sql: include_str!("federation_subscriptions/schema.sql"),
     },
+    Migration {
+        version: 132,
+        name: "durable_conversation_goal_storage",
+        sql: include_str!("conversation_goals/schema.sql"),
+    },
 ];
 
 async fn run_migration_130(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
@@ -12060,8 +12065,21 @@ async fn run_migration_121(pool: &SqlitePool, migration: &Migration) -> DbResult
 /// # Errors
 ///
 /// Returns a [`DbError`] if the underlying database operation fails.
-#[allow(clippy::too_many_lines)]
 pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
+    run_migration_list(pool, MIGRATIONS).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_before_goal_storage_for_test(pool: &SqlitePool) -> DbResult<u32> {
+    let goal_index = MIGRATIONS
+        .iter()
+        .position(|migration| migration.name == "durable_conversation_goal_storage")
+        .expect("goal storage migration is registered");
+    run_migration_list(pool, &MIGRATIONS[..goal_index]).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbResult<u32> {
     // Ensure the tracking table exists
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS _migrations (\
@@ -12087,7 +12105,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
     let mut applied = 0u32;
 
-    for migration in MIGRATIONS {
+    for migration in migrations {
         if applied_versions.contains(&migration.version) {
             continue;
         }
