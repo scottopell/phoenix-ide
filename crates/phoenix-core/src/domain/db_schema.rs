@@ -1600,44 +1600,48 @@ impl InputOrigin {
         match (self, retry) {
             (
                 Self::InternalConversation {
-                    product_conversation_id: a,
-                    transcript_id: b,
+                    product_conversation_id: stored_product,
+                    transcript_id: stored_transcript,
                     ..
                 },
                 Self::InternalConversation {
-                    product_conversation_id: c,
-                    transcript_id: d,
+                    product_conversation_id: retry_product,
+                    transcript_id: retry_transcript,
                     ..
                 },
-            ) => a == c && b == d,
+            ) => stored_product == retry_product && stored_transcript == retry_transcript,
             (
                 Self::RemoteConversation {
-                    instance_id: a,
-                    product_conversation_id: b,
-                    transcript_id: c,
+                    instance_id: stored_instance,
+                    product_conversation_id: stored_product,
+                    transcript_id: stored_transcript,
                     ..
                 },
                 Self::RemoteConversation {
-                    instance_id: d,
-                    product_conversation_id: e,
-                    transcript_id: f,
+                    instance_id: retry_instance,
+                    product_conversation_id: retry_product,
+                    transcript_id: retry_transcript,
                     ..
                 },
             )
             | (
                 Self::RemoteCoordinator {
-                    instance_id: a,
-                    product_conversation_id: b,
-                    transcript_id: c,
+                    instance_id: stored_instance,
+                    product_conversation_id: stored_product,
+                    transcript_id: stored_transcript,
                     ..
                 },
                 Self::RemoteCoordinator {
-                    instance_id: d,
-                    product_conversation_id: e,
-                    transcript_id: f,
+                    instance_id: retry_instance,
+                    product_conversation_id: retry_product,
+                    transcript_id: retry_transcript,
                     ..
                 },
-            ) => a == d && b == e && c == f,
+            ) => {
+                stored_instance == retry_instance
+                    && stored_product == retry_product
+                    && stored_transcript == retry_transcript
+            }
             _ => self == retry || matches!((self, retry), (Self::UnknownHistorical, Self::UserApi)),
         }
     }
