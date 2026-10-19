@@ -117,6 +117,7 @@ pub struct BashTeardownGeneration(u64);
 
 #[derive(Debug)]
 pub struct BashTeardownFence {
+    work_scope: ResourceScopeKey,
     entry: Arc<RwLock<ResourceScopeKeyHandles>>,
     generation: BashTeardownGeneration,
 }
@@ -864,10 +865,27 @@ impl BashHandleRegistry {
         registered
     }
 
-    /// Remove a `ResourceScopeKey`'s handle table outright. Used by the
-    /// hard-delete cascade (REQ-BASH-006). Returns the removed entry so
-    /// the caller can SIGKILL its live process groups synchronously.
+    /// Fences spawn admission and waits for admitted launches to settle,
+    /// superseding any earlier teardown generation.
     pub async fn begin_teardown(&self, work_scope: &ResourceScopeKey) -> Option<BashTeardownFence> {
+        self.begin_teardown_inner(work_scope, true).await
+    }
+
+    /// Acquires a teardown fence only if no teardown already owns admission.
+    /// Returns `None` if another owner is fenced, or supersedes this acquisition
+    /// while admitted launches settle. Cancellation leaves admission fenced.
+    pub async fn try_begin_teardown(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Option<BashTeardownFence> {
+        self.begin_teardown_inner(work_scope, false).await
+    }
+
+    async fn begin_teardown_inner(
+        &self,
+        work_scope: &ResourceScopeKey,
+        supersede_existing: bool,
+    ) -> Option<BashTeardownFence> {
         let (entry, generation) = {
             let mut tables = self.inner.write().await;
             let entry = tables
@@ -875,6 +893,9 @@ impl BashHandleRegistry {
                 .or_insert_with(|| Arc::new(RwLock::new(ResourceScopeKeyHandles::new())))
                 .clone();
             let mut table = entry.write().await;
+            if table.teardown_started && !supersede_existing {
+                return None;
+            }
             table.teardown_generation = table.teardown_generation.wrapping_add(1);
             table.teardown_started = true;
             let generation = BashTeardownGeneration(table.teardown_generation);
@@ -884,11 +905,17 @@ impl BashHandleRegistry {
         loop {
             let notified = {
                 let mut table = entry.write().await;
+                if !supersede_existing
+                    && (!table.teardown_started || table.teardown_generation != generation.0)
+                {
+                    return None;
+                }
                 table.teardown_started = true;
                 let mut notified = Box::pin(table.admission.settled.clone().notified_owned());
                 notified.as_mut().enable();
                 if table.admission.pending.load(Ordering::Acquire) == 0 {
                     return Some(BashTeardownFence {
+                        work_scope: work_scope.clone(),
                         entry: entry.clone(),
                         generation,
                     });
@@ -922,6 +949,32 @@ impl BashHandleRegistry {
             entry: fence.entry,
             removed_handles,
         }
+    }
+
+    /// Retires handles under the supplied fence without acquiring a newer generation.
+    pub async fn complete_teardown(&self, fence: &BashTeardownFence) -> BashRetirementOutcome {
+        let removed_handles = {
+            let mut table = fence.entry.write().await;
+            if !table.teardown_started || table.teardown_generation != fence.generation.0 {
+                return BashRetirementOutcome::StaleGeneration(CascadeBashReport {
+                    teardown_generation: Some(fence.generation),
+                    ..CascadeBashReport::default()
+                });
+            }
+            table.take_all()
+        };
+        self.remove_from_global_index(&removed_handles).await;
+        let exact_process_groups = snapshot_retirement_targets(&removed_handles).await;
+        let permit = BashRetirementPermit {
+            work_scope: fence.work_scope.clone(),
+            exact_process_groups,
+            generation: fence.generation,
+            had_handles: !removed_handles.is_empty(),
+            entry: Arc::clone(&fence.entry),
+            removed_handles,
+        };
+        self.complete_retirement_with_policy(&permit, SignalFailurePolicy::Continue)
+            .await
     }
 
     async fn verify_exact_absence(&self, permit: &BashRetirementPermit) -> BashRetirementOutcome {
@@ -1414,6 +1467,7 @@ mod tests {
     use super::*;
     use crate::bash::handle::{BashLaunchIdentity, FinalCause, Handle};
     use phoenix_core::process_identity::ProcessIdentity;
+    use std::time::Duration;
 
     fn scope(name: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(name).unwrap())
@@ -1718,6 +1772,149 @@ mod tests {
         ));
         assert!(registry.reopen_spawn_admission(&owner, current).await);
         assert!(registry.reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn browser_teardown_does_not_supersede_pending_owner() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("pending-owner");
+        let reservation = registry.reserve_spawn(&owner).await.unwrap();
+        let retirement = registry.begin_retirement(&owner);
+        tokio::pin!(retirement);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut retirement)
+                .await
+                .is_err()
+        );
+
+        assert!(registry.try_begin_teardown(&owner).await.is_none());
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        drop(reservation);
+        let permit = tokio::time::timeout(Duration::from_secs(2), &mut retirement)
+            .await
+            .expect("original retirement must settle");
+        assert!(matches!(
+            registry.complete_retirement(&permit).await,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
+        registry.cancel_retirement(permit).await;
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn browser_teardown_does_not_reassert_released_or_newer_fence() {
+        for reopen_newer in [false, true] {
+            let registry = BashHandleRegistry::new();
+            let owner = scope("superseded-browser");
+            let reservation = registry.reserve_spawn(&owner).await.unwrap();
+            let browser = registry.try_begin_teardown(&owner);
+            tokio::pin!(browser);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut browser)
+                    .await
+                    .is_err()
+            );
+            let newer = registry.begin_retirement(&owner);
+            tokio::pin!(newer);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut newer)
+                .await
+                .is_err());
+
+            drop(reservation);
+            let permit = tokio::time::timeout(Duration::from_secs(2), &mut newer)
+                .await
+                .expect("newer retirement must settle");
+            if reopen_newer {
+                registry.cancel_retirement(permit).await;
+            }
+            assert!(tokio::time::timeout(Duration::from_secs(2), &mut browser)
+                .await
+                .expect("superseded browser waiter must settle")
+                .is_none());
+            if reopen_newer {
+                assert!(registry.reserve_spawn(&owner).await.is_ok());
+            } else {
+                assert!(matches!(
+                    registry.reserve_spawn(&owner).await,
+                    Err(BashHandleError::SpawnFenced)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_teardown_completion_preserves_fence_generation() {
+        for superseded in [false, true] {
+            let registry = BashHandleRegistry::new();
+            let owner = scope("browser-completion");
+            let fence = registry.try_begin_teardown(&owner).await.unwrap();
+            let newer = if superseded {
+                Some(registry.begin_retirement(&owner).await)
+            } else {
+                None
+            };
+
+            let outcome = registry.complete_teardown(&fence).await;
+            assert_eq!(
+                outcome.report().teardown_generation,
+                Some(fence.generation())
+            );
+            assert!(matches!(
+                registry.reserve_spawn(&owner).await,
+                Err(BashHandleError::SpawnFenced)
+            ));
+            if let Some(permit) = newer {
+                assert!(matches!(outcome, BashRetirementOutcome::StaleGeneration(_)));
+                assert!(
+                    !registry
+                        .reopen_spawn_admission(&owner, fence.generation())
+                        .await
+                );
+                assert!(matches!(
+                    registry.complete_retirement(&permit).await,
+                    BashRetirementOutcome::AbsenceVerified(_)
+                ));
+                registry.cancel_retirement(permit).await;
+            } else {
+                assert!(matches!(outcome, BashRetirementOutcome::AbsenceVerified(_)));
+                assert!(
+                    registry
+                        .reopen_spawn_admission(&owner, fence.generation())
+                        .await
+                );
+            }
+            assert!(registry.reserve_spawn(&owner).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_teardown_cancellation_keeps_pending_admission_fenced() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("cancelled-browser");
+        let reservation = registry.reserve_spawn(&owner).await.unwrap();
+        {
+            let browser = registry.try_begin_teardown(&owner);
+            tokio::pin!(browser);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut browser)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(registry.try_begin_teardown(&owner).await.is_none());
+        drop(reservation);
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        let permit = registry.begin_retirement(&owner).await;
+        assert!(matches!(
+            registry.complete_retirement(&permit).await,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
     }
 
     #[tokio::test]

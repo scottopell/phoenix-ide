@@ -2663,7 +2663,8 @@ impl RuntimeManager {
             return;
         }
 
-        let Some(fence) = self.bash_handles.begin_teardown(work_scope).await else {
+        let Some(fence) = self.bash_handles.try_begin_teardown(work_scope).await else {
+            tracing::debug!(work_scope = %scope_id, "skipping browser retirement: bash teardown already owned or superseded");
             return;
         };
         if let Some(uncertainty) = fence.scope_uncertainty().await {
@@ -2686,11 +2687,11 @@ impl RuntimeManager {
             .await
         {
             Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::Retired) => {
-                let report = phoenix_tools::bash::registry::teardown_bash_owner(
-                    &self.bash_handles,
-                    work_scope,
-                )
-                .await;
+                let report = self
+                    .bash_handles
+                    .complete_teardown(&fence)
+                    .await
+                    .into_report();
                 if let Some(uncertainty) = report.scope_uncertainty {
                     tracing::warn!(work_scope = %scope_id, ?uncertainty, "bash scope shutdown remains unverified");
                 }
@@ -12051,6 +12052,120 @@ mod scope_liveness_tests {
                 reservation.is_ok(),
                 "DB rejection must reopen its own fence"
             );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn browser_retirement_preserves_existing_retirement_permit() {
+        use phoenix_tools::bash::{
+            handle::{FinalCause, Handle, HandleId},
+            registry::{BashHandleError, BashRetirementOutcome},
+            ring::RING_BUFFER_BYTES,
+        };
+
+        for database_error in [false, true] {
+            for cancel in [false, true] {
+                let mgr = test_manager().await;
+                let scope_id = if database_error {
+                    let scope_id =
+                        phoenix_core::work_scope::WorkScopeId::parse("held-browser-scope").unwrap();
+                    sqlx::query(
+                        "INSERT INTO work_scopes
+                         (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+                         VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+                    )
+                    .bind(scope_id.as_str())
+                    .execute(mgr.db().pool())
+                    .await
+                    .unwrap();
+                    sqlx::query(
+                        "CREATE TRIGGER reject_held_browser_retirement
+                         BEFORE UPDATE OF lifecycle ON work_scopes
+                         WHEN NEW.lifecycle = 'retired'
+                         BEGIN SELECT RAISE(ABORT, 'injected retirement failure'); END",
+                    )
+                    .execute(mgr.db().pool())
+                    .await
+                    .unwrap();
+                    scope_id
+                } else {
+                    mgr.db()
+                        .initialize_coordinator_work_scope("/tmp")
+                        .await
+                        .unwrap()
+                        .work_scope_id
+                };
+                let scope = ResourceScopeKey::Work(scope_id.clone());
+                let handle = Handle::new_live(
+                    scope.clone(),
+                    HandleId::new("held-by-retirement"),
+                    "held command".into(),
+                    None,
+                    "/tmp".into(),
+                    12345,
+                    12345,
+                    RING_BUFFER_BYTES,
+                );
+                if !cancel {
+                    handle
+                        .transition_to_terminal(
+                            FinalCause::Exited { exit_code: Some(0) },
+                            std::time::Duration::ZERO,
+                            std::time::SystemTime::now(),
+                            0,
+                        )
+                        .await;
+                }
+                mgr.bash_handles()
+                    .register_existing_handle(&scope, Arc::clone(&handle))
+                    .await;
+                let permit = mgr.bash_handles().begin_retirement(&scope).await;
+                assert!(mgr.bash_handles().owner_handles(&scope).await.is_empty());
+                assert!(mgr
+                    .bash_handles()
+                    .get_by_id(&handle.handle_id)
+                    .await
+                    .is_none());
+                assert_eq!(permit.exact_process_groups.len(), usize::from(cancel));
+
+                mgr.retire_scope_after_browser_teardown(&scope).await;
+                mgr.retire_scope_after_browser_teardown(&scope).await;
+
+                let lifecycle: String =
+                    sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                        .bind(scope_id.as_str())
+                        .fetch_one(mgr.db().pool())
+                        .await
+                        .unwrap();
+                assert_eq!(lifecycle, "active");
+                assert!(matches!(
+                    mgr.bash_handles().reserve_spawn(&scope).await,
+                    Err(BashHandleError::SpawnFenced)
+                ));
+                if cancel {
+                    mgr.bash_handles().cancel_retirement(permit).await;
+                    let restored = mgr
+                        .bash_handles()
+                        .get_by_id(&handle.handle_id)
+                        .await
+                        .unwrap();
+                    assert!(Arc::ptr_eq(&restored.handle, &handle));
+                    assert!(restored.handle.state().await.is_live());
+                    assert!(mgr.bash_handles().reserve_spawn(&scope).await.is_ok());
+                } else {
+                    let outcome = mgr.bash_handles().complete_retirement(&permit).await;
+                    assert!(matches!(outcome, BashRetirementOutcome::Retired(_)));
+                    assert_eq!(
+                        outcome.report().teardown_generation,
+                        Some(permit.generation())
+                    );
+                    assert!(matches!(
+                        mgr.bash_handles().reserve_spawn(&scope).await,
+                        Err(BashHandleError::SpawnFenced)
+                    ));
+                }
+            }
         }
     }
 
