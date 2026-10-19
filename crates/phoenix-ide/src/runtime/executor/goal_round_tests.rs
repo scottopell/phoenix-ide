@@ -536,6 +536,19 @@ async fn conversation_goal_mixed_legacy_trusted_payload_keeps_live_authority_and
         .unwrap();
     let messages = db.get_messages(CONVERSATION).await.unwrap();
     assert!(!serde_json::to_string(&messages).unwrap().contains(&payload));
+    let durable = messages
+        .iter()
+        .find_map(|message| {
+            let MessageContent::Tool(content) = &message.content else {
+                return None;
+            };
+            (content.tool_use_id == "other").then_some(content)
+        })
+        .unwrap();
+    assert_eq!(
+        durable.content,
+        "Authenticated built-in skill instructions were delivered for this live request."
+    );
     assert_eq!(rt.pending_trusted_tool_results.len(), 1);
     assert_eq!(rt.pending_trusted_tool_results[0].instructions, payload);
     rt.execute_effect(Effect::PersistCheckpoint { data })

@@ -23416,7 +23416,7 @@ mod steer_drain_detector_tests {
                 None,
                 None,
             ),
-            vec![],
+            Vec::<ToolResult>::new(),
         )
         .unwrap();
 
