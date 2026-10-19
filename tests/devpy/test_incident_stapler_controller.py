@@ -23,7 +23,10 @@ SCRIPT = ROOT / "scripts/incident_stapler_controller.py"
 spec = importlib.util.spec_from_file_location("incident_stapler_controller", SCRIPT)
 controller = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(controller)
+PINNED_CANDIDATE = "237100c79d9ce672867b284167a099fa0b7a2bcf"
+PINNED_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
 WORKFLOW = (ROOT / ".github/workflows/release.yml").read_text()
+REAL_CHECK_OUTPUT = subprocess.check_output
 
 
 def step_shell(name):
@@ -41,7 +44,10 @@ class CandidateGateTests(unittest.TestCase):
         self.git("init", "-q")
         self.registry = self.repo / controller.REGISTRY_PATH
         self.registry.parent.mkdir(parents=True)
-        self.registry.write_bytes(b"complete immutable fixture registry\n")
+        self.registry.write_bytes(
+            b"const MIGRATIONS: &[Migration] = &[\n    Migration { version: 128, },\n];\n"
+            b"#[cfg(test)]\nconst TEST_FIXTURE: Migration = Migration { version: 120, };\n"
+        )
         self.cargo = self.repo / "crates/phoenix-ide/Cargo.toml"
         self.cargo.parent.mkdir(parents=True)
         self.cargo.write_text('[package]\nversion = "0.13.0-rc.4"\n')
@@ -74,6 +80,24 @@ class CandidateGateTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), other)
         self.assertEqual(self.git("tag", "--list"), "")
 
+    def test_pinned_git_candidate_has_bounded_registry_target_128(self):
+        try:
+            registry = controller.git(ROOT, "show", f"{PINNED_CANDIDATE}:{controller.REGISTRY_PATH}")
+        except subprocess.CalledProcessError:
+            self.skipTest("pinned candidate Git object is not available in this checkout")
+        self.assertEqual(hashlib.sha256(registry).hexdigest(), PINNED_REGISTRY_SHA256)
+        controller.verify_registry_bytes(registry)
+
+    def test_registry_version_scan_is_bounded_before_trailing_fixture(self):
+        controller.verify_registry_bytes(self.registry.read_bytes())
+        with self.assertRaisesRegex(ValueError, "migration target"):
+            controller.verify_registry_bytes(
+                b"const MIGRATIONS: &[Migration] = &[\n    Migration { version: 127, },\n];\n"
+                b"Migration { version: 128, }\n"
+            )
+        with self.assertRaisesRegex(ValueError, "migration registry"):
+            controller.verify_registry_bytes(b"Migration { version: 128, }\n")
+
     def test_gate_rejects_missing_candidate_non_ancestor_wrong_version_or_digest(self):
         for attribute, value in [("CANDIDATE", "f" * 40), ("VERSION", "0.13.0-rc.5"),
                                  ("REGISTRY_SHA256", "0" * 64)]:
@@ -89,6 +113,162 @@ class CandidateGateTests(unittest.TestCase):
         self.git("update-ref", "-d", "refs/remotes/origin/main")
         with self.assertRaises(subprocess.CalledProcessError):
             controller.gate_outputs(self.repo)
+
+class LinuxArtifactGateTests(CandidateGateTests):
+    def test_linux_gate_fixes_source_registry_version_and_target(self):
+        self.assertEqual(controller.linux_gate_outputs(self.repo), {
+            "preparation": "true", "release": "false", "create_tag": "false", "tag": "",
+            "version": controller.VERSION, "channel": "rc", "commit": controller.CANDIDATE,
+            "operation": controller.LINUX_OPERATION, "target": controller.LINUX_TARGET,
+        })
+        for name, value in [("VERSION", "0.13.0-rc.5"), ("REGISTRY_SHA256", "0" * 64),
+                            ("REGISTRY_TARGET_VERSION", 129), ("CANDIDATE", "f" * 40)]:
+            with self.subTest(name=name), mock.patch.object(controller, name, value):
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    controller.linux_gate_outputs(self.repo)
+
+    def _linux_fixture(self, *, identity=None, dirty=False, dynamic=False, machine="Advanced Micro Devices X86-64"):
+        directory = Path(self.temporary.name) / "out"
+        directory.mkdir(exist_ok=True)
+        artifact = directory / controller.LINUX_PREPARED_ASSET
+        identity = identity or {"version": controller.VERSION, "git_sha": controller.CANDIDATE}
+        identity_output = identity if isinstance(identity, str) else json.dumps(identity)
+        artifact.write_text(f"#!{sys.executable}\nprint({identity_output!r})\n")
+        artifact.chmod(0o755)
+        def readelf(args, text=True, timeout=None):
+            if args[0] == "git" and args[1:3] == ["-C", str(self.repo)]:
+                return " M tracked-file\\n" if dirty else ""
+            self.assertEqual(timeout, 10)
+            if args[0] == "readelf" and args[1] == "-h":
+                return f"Class: ELF64\\nMachine: {machine}\\n"
+            if args[0] == "readelf":
+                return "INTERP /lib/ld-musl.so" if dynamic else "LOAD"
+            return REAL_CHECK_OUTPUT(args, text=text, timeout=timeout)
+        self.patches = mock.patch.object(controller.subprocess, "check_output", side_effect=readelf)
+        self.patches.start()
+        self.addCleanup(self.patches.stop)
+        return artifact, directory
+
+    def test_receipt_is_closed_exact_contract_and_hashes_prepared_binary(self):
+        artifact, directory = self._linux_fixture()
+        receipt_path = directory / controller.LINUX_RECEIPT
+        evidence = controller.write_linux_receipt(
+            receipt_path, "b" * 40, 123, 2, artifact,
+            event="workflow_dispatch", ref="refs/heads/main", repo=self.repo,
+        )
+        self.assertEqual(set(evidence), {
+            "schema", "operation", "target", "version", "commit", "controller_commit", "registry_sha256",
+            "run_id", "run_attempt", "event", "ref", "sha256", "checks",
+        })
+        self.assertEqual(evidence, {
+            "schema": 1, "operation": controller.LINUX_OPERATION, "target": controller.LINUX_TARGET,
+            "version": controller.VERSION, "commit": controller.CANDIDATE, "controller_commit": "b" * 40,
+            "registry_sha256": controller.REGISTRY_SHA256, "run_id": 123, "run_attempt": 2,
+            "event": "workflow_dispatch", "ref": "refs/heads/main",
+            "sha256": {controller.LINUX_PREPARED_ASSET: hashlib.sha256(artifact.read_bytes()).hexdigest()},
+            "checks": controller.LINUX_CHECKS,
+        })
+        self.assertEqual(json.loads(receipt_path.read_text()), evidence)
+        self.assertEqual({path.name for path in directory.iterdir()}, {artifact.name, receipt_path.name})
+
+    def test_failed_artifact_source_or_workflow_check_never_writes_receipt(self):
+        fixtures = [
+            {"dirty": True}, {"dynamic": True}, {"machine": "AArch64"},
+            {"identity": {"version": "wrong", "git_sha": controller.CANDIDATE}},
+            {"identity": {"version": controller.VERSION, "git_sha": "f" * 40}},
+            {"identity": '{"version":"x","version":"y","git_sha":"' + controller.CANDIDATE + '"}'},
+        ]
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                artifact, directory = self._linux_fixture(**fixture)
+                receipt_path = directory / controller.LINUX_RECEIPT
+                with self.assertRaises(ValueError):
+                    controller.write_linux_receipt(receipt_path, "b" * 40, 1, 1, artifact,
+                        event="workflow_dispatch", ref="refs/heads/main", repo=self.repo)
+                self.assertFalse(receipt_path.exists())
+                self.temporary.cleanup()
+                self.temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(self.temporary.cleanup)
+
+    def test_rejects_invalid_workflow_ids_source_controller_symlinks_and_extra_files(self):
+        artifact, directory = self._linux_fixture()
+        receipt_path = directory / controller.LINUX_RECEIPT
+        for kwargs in [
+            {"controller": controller.CANDIDATE}, {"controller": "B" * 40},
+            {"run_id": 0}, {"run_attempt": 0}, {"run_id": True},
+            {"event": "push"}, {"ref": "refs/heads/other"},
+        ]:
+            args = dict(controller="b" * 40, run_id=1, run_attempt=1, event="workflow_dispatch", ref="refs/heads/main")
+            args.update(kwargs)
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                controller.write_linux_receipt(receipt_path, args.pop("controller"), args.pop("run_id"),
+                    args.pop("run_attempt"), artifact, event=args.pop("event"), ref=args.pop("ref"), repo=self.repo)
+            self.assertFalse(receipt_path.exists())
+        (directory / "extra").write_text("no")
+        with self.assertRaises(ValueError):
+            controller.write_linux_receipt(receipt_path, "b" * 40, 1, 1, artifact,
+                event="workflow_dispatch", ref="refs/heads/main", repo=self.repo)
+        self.assertFalse(receipt_path.exists())
+
+    def test_rejects_wrong_name_missing_or_empty_artifact_without_receipt(self):
+        artifact, directory = self._linux_fixture()
+        receipt_path = directory / controller.LINUX_RECEIPT
+        wrong = directory / "phoenix_ide-x86_64-unknown-linux-musl"
+        wrong.write_text("payload")
+        with self.assertRaises(ValueError):
+            controller.write_linux_receipt(receipt_path, "b" * 40, 1, 1, wrong,
+                event="workflow_dispatch", ref="refs/heads/main", repo=self.repo)
+        wrong.unlink()
+        artifact.write_text("")
+        with self.assertRaises(ValueError):
+            controller.write_linux_receipt(receipt_path, "b" * 40, 1, 1, artifact,
+                event="workflow_dispatch", ref="refs/heads/main", repo=self.repo)
+        artifact.unlink()
+        with self.assertRaises(ValueError):
+            controller.write_linux_receipt(receipt_path, "b" * 40, 1, 1, artifact,
+                event="workflow_dispatch", ref="refs/heads/main", repo=self.repo)
+        self.assertFalse(receipt_path.exists())
+
+    def test_rejects_symlink_artifact_without_receipt(self):
+        artifact, directory = self._linux_fixture()
+        real = directory / "real"
+        artifact.rename(real)
+        artifact.symlink_to(real)
+        with self.assertRaises(ValueError):
+            controller.write_linux_receipt(directory / controller.LINUX_RECEIPT, "b" * 40, 1, 1, artifact,
+                event="workflow_dispatch", ref="refs/heads/main", repo=self.repo)
+
+    def test_workflow_dispatch_is_source_only_and_artifact_only(self):
+        self.assertIn(f"- {controller.LINUX_OPERATION}", WORKFLOW)
+        self.assertIn("python3 scripts/incident_stapler_controller.py linux-gate", WORKFLOW)
+        self.assertIn("needs.gate.outputs.operation == 'prepare-incident-237100-linux-x86_64'", WORKFLOW)
+        self.assertIn("build-incident-linux:", WORKFLOW)
+        self.assertIn("cargo build --locked --profile release-min", WORKFLOW)
+        self.assertIn("target: ${{ steps.ver.outputs.target }}", WORKFLOW)
+        self.assertIn("linux-receipt", WORKFLOW)
+        self.assertIn(controller.LINUX_RECEIPT, WORKFLOW)
+        self.assertIn(controller.LINUX_PREPARED_ASSET, WORKFLOW)
+        self.assertNotIn("SHA256SUMS", WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0])
+        self.assertIn("needs.gate.outputs.operation != 'prepare-incident-237100-linux-x86_64'", WORKFLOW)
+        self.assertIn("matrix={\"include\":[]}", WORKFLOW)
+        inputs = WORKFLOW.split("    inputs:\n", 1)[1].split("\njobs:", 1)[0]
+        self.assertNotRegex(inputs, r"(?m)^      (candidate|target|commit):")
+        self.assertNotIn("contents: write", WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0])
+        self.assertIn("retention-days: 14", WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0])
+        consumer = WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0]
+        self.assertIn("needs.gate.outputs.target == 'x86_64-unknown-linux-musl'", consumer)
+        outputs = WORKFLOW.split("    outputs:\n", 1)[1].split("    steps:\n", 1)[0]
+        mapping = dict(re.findall(r"(?m)^      (\w+): \$\{\{ (.*?) \}\}$", outputs))
+        condition_names = set(re.findall(r"needs\.gate\.outputs\.(\w+)", consumer))
+        self.assertTrue(condition_names <= set(mapping), f"unexported Linux condition outputs: {condition_names - set(mapping)}")
+        self.assertEqual(mapping["target"], "steps.ver.outputs.target")
+        self.assertEqual(mapping["operation"], "steps.macos.outputs.operation")
+        self.assertEqual(mapping["controller_commit"], "github.sha")
+        without_target = {key: value for key, value in mapping.items() if key != "target"}
+        self.assertFalse(condition_names <= set(without_target), "removing target export must fail the consumer contract")
+        self.assertIn("git status --porcelain", consumer)
+        self.assertIn('subprocess.check_output(["readelf", "-h", str(artifact)]', SCRIPT.read_text())
+        self.assertNotIn("cargo run", consumer)
 
 
 class WrapperTests(unittest.TestCase):
@@ -314,6 +494,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(incident_operation, controller.OPERATION)
         for event, operation, targets in [
             ("workflow_dispatch", controller.OPERATION, [controller.TARGET]),
+            ("workflow_dispatch", controller.LINUX_OPERATION, []),
             ("workflow_dispatch", "prepare-main", [controller.TARGET, "x86_64-apple-darwin"]),
             ("workflow_dispatch", "retry-release", [controller.TARGET, "x86_64-apple-darwin"]),
             ("push", "", [controller.TARGET, "x86_64-apple-darwin"]),
@@ -330,7 +511,8 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(minutes, 30 if len(targets) == 1 else 360)
                 matrix = json.loads(produced["matrix"])["include"]
                 self.assertEqual([row["target"] for row in matrix], targets)
-                self.assertEqual(matrix[0], dict(runner="macos-15", target=controller.TARGET, asset=f"phoenix_ide-{controller.TARGET}"))
+                if matrix:
+                    self.assertEqual(matrix[0], dict(runner="macos-15", target=controller.TARGET, asset=f"phoenix_ide-{controller.TARGET}"))
                 if len(matrix) == 2:
                     self.assertEqual(matrix[1]["runner"], "macos-15-intel")
         self.assertIn("macos_matrix: ${{ steps.macos.outputs.matrix }}", WORKFLOW)
@@ -350,7 +532,7 @@ class WorkflowTests(unittest.TestCase):
             cargo.write_text('[package]\nversion = "0.13.0-rc.4"\n')
             registry = repo / controller.REGISTRY_PATH
             registry.parent.mkdir(parents=True)
-            registry.write_text("immutable fixture registry")
+            registry.write_text("const MIGRATIONS: &[Migration] = &[\n    Migration { version: 128, },\n];\nMigration { version: 120, }\n")
             git("add", ".")
             git("commit", "-qm", "candidate")
             candidate = git("rev-parse", "HEAD")
@@ -360,23 +542,73 @@ class WorkflowTests(unittest.TestCase):
             script.parent.mkdir()
             script.write_text(SCRIPT.read_text().replace(controller.CANDIDATE, candidate).replace(
                 controller.REGISTRY_SHA256, hashlib.sha256(registry.read_bytes()).hexdigest()))
-            for tag, expected in [("", 0), ("v0.13.0-rc.4", 1)]:
-                output = repo / "output"
-                output.unlink(missing_ok=True)
-                result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell], cwd=repo,
-                                        env=dict(env, GITHUB_EVENT_NAME="workflow_dispatch", OPERATION=controller.OPERATION,
-                                                 RETRY_TAG=tag, GITHUB_OUTPUT=str(output), GITHUB_SHA="a" * 40),
-                                        capture_output=True, text=True)
-                self.assertEqual(result.returncode, expected, result.stderr)
-                if expected == 0:
-                    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-                    self.assertEqual(values["commit"], candidate)
-                    self.assertEqual(values["release"], "false")
-                    self.assertEqual(values["create_tag"], "false")
-                    self.assertEqual(values["preparation"], "true")
-                    self.assertEqual(values["version"], controller.VERSION)
+            for operation in [controller.OPERATION, controller.LINUX_OPERATION]:
+                for tag, expected in [("", 0), ("v0.13.0-rc.4", 1)]:
+                    output = repo / "output"
+                    output.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell], cwd=repo,
+                                            env=dict(env, GITHUB_EVENT_NAME="workflow_dispatch", OPERATION=operation,
+                                                     RETRY_TAG=tag, GITHUB_OUTPUT=str(output), GITHUB_SHA="a" * 40),
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected == 0:
+                        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                        self.assertEqual(values["commit"], candidate)
+                        self.assertEqual(values["release"], "false")
+                        self.assertEqual(values["create_tag"], "false")
+                        self.assertEqual(values["preparation"], "true")
+                        self.assertEqual(values["version"], controller.VERSION)
+                        self.assertEqual(values.get("target"), controller.LINUX_TARGET if operation == controller.LINUX_OPERATION else None)
+                    else:
+                        self.assertFalse(output.exists())
+
+    def test_linux_artifact_validation_shell_rejects_bad_binary_before_receipt(self):
+        shell = step_shell("Validate Linux artifact and write receipt")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact_dir = root / "incident-linux-artifact"
+            artifact_dir.mkdir()
+            artifact = artifact_dir / controller.LINUX_PREPARED_ASSET
+            artifact.write_text(f"#!{sys.executable}\nprint('{json.dumps({'version': controller.VERSION, 'git_sha': controller.CANDIDATE})}')\n")
+            artifact.chmod(0o755)
+            controller_copy = root / "incident_stapler_controller.py"
+            controller_copy.write_text(SCRIPT.read_text())
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            readelf = bin_dir / "readelf"
+            readelf.write_text(f"#!{sys.executable}\nimport os, sys\nif sys.argv[1] == '-h': print(os.environ.get('FAKE_ELF_HEADER', 'Class: ELF64\\nMachine: Advanced Micro Devices X86-64'))\nelse: print(os.environ.get('FAKE_PROGRAM_HEADERS', ''))\n")
+            readelf.chmod(0o755)
+            git = bin_dir / "git"
+            git.write_text(f"#!{sys.executable}\nimport sys\nsys.stdout.write('')\n")
+            git.chmod(0o755)
+            base_env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", RUNNER_TEMP=temp,
+                            GITHUB_SHA="b" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                            GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_REF="refs/heads/main",
+                            GITHUB_WORKSPACE=temp, GITHUB_OUTPUT=str(root / "outputs"))
+            receipt = artifact_dir / controller.LINUX_RECEIPT
+            for overrides in [{}, {"FAKE_PROGRAM_HEADERS": " INTERP 0x0000"},
+                              {"FAKE_ELF_HEADER": "Class: ELF32\nMachine: Advanced Micro Devices X86-64"},
+                              {"FAKE_ELF_HEADER": "Class: ELF64\nMachine: AArch64"}]:
+                receipt.unlink(missing_ok=True)
+                output = root / "outputs"
+                output.write_text("")
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell],
+                                        env={**base_env, **overrides}, capture_output=True, text=True)
+                # First case succeeds; remaining cases fail before the receipt and artifact upload.
+                if not overrides:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    digest = hashlib.sha256(receipt.read_bytes()).hexdigest()
+                    self.assertEqual(output.read_text(), f"receipt_sha256={digest}\n")
+                    self.assertEqual({p.name for p in artifact_dir.iterdir()},
+                                     {controller.LINUX_RECEIPT, controller.LINUX_PREPARED_ASSET})
+                    receipt.unlink()
                 else:
-                    self.assertFalse(output.exists())
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(receipt.exists())
+                    self.assertEqual(output.read_text(), "")
+            upload = WORKFLOW.index("      - id: upload", WORKFLOW.index("Validate Linux artifact"))
+            self.assertGreater(upload, WORKFLOW.index("Validate Linux artifact"))
+            self.assertNotIn("publish:", WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0])
 
     def test_controller_scope_provenance_and_gate_ownership(self):
         materialize = WORKFLOW.index("      - name: Materialize exact incident packaging controller")
@@ -427,6 +659,47 @@ class WorkflowTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
+
+
+
+
+class LinuxReceiptEvidenceTests(unittest.TestCase):
+    def test_post_upload_summary_binds_exact_evidence_and_rejects_missing_upload(self):
+        job = WORKFLOW.split("  build-incident-linux:", 1)[1].split("  build-macos:", 1)[0]
+        evidence = job.split("      - name: Publish authenticated Linux receipt evidence", 1)[1]
+        self.assertIn("if: ${{ success() && steps.upload.outcome == 'success' }}", evidence)
+        self.assertLess(job.index("id: upload"), job.index("id: evidence"))
+        self.assertIn("receipt_sha256: ${{ steps.evidence.outputs.receipt_sha256 }}", job)
+        self.assertIn("artifact_id: ${{ steps.evidence.outputs.artifact_id }}", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotIn("always()", evidence)
+        shell = textwrap.dedent(evidence.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as temp:
+            summary, output = Path(temp) / "summary", Path(temp) / "output"
+            env = dict(os.environ, RECEIPT_SHA256="a" * 64, ARTIFACT_ID="42",
+                       APP_COMMIT=controller.CANDIDATE, CONTROLLER_COMMIT="b" * 40,
+                       GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
+                       GITHUB_REPOSITORY="scottopell/phoenix-ide",
+                       GITHUB_STEP_SUMMARY=str(summary), GITHUB_OUTPUT=str(output))
+            for overrides in [{"ARTIFACT_ID": ""}, {"RECEIPT_SHA256": ""}, {}]:
+                summary.unlink(missing_ok=True)
+                output.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell],
+                                        env={**env, **overrides}, capture_output=True, text=True)
+                if overrides:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(summary.exists())
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for value in [f"receipt_sha256: `{'a' * 64}`", "artifact_id: `42`",
+                                  "run_id: `123`", "run_attempt: `2`",
+                                  f"app_commit: `{controller.CANDIDATE}`",
+                                  f"controller_commit: `{'b' * 40}`",
+                                  f"receipt_basename: `{controller.LINUX_RECEIPT}`",
+                                  "--expected-preparation-receipt-sha256", "NOT the artifact archive digest"]:
+                        self.assertIn(value, summary.read_text())
+                    self.assertEqual(output.read_text(), f"receipt_sha256={'a' * 64}\nartifact_id=42\n")
 
 
 if __name__ == "__main__":

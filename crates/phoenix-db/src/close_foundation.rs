@@ -1473,7 +1473,7 @@ async fn read_topology_tx(
                 c.cm_kind, e.branch_name AS env_branch_name,
                 e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch,
                 c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name,
+                c.seed_parent_id, c.seed_label, c.continued_in_conv_id,
                 c.llm_language, c.spawned_from_conversation_id,
                 (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
                 forward.depth AS close_depth,

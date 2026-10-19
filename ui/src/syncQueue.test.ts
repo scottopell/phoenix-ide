@@ -4,6 +4,7 @@ import type { PendingOperation } from './cache';
 const { apiMock, cacheMock } = vi.hoisted(() => ({
   apiMock: {
     archiveConversation: vi.fn(),
+    renameProductConversation: vi.fn(),
     archiveChain: vi.fn(),
     deleteConversation: vi.fn(),
   },
@@ -56,6 +57,13 @@ describe('SyncQueue legacy op draining', () => {
     await expect(syncQueue.processOperation(makeOp('teleport'))).rejects.toThrow(
       /Unknown operation type/,
     );
+  });
+
+  it('replays an already-persisted legacy rename through the canonical product operation', async () => {
+    const op = makeOp('rename');
+    (op as unknown as { payload: { name: string } }).payload = { name: 'Renamed title' };
+    await syncQueue.processOperation(op);
+    expect(apiMock.renameProductConversation).toHaveBeenCalledWith('conv-1', 'Renamed title');
   });
 
   it('processes a current archive op through the api', async () => {

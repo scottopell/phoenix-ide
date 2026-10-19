@@ -8,6 +8,7 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import base64
 import contextvars
 import contextlib
 import dataclasses
@@ -24,7 +25,9 @@ import re
 import resource
 import shutil
 import signal
+import stat
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -6871,12 +6874,13 @@ def _validate_spears_v2_shape(specs_root: Path) -> SpearsV2ShapeResult:
 
     if numbered:
         nums = [n for n, _ in numbered]
-        expected = list(range(0, max(nums) + 1))
-        if nums != expected:
-            errors.append(
-                "specs/adrs/: ADR numbers must be sequential without gaps "
-                f"(found {', '.join(f'{n:03d}' for n in nums)})"
-            )
+        if 0 not in nums:
+            errors.append("specs/adrs/: ADR numbering must start at 000")
+        seen: set[int] = set()
+        for num, path in numbered:
+            if num in seen:
+                errors.append(f"{rel(path)}: duplicate ADR number {num:03d}")
+            seen.add(num)
     else:
         errors.append("specs/adrs/: at least one numbered ADR is required")
 
@@ -8155,15 +8159,35 @@ def _stage_systemd_root_handoff(
     files: list[tuple[str, Path]],
     *,
     noninteractive: bool = False,
+    bind_bundle: bool = True,
+    expected_helper_sha256: str | None = None,
+    expected_preparation_receipt_sha256: str | None = None,
 ) -> Path:
+    if re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        raise SystemExit("systemd handoff requires an exact transaction id")
     bundle = staging / "bundle.json"
-    _write_json_atomic(bundle, {
+    bundle_value = {
         "transaction_id": transaction_id,
         "files": [
-            {"name": name, "source": str(path), "sha256": _file_sha256(path)}
+            {
+                "name": name,
+                "source": str(path),
+                "sha256": expected_helper_sha256
+                if name == "helper.py" and expected_helper_sha256 is not None
+                else _file_sha256(path),
+            }
             for name, path in files
         ],
-    })
+    }
+    bundle_bytes = (json.dumps(bundle_value, indent=2, sort_keys=True) + "\n").encode()
+    bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
+    try:
+        helper_sha256 = next(
+            entry["sha256"] for entry in bundle_value["files"] if entry["name"] == "helper.py"
+        )
+    except StopIteration as exc:
+        raise SystemExit("systemd handoff bundle is missing helper.py") from exc
+    _write_json_atomic(bundle, bundle_value)
     bootstrap = SYSTEMD_DEPLOY_DIR / f"bootstrap-{transaction_id}"
     root_helper = bootstrap / "helper.py"
     sudo = ["sudo", "-n"] if noninteractive else ["sudo"]
@@ -8173,11 +8197,33 @@ def _stage_systemd_root_handoff(
 
         str(helper), str(root_helper),
     ], check=True)
+    try:
+        verified_helper = subprocess.run(
+            [*sudo, "sha256sum", str(root_helper)],
+            capture_output=True,
+            text=True,
+        )
+    except BaseException:
+        subprocess.run([*sudo, "rm", "-rf", str(bootstrap)], check=False)
+        raise
+    helper_output = (verified_helper.stdout or "").split(maxsplit=1)
+    if (verified_helper.returncode != 0 or not helper_output
+            or helper_output[0] != helper_sha256):
+        subprocess.run([*sudo, "rm", "-rf", str(bootstrap)], check=False)
+        raise SystemExit("systemd handoff bootstrap helper hash mismatch")
+    stage_command = [
+        *sudo, "python3", str(root_helper), "stage", "--bundle", str(bundle),
+    ]
+    if bind_bundle:
+        stage_command.extend(("--bundle-sha256", bundle_sha256))
+    if expected_preparation_receipt_sha256 is not None:
+        stage_command.extend((
+            "--expected-preparation-receipt-sha256",
+            expected_preparation_receipt_sha256,
+        ))
+    stage_command.extend(("--source-uid", str(os.getuid())))
     result = subprocess.run(
-        [
-            *sudo, "python3", str(root_helper), "stage",
-            "--bundle", str(bundle), "--source-uid", str(os.getuid()),
-        ],
+        stage_command,
         capture_output=True,
         text=True,
     )
@@ -8273,6 +8319,203 @@ SYSTEMD_PROTECTED_ASSET = "phoenix_ide-x86_64-unknown-linux-musl"
 SYSTEMD_PROTECTED_ASSET_SHA256 = "bcb74d565c828843596e5109ea9034a2b0e505aab4ba6c18c5cca8e116f5677e"
 SYSTEMD_PROTECTED_REGISTRY_SHA256 = "700162dd8e41305546cf2acd2763bad5603c642840f5be851fb788353879a36a"
 SYSTEMD_PROTECTED_PROTOCOL = 2
+SYSTEMD_PREPARED_COMMIT = "237100c79d9ce672867b284167a099fa0b7a2bcf"
+SYSTEMD_PREPARED_VERSION = "0.13.0-rc.4"
+SYSTEMD_PREPARED_TARGET = "x86_64-unknown-linux-musl"
+SYSTEMD_PREPARED_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+SYSTEMD_PREPARED_OPERATION = "prepare-incident-237100-linux-x86_64"
+SYSTEMD_PREPARED_PAYLOAD = "phoenix_ide-x86_64-unknown-linux-musl-prepared-237100c79d9c"
+SYSTEMD_PREPARED_RECEIPT = "LINUX-PREPARATION-RECEIPT-x86_64-unknown-linux-musl.json"
+SYSTEMD_PREPARED_PROTOCOL = 3
+
+
+def _open_prepared_regular(source_directory_fd: int, source_name: str) -> int:
+    try:
+        source_fd = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_directory_fd)
+    except OSError as exc:
+        raise SystemExit(f"cannot open prepared systemd artifact {source_name}: {exc}") from exc
+    try:
+        source_mode = os.fstat(source_fd).st_mode
+    except BaseException:
+        os.close(source_fd)
+        raise
+    if not stat.S_ISREG(source_mode):
+        os.close(source_fd)
+        raise SystemExit("prepared systemd artifact entries must be regular files")
+    return source_fd
+
+
+def _copy_prepared_regular(source_fd: int, destination: Path, mode: int) -> str:
+    destination_fd = None
+    try:
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        digest = hashlib.sha256()
+        with os.fdopen(source_fd, "rb", closefd=False) as source_stream, os.fdopen(
+            destination_fd, "wb", closefd=False
+        ) as destination_stream:
+            while chunk := source_stream.read(1024 * 1024):
+                destination_stream.write(chunk)
+                digest.update(chunk)
+            destination_stream.flush()
+            os.fsync(destination_stream.fileno())
+        os.fchmod(destination_fd, mode)
+        _fsync_directory(destination.parent)
+        return digest.hexdigest()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+
+
+@dataclasses.dataclass(frozen=True)
+class VerifiedSystemdControllerHelper:
+    source: bytes
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.source).hexdigest()
+
+
+def _parse_prepared_receipt_with_verified_helper(
+    verified_helper: VerifiedSystemdControllerHelper,
+    receipt: bytes,
+) -> dict:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-",
+            "--parse-prepared-receipt",
+            base64.b64encode(receipt).decode("ascii"),
+        ],
+        input=verified_helper.source,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit("invalid Linux prepared artifact receipt")
+    try:
+        metadata = json.loads(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("exact controller helper returned invalid prepared receipt metadata") from exc
+    if not isinstance(metadata, dict):
+        raise SystemExit("exact controller helper returned invalid prepared receipt metadata")
+    return metadata
+
+
+def _materialize_verified_systemd_helper(
+    source_commit: str,
+    destination: Path,
+    source_kind: str,
+) -> VerifiedSystemdControllerHelper:
+    expected_sha256 = _materialize_source_file(
+        source_commit,
+        "scripts/systemd_deploy_helper.py",
+        destination,
+        source_kind,
+    )
+    source = destination.read_bytes()
+    if hashlib.sha256(source).hexdigest() != expected_sha256:
+        raise SystemExit("prepared systemd helper changed after exact controller materialization")
+    return VerifiedSystemdControllerHelper(source=source)
+
+
+def _prepare_linux_artifact(
+    directory: Path,
+    expected_full_commit: str,
+    controller_commit: str,
+    expected_receipt_sha256: str,
+    staging: Path,
+    verified_helper: VerifiedSystemdControllerHelper,
+) -> "ValidatedLinuxPreparedCandidate":
+    if expected_full_commit != SYSTEMD_PREPARED_COMMIT:
+        raise SystemExit("Linux prepared candidate requires exact app commit")
+    try:
+        source_directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise SystemExit(f"cannot open prepared systemd artifact directory: {exc}") from exc
+    receipt = staging / SYSTEMD_PREPARED_RECEIPT
+    binary = staging / "prepared-candidate"
+    receipt_fd = None
+    binary_fd = None
+    try:
+        directory_before = os.fstat(source_directory_fd)
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise SystemExit("Linux prepared artifact must be a real directory")
+        if set(os.listdir(source_directory_fd)) != {SYSTEMD_PREPARED_PAYLOAD, SYSTEMD_PREPARED_RECEIPT}:
+            raise SystemExit("Linux prepared artifact must contain only exact payload and receipt")
+        receipt_fd = _open_prepared_regular(source_directory_fd, SYSTEMD_PREPARED_RECEIPT)
+        binary_fd = _open_prepared_regular(source_directory_fd, SYSTEMD_PREPARED_PAYLOAD)
+        directory_after = os.fstat(source_directory_fd)
+        if (
+            directory_before.st_dev,
+            directory_before.st_ino,
+            directory_before.st_mtime_ns,
+            directory_before.st_ctime_ns,
+        ) != (
+            directory_after.st_dev,
+            directory_after.st_ino,
+            directory_after.st_mtime_ns,
+            directory_after.st_ctime_ns,
+        ):
+            raise SystemExit("Linux prepared artifact directory changed during validation")
+        receipt_sha = _copy_prepared_regular(receipt_fd, receipt, 0o600)
+        completed_receipt_fd = receipt_fd
+        receipt_fd = None
+        os.close(completed_receipt_fd)
+        if receipt_sha != expected_receipt_sha256:
+            raise SystemExit("Linux prepared receipt does not match independently authenticated digest")
+        metadata = _parse_prepared_receipt_with_verified_helper(
+            verified_helper,
+            receipt.read_bytes(),
+        )
+        if metadata["controller_commit"] != controller_commit:
+            raise SystemExit("Linux preparation receipt controller commit mismatch")
+        binary_sha = _copy_prepared_regular(binary_fd, binary, 0o700)
+        completed_binary_fd = binary_fd
+        binary_fd = None
+        os.close(completed_binary_fd)
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        if binary_fd is not None:
+            os.close(binary_fd)
+        os.close(source_directory_fd)
+    if metadata["sha256"][SYSTEMD_PREPARED_PAYLOAD] != binary_sha:
+        raise SystemExit("Linux prepared payload checksum mismatch")
+    try:
+        embedded = RuntimeIdentity.from_value(_binary_identity(binary))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit("Linux prepared payload has no valid embedded identity") from exc
+    if embedded != RuntimeIdentity(SYSTEMD_PREPARED_VERSION, SYSTEMD_PREPARED_COMMIT):
+        raise SystemExit("Linux prepared payload embedded identity mismatch")
+    if _file_sha256(binary) != binary_sha or _file_sha256(receipt) != receipt_sha:
+        raise SystemExit("Linux prepared artifact changed during validation")
+    return ValidatedLinuxPreparedCandidate(binary, receipt, binary_sha, receipt_sha, controller_commit)
+
+
+def _require_linux_prepared_unchanged(candidate: "ValidatedLinuxPreparedCandidate") -> None:
+    if any(not path.is_file() or path.is_symlink() or _file_sha256(path) != digest
+           for path, digest in ((candidate.binary, candidate.binary_sha256),
+                                (candidate.receipt, candidate.receipt_sha256))):
+        raise SystemExit("Linux prepared candidate or receipt changed during staging")
+
+
+def _require_exact_clean_controller_checkout(expected_commit: str) -> None:
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit("cannot verify the prepared systemd controller checkout") from exc
+    if head != expected_commit or dirty:
+        raise SystemExit(
+            "prepared systemd deployment requires a clean checkout at the exact --controller-source-commit"
+        )
 
 
 def _systemd_ordinary_database_preflight(prepared: "PreparedCandidate", staging: Path, environment: dict[str, str]) -> None:
@@ -8323,22 +8566,56 @@ def native_prod_deploy(
 
     controller = controller or ProdDeployControllerOptions()
     controller.require_systemd_current(release)
+    if controller.transaction_id is not None and re.fullmatch(r"[0-9a-f]{32}", controller.transaction_id) is None:
+        raise SystemExit("systemd deployment requires a 32-character lowercase transaction id")
+    if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None:
+        controller_commit = controller.controller_source_commit
+        if controller_commit is None:
+            raise SystemExit("prepared systemd deployment requires an exact controller source commit")
+        _require_exact_clean_controller_checkout(controller_commit)
+    prepared_systemd_request = (
+        controller.enabled
+        and controller.systemd_current_schema_upgrade
+        and controller.prepared_artifact is not None
+    )
     if controller.enabled:
-        release, _expected_full_commit = controller.require_exact_release(release)
-        _require_noninteractive_sudo_ready()
+        if controller.prepared_artifact is None:
+            release, _expected_full_commit = controller.require_exact_release(release)
+        if not prepared_systemd_request:
+            _require_noninteractive_sudo_ready()
     elif not check_systemd_available():
         raise SystemExit("systemd is not available on this Linux host")
 
-    env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
-    env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
-    _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
-    service_user = detect_service_user()
+    if not prepared_systemd_request:
+        env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
+        env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
+        _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
+        service_user = detect_service_user()
     transaction_id = controller.transaction_id or uuid.uuid4().hex
 
     with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
         staging = Path(temporary)
+        helper = staging / "helper.py"
+        verified_controller_helper = (
+            _materialize_verified_systemd_helper(
+                controller.controller_source_commit,
+                helper,
+                ProdSourceKind.PREPARED_ARTIFACT.value,
+            )
+            if prepared_systemd_request
+            else None
+        )
         prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
+            _prepare_linux_artifact(
+                controller.prepared_artifact,
+                controller.expected_full_commit,
+                controller.controller_source_commit,
+                controller.expected_preparation_receipt_sha256,
+                staging,
+                verified_controller_helper,
+            )
+            if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None
+            else _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release
             else _prepare_local_candidate(
                 target=_linux_musl_target(),
@@ -8349,10 +8626,18 @@ def native_prod_deploy(
                 ),
             )
         )
+        if prepared_systemd_request:
+            _require_noninteractive_sudo_ready()
+            env_snapshot = _read_systemd_installed_env(noninteractive=True)
+            env_file_loaded = str(PROD_ENV_FILE)
+            _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
+            service_user = detect_service_user()
         candidate_binary = staging / "candidate-binary"
         if prepared.binary != candidate_binary:
             shutil.copy2(prepared.binary, candidate_binary)
         candidate_binary.chmod(0o700)
+        if isinstance(prepared, ValidatedLinuxPreparedCandidate) and _file_sha256(candidate_binary) != prepared.binary_sha256:
+            raise SystemExit("Linux prepared candidate changed while staging")
 
         candidate_env = staging / "candidate.env"
         candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
@@ -8378,31 +8663,53 @@ def native_prod_deploy(
         candidate_socket.write_text(generate_systemd_socket(config))
         candidate_socket.chmod(0o600)
 
-        helper = staging / "helper.py"
-        _materialize_source_file(
-            controller.controller_source_commit or prepared.source_commit,
-            "scripts/systemd_deploy_helper.py",
-            helper,
-            "published_release" if controller.systemd_current_schema_upgrade else prepared.source_kind.value,
-        )
+        if verified_controller_helper is not None:
+            expected_helper_sha256 = verified_controller_helper.digest()
+        else:
+            expected_helper_sha256 = _materialize_source_file(
+                controller.controller_source_commit or prepared.source_commit,
+                "scripts/systemd_deploy_helper.py",
+                helper,
+                prepared.source_kind.value,
+            )
         registry = None
         if controller.systemd_current_schema_upgrade:
-            if (prepared.release_tag != SYSTEMD_PROTECTED_TAG or prepared.release_commit != SYSTEMD_PROTECTED_COMMIT
+            if isinstance(prepared, ValidatedLinuxPreparedCandidate):
+                _require_linux_prepared_unchanged(prepared)
+            elif (prepared.release_tag != SYSTEMD_PROTECTED_TAG or prepared.release_commit != SYSTEMD_PROTECTED_COMMIT
                     or prepared.source_commit != SYSTEMD_PROTECTED_COMMIT
                     or prepared.identity != RuntimeIdentity(SYSTEMD_PROTECTED_VERSION, SYSTEMD_PROTECTED_COMMIT)
                     or _file_sha256(candidate_binary) != SYSTEMD_PROTECTED_ASSET_SHA256):
                 raise SystemExit("protected systemd candidate is not the reviewed release")
             registry = staging / "migrations.rs"
             _materialize_source_file(prepared.source_commit, "crates/phoenix-db/src/migrations.rs", registry, prepared.source_kind.value)
-            if _file_sha256(registry) != SYSTEMD_PROTECTED_REGISTRY_SHA256:
+            expected_registry_sha = (SYSTEMD_PREPARED_REGISTRY_SHA256 if isinstance(prepared, ValidatedLinuxPreparedCandidate)
+                                     else SYSTEMD_PROTECTED_REGISTRY_SHA256)
+            if _file_sha256(registry) != expected_registry_sha:
                 raise SystemExit("protected systemd registry hash is not the reviewed release")
         else:
             _systemd_ordinary_database_preflight(dataclasses.replace(prepared, binary=candidate_binary), staging, env_snapshot)
-        expected_protocol = SYSTEMD_PROTECTED_PROTOCOL if controller.systemd_current_schema_upgrade else SYSTEMD_HANDOFF_PROTOCOL_VERSION
-        protocol = subprocess.run(
-            [sys.executable, str(helper), "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
+        is_prepared = isinstance(prepared, ValidatedLinuxPreparedCandidate)
+        expected_protocol = (SYSTEMD_PREPARED_PROTOCOL if is_prepared else SYSTEMD_PROTECTED_PROTOCOL
+                             if controller.systemd_current_schema_upgrade else SYSTEMD_HANDOFF_PROTOCOL_VERSION)
+        protocol_argument = (
+            "--protected-prepared-protocol-version" if is_prepared else
+            "--protected-protocol-version" if controller.systemd_current_schema_upgrade else "--protocol-version"
+        )
+        if is_prepared:
+            helper_bytes = helper.read_bytes()
+            if hashlib.sha256(helper_bytes).hexdigest() != expected_helper_sha256:
+                raise SystemExit("prepared systemd helper changed after exact controller materialization")
+            protocol_result = subprocess.run(
+                [sys.executable, "-", protocol_argument], input=helper_bytes,
+                capture_output=True, check=True,
+            )
+            protocol = protocol_result.stdout.decode().strip()
+        else:
+            protocol = subprocess.run(
+                [sys.executable, str(helper), protocol_argument],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
         if protocol != str(expected_protocol):
             raise SystemExit(f"systemd helper protocol mismatch: expected {expected_protocol}, got {protocol!r}")
 
@@ -8419,16 +8726,16 @@ def native_prod_deploy(
                 "database_path": env_snapshot.get("PHOENIX_DB_PATH", str(SYSTEMD_DB_PATH)),
                 "controller_source_commit": controller.controller_source_commit,
                 "controller_helper": _systemd_artifact(root_paths["helper.py"], helper),
-                "release_asset_name": controller.expected_asset_name,
-                "release_asset_sha256": controller.expected_asset_sha256,
+                **({"prepared_artifact_receipt": _systemd_artifact(root_transaction / SYSTEMD_PREPARED_RECEIPT, prepared.receipt)}
+                   if is_prepared else {"release_asset_name": controller.expected_asset_name,
+                                        "release_asset_sha256": controller.expected_asset_sha256}),
             } if controller.systemd_current_schema_upgrade else {}),
             "transaction_id": transaction_id,
             "unit_name": PROD_SERVICE_NAME,
             "service_user": service_user,
             "source_kind": prepared.source_kind.value,
             "source_commit": prepared.source_commit,
-            "release_tag": prepared.release_tag,
-            "release_commit": prepared.release_commit,
+            **({} if is_prepared else {"release_tag": prepared.release_tag, "release_commit": prepared.release_commit}),
             "expected": prepared.identity.as_dict(),
             "previous": None,
             "expected_health_url": _prod_api_health_url(env_snapshot),
@@ -8470,14 +8777,27 @@ def native_prod_deploy(
         ]
         if registry is not None:
             files.append(("migrations.rs", registry))
+        if is_prepared:
+            _require_linux_prepared_unchanged(prepared)
+            files.append((SYSTEMD_PREPARED_RECEIPT, prepared.receipt))
         if env_snapshot:
             files.append(("candidate.env", candidate_env))
+        prepared_stage_kwargs = (
+            {
+                "expected_helper_sha256": expected_helper_sha256,
+                "expected_preparation_receipt_sha256": controller.expected_preparation_receipt_sha256,
+            }
+            if is_prepared
+            else {}
+        )
         root_manifest = _stage_systemd_root_handoff(
             staging,
             transaction_id,
             helper,
             files,
             noninteractive=controller.enabled,
+            bind_bundle=prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT,
+            **prepared_stage_kwargs,
         )
 
     _launch_systemd_activation(
@@ -9588,6 +9908,39 @@ class PreparedCandidate:
 
 
 @dataclasses.dataclass(frozen=True)
+class DisposableLaunchdValidationInputs:
+    prepared_artifact: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class DisposableLaunchdValidationReceipt:
+    transaction_id: str
+    root: Path
+    transaction_path: Path
+    manifest_path: Path
+    candidate_identity: RuntimeIdentity
+    rollback_identity: RuntimeIdentity
+    controller_source_commit: str
+    controller_helper_sha256: str
+    candidate_registry_sha256: str
+    database_ledger: tuple[tuple[int, str], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class ValidatedLinuxPreparedCandidate:
+    binary: Path
+    receipt: Path
+    binary_sha256: str
+    receipt_sha256: str
+    controller_commit: str
+    source_kind: ProdSourceKind = ProdSourceKind.PREPARED_ARTIFACT
+    source_commit: str = SYSTEMD_PREPARED_COMMIT
+    identity: RuntimeIdentity = RuntimeIdentity(SYSTEMD_PREPARED_VERSION, SYSTEMD_PREPARED_COMMIT)
+    release_tag: None = None
+    release_commit: None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class ProdDeployControllerOptions:
     enabled: bool = False
     exact_release_tag: str | None = None
@@ -9597,12 +9950,15 @@ class ProdDeployControllerOptions:
     transaction_id: str | None = None
     backend: str | None = None
     prepared_artifact: Path | None = None
+    expected_preparation_receipt_sha256: str | None = None
     paired_database_upgrade: bool = False
     current_schema_upgrade: bool = False
     systemd_current_schema_upgrade: bool = False
     controller_source_commit: str | None = None
 
     def require_controller_source(self, release: str | None) -> None:
+        if self.expected_preparation_receipt_sha256 is not None and not self.systemd_current_schema_upgrade:
+            raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
         if self.systemd_current_schema_upgrade:
             self.require_systemd_current(release)
             return
@@ -9642,12 +9998,28 @@ class ProdDeployControllerOptions:
         if not self.systemd_current_schema_upgrade:
             if self.controller_source_commit is not None:
                 raise SystemExit("--controller-source-commit requires --systemd-current-schema-upgrade")
+            if self.expected_preparation_receipt_sha256 is not None:
+                raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
             return
         import platform
         if (not self.enabled or self.backend != "systemd" or sys.platform != "linux"
                 or platform.machine().lower() not in {"x86_64", "amd64"}
-                or self.prepared_artifact is not None or self.current_schema_upgrade or self.paired_database_upgrade):
-            raise SystemExit("--systemd-current-schema-upgrade requires Linux x86_64 systemd exact-release controller mode only")
+                or self.current_schema_upgrade or self.paired_database_upgrade):
+            raise SystemExit("--systemd-current-schema-upgrade requires Linux x86_64 systemd controller mode only")
+        if self.prepared_artifact is not None:
+            if (release is not None or self.expected_full_commit != SYSTEMD_PREPARED_COMMIT
+                    or any(value is not None for value in (
+                        self.exact_release_tag, self.expected_asset_name, self.expected_asset_sha256,
+                    )) or re.fullmatch(r"[0-9a-f]{40}", self.controller_source_commit or "") is None
+                    or self.controller_source_commit == self.expected_full_commit
+                    or re.fullmatch(r"[0-9a-f]{64}", self.expected_preparation_receipt_sha256 or "") is None):
+                raise SystemExit(
+                    "protected Linux prepared artifact requires exact app SHA, separate controller, "
+                    "authenticated --expected-preparation-receipt-sha256 and no release pins"
+                )
+            return
+        if self.expected_preparation_receipt_sha256 is not None:
+            raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
         self.require_exact_release(release)
         if (release != SYSTEMD_PROTECTED_TAG or self.exact_release_tag != SYSTEMD_PROTECTED_TAG
                 or self.expected_full_commit != SYSTEMD_PROTECTED_COMMIT
@@ -10216,6 +10588,25 @@ PREPARED_SOURCE114_COMMIT = "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
 PREPARED_SOURCE114_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
 
 
+def _macos_prepared_target() -> str:
+    machine = platform.machine().lower()
+    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
+    if target is None:
+        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    return target
+
+
+def _prepared_artifact_bundle_names(target: str) -> dict[str, str]:
+    short_commit = PREPARED_SOURCE114_COMMIT[:12]
+    return {
+        "receipt": f"PREPARATION-RECEIPT-{target}.json",
+        "standalone": f"phoenix_ide-{target}-prepared-{short_commit}",
+        "archive": f"Phoenix-macos-{target}-prepared-{short_commit}.zip",
+        "checksums": f"PREPARATION-SHA256SUMS-{target}",
+        "headless_acceptance": f"HEADLESS-ACCEPTANCE-{target}.json",
+    }
+
+
 def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> PreparedCandidate:
     """Validate one protected prepare-main standalone artifact without resigning it."""
     if sys.platform != "darwin":
@@ -10224,10 +10615,7 @@ def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> Pr
         raise SystemExit("--expected-full-commit must be a full 40-character lowercase git SHA")
     if not directory.is_dir() or directory.is_symlink():
         raise SystemExit("prepared artifact must be a real directory")
-    machine = platform.machine().lower()
-    target = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}.get(machine)
-    if target is None:
-        raise SystemExit(f"unsupported macOS architecture {machine!r}")
+    target = _macos_prepared_target()
     receipt = directory / f"PREPARATION-RECEIPT-{target}.json"
     if not receipt.is_file() or receipt.is_symlink():
         raise SystemExit(f"prepared artifact is missing {receipt.name}")
@@ -10420,6 +10808,15 @@ def _status_is_terminal_for_owner(
         return False
 
 
+def _deploy_unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
 class DeployManifestKind(enum.Enum):
     ORDINARY = "ordinary"
     ORDINARY_FORWARD = "ordinary_forward"
@@ -10441,8 +10838,10 @@ def _deploy_manifest_kind(transaction: Path) -> DeployManifestKind:
     if manifest_path.is_symlink() or not manifest_path.is_file():
         return DeployManifestKind.UNKNOWN
     try:
-        payload = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(
+            manifest_path.read_text(), object_pairs_hook=_deploy_unique_json_object
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
         return DeployManifestKind.UNKNOWN
     if not isinstance(payload, dict) or not isinstance(payload.get("source_kind"), str):
         return DeployManifestKind.UNKNOWN
@@ -10981,7 +11380,7 @@ def _materialize_source_file(
     source_path: str,
     destination: Path,
     source_kind: str,
-) -> None:
+) -> str:
     if source_kind == "local_head":
         result = subprocess.run(
             ["git", "show", f"{source_commit}:{source_path}"],
@@ -11004,6 +11403,7 @@ def _materialize_source_file(
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
+        return hashlib.sha256(result.stdout).hexdigest()
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -11033,6 +11433,351 @@ def _materialize_helper(source_commit: str, destination: Path, source_kind: str)
         "scripts/launchd_deploy_helper.py",
         destination,
         source_kind,
+    )
+
+
+def _stage_disposable_validation_file(source: Path, destination: Path, mode: int) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with source.open("rb") as input_stream, os.fdopen(fd, "wb") as output_stream:
+            fd = -1
+            shutil.copyfileobj(input_stream, output_stream)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(destination.parent)
+
+
+def _write_disposable_validation_bytes(
+    destination: Path, content: bytes, mode: int
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(destination.parent)
+
+
+def _fsync_disposable_validation_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    _fsync_directory(path.parent)
+
+
+def _disposable_launchd_validation_plist(
+    *, label: str, target_binary: Path, database: Path, port: int
+) -> bytes:
+    return plistlib.dumps(
+        {
+            "Label": label,
+            "ProgramArguments": [str(target_binary)],
+            "EnvironmentVariables": {"PHOENIX_DB_PATH": str(database)},
+            "KeepAlive": True,
+            "Sockets": {
+                "Listeners": {"SockServiceName": str(port), "SockType": "stream"}
+            },
+        },
+        fmt=plistlib.FMT_XML,
+    )
+
+
+def _create_disposable_source114_database(
+    database: Path, target_ledger: tuple[tuple[int, str], ...]
+) -> tuple[tuple[int, str], ...]:
+    import sqlite3
+
+    source_ledger = tuple(item for item in target_ledger if item[0] <= 114)
+    if not source_ledger or source_ledger[-1][0] != 114:
+        raise SystemExit("exact candidate registry lacks the source114 baseline")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO _migrations (version, name) VALUES (?, ?)", source_ledger
+        )
+        connection.executescript(
+            """
+            CREATE TABLE product_conversations (id TEXT PRIMARY KEY);
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                product_conversation_id TEXT
+                    REFERENCES product_conversations(id) ON DELETE CASCADE
+            );
+            CREATE TABLE product_conversation_sources (
+                target_product_conversation_id TEXT PRIMARY KEY
+                    REFERENCES product_conversations(id) ON DELETE CASCADE,
+                source_product_conversation_id TEXT NOT NULL,
+                source_conversation_id TEXT NOT NULL,
+                relation_kind TEXT NOT NULL,
+                relation_key TEXT NOT NULL,
+                created_at_us INTEGER NOT NULL
+            );
+            """
+        )
+    database.chmod(0o600)
+    _fsync_disposable_validation_file(database)
+    return source_ledger
+
+
+def _disposable_validation_tree_witness(
+    root: Path,
+) -> tuple[tuple[str, str, int, int, int], ...]:
+    witness = []
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item))]:
+        relative = str(path.relative_to(root))
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            content = f"symlink:{os.readlink(path)}"
+        elif stat.S_ISREG(metadata.st_mode):
+            content = f"file:{_file_sha256(path)}"
+        elif stat.S_ISDIR(metadata.st_mode):
+            content = "directory"
+        else:
+            content = f"other:{stat.S_IFMT(metadata.st_mode)}"
+        witness.append(
+            (
+                relative,
+                content,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+        )
+    return tuple(witness)
+
+
+def prepare_disposable_launchd_validation(
+    inputs: DisposableLaunchdValidationInputs,
+) -> DisposableLaunchdValidationReceipt:
+    """Stage and validate one exact prepared handoff without activation authority."""
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if dirty:
+        raise SystemExit("disposable validation requires a clean controller source tree")
+    controller_source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", controller_source_commit) is None
+        or controller_source_commit == PREPARED_SOURCE114_COMMIT
+    ):
+        raise SystemExit("disposable validation requires an independent controller commit")
+    root = Path(tempfile.mkdtemp(prefix="phoenix-launchd-validation-"))
+    try:
+        root = root.resolve()
+        root.chmod(0o700)
+        return _prepare_disposable_launchd_validation(inputs, root, controller_source_commit)
+    except BaseException:
+        shutil.rmtree(root)
+        raise
+
+
+def _prepare_disposable_launchd_validation(
+    inputs: DisposableLaunchdValidationInputs,
+    root: Path,
+    controller_source_commit: str,
+) -> DisposableLaunchdValidationReceipt:
+    import runpy
+
+    target = _macos_prepared_target()
+    bundle_names = _prepared_artifact_bundle_names(target)
+    expected_names = set(bundle_names.values())
+    source = inputs.prepared_artifact
+    if not stat.S_ISDIR(source.lstat().st_mode):
+        raise SystemExit("prepared artifact must be a real directory")
+    entries = {entry.name: entry for entry in source.iterdir()}
+    if entries.keys() != expected_names:
+        raise SystemExit("disposable prepared artifact does not match the exact retained bundle")
+    if any(not stat.S_ISREG(entry.lstat().st_mode) for entry in entries.values()):
+        raise SystemExit("disposable prepared artifact entries must be regular non-symlink files")
+
+    checksum_entries: dict[str, str] = {}
+    for line in entries[bundle_names["checksums"]].read_text().splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            raise SystemExit("prepared artifact checksum manifest is malformed")
+        digest, name = fields[0].lower(), fields[1].lstrip("*")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or name in checksum_entries:
+            raise SystemExit("prepared artifact checksum manifest is malformed")
+        checksum_entries[name] = digest
+    payload_names = {bundle_names["standalone"], bundle_names["archive"]}
+    if checksum_entries.keys() != payload_names:
+        raise SystemExit("prepared artifact checksum manifest has the wrong payload set")
+    try:
+        receipt = json.loads(entries[bundle_names["receipt"]].read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("prepared artifact receipt is unreadable") from exc
+    if not isinstance(receipt, dict) or receipt.get("sha256") != checksum_entries:
+        raise SystemExit("prepared artifact receipt and checksum manifest disagree")
+    for name, digest in checksum_entries.items():
+        if _file_sha256(entries[name]) != digest:
+            raise SystemExit(f"prepared artifact payload checksum mismatch: {name}")
+
+    staged_artifact = root / "prepared-artifact"
+    staged_artifact.mkdir(mode=0o700)
+    for name in (bundle_names["receipt"], bundle_names["standalone"]):
+        _stage_disposable_validation_file(entries[name], staged_artifact / name, 0o600)
+    prepared = _prepare_prepared_artifact(staged_artifact, PREPARED_SOURCE114_COMMIT)
+    token = hashlib.sha256(f"{root}:{controller_source_commit}".encode()).hexdigest()[:20]
+    transaction_id = f"validation-{token}"
+    transactions = root / "transactions"
+    transactions.mkdir(mode=0o700)
+    transaction = transactions / transaction_id
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "candidate-phoenix-ide"
+    rollback = transaction / "rollback-phoenix-ide"
+    candidate_plist = transaction / "candidate.plist"
+    rollback_plist = transaction / "rollback.plist"
+    target_binary = root / "target" / "phoenix-ide"
+    target_plist = root / "target" / "phoenix.plist"
+    helper = transaction / "activate.py"
+    registry = transaction / "migrations.rs"
+    database = transaction / "application.sqlite3"
+    manifest_path = transaction / "manifest.json"
+    _stage_disposable_validation_file(prepared.binary, candidate, 0o755)
+    rollback_identity = RuntimeIdentity(version="0.0.0", git_sha="a" * 40)
+    _write_disposable_validation_bytes(
+        rollback, b"disposable rollback witness; never executable\n", 0o600
+    )
+    label = f"test.disposable.phoenix.validation.{token}"
+    first_port = 40_000 + int(token[:4], 16) % 10_000
+    _write_disposable_validation_bytes(
+        candidate_plist,
+        _disposable_launchd_validation_plist(
+            label=label, target_binary=target_binary, database=database, port=first_port
+        ),
+        0o600,
+    )
+    _write_disposable_validation_bytes(
+        rollback_plist,
+        _disposable_launchd_validation_plist(
+            label=label, target_binary=target_binary, database=database, port=first_port + 1
+        ),
+        0o600,
+    )
+    _materialize_helper(controller_source_commit, helper, "local_head")
+    _materialize_source_file(
+        PREPARED_SOURCE114_COMMIT,
+        "crates/phoenix-db/src/migrations.rs",
+        registry,
+        "local_head",
+    )
+    registry.chmod(0o600)
+    _fsync_disposable_validation_file(helper)
+    _fsync_disposable_validation_file(registry)
+    if _file_sha256(registry) != PREPARED_SOURCE114_REGISTRY_SHA256:
+        raise SystemExit(
+            "disposable candidate registry differs from exact source114 evidence"
+        )
+    helper_protocol = subprocess.run(
+        [sys.executable, str(helper), "--protocol-version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if helper_protocol != str(LAUNCHD_HANDOFF_PROTOCOL_VERSION):
+        raise SystemExit("disposable retained helper protocol is unsupported")
+    policy = runpy.run_path(str(helper))
+    target_ledger = policy["migration_registry"](registry)
+    source_ledger = _create_disposable_source114_database(database, target_ledger)
+    helper_label = f"com.phoenix-ide.deploy.{transaction_id}"
+    upgrade = {
+        "database_path": str(database),
+        "backup_path": str(transaction / "database-backup.sqlite3"),
+        "proof_path": str(transaction / "database-proof.json"),
+        "controller_source_commit": controller_source_commit,
+        "controller_helper_path": str(helper),
+        "controller_helper_sha256": _file_sha256(helper),
+        "migration_registry_path": str(registry),
+        "migration_registry_sha256": _file_sha256(registry),
+        "prepared_source_baseline": 114,
+        "candidate_registry_expected_sha256": PREPARED_SOURCE114_REGISTRY_SHA256,
+    }
+    manifest = {
+        "manifest_version": LAUNCHD_HANDOFF_PROTOCOL_VERSION,
+        "transaction_id": transaction_id,
+        "source_kind": prepared.source_kind.value,
+        "source_commit": prepared.source_commit,
+        "release_tag": prepared.release_tag,
+        "release_commit": prepared.release_commit,
+        "expected": dataclasses.asdict(prepared.identity),
+        "previous": dataclasses.asdict(rollback_identity),
+        "previous_deployed_sha": rollback_identity.git_sha,
+        "candidate_binary": str(candidate),
+        "candidate_binary_sha256": _file_sha256(candidate),
+        "candidate_plist": str(candidate_plist),
+        "candidate_plist_sha256": _file_sha256(candidate_plist),
+        "rollback_binary": str(rollback),
+        "rollback_binary_sha256": _file_sha256(rollback),
+        "rollback_plist": str(rollback_plist),
+        "rollback_plist_sha256": _file_sha256(rollback_plist),
+        "target_binary": str(target_binary),
+        "target_plist": str(target_plist),
+        "label": label,
+        "helper_label": helper_label,
+        "uid": os.getuid(),
+        "health_url": f"http://127.0.0.1:{first_port}/api/version",
+        "health_insecure_tls": False,
+        "previous_health_url": f"http://127.0.0.1:{first_port + 1}/api/version",
+        "previous_health_insecure_tls": False,
+        "previous_health_json": True,
+        "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
+        "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
+        "active_path": str(root / "evidence" / "active"),
+        "status_path": str(root / "evidence" / "status.json"),
+        "deployed_sha_path": str(root / "evidence" / "deployed.sha"),
+        "lock_path": str(root / "evidence" / "deploy.lock"),
+        "claim_lock_path": str(root / "evidence" / "claim.lock"),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "current_schema_upgrade": upgrade,
+    }
+    _write_json_atomic(manifest_path, manifest)
+    if _deploy_manifest_kind(transaction) is not DeployManifestKind.CURRENT_SCHEMA:
+        raise SystemExit(
+            "disposable manifest was not classified as exact current-schema evidence"
+        )
+    tree_before_validation = _disposable_validation_tree_witness(root)
+    loaded = policy["Manifest"].load(manifest_path)
+    validated = policy["validate_pre_disruption_handoff"](loaded)
+    if _disposable_validation_tree_witness(root) != tree_before_validation:
+        raise SystemExit("disposable helper validation mutated retained evidence")
+    if (
+        validated.candidate_binary != candidate
+        or validated.candidate_plist != candidate_plist
+        or validated.rollback != (rollback, rollback_plist)
+    ):
+        raise SystemExit("disposable helper validation returned mismatched evidence")
+    return DisposableLaunchdValidationReceipt(
+        transaction_id=transaction_id,
+        root=root,
+        transaction_path=transaction,
+        manifest_path=manifest_path,
+        candidate_identity=prepared.identity,
+        rollback_identity=rollback_identity,
+        controller_source_commit=controller_source_commit,
+        controller_helper_sha256=_file_sha256(helper),
+        candidate_registry_sha256=_file_sha256(registry),
+        database_ledger=source_ledger,
     )
 
 
@@ -12611,11 +13356,12 @@ def cmd_prod_deploy(
         raise SystemExit("--paired-database-upgrade and --current-schema-upgrade are mutually exclusive")
     if controller.expected_full_commit is not None and release is None and controller.prepared_artifact is None and not any(upgrade_modes):
         raise SystemExit("--expected-full-commit requires all prepared upgrade options or an exact release controller")
-    if not (release is not None and controller.current_schema_upgrade and controller.prepared_artifact is None) and (controller.prepared_artifact is not None or any(upgrade_modes)) and (
+    if not (release is not None and controller.current_schema_upgrade and controller.prepared_artifact is None) and not controller.systemd_current_schema_upgrade and (controller.prepared_artifact is not None or any(upgrade_modes)) and (
         controller.prepared_artifact is None or controller.expected_full_commit is None or not any(upgrade_modes)
     ):
         raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together")
-    if controller.prepared_artifact is not None and (sys.platform != "darwin" or controller.backend not in (None, "launchd")):
+    if (controller.prepared_artifact is not None and not controller.systemd_current_schema_upgrade
+            and (sys.platform != "darwin" or controller.backend not in (None, "launchd"))):
         raise SystemExit("prepared artifact upgrade is supported only by macOS launchd")
     if controller.prepared_artifact is not None and release:
         raise SystemExit("prepared artifact upgrade excludes --release")
@@ -13009,7 +13755,11 @@ def main():
     deploy_parser.add_argument("--controller-expected-asset-name", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
-    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepare-main artifact directory (macOS launchd only)")
+    deploy_parser.add_argument("--prepared-artifact", type=Path, help="Protected prepared artifact directory (macOS launchd or Linux systemd)")
+    deploy_parser.add_argument(
+        "--expected-preparation-receipt-sha256",
+        help="Authenticated exact receipt-byte SHA-256 for protected prepared Linux systemd deployment",
+    )
     deploy_parser.add_argument("--expected-full-commit", help="Exact full lowercase candidate SHA for --prepared-artifact or protected --release upgrade")
     upgrade_group = deploy_parser.add_mutually_exclusive_group()
     upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
@@ -13222,6 +13972,7 @@ def main():
                     expected_asset_sha256=args.controller_expected_asset_sha256,
                     transaction_id=args.transaction_id,
                     prepared_artifact=args.prepared_artifact,
+                    expected_preparation_receipt_sha256=args.expected_preparation_receipt_sha256,
                     paired_database_upgrade=args.paired_database_upgrade,
                     current_schema_upgrade=args.current_schema_upgrade,
                     systemd_current_schema_upgrade=args.systemd_current_schema_upgrade,

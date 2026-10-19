@@ -287,6 +287,7 @@ pub fn spawn_pty(
             Ok(TerminalHandle {
                 master_fd: Mutex::new(Some(master_fd)),
                 child_pid: child,
+                child_lifecycle: crate::child_lifecycle::TerminalChildLifecycle::new(),
                 launch_identity,
                 child_kind,
                 tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),

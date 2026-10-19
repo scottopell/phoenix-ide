@@ -473,14 +473,23 @@ rule ShellExited {
     requires: terminal.status = active
 
     ensures: ChildReaped(terminal.child_pid)
-        -- waitpid() called to prevent zombie processes
+        -- The registered child observer publishes the reap receipt.
     ensures: WebSocketClosed(terminal)
     ensures: terminal.status = absent
 
     @guidance
         -- EIO is PTY EOF: the slave fd closed because the shell exited.
         -- This is NOT an error condition. Log at tracing::debug, not error.
-        -- waitpid() belongs here (Task A) because Task A observes EIO first.
+        -- One observer is installed on registry publication, independently of
+        -- relay attachment; only it reaps the registered child. Consumers await
+        -- its read-only retained exit receipt, not another waitpid call.
+        -- Natural child exit does not send TearDown to an attached relay:
+        -- output drains through the existing EOF path before attach authority
+        -- is released. The observer acquires that authority before closing
+        -- the master and removing only the exact registered instance.
+        -- Detached exit needs no reconnect or Close; a live idle detached child
+        -- is preserved. Explicit Close awaits the same receipt and retains its
+        -- fence until its owning operation releases it.
 }
 
 -- REQ-TERM-008: User closes terminal (WebSocket disconnect)
@@ -496,13 +505,13 @@ rule UserClosedTerminal {
     ensures: MasterFdClosed(terminal)
         -- Closing master_fd triggers kernel SIGHUP to shell's process group.
         -- Shell receives SIGHUP and exits → slave fd closes → Task A reads EIO.
-        -- Task A then calls waitpid() to reap the child (ShellExited rule).
+        -- The independent registered observer reaps the child (ShellExited guidance).
     ensures: terminal.status = absent
 
     @guidance
         -- master_fd closure happens via Drop on TerminalHandle.
-        -- Do NOT call waitpid() here; let the reader task (Task A) observe EIO
-        -- and reap. Calling it in two places risks a race or double-reap.
+        -- Do NOT call waitpid() here; await the registered observer's receipt.
+        -- Calling it in two places risks a race or double-reap.
 }
 
 -- REQ-TERM-022: Agent reads most recent command record (success)

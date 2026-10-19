@@ -79,7 +79,7 @@ const FirstTaskWelcome = lazy(() =>
   import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
 );
 const ChainQaColumn = lazy(() =>
-  import('./ChainPage').then((m) => ({ default: m.ChainQaColumn })),
+  import('../components/ChainQaColumn').then((m) => ({ default: m.ChainQaColumn })),
 );
 
 
