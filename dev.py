@@ -5294,23 +5294,28 @@ def _start_kache_daemon_locked(
         if settlement_error:
             return f"{safe_readiness}; {settlement_error}"
         return (
-            f"{safe_readiness}; spawned Kache child pid {child.pid} terminated "
+            f"{safe_readiness}; spawned Kache child pid {child.pid} is no longer running "
             "after readiness failure"
         )
     serving_pid = _kache_daemon_serving_pid(socket)
     if serving_pid != child.pid:
-        child_state = "live" if child.poll() is None else "exited"
+        settlement_error = _settle_spawned_kache_child(child)
+        if settlement_error:
+            return (
+                "a different process won the daemon bind race; refusing to claim ownership; "
+                f"{settlement_error}"
+            )
         return (
             "a different process won the daemon bind race; refusing to claim ownership; "
-            f"spawned child pid {child.pid} is {child_state} and unclaimed for {socket}"
+            f"spawned Kache child pid {child.pid} is no longer running"
         )
     receipt_error = _record_kache_daemon_receipt(socket, identity)
-    if receipt_error and child.poll() is None:
-        return (
-            f"{receipt_error}; spawned Kache child pid {child.pid} is live on {socket} "
-            "without a Phoenix ownership receipt"
-        )
-    return receipt_error
+    if receipt_error:
+        settlement_error = _settle_spawned_kache_child(child)
+        if settlement_error:
+            return f"{receipt_error}; {settlement_error}"
+        return f"{receipt_error}; spawned Kache child pid {child.pid} is no longer running"
+    return None
 
 
 def _generated_kache_socket(binary: str, *, cargo_cwd: Path | None) -> Path:

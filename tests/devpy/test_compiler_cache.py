@@ -755,6 +755,7 @@ class CompilerCacheTests(unittest.TestCase):
     def test_daemon_start_receipts_only_the_spawned_serving_process(self):
         child = mock.Mock(pid=1234)
         child.poll.return_value = None
+        child.wait.return_value = -15
         with mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
@@ -774,7 +775,10 @@ class CompilerCacheTests(unittest.TestCase):
             )
 
         self.assertIn("different process won the daemon bind race", error or "")
+        self.assertIn("spawned Kache child pid 1234 is no longer running", error or "")
         self.assertEqual(["/bin/kache", "daemon", "run"], spawn.call_args.args[0])
+        child.terminate.assert_called_once_with()
+        child.wait.assert_called_once_with(timeout=1.0)
         record.assert_not_called()
 
     def test_live_child_after_readiness_failure_is_settled(self):
@@ -798,7 +802,7 @@ class CompilerCacheTests(unittest.TestCase):
         child.kill.assert_not_called()
         child.wait.assert_called_once_with(timeout=1.0)
         self.assertIn("readiness timed out", error or "")
-        self.assertIn("spawned Kache child pid 2468 terminated", error or "")
+        self.assertIn("spawned Kache child pid 2468 is no longer running", error or "")
         self.assertNotIn("may still be live", error or "")
 
     def test_readiness_failure_escalates_only_spawned_child(self):
@@ -840,7 +844,7 @@ class CompilerCacheTests(unittest.TestCase):
             )
         rendered = self.dev._safe_kache_startup_diagnostic(error or "", environment={})
         self.assertLessEqual(len(rendered), 2048)
-        self.assertIn("spawned Kache child pid 2468 terminated", rendered)
+        self.assertIn("spawned Kache child pid 2468 is no longer running", rendered)
         self.assertIn("after readiness failure", rendered)
 
     def test_credential_readiness_failure_retains_child_settlement(self):
@@ -863,7 +867,7 @@ class CompilerCacheTests(unittest.TestCase):
             )
         self.assertNotIn("fixture-secret", error or "")
         self.assertIn("[redacted backend diagnostic]", error or "")
-        self.assertIn("spawned Kache child pid 2468 terminated", error or "")
+        self.assertIn("spawned Kache child pid 2468 is no longer running", error or "")
 
     def test_diagnostic_thread_failure_reports_live_child(self):
         child = mock.Mock(pid=2468)
@@ -884,9 +888,10 @@ class CompilerCacheTests(unittest.TestCase):
         self.assertIn("thread unavailable", error or "")
         self.assertIn("pid 2468 may still be live", error or "")
 
-    def test_live_child_after_receipt_failure_is_reported_unclaimed(self):
+    def test_live_child_after_receipt_failure_is_settled(self):
         child = mock.Mock(pid=2468)
         child.poll.return_value = None
+        child.wait.return_value = -15
         with mock.patch.object(
             self.dev, "_kache_daemon_is_running", return_value=(False, None)
         ), mock.patch.object(
@@ -905,8 +910,9 @@ class CompilerCacheTests(unittest.TestCase):
                 identity="identity",
             )
         self.assertIn("receipt write failed", error or "")
-        self.assertIn("pid 2468 is live", error or "")
-        self.assertIn("without a Phoenix ownership receipt", error or "")
+        self.assertIn("spawned Kache child pid 2468 is no longer running", error or "")
+        child.terminate.assert_called_once_with()
+        child.wait.assert_called_once_with(timeout=1.0)
 
     def test_malformed_utf8_proof_files_are_unverifiable(self):
         with self.dev.tempfile.TemporaryDirectory() as temporary:
