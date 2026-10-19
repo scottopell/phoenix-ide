@@ -1445,9 +1445,13 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
         canonical_route = creation["canonical_route"]
         root_conv_id = creation["transcript_row_id"]
 
-        assert canonical_route == f"/c/{product_conversation_id}", (
+        from urllib.parse import quote
+        root = _get_conv(base_url, root_conv_id)["conversation"]
+        assert canonical_route == f"/c/{quote(root['slug'], safe='')}", (
             f"unexpected canonical route: {canonical_route!r}"
         )
+        assert _get_product_conversation(base_url, product_conversation_id)["canonical_route"] == canonical_route
+        assert _get_product_conversation_route(base_url, root["slug"])["transcript_row_id"] == root_conv_id
 
         _wait_for_sse_signal(
             base_url,

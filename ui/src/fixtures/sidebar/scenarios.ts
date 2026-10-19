@@ -61,7 +61,6 @@ function conv(id: string, slug: string, projectId: string, overrides: Partial<Co
     seed_label: null,
     seed_parent_slug: null,
     continued_in_conv_id: null,
-    chain_name: null,
     browser_session_active: false,
     terminal_uses_tmux: true,
     work_scope_key: `conversation:${id}`,

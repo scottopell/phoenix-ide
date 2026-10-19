@@ -47,7 +47,7 @@ impl Database {
                     COALESCE(w.source_product_conversation_id, e.mandatory_source_product_id) AS product_id,
                     e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
                     e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
-                    (SELECT COALESCE(NULLIF(root.chain_name, ''), NULLIF(root.title, ''),
+                    (SELECT COALESCE(NULLIF(root.title, ''),
                                      NULLIF(root.slug, ''), 'Untitled conversation')
                      FROM conversations root
                      WHERE root.product_conversation_id = p.id AND root.runtime_role = 'user'

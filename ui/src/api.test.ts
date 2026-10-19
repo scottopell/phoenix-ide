@@ -49,6 +49,29 @@ describe('question response API identity', () => {
   });
 });
 
+describe('canonical product-conversation naming', () => {
+  beforeEach(() => vi.stubGlobal('fetch', vi.fn()));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('uses one PATCH title and POST regenerate flow, returning aggregate rows', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const row = { product_conversation_id: 'product-1' };
+    fetchMock.mockResolvedValue({ ok: true, json: async () => row } as unknown as Response);
+
+    await expect(api.renameProductConversation('conv/id', 'A title')).resolves.toEqual(row);
+    await expect(api.regenerateProductConversationName('product-1')).resolves.toEqual(row);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/product-conversations/conv%2Fid/title', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'A title' }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/product-conversations/product-1/regenerate-name', {
+      method: 'POST',
+    });
+  });
+});
+
 describe('api.continueConversation', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
@@ -476,47 +499,6 @@ describe('conversation message history clients', () => {
 
     await expect(api.getProductConversationSnapshot('pc-1', { before: 'stale' }))
       .rejects.toMatchObject({ status: 400 });
-  });
-});
-
-describe('api.regenerateConversationName', () => {
-  beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn());
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('POSTs /api/conversations/:id/regenerate-name and returns the refreshed conversation', async () => {
-    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        conversation: { id: 'conv-id', slug: 'generated-slug' },
-      }),
-    } as unknown as Response);
-
-    const res = await api.regenerateConversationName('conv-id');
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-id/regenerate-name',
-      { method: 'POST' },
-    );
-    expect(res.conversation.slug).toBe('generated-slug');
-  });
-
-  it('surfaces backend errors', async () => {
-    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => ({ error: 'name regeneration failed' }),
-    } as unknown as Response);
-
-    await expect(api.regenerateConversationName('conv-id')).rejects.toThrow(
-      /name regeneration failed/,
-    );
   });
 });
 
