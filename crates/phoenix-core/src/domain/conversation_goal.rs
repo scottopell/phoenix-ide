@@ -4,6 +4,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::product_conversation::ProductConversationId;
 
+mod pending_report;
+pub use pending_report::{GoalPendingReport, GoalReportBinding, GoalReportCall, GoalReportOutcome};
+mod tool_round_result;
+pub use tool_round_result::ToolRoundResult;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GoalError {
     #[error("goal value must not be blank")]

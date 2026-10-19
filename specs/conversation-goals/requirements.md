@@ -173,3 +173,26 @@ THE SYSTEM SHALL recheck that the bound Runtime turn and workflow still own the 
 THE SYSTEM SHALL preserve exact accepted retries as historical reads without requiring settlement again or repeating the mutation.
 
 THE SYSTEM SHALL expose persisted goal reads without adding ordinary chat or granting execution permission.
+
+### REQ-GOAL-010 — Goal reports finalize with the genuine tool round
+
+WHEN an executing agent prepares a goal report
+THE SYSTEM SHALL retain its exact admitted fence, execution, assistant-message and tool-use identity as typed pending data in the existing tool-round checkpoint, not as successful tool output or synthetic source chat.
+
+THE SYSTEM SHALL derive the pending report's owner, expected version and owning-agent execution from one immutable admitted binding, without a separate caller-supplied owner or execution representation.
+
+WHEN the owning tool-round transaction persists the genuine assistant call and its paired results
+THE SYSTEM SHALL apply a valid report and finalize its truthful result in that same transaction, including corresponding runtime state and provider replay progress.
+
+WHEN an expected semantic report refusal occurs
+THE SYSTEM SHALL roll back that report's mutation, retain unrelated legitimate tool results, and persist a finalized rejection rather than publish success or indefinitely abort the round.
+
+WHEN an unclassified SQL, constraint, I/O or commit failure occurs
+THE SYSTEM SHALL preserve the existing checkpoint failure/reconciliation behavior rather than mislabel that failure as an expected semantic refusal.
+
+THE SYSTEM SHALL publish report success or rejection to history, SSE or model context only after its owning checkpoint commits.
+
+WHEN checkpoint recovery or exact retry encounters an already finalized report result
+THE SYSTEM SHALL verify the exact pending payload and assistant/tool-use/execution identity and retain the committed outcome, including a rejection whose preconditions have since changed.
+
+THE SYSTEM SHALL NOT treat an existing result row alone as proof of an identical report, or reinterpret a previously committed rejection as success.
