@@ -941,6 +941,7 @@ async fn subscription_https_transport_rejects_malformed_oversized_redirect_and_t
                         )
                             .into_response(),
                         "timeout" => {
+                            // test-timing-allow: the delayed response must exceed the client deadline
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             axum::http::StatusCode::OK.into_response()
                         }
@@ -991,6 +992,7 @@ async fn slow_https_subscription_pass_has_one_total_budget_before_local_direct_t
                 let seen = seen.clone();
                 async move {
                     seen.fetch_add(1, Ordering::SeqCst);
+                    // test-timing-allow: the response must outlive the total sync-pass budget
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     axum::http::StatusCode::OK
                 }
@@ -1088,6 +1090,7 @@ async fn healthy_300ms_subscription_requests_finish_across_bounded_passes_withou
                         if request.uri().path().ends_with("/create") {
                             seen.fetch_add(1, Ordering::SeqCst);
                         }
+                        // test-timing-allow: elapsed delay is the behavior under the bounded-pass test
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     }
                     next.run(request).await
