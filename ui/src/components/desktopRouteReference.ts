@@ -1,5 +1,5 @@
 export function extractProductRouteReference(pathname: string) {
-  const match = pathname.match(/^\/(c|product-conversations)\/([^/]+)$/);
+  const match = pathname.match(/^\/(c|product-conversations)\/([^/]+)\/?$/);
   let reference = match?.[2];
   if (!reference) return null;
   try {

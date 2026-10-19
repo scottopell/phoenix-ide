@@ -36,6 +36,19 @@ describe('product conversation identity presentation', () => {
     expect(productConversationOwnsRoute('/c/some-other-conversation', previous)).toBe(false);
   });
 
+  it.each(['c', 'product-conversations'])('refreshes terminal-slash /%s routes while rejecting nested routes', (prefix) => {
+    const previous = row();
+    const renamed = row({ canonical_route: '/c/nouveau' });
+    expect(productConversationOwnsRoute(`/${prefix}/old-name/`, previous)).toBe(true);
+    expect(renamedProductConversationLocation(
+      `/${prefix}/latest-transcript-uuid/`, '?keep=yes', '#message-1', previous, renamed,
+    )).toEqual({ pathname: '/c/nouveau', search: '?keep=yes&source_transcript=latest-transcript-uuid', hash: '#message-1' });
+    for (const path of [`/${prefix}/old-name/child`, `/${prefix}/old-name//`]) {
+      expect(productConversationOwnsRoute(path, previous)).toBe(false);
+      expect(renamedProductConversationLocation(path, '', '', previous, renamed)).toBeNull();
+    }
+  });
+
   it('pins the exact matched root or latest transcript when moving an ID route to a slug', () => {
     const previous = row();
     const renamed = row({ canonical_route: '/c/nouveau-nom' });

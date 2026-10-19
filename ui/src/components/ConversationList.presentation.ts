@@ -8,7 +8,7 @@ export function productConversationOwnsRoute(
   pathname: string,
   row: Pick<ProductConversationListRow, 'product_conversation_id' | 'canonical_root' | 'latest_transcript_row_id'>,
 ): boolean {
-  const match = pathname.match(/^\/(?:c|product-conversations)\/([^/]+)$/);
+  const match = pathname.match(/^\/(?:c|product-conversations)\/([^/]+)\/?$/);
   if (!match?.[1]) return false;
   let routeIdentity: string;
   try {
@@ -33,7 +33,7 @@ export function renamedProductConversationLocation(
 ): { pathname: string; search: string; hash: string } | null {
   if (!productConversationOwnsRoute(pathname, previous)) return null;
 
-  const match = pathname.match(/^\/(?:c|product-conversations)\/([^/]+)$/);
+  const match = pathname.match(/^\/(?:c|product-conversations)\/([^/]+)\/?$/);
   let identity: string;
   try {
     identity = decodeURIComponent(match![1]!);

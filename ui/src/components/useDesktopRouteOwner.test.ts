@@ -36,6 +36,15 @@ describe('desktop validated route ownership', () => {
     await waitFor(() => expect(result.current).toBe('unicode-owner'));
     expect(get).toHaveBeenCalledWith(reference, { message_limit: 1 });
   });
+  it.each(['c', 'product-conversations'])('accepts one terminal slash on /%s routes without accepting nested segments', (prefix) => {
+    const reference = 'café-日本';
+    expect(extractProductRouteReference(`/${prefix}/${encodeURIComponent(reference)}/`)).toEqual({
+      productConversationId: reference,
+      routeSlug: prefix === 'c' ? reference : null,
+    });
+    expect(extractProductRouteReference(`/${prefix}/product/child`)).toBeNull();
+    expect(extractProductRouteReference(`/${prefix}/product//`)).toBeNull();
+  });
   it('falls back safely for a malformed percent escape in a /c reference', () => {
     expect(extractProductRouteReference('/c/bad%escape')).toEqual({
       productConversationId: 'bad%escape',
