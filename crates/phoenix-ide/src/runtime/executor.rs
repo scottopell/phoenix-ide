@@ -32,7 +32,7 @@ use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
     Effect, Event, SteeringDrainMessage, SteeringDrainPostCommit, StepResult,
 };
-use crate::system_prompt::{build_system_prompt, ModeContext};
+use crate::system_prompt::{build_system_prompt_with_catalog, ModeContext, OrdinarySkillCatalog};
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_llm::{
@@ -2085,6 +2085,7 @@ where
     /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
     llm_turn_count: u32,
+    ordinary_skill_catalog: Option<OrdinarySkillCatalog>,
     /// Whether this sub-agent has been given its grace turn (one extra LLM turn to produce a terminal outcome)
     grace_turn_granted: bool,
     /// Wall-clock marker for the start of the grace turn. The hard-stop fallback
@@ -2318,6 +2319,7 @@ where
             #[cfg(test)]
             terminal_effect_admission_barrier: None,
             llm_turn_count: 0,
+            ordinary_skill_catalog: None,
             grace_turn_granted: false,
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
@@ -3644,7 +3646,14 @@ where
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
                 .clone_from(&accepted_sub_agent);
-            let generated = match self.apply_transition_result(result).await {
+            let ordinary_input_id = match &terminal_event {
+                Event::UserMessage { message_id, .. } => Some(message_id.as_str()),
+                _ => None,
+            };
+            let generated = match self
+                .apply_transition_result_with_input(result, ordinary_input_id)
+                .await
+            {
                 Ok(generated) => generated,
                 Err(error) => {
                     if accepted_sub_agent.is_some() {
@@ -3755,6 +3764,16 @@ where
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
+        Box::pin(self.apply_transition_result_with_input(result, None)).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::large_futures)]
+    async fn apply_transition_result_with_input(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        ordinary_input_id: Option<&str>,
+    ) -> Result<Vec<Event>, String> {
         let remaining = self.bash_wait_transition_remaining(&result.new_state);
         if let Some(remaining) = remaining {
             let dispatch_index = result.effects.iter().position(|effect| {
@@ -3775,7 +3794,7 @@ where
                 tokio::select! {
                     biased;
                     () = &mut cutoff => None,
-                    applied = self.apply_transition_result_inner(settlement) => Some(applied?),
+                    applied = Box::pin(self.apply_transition_result_inner(settlement, ordinary_input_id)) => Some(applied?),
                 }
             };
             let Some(mut generated) = generated.take() else {
@@ -3798,7 +3817,7 @@ where
             }
             return Ok(generated);
         }
-        self.apply_transition_result_inner(result).await
+        Box::pin(self.apply_transition_result_inner(result, ordinary_input_id)).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3806,6 +3825,7 @@ where
     async fn apply_transition_result_inner(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
+        ordinary_input_id: Option<&str>,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
@@ -4068,7 +4088,15 @@ where
             .await?;
         } else {
             let mut state_committed = false;
+            let mut new_turn_input_persisted = false;
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
+                let is_new_turn_input = match &effect {
+                    Effect::PersistUserInputMessage { .. } => true,
+                    Effect::PersistMessage { message_id, .. } => {
+                        ordinary_input_id == Some(message_id.as_str())
+                    }
+                    _ => false,
+                };
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 let checkpoint_commits_state = matches!(
@@ -4350,6 +4378,10 @@ where
                 }
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
+                        new_turn_input_persisted |= is_new_turn_input;
+                        if is_state_persist && new_turn_input_persisted {
+                            self.ordinary_skill_catalog = None;
+                        }
                         state_committed |= is_state_persist;
                         if is_state_persist && clears_pending_trusted_after_commit {
                             self.pending_trusted_tool_results.clear();
@@ -6265,6 +6297,7 @@ where
                         self.state = proposed.state;
                         self.state_updated_at = proposed.updated_at;
                         self.active_direct_turn = Some(Box::new(active));
+                        self.ordinary_skill_catalog = None;
                         self.publish_live_state_admitted();
                         let mut materialization_owner = materialization_owner;
                         let _ = self
@@ -7566,6 +7599,7 @@ where
     ) -> Result<Option<Event>, String> {
         match post_commit {
             SteeringDrainPostCommit::StartLlmAndNotifyState => {
+                self.ordinary_skill_catalog = None;
                 self.parent_tool_cycle_count = 0;
                 let _ = self
                     .broadcast_tx
@@ -8155,7 +8189,14 @@ where
                 tool_executor.coordinator_skill_catalog().as_ref(),
             )
         } else {
-            build_system_prompt(
+            let catalog = self.ordinary_skill_catalog.get_or_insert_with(|| {
+                OrdinarySkillCatalog::discover(
+                    working_dir
+                        .as_deref()
+                        .expect("filesystem conversation has cwd"),
+                )
+            });
+            build_system_prompt_with_catalog(
                 working_dir
                     .as_deref()
                     .expect("filesystem conversation has cwd"),
@@ -8165,6 +8206,7 @@ where
                 llm_language,
                 persona.as_deref(),
                 explore_bash_capability,
+                catalog,
             )
         };
         if is_coordinator {
@@ -18934,6 +18976,217 @@ mod explore_prompt_cache_shape_tests {
                 defer_loading: false,
             }]
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn skill_catalog_survives_tool_loop_and_refreshes_on_new_input() {
+        let temp = TempDir::new().unwrap();
+        let write = |name: &str, description: &str| {
+            let dir = temp.path().join(".claude/skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: turn-test-{name}\ndescription: {description}\n---\nbody {name}"
+                ),
+            )
+            .unwrap();
+        };
+        write("edited", "old description");
+        write("removed", "removed description");
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::ToolUse {
+                id: "catalog-patch".into(),
+                name: "patch".into(),
+                input: serde_json::json!({
+                    "path": temp.path().join("draft"),
+                    "patches": [{"operation": "overwrite", "newText": "draft"}],
+                }),
+            }],
+            end_turn: false,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        for _ in 0..4 {
+            llm.queue_response(LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text("done")],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+        }
+        let storage = Arc::new(InMemoryStorage::new());
+        let (tx, rx) = mpsc::channel(32);
+        let mut runtime = ConversationRuntime::new(
+            ConvContext::new(
+                "catalog-turn",
+                temp.path().to_path_buf(),
+                "test-model",
+                200_000,
+            ),
+            ConvState::Idle,
+            storage.clone(),
+            llm.clone(),
+            Arc::new(TaskCreatingPatchExecutor {
+                task_path: temp.path().join("draft"),
+            }),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            rx,
+            tx,
+            SseBroadcaster::new(128, 0),
+        );
+        let user = |id: &str| Event::UserMessage {
+            text: "work".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: id.into(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        assert!(
+            std::mem::size_of_val(&runtime.apply_transition_result(
+                crate::state_machine::transition::TransitionResult::new(ConvState::Idle),
+            )) < 8_192,
+            "transition wrapper must not embed the settlement future inline",
+        );
+        assert!(
+            std::mem::size_of_val(&runtime.apply_transition_result_with_input(
+                crate::state_machine::transition::TransitionResult::new(ConvState::Idle),
+                Some("size-check"),
+            )) < 8_192,
+            "input transition wrapper must not embed the settlement future inline",
+        );
+        Box::pin(runtime.process_event(user("first")))
+            .await
+            .unwrap();
+        let (_, outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.llm_outcome_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        write("edited", "new description");
+        write("added", "added description");
+        std::fs::remove_dir_all(temp.path().join(".claude/skills/removed")).unwrap();
+        // Rejected busy input must not refresh the active turn.
+        assert!(Box::pin(runtime.process_event(user("busy"))).await.is_err());
+        let entries = vec![crate::state_machine::event::SteerEntry {
+            text: "mid-turn steering".into(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "midturn".into(),
+            user_agent: None,
+            skill_invocation: None,
+        }];
+        storage.set_steering_queue("catalog-turn", entries.clone());
+        Box::pin(runtime.process_event(Event::SteerDrainedUserMessages { entries }))
+            .await
+            .unwrap();
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
+            .await
+            .unwrap();
+        let (_, outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.tool_outcome_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        Box::pin(runtime.process_outcome(EffectOutcome::Tool(outcome)))
+            .await
+            .unwrap();
+        let (_, outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.llm_outcome_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
+            .await
+            .unwrap();
+        let first = llm.recorded_requests();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].system[0].text, first[1].system[0].text);
+        assert!(first[0].system[0].text.contains("old description"));
+        assert!(first[0].system[0].text.contains("turn-test-removed"));
+        assert!(first[0].system[0].text.contains(&format!(
+            "(`{}`)",
+            temp.path().join(".claude/skills/edited/SKILL.md").display()
+        )));
+        assert!(!first[0].system[0].text.contains("turn-test-added"));
+        assert!(matches!(runtime.state, ConvState::Idle));
+        let retained_catalog = format!("{:?}", runtime.ordinary_skill_catalog);
+        storage.set_fail_state_update(true);
+        assert!(Box::pin(runtime.process_event(user("failed-state")))
+            .await
+            .is_err());
+        storage.set_fail_state_update(false);
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(
+            format!("{:?}", runtime.ordinary_skill_catalog),
+            retained_catalog,
+            "a failed state commit must retain the prior advertised catalog"
+        );
+        assert_eq!(llm.recorded_requests().len(), 2);
+        Box::pin(runtime.process_event(user("second")))
+            .await
+            .unwrap();
+        let (_, outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.llm_outcome_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let refreshed = llm.recorded_requests();
+        assert!(refreshed[2].system[0].text.contains("new description"));
+        assert!(refreshed[2].system[0].text.contains("turn-test-added"));
+        assert!(!refreshed[2].system[0].text.contains("turn-test-removed"));
+        assert_ne!(first[0].system[0].text, refreshed[2].system[0].text);
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
+            .await
+            .unwrap();
+        write("edited", "queued description");
+        let entries = vec![crate::state_machine::event::SteerEntry {
+            text: "queued work".into(),
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "queued".into(),
+            user_agent: None,
+            skill_invocation: None,
+        }];
+        storage.set_steering_queue("catalog-turn", entries.clone());
+        Box::pin(runtime.process_event(Event::SteerDrainedUserMessages { entries }))
+            .await
+            .unwrap();
+        let (_, outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.llm_outcome_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(llm.recorded_requests()[3].system[0]
+            .text
+            .contains("queued description"));
+        Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
