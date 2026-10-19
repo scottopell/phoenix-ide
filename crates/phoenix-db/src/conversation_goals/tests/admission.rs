@@ -373,3 +373,94 @@ async fn transferred_latest_target_is_rechecked_and_unaccepted_opening_intent_bl
         .unwrap()
         .is_none());
 }
+
+async fn retain_report_source_for_round(db: &Database) -> String {
+    let content =
+        sqlx::query_scalar("SELECT content FROM messages WHERE message_id='report-message'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    sqlx::query("DELETE FROM messages WHERE message_id='report-message'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    content
+}
+
+async fn insert_complete_report_round(tx: &mut GoalTx<'_>, content: &str) {
+    sqlx::query("INSERT INTO messages (conversation_id,message_id,sequence_id,message_type,content,created_at,origin_kind) VALUES ('full-root','report-message',2,'agent',?,'2026-10-19T00:00:01Z','system_generated')")
+        .bind(content).execute(&mut **tx).await.unwrap();
+    let result = phoenix_core::domain::db_schema::MessageContent::tool(
+        "report-call",
+        "checkpoint result",
+        false,
+    );
+    sqlx::query("INSERT INTO messages (conversation_id,message_id,sequence_id,message_type,content,created_at,origin_kind) VALUES ('full-root','report-result',3,'tool',?,'2026-10-19T00:00:01Z','system_generated')")
+        .bind(serde_json::to_string(&result).unwrap()).execute(&mut **tx).await.unwrap();
+}
+
+#[tokio::test]
+async fn outer_round_rollback_removes_genuine_source_result_and_goal_change_together() {
+    let (db, command) = fixture().await;
+    let report = bound_report(&db, &command).await;
+    let source = retain_report_source_for_round(&db).await;
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    assert!(matches!(
+        apply_goal_tx(&mut tx, &report, Some("full-root"), at()).await,
+        Err(GoalDbError::ActorMismatch)
+    ));
+    insert_complete_report_round(&mut tx, &source).await;
+    let applied = apply_goal_tx(&mut tx, &report, Some("full-root"), at())
+        .await
+        .unwrap();
+    assert!(matches!(applied.snapshot.state, GoalState::Blocked(_)));
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        db.conversation_goal(&command.owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        1
+    );
+    let source_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM messages WHERE message_id IN ('report-message','report-result')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(source_rows, 0);
+}
+
+#[tokio::test]
+async fn committed_outer_round_and_exact_report_retry_share_one_history_change() {
+    let (db, command) = fixture().await;
+    let report = bound_report(&db, &command).await;
+    let source = retain_report_source_for_round(&db).await;
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    insert_complete_report_round(&mut tx, &source).await;
+    let accepted = apply_goal_tx(&mut tx, &report, Some("full-root"), at())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let retried = db
+        .apply_conversation_goal(&report, "full-root", GoalTimestampUs::parse(20).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(retried, accepted);
+    assert_eq!(
+        db.conversation_goal_history(&command.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let source_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM messages WHERE message_id IN ('report-message','report-result')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(source_rows, 2);
+}

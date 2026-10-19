@@ -292,6 +292,62 @@ async fn retry_tx(
     Ok(None)
 }
 
+async fn apply_goal_tx(
+    tx: &mut GoalTx<'_>,
+    mutation: &GoalMutation,
+    expected_transcript: Option<&str>,
+    at: GoalTimestampUs,
+) -> Result<GoalHistoryEntry> {
+    if let Some(previous) = retry_tx(tx, mutation).await? {
+        return Ok(previous);
+    }
+    if let Some(transcript) = expected_transcript {
+        match &mutation.change {
+            GoalChange::Report { binding, .. } => {
+                admission::require_live_report_tx(tx, binding, transcript).await?;
+            }
+            GoalChange::Create { .. } | GoalChange::SetDisposition { .. } => {
+                admission::require_settled_tx(tx, mutation, transcript).await?;
+            }
+        }
+    }
+    let current = current_tx(tx, &mutation.owner).await?;
+    let next = mutation.advance(current.as_ref())?;
+    let (kind, report_turn) = match &mutation.change {
+        GoalChange::Create { goal_id, objective } => {
+            sqlx::query(
+                "INSERT INTO conversation_goal_ids (goal_id,owner_id,objective) VALUES (?,?,?)",
+            )
+            .bind(goal_id.as_str())
+            .bind(mutation.owner.as_str())
+            .bind(objective.as_str())
+            .execute(&mut **tx)
+            .await?;
+            ("create", None)
+        }
+        GoalChange::SetDisposition { .. } => ("state", None),
+        GoalChange::Report { binding, .. } => {
+            if binding_tx(tx, binding.execution.turn_id()).await?.as_ref() != Some(binding) {
+                return Err(GoalDbError::BindingConflict);
+            }
+            ("report", Some(binding.execution.turn_id()))
+        }
+    };
+    let requester = insert_actor(tx, &mutation.owner, &mutation.attribution.requested_by).await?;
+    let applier = insert_actor(tx, &mutation.owner, &mutation.attribution.applied_by).await?;
+    let (state, reason) = state_columns(&next.state);
+    sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(next.owner.as_str()).bind(next.version.get()).bind(next.goal_id.as_str())
+        .bind(state).bind(reason)
+        .bind(mutation.action_id.as_str()).bind(kind).bind(report_turn).bind(requester).bind(applier)
+        .bind(at.get()).execute(&mut **tx).await?;
+    Ok(GoalHistoryEntry {
+        snapshot: next,
+        mutation: mutation.clone(),
+        recorded_at_us: at,
+    })
+}
+
 impl Database {
     /// Read an exact accepted retry without admitting another mutation.
     ///
@@ -391,62 +447,9 @@ impl Database {
         at: GoalTimestampUs,
     ) -> Result<GoalHistoryEntry> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(previous) = retry_tx(&mut tx, mutation).await? {
-            tx.commit().await?;
-            return Ok(previous);
-        }
-        if let Some(transcript) = expected_transcript {
-            match &mutation.change {
-                GoalChange::Report { binding, .. } => {
-                    admission::require_live_report_tx(&mut tx, binding, transcript).await?;
-                }
-                GoalChange::Create { .. } | GoalChange::SetDisposition { .. } => {
-                    admission::require_settled_tx(&mut tx, mutation, transcript).await?;
-                }
-            }
-        }
-        let current = current_tx(&mut tx, &mutation.owner).await?;
-        let next = mutation.advance(current.as_ref())?;
-        let (kind, report_turn) = match &mutation.change {
-            GoalChange::Create { goal_id, objective } => {
-                sqlx::query(
-                    "INSERT INTO conversation_goal_ids (goal_id,owner_id,objective) VALUES (?,?,?)",
-                )
-                .bind(goal_id.as_str())
-                .bind(mutation.owner.as_str())
-                .bind(objective.as_str())
-                .execute(&mut *tx)
-                .await?;
-                ("create", None)
-            }
-            GoalChange::SetDisposition { .. } => ("state", None),
-            GoalChange::Report { binding, .. } => {
-                if binding_tx(&mut tx, binding.execution.turn_id())
-                    .await?
-                    .as_ref()
-                    != Some(binding)
-                {
-                    return Err(GoalDbError::BindingConflict);
-                }
-                ("report", Some(binding.execution.turn_id()))
-            }
-        };
-        let requester =
-            insert_actor(&mut tx, &mutation.owner, &mutation.attribution.requested_by).await?;
-        let applier =
-            insert_actor(&mut tx, &mutation.owner, &mutation.attribution.applied_by).await?;
-        let (state, reason) = state_columns(&next.state);
-        sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(next.owner.as_str()).bind(next.version.get()).bind(next.goal_id.as_str())
-            .bind(state).bind(reason)
-            .bind(mutation.action_id.as_str()).bind(kind).bind(report_turn).bind(requester).bind(applier)
-            .bind(at.get()).execute(&mut *tx).await?;
+        let accepted = apply_goal_tx(&mut tx, mutation, expected_transcript, at).await?;
         tx.commit().await?;
-        Ok(GoalHistoryEntry {
-            snapshot: next,
-            mutation: mutation.clone(),
-            recorded_at_us: at,
-        })
+        Ok(accepted)
     }
 }
 

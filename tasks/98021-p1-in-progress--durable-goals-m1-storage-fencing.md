@@ -1,5 +1,9 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Report checkpoint source preparation and actual upstream repair
+
+Exact owner repair866e5e56 was merged non-destructively asb6b258c74 under parent source-integration approval, with no conflicts or132/133 registry/SQL/ADR changes. No separate owner stability receipt or qualification claimed. Capture fixture goal_id correction9f4b87002 precedes merge; checked serde checkpoint vocabulary4a87f5012 follows. Normal CI39291963325 is the current published4a source run; pending, not test evidence. Goal apply body now factors into private borrowed-transaction helper with ordinary facade still owning commit, enabling genuine report source+status to share future full-round txn. Two encoding+two outer-txn regressions add to capture checkpoint54:58 authored,0proved passing. Pending-result/finalizer/provider-replay integration remains uninstalled; don't infer success/recovery from preparatory DTOs/tests. Work remains same single writer, no132 edits/later slot guess/local heavy execution/activation.
+
 ## New-turn atomic observation source increment
 
 Ordinary Runtime turn admission now authors Goal/NoGoal capture with the actual turn/workflow transaction, before materialization and the existing crash cuts; exact replay does not recapture. Inactive goal statuses capture explicit NoGoal at their version, so unrelated turns do not resume Blocked or terminal goals. Accepted Steering has no execution binding. Read API requires exact workflow+turn and does not backfill. Five actual-admission regressions authored/unexecuted;54total authored,0proved passing. No132 SQL/registry change, new DDL, provider context/public tool/follow-through/Stop activation. M2 sourcec8e8bf536 normal run39290326736/Rust118189160877 failed on inherited federation compile defects; parent coordinates real owner correction.
