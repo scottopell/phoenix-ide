@@ -114,9 +114,29 @@ export const MESSAGE_TYPE_OPTIONS = [
   'continuation',
 ] as const;
 
+const RemoteOriginInstanceSchema = v.pipe(
+  v.string(),
+  v.regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+);
+
 export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.variant('kind', [
   v.looseObject({ kind: v.literal('unknown_historical') }),
   v.looseObject({ kind: v.literal('user_api') }),
+  v.looseObject({ kind: v.literal('remote_api'), instance_id: RemoteOriginInstanceSchema }),
+  v.looseObject({
+    kind: v.literal('remote_conversation'),
+    instance_id: RemoteOriginInstanceSchema,
+    product_conversation_id: v.pipe(v.string(), v.nonEmpty()),
+    transcript_id: v.pipe(v.string(), v.nonEmpty()),
+    source_call: v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })),
+  }),
+  v.looseObject({
+    kind: v.literal('remote_coordinator'),
+    instance_id: RemoteOriginInstanceSchema,
+    product_conversation_id: v.pipe(v.string(), v.nonEmpty()),
+    transcript_id: v.pipe(v.string(), v.nonEmpty()),
+    source_call: v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })),
+  }),
   v.looseObject({ kind: v.literal('system_generated') }),
   v.looseObject({ kind: v.literal('subscription_event'), event_id: v.string() }),
   v.looseObject({

@@ -64,9 +64,148 @@ final class RenderingReducerTests: XCTestCase {
         }
     }
 
+    func testRemoteOriginDecodingEncodingAndHeaderLabelsPreserveExactSource() throws {
+        let instanceText = "11111111-1111-4111-8111-111111111111"
+        let instanceId = try XCTUnwrap(UUID(uuidString: instanceText))
+        let sourceCall = SourceToolCall(message_id: "original-assistant", tool_use_id: "original-send")
+        let cases: [(String, InputOrigin, String)] = [
+            ("remote_api", .remoteApi(instanceId: instanceId), "Remote API from @instance:\(instanceText)"),
+            (
+                "remote_conversation",
+                .remoteConversation(
+                    instanceId: instanceId, productConversationId: "remote-product", transcriptId: "original-member",
+                    sourceCall: sourceCall),
+                "Remote conversation from @instance:\(instanceText) @transcript:original-member (conversation ID remote-product) — source message original-assistant, tool original-send"
+            ),
+            (
+                "remote_coordinator",
+                .remoteCoordinator(
+                    instanceId: instanceId, productConversationId: "remote-product", transcriptId: "original-member",
+                    sourceCall: sourceCall),
+                "Remote coordinator from @instance:\(instanceText) @transcript:original-member (conversation ID remote-product) — source message original-assistant, tool original-send"
+            ),
+        ]
+        for (kind, expected, label) in cases {
+            var wire: [String: Any] = ["kind": kind, "instance_id": instanceText]
+            if kind != "remote_api" {
+                wire["product_conversation_id"] = "remote-product"
+                wire["transcript_id"] = "original-member"
+                wire["source_call"] = ["message_id": "original-assistant", "tool_use_id": "original-send"]
+            }
+            let decoded = try JSONDecoder().decode(InputOrigin.self, from: JSONSerialization.data(withJSONObject: wire))
+            XCTAssertEqual(decoded, expected, kind)
+            XCTAssertEqual(decoded.label, label, kind)
+            XCTAssertFalse(decoded.isUserApiInput, kind)
+            XCTAssertFalse(decoded.sourceCallUnavailable, kind)
+            let encoded = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? NSDictionary)
+            XCTAssertEqual(encoded, wire as NSDictionary, kind)
+        }
+    }
+
+    func testRemoteOriginRequiresValidInstanceUUID() throws {
+        for kind in ["remote_api", "remote_conversation", "remote_coordinator"] {
+            for instance in [nil, NSNull(), "not-a-uuid", 123] as [Any?] {
+                var wire: [String: Any] = [
+                    "kind": kind, "product_conversation_id": "product", "transcript_id": "member",
+                    "source_call": ["message_id": "assistant", "tool_use_id": "send"],
+                ]
+                wire["instance_id"] = instance
+                let data = try JSONSerialization.data(withJSONObject: wire)
+                XCTAssertThrowsError(try JSONDecoder().decode(InputOrigin.self, from: data), kind)
+                let message: [String: Any] = [
+                    "message_id": "m1", "sequence_id": 1, "message_type": "user",
+                    "content": ["text": "hello"], "origin": wire,
+                ]
+                let messageData = try JSONSerialization.data(withJSONObject: message)
+                XCTAssertThrowsError(try JSONDecoder().decode(Message.self, from: messageData), kind)
+            }
+        }
+    }
+
+    func testRemoteOriginsWithoutSourceCallRemainAttributedAndUnlinked() throws {
+        let instanceText = "11111111-1111-4111-8111-111111111111"
+        let instanceId = try XCTUnwrap(UUID(uuidString: instanceText))
+        let cases: [(String, InputOrigin, String)] = [
+            (
+                "remote_conversation",
+                .remoteConversation(instanceId: instanceId, productConversationId: "product", transcriptId: "member"),
+                "Remote conversation"
+            ),
+            (
+                "remote_coordinator",
+                .remoteCoordinator(instanceId: instanceId, productConversationId: "product", transcriptId: "member"),
+                "Remote coordinator"
+            ),
+        ]
+        for (kind, expected, label) in cases {
+            for sourceCall in [nil, NSNull()] as [Any?] {
+                var wire: [String: Any] = [
+                    "kind": kind, "instance_id": instanceText,
+                    "product_conversation_id": "product", "transcript_id": "member",
+                ]
+                wire["source_call"] = sourceCall
+                let decoded = try JSONDecoder().decode(
+                    InputOrigin.self, from: JSONSerialization.data(withJSONObject: wire))
+                XCTAssertEqual(decoded, expected)
+                XCTAssertEqual(
+                    decoded.label,
+                    "\(label) from @instance:\(instanceText) @transcript:member (conversation ID product)")
+                XCTAssertTrue(decoded.sourceCallUnavailable)
+                XCTAssertNil(decoded.sourceTranscriptURL(serverURL: "https://receiver.test"))
+                XCTAssertNil(decoded.sourceCallURL(serverURL: "https://receiver.test"))
+                let restored = try JSONDecoder().decode(InputOrigin.self, from: JSONEncoder().encode(decoded))
+                XCTAssertEqual(restored, expected)
+            }
+        }
+    }
+
+    func testRemoteAndLocalIDCollisionCannotCreateReceiverLocalLink() throws {
+        let firstInstance = try XCTUnwrap(UUID(uuidString: "11111111-1111-4111-8111-111111111111"))
+        let secondInstance = try XCTUnwrap(UUID(uuidString: "22222222-2222-4222-8222-222222222222"))
+        let sourceCall = SourceToolCall(message_id: "same-assistant", tool_use_id: "same-tool")
+        let local = InputOrigin.internalConversation(
+            productConversationId: "same-product", transcriptId: "same-member", sourceCall: sourceCall)
+        var labels: Set<String> = [local.label]
+        for instance in [firstInstance, secondInstance] {
+            let remoteOrigins: [InputOrigin] = [
+                .remoteApi(instanceId: instance),
+                .remoteConversation(
+                    instanceId: instance, productConversationId: "same-product", transcriptId: "same-member",
+                    sourceCall: sourceCall),
+                .remoteCoordinator(
+                    instanceId: instance, productConversationId: "same-product", transcriptId: "same-member",
+                    sourceCall: sourceCall),
+            ]
+            for origin in remoteOrigins {
+                XCTAssertNotEqual(origin, local)
+                XCTAssertTrue(labels.insert(origin.label).inserted)
+                for receiver in ["https://receiver.test", "https://receiver.test/phoenix/"] {
+                    XCTAssertNil(origin.sourceTranscriptURL(serverURL: receiver))
+                    XCTAssertNil(origin.sourceCallURL(serverURL: receiver))
+                    XCTAssertEqual(local.sourceTranscriptURL(serverURL: receiver)?.lastPathComponent, "same-member")
+                    XCTAssertEqual(local.sourceCallURL(serverURL: receiver)?.fragment, "message-same-assistant")
+                }
+            }
+        }
+    }
+
     func testOnlyUserApiOriginIsHumanAcrossMessageRolesAndCacheRoundTrip() throws {
+        let instanceId = try XCTUnwrap(UUID(uuidString: "11111111-1111-4111-8111-111111111111"))
+        let sourceCall = SourceToolCall(message_id: "remote-assistant", tool_use_id: "remote-send")
         let origins: [(InputOrigin, Bool)] = [
             (.userApi, true),
+            (.remoteApi(instanceId: instanceId), false),
+            (
+                .remoteConversation(
+                    instanceId: instanceId, productConversationId: "pc-parent", transcriptId: "row-parent",
+                    sourceCall: sourceCall), false
+            ),
+            (
+                .remoteCoordinator(
+                    instanceId: instanceId, productConversationId: "pc-parent", transcriptId: "row-parent",
+                    sourceCall: sourceCall), false
+            ),
             (.internalConversation(productConversationId: "pc-parent", transcriptId: "row-parent"), false),
             (.unknownHistorical, false),
             (.systemGenerated, false),
@@ -80,6 +219,8 @@ final class RenderingReducerTests: XCTestCase {
                     message_type: type, content: .object(["text": .string("same text")]),
                     display_data: nil, created_at: nil, origin: origin)
                 let restored = try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(message))
+                XCTAssertEqual(restored.inputOrigin, origin, type)
+                XCTAssertEqual(restored.inputOrigin.label, origin.label, type)
                 XCTAssertEqual(restored.inputOrigin.isUserApiInput, isHuman, type)
             }
         }

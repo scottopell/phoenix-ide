@@ -2040,6 +2040,9 @@ pub(crate) fn attributed_role(
     match message_type {
         MessageType::User => match origin {
             InputOrigin::UserApi => "User API",
+            InputOrigin::RemoteApi { .. } => "Remote API",
+            InputOrigin::RemoteConversation { .. } => "Remote conversation",
+            InputOrigin::RemoteCoordinator { .. } => "Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Conversation",
             InputOrigin::SystemGenerated => "System input",
             InputOrigin::SubscriptionEvent { .. } => "Conversation event",
@@ -2052,12 +2055,64 @@ pub(crate) fn attributed_role(
         MessageType::Continuation => "Continuation",
         MessageType::Skill => match origin {
             InputOrigin::UserApi => "Skill · User API",
+            InputOrigin::RemoteApi { .. } => "Skill · Remote API",
+            InputOrigin::RemoteConversation { .. } => "Skill · Remote conversation",
+            InputOrigin::RemoteCoordinator { .. } => "Skill · Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Skill · Conversation",
             InputOrigin::SystemGenerated => "Skill · System input",
             InputOrigin::SubscriptionEvent { .. } => "Skill · Conversation event",
             InputOrigin::UnknownHistorical => "Skill · Unknown input",
         },
     }
+}
+
+fn remote_qualified_sender(
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+) -> Result<Option<QualifiedSearchSender>, DbError> {
+    use phoenix_core::domain::{
+        close::TranscriptConversationId,
+        conversation_reference::{ConversationReferenceTarget, QualifiedConversationReference},
+        db_schema::InputOrigin,
+    };
+
+    let (instance_id, transcript_id, stable_target) = match origin {
+        InputOrigin::RemoteConversation {
+            instance_id,
+            product_conversation_id,
+            transcript_id,
+            ..
+        } => (
+            *instance_id,
+            transcript_id,
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: product_conversation_id.clone(),
+            },
+        ),
+        InputOrigin::RemoteCoordinator {
+            instance_id,
+            transcript_id,
+            ..
+        } => (
+            *instance_id,
+            transcript_id,
+            ConversationReferenceTarget::Coordinator,
+        ),
+        InputOrigin::UnknownHistorical
+        | InputOrigin::UserApi
+        | InputOrigin::RemoteApi { .. }
+        | InputOrigin::InternalConversation { .. }
+        | InputOrigin::SystemGenerated
+        | InputOrigin::SubscriptionEvent { .. } => return Ok(None),
+    };
+    let transcript_id = TranscriptConversationId::parse(transcript_id)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    Ok(Some(QualifiedSearchSender {
+        stable: QualifiedConversationReference::new(instance_id, stable_target),
+        exact: QualifiedConversationReference::new(
+            instance_id,
+            ConversationReferenceTarget::Transcript { transcript_id },
+        ),
+    }))
 }
 
 async fn qualified_search_sender(
@@ -2075,6 +2130,9 @@ async fn qualified_search_sender(
         product_conversation::ProductConversationKind,
     };
 
+    if let Some(sender) = remote_qualified_sender(origin)? {
+        return Ok(Some(sender));
+    }
     let InputOrigin::InternalConversation {
         product_conversation_id,
         transcript_id,
@@ -2120,6 +2178,13 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
             ..
         } => format!(
             " from recorded product conversation {product_conversation_id} via @transcript:{transcript_id}"
+        ),
+        InputOrigin::RemoteApi { instance_id } => format!(" from authenticated instance {instance_id} (API channel)"),
+        InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!(
+            " from recorded remote product conversation {product_conversation_id}, authenticated instance {instance_id}, transcript {transcript_id}"
+        ),
+        InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!(
+            " from remote Coordinator {product_conversation_id}, authenticated instance {instance_id}, transcript {transcript_id}"
         ),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
@@ -2171,6 +2236,9 @@ async fn attributed_sender_with_cache(
                 ),
             })
         }
+        InputOrigin::RemoteApi { .. }
+        | InputOrigin::RemoteConversation { .. }
+        | InputOrigin::RemoteCoordinator { .. } => Ok(attributed_sender(origin)),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
         | InputOrigin::SystemGenerated
@@ -3017,6 +3085,14 @@ async fn resolve_message(
             );
             references
         }
+        phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { .. }
+        | phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { .. } => {
+            let sender = remote_qualified_sender(&message.origin)
+                .map_err(|error| AppError::Internal(format!("sender reference failed: {error}")))?
+                .ok_or_else(|| AppError::Internal("remote sender reference missing".to_string()))?;
+            vec![sender.exact, sender.stable]
+        }
+        phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. } => Vec::new(),
         phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
         | phoenix_core::domain::db_schema::InputOrigin::UserApi
         | phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
@@ -4262,6 +4338,218 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(second.contains("from Global"));
+    }
+
+    #[tokio::test]
+    async fn remote_senders_ignore_local_kind_cache_and_database_even_on_id_collision() {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget,
+            db_schema::InputOrigin,
+            instance_identity::InstanceId,
+            product_conversation::{ProductConversationId, ProductConversationKind},
+        };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let local_instance = db.instance_id().await.unwrap();
+        let remote_instance = InstanceId::new();
+        let product = ProductConversationId::parse("colliding-product").unwrap();
+        db.pool().close().await;
+        for coordinator in [false, true] {
+            let origin = if coordinator {
+                InputOrigin::RemoteCoordinator {
+                    instance_id: remote_instance,
+                    product_conversation_id: product.clone(),
+                    transcript_id: "colliding-transcript".into(),
+                    source_call: None,
+                }
+            } else {
+                InputOrigin::RemoteConversation {
+                    instance_id: remote_instance,
+                    product_conversation_id: product.clone(),
+                    transcript_id: "colliding-transcript".into(),
+                    source_call: None,
+                }
+            };
+            let mut cache = std::collections::HashMap::from([(
+                product.clone(),
+                Some(if coordinator {
+                    ProductConversationKind::Ordinary
+                } else {
+                    ProductConversationKind::Coordinator
+                }),
+            )]);
+            let before = cache.clone();
+            let text = super::attributed_sender_with_cache(&db, &origin, &mut cache)
+                .await
+                .unwrap();
+            assert!(text.contains(&remote_instance.to_string()));
+            assert_eq!(text.contains("remote Coordinator"), coordinator);
+            assert!(!text.contains("@transcript:"));
+            let sender = super::qualified_search_sender(&db, local_instance, &origin, &mut cache)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sender.stable.instance_id, remote_instance);
+            assert_eq!(sender.exact.instance_id, remote_instance);
+            assert_eq!(
+                sender.stable.target,
+                if coordinator {
+                    ConversationReferenceTarget::Coordinator
+                } else {
+                    ConversationReferenceTarget::ProductConversation {
+                        product_conversation_id: product.clone(),
+                    }
+                }
+            );
+            assert_eq!(cache, before);
+            cache.clear();
+            assert!(
+                super::qualified_search_sender(&db, local_instance, &origin, &mut cache)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(cache.is_empty());
+        }
+        let api = InputOrigin::RemoteApi {
+            instance_id: remote_instance,
+        };
+        let mut cache = std::collections::HashMap::new();
+        assert!(
+            super::qualified_search_sender(&db, local_instance, &api, &mut cache)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(super::attributed_sender_with_cache(&db, &api, &mut cache)
+            .await
+            .unwrap()
+            .contains("API channel"));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn malformed_remote_transcript_is_not_reinterpreted_as_local() {
+        use phoenix_core::domain::{
+            db_schema::InputOrigin, instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        for coordinator in [false, true] {
+            let instance_id = InstanceId::new();
+            let product_conversation_id = ProductConversationId::parse("product").unwrap();
+            let origin = if coordinator {
+                InputOrigin::RemoteCoordinator {
+                    instance_id,
+                    product_conversation_id,
+                    transcript_id: " ".into(),
+                    source_call: None,
+                }
+            } else {
+                InputOrigin::RemoteConversation {
+                    instance_id,
+                    product_conversation_id,
+                    transcript_id: " ".into(),
+                    source_call: None,
+                }
+            };
+            assert!(super::remote_qualified_sender(&origin).is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn remote_message_search_and_resolve_keep_recipient_evidence_receiver_owned() {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget,
+            db_schema::{InputOrigin, MessageContent},
+            instance_identity::InstanceId,
+        };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let recipient = db
+            .create_conversation("recipient", "recipient", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let local_coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let local_instance = db.instance_id().await.unwrap();
+        let remote_instance = InstanceId::new();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        for (n, origin) in [
+            InputOrigin::RemoteConversation {
+                instance_id: remote_instance,
+                product_conversation_id: local_coordinator.product_conversation_id.clone(),
+                transcript_id: local_coordinator.id.clone(),
+                source_call: None,
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id: remote_instance,
+                product_conversation_id: recipient.product_conversation_id.clone(),
+                transcript_id: recipient.id.clone(),
+                source_call: None,
+            },
+            InputOrigin::RemoteApi {
+                instance_id: remote_instance,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("remote-message-{n}");
+            db.add_message_with_seq_and_origin(
+                &id,
+                &recipient.id,
+                i64::try_from(n + 1).unwrap(),
+                &MessageContent::user("remote attribution evidence"),
+                None,
+                None,
+                &origin,
+            )
+            .await
+            .unwrap();
+            let resolved = super::resolve_message(&service, recipient.clone(), &id, false)
+                .await
+                .unwrap();
+            assert_eq!(resolved.reference.instance_id, local_instance);
+            assert!(
+                matches!(&resolved.reference.target, ConversationReferenceTarget::Message { transcript_id, message_id } if transcript_id.as_str() == recipient.id && message_id.as_str() == id)
+            );
+            let expected = super::remote_qualified_sender(&origin).unwrap();
+            if let Some(sender) = expected {
+                assert_eq!(
+                    resolved.related_references,
+                    vec![sender.exact, sender.stable]
+                );
+            } else {
+                assert!(resolved.related_references.is_empty());
+            }
+        }
+        let hits = service
+            .message_retriever
+            .retrieve(crate::db::RetrievalRequest::natural_language(
+                "remote attribution evidence",
+                crate::db::RetrievalScope::Global,
+                10,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        let qualified = super::qualify_search_hits(&service, &hits).await.unwrap();
+        for (hit, search) in hits.iter().zip(qualified) {
+            assert_eq!(search.source.instance_id, local_instance);
+            assert!(
+                matches!(search.stable_conversation.as_ref().map(|r| &r.target), Some(ConversationReferenceTarget::ProductConversation { product_conversation_id }) if product_conversation_id == &recipient.product_conversation_id)
+            );
+            let expected = super::remote_qualified_sender(&hit.origin).unwrap();
+            match (search.sender, expected) {
+                (Some(actual), Some(expected)) => {
+                    assert_eq!(actual.stable, expected.stable);
+                    assert_eq!(actual.exact, expected.exact);
+                }
+                (None, None) => assert!(matches!(hit.origin, InputOrigin::RemoteApi { .. })),
+                _ => panic!("remote sender attribution missing"),
+            }
+        }
     }
 
     #[tokio::test]

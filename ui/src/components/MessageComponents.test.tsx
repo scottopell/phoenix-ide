@@ -329,6 +329,41 @@ describe('user message provenance rendering', () => {
     expect(screen.queryByText('You')).not.toBeInTheDocument();
   });
 
+  it.each(['remote_conversation', 'remote_coordinator'] as const)('renders %s as instance-qualified meta without receiver-local links', (kind) => {
+    const instance_id = 'a48ea5c2-37cc-42d5-a1d7-fac1d7765d4e';
+    const origin: InputOrigin = {
+      kind, instance_id, product_conversation_id: 'source-product', transcript_id: 'source-member',
+      source_call: { message_id: 'source-message', tool_use_id: 'source-tool' },
+    };
+    const { container } = render(<MemoryRouter><UserMessage message={userMessage('recipient-message', 'remote body', { origin })} /></MemoryRouter>);
+    const sender = container.querySelector('.message-sender');
+    expect(sender).toHaveTextContent(instance_id);
+    expect(sender).toHaveTextContent(kind === 'remote_coordinator' ? 'remote Coordinator' : 'remote conversation');
+    expect(sender).toHaveTextContent('source-product');
+    expect(sender).toHaveTextContent('source-member');
+    expect(sender).toHaveAttribute('title', expect.stringContaining('source-message'));
+    expect(sender?.closest('.message')).toHaveClass('meta');
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy input message' })).toBeInTheDocument();
+  });
+
+  it('renders remote API and queued remote steering meaningfully without peer config', () => {
+    const instance_id = 'a48ea5c2-37cc-42d5-a1d7-fac1d7765d4e';
+    const { container } = render(<MemoryRouter><>
+      <UserMessage message={userMessage('api', 'remote API body', { origin: { kind: 'remote_api', instance_id } })} />
+      <QueuedUserMessage message={{ localId: 'remote-queued', text: 'remote queued body', images: [], status: 'steering_queued', origin: {
+        kind: 'remote_coordinator', instance_id, product_conversation_id: 'source-product', transcript_id: 'source-member', source_call: null,
+      } }} onRetry={() => {}} />
+    </></MemoryRouter>);
+    expect(screen.getByText(`API · instance ${instance_id}`).closest('.message')).toHaveClass('meta');
+    const queued = container.querySelector('.message.steering-queued');
+    expect(queued).toHaveClass('meta');
+    expect(queued).toHaveTextContent('remote Coordinator');
+    expect(queued).toHaveTextContent(instance_id);
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
   it('renders system-generated input as meta without claiming human authorship', () => {
     const { container } = render(<MemoryRouter><UserMessage message={userMessage('automatic', 'System prompt', {
       origin: { kind: 'system_generated' },
