@@ -848,7 +848,7 @@ pub fn transition_core(
             CoreState::LlmRequesting { attempt: 1 },
         )
         .with_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload.as_ref().clone(),
+            payload: payload.clone(),
             authority: authority.clone(),
             idempotent: false,
         })
@@ -6534,8 +6534,8 @@ mod tests {
                 payload: effect_payload,
                 authority: effect_authority,
                 idempotent: false,
-            } if effect_payload.message_id() == payload.message_id()
-                && effect_payload.delivery.llm_text == payload.delivery.llm_text
+            } if effect_payload.as_ref() == &payload
+                && serde_json::to_value(effect_payload).unwrap() == serde_json::to_value(&payload).unwrap()
                 && effect_authority == &authority
         )));
         assert!(!result

@@ -65,7 +65,7 @@ enum AuthoritativeEffect {
         origin: phoenix_core::domain::db_schema::InputOrigin,
     },
     PersistAuthoritativeUserMessage {
-        payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        payload: Box<phoenix_core::domain::sm_event::PreparedDirectTurnPayload>,
         authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
         idempotent: bool,
     },
@@ -6301,7 +6301,7 @@ where
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
                     authority,
-                    payload,
+                    payload: *payload,
                     sequence_id: reserved_seqs[0],
                     created_at: phoenix_workflow::Timestamp(now),
                     accepted_state: self
@@ -14467,7 +14467,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -14492,7 +14492,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -14527,7 +14527,7 @@ mod authoritative_user_message_effect_tests {
             updated_at: Utc::now(),
         });
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -16542,7 +16542,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16577,7 +16577,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16628,7 +16628,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16684,7 +16684,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16720,7 +16720,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16756,7 +16756,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             })
@@ -16789,7 +16789,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16818,7 +16818,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -17409,7 +17409,7 @@ mod authoritative_user_message_effect_tests {
                     attempt: 1,
                 })
                 .with_effect(Effect::PersistAuthoritativeUserMessage {
-                    payload: payload("msg-direct"),
+                    payload: Box::new(payload("msg-direct")),
                     authority: authority(),
                     idempotent: false,
                 })
@@ -17445,7 +17445,7 @@ mod authoritative_user_message_effect_tests {
                 updated_at: Utc::now(),
             });
             rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: true,
             })

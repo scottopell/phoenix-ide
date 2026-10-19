@@ -126,7 +126,7 @@ pub enum Effect {
         message_id: String,
     },
     PersistAuthoritativeUserMessage {
-        payload: PreparedDirectTurnPayload,
+        payload: Box<PreparedDirectTurnPayload>,
         authority: DirectTurnAttemptAuthority,
         idempotent: bool,
     },
