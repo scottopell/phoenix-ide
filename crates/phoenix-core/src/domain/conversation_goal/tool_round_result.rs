@@ -104,7 +104,7 @@ mod tests {
         GoalText::parse(value).unwrap()
     }
     fn pending() -> ToolRoundResult {
-        let owner = ProductConversationId::from_db("round-owner".into());
+        let owner = ProductConversationId::parse("round-owner").unwrap();
         let binding = GoalExecutionBinding {
             owner: owner.clone(),
             execution: GoalExecution::parse(13, 29).unwrap(),

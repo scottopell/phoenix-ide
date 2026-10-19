@@ -173,7 +173,7 @@ mod tests {
         GoalText::parse(value).unwrap()
     }
     fn binding() -> GoalExecutionBinding {
-        let owner = ProductConversationId::from_db("report-owner".into());
+        let owner = ProductConversationId::parse("report-owner").unwrap();
         GoalExecutionBinding {
             owner: owner.clone(),
             execution: GoalExecution::parse(31, 47).unwrap(),
@@ -235,7 +235,7 @@ mod tests {
             Err(GoalError::ReportBindingRequired)
         );
         let mut mismatch = binding();
-        mismatch.owner = ProductConversationId::from_db("different".into());
+        mismatch.owner = ProductConversationId::parse("different").unwrap();
         assert_eq!(
             GoalReportBinding::try_from(mismatch),
             Err(GoalError::Conflict)
