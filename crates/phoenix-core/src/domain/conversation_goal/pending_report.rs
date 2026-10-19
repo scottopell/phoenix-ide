@@ -102,6 +102,11 @@ impl GoalPendingReport {
     }
 
     #[must_use]
+    pub fn execution(&self) -> GoalExecution {
+        self.admission.execution
+    }
+
+    #[must_use]
     pub fn call(&self) -> &GoalReportCall {
         &self.call
     }

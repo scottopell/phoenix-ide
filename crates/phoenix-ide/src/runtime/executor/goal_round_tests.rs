@@ -859,3 +859,615 @@ async fn conversation_goal_terminal_late_replay_failure_is_known_rollback_and_re
         1
     );
 }
+
+fn journey_response(content: Vec<ContentBlock>, end_turn: bool) -> LlmResponse {
+    let replay = (!end_turn).then(|| {
+        ProviderReplayUpdate::Anthropic(
+            AnthropicResponseSet::with_public_content(
+                AnthropicResponseIdentity {
+                    response_id: uuid::Uuid::new_v4().to_string(),
+                    model: "claude-opus-5-5".into(),
+                },
+                content.clone(),
+                vec![],
+            )
+            .unwrap(),
+        )
+    });
+    LlmResponse {
+        content,
+        end_turn,
+        usage: phoenix_core::domain::llm_types::Usage::default(),
+        stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        provider_replay: replay,
+    }
+}
+
+async fn journey_provider_step(rt: &mut TestRuntime) {
+    let (generation, outcome) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), rt.llm_outcome_rx.recv())
+            .await
+            .expect("provider completion")
+            .expect("outcome channel");
+    rt.process_generation_tagged_llm_outcome(generation, outcome)
+        .await;
+}
+
+async fn journey_report_step(rt: &mut TestRuntime) {
+    let event = tokio::time::timeout(std::time::Duration::from_secs(30), rt.event_rx.recv())
+        .await
+        .expect("internal report completion")
+        .expect("event channel");
+    assert!(matches!(&event, Event::GoalReportPrepared { .. }));
+    rt.process_event(event).await.unwrap();
+}
+
+async fn journey_input(db: &Database) {
+    db.add_message(
+        "goal-user-input",
+        CONVERSATION,
+        &MessageContent::user("do the work"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    db.update_conversation_state(CONVERSATION, &ConvState::LlmRequesting { attempt: 2 })
+        .await
+        .unwrap();
+}
+
+fn enable_admitted_report(rt: &mut TestRuntime, report: &GoalPendingReport) {
+    let GoalChange::Report { binding, .. } = report.mutation().change else {
+        panic!("admission binding")
+    };
+    rt.goal_report_emitter = Some(GoalReportEmitter {
+        binding: binding.try_into().unwrap(),
+    });
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_internal_emitter_processes_round_before_next_model_request_and_output(
+) {
+    let (db, _, report, _) = goal_fixture().await;
+    journey_input(&db).await;
+    let client = Arc::new(RenderingAnthropicClient::scripted(vec![
+        journey_response(
+            vec![ContentBlock::ToolUse {
+                id: "actual-report".into(),
+                name: "goal_report".into(),
+                input: serde_json::json!({"status":"complete","reason":"actual model work finished"}),
+            }],
+            false,
+        ),
+        journey_response(
+            vec![ContentBlock::text("Delivered the completed result.")],
+            true,
+        ),
+    ]));
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = runtime(
+        db.clone(),
+        dir.path(),
+        client.clone(),
+        Arc::new(DeferredMcpCatalog::new(false)),
+    )
+    .with_active_direct_turn(Some(active(&report)));
+    enable_admitted_report(&mut rt, &report);
+    dispatch(&mut rt).await;
+    journey_provider_step(&mut rt).await;
+    assert!(db
+        .get_messages(CONVERSATION)
+        .await
+        .unwrap()
+        .iter()
+        .all(|message| !matches!(&message.content, MessageContent::Tool(_))));
+    assert_eq!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        1
+    );
+    journey_report_step(&mut rt).await;
+    let committed = db.get_messages(CONVERSATION).await.unwrap();
+    assert_eq!(committed.len(), 3);
+    let stored_result = committed
+        .iter()
+        .find_map(|message| match &message.content {
+            MessageContent::Tool(result) if result.tool_use_id == "actual-report" => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!stored_result.is_error);
+    assert_eq!(
+        db.get_conversation(CONVERSATION).await.unwrap().state,
+        rt.state
+    );
+    assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    let replay = db
+        .load_provider_replay_state(CONVERSATION)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.response_sets.len(), 1);
+    let assistant = committed
+        .iter()
+        .find(|message| matches!(&message.content, MessageContent::Agent(_)))
+        .unwrap();
+    assert_eq!(
+        replay.response_sets[0].owner_message_id,
+        assistant.message_id
+    );
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        unreachable!()
+    };
+    assert_eq!(&replay.response_sets[0].public_content, blocks);
+    assert_eq!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        2
+    );
+    journey_provider_step(&mut rt).await;
+    let requests = client.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].tools.iter().any(
+        |tool| tool.name == "goal_report" && tool.input_schema["additionalProperties"] == false
+    ));
+    let second_wire = client.wires.lock().unwrap()[1].clone();
+    let results: Vec<_> = second_wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|block| block["type"] == "tool_result" && block["tool_use_id"] == "actual-report")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert!(!results[0]["is_error"].as_bool().unwrap_or(false));
+    assert!(results[0]["content"]
+        .to_string()
+        .contains("recorded complete at owner version 2"));
+    assert!(results[0]["content"]
+        .to_string()
+        .contains(&stored_result.content));
+    let messages = db.get_messages(CONVERSATION).await.unwrap();
+    assert_eq!(messages.len(), 4);
+    assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Agent(blocks) if blocks.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "Delivered the completed result.")))));
+    assert!(matches!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        GoalState::Complete(_)
+    ));
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_report_checkpoint_failure_keeps_round_goal_and_replay_unadvanced_until_retry(
+) {
+    let (db, _, report, _) = goal_fixture().await;
+    journey_input(&db).await;
+    let client = Arc::new(RenderingAnthropicClient::scripted(vec![
+        journey_response(
+            vec![ContentBlock::ToolUse {
+                id: "rollback-report".into(),
+                name: "goal_report".into(),
+                input: serde_json::json!({"status":"complete","reason":"only the committed result is true"}),
+            }],
+            false,
+        ),
+        journey_response(vec![ContentBlock::text("Committed after retry.")], true),
+    ]));
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = runtime(
+        db.clone(),
+        dir.path(),
+        client.clone(),
+        Arc::new(DeferredMcpCatalog::new(false)),
+    )
+    .with_active_direct_turn(Some(active(&report)));
+    enable_admitted_report(&mut rt, &report);
+    dispatch(&mut rt).await;
+    journey_provider_step(&mut rt).await;
+    let event = rt.event_rx.try_recv().expect("prepared report");
+    assert!(matches!(&event, Event::GoalReportPrepared { .. }));
+    let before_state = db.get_conversation(CONVERSATION).await.unwrap().state;
+    let before_replay = db.load_provider_replay_state(CONVERSATION).await.unwrap();
+    assert!(before_replay.is_some());
+    let mut receiver = rt.broadcast_tx.subscribe();
+    sqlx::query("CREATE TRIGGER fail_actual_goal_round BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT,'actual goal checkpoint failed'); END")
+        .execute(db.pool()).await.unwrap();
+    let error = rt.process_event(event.clone()).await.unwrap_err();
+    assert!(error.contains("actual goal checkpoint failed"));
+    assert_eq!(db.get_messages(CONVERSATION).await.unwrap().len(), 1);
+    assert_eq!(
+        db.get_conversation(CONVERSATION).await.unwrap().state,
+        before_state
+    );
+    assert_eq!(
+        db.load_provider_replay_state(CONVERSATION).await.unwrap(),
+        before_replay
+    );
+    assert_eq!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        1
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+    assert!(rt.llm_task_handle.is_none());
+    while let Ok(event) = receiver.try_recv() {
+        assert!(
+            !matches!(event, SseEvent::Message { message, .. } if matches!(&message.content, MessageContent::Tool(_)))
+        );
+    }
+    sqlx::query("DROP TRIGGER fail_actual_goal_round")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    rt.process_event(event).await.unwrap();
+    assert_eq!(db.get_messages(CONVERSATION).await.unwrap().len(), 3);
+    assert_eq!(
+        db.get_conversation(CONVERSATION).await.unwrap().state,
+        rt.state
+    );
+    assert_eq!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        2
+    );
+    assert_eq!(
+        db.conversation_goal_history(&report.mutation().owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    journey_provider_step(&mut rt).await;
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_report_prepared_before_stop_cannot_commit_success_after_stop() {
+    let (db, _, report, _) = goal_fixture().await;
+    journey_input(&db).await;
+    let client = Arc::new(RenderingAnthropicClient::scripted(vec![journey_response(
+        vec![ContentBlock::ToolUse {
+            id: "stopped-report".into(),
+            name: "goal_report".into(),
+            input: serde_json::json!({"status":"complete","reason":"prepared before stop"}),
+        }],
+        false,
+    )]));
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = runtime(
+        db.clone(),
+        dir.path(),
+        client.clone(),
+        Arc::new(DeferredMcpCatalog::new(false)),
+    )
+    .with_active_direct_turn(Some(active(&report)));
+    enable_admitted_report(&mut rt, &report);
+    dispatch(&mut rt).await;
+    journey_provider_step(&mut rt).await;
+    let prepared = rt.event_rx.try_recv().expect("prepared report before Stop");
+    assert!(matches!(&prepared, Event::GoalReportPrepared { .. }));
+    assert!(phoenix_core::domain::sm_event::SubAgentEvent::try_from(prepared.clone()).is_err());
+    rt.process_event(Event::UserCancel { steer: None })
+        .await
+        .unwrap();
+    assert!(matches!(rt.state, ConvState::CancellingTool { .. }));
+    rt.process_event(prepared).await.unwrap();
+    assert!(matches!(rt.state, ConvState::Idle));
+    assert_eq!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        1
+    );
+    assert_eq!(
+        db.conversation_goal_history(&report.mutation().owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let messages = db.get_messages(CONVERSATION).await.unwrap();
+    assert_eq!(messages.len(), 3);
+    assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Tool(result) if result.tool_use_id == "stopped-report" && result.is_error)));
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+    assert!(rt.llm_task_handle.is_none());
+    assert!(rt.llm_outcome_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn conversation_goal_internal_binding_is_parent_only_even_when_injected_in_child_context() {
+    let (db, _, report, _) = goal_fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = runtime(
+        db,
+        dir.path(),
+        Arc::new(RenderingAnthropicClient::default()),
+        Arc::new(DeferredMcpCatalog::new(false)),
+    );
+    assert!(rt.parent_goal_report_emitter().is_none());
+    enable_admitted_report(&mut rt, &report);
+    assert!(rt.parent_goal_report_emitter().is_some());
+    rt.context.is_sub_agent = true;
+    assert!(rt.parent_goal_report_emitter().is_none());
+    rt.context.is_sub_agent = false;
+    rt.context.is_coordinator = true;
+    assert!(rt.parent_goal_report_emitter().is_none());
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_mixed_proposal_and_report_are_all_paired_errors_without_goal_history(
+) {
+    let (db, _, report, _) = goal_fixture().await;
+    journey_input(&db).await;
+    let client = Arc::new(RenderingAnthropicClient::scripted(vec![
+        journey_response(
+            vec![
+                ContentBlock::ToolUse {
+                    id: "mixed-report".into(),
+                    name: "goal_report".into(),
+                    input: serde_json::json!({"status":"complete","reason":"must not apply mixed batch"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "mixed-proposal".into(),
+                    name: "propose_task".into(),
+                    input: serde_json::json!({"task_file":"tasks/00001-p2-ready--later.md"}),
+                },
+            ],
+            false,
+        ),
+        journey_response(
+            vec![ContentBlock::text("I will issue one tool at a time.")],
+            true,
+        ),
+    ]));
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = runtime(
+        db.clone(),
+        dir.path(),
+        client.clone(),
+        Arc::new(DeferredMcpCatalog::with_proposals()),
+    )
+    .with_active_direct_turn(Some(active(&report)));
+    enable_admitted_report(&mut rt, &report);
+    dispatch(&mut rt).await;
+    journey_provider_step(&mut rt).await;
+    assert!(rt.event_rx.try_recv().is_err());
+    let messages = db.get_messages(CONVERSATION).await.unwrap();
+    let results: Vec<_> = messages
+        .iter()
+        .filter_map(|message| {
+            if let MessageContent::Tool(result) = &message.content {
+                Some(result)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.is_error));
+    for tool_id in ["mixed-report", "mixed-proposal"] {
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.tool_use_id == tool_id)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        db.conversation_goal_history(&report.mutation().owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(db
+        .list_fork_proposals_for_origin(CONVERSATION)
+        .await
+        .unwrap()
+        .is_empty());
+    journey_provider_step(&mut rt).await;
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn conversation_goal_report_then_separate_valid_proposal_round_preserves_both_real_exchanges()
+{
+    let (db, _, report, _) = goal_fixture().await;
+    journey_input(&db).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("tasks")).unwrap();
+    let task_file = "tasks/00001-p2-ready--follow-up.md";
+    std::fs::write(
+        dir.path().join(task_file),
+        "# Follow-up\n\nContinue the next bounded unit of work.\n",
+    )
+    .unwrap();
+    let path = dir.path().to_str().unwrap().to_owned();
+    db.update_conversation_mode(
+        CONVERSATION,
+        &crate::db::ConvMode::Branch {
+            branch_name: "goal-journey".try_into().unwrap(),
+            worktree_path: path.clone().try_into().unwrap(),
+            base_branch: "main".try_into().unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let client = Arc::new(RenderingAnthropicClient::scripted(vec![
+        journey_response(
+            vec![ContentBlock::ToolUse {
+                id: "proposal-preceding-report".into(),
+                name: "goal_report".into(),
+                input: serde_json::json!({"status":"complete","reason":"ready for the separate follow-up proposal"}),
+            }],
+            false,
+        ),
+        journey_response(
+            vec![ContentBlock::ToolUse {
+                id: "sole-proposal".into(),
+                name: "propose_task".into(),
+                input: serde_json::json!({"task_file":task_file}),
+            }],
+            false,
+        ),
+    ]));
+    let mut context = ConvContext::new(
+        CONVERSATION,
+        dir.path().to_path_buf(),
+        "claude-opus-5-5",
+        200_000,
+    );
+    context.mode = crate::state_machine::ModeKind::Branch;
+    context.mode_context = Some(phoenix_core::domain::mode_context::ModeContext::Branch {
+        branch_name: "goal-journey".into(),
+        base_branch: "main".into(),
+        worktree_path: path,
+    });
+    let mut rt = runtime_for_context(
+        db.clone(),
+        context,
+        client.clone(),
+        Arc::new(DeferredMcpCatalog::with_proposals()),
+    )
+    .with_active_direct_turn(Some(active(&report)));
+    enable_admitted_report(&mut rt, &report);
+    dispatch(&mut rt).await;
+    journey_provider_step(&mut rt).await;
+    journey_report_step(&mut rt).await;
+    journey_provider_step(&mut rt).await;
+    assert!(
+        matches!(&rt.state, ConvState::AwaitingTaskApproval { task_file: pending, .. } if pending == task_file)
+    );
+    assert_eq!(
+        db.get_conversation(CONVERSATION).await.unwrap().state,
+        rt.state
+    );
+    assert!(db
+        .list_fork_proposals_for_origin(CONVERSATION)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.conversation_goal(&report.mutation().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+            .get(),
+        2
+    );
+    assert!(rt.llm_task_handle.is_none());
+    assert!(rt.llm_outcome_rx.try_recv().is_err());
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
+    let messages = db.get_messages(CONVERSATION).await.unwrap();
+    for id in ["proposal-preceding-report", "sole-proposal"] {
+        let results: Vec<_> = messages
+            .iter()
+            .filter_map(|message| {
+                if let MessageContent::Tool(result) = &message.content {
+                    (result.tool_use_id == id).then_some(result)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_error);
+    }
+}
+
+#[tokio::test]
+async fn conversation_goal_model_cannot_supply_binding_or_actor_and_production_gate_defaults_absent(
+) {
+    for inject_binding in [false, true] {
+        let (db, _, report, _) = goal_fixture().await;
+        journey_input(&db).await;
+        let client = Arc::new(RenderingAnthropicClient::scripted(vec![
+            journey_response(
+                vec![ContentBlock::ToolUse {
+                    id: "forged-report".into(),
+                    name: "goal_report".into(),
+                    input: serde_json::json!({"status":"complete","reason":"forged","actor":"host","binding":{"turn_id":1}}),
+                }],
+                false,
+            ),
+            journey_response(
+                vec![ContentBlock::text("No goal mutation was admitted.")],
+                true,
+            ),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(
+            db.clone(),
+            dir.path(),
+            client.clone(),
+            Arc::new(DeferredMcpCatalog::new(false)),
+        )
+        .with_active_direct_turn(Some(active(&report)));
+        assert!(rt.goal_report_emitter.is_none());
+        if inject_binding {
+            enable_admitted_report(&mut rt, &report);
+        }
+        dispatch(&mut rt).await;
+        journey_provider_step(&mut rt).await;
+        let event = rt
+            .event_rx
+            .try_recv()
+            .expect("synchronous invalid report result");
+        assert!(matches!(&event, Event::ToolComplete { result, .. } if result.is_error()));
+        rt.process_event(event).await.unwrap();
+        assert_eq!(
+            db.conversation_goal(&report.mutation().owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .version
+                .get(),
+            1
+        );
+        let messages = db.get_messages(CONVERSATION).await.unwrap();
+        let result = messages
+            .iter()
+            .find_map(|message| {
+                if let MessageContent::Tool(result) = &message.content {
+                    Some(result)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            client.requests.lock().unwrap()[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "goal_report"),
+            inject_binding
+        );
+        journey_provider_step(&mut rt).await;
+    }
+}

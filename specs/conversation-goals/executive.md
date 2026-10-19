@@ -105,3 +105,29 @@ Core tests live in `crates/phoenix-core/src/domain/conversation_goal/tests.rs`; 
 Task98021 carries the approved amendment and status. Migration132 and ADR182 reservation gates are resolved; exact registered-source review and hosted compile/test/check qualification remain. Settled-turn application admission is authored but remains unqualified and has no public caller. Atomic new-turn observation capture is authored separately. Actual trusted adapters, a stable-owner durable Stop fence and provider request preparation remain integration work under the locked design; follow-through is not activated. Keep132 immutable after qualification/import; any concrete Stop DDL requires later coordinated numbering after federation133. No extra implementation writer, generic authorization/event/wake framework, shared-main mutation, deployment, release or production migration is introduced by this increment.
 
 ADR-182: immutable objectives remove the need for objective-revision fencing and edit/reopen policy. New identity plus the existing monotonic owner version fences replacement races; objective-once storage makes mutation structurally unavailable. Goal-specific history preserves terminal outcomes and exact actor retry evidence. Owner coordination released132 and182 before assignment; reserved federation130/131 and ADR180/181 are preserved.
+
+## Private report emitter and runtime journey qualification
+
+The source includes a parent-only `GoalReportPrepared` event and a private
+runtime emitter whose production constructor remains `None`. The admitted
+binding owns both the advertised `goal_report` definition and preparation of a
+typed pending report. Only tests install this binding; this is not production
+activation or authorization for another turn.
+
+The added `runtime::executor::goal_round_tests` journeys process actual provider
+outcomes and internal events through `process_event`, rather than installing a
+synthetic pending checkpoint. They cover paired report rows, goal mutation and
+committed state, public replay identity, the next Anthropic-rendered request,
+rollback/retry, Stop before prepared-report delivery, and strict report inputs.
+A mixed report/proposal response remains all paired errors with no goal history;
+a separate sole proposal reaches `AwaitingTaskApproval`. Database pending-fork
+parity remains defensive coverage, not a runtime fork journey.
+
+These additions and the intervening runtime/provider/fork/terminal changes are
+unqualified until the new exact-head hosted run is inspected. The prior 96/96
+focused pass belongs only to `f6a5ea5570a3d4a086ef4a427b9c4f7745c70e08`, run
+`39331620726`, artifact `12226138977`; that run's aggregate result failed.
+No local compilation, tests, migration, deployment, or activation was performed
+for this source-only continuation. Migration 132 is unchanged. UserControl and
+stable-Stop DDL remain separately unassigned; they are not implicitly delivered
+by this emitter work.

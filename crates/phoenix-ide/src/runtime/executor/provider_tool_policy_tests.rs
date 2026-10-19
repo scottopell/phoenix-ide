@@ -22,17 +22,25 @@ const MCP_TOOL: &str = "mcp__slack__read_thread";
 struct RenderingAnthropicClient {
     requests: Mutex<Vec<LlmRequest>>,
     wires: Mutex<Vec<serde_json::Value>>,
+    responses: Mutex<std::collections::VecDeque<LlmResponse>>,
 }
 
-struct DeferredMcpCatalog(MockToolExecutor);
+struct DeferredMcpCatalog(MockToolExecutor, bool);
 
 impl DeferredMcpCatalog {
     fn new(available: bool) -> Self {
-        Self(if available {
-            MockToolExecutor::new().with_tool(MCP_TOOL, ToolOutput::error("Session expired"))
-        } else {
-            MockToolExecutor::new()
-        })
+        Self(
+            if available {
+                MockToolExecutor::new().with_tool(MCP_TOOL, ToolOutput::error("Session expired"))
+            } else {
+                MockToolExecutor::new()
+            },
+            false,
+        )
+    }
+
+    fn with_proposals() -> Self {
+        Self(MockToolExecutor::new(), true)
     }
 
     fn recorded_executions(&self) -> Vec<(String, serde_json::Value)> {
@@ -51,7 +59,8 @@ impl ToolExecutor for DeferredMcpCatalog {
     }
 
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
-        self.0
+        let mut definitions: Vec<_> = self
+            .0
             .definitions()
             .await
             .into_iter()
@@ -59,15 +68,34 @@ impl ToolExecutor for DeferredMcpCatalog {
                 definition.defer_loading = true;
                 definition
             })
-            .collect()
+            .collect();
+        if self.1 {
+            use crate::tools::Tool;
+            let proposal = crate::tools::ProposeTaskTool;
+            definitions.push(phoenix_llm::ToolDefinition {
+                name: proposal.name().into(),
+                description: proposal.description(),
+                input_schema: proposal.input_schema(),
+                defer_loading: false,
+            });
+        }
+        definitions
     }
 }
 
 impl RenderingAnthropicClient {
+    fn scripted(responses: Vec<LlmResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+            ..Self::new()
+        }
+    }
+
     fn new() -> Self {
         Self {
             requests: Mutex::new(vec![]),
             wires: Mutex::new(vec![]),
+            responses: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 }
@@ -90,6 +118,9 @@ impl LlmClient for RenderingAnthropicClient {
         let wire = phoenix_llm::render_anthropic_request_for_test(&spec, request)?;
         self.requests.lock().unwrap().push(request.clone());
         self.wires.lock().unwrap().push(wire);
+        if let Some(response) = self.responses.lock().unwrap().pop_front() {
+            return Ok(response);
+        }
         Err(LlmError::network(
             "Injected transport failure after local request rendering",
         ))
@@ -115,6 +146,15 @@ fn runtime(
         "claude-opus-5-5",
         200_000,
     );
+    runtime_for_context(db, context, client, tools)
+}
+
+fn runtime_for_context(
+    db: Database,
+    context: ConvContext,
+    client: Arc<RenderingAnthropicClient>,
+    tools: Arc<DeferredMcpCatalog>,
+) -> TestRuntime {
     let (event_tx, event_rx) = mpsc::channel(8);
     ConversationRuntime::new(
         context,

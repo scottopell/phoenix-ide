@@ -527,6 +527,10 @@ use std::collections::HashMap;
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
 pub enum Event {
+    GoalReportPrepared {
+        report: crate::domain::conversation_goal::GoalPendingReport,
+        duration_ms: u64,
+    },
     // User events
     UserMessage {
         /// Display text — stored in DB and shown in history (REQ-IR-006).
@@ -805,6 +809,7 @@ impl Event {
             Event::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
             Event::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             Event::RetryTimeout { .. } => "RetryTimeout",
+            Event::GoalReportPrepared { .. } => "GoalReportPrepared",
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolAborted { .. } => "ToolAborted",
             Event::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
@@ -952,6 +957,10 @@ pub enum CoreEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum ParentOnlyEvent {
+    GoalReportPrepared {
+        report: crate::domain::conversation_goal::GoalPendingReport,
+        duration_ms: u64,
+    },
     TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
@@ -1226,6 +1235,13 @@ impl TryFrom<Event> for ParentEvent {
             Event::UserQuestionDismissed { request_id } => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::UserQuestionDismissed { request_id },
             )),
+            Event::GoalReportPrepared {
+                report,
+                duration_ms,
+            } => Ok(ParentEvent::Parent(ParentOnlyEvent::GoalReportPrepared {
+                report,
+                duration_ms,
+            })),
             Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
             Event::CredentialBecameAvailable { observed_at } => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialBecameAvailable { observed_at },
@@ -1437,6 +1453,7 @@ impl TryFrom<Event> for SubAgentEvent {
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
             Event::TaskApprovalDecided { .. }
+            | Event::GoalReportPrepared { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed { .. }
@@ -1494,6 +1511,7 @@ impl ParentEvent {
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::UserQuestionDismissed { .. } => "UserQuestionDismissed",
+                ParentOnlyEvent::GoalReportPrepared { .. } => "GoalReportPrepared",
                 ParentOnlyEvent::DismissError => "DismissError",
                 ParentOnlyEvent::CredentialBecameAvailable { .. } => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",

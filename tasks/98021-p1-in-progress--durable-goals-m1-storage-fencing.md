@@ -183,3 +183,39 @@ No public mutation HTTP API/tool/UI/SSE, automatic turns, runtime wiring, Stop/c
 A reviewed source amendment removes edit/revision/clear-first complexity, stores immutable objectives once per identity, atomically supersedes current identity, preserves attributed status history and one owner-version CAS, distinguishes terminal success from exhaustion, permits Blocked → Underway without terminal reopen, and retains exact report and deletion safeguards.
 
 Acceptance here is **dormant source authored plus honest evidence**, not runtime delivery or qualified passing tests. Normal amendment approval precedes product edits. Numbered schema/ADR integration, real Stop fence, actual atomic admission capture and hosted qualification remain explicit parent-owned gates. Do not merge, deploy, migrate production or publish the superseded mutable design as selected behavior.
+
+### Same-writer private emitter and process-event journey continuation
+
+Recovered HEAD `58eb9cab8d67c0fc0f234d885391c26d82b78b15`, all five dirty
+emitter/journey files, and stash inventory without resets or unstashing. Recovery
+patch retained in this harness at `/tmp/stablea52c58d8-emitter-recovered.patch`.
+Private bindings/stashes remain intact; no duplicate writer or worktree was made.
+
+Completed source integration of parent-only `GoalReportPrepared`, shared
+last-tool transition construction, and private `GoalReportEmitter` defaulting to
+`None`. The same bound emitter advertises and prepares reports; only tests
+install it. Corrected the recovered draft's mismatched schema (`status`, not
+`outcome`), unsupported status, missing execution accessor and stale fixture API
+calls. Parent event guards match tool, assistant-message and transcript identity;
+Stop routes a prepared report to cancellation rather than report success.
+
+Seven added tests cover actual provider outcome/internal-event processing,
+committed paired report/result rows and next Anthropic rendering, unchanged
+state/replay/goal on failed checkpoint followed by exact retry, Stop ordering,
+parent-only access, mixed report/proposal all-ERR refusal, a separate valid sole
+proposal awaiting approval, and default-off/forged-input rejection. The replay
+source written at the pre-tool state remains distinct from replay progress
+co-committed by the existing combined checkpoint owner. Database-only pending
+fork parity is not labelled runtime E2E.
+
+Source-only self-review (anchored, not an independent review) traced the new
+emitter/reducer and existing checkpoint, provider and cancellation owners.
+Lightweight rustfmt and `git diff --check` were run; no local compilation/tests,
+heavy/VM/browser work, merge, deployment, release or production migration.
+Existing PR #959 is draft. No active goals-branch CI was present before
+publication. One exact-head hosted qualification is the next gate; the additions
+remain unqualified until its artifact is read. Prior focused evidence is still
+only 96/96 at `f6a5ea5570a3d4a086ef4a427b9c4f7745c70e08`, run `39331620726`,
+artifact `12226138977`, with aggregate failure and no attributed full-suite
+failure names. Production emitter/autoactivation stay OFF. Migration132 is
+unchanged; UserControl/stable-Stop later DDL remains UNASSIGNED.

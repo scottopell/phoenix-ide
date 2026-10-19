@@ -18,10 +18,10 @@ use super::event::{
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
-    OverloadRetryGuidance, ParentState, RecoverableContinuationFailure, RecoveryKind,
-    RecoveryResumeTarget, ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
-    SubAgentOutcome, SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome,
-    ToolCall, ToolInput,
+    OverloadRetryGuidance, ParentState, PendingSubAgent, RecoverableContinuationFailure,
+    RecoveryKind, RecoveryResumeTarget, ServerOverloadPhase, ServerOverloadRetry,
+    ServerOverloadTarget, SubAgentOutcome, SubAgentResult, SubAgentState, TaskApprovalHandoff,
+    TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -1129,6 +1129,68 @@ fn handle_core_llm_response(
     .with_effect(Effect::execute_tool(first)))
 }
 
+fn finish_tool_round_step(
+    remaining_tools: &[ToolCall],
+    completed_results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+    pending_sub_agents: &[PendingSubAgent],
+    assistant_message: &AssistantMessage,
+    result: impl Into<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+) -> CoreTransitionResult {
+    match (remaining_tools.is_empty(), pending_sub_agents.is_empty()) {
+        (false, _) => {
+            let mut new_results = completed_results.to_vec();
+            new_results.push(result.into());
+
+            let next_tool = remaining_tools[0].clone();
+            let new_remaining = remaining_tools[1..].to_vec();
+
+            CoreTransitionResult::new(CoreState::ToolExecuting {
+                current_tool: next_tool.clone(),
+                remaining_tools: new_remaining,
+                completed_results: new_results,
+                pending_sub_agents: pending_sub_agents.to_vec(),
+                assistant_message: assistant_message.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change())
+            .with_effect(Effect::execute_tool(next_tool))
+        }
+
+        (true, true) => {
+            let mut all_results = completed_results.to_vec();
+            all_results.push(result.into());
+
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in last-tool transition");
+
+            CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm)
+        }
+
+        (true, false) => {
+            let mut all_results = completed_results.to_vec();
+            all_results.push(result.into());
+
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect(
+                    "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
+                );
+
+            CoreTransitionResult::new(CoreState::AwaitingSubAgents {
+                pending: pending_sub_agents.to_vec(),
+                completed_results: vec![],
+                spawn_tool_id: None,
+            })
+            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change())
+        }
+    }
+}
+
 /// Handles `ToolComplete` and `SpawnAgentsComplete` events during `ToolExecuting` state.
 #[allow(clippy::too_many_lines)]
 fn handle_core_tool_complete(
@@ -1147,77 +1209,16 @@ fn handle_core_tool_complete(
     };
 
     match event {
-        // ToolComplete (more tools remaining) -> next tool
         CoreEvent::ToolComplete {
             tool_use_id,
             result,
-        } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
-            let mut new_results = completed_results.clone();
-            new_results.push(result.into());
-
-            let next_tool = remaining_tools[0].clone();
-            let new_remaining = remaining_tools[1..].to_vec();
-
-            Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
-                current_tool: next_tool.clone(),
-                remaining_tools: new_remaining,
-                completed_results: new_results,
-                pending_sub_agents: pending_sub_agents.clone(),
-                assistant_message: assistant_message.clone(),
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::execute_tool(next_tool)))
-        }
-
-        // ToolComplete (last tool, no sub-agents) -> LlmRequesting
-        CoreEvent::ToolComplete {
-            tool_use_id,
+        } if tool_use_id == current_tool.id => Ok(finish_tool_round_step(
+            remaining_tools,
+            completed_results,
+            pending_sub_agents,
+            assistant_message,
             result,
-        } if tool_use_id == current_tool.id
-            && remaining_tools.is_empty()
-            && pending_sub_agents.is_empty() =>
-        {
-            let mut all_results = completed_results.clone();
-            all_results.push(result.into());
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in last-tool transition");
-
-            Ok(
-                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm),
-            )
-        }
-
-        // ToolComplete (last tool, has sub-agents) -> AwaitingSubAgents
-        CoreEvent::ToolComplete {
-            tool_use_id,
-            result,
-        } if tool_use_id == current_tool.id
-            && remaining_tools.is_empty()
-            && !pending_sub_agents.is_empty() =>
-        {
-            let mut all_results = completed_results.clone();
-            all_results.push(result.into());
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect(
-                    "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
-                );
-
-            Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
-                pending: pending_sub_agents.clone(),
-                completed_results: vec![],
-                spawn_tool_id: None,
-            })
-            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change()))
-        }
+        )),
 
         // SpawnAgentsComplete (more tools) -> accumulate
         CoreEvent::SpawnAgentsComplete {
@@ -2367,6 +2368,65 @@ pub fn transition_parent(
     event: ParentEvent,
 ) -> Result<ParentTransitionResult, TransitionError> {
     match (state, event) {
+        (
+            ParentState::Core(CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            }),
+            ParentEvent::Parent(ParentOnlyEvent::GoalReportPrepared {
+                report,
+                duration_ms,
+            }),
+        ) if current_tool.name() == "goal_report"
+            && report.call().tool_use_id.as_str() == current_tool.id
+            && report.call().message_id.as_str() == assistant_message.message_id
+            && report.call().transcript_id.as_str() == context.conversation_id =>
+        {
+            let result =
+                phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport {
+                    report,
+                    duration_ms,
+                };
+            let core = finish_tool_round_step(
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+                result,
+            );
+            Ok(ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
+        (
+            ParentState::Core(
+                core @ CoreState::CancellingTool {
+                    tool_use_id,
+                    assistant_message,
+                    ..
+                },
+            ),
+            ParentEvent::Parent(ParentOnlyEvent::GoalReportPrepared { report, .. }),
+        ) if report.call().tool_use_id.as_str() == tool_use_id
+            && report.call().message_id.as_str() == assistant_message.message_id
+            && report.call().transcript_id.as_str() == context.conversation_id =>
+        {
+            handle_core_cancellation(
+                core,
+                context,
+                CoreEvent::ToolAborted {
+                    tool_use_id: tool_use_id.clone(),
+                },
+            )
+            .map(|core| ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
         // ============================================================
         // Parent-only state: AwaitingTaskApproval
         // ============================================================

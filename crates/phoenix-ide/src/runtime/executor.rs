@@ -638,6 +638,28 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
     }
 }
 
+struct GoalReportEmitter {
+    binding: phoenix_core::domain::conversation_goal::GoalReportBinding,
+}
+
+impl GoalReportEmitter {
+    fn definition(&self) -> phoenix_core::domain::llm_types::ToolDefinition {
+        phoenix_core::domain::llm_types::ToolDefinition {
+            name: "goal_report".into(),
+            description: format!(
+                "Report the admitted outcome for goal {} at owner version {}; this does not start another turn.",
+                self.binding.goal_id.as_str(),
+                self.binding.observed_owner_version.get(),
+            ),
+            defer_loading: false,
+            input_schema: serde_json::json!({"type":"object", "properties":{
+                "status":{"type":"string","enum":["complete","blocked","exhausted"]},
+                "reason":{"type":"string","minLength":1}
+            }, "required":["status","reason"], "additionalProperties":false}),
+        }
+    }
+}
+
 fn contains_pending_goal_report(
     results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
 ) -> bool {
@@ -1941,6 +1963,7 @@ where
     /// authoritative persistence effect. Consumed by `PersistState`.
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    goal_report_emitter: Option<GoalReportEmitter>,
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
     pending_sub_agent_activation: Option<PendingSubAgentActivation>,
@@ -2300,6 +2323,7 @@ where
             active_prompt_projection: None,
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
+            goal_report_emitter: None,
             pending_sub_agent_acceptance: None,
             pending_sub_agent_terminal: None,
             pending_sub_agent_activation: None,
@@ -8199,6 +8223,15 @@ where
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // provider context are request authority, not task-local inputs.
         let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
+        if let Some(emitter) = self.parent_goal_report_emitter() {
+            if available_tools
+                .iter()
+                .any(|definition| definition.name == "goal_report")
+            {
+                return Err("goal report declaration has two owners".into());
+            }
+            available_tools.push(emitter.definition());
+        }
         if let Some(tool) = available_tools
             .iter_mut()
             .find(|tool| tool.name == "spawn_agents")
@@ -8698,6 +8731,72 @@ where
         self.create_tool_llm_metrics_sink(admitted)
     }
 
+    fn parent_goal_report_emitter(&self) -> Option<&GoalReportEmitter> {
+        if self.context.is_sub_agent || self.context.is_coordinator {
+            None
+        } else {
+            self.goal_report_emitter.as_ref()
+        }
+    }
+
+    fn prepare_goal_report(
+        &self,
+        tool: &ToolCall,
+        binding: phoenix_core::domain::conversation_goal::GoalReportBinding,
+        _admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Event, String> {
+        use phoenix_core::domain::conversation_goal::{
+            GoalPendingReport, GoalReportCall, GoalReportOutcome, GoalText,
+        };
+        let start = std::time::Instant::now();
+        let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = &self.state
+        else {
+            return Err("goal report has no owning assistant round".into());
+        };
+        if current_tool.id != tool.id {
+            return Err("goal report differs from the executing tool".into());
+        }
+        let outcome = match serde_json::from_value::<GoalReportOutcome>(tool.input.to_value()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(Event::ToolComplete {
+                    tool_use_id: tool.id.clone(),
+                    result: ToolResult::error(
+                        tool.id.clone(),
+                        format!("Invalid goal report: {error}"),
+                    ),
+                })
+            }
+        };
+        let report = GoalPendingReport::new(
+            binding,
+            GoalReportCall {
+                transcript_id: GoalText::parse(self.context.conversation_id.clone())
+                    .map_err(|error| error.to_string())?,
+                message_id: GoalText::parse(assistant_message.message_id.clone())
+                    .map_err(|error| error.to_string())?,
+                tool_use_id: GoalText::parse(tool.id.clone()).map_err(|error| error.to_string())?,
+            },
+            outcome,
+        );
+        if self
+            .active_direct_turn
+            .as_deref()
+            .and_then(|turn| i64::try_from(turn.turn_id.0).ok())
+            != Some(report.execution().turn_id())
+        {
+            return Err("goal report binding differs from the active admitted execution".into());
+        }
+        Ok(Event::GoalReportPrepared {
+            report,
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch_tool_execution(
         &mut self,
@@ -8738,6 +8837,24 @@ where
                 ),
             }));
         }
+        if tool.name() == "goal_report" {
+            if let Some(emitter) = self.parent_goal_report_emitter() {
+                if request_schema != emitter.definition().input_schema {
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id: tool.id.clone(),
+                        result: ToolResult::error(
+                            tool.id.clone(),
+                            "EUNAVAIL: goal report schema changed since the originating request"
+                                .into(),
+                        ),
+                    }));
+                }
+                return self
+                    .prepare_goal_report(&tool, emitter.binding.clone(), admitted)
+                    .map(Some);
+            }
+        }
+
         if tool.name() == "spawn_agents" {
             let advertised = self
                 .tool_executor
