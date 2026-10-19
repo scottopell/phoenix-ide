@@ -8,6 +8,7 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import base64
 import contextvars
 import contextlib
 import dataclasses
@@ -8378,8 +8379,6 @@ def _parse_prepared_receipt_with_verified_helper(
     verified_helper: VerifiedSystemdControllerHelper,
     receipt: bytes,
 ) -> dict:
-    import base64
-
     result = subprocess.run(
         [
             sys.executable,
