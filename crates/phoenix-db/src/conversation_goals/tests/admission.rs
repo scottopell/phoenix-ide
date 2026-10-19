@@ -410,7 +410,7 @@ async fn completed_real_continuation_releases_reservation_and_admits_only_the_ne
         .unwrap();
     assert_eq!(retried.snapshot, applied.snapshot);
     assert_eq!(
-        db.conversation_goal_history(&command.owner)
+        db.conversation_goal_history(&command.owner, GoalVersion::INITIAL)
             .await
             .unwrap()
             .len(),
