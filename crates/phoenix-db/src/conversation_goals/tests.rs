@@ -1,6 +1,9 @@
 use super::*;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+#[path = "tests/admission.rs"]
+mod admission;
+
 fn goal_count_sql(table: &str, owner_scoped: bool) -> &'static str {
     let (all, owner) = match table {
         "conversation_goal_ids" => (

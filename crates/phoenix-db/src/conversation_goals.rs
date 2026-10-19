@@ -12,8 +12,16 @@ use crate::Database;
 
 type GoalTx<'a> = Transaction<'a, Sqlite>;
 
+mod admission;
+
 #[derive(Debug, thiserror::Error)]
 pub enum GoalDbError {
+    #[error(transparent)]
+    Admission(#[from] crate::DbError),
+    #[error("goal mutation requires a settled turn boundary")]
+    Busy,
+    #[error("goal owner or current transcript changed during admission")]
+    TargetChanged,
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -264,7 +272,41 @@ async fn history_entry(tx: &mut GoalTx<'_>, row: &SqliteRow) -> Result<GoalHisto
     })
 }
 
+async fn retry_tx(
+    tx: &mut GoalTx<'_>,
+    mutation: &GoalMutation,
+) -> Result<Option<GoalHistoryEntry>> {
+    if let Some(row) =
+        sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? AND action_id=?")
+            .bind(mutation.owner.as_str())
+            .bind(mutation.action_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+    {
+        let previous = history_entry(tx, &row).await?;
+        if previous.mutation != *mutation {
+            return Err(GoalDbError::RetryConflict);
+        }
+        return Ok(Some(previous));
+    }
+    Ok(None)
+}
+
 impl Database {
+    /// Read an exact accepted retry without admitting another mutation.
+    ///
+    /// # Errors
+    /// Rejects conflicting action reuse and malformed persisted data or database failures.
+    pub async fn accepted_conversation_goal_mutation(
+        &self,
+        mutation: &GoalMutation,
+    ) -> Result<Option<GoalHistoryEntry>> {
+        let mut tx = self.pool().begin().await?;
+        let accepted = retry_tx(&mut tx, mutation).await?;
+        tx.commit().await?;
+        Ok(accepted)
+    }
+
     /// # Errors
     /// Returns a database error or rejects malformed persisted goal data.
     pub async fn conversation_goal(
@@ -297,29 +339,51 @@ impl Database {
         Ok(entries)
     }
 
-    /// Internal persistence only. Trusted callers supply actors; this is not an authorization API.
+    /// Apply a trusted host command after the application holds product-message then
+    /// transcript-acceptance gates, or an exact in-flight report without those wait gates.
+    /// No public adapter is installed by this method.
     ///
     /// # Errors
-    /// Rejects stale/conflicting changes, invalid attribution or binding, and database failures.
-    pub async fn mutate_conversation_goal(
+    /// Rejects busy or changed targets, stale versions, invalid attribution/bindings and DB failures.
+    pub async fn apply_conversation_goal(
+        &self,
+        mutation: &GoalMutation,
+        expected_transcript: &str,
+        at: GoalTimestampUs,
+    ) -> Result<GoalHistoryEntry> {
+        self.mutate_goal_with_admission(mutation, Some(expected_transcript), at)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn mutate_conversation_goal(
         &self,
         mutation: &GoalMutation,
         at: GoalTimestampUs,
     ) -> Result<GoalHistoryEntry> {
+        self.mutate_goal_with_admission(mutation, None, at).await
+    }
+
+    async fn mutate_goal_with_admission(
+        &self,
+        mutation: &GoalMutation,
+        expected_transcript: Option<&str>,
+        at: GoalTimestampUs,
+    ) -> Result<GoalHistoryEntry> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(row) =
-            sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? AND action_id=?")
-                .bind(mutation.owner.as_str())
-                .bind(mutation.action_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?
-        {
-            let previous = history_entry(&mut tx, &row).await?;
-            if previous.mutation != *mutation {
-                return Err(GoalDbError::RetryConflict);
-            }
+        if let Some(previous) = retry_tx(&mut tx, mutation).await? {
             tx.commit().await?;
             return Ok(previous);
+        }
+        if let Some(transcript) = expected_transcript {
+            match &mutation.change {
+                GoalChange::Report { binding, .. } => {
+                    admission::require_live_report_tx(&mut tx, binding, transcript).await?;
+                }
+                GoalChange::Create { .. } | GoalChange::SetDisposition { .. } => {
+                    admission::require_settled_tx(&mut tx, mutation, transcript).await?;
+                }
+            }
         }
         let current = current_tx(&mut tx, &mutation.owner).await?;
         let next = mutation.advance(current.as_ref())?;

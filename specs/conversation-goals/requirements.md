@@ -4,7 +4,7 @@
 
 As a Phoenix user, I need an ordinary conversation's immutable goal and attributed status history to remain inspectable across transcript changes, without an older execution affecting a replacement goal or a later status.
 
-This contract covers goal storage, mutation fencing, attribution consistency and immutable report bindings. It does not grant execution, resource, deployment or merge authority. Automatic follow-through, admission orchestration, Stop integration, release/resume interpretation, ceilings, renewals, waiting and watch delivery are outside this storage contract.
+This contract covers goal storage, mutation fencing, attribution consistency, immutable report bindings and settled-boundary application admission. It does not grant execution, resource, deployment or merge authority. Automatic follow-through, Stop integration, release/resume interpretation, ceilings, renewals, waiting and watch delivery are outside this contract.
 
 ## Requirements
 
@@ -144,3 +144,24 @@ WHEN goal storage is introduced by a forward migration
 THE SYSTEM SHALL leave existing conversation, message and execution identities and contents unchanged and SHALL fabricate no historical goals or actors.
 
 THE SYSTEM SHALL NOT infer a downgrade, cross-version replay or general recovery guarantee from this storage contract.
+
+### REQ-GOAL-009 — Settled-boundary mutation admission
+
+WHEN a trusted caller creates or replaces a goal, or requests an unbound disposition change
+THE SYSTEM SHALL require the ordinary owner's latest transcript at a settled-turn boundary, rather than infer settlement from an Idle projection alone.
+
+THE SYSTEM SHALL serialize those mutations with existing product-message admission followed by latest-transcript message acceptance, and SHALL recheck the owner, latest transcript, lifecycle admission and durable pending work in the write transaction.
+
+WHILE an admission or acceptance gate is occupied, or an owner has an active or accepted nonterminal turn, queued input, pending structured question or task approval, pending continuation reservation or opening, unfinished automatic continuation admission, unfinished creation delivery, or terminal settlement obligation
+THE SYSTEM SHALL refuse a new mutation as busy or unavailable without creating synthetic chat, queuing that mutation or admitting execution.
+
+THE SYSTEM SHALL permit retained terminal automatic-continuation records without treating them as pending work.
+
+THE SYSTEM SHALL apply the same settled-boundary rule to owning-agent create/replace calls; execution does not grant an exemption.
+
+WHEN an owning agent reports against its exact persisted execution binding
+THE SYSTEM SHALL recheck that the bound Runtime turn and workflow still own the current transcript without acquiring the message wait gates held by that execution.
+
+THE SYSTEM SHALL preserve exact accepted retries as historical reads without requiring settlement again or repeating the mutation.
+
+THE SYSTEM SHALL expose persisted goal reads without adding ordinary chat or granting execution permission.
