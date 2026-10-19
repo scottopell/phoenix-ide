@@ -2213,8 +2213,27 @@ mod tests {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let successor = historical_manual_opening(&state.db, "remote-reserved-parent", None).await;
         let reserved_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("UPDATE continuation_dispatch_intents SET message_id = ?1 WHERE successor_conversation_id = ?2")
-            .bind(&reserved_id).bind(&successor).execute(state.db.pool()).await.unwrap();
+        sqlx::query(
+            "DELETE FROM continuation_dispatch_intents WHERE successor_conversation_id = ?1",
+        )
+        .bind(&successor)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, user_agent, opening_authority, created_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, 'user_authorized_instruction', ?5)",
+        )
+        .bind("remote-reserved-parent")
+        .bind(&successor)
+        .bind(&reserved_id)
+        .bind("historical manual handoff")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(state.db.pool())
+        .await
+        .unwrap();
         let service =
             super::SendChatApplicationService::new(state.db.clone(), state.runtime.clone());
         let instance_id = InstanceId::new();
