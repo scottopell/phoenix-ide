@@ -172,12 +172,34 @@ making orphan prevention correct by construction rather than by discipline.
 
 ### REQ-TERM-009: Child Process Reaped After Shell Exit
 
-WHEN the shell process exits
-THE SYSTEM SHALL call `waitpid` to reap the child
-AND NOT leave zombie processes
+WHEN a terminal child is published in the active-terminal registry
+THE SYSTEM SHALL install one child-exit observer independent of WebSocket attachment
+AND SHALL expose its result through a read-only, retained in-memory exit receipt
 
-**Rationale:** Unreaned children remain as zombies in the process table until the
-API server exits. Long-lived servers with many terminal sessions accumulate zombies.
+WHEN the registered child exits, whether attached or detached
+THE SYSTEM SHALL reap it through that single observer
+AND NOT require reconnect or explicit Close to prevent zombie processes
+
+WHEN the exited child is detached
+THE SYSTEM SHALL acquire attach authority before closing its master fd and removing
+only its exact registry instance
+AND SHALL preserve any explicit Close fence
+
+WHEN the child exits while a relay is attached
+THE SYSTEM SHALL NOT send `StopReason::TearDown` merely because exit was observed
+AND SHALL allow the relay to drain output through its existing EOF path
+before acquiring attach authority for cleanup
+
+WHEN explicit Close retires a registered terminal
+THE SYSTEM SHALL await the same exit receipt rather than independently reap the child
+AND SHALL retain its retirement fence until the owning Close operation releases it
+
+WHILE a detached child remains alive
+THE SYSTEM SHALL NOT retire it merely because it is idle or unattached
+
+**Rationale:** Unreaped children remain as zombies until the API server exits.
+Independent observation prevents detached sessions from accumulating zombies;
+separate attach authority preserves output draining and exact-instance cleanup.
 
 ---
 

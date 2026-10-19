@@ -656,6 +656,7 @@ mod reclaim_tests {
         Arc::new(TerminalHandle {
             master_fd: std::sync::Mutex::new(Some(owned_fd)),
             child_pid: nix::unistd::Pid::from_raw(1),
+            child_lifecycle: phoenix_terminal::child_lifecycle::TerminalChildLifecycle::passive(),
             launch_identity: TerminalLaunchIdentity {
                 process: ProcessIdentity {
                     pid: 1,
@@ -681,18 +682,14 @@ mod reclaim_tests {
 
     impl Drop for DirectPtyFixture {
         fn drop(&mut self) {
-            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-
-            // Retirement may already have reaped this child.
-            if matches!(
-                waitpid(self.handle.child_pid, Some(WaitPidFlag::WNOHANG)),
-                Ok(WaitStatus::StillAlive)
+            if phoenix_core::process_identity::process_identity_matches(
+                self.handle.launch_identity.process,
             ) {
                 let _ = nix::sys::signal::kill(
                     self.handle.child_pid,
                     nix::sys::signal::Signal::SIGKILL,
                 );
-                let _ = waitpid(self.handle.child_pid, None);
+                // The registered monitor remains the only waitpid owner.
             }
         }
     }
