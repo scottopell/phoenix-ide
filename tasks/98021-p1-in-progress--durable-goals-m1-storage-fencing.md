@@ -199,11 +199,14 @@ install it. Corrected the recovered draft's mismatched schema (`status`, not
 calls. Parent event guards match tool, assistant-message and transcript identity;
 Stop routes a prepared report to cancellation rather than report success.
 
-Seven added tests cover actual provider outcome/internal-event processing,
+Six added provider/internal-event journey test functions cover actual processing,
 committed paired report/result rows and next Anthropic rendering, unchanged
-state/replay/goal on failed checkpoint followed by exact retry, Stop ordering,
-parent-only access, mixed report/proposal all-ERR refusal, a separate valid sole
-proposal awaiting approval, and default-off/forged-input rejection. The replay
+state/replay/goal on failed checkpoint followed by manual delivery of the exact
+same event, Stop ordering, mixed report/proposal all-ERR refusal, a separate
+valid sole proposal awaiting approval, and default-off/forged-input rejection
+(two modes in one function). One additional helper-only test checks parent-only
+emitter access; it is not a child runtime journey. Manual event retry is not
+automatic restart/recovery coverage. The replay
 source written at the pre-tool state remains distinct from replay progress
 co-committed by the existing combined checkpoint owner. Database-only pending
 fork parity is not labelled runtime E2E.
@@ -219,3 +222,23 @@ only 96/96 at `f6a5ea5570a3d4a086ef4a427b9c4f7745c70e08`, run `39331620726`,
 artifact `12226138977`, with aggregate failure and no attributed full-suite
 failure names. Production emitter/autoactivation stay OFF. Migration132 is
 unchanged; UserControl/stable-Stop later DDL remains UNASSIGNED.
+
+### Exact f554 hosted compile failure and isolated correction
+
+Published `f5549ac9a829e04728b98d6524df3c61d236c953` received one existing-CI
+workflow dispatch, run `39338770106` (terminal FAILED), Rust evidence artifact
+`12228471018`. Both broad Rust and focused goal stages stopped at compilation;
+no passing goal/journey execution is claimed. Actual diagnostics: unresolved
+`Message` in the shared replay validator, private `apply_replay_tx` called from
+two combined owners, and the new prepared-report cancellation arm passing an
+extra context argument. The first two are exposed post-f6 combined-owner source;
+the cancellation signature is an introduced emitter defect.
+
+Independent parent review of `58eb9cab8..f5549ac9a` also found introduced emitter
+description references to nonexistent public binding fields. The real binding
+contains private `execution` and `goal`; the isolated correction restores a
+generic description and keeps the binding private rather than adding metadata
+or authority surfaces. Removed the extra cancellation argument after reading
+the actual callee. Coverage language above is corrected to six journey
+functions plus one helper-only parent guard, with manual retry stated precisely.
+These corrections are source-only until a subsequent exact-head hosted run.

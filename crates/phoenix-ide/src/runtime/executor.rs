@@ -643,14 +643,12 @@ struct GoalReportEmitter {
 }
 
 impl GoalReportEmitter {
+    #[allow(clippy::unused_self)]
     fn definition(&self) -> phoenix_core::domain::llm_types::ToolDefinition {
         phoenix_core::domain::llm_types::ToolDefinition {
             name: "goal_report".into(),
-            description: format!(
-                "Report the admitted outcome for goal {} at owner version {}; this does not start another turn.",
-                self.binding.goal_id.as_str(),
-                self.binding.observed_owner_version.get(),
-            ),
+            description: "Report the admitted goal outcome; this does not start another turn."
+                .into(),
             defer_loading: false,
             input_schema: serde_json::json!({"type":"object", "properties":{
                 "status":{"type":"string","enum":["complete","blocked","exhausted"]},

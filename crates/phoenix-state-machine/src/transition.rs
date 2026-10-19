@@ -2417,7 +2417,6 @@ pub fn transition_parent(
         {
             handle_core_cancellation(
                 core,
-                context,
                 CoreEvent::ToolAborted {
                     tool_use_id: tool_use_id.clone(),
                 },

@@ -114,17 +114,24 @@ binding owns both the advertised `goal_report` definition and preparation of a
 typed pending report. Only tests install this binding; this is not production
 activation or authorization for another turn.
 
-The added `runtime::executor::goal_round_tests` journeys process actual provider
-outcomes and internal events through `process_event`, rather than installing a
-synthetic pending checkpoint. They cover paired report rows, goal mutation and
-committed state, public replay identity, the next Anthropic-rendered request,
-rollback/retry, Stop before prepared-report delivery, and strict report inputs.
+Six added `runtime::executor::goal_round_tests` journey functions process actual
+provider outcomes and internal events through `process_event`, rather than
+installing a synthetic pending checkpoint. They cover paired report rows, goal
+mutation and committed state, public replay identity, the next Anthropic-rendered
+request, rollback followed by manual exact-event retry, Stop before prepared-report
+delivery, and strict report inputs. A seventh test checks only the parent-emitter
+helper guard, not a child runtime journey. None proves automatic restart recovery.
 A mixed report/proposal response remains all paired errors with no goal history;
 a separate sole proposal reaches `AwaitingTaskApproval`. Database pending-fork
 parity remains defensive coverage, not a runtime fork journey.
 
-These additions and the intervening runtime/provider/fork/terminal changes are
-unqualified until the new exact-head hosted run is inspected. The prior 96/96
+Exact head `f5549ac9a829e04728b98d6524df3c61d236c953` failed hosted run
+`39338770106` before goal tests executed (Rust artifact `12228471018`). The
+compile blockers were a shared replay validator import, replay helper visibility,
+and the prepared-report cancellation signature; independent parent source review
+also caught nonexistent binding metadata in the emitter description. Isolated
+source corrections remain unqualified until another exact-head hosted execution.
+The intervening runtime/provider/fork/terminal changes are also unqualified. The prior 96/96
 focused pass belongs only to `f6a5ea5570a3d4a086ef4a427b9c4f7745c70e08`, run
 `39331620726`, artifact `12226138977`; that run's aggregate result failed.
 No local compilation, tests, migration, deployment, or activation was performed
