@@ -7657,22 +7657,6 @@ async fn cleanup_pending_fork_orphans_on_delete(
         .map_err(|error| AppError::Internal(error.to_string()))
 }
 
-async fn conversation_response(
-    state: &AppState,
-    id: &str,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok(Json(ConversationResponse {
-        conversation: conversation_to_json_with_seed(state, &conversation, true).await?,
-    }))
-}
-
 pub(crate) fn title_from_text(text: &str) -> String {
     text.split_whitespace()
         .take(8)
