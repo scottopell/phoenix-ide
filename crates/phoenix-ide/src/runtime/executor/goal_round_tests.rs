@@ -1167,9 +1167,12 @@ async fn conversation_goal_actual_report_prepared_before_stop_cannot_commit_succ
     let prepared = rt.event_rx.try_recv().expect("prepared report before Stop");
     assert!(matches!(&prepared, Event::GoalReportPrepared { .. }));
     assert!(phoenix_core::domain::sm_event::SubAgentEvent::try_from(prepared.clone()).is_err());
-    rt.process_event(Event::UserCancel { steer: None })
-        .await
-        .unwrap();
+    rt.process_event(Event::UserCancel {
+        reason: None,
+        cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+    })
+    .await
+    .unwrap();
     assert!(matches!(rt.state, ConvState::CancellingTool { .. }));
     rt.process_event(prepared).await.unwrap();
     assert!(matches!(rt.state, ConvState::Idle));
