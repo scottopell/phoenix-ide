@@ -514,6 +514,32 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
                 self.staging_policy(),
             )
 
+    def test_copy_handoff_file_hashes_the_same_bytes_it_publishes(self):
+        source = self.base / "mutable-source"
+        source.write_bytes(b"controller-bound bytes")
+        expected = digest(source)
+        destination = self.base / "root-owned-copy"
+        original_read, original_write = os.read, os.write
+        mutated = False
+
+        def mutate_source_after_read(fd, size):
+            nonlocal mutated
+            chunk = original_read(fd, size)
+            if chunk and not mutated:
+                source.write_bytes(b"x" * len(chunk))
+                mutated = True
+            return chunk
+
+        def short_write(fd, data):
+            return original_write(fd, data[:3])
+
+        with mock.patch.object(helper.os, "read", side_effect=mutate_source_after_read), \
+             mock.patch.object(helper.os, "write", side_effect=short_write):
+            helper.copy_handoff_file(source, destination, expected, os.getuid(), 0o600)
+        self.assertTrue(mutated)
+        self.assertNotEqual(expected, digest(source))
+        self.assertEqual(expected, digest(destination))
+
     def test_root_staging_derives_previous_runtime_from_captured_install(self):
         sources = self.staging_sources()
         source_manifest = self.base / "manifest-source.json"

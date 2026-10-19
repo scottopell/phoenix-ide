@@ -515,6 +515,38 @@ class SystemdDeployCommandTests(unittest.TestCase):
         }))
         return binary, receipt
 
+    def test_linux_prepared_controller_checkout_must_be_exact_and_clean_before_sudo(self):
+        import platform
+        expected = "c" * 40
+
+        for head, status in (("d" * 40, ""), (expected, "?? local-change")):
+            with self.subTest(head=head, status=status), \
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=[
+                     subprocess.CompletedProcess([], 0, head + "\n", ""),
+                     subprocess.CompletedProcess([], 0, status + "\n", ""),
+                 ]), self.assertRaisesRegex(SystemExit, "clean checkout"):
+                self.dev._require_exact_clean_controller_checkout(expected)
+
+        with mock.patch.object(self.dev.subprocess, "run", side_effect=[
+                 subprocess.CompletedProcess([], 0, expected + "\n", ""),
+                 subprocess.CompletedProcess([], 0, "", ""),
+             ]) as run:
+            self.dev._require_exact_clean_controller_checkout(expected)
+        self.assertEqual(["git", "rev-parse", "HEAD"], run.call_args_list[0].args[0])
+        self.assertEqual(["git", "status", "--porcelain"], run.call_args_list[1].args[0])
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(sys, "platform", "linux"), \
+             mock.patch.object(platform, "machine", return_value="x86_64"), \
+             mock.patch.object(self.dev, "_require_exact_clean_controller_checkout",
+                               side_effect=SystemExit("wrong controller")) as checkout, \
+             mock.patch.object(self.dev, "_require_noninteractive_sudo_ready") as sudo, \
+             mock.patch.object(self.dev, "_prepare_linux_artifact") as prepare:
+            with self.assertRaisesRegex(SystemExit, "wrong controller"):
+                self.dev.native_prod_deploy(controller=self.linux_prepared_options(Path(td)))
+        checkout.assert_called_once_with(expected)
+        sudo.assert_not_called()
+        prepare.assert_not_called()
+
     def test_linux_prepared_options_reject_mixed_modes_before_sudo_or_preparation(self):
         import platform
         with tempfile.TemporaryDirectory() as td, mock.patch.object(sys, "platform", "linux"), \
@@ -699,6 +731,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_binary_identity", return_value=expected), \
                  mock.patch.object(self.dev, "SYSTEMD_PREPARED_REGISTRY_SHA256", registry_sha), \
                  mock.patch.object(linux_helper, "PREPARED_REGISTRY_SHA256", registry_sha), \
+                 mock.patch.object(self.dev, "_require_exact_clean_controller_checkout") as checkout, \
                  mock.patch.object(self.dev, "_require_noninteractive_sudo_ready"), \
                  mock.patch.object(self.dev, "_read_systemd_installed_env", return_value={"SECRET": "installed"}), \
                  mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
@@ -725,6 +758,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                               (self.dev.SYSTEMD_PREPARED_COMMIT, "crates/phoenix-db/src/migrations.rs", "prepared_artifact")],
                              captured["sources"])
             self.assertIn("--protected-prepared-protocol-version", run.call_args_list[0].args[0])
+            checkout.assert_called_once_with("c" * 40)
 
     def test_ordinary_old_release_pending_database_refuses_before_handoff_using_candidate_bytes(self):
         import sqlite3

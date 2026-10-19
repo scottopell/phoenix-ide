@@ -1638,15 +1638,21 @@ def copy_handoff_file(source: Path, destination: Path, expected_hash: str, sourc
         metadata = os.fstat(source_fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != source_uid:
             raise ValidationError("handoff artifact has unexpected type or owner")
-        if sha256_fd(source_fd) != expected_hash:
-            raise ValidationError("handoff artifact checksum mismatch")
-        os.lseek(source_fd, 0, os.SEEK_SET)
         destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         output_fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
         try:
             os.fchmod(output_fd, mode)
+            copied_hash = hashlib.sha256()
             while chunk := os.read(source_fd, 1024 * 1024):
-                os.write(output_fd, chunk)
+                copied_hash.update(chunk)
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(output_fd, remaining)
+                    if written <= 0:
+                        raise OSError("short handoff artifact write")
+                    remaining = remaining[written:]
+            if copied_hash.hexdigest() != expected_hash:
+                raise ValidationError("handoff artifact checksum mismatch")
             os.fsync(output_fd)
         finally:
             os.close(output_fd)

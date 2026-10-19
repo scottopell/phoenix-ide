@@ -8430,6 +8430,22 @@ def _require_linux_prepared_unchanged(candidate: "ValidatedLinuxPreparedCandidat
         raise SystemExit("Linux prepared candidate or receipt changed during staging")
 
 
+def _require_exact_clean_controller_checkout(expected_commit: str) -> None:
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit("cannot verify the prepared systemd controller checkout") from exc
+    if head != expected_commit or dirty:
+        raise SystemExit(
+            "prepared systemd deployment requires a clean checkout at the exact --controller-source-commit"
+        )
+
+
 def _systemd_ordinary_database_preflight(prepared: "PreparedCandidate", staging: Path, environment: dict[str, str]) -> None:
     import sqlite3
     import urllib.parse
@@ -8478,6 +8494,11 @@ def native_prod_deploy(
 
     controller = controller or ProdDeployControllerOptions()
     controller.require_systemd_current(release)
+    if controller.systemd_current_schema_upgrade and controller.prepared_artifact is not None:
+        controller_commit = controller.controller_source_commit
+        if controller_commit is None:
+            raise SystemExit("prepared systemd deployment requires an exact controller source commit")
+        _require_exact_clean_controller_checkout(controller_commit)
     if controller.enabled:
         if controller.prepared_artifact is None:
             release, _expected_full_commit = controller.require_exact_release(release)
