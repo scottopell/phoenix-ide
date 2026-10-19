@@ -1,6 +1,6 @@
 # ADR-143: Bound owned-child settlement after Bash launch
 
-- **Status:** Accepted
+- **Status:** Proposed
 - **Date:** 2026-10-17
 - **Affects:** `specs/bash/requirements.md` REQ-BASH-017
 
@@ -23,7 +23,7 @@ Tokio 1.52.3 routes `Child::start_kill` through `FusedChild`: completed children
 
 Never re-probe identity for adoption, signal an unknown group, or replay. Return handle-free typed terminal results when owned wait proves terminal status, otherwise an explicit side-effect-unknown error prohibiting automatic retry. Descendant shutdown remains unverified in both cases.
 
-Release pending admission after bounded settlement. Retain one process-local uncertainty bit per owner, fencing subsequent spawns and entering the existing retirement failure report. The report carries typed scope uncertainty separately from process-group failures, without inventing a group ID or signal authority. Its `has_failures` check causes Close's `require_absent` check to reject successful retirement, including when no exact process-group target exists. Preserve sandbox scratch that unverified descendants might still use. No persistence, restart recovery, historical PID authority or auto-cleanup is added.
+Publish one process-local uncertainty bit per owner at the custody transition, before asynchronous settlement can yield. Keep the pending admission reservation until bounded settlement completes, then release it without clearing that uncertainty. The retained uncertainty fences subsequent spawns and enters the existing retirement failure report. The report carries typed scope uncertainty separately from process-group failures, without inventing a group ID or signal authority. Its `has_failures` check causes Close's `require_absent` check to reject successful retirement, including when no exact process-group target exists. Preserve sandbox scratch that unverified descendants might still use. No persistence, restart recovery, historical PID authority or auto-cleanup is added.
 
 ## Consequences
 
