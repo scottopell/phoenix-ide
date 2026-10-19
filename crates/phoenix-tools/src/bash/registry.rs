@@ -210,6 +210,15 @@ impl SpawnReservation {
         self.launched = true;
     }
 
+    /// Publish a launched child's missing registration before bounded settlement.
+    /// The reservation continues to count as pending until custody is settled.
+    pub fn mark_unregistered(&mut self) {
+        self.launched = true;
+        self.admission
+            .unverified_launch
+            .store(true, Ordering::Release);
+    }
+
     fn settle(&mut self) {
         if !self.committed {
             self.committed = true;
@@ -2114,9 +2123,17 @@ mod tests {
         let registry = Arc::new(BashHandleRegistry::new());
         let owner = scope("inherited-unregistered-launch");
         let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
-        reservation.mark_launched();
-        drop(reservation);
+        reservation.mark_unregistered();
 
+        let entry = registry.get_existing(&owner).await.unwrap();
+        assert_eq!(
+            entry.read().await.admission.pending.load(Ordering::Acquire),
+            1
+        );
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
         let report =
             cascade_bash_on_delete(&registry, &owner, &work_actor("owner"), Some(&owner)).await;
         assert_eq!(
@@ -2128,9 +2145,43 @@ mod tests {
         assert!(report.live_handle_pgids.is_empty());
         assert!(report.kill_failures.is_empty());
         assert!(report.teardown_generation.is_none());
-        let entry = registry.get_existing(&owner).await.unwrap();
         assert!(!entry.read().await.teardown_started);
+        assert_eq!(
+            entry.read().await.admission.pending.load(Ordering::Acquire),
+            1
+        );
+        drop(reservation);
+        assert_eq!(
+            entry.read().await.admission.pending.load(Ordering::Acquire),
+            0
+        );
         assert!(registry.reserve_spawn(&owner).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unregistered_launch_retains_pending_reservation_until_settlement() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("pending-unregistered-launch");
+        let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
+        reservation.mark_unregistered();
+
+        let retirement = registry.begin_retirement(&owner);
+        tokio::pin!(retirement);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut retirement)
+                .await
+                .is_err()
+        );
+        drop(reservation);
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), retirement)
+            .await
+            .expect("settled reservation must release owner teardown");
+        let outcome = registry.complete_retirement(&permit).await;
+        assert_eq!(
+            outcome.report().scope_uncertainty,
+            Some(BashScopeUncertainty::UnregisteredLaunch)
+        );
+        assert!(outcome.report().live_handle_pgids.is_empty());
     }
 
     /// A continuation that resolves to a DIFFERENT scope does not preserve;

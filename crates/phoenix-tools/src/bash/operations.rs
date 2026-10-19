@@ -616,8 +616,10 @@ async fn run_run_with_identity_probe(
             },
         )
     });
-    if !matches!(&launched, Err(SpawnChildError::NotSpawned(_))) {
-        reservation.mark_launched();
+    match &launched {
+        Ok(_) => reservation.mark_launched(),
+        Err(SpawnChildError::Unregistered(_)) => reservation.mark_unregistered(),
+        Err(SpawnChildError::NotSpawned(_)) => {}
     }
     let fallback_cmd = cmd.to_string();
     let fallback_label = label.clone();
@@ -834,7 +836,7 @@ fn settle_unregistered_run(
     let started = unregistered.started_at;
     let cmd = cmd.to_string();
     let read_args = read_args.clone();
-    reservation.mark_launched();
+    reservation.mark_unregistered();
     tracing::warn!(
         ?launch_error,
         "bash child launched without a registered handle; bounded direct-child settlement, never retrying"
@@ -2829,8 +2831,12 @@ mod tests {
             &read_args,
             BashLaunchError::IdentityUnavailable,
         );
-        drop(future);
         let registry = ctx.bash_handle_registry();
+        assert!(matches!(
+            registry.reserve_spawn(&ctx.work_scope).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        drop(future);
         let permit = tokio::time::timeout(
             Duration::from_secs(3),
             registry.begin_retirement(&ctx.work_scope),
