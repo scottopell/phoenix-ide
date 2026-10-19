@@ -38,11 +38,11 @@ fn product(value: String) -> Result<ProductConversationId> {
 
 fn state_columns(state: &GoalState) -> (&'static str, Option<&str>) {
     match state {
-        GoalState::Active => ("active", None),
+        GoalState::Underway => ("underway", None),
         GoalState::Blocked(reason) => ("blocked", Some(reason.as_str())),
         GoalState::Suspended(reason) => ("suspended", Some(reason.as_str())),
         GoalState::Complete(reason) => ("complete", Some(reason.as_str())),
-        GoalState::Cleared(reason) => ("cleared", Some(reason.as_str())),
+        GoalState::Exhausted(reason) => ("exhausted", Some(reason.as_str())),
     }
 }
 
@@ -50,22 +50,22 @@ fn read_state(row: &SqliteRow) -> Result<GoalState> {
     let kind: String = row.try_get("state")?;
     let reason: Option<String> = row.try_get("reason")?;
     match (kind.as_str(), reason) {
-        ("active", None) => Ok(GoalState::Active),
+        ("underway", None) => Ok(GoalState::Underway),
         ("blocked", Some(reason)) => Ok(GoalState::Blocked(text(reason)?)),
         ("suspended", Some(reason)) => Ok(GoalState::Suspended(text(reason)?)),
         ("complete", Some(reason)) => Ok(GoalState::Complete(text(reason)?)),
-        ("cleared", Some(reason)) => Ok(GoalState::Cleared(text(reason)?)),
+        ("exhausted", Some(reason)) => Ok(GoalState::Exhausted(text(reason)?)),
         _ => Err(GoalDbError::Integrity("state/reason")),
     }
 }
 
-fn disposition(state: &GoalState) -> Result<GoalDisposition> {
+fn disposition(state: &GoalState) -> GoalDisposition {
     match state {
-        GoalState::Active => Err(GoalDbError::Integrity("active disposition")),
-        GoalState::Blocked(reason) => Ok(GoalDisposition::Blocked(reason.clone())),
-        GoalState::Suspended(reason) => Ok(GoalDisposition::Suspended(reason.clone())),
-        GoalState::Complete(reason) => Ok(GoalDisposition::Complete(reason.clone())),
-        GoalState::Cleared(reason) => Ok(GoalDisposition::Cleared(reason.clone())),
+        GoalState::Underway => GoalDisposition::Underway,
+        GoalState::Blocked(reason) => GoalDisposition::Blocked(reason.clone()),
+        GoalState::Suspended(reason) => GoalDisposition::Suspended(reason.clone()),
+        GoalState::Complete(reason) => GoalDisposition::Complete(reason.clone()),
+        GoalState::Exhausted(reason) => GoalDisposition::Exhausted(reason.clone()),
     }
 }
 
@@ -74,7 +74,6 @@ fn snapshot(row: &SqliteRow) -> Result<GoalSnapshot> {
         owner: product(row.try_get("owner_id")?)?,
         goal_id: GoalId::parse(row.try_get::<String, _>("goal_id")?)?,
         version: GoalVersion::parse(row.try_get("version")?)?,
-        objective_revision: GoalVersion::parse(row.try_get("objective_revision")?)?,
         objective: text(row.try_get("objective")?)?,
         state: read_state(row)?,
     })
@@ -85,7 +84,7 @@ async fn current_tx(
     owner: &ProductConversationId,
 ) -> Result<Option<GoalSnapshot>> {
     sqlx::query(
-        "SELECT * FROM conversation_goal_history WHERE owner_id=? ORDER BY version DESC LIMIT 1",
+        "SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? ORDER BY version DESC LIMIT 1",
     )
     .bind(owner.as_str())
     .fetch_optional(&mut **tx)
@@ -114,7 +113,6 @@ async fn binding_tx(tx: &mut GoalTx<'_>, turn_id: i64) -> Result<Option<GoalExec
             owner: owner.clone(),
             goal_id: GoalId::parse(goal_id)?,
             version,
-            objective_revision: GoalVersion::parse(row.try_get("objective_revision")?)?,
         }),
         None => GoalAdmissionObservation::NoGoal {
             observed_version: version,
@@ -238,19 +236,15 @@ async fn history_entry(tx: &mut GoalTx<'_>, row: &SqliteRow) -> Result<GoalHisto
             goal_id: snapshot.goal_id.clone(),
             objective: snapshot.objective.clone(),
         },
-        "edit" => GoalChange::EditObjective {
-            goal_id: snapshot.goal_id.clone(),
-            objective: snapshot.objective.clone(),
-        },
         "state" => GoalChange::SetDisposition {
             goal_id: snapshot.goal_id.clone(),
-            disposition: disposition(&snapshot.state)?,
+            disposition: disposition(&snapshot.state),
         },
         "report" => GoalChange::Report {
             binding: binding_tx(tx, row.try_get("report_turn_id")?)
                 .await?
                 .ok_or(GoalDbError::Integrity("report binding"))?,
-            disposition: disposition(&snapshot.state)?,
+            disposition: disposition(&snapshot.state),
         },
         _ => return Err(GoalDbError::Integrity("change kind")),
     };
@@ -293,7 +287,7 @@ impl Database {
         after: GoalVersion,
     ) -> Result<Vec<GoalHistoryEntry>> {
         let mut tx = self.pool().begin().await?;
-        let rows = sqlx::query("SELECT * FROM conversation_goal_history WHERE owner_id=? AND version>? ORDER BY version LIMIT 100")
+        let rows = sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? AND version>? ORDER BY version LIMIT 100")
             .bind(owner.as_str()).bind(after.get()).fetch_all(&mut *tx).await?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -314,7 +308,7 @@ impl Database {
     ) -> Result<GoalHistoryEntry> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         if let Some(row) =
-            sqlx::query("SELECT * FROM conversation_goal_history WHERE owner_id=? AND action_id=?")
+            sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? AND action_id=?")
                 .bind(mutation.owner.as_str())
                 .bind(mutation.action_id.as_str())
                 .fetch_optional(&mut *tx)
@@ -330,15 +324,17 @@ impl Database {
         let current = current_tx(&mut tx, &mutation.owner).await?;
         let next = mutation.advance(current.as_ref())?;
         let (kind, report_turn) = match &mutation.change {
-            GoalChange::Create { goal_id, .. } => {
-                sqlx::query("INSERT INTO conversation_goal_ids (goal_id,owner_id) VALUES (?,?)")
-                    .bind(goal_id.as_str())
-                    .bind(mutation.owner.as_str())
-                    .execute(&mut *tx)
-                    .await?;
+            GoalChange::Create { goal_id, objective } => {
+                sqlx::query(
+                    "INSERT INTO conversation_goal_ids (goal_id,owner_id,objective) VALUES (?,?,?)",
+                )
+                .bind(goal_id.as_str())
+                .bind(mutation.owner.as_str())
+                .bind(objective.as_str())
+                .execute(&mut *tx)
+                .await?;
                 ("create", None)
             }
-            GoalChange::EditObjective { .. } => ("edit", None),
             GoalChange::SetDisposition { .. } => ("state", None),
             GoalChange::Report { binding, .. } => {
                 if binding_tx(&mut tx, binding.execution.turn_id())
@@ -356,9 +352,9 @@ impl Database {
         let applier =
             insert_actor(&mut tx, &mutation.owner, &mutation.attribution.applied_by).await?;
         let (state, reason) = state_columns(&next.state);
-        sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,objective_revision,objective,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
             .bind(next.owner.as_str()).bind(next.version.get()).bind(next.goal_id.as_str())
-            .bind(next.objective_revision.get()).bind(next.objective.as_str()).bind(state).bind(reason)
+            .bind(state).bind(reason)
             .bind(mutation.action_id.as_str()).bind(kind).bind(report_turn).bind(requester).bind(applier)
             .bind(at.get()).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -384,23 +380,19 @@ pub(crate) async fn bind_goal_at_admission_tx(
             Err(GoalDbError::BindingConflict)
         };
     }
-    let (observed_version, goal_id, revision) = match &binding.observation {
-        GoalAdmissionObservation::NoGoal { observed_version } => (*observed_version, None, None),
+    let (observed_version, goal_id) = match &binding.observation {
+        GoalAdmissionObservation::NoGoal { observed_version } => (*observed_version, None),
         GoalAdmissionObservation::Goal(fence) => {
             if fence.owner != binding.owner {
                 return Err(GoalDbError::BindingConflict);
             }
-            (
-                fence.version,
-                Some(fence.goal_id.as_str()),
-                Some(fence.objective_revision.get()),
-            )
+            (fence.version, Some(fence.goal_id.as_str()))
         }
     };
-    sqlx::query("INSERT INTO conversation_goal_bindings (turn_id,workflow_id,owner_id,observed_version,goal_id,objective_revision) VALUES (?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO conversation_goal_bindings (turn_id,workflow_id,owner_id,observed_version,goal_id) VALUES (?,?,?,?,?)")
         .bind(binding.execution.turn_id()).bind(binding.execution.workflow_id()).bind(binding.owner.as_str())
         .bind(if observed_version == GoalVersion::INITIAL { None } else { Some(observed_version.get()) })
-        .bind(goal_id).bind(revision).execute(&mut **tx).await?;
+        .bind(goal_id).execute(&mut **tx).await?;
     Ok(())
 }
 

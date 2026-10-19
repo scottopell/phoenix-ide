@@ -2,7 +2,7 @@
 
 ## User story and scope
 
-As a Phoenix user, I need an ordinary conversation's objective and attributed changes to remain inspectable across transcript changes, without an older execution overwriting a newer instruction or Stop.
+As a Phoenix user, I need an ordinary conversation's immutable goal and attributed status history to remain inspectable across transcript changes, without an older execution affecting a replacement goal or a later status.
 
 This contract covers goal storage, mutation fencing, attribution consistency and immutable report bindings. It does not grant execution, resource, deployment or merge authority. Automatic follow-through, admission orchestration, Stop integration, release/resume interpretation, ceilings, renewals, waiting and watch delivery are outside this storage contract.
 
@@ -14,7 +14,14 @@ THE SYSTEM SHALL associate a goal with an ordinary stable ProductConversation, i
 
 THE SYSTEM SHALL reject a Coordinator ProductConversation as a goal owner.
 
-THE SYSTEM SHALL expose at most one current goal state for an ordinary owner and retain ordered completed and cleared history while that owner exists.
+THE SYSTEM SHALL expose at most one current goal identity for an ordinary owner and retain ordered status and supersession history while that owner exists.
+
+THE SYSTEM SHALL store one immutable objective per goal identity.
+
+WHEN a new objective is set
+THE SYSTEM SHALL create a new goal identity and atomically make it current without requiring a clear or edit step.
+
+THE SYSTEM SHALL retain prior goal identities and outcomes without representing supersession as successful completion or reopening a terminal identity.
 
 WHEN the owner has no goal history
 THE SYSTEM SHALL represent that absence without creating a goal or changing ordinary execution behavior.
@@ -29,7 +36,7 @@ THE SYSTEM SHALL apply the same fence to user-facing, owning-agent, Coordinator 
 WHEN competing mutations name the same observed version
 THE SYSTEM SHALL accept at most one distinct mutation and return an explicit conflict for another.
 
-THE SYSTEM SHALL advance the owner version for every accepted mutation, including objective edits and lifecycle changes, and SHALL preserve monotonic owner versions across clear and replacement.
+THE SYSTEM SHALL advance one owner version for every accepted status change or new-identity supersession, and SHALL preserve its monotonicity across goal identities.
 
 THE SYSTEM SHALL reject reuse of a historical goal identity for a new goal.
 
@@ -37,7 +44,7 @@ THE SYSTEM SHALL reject reuse of a historical goal identity for a new goal.
 
 THE SYSTEM SHALL persist a mutation's resulting state, exact attribution, cause/action identity and timestamp atomically.
 
-THE SYSTEM SHALL retain a lossless ordered history from which both preceding and resulting values are inspectable, without an independently writable duplicate current-state representation.
+THE SYSTEM SHALL retain a lossless ordered history from which both preceding and resulting goal identities/statuses are inspectable, with objective text stored only on the immutable identity row and without an independently writable duplicate current-state representation.
 
 WHEN an accepted action identity is retried with the identical owner, expected version, actors and change payload
 THE SYSTEM SHALL return the original accepted result without appending another change or replacing the original timestamp.
@@ -65,12 +72,14 @@ THE SYSTEM SHALL NOT describe user-API channel provenance as proof of biological
 
 ### REQ-GOAL-005 — Immutable execution observation and stale reports
 
-THE SYSTEM SHALL represent an execution's goal observation as either an explicit no-goal observation at an owner version or a binding to the exact stable owner, goal identity, objective revision and lifecycle/concurrency version.
+THE SYSTEM SHALL represent an execution's goal observation as either an explicit no-goal observation at an owner version or a binding to the exact stable owner, immutable goal identity and observed owner/status version.
 
 THE SYSTEM SHALL retain the execution's workflow/turn identity and immutable observation without replacing it from a later current-goal lookup.
 
 WHEN a report requests a state change
-THE SYSTEM SHALL require an identical persisted goal-bearing execution binding, matching report source execution and matching current goal/objective/lifecycle fence.
+THE SYSTEM SHALL require an identical persisted goal-bearing execution binding, matching report source execution and matching current goal identity and owner/status version.
+
+THE SYSTEM SHALL reject an old report after supersession even when the replacement has the same objective text.
 
 THE SYSTEM SHALL reject stale, cross-owner, unrelated-execution, unbound and conflicting-binding reports without applying their state changes.
 
@@ -81,12 +90,22 @@ THE SYSTEM SHALL NOT convert that observation into a later goal-bearing binding.
 
 The storage primitive's ability to insert an immutable observation does not establish when the runtime captured it. Actual turn admission owns atomic capture; an absent binding is never proof that a late current-goal attachment is valid.
 
-### REQ-GOAL-006 — Edits do not activate work
+### REQ-GOAL-006 — Immutable objective and explicit status transitions
 
-WHEN an objective is edited
-THE SYSTEM SHALL advance its objective revision and owner version without implicitly changing its disposition.
+THE SYSTEM SHALL reject objective changes under an existing goal identity and SHALL provide no objective-edit mutation.
 
-THE SYSTEM SHALL keep completed goals completed under ordinary objective edits and SHALL provide no implicit reactivation through stale status writes.
+THE SYSTEM SHALL distinguish Underway, Blocked, successful Complete and unfinished Exhausted outcomes.
+
+WHEN a Blocked goal is returned to Underway
+THE SYSTEM SHALL retain that goal's identity and objective and advance the owner/status version.
+
+THE SYSTEM SHALL keep Complete and Exhausted terminal on their original identity and SHALL reject further status mutations or reopening of either outcome.
+
+THE SYSTEM SHALL distinguish creating a new current identity from modifying or reopening the prior identity.
+
+THE SYSTEM SHALL NOT treat goal status, supersession or a replacement's Underway marker as permission to release a protected user Stop, override security or admit execution.
+
+The dormant Suspended representation supports historical fencing and has no status-release operation. Durable runtime Stop enforcement and authorized admission are separate prerequisites; storage alone does not establish them.
 
 THE SYSTEM SHALL NOT infer completion from Idle, final prose, a WorkScope attachment, command dispatch or unrelated successful checks.
 
@@ -100,7 +119,7 @@ THE SYSTEM SHALL preserve recorded goal attribution and execution identities as 
 WHEN the ordinary ProductConversation is hard-deleted through supported aggregate deletion
 THE SYSTEM SHALL remove its goal identities, history, actor rows and execution observations with that owner.
 
-THE SYSTEM SHALL NOT let a cleared goal or a no-goal-only observation pin ordinary conversation deletion.
+THE SYSTEM SHALL NOT let a terminal or superseded goal or a no-goal-only observation pin ordinary conversation deletion.
 
 THE SYSTEM SHALL reject standalone rewriting or deletion of goal history, actors and observations while their owner exists.
 

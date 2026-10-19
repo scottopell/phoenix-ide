@@ -157,29 +157,31 @@ pub struct GoalAttribution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalState {
-    Active,
+    Underway,
     Blocked(GoalText),
     Suspended(GoalText),
     Complete(GoalText),
-    Cleared(GoalText),
+    Exhausted(GoalText),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalDisposition {
+    Underway,
     Blocked(GoalText),
     Suspended(GoalText),
     Complete(GoalText),
-    Cleared(GoalText),
+    Exhausted(GoalText),
 }
 
 impl GoalDisposition {
     #[must_use]
     pub fn state(&self) -> GoalState {
         match self {
+            Self::Underway => GoalState::Underway,
             Self::Blocked(reason) => GoalState::Blocked(reason.clone()),
             Self::Suspended(reason) => GoalState::Suspended(reason.clone()),
             Self::Complete(reason) => GoalState::Complete(reason.clone()),
-            Self::Cleared(reason) => GoalState::Cleared(reason.clone()),
+            Self::Exhausted(reason) => GoalState::Exhausted(reason.clone()),
         }
     }
 }
@@ -189,7 +191,6 @@ pub struct GoalSnapshot {
     pub owner: ProductConversationId,
     pub goal_id: GoalId,
     pub version: GoalVersion,
-    pub objective_revision: GoalVersion,
     pub objective: GoalText,
     pub state: GoalState,
 }
@@ -199,7 +200,6 @@ pub struct GoalFence {
     pub owner: ProductConversationId,
     pub goal_id: GoalId,
     pub version: GoalVersion,
-    pub objective_revision: GoalVersion,
 }
 
 impl GoalSnapshot {
@@ -209,7 +209,6 @@ impl GoalSnapshot {
             owner: self.owner.clone(),
             goal_id: self.goal_id.clone(),
             version: self.version,
-            objective_revision: self.objective_revision,
         }
     }
 }
@@ -230,10 +229,6 @@ pub struct GoalExecutionBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalChange {
     Create {
-        goal_id: GoalId,
-        objective: GoalText,
-    },
-    EditObjective {
         goal_id: GoalId,
         objective: GoalText,
     },
@@ -267,33 +262,28 @@ impl GoalMutation {
             return Err(GoalError::Conflict);
         }
         if let GoalChange::Create { goal_id, objective } = &self.change {
-            if current.is_some_and(|s| !matches!(s.state, GoalState::Cleared(_))) {
+            if current.is_some_and(|s| s.goal_id == *goal_id) {
                 return Err(GoalError::Inapplicable);
             }
             return Ok(GoalSnapshot {
                 owner: self.owner.clone(),
                 goal_id: goal_id.clone(),
                 version: version.next()?,
-                objective_revision: GoalVersion(1),
                 objective: objective.clone(),
-                state: GoalState::Active,
+                state: GoalState::Underway,
             });
         }
         let current = current.ok_or(GoalError::Conflict)?;
-        if matches!(current.state, GoalState::Cleared(_)) {
+        if matches!(
+            current.state,
+            GoalState::Complete(_) | GoalState::Exhausted(_) | GoalState::Suspended(_)
+        ) {
             return Err(GoalError::Inapplicable);
         }
         let mut next = current.clone();
         next.version = version.next()?;
         match &self.change {
             GoalChange::Create { .. } => return Err(GoalError::Inapplicable),
-            GoalChange::EditObjective { goal_id, objective } => {
-                if goal_id != &current.goal_id {
-                    return Err(GoalError::Conflict);
-                }
-                next.objective = objective.clone();
-                next.objective_revision = current.objective_revision.next()?;
-            }
             GoalChange::SetDisposition {
                 goal_id,
                 disposition,
@@ -315,7 +305,7 @@ impl GoalMutation {
                 {
                     return Err(GoalError::Conflict);
                 }
-                if !matches!(current.state, GoalState::Active) {
+                if !matches!(current.state, GoalState::Underway) {
                     return Err(GoalError::Inapplicable);
                 }
                 match &self.attribution.requested_by {
@@ -332,9 +322,8 @@ impl GoalMutation {
                 next.state = disposition.state();
             }
         }
-        // There is intentionally no Active disposition or release action in M1.
-        if matches!(current.state, GoalState::Complete(_))
-            && !matches!(next.state, GoalState::Complete(_) | GoalState::Cleared(_))
+        if matches!(next.state, GoalState::Underway)
+            && !matches!(current.state, GoalState::Blocked(_))
         {
             return Err(GoalError::Inapplicable);
         }

@@ -112,7 +112,7 @@ fn create() -> GoalMutation {
     }
 }
 
-fn edit(snapshot: &GoalSnapshot, actor: GoalActor, id: &str) -> GoalMutation {
+fn replace(snapshot: &GoalSnapshot, actor: GoalActor, id: &str) -> GoalMutation {
     GoalMutation {
         owner: snapshot.owner.clone(),
         expected_version: snapshot.version,
@@ -121,8 +121,8 @@ fn edit(snapshot: &GoalSnapshot, actor: GoalActor, id: &str) -> GoalMutation {
             requested_by: actor,
             applied_by: generated(),
         },
-        change: GoalChange::EditObjective {
-            goal_id: snapshot.goal_id.clone(),
+        change: GoalChange::Create {
+            goal_id: GoalId::parse(id).unwrap(),
             objective: t(id),
         },
     }
@@ -171,17 +171,29 @@ async fn normalized_history_roundtrips_all_actors_and_exact_retries() {
         first
     );
     let second = db
-        .mutate_conversation_goal(&edit(&first.snapshot, agent(false), "owner-edit"), at())
+        .mutate_conversation_goal(
+            &replace(&first.snapshot, agent(false), "owner-replacement"),
+            at(),
+        )
         .await
         .unwrap();
     let third = db
-        .mutate_conversation_goal(&edit(&second.snapshot, agent(true), "global-edit"), at())
+        .mutate_conversation_goal(
+            &replace(&second.snapshot, agent(true), "global-replacement"),
+            at(),
+        )
         .await
         .unwrap();
     let history = db
         .conversation_goal_history(&p("owner"), GoalVersion::INITIAL)
         .await
         .unwrap();
+    assert_eq!(
+        db.mutate_conversation_goal(&request, GoalTimestampUs::parse(101).unwrap())
+            .await
+            .unwrap(),
+        first
+    );
     assert_eq!(history, vec![first, second, third.clone()]);
     assert_eq!(
         db.conversation_goal(&p("owner")).await.unwrap(),
@@ -206,8 +218,8 @@ async fn all_actor_writes_compete_on_observed_version() {
         .await
         .unwrap()
         .snapshot;
-    let ui = edit(&first, user(), "ui-change");
-    let global = edit(&first, agent(true), "global-change");
+    let ui = replace(&first, user(), "ui-change");
+    let global = replace(&first, agent(true), "global-change");
     let (a, b) = tokio::join!(
         db.mutate_conversation_goal(&ui, at()),
         db.mutate_conversation_goal(&global, at())
@@ -275,7 +287,7 @@ async fn wrong_owner_role_and_fabricated_user_channel_roll_back_every_row() {
 }
 
 #[tokio::test]
-async fn admitted_binding_is_immutable_and_late_report_cannot_rebind_to_edit() {
+async fn admitted_binding_is_immutable_and_late_report_cannot_rebind_to_replacement() {
     let (_dir, db) = fixture().await;
     let first = db
         .mutate_conversation_goal(&create(), at())
@@ -285,7 +297,7 @@ async fn admitted_binding_is_immutable_and_late_report_cannot_rebind_to_edit() {
     let captured = binding(&first);
     bind(&db, &captured).await.unwrap();
     let second = db
-        .mutate_conversation_goal(&edit(&first, user(), "new-objective"), at())
+        .mutate_conversation_goal(&replace(&first, user(), "new-objective"), at())
         .await
         .unwrap()
         .snapshot;
@@ -400,11 +412,11 @@ async fn history_and_binding_rows_cannot_be_rewritten_or_deleted() {
         .snapshot;
     bind(&db, &binding(&first)).await.unwrap();
     for sql in [
-        "UPDATE conversation_goal_history SET objective='overwritten'",
+        "UPDATE conversation_goal_ids SET objective='overwritten'",
         "DELETE FROM conversation_goal_history",
         "UPDATE conversation_goal_actors SET kind='generated_host'",
         "DELETE FROM conversation_goal_actors",
-        "UPDATE conversation_goal_bindings SET observed_version=NULL,goal_id=NULL,objective_revision=NULL",
+        "UPDATE conversation_goal_bindings SET observed_version=NULL,goal_id=NULL",
         "DELETE FROM conversation_goal_bindings",
     ] {
         assert!(sqlx::query(sql).execute(db.pool()).await.is_err(), "{sql}");
@@ -486,49 +498,42 @@ async fn failed_history_insert_rolls_back_both_actor_rows() {
 }
 
 #[tokio::test]
-async fn cleared_goal_does_not_allow_id_or_version_aba() {
+async fn superseded_goal_identity_cannot_be_reused_or_bypass_owner_version() {
     let (_dir, db) = fixture().await;
     let first = db
         .mutate_conversation_goal(&create(), at())
         .await
         .unwrap()
         .snapshot;
-    let clear = GoalMutation {
-        owner: first.owner.clone(),
-        expected_version: first.version,
-        action_id: t("clear"),
-        attribution: GoalAttribution {
-            requested_by: user(),
-            applied_by: generated(),
-        },
-        change: GoalChange::SetDisposition {
-            goal_id: first.goal_id.clone(),
-            disposition: GoalDisposition::Cleared(t("unfinished archive")),
-        },
-    };
-    let cleared = db
-        .mutate_conversation_goal(&clear, at())
-        .await
-        .unwrap()
-        .snapshot;
-    let mut reused = create();
-    reused.action_id = t("reuse-id");
-    reused.expected_version = cleared.version;
-    assert!(db.mutate_conversation_goal(&reused, at()).await.is_err());
-    let mut replacement = reused;
-    replacement.action_id = t("replace");
+    let mut replacement = replace(&first, agent(true), "goal-2");
     replacement.change = GoalChange::Create {
         goal_id: GoalId::parse("goal-2").unwrap(),
-        objective: t("new objective"),
+        objective: first.objective.clone(),
     };
     let second = db
         .mutate_conversation_goal(&replacement, at())
         .await
         .unwrap()
         .snapshot;
-    assert_eq!(second.version.get(), 3);
-    assert_eq!(second.objective_revision.get(), 1);
-    let mut stale = edit(&first, agent(true), "late-global-edit");
+    assert_eq!(second.version.get(), 2);
+    assert_ne!(first.goal_id, second.goal_id);
+    let mut reused = create();
+    reused.action_id = t("reuse-id");
+    reused.expected_version = second.version;
+    assert!(db.mutate_conversation_goal(&reused, at()).await.is_err());
+    let mut stale = GoalMutation {
+        owner: first.owner.clone(),
+        expected_version: first.version,
+        action_id: t("late-global-status"),
+        attribution: GoalAttribution {
+            requested_by: agent(true),
+            applied_by: generated(),
+        },
+        change: GoalChange::SetDisposition {
+            goal_id: first.goal_id.clone(),
+            disposition: GoalDisposition::Blocked(t("old blocker")),
+        },
+    };
     assert!(matches!(
         db.mutate_conversation_goal(&stale, at()).await,
         Err(GoalDbError::Domain(GoalError::Conflict))
@@ -538,6 +543,13 @@ async fn cleared_goal_does_not_allow_id_or_version_aba() {
         db.mutate_conversation_goal(&stale, at()).await,
         Err(GoalDbError::Domain(GoalError::Conflict))
     ));
+    let history = db
+        .conversation_goal_history(&p("owner"), GoalVersion::INITIAL)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].snapshot, first);
+    assert_eq!(history[1].snapshot, second);
 }
 
 #[tokio::test]
@@ -545,7 +557,7 @@ async fn timestamp_constraints_reject_text_and_negative_integers() {
     let (_dir, db) = fixture().await;
     db.mutate_conversation_goal(&create(), at()).await.unwrap();
     for timestamp in ["'not-an-integer'", "-1", "1.5"] {
-        let sql = format!("INSERT INTO conversation_goal_history (owner_id,version,goal_id,objective_revision,objective,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,2,'edit',state,reason,'timestamp-test','edit',NULL,requested_actor_id,applied_actor_id,{timestamp} FROM conversation_goal_history WHERE version=1");
+        let sql = format!("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,'blocked','input needed','timestamp-test','state',NULL,requested_actor_id,applied_actor_id,{timestamp} FROM conversation_goal_history WHERE version=1");
         assert!(sqlx::query(&sql).execute(db.pool()).await.is_err());
     }
     assert_eq!(
@@ -575,16 +587,19 @@ async fn raw_report_row_cannot_reference_another_owner_or_wrong_version() {
     };
     bind(&db, &other).await.unwrap();
     for turn in [1, 2] {
-        let sql = format!("INSERT INTO conversation_goal_history (owner_id,version,goal_id,objective_revision,objective,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,objective_revision,objective,'complete','done','raw-report','report',{turn},requested_actor_id,applied_actor_id,10 FROM conversation_goal_history WHERE version=1");
+        let sql = format!("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,2,goal_id,'complete','done','raw-report','report',{turn},requested_actor_id,applied_actor_id,10 FROM conversation_goal_history WHERE version=1");
         // turn=1 also fails: the copied requester is UserApi, not the admitted owning agent.
         assert!(sqlx::query(&sql).execute(db.pool()).await.is_err());
     }
     let second = db
-        .mutate_conversation_goal(&edit(&first, agent(false), "edit-before-report"), at())
+        .mutate_conversation_goal(
+            &replace(&first, agent(false), "replacement-before-report"),
+            at(),
+        )
         .await
         .unwrap()
         .snapshot;
-    let sql = "INSERT INTO conversation_goal_history (owner_id,version,goal_id,objective_revision,objective,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,3,goal_id,objective_revision,objective,'complete','done','raw-late-report','report',1,requested_actor_id,applied_actor_id,10 FROM conversation_goal_history WHERE version=2";
+    let sql = "INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,3,goal_id,'complete','done','raw-late-report','report',1,requested_actor_id,applied_actor_id,10 FROM conversation_goal_history WHERE version=2";
     assert!(sqlx::query(sql).execute(db.pool()).await.is_err());
     assert_eq!(
         db.conversation_goal(&p("owner")).await.unwrap(),
@@ -609,7 +624,7 @@ async fn full_substrate() -> (Database, ProductConversationId) {
 }
 
 #[tokio::test]
-async fn real_migrations_user_goal_clear_and_supported_hard_delete_do_not_pin_aggregate() {
+async fn real_migrations_user_goal_supersession_and_supported_hard_delete_do_not_pin_aggregate() {
     let (db, owner) = full_substrate().await;
     let mut request = create();
     request.owner = owner.clone();
@@ -622,17 +637,11 @@ async fn real_migrations_user_goal_clear_and_supported_hard_delete_do_not_pin_ag
         .await
         .unwrap()
         .snapshot;
-    let clear = GoalMutation {
-        owner: owner.clone(),
-        expected_version: first.version,
-        action_id: t("clear"),
-        attribution: request.attribution,
-        change: GoalChange::SetDisposition {
-            goal_id: first.goal_id,
-            disposition: GoalDisposition::Cleared(t("unfinished")),
-        },
-    };
-    db.mutate_conversation_goal(&clear, at()).await.unwrap();
+    let mut replacement = replace(&first, request.attribution.requested_by, "full-replacement");
+    replacement.owner = owner.clone();
+    db.mutate_conversation_goal(&replacement, at())
+        .await
+        .unwrap();
     db.delete_conversation("full-root").await.unwrap();
     for table in [
         "conversation_goal_ids",
@@ -677,4 +686,275 @@ async fn real_migrations_no_goal_binding_does_not_pin_supported_hard_delete() {
             .await
             .unwrap();
     assert_eq!(count, 0);
+}
+
+fn status(snapshot: &GoalSnapshot, disposition: GoalDisposition, action: &str) -> GoalMutation {
+    GoalMutation {
+        owner: snapshot.owner.clone(),
+        expected_version: snapshot.version,
+        action_id: t(action),
+        attribution: GoalAttribution {
+            requested_by: user(),
+            applied_by: generated(),
+        },
+        change: GoalChange::SetDisposition {
+            goal_id: snapshot.goal_id.clone(),
+            disposition,
+        },
+    }
+}
+
+#[tokio::test]
+async fn blocked_underway_roundtrip_keeps_objective_and_fences_previous_execution() {
+    let (_dir, db) = fixture().await;
+    let first = db
+        .mutate_conversation_goal(&create(), at())
+        .await
+        .unwrap()
+        .snapshot;
+    let captured = binding(&first);
+    bind(&db, &captured).await.unwrap();
+    let blocked_request = status(
+        &first,
+        GoalDisposition::Blocked(t("question awaiting answer")),
+        "blocked",
+    );
+    let blocked = db
+        .mutate_conversation_goal(&blocked_request, at())
+        .await
+        .unwrap();
+    let resumed = db
+        .mutate_conversation_goal(
+            &status(
+                &blocked.snapshot,
+                GoalDisposition::Underway,
+                "known-answer-recovery",
+            ),
+            at(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.snapshot.goal_id, first.goal_id);
+    assert_eq!(resumed.snapshot.objective, first.objective);
+    assert_eq!(resumed.snapshot.version.get(), 3);
+    assert_eq!(resumed.snapshot.state, GoalState::Underway);
+    let mut late = completion(&first, captured);
+    late.expected_version = resumed.snapshot.version;
+    assert!(matches!(
+        db.mutate_conversation_goal(&late, at()).await,
+        Err(GoalDbError::Domain(GoalError::Conflict))
+    ));
+    assert_eq!(
+        db.mutate_conversation_goal(&blocked_request, at())
+            .await
+            .unwrap(),
+        blocked
+    );
+    let history = db
+        .conversation_goal_history(&p("owner"), GoalVersion::INITIAL)
+        .await
+        .unwrap();
+    assert_eq!(history[1], blocked);
+    assert_eq!(history[2], resumed);
+}
+
+#[tokio::test]
+async fn terminal_success_and_exhaustion_roundtrip_cannot_reopen_but_allow_new_identity() {
+    for disposition in [
+        GoalDisposition::Complete(t("prepared")),
+        GoalDisposition::Exhausted(t("limit reached; unfinished")),
+    ] {
+        let (_dir, db) = fixture().await;
+        let first = db
+            .mutate_conversation_goal(&create(), at())
+            .await
+            .unwrap()
+            .snapshot;
+        let terminal_request = status(&first, disposition.clone(), "close-goal");
+        let terminal = db
+            .mutate_conversation_goal(&terminal_request, at())
+            .await
+            .unwrap();
+        assert_eq!(terminal.snapshot.state, disposition.state());
+        assert_eq!(
+            db.conversation_goal(&p("owner")).await.unwrap(),
+            Some(terminal.snapshot.clone())
+        );
+        for next in [
+            GoalDisposition::Underway,
+            GoalDisposition::Blocked(t("retry")),
+            GoalDisposition::Complete(t("reworded")),
+            GoalDisposition::Exhausted(t("reworded")),
+        ] {
+            assert!(matches!(
+                db.mutate_conversation_goal(&status(&terminal.snapshot, next, "reopen"), at())
+                    .await,
+                Err(GoalDbError::Domain(GoalError::Inapplicable))
+            ));
+        }
+        let raw_reopen = "INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,requested_actor_id,applied_actor_id,recorded_at_us) SELECT owner_id,3,goal_id,'underway',NULL,'raw-reopen','state',requested_actor_id,applied_actor_id,10 FROM conversation_goal_history WHERE version=2";
+        assert!(sqlx::query(raw_reopen).execute(db.pool()).await.is_err());
+        let replacement = db
+            .mutate_conversation_goal(
+                &replace(&terminal.snapshot, agent(true), "new-deliberate-goal"),
+                at(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replacement.snapshot.version.get(), 3);
+        assert_ne!(replacement.snapshot.goal_id, terminal.snapshot.goal_id);
+        assert_eq!(
+            db.mutate_conversation_goal(&terminal_request, GoalTimestampUs::parse(99).unwrap())
+                .await
+                .unwrap(),
+            terminal
+        );
+        assert_eq!(
+            db.conversation_goal_history(&p("owner"), GoalVersion::INITIAL)
+                .await
+                .unwrap()[1],
+            terminal
+        );
+    }
+}
+
+#[tokio::test]
+async fn immutable_objective_is_not_overwritten_by_create_reuse_or_raw_updates() {
+    let (_dir, db) = fixture().await;
+    let first = db
+        .mutate_conversation_goal(&create(), at())
+        .await
+        .unwrap()
+        .snapshot;
+    let mut reuse = create();
+    reuse.action_id = t("replace-text-under-same-id");
+    reuse.expected_version = first.version;
+    reuse.change = GoalChange::Create {
+        goal_id: first.goal_id.clone(),
+        objective: t("different objective"),
+    };
+    assert!(matches!(
+        db.mutate_conversation_goal(&reuse, at()).await,
+        Err(GoalDbError::Domain(GoalError::Inapplicable))
+    ));
+    assert!(sqlx::query(
+        "UPDATE conversation_goal_ids SET objective='different objective' WHERE goal_id=?"
+    )
+    .bind(first.goal_id.as_str())
+    .execute(db.pool())
+    .await
+    .is_err());
+    let objective: String =
+        sqlx::query_scalar("SELECT objective FROM conversation_goal_ids WHERE goal_id=?")
+            .bind(first.goal_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(objective, first.objective.as_str());
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('conversation_goal_history')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert!(!columns
+        .iter()
+        .any(|column| column == "objective" || column == "objective_revision"));
+    assert_eq!(
+        db.conversation_goal(&p("owner")).await.unwrap(),
+        Some(first)
+    );
+}
+
+#[tokio::test]
+async fn suspended_representation_rejects_fresh_report_or_status_release_without_claiming_stop_enforcement(
+) {
+    let (_dir, db) = fixture().await;
+    let first = db
+        .mutate_conversation_goal(&create(), at())
+        .await
+        .unwrap()
+        .snapshot;
+    let suspended = db
+        .mutate_conversation_goal(
+            &status(
+                &first,
+                GoalDisposition::Suspended(t("recorded Stop")),
+                "suspend",
+            ),
+            at(),
+        )
+        .await
+        .unwrap()
+        .snapshot;
+    assert!(matches!(
+        db.mutate_conversation_goal(
+            &status(&suspended, GoalDisposition::Underway, "release"),
+            at()
+        )
+        .await,
+        Err(GoalDbError::Domain(GoalError::Inapplicable))
+    ));
+    let fabricated = binding(&suspended);
+    assert!(bind(&db, &fabricated).await.is_err());
+    assert!(matches!(
+        db.mutate_conversation_goal(&completion(&suspended, fabricated), at())
+            .await,
+        Err(GoalDbError::Domain(GoalError::Inapplicable))
+    ));
+    assert_eq!(
+        db.conversation_goal(&p("owner")).await.unwrap(),
+        Some(suspended)
+    );
+    // Replacing a goal is not a runtime Stop-release capability; M3 must enforce the real Stop fence.
+}
+
+#[tokio::test]
+async fn real_migrations_terminal_and_superseded_goals_do_not_pin_supported_hard_delete() {
+    for disposition in [
+        GoalDisposition::Complete(t("prepared")),
+        GoalDisposition::Exhausted(t("unfinished limit")),
+    ] {
+        let (db, owner) = full_substrate().await;
+        let mut request = create();
+        request.owner = owner.clone();
+        request.attribution.requested_by = GoalActor::UserApi {
+            transcript_id: t("full-root"),
+            message_id: t("full-input"),
+        };
+        let first = db
+            .mutate_conversation_goal(&request, at())
+            .await
+            .unwrap()
+            .snapshot;
+        let mut close = status(&first, disposition, "terminal");
+        close.attribution = request.attribution.clone();
+        let terminal = db
+            .mutate_conversation_goal(&close, at())
+            .await
+            .unwrap()
+            .snapshot;
+        let replacement = replace(
+            &terminal,
+            request.attribution.requested_by,
+            "full-terminal-replacement",
+        );
+        db.mutate_conversation_goal(&replacement, at())
+            .await
+            .unwrap();
+        db.delete_conversation("full-root").await.unwrap();
+        for table in [
+            "conversation_goal_ids",
+            "conversation_goal_history",
+            "conversation_goal_actors",
+            "conversation_goal_bindings",
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE owner_id=?"))
+                    .bind(owner.as_str())
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+    }
 }

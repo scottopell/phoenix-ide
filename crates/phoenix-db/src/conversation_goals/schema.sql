@@ -1,5 +1,6 @@
 CREATE TABLE conversation_goal_ids (
     goal_id TEXT PRIMARY KEY CHECK (trim(goal_id) <> ''),
+    objective TEXT NOT NULL CHECK (trim(objective) <> ''),
     owner_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     UNIQUE (goal_id, owner_id)
 );
@@ -55,24 +56,22 @@ CREATE TABLE conversation_goal_history (
     owner_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     version INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version > 0),
     goal_id TEXT NOT NULL,
-    objective_revision INTEGER NOT NULL CHECK (typeof(objective_revision) = 'integer' AND objective_revision > 0),
-    objective TEXT NOT NULL CHECK (trim(objective) <> ''),
-    state TEXT NOT NULL CHECK (state IN ('active','blocked','suspended','complete','cleared')),
+    state TEXT NOT NULL CHECK (state IN ('underway','blocked','suspended','complete','exhausted')),
     reason TEXT,
     action_id TEXT NOT NULL CHECK (trim(action_id) <> ''),
-    change_kind TEXT NOT NULL CHECK (change_kind IN ('create','edit','state','report')),
+    change_kind TEXT NOT NULL CHECK (change_kind IN ('create','state','report')),
     report_turn_id INTEGER REFERENCES conversation_goal_bindings(turn_id),
     requested_actor_id INTEGER NOT NULL,
     applied_actor_id INTEGER NOT NULL,
     recorded_at_us INTEGER NOT NULL CHECK (typeof(recorded_at_us) = 'integer' AND recorded_at_us >= 0),
     PRIMARY KEY (owner_id, version),
     UNIQUE (owner_id, action_id),
-    UNIQUE (owner_id, version, goal_id, objective_revision),
+    UNIQUE (owner_id, version, goal_id),
     FOREIGN KEY (goal_id, owner_id) REFERENCES conversation_goal_ids(goal_id, owner_id),
     FOREIGN KEY (requested_actor_id, owner_id) REFERENCES conversation_goal_actors(actor_id, owner_id),
     FOREIGN KEY (applied_actor_id, owner_id) REFERENCES conversation_goal_actors(actor_id, owner_id),
-    CHECK ((state = 'active' AND reason IS NULL)
-        OR (state <> 'active' AND reason IS NOT NULL AND trim(reason) <> '')),
+    CHECK ((state = 'underway' AND reason IS NULL)
+        OR (state <> 'underway' AND reason IS NOT NULL AND trim(reason) <> '')),
     CHECK ((change_kind = 'report' AND report_turn_id IS NOT NULL)
         OR (change_kind <> 'report' AND report_turn_id IS NULL))
 );
@@ -82,18 +81,28 @@ BEFORE INSERT ON conversation_goal_history
 WHEN NEW.version <> COALESCE((SELECT MAX(version) + 1 FROM conversation_goal_history WHERE owner_id = NEW.owner_id), 1)
 BEGIN SELECT RAISE(ABORT, 'goal version must append'); END;
 
+CREATE TRIGGER conversation_goal_history_transition
+BEFORE INSERT ON conversation_goal_history
+WHEN (NEW.change_kind = 'create' AND (
+        NEW.state <> 'underway' OR EXISTS (
+            SELECT 1 FROM conversation_goal_history WHERE goal_id = NEW.goal_id)))
+ OR (NEW.change_kind <> 'create' AND NOT EXISTS (
+        SELECT 1 FROM conversation_goal_history prior
+        WHERE prior.owner_id = NEW.owner_id AND prior.version = NEW.version - 1
+          AND prior.goal_id = NEW.goal_id AND prior.state NOT IN ('complete','exhausted','suspended')
+          AND (NEW.state <> 'underway' OR prior.state = 'blocked')))
+BEGIN SELECT RAISE(ABORT, 'goal status transition or supersession mismatch'); END;
+
 CREATE TABLE conversation_goal_bindings (
     turn_id INTEGER PRIMARY KEY,
     workflow_id INTEGER NOT NULL,
     owner_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     observed_version INTEGER,
     goal_id TEXT,
-    objective_revision INTEGER,
     FOREIGN KEY (owner_id, observed_version) REFERENCES conversation_goal_history(owner_id, version),
-    FOREIGN KEY (owner_id, observed_version, goal_id, objective_revision)
-        REFERENCES conversation_goal_history(owner_id, version, goal_id, objective_revision),
-    CHECK ((goal_id IS NULL AND objective_revision IS NULL)
-        OR (goal_id IS NOT NULL AND objective_revision IS NOT NULL AND observed_version IS NOT NULL))
+    FOREIGN KEY (owner_id, observed_version, goal_id)
+        REFERENCES conversation_goal_history(owner_id, version, goal_id),
+    CHECK (goal_id IS NULL OR observed_version IS NOT NULL)
 );
 
 CREATE TRIGGER conversation_goal_binding_admission
@@ -110,10 +119,10 @@ WHEN NOT EXISTS (
  OR (NEW.goal_id IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM conversation_goal_history WHERE owner_id = NEW.owner_id
     AND version = NEW.observed_version AND goal_id = NEW.goal_id
-    AND objective_revision = NEW.objective_revision AND state = 'active'))
+    AND state = 'underway'))
  OR (NEW.goal_id IS NULL AND EXISTS (
     SELECT 1 FROM conversation_goal_history WHERE owner_id = NEW.owner_id
-    AND version = NEW.observed_version AND state = 'active'))
+    AND version = NEW.observed_version AND state = 'underway'))
 BEGIN SELECT RAISE(ABORT, 'goal binding must match admission observation'); END;
 
 CREATE TRIGGER conversation_goal_report_fence
@@ -123,8 +132,8 @@ WHEN NEW.change_kind = 'report' AND NOT EXISTS (
     JOIN conversation_goal_history admitted ON admitted.owner_id = b.owner_id AND admitted.version = b.observed_version
     JOIN conversation_goal_actors actor ON actor.actor_id = NEW.requested_actor_id
     WHERE b.turn_id = NEW.report_turn_id AND b.owner_id = NEW.owner_id
-      AND b.goal_id = NEW.goal_id AND b.objective_revision = NEW.objective_revision
-      AND b.observed_version = NEW.version - 1 AND admitted.state = 'active'
+      AND b.goal_id = NEW.goal_id
+      AND b.observed_version = NEW.version - 1 AND admitted.state = 'underway'
       AND actor.kind = 'owning_agent' AND actor.owner_id = b.owner_id
       AND actor.turn_id = b.turn_id AND actor.workflow_id = b.workflow_id)
 BEGIN SELECT RAISE(ABORT, 'goal report does not match admitted fence'); END;

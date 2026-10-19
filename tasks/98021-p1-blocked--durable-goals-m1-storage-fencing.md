@@ -1,134 +1,106 @@
-# Durable conversation goals M1 — storage, attribution, and immutable execution fencing
+# Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
-## Implementation handoff — supersedes preparation state
+## Amended source handoff
 
-- Normal approval receipt: `44c2f6c0-28ad-4dc1-9825-ab01e6a0f8c6` at 2026-10-19 15:46:52 UTC, independently verified by the parent. Read-only app projection confirmed active WorkScope `cf401196-6988-470d-b822-6f55bcf1f16e`, `authority_kind=work`, `environment_kind=allocated_worktree`, at this exact allocated cwd. Parent also verified persisted approved-task authority/objective records. No manual approval/API bypass was used.
-- Task approval created local commit `cedb8e938b29e9d0d22088c59e791a954618e0ba` atop source base `69b5d1b7018c62fb8c20fc9080e75b77131bc12b`; branch remains supported detached HEAD.
-- Authored: focused core domain + DB service, staged goal-only SQL, storage requirements/executive, 8 pure domain and 16 DB tests. No runtime/HTTP/tool/UI/watch activation or safety-budget/release/resume policy was added.
-- Two independent read-only source reviewers completed; no implementation subagent was used. Addressed pure inactive-report forgery, SQL report owner/fence correspondence, assistant ToolUse locator consistency, late-stage rollback coverage, and parent review's supported-hard-delete regression. Full-migration user-goal/clear/delete and NoGoal-only-binding/delete tests are authored but not run.
-- Normal parent messages delivered/queued milestone receipts, exact scope/pins and reviewed fixes. The preparation note about messaging unavailability was an initial tool-inventory mistake; normal `send_conversation_message` was subsequently used, with no indirect relay or API bypass.
-- Source-only validation: existing standalone rustfmt 1.95 (not Cargo/compiler) and Git whitespace checks. No local compiler/Cargo/test/SQLite/migration/browser/VM/install/server execution and no hosted CI qualification. Authored tests are **unqualified**.
-- Parent explicitly retained actual atomic turn-admission integration for M3. The capture primitive is crate-private/dormant and cannot prove the caller co-created the turn; it must not be used later to retrofit a missing observation. Exact message/tool-to-execution assignment remains trusted runtime context; typed ToolUse validation is consistency, not authentication. Immutable evidence locators can outlive deleted source rows.
-- Integration blockers: parent-coordinated numeric migration/ADR reservation and resulting registry integration; exact-commit hosted compile/test/check qualification. The schema is deliberately unregistered. Parent has requested no additional source-review agents.
-- Product gates remain open. Parent relayed withdrawal of a restrictive conversation-wide lifetime/shared-budget recommendation; M1 has no such schema or arbitrary renewal/release defaults. Deliberate authorized Global steering is not itself a failure. No replacement policy was chosen.
-- Handoff task state: **blocked** pending coordinated registration/ADR and hosted qualification. Source is authored, not shipped/qualified; do not close on authored test counts. Parent retains integration; no shared-main edits, merge, push, deploy, release or production migration occurred.
+- Follow-up normal task approval was received in this transcript before product edits. Authoritative `conversation_approved_task_objectives` now binds transcript `ae2389e0-6819-406c-b67f-9a88c54406f6` to task 98021 and the exact amended title/brief at `created_at_us=1792426087034237`; the active allocated WorkScope was reverified. Approval created brief commit `f6604cd89afdf93071d482ab0d38593c78e114d6`, **not** a completed feature commit.
+- Source amendment is authored on top of that approval commit, preserving superseded `4a71cba` without rewriting history. Objective-once immutable identity storage, atomic supersession, one owner/status CAS, Complete/Exhausted terminality and Blocked → Underway replace edit/revision/clear-first behavior. Actor, report, exact-retry, rollback and aggregate hard-delete safeguards are retained.
+- Actual authored coverage: **9 core + 21 DB tests; 0 run and 0 qualified**. Earlier 8+16 edit/clear-oriented cases were revised rather than silently discarded. Added terminal/exhaustion, immutable-objective, same-text replacement, blocked recovery, suspended-record fencing and full-schema terminal/supersession/delete cases.
+- Source-only checks: existing standalone rustfmt 1.95, removed-symbol inventory, self-review and Git whitespace checks. No compiler/Cargo/SQLite test/migration/browser/VM/install/server/heavy execution or hosted CI was run; no new reviewer or implementation subagent was used for this amendment.
+- Parent's later M2/M3 source-review findings remain integration obligations, not new M1 code: prepare current goal context without ordinary steering that can bypass Stop; capture report binding at actual admission before generation; coordinate structured answer recovery without a second competing turn or silently changing NoGoal binding. Storage alone is not user Stop/security enforcement. Suspended is only a dormant representation with no status-release operation.
+- Requirements/executive now describe the selected immutable model. Amendment rationale for parent's ADR: removing objective mutation removes revision/reopen machinery; new ID plus one monotonic owner version supplies replacement fencing; history preserves factual outcomes rather than inventing supersession success. No ADR number is claimed.
+- Handoff task state is **blocked** pending parent-owned numbered migration/ADR integration and exact-commit hosted qualification. DDL remains unregistered. No public surface/runtime/watch activation, lifecycle/budget/wait framework, merge/push/deploy/release or production migration. Parent retains integration.
 
-## Commission and boundary
+## Approval boundary and historical source
 
-Implement only the dormant domain/persistence foundation for goals on stable ordinary ProductConversations. Parent integrator: `@conv:b477b7e7-0e64-4c4f-bba1-d0b101df98e9`; design conversation: `f9c038d2-9112-47f6-b08a-4e533ea4c77d`.
+This is a scope amendment to existing task **98021**, not a new task identity or an approval bypass. The parent integrator `@conv:b477b7e7-0e64-4c4f-bba1-d0b101df98e9` accepted the minimal technical delta and instructed submission through the normal task approval flow. The amended brief was subsequently approved through the normal gate; the source handoff above records approval evidence, actual coverage and remaining blockers.
 
-The current user commissions bounded M1 and requires normal task approval before implementation. Referenced primary commission: `@transcript:8521dc04-bdf5-49c5-a61e-526fdc9431db#message-8521dc04-bdf5-49c5-a61e-526fdc9431db:f18ff8eb-e5e7-4601-b378-871e34a750d8`, quoted by the user: “Do this, and pass through adversarial reviewers with goal of finding pit of success failures or design ambiguities. Surface the most interesting 4 open findings to me for my input.” The transcript reader did not resolve this historical reference during preparation; do not claim independent verification. The present user instruction supplies the operative M1 scope.
+The primary user simplified the design, relayed by Global and confirmed by the parent: the objective is immutable per goal identity; a new objective creates a new goal that atomically supersedes the prior current goal. Complete and limit reached close the goal with distinct outcomes. Blocked can return to Underway on the same identity. Removing objective edit/revision machinery is intentional, not missing compatibility.
 
-Historical design evidence: `/Users/scottopell/.phoenix-ide/coordinator/goal-design/durable-goals/design.md`. Its latest prefix supersedes older proposals; the present user instruction supersedes conflicting historical details. Historical notes are not normative source specifications.
+Superseded source is preserved at `4a71cba3976a2c3f1f02c1e1ef6931e27887907c` (parent `cedb8e938b29e9d0d22088c59e791a954618e0ba`, original base `69b5d1b7018c62fb8c20fc9080e75b77131bc12b`). Its mutable-objective implementation and specifications are **historical, unqualified, unregistered, and not the selected design**. Amend with subsequent commits; do not rewrite that history or register/publish the stale schema.
 
-Parent follow-up confirms provisioning published `ae2389e0-6819-406c-b67f-9a88c54406f6` and source pin unchanged. Read parent packet `/Users/scottopell/.phoenix-ide/coordinator/goal-design/durable-goals/implementation-review.md`: it attributes direct recovery of the original commission to the parent, records three independent read-only reviews, and confirms M1 only. Do not treat its recommendations for the four open questions as accepted policy. Parent owns migration/ADR reservation coordination: report intended goal/state/history/binding schema and request the coordinated reservation; do not allocate shared migration/ADR numbers independently. If registration requires a reservation, wait for the parent before that step.
+Latest historical design prefix: `/Users/scottopell/.phoenix-ide/coordinator/goal-design/durable-goals/design.md`, headed “PRIMARY USER SIMPLIFICATION”. The prefix supersedes older notes, including the prior four-question packet and abstract healthy-wait concern. No new product clarification is required for this bounded amendment.
 
-## Exact preparation state and environment
+## Supported environment and execution limits
 
-- Task state: **ready; awaiting approval**. No source implementation, test execution, compiler run, or migration application has occurred.
-- Supported allocated checkout/cwd: `/Users/scottopell/dev/phoenix-ide/.phoenix/worktrees/a52c58d8-3dcb-42c5-82fe-585e6126dcb0`.
-- Source pin: `69b5d1b7018c62fb8c20fc9080e75b77131bc12b`; clean detached HEAD before this proposal draft. This is not shared main. A persisted WorkScope ID was not exposed by the available tools; do not invent one.
-- On approval, verify the actual supported WorkScope, cwd, writable branch and source pin again. Work only there; stop and report if approval routes to an unsupported/shared scope. Do not reset or move another owner's branch.
-- Read current checkout AGENTS guidance, VISION, compatibility requirements, stable ProductConversation Allium/domain boundaries, and trusted-input/watch requirements and ADRs during preparation.
-- Roadmap Issue #806 could not be verified: `gh issue view` was blocked by sandbox network policy. Continue from domain authorities and report this evidence gap; do not claim roadmap coordination.
-- Initial preparation did not deliver a separate parent message. This was corrected after approval using normal messaging; see the implementation handoff above for the authoritative reporting state.
+- Allocated cwd: `/Users/scottopell/dev/phoenix-ide/.phoenix/worktrees/a52c58d8-3dcb-42c5-82fe-585e6126dcb0`.
+- Attached WorkScope: `cf401196-6988-470d-b822-6f55bcf1f16e`; ordinary ProductConversation: `a52c58d8-3dcb-42c5-82fe-585e6126dcb0`; execution transcript: `ae2389e0-6819-406c-b67f-9a88c54406f6`.
+- Existing scope was verified through authoritative app records as active/work/allocated_worktree with approved-task authority, not inferred from legacy conversation mode. Original approval receipt `44c2f6c0-28ad-4dc1-9825-ab01e6a0f8c6` approved the older brief; it does not silently approve this delta.
+- Current source pin: `4a71cba3976a2c3f1f02c1e1ef6931e27887907c`, supported detached HEAD; source tree was clean before task-only amendment preparation. Reverify cwd/scope/pin after amended approval.
+- Work only in this supported allocation, never shared main. Preserve a single implementation writer; no implementation subagent or new reviewer agents.
+- No local compiler, Cargo, tests, SQLite execution/migrations, browser, VM, install, servers or heavy work. Existing standalone formatter, source inspection and Git whitespace checks are allowed. Hosted CI is allowed within commission, but do not claim qualification unless an exact-commit run executes successfully.
+- No merge, deployment, release or production migration. Parent owns integration and numbered migration/ADR reservation. **Do not register a migration, allocate an ADR number or edit the shared numeric registries under this amendment.** Keep DDL staged in its goal-specific module/fixture.
 
-## Observed journey and required truth
+## Required durable truth
 
-A user, owning agent, or commissioned Global Coordinator can eventually manage an ordinary conversation's durable goal. A transcript rollover or shared WorkScope must not transfer goal ownership. Goal edits and reports can race: an older execution reporting completion must not overwrite a newer objective, Stop, clear, or lifecycle state. History must preserve who actually requested/applied a change, without treating attribution as authorization or generated host text as user input.
+An ordinary stable conversation owns the current goal and retained history. Objective text belongs to an immutable goal identity, not to a mutable revision. A new goal is created from scratch and atomically becomes current, retaining earlier identities and outcomes. A stale report or management action cannot affect the replacement or undo a later status transition. Global management remains supported through the same internal actor-attributed CAS service; attribution does not confer permission or resource authority.
 
-M1 establishes that durable truth only. It does not make a goal run, admit another turn, enable a tool/API, steer a busy owner, or change watches.
+Goal storage alone does **not** protect user Stop. Replacement is not permission to resume stopped execution. This dormant M1 must neither activate runtime work nor represent a goal write as releasing a protected Stop/security fence. Actual Stop integration and turn admission remain parent-owned M3 work.
 
-## Verified starting seams
+## Approved amendment scope
 
-- `crates/phoenix-core/src/domain/product_conversation.rs`: `ProductConversation` has structurally distinct ordinary and Coordinator variants; goal ownership must be ordinary-only.
-- `specs/bedrock/bedrock.allium`: ProductConversation owns stable aggregate identity; transcripts/execution participants are members, not the durable goal owner.
-- `crates/phoenix-core/src/domain/sm_event.rs`: direct-turn identities and attempt authority already distinguish workflow, turn, attempt, generation and process incarnation. Reuse the actual durable execution identity rather than a mutable current/latest transcript lookup.
-- `crates/phoenix-core/src/domain/db_schema.rs`: `InputOrigin` and direct-turn payloads preserve trusted provenance. Channel provenance alone does not prove a biological human; do not invent a principal absent from the trusted boundary.
-- `crates/phoenix-db/src/workflow/direct_turn.rs`, `product_conversation_read.rs`, `ddl.rs`, `migrations.rs`: persistence and execution-binding integration seams to inspect precisely before editing.
-- `specs/global-recall/requirements.md` REQ-GR-014/015 and ADR-070: trusted actor provenance and existing stable-conversation watches have separate authority. M1 must not alter their behavior.
-- `specs/compatibility/requirements.md`: forward migrations only under existing policy; new internal timestamps use checked integer Unix microseconds. No downgrade/rollback/live-database-replacement promise is added.
-- No existing goal domain/storage implementation was found in the inspected core domain and DB source.
+### 1. Delete mutable-objective domain complexity
 
-## Interaction map
+In `crates/phoenix-core/src/domain/conversation_goal.rs`:
 
-Future trusted user/owning-agent/Coordinator boundary → internal goal command with concrete attribution → ordinary ProductConversation-owned transactional state/history → immutable execution-bound snapshot → report fence → applied state change or explicit stale rejection/evidence outcome.
+- Remove `GoalChange::EditObjective`, `objective_revision` from `GoalSnapshot` and `GoalFence`, and every objective-revision increment/reset/check.
+- Keep goal ID, immutable objective, ordinary stable owner and **one monotonically increasing owner/status version**. Versions do not reset when goal identity changes, preventing clear/recreate or replacement ABA.
+- Replace the old create-only-when-absent-or-cleared gate with explicit new-identity create/supersede using an observed owner-version CAS. No clear-first step.
+- Remove `Cleared` and the unrequested clear API from revised M1. Supersession retains history without an archive/reopen mechanism.
+- Represent Underway and Blocked as nonterminal status, with explicit Blocked → Underway on the same goal identity. Keep Complete and Exhausted/limit-reached as distinct terminal outcomes with concise reasons; exhaustion is not success. No status transition or objective mutation reopens a terminal goal. Exact accepted-action retries remain idempotent historical reads.
+- Preserve the existing dormant Suspended marker only where needed for stale-report regression. Do not add a Suspended → Underway/resume action, Stop-release policy, new lifecycle framework or automatic admission. If the marker is simplified away, explicitly leave real durable Stop fencing as an M3 prerequisite; do not claim the storage model solves it.
+- Keep execution identity, explicit Goal/NoGoal admission observation, stale-report CAS and report-only owning-agent state application. No fresh fabricated fence may complete a suspended or otherwise ineligible goal.
 
-M1 implements the middle domain/DB contract and authors its tests. The future callers, automatic admission, prompt/tool surfaces, UI/SSE, cancellation integration, continuation worker behavior and goal-aware watch policy remain disconnected.
+### 2. Store objective once and atomically supersede current identity
 
-## M1 deliverables
+In `crates/phoenix-db/src/conversation_goals/schema.sql`:
 
-### 1. Bounded domain contract
+- Move objective to the immutable goal identity row: goal ID, ordinary owner, objective. Retain nonblank checks and no-update protection.
+- Remove objective and `objective_revision` from history; remove `objective_revision` from bindings, composite keys/foreign keys and admission/report triggers.
+- Keep goal-specific history rows with owner version, goal ID, disposition/reason, exact action, requester/applier and checked integer `_us` timestamp. The indexed latest owner-history row is current state; do not add a second writable current authority or a general event store.
+- A create/supersede transaction inserts the new goal identity and next owner-history row atomically. Earlier identities/history remain inspectable. Supersession is a recorded identity boundary, not a fabricated successful completion or a rewrite of an older terminal outcome.
+- Simplify execution report fencing to stable owner, goal identity, observed owner/status version and exact workflow/turn, or explicit NoGoal. Check both identity and owner version so an old report cannot finish a replacement even when text is identical.
+- Revise status/change-kind checks to match immutable objectives and terminal success/exhaustion. No `edit` kind or clear-first status remains.
+- Preserve ordinary-only ownership, typed actor shape/source consistency, immutable evidence locators, report-owner/fence correspondence, owner-scoped cascades and owner-existence no-delete guards.
+- Keep the schema **unregistered**. No migration/backfill of stale rows is needed or authorized: the older DDL was never registered or applied.
 
-- Add a focused goal domain module using existing ID conventions: goal identity, ordinary stable owner, objective, explicit stored state/reason, objective revision and lifecycle/concurrency version.
-- Support one current goal per ordinary owner with retained completed/cleared history; no mandatory WorkScope or coding artifact schema. Define clearly which field is authoritative and which values are immutable historical snapshots; avoid two writable current-goal authorities.
-- Require observed-version compare-and-set for ALL actor writes, including future Global and UI writes, as well as create/edit/state change/clear and report application. No last-writer-wins or privileged bypass of fencing/history. A stale Active edit cannot resurrect a completed goal; fresh activation is distinct from an ordinary edit, with its unresolved release policy deferred.
-- Objective edits invalidate older report authority; lifecycle changes invalidate older authority even when objective text is unchanged. Clear/recreate cannot revive a former goal's report authority. Exact retry identity must not duplicate accepted history or overwrite a different request.
-- Keep status vocabulary separate from automatic transition/permission policy. Do not encode a complete resume/release/ceiling state machine in M1.
+### 3. Amend dormant DB service without runtime expansion
 
-### 2. Concrete actor attribution, distinct from authority
+In `crates/phoenix-db/src/conversation_goals.rs`:
 
-- Use typed actor variants for user-origin action, owning-agent action, Coordinator action, and generated host activity. Persist the concrete identity available at the trusted boundary, causative input/action, and exact conversation/transcript/turn/tool-call locator where applicable.
-- Preserve requested-by versus applied-by when different. Generated host activity stays generated even when caused by a user or Coordinator; no model-provided actor label can establish authenticated identity.
-- Owning-agent attribution must match the ordinary owner; Coordinator attribution must identify the actual Coordinator and exact originating execution/action, not just an enum string.
-- Reuse existing trusted identity/provenance where sufficient; explicitly represent what the existing boundary can prove. Do not fabricate a human identity or accept actor identity from future untrusted tool arguments.
-- Attribution is audit data, not a deployment/merge/resource grant. M1 exposes no public authorization route and makes no decision about unresolved non-user release authority.
+- Delete edit encode/decode/dispatch and revision fields/binds. Read immutable objective by joining its identity row; never reconstruct a prior action from the latest current objective.
+- Serialize every mutation, including Global and future UI operations, under the same observed owner-version CAS. Create/supersede is one transaction with attribution and history; distinct same-version writers cannot both succeed.
+- Preserve exact action-retry comparison across owner, expected version, concrete actors, goal/status payload and binding. A conflicting action identity is rejected; identical retry returns original timestamp/result without another write, even if the goal is now superseded or terminal.
+- Require status/report mutations to target the current goal identity and expected version. Preserve immutable persisted report-binding equality and cross-owner/source-execution checks. No terminal reactivation or late current-goal lookup.
+- Preserve concrete user-channel, owning-agent, Coordinator and generated-host attribution, requested-by versus applied-by, typed assistant ToolUse consistency and transactional rollback. These are consistency/audit checks, not proof of biological human identity, exact invocation assignment or commission authority. Trusted future runtime adapters must derive actors rather than take labels from model arguments.
+- Keep admission capture crate-private and dormant. Explicitly document that the primitive cannot prove transaction co-creation. Actual M3 admission must atomically persist Goal/NoGoal with turn creation, never retrofit a new current goal onto an older unbound turn.
+- Retain bounded history reads and supported hard-delete compatibility. Historical source locators may outlive their source rows without claiming those sources remain live.
 
-### 3. Normalized, atomic DB storage/history
+### 4. Revise tests; preserve regression obligations
 
-- Add a focused DB module and forward schema migration/registration through existing conventions, with ordinary-only ownership enforced by the persisted shape and database constraints, not a caller comment alone.
-- Normalize goal state, mutation history, and execution bindings into appropriate relational rows/columns. Collections are child rows, not JSON arrays. Use explicit ordering/identities and foreign keys/checks/uniqueness for owner membership, versions and history consistency.
-- Store previous/new values or an equally lossless immutable mutation representation, exact actor/cause, and integer `_us` timestamps. Current state plus history updates commit atomically; failed/conflicting writes leave neither partial state nor a misleading accepted-history record.
-- Concurrent edits using the same expected version yield one success and an explicit conflict for the other; creation/replacement/clear have equivalent fences. Bounded reads return current state and ordered history without reconstructing ownership from mutable transcript selection.
-- Preserve existing conversation/message identities and no-goal behavior. Author migration tests on disposable fixtures only; never open or migrate a production database.
+Amend existing files, do not silently delete regression coverage:
 
-### 4. Immutable report execution binding
+- Core edit/revision tests become immutable-objective/direct-supersession tests. Cover new ID/current identity and retained history; monotonically increasing owner versions; same-text new ID not confused with retry; no reuse/mutation of an old identity; old reports rejected after replacement.
+- Replace completed-edit behavior with Complete and Exhausted terminality and explicit distinct reasons. Add Blocked → Underway same-ID test; no Suspended/terminal reopen or implied Stop release. Counter-overflow coverage uses status/supersession, not objective edits.
+- DB actor roundtrip and competing-writer tests use status changes or two new-goal candidates as appropriate. A UI/Global race at one observed owner version has one winner; exact accepted retry remains stable after supersession.
+- Replace `admitted_binding_is_immutable_and_late_report_cannot_rebind_to_edit` with replacement fencing; replace clear/recreate ABA coverage with direct supersession ABA. Remove revision assertions/SQL columns from raw-report, timestamp and immutability tests.
+- Preserve actor requester/applier spoof-consistency cases, both-actor and final-history rollback, NoGoal binding immutability, cross-owner/execution rejection, restart retry, ordinary-only ownership and source-locator consistency.
+- Preserve full-migration supported hard-delete tests: user-attributed goal then supersession then delete, and NoGoal-only binding then delete. A completed/exhausted/superseded identity must not pin aggregate deletion. Do not claim isolated fixture checks prove the real deletion order.
+- All authored tests remain **unexecuted/unqualified** unless named hosted CI provides evidence at an exact commit. The old source has 8 core + 16 DB tests authored and zero executed; report revised actual counts rather than assume they stay unchanged.
 
-- Define and persist the immutable tuple that a report is about: ordinary stable owner, goal ID, objective revision, lifecycle/concurrency version, and actual admitted execution/turn identity (plus concrete report source identity as needed).
-- Capture that tuple once at work/turn admission, never at late report/tool execution; no implementation may look up “the current goal” when a report arrives and silently attach a newer revision/version. M1 authors dormant admission-binding operations and tests without wiring live callers or automatic execution.
-- DB/domain contracts reject cross-owner, unrelated-execution, stale-goal/revision/version and mutable-rebinding attempts. A retry of the identical binding is idempotent; a conflicting binding for that execution is not silently replaced. A late report may remain factual evidence but cannot change current lifecycle state.
-- Do not infer success from Idle, final prose, a WorkScope attachment, a command dispatch, or an unrelated check. Completion is an auditable report under the captured authority, not a generic mandatory proof form.
-- If existing durable execution identity cannot express the binding safely without broad runtime work, report that concrete boundary to the parent; do not widen M1 unilaterally.
+### 5. Specifications and evidence-backed handoff
 
-### 5. Tests authored, source review and handoff
+- Amend `specs/conversation-goals/requirements.md` to immutable identity/supersession, single owner-version fencing and terminal Complete/Exhausted outcomes. Remove objective revisions, editing and unrequested clear behavior. Preserve requirement traceability; do not treat obsolete local text as current user authority.
+- Update `specs/conversation-goals/executive.md` with selected immutable contract, dormant/unregistered state, source-only verification and exact admission/Stop limitations. Remove the withdrawn four-question agenda and abstract healthy-wait feature concern; ordinary Bash same-handle behavior is unchanged.
+- Record significant amendment rationale for the parent to incorporate into its coordinated ADR, without claiming a numeric reservation or editing the registry.
+- Use subsequent local commits, preserve `4a71cba` as superseded historical evidence, and update task status honestly. If registration/qualification remain gated, hand off as blocked rather than done.
+- Send parent exact approval receipt/state, WorkScope/cwd/pin, source milestones, changed symbols/tests, authored versus executed counts, commit IDs and blockers through normal messaging. Delivery acceptance is not proof of parent review or execution.
 
-Author pure domain and disposable SQLite tests covering:
+## Explicit non-goals
 
-1. Ordinary-only ownership, one current goal, completed/cleared history and no WorkScope dependency.
-2. Objective/lifecycle monotonic fences, same-version competing writes, create/clear/recreate ABA prevention, atomic rollback and exact retry behavior.
-3. User, owning-agent, Coordinator and generated-host actor distinctions; concrete locators and requester/applier preservation; cross-owner/spoofed attribution rejection at the defined internal boundary.
-4. Binding retained across transcript/current-owner pointer changes; immutable execution binding; cross-owner, unrelated execution, stale revision/version and conflicting retry rejection; stale evidence cannot apply a lifecycle mutation.
-5. Migration constraints, integer timestamp shape, foreign keys and lossless history round trips; existing no-goal fixtures unaffected.
+No public mutation HTTP API/tool/UI/SSE, automatic turns, runtime wiring, Stop/cancellation/activation implementation, natural-language resume parsing, arbitrary resume permissions, lifetime/shared-budget schema, numeric ceiling or renewal mechanism, waiting/wake/external-operation framework, extra watch subscriptions, profiles788, generic commission/authorization/event framework, new review agents or implementation subagents. Existing Bash waits remain unchanged. No old four-question packet is resurrected.
 
-These are **authored tests, not qualified passing tests** until a named hosted CI run executes them at an exact commit. Do not run local Cargo, compiler, browser, VM, install, servers, migrations or other heavy work. Source-only/light checks and hosted CI are permitted after approval within commission. Preserve exact commands/CI URLs/commit pins and distinguish not-run, failed, and passed evidence.
+## Acceptance and gates
 
-Pass the exact diff to independent read-only adversarial reviewers when available; no additional implementation writer/subagent is authorized. Challenge pit-of-success failures: bypassable CAS/history, mutable report rebinding, forged/ambiguous actor identity, and ordinary/Coordinator ownership leakage. Surface substantive ambiguities to the parent rather than guessing. The parent owns overall review/integration and the requested four user findings; do not invent four new questions merely to fill a quota.
+A reviewed source amendment removes edit/revision/clear-first complexity, stores immutable objectives once per identity, atomically supersedes current identity, preserves attributed status history and one owner-version CAS, distinguishes terminal success from exhaustion, permits Blocked → Underway without terminal reopen, and retains exact report and deletion safeguards.
 
-## Source milestones and parent reporting
-
-- **S0 — approval/scope**: report task state, actual WorkScope/cwd/branch/pin and roadmap availability before source work.
-- **S1 — domain contract**: report types, invariants and any blocking identity/policy seam.
-- **S2 — dormant persistence**: report intended schema/history/CAS and immutable execution binding at exact source pin; obtain migration/ADR reservations from the parent before assigning shared numeric identities.
-- **S3 — authored coverage/review**: report authored test names, adversarial findings, source checks and hosted CI if used; label unexecuted tests unqualified.
-- **S4 — bounded handoff**: report changed surfaces, commit pins, remaining blockers and explicit confirmation that no runtime/public activation, merge, deploy, release or production migration occurred. Parent retains integration.
-
-## Locked wider-design constraints to preserve, not activate
-
-Ordinary owns the goal; Global can directly manage within commission; runtime admits local continuation; busy edits persist/steer without a competing turn; user Stop is protected; no boilerplate proof forms; reuse existing goal-aware watches; at most one terminal-only grace; no wake framework, external waits or profiles788.
-
-M1 must leave these future features possible without wiring them up or pretending they are delivered. In particular, stale-report fencing must be capable of preserving a later Stop, but M1 does not change Stop/cancellation behavior.
-
-## Four open product decisions — remain open and unchosen
-
-1. Collective safety-ceiling scope and renewal.
-2. Non-user release/resume authority.
-3. Ambiguity of natural-language resume.
-4. Healthy slow-wait behavior.
-
-Do not pick defaults, schemas requiring a particular policy, automatic replenishment, permission flags or generic escape hatches that silently settle these decisions. Omit allowance/grace/resume/no-progress machinery from M1. If a proposed storage primitive requires one of these answers, stop that slice and ask the parent for a decision.
-
-## Explicit non-goals and acceptance gate
-
-No automatic turns, idle hooks, reminders, startup goal admission/recovery workers, budget enforcement, grace execution, goal-aware watch activation, new watch subscriptions, Stop/resume parsing, public mutation HTTP API or tool registration, UI/SSE/codegen changes, external completion/wake system, PR monitor work, profiles788, general authorization framework, merge/deploy/release or production migration. No other implementation writer/subagent. No shared-main writes.
-
-Acceptance is a reviewed dormant M1 source increment with normalized storage, auditable actors, atomic optimistic fencing, immutable execution-bound reports and authored tests, plus an honest validation report. Normative additions are limited to this storage/identity/fencing contract and relevant ADR/executive status; runtime policy remains with the parent. Use source-only spec pre-flight review and mark unavailable validators honestly under the no-heavy-work restriction.
+Acceptance here is **dormant source authored plus honest evidence**, not runtime delivery or qualified passing tests. Normal amendment approval precedes product edits. Numbered schema/ADR integration, real Stop fence, actual atomic admission capture and hosted qualification remain explicit parent-owned gates. Do not merge, deploy, migrate production or publish the superseded mutable design as selected behavior.
