@@ -1,5 +1,18 @@
 # Durable conversation goals M1 — storage, attribution, and immutable execution fencing
 
+## Implementation handoff — supersedes preparation state
+
+- Normal approval receipt: `44c2f6c0-28ad-4dc1-9825-ab01e6a0f8c6` at 2026-10-19 15:46:52 UTC, independently verified by the parent. Read-only app projection confirmed active WorkScope `cf401196-6988-470d-b822-6f55bcf1f16e`, `authority_kind=work`, `environment_kind=allocated_worktree`, at this exact allocated cwd. Parent also verified persisted approved-task authority/objective records. No manual approval/API bypass was used.
+- Task approval created local commit `cedb8e938b29e9d0d22088c59e791a954618e0ba` atop source base `69b5d1b7018c62fb8c20fc9080e75b77131bc12b`; branch remains supported detached HEAD.
+- Authored: focused core domain + DB service, staged goal-only SQL, storage requirements/executive, 8 pure domain and 16 DB tests. No runtime/HTTP/tool/UI/watch activation or safety-budget/release/resume policy was added.
+- Two independent read-only source reviewers completed; no implementation subagent was used. Addressed pure inactive-report forgery, SQL report owner/fence correspondence, assistant ToolUse locator consistency, late-stage rollback coverage, and parent review's supported-hard-delete regression. Full-migration user-goal/clear/delete and NoGoal-only-binding/delete tests are authored but not run.
+- Normal parent messages delivered/queued milestone receipts, exact scope/pins and reviewed fixes. The preparation note about messaging unavailability was an initial tool-inventory mistake; normal `send_conversation_message` was subsequently used, with no indirect relay or API bypass.
+- Source-only validation: existing standalone rustfmt 1.95 (not Cargo/compiler) and Git whitespace checks. No local compiler/Cargo/test/SQLite/migration/browser/VM/install/server execution and no hosted CI qualification. Authored tests are **unqualified**.
+- Parent explicitly retained actual atomic turn-admission integration for M3. The capture primitive is crate-private/dormant and cannot prove the caller co-created the turn; it must not be used later to retrofit a missing observation. Exact message/tool-to-execution assignment remains trusted runtime context; typed ToolUse validation is consistency, not authentication. Immutable evidence locators can outlive deleted source rows.
+- Integration blockers: parent-coordinated numeric migration/ADR reservation and resulting registry integration; exact-commit hosted compile/test/check qualification. The schema is deliberately unregistered. Parent has requested no additional source-review agents.
+- Product gates remain open. Parent relayed withdrawal of a restrictive conversation-wide lifetime/shared-budget recommendation; M1 has no such schema or arbitrary renewal/release defaults. Deliberate authorized Global steering is not itself a failure. No replacement policy was chosen.
+- Handoff task state: **blocked** pending coordinated registration/ADR and hosted qualification. Source is authored, not shipped/qualified; do not close on authored test counts. Parent retains integration; no shared-main edits, merge, push, deploy, release or production migration occurred.
+
 ## Commission and boundary
 
 Implement only the dormant domain/persistence foundation for goals on stable ordinary ProductConversations. Parent integrator: `@conv:b477b7e7-0e64-4c4f-bba1-d0b101df98e9`; design conversation: `f9c038d2-9112-47f6-b08a-4e533ea4c77d`.
@@ -18,7 +31,7 @@ Parent follow-up confirms provisioning published `ae2389e0-6819-406c-b67f-9a88c5
 - On approval, verify the actual supported WorkScope, cwd, writable branch and source pin again. Work only there; stop and report if approval routes to an unsupported/shared scope. Do not reset or move another owner's branch.
 - Read current checkout AGENTS guidance, VISION, compatibility requirements, stable ProductConversation Allium/domain boundaries, and trusted-input/watch requirements and ADRs during preparation.
 - Roadmap Issue #806 could not be verified: `gh issue view` was blocked by sandbox network policy. Continue from domain authorities and report this evidence gap; do not claim roadmap coordination.
-- No parent messaging capability was exposed during preparation. This task and the proposal response are the status report, not proof of delivered cross-conversation input. When normal messaging is available, send the exact state, scope/cwd/pin, milestones and blockers to the parent; never substitute a fake transcript or claim delivery.
+- Initial preparation did not deliver a separate parent message. This was corrected after approval using normal messaging; see the implementation handoff above for the authoritative reporting state.
 
 ## Observed journey and required truth
 

@@ -7,6 +7,7 @@ use phoenix_core::domain::tool_result_identity::{
 };
 
 mod close_foundation;
+pub mod conversation_goals;
 mod coordinator_query;
 mod coordinator_watches;
 mod coordinator_work_scope;

@@ -6,6 +6,7 @@ pub mod active_pr_selection;
 pub mod bash_progress;
 pub mod bash_types;
 pub mod close;
+pub mod conversation_goal;
 pub mod creation_protocol;
 pub mod db_schema;
 pub mod instance_identity;
