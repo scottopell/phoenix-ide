@@ -1,4 +1,4 @@
-# ADR-133: Federated subscriptions carry bounded durable terminal facts
+# ADR-180: Federated subscriptions carry bounded durable terminal facts
 
 - **Status:** Accepted
 - **Date:** 2026-10-12

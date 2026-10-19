@@ -140,7 +140,7 @@ entity FederatedSubscription {
     destination_instance: String
     stable_conversation: String
     last_admitted_event_id: String?
-    state: active | unsubscribed | revoked
+    state: active | unsubscribed | revoked | source_closed
 }
 
 entity FederatedTerminalFact {
@@ -158,6 +158,10 @@ entity FederatedTerminalFact {
 -- current_state_reported(stable_conversation: String) -> Boolean
 -- authenticated_subscription_caller(subscription: FederatedSubscription) -> Boolean
 -- owner_authenticated() -> Boolean
+-- open_ordinary_conversation(stable_conversation: String) -> Boolean
+-- unadmitted_facts_suppressed(subscription: FederatedSubscription) -> Boolean
+-- admitted_facts_retained(subscription: FederatedSubscription) -> Boolean
+-- subscription_tombstone_required(subscription: FederatedSubscription) -> Boolean
 
 rule AdmitFederatedTerminalFact {
     when: TerminalFactReceived(subscription, fact)
@@ -195,6 +199,23 @@ rule UnsubscribeFederatedSubscription {
     ensures: subscription.state = unsubscribed
 }
 
+rule CloseFederatedSubscriptionWithSource {
+    when: SourceConversationClosed(subscription)
+    requires: subscription.state = active
+
+    ensures: subscription.state = source_closed
+    ensures: unadmitted_facts_suppressed(subscription)
+    ensures: admitted_facts_retained(subscription)
+}
+
+rule HardDeleteClosedFederatedSubscriptionSource {
+    when: SourceConversationHardDeleted(subscription)
+    requires: subscription.state = source_closed
+
+    ensures: admitted_facts_retained(subscription)
+    ensures: not subscription_tombstone_required(subscription)
+}
+
 rule ReconcileExpiredFederatedCursor {
     when: SubscriptionCursorOutsideRetention(subscription)
     requires: subscription.state = active
@@ -204,12 +225,18 @@ rule ReconcileExpiredFederatedCursor {
     ensures: current_state_reported(subscription.stable_conversation)
 }
 
+invariant ActiveFederatedSubscriptionsTargetOpenOrdinaryConversations {
+    for subscription in FederatedSubscriptions:
+        subscription.state = active implies
+            open_ordinary_conversation(subscription.stable_conversation)
+}
+
 invariant FederatedSubscriptionFactsAreTerminalOnly {
     for fact in FederatedTerminalFacts:
         fact.outcome in { terminal_completed, terminal_failed, terminal_cancelled }
 }
 
-invariant RevokedOrUnsubscribedSubscriptionsAdmitNoFutureFacts {
+invariant InactiveFederatedSubscriptionsAdmitNoFutureFacts {
     for subscription in FederatedSubscriptions:
         subscription.state != active implies
             no_future_fact_admitted(subscription)

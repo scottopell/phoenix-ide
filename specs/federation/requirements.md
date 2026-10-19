@@ -119,7 +119,7 @@ Existing native URL schemes MAY remain supported locally; federation SHALL NOT r
 
 ### REQ-FED-015: Bounded Conversation Subscriptions
 
-WHEN an authenticated enrolled caller subscribes to a destination stable conversation
+WHEN an authenticated enrolled caller subscribes to an open ordinary destination ProductConversation
 THE SYSTEM SHALL bind the subscription to the authenticated source instance and destination stable ProductConversation identity
 AND SHALL follow that conversation across transcript continuation
 AND SHALL emit only destination-committed terminal completion, failure, and cancellation facts
@@ -135,4 +135,8 @@ THE SYSTEM SHALL report an explicit gap together with the authoritative current 
 
 Unsubscribe or peer revocation SHALL prevent future event delivery
 AND SHALL NOT retract facts already durably accepted by the caller.
+WHEN the destination ProductConversation closes
+THE SYSTEM SHALL end its active subscriptions and suppress facts that the caller has not durably admitted
+AND SHALL retain facts already durably admitted by the caller.
+Subsequent hard deletion SHALL NOT require a retained subscription tombstone or current-state reconstruction guarantee.
 Delivery discovery SHALL reuse existing durable admission and owner-driven wake boundaries rather than add an indefinite broadcast, distributed scheduler, or generic event platform.

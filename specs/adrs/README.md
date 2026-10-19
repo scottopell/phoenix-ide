@@ -176,7 +176,8 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [121](121_web-history-selects-original-boundary-messages.md) | Web history selects original boundary messages without duplicating the default handoff projection | Accepted | REQ-API-030, REQ-CONV-023/026, REQ-COMP-001 |
 | [122](122_pagehide-delivery-uses-collector-and-export-evidence.md) | Departing-document delivery uses collector acceptance and export evidence | Accepted | REQ-CVT-004, REQ-CVT-005, REQ-CVT-006 |
 | [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
-| [133](133_federated-subscriptions-carry-bounded-terminal-facts.md) | Federated subscriptions carry bounded durable terminal facts | Accepted | REQ-FED-015; extends ADR-070 across authenticated peers |
+| [180](180_federated-subscriptions-carry-bounded-terminal-facts.md) | Federated subscriptions carry bounded durable terminal facts | Accepted | REQ-FED-015; extends ADR-070 across authenticated peers |
+| [181](181_federated-subscriptions-end-with-their-source.md) | Federated subscriptions end with their source conversation | Accepted | REQ-FED-015; extends ADR-070/180 |
 
 ## For agents: which decisions bind your task
 
