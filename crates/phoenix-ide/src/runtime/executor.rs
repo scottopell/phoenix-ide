@@ -9093,6 +9093,44 @@ where
         Ok(None)
     }
 
+    async fn persist_pending_goal_terminal(
+        &mut self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<Option<Vec<crate::db::Message>>, String> {
+        let obligation = crate::runtime::traits::terminal_obligation(settlement, None);
+        let checkpoint = phoenix_db::conversation_goals::round::GoalRoundCheckpoint {
+            assistant: checkpoint.assistant,
+            execution: checkpoint.execution,
+            results: checkpoint.results,
+            state: &settlement.state,
+            state_updated_at: settlement.state_updated_at,
+        };
+        let committed = match self
+            .storage
+            .persist_goal_terminal_tool_round(
+                &checkpoint,
+                &obligation,
+                self.pending_provider_replay_update.as_ref(),
+            )
+            .await
+        {
+            TerminalMutationEstablishment::Established { value, .. } => value,
+            TerminalMutationEstablishment::Retired => {
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                return Ok(None);
+            }
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+        };
+        self.pending_provider_replay_update = None;
+        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        Ok(Some(committed.results))
+    }
+
     async fn persist_pending_goal_round(
         &mut self,
         mut assistant: crate::db::Message,
@@ -9148,33 +9186,13 @@ where
                     "pending goal terminal settlement differs from active direct turn".into(),
                 );
             }
-            let obligation = crate::runtime::traits::terminal_obligation(settlement, None);
-            let mut checkpoint = checkpoint;
-            checkpoint.state = &settlement.state;
-            checkpoint.state_updated_at = settlement.state_updated_at;
-            let committed = match self
-                .storage
-                .persist_goal_terminal_tool_round(
-                    &checkpoint,
-                    &obligation,
-                    self.pending_provider_replay_update.as_ref(),
-                )
-                .await
-            {
-                TerminalMutationEstablishment::Established { value, .. } => value,
-                TerminalMutationEstablishment::Retired => {
-                    self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
-                    return Ok(None);
-                }
-                TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
-                TerminalMutationEstablishment::Unclassifiable(error) => {
-                    self.local_terminal_authority = LocalTerminalAuthority::Fatal;
-                    return Err(error);
-                }
+            let Some(messages) = self
+                .persist_pending_goal_terminal(&checkpoint, settlement)
+                .await?
+            else {
+                return Ok(None);
             };
-            self.pending_provider_replay_update = None;
-            self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
-            committed.results
+            messages
         } else {
             let committed = if let Some(proposal) = proposal {
                 self.storage
