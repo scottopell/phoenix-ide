@@ -230,7 +230,7 @@ impl ClassifiedEffect {
                 idempotent,
             } => Self::Authoritative(Box::new(
                 AuthoritativeEffect::PersistAuthoritativeUserMessage {
-                    payload,
+                    payload: *payload,
                     authority,
                     idempotent,
                 },
@@ -14033,8 +14033,8 @@ mod authoritative_user_message_effect_tests {
         ));
     }
 
-    fn payload(message_id: &str) -> PreparedDirectTurnPayload {
-        PreparedDirectTurnPayload::from_parts(
+    fn payload(message_id: &str) -> Box<PreparedDirectTurnPayload> {
+        Box::new(PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
                 origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                 text: "hello".to_string(),
@@ -14053,7 +14053,7 @@ mod authoritative_user_message_effect_tests {
                 user_agent: None,
                 skill_invocation: None,
             },
-        )
+        ))
     }
 
     fn authority() -> DirectTurnAttemptAuthority {
