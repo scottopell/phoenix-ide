@@ -106,6 +106,9 @@ THE SYSTEM SHALL structurally distinguish the Coordinator from ordinary product 
 THE SYSTEM SHALL NOT present the Coordinator as ordinary repository-backed coding work or as a user-created open-work item
 AND SHALL NOT give the Coordinator an ordinary ProductConversation Open/History lifecycle, worker-owned WorkScope attachment, Close control, or Delete control
 
+THE Coordinator's persistent instance-local execution WorkScope SHALL follow `../federation/requirements.md` REQ-FED-011 and REQ-FED-012
+AND SHALL remain distinct from ordinary ProductConversation lifecycle and WorkScope retirement
+
 THE SYSTEM SHALL reject archive and hard-delete operations targeting any member of the Coordinator continuation chain so its transcript and singleton identity remain durable
 
 WHEN a chain lifecycle operation contains a Coordinator conversation
@@ -173,12 +176,18 @@ AND SHALL NOT thereby grant generic filesystem authority or any unrelated write 
 
 THE SYSTEM MAY provide a dedicated cross-conversation message tool to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative input acceptance path
 
+WHEN an authenticated enrolled remote Coordinator sends through the federated message adapter governed by `../federation/requirements.md` REQ-FED-007
+THE destination MAY admit the message to its Coordinator chain through the same authoritative input acceptance path
+AND SHALL preserve the source instance and exact source-call provenance
+AND SHALL continue to reject same-instance Coordinator self-targeting
+
 THE SYSTEM SHALL additionally provide explicit subscription management only to the Global Coordinator as governed by REQ-GR-015
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
-THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
-AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, dedicated conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other dedicated lifecycle mutation tools to the Coordinator
+THE Coordinator's own persistent execution WorkScope MAY provide local file, patch, shell, and browser affordances governed by `../federation/requirements.md` REQ-FED-011 and REQ-FED-012
+
+THE SYSTEM SHALL NOT provide MCP, task approval, project, dedicated conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other dedicated lifecycle mutation tools to the Coordinator
 
 ---
 
@@ -313,7 +322,8 @@ THE SYSTEM SHALL report a queued-as-steering result containing the resolved targ
 IF the target cannot accept the message
 THE SYSTEM SHALL report a rejected result with a stable reason code and explanatory message and SHALL NOT report it as delivered or queued
 
-THE SYSTEM SHALL reject the originating conversation, the Coordinator conversation and every member of its continuation chain as message targets
+THE SYSTEM SHALL reject the originating conversation as a message target
+AND SHALL reject the Coordinator conversation and every member of its continuation chain for same-instance callers and remote callers lacking the authenticated enrolled Coordinator exception in REQ-GR-007
 AND SHALL continue to treat sub-agent conversations as separately ineligible targets under the ordinary acceptance rules rather than by conflating them with Coordinator identity
 
 THE SYSTEM SHALL reject archived, deleted, unavailable, terminal, context-exhausted, awaiting-question, and awaiting-approval targets according to authoritative conversation state

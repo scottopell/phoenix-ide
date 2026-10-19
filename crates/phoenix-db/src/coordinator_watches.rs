@@ -510,6 +510,24 @@ async fn record_watch_event_tx(
     if category == "completed" && context_exhausted {
         return Ok(());
     }
+    let occurred_at_us = Utc::now().timestamp_micros();
+    crate::federation_subscriptions::append_terminal_tx(
+        tx,
+        crate::federation_subscriptions::ClassifiedTerminal {
+            occurrence_kind,
+            occurrence_id,
+            generation: i64::try_from(generation)
+                .map_err(|_| DbError::Serialization("generation overflow".into()))?,
+            transcript_id,
+            outcome: phoenix_core::domain::federation_subscription::TerminalFactOutcome::try_from(
+                category,
+            )
+            .map_err(|error| DbError::Serialization(error.into()))?,
+            context_exhausted,
+            occurred_at_us,
+        },
+    )
+    .await?;
     sqlx::query("INSERT INTO coordinator_watch_events
         (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
@@ -532,7 +550,7 @@ async fn record_watch_event_tx(
         .bind(occurrence_id)
         .bind(i64::try_from(generation).map_err(|_| DbError::Serialization("generation overflow".into()))?)
         .bind(category).bind(if context_exhausted && category == "failed" { Some("context exhausted") } else { reason.or((category == "failed").then_some("turn failed")) })
-        .bind(Utc::now().timestamp_micros())
+        .bind(occurred_at_us)
         .bind(transcript_id).bind(context_exhausted).execute(&mut **tx).await?;
     Ok(())
 }

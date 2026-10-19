@@ -457,12 +457,17 @@ struct SourceToolCall: Codable, Equatable, Sendable {
 enum InputOrigin: Codable, Equatable, Sendable {
     case unknownHistorical
     case userApi
+    case remoteApi(instanceId: UUID)
+    case remoteConversation(
+        instanceId: UUID, productConversationId: String, transcriptId: String, sourceCall: SourceToolCall? = nil)
+    case remoteCoordinator(
+        instanceId: UUID, productConversationId: String, transcriptId: String, sourceCall: SourceToolCall? = nil)
     case internalConversation(productConversationId: String, transcriptId: String, sourceCall: SourceToolCall? = nil)
     case systemGenerated
     case subscriptionEvent(eventId: String)
 
     private enum CodingKeys: String, CodingKey {
-        case kind, product_conversation_id, transcript_id, event_id, source_call
+        case kind, instance_id, product_conversation_id, transcript_id, event_id, source_call
     }
 
     init(from decoder: Decoder) throws {
@@ -470,6 +475,20 @@ enum InputOrigin: Codable, Equatable, Sendable {
         switch try container.decode(String.self, forKey: .kind) {
         case "unknown_historical": self = .unknownHistorical
         case "user_api": self = .userApi
+        case "remote_api":
+            self = .remoteApi(instanceId: try container.decode(UUID.self, forKey: .instance_id))
+        case "remote_conversation":
+            self = .remoteConversation(
+                instanceId: try container.decode(UUID.self, forKey: .instance_id),
+                productConversationId: try container.decode(String.self, forKey: .product_conversation_id),
+                transcriptId: try container.decode(String.self, forKey: .transcript_id),
+                sourceCall: try container.decodeIfPresent(SourceToolCall.self, forKey: .source_call))
+        case "remote_coordinator":
+            self = .remoteCoordinator(
+                instanceId: try container.decode(UUID.self, forKey: .instance_id),
+                productConversationId: try container.decode(String.self, forKey: .product_conversation_id),
+                transcriptId: try container.decode(String.self, forKey: .transcript_id),
+                sourceCall: try container.decodeIfPresent(SourceToolCall.self, forKey: .source_call))
         case "internal_conversation":
             self = .internalConversation(
                 productConversationId: try container.decode(String.self, forKey: .product_conversation_id),
@@ -489,6 +508,21 @@ enum InputOrigin: Codable, Equatable, Sendable {
         switch self {
         case .unknownHistorical: try container.encode("unknown_historical", forKey: .kind)
         case .userApi: try container.encode("user_api", forKey: .kind)
+        case let .remoteApi(instanceId):
+            try container.encode("remote_api", forKey: .kind)
+            try container.encode(instanceId, forKey: .instance_id)
+        case let .remoteConversation(instanceId, productId, transcriptId, sourceCall):
+            try container.encode("remote_conversation", forKey: .kind)
+            try container.encode(instanceId, forKey: .instance_id)
+            try container.encode(productId, forKey: .product_conversation_id)
+            try container.encode(transcriptId, forKey: .transcript_id)
+            try container.encode(sourceCall, forKey: .source_call)
+        case let .remoteCoordinator(instanceId, productId, transcriptId, sourceCall):
+            try container.encode("remote_coordinator", forKey: .kind)
+            try container.encode(instanceId, forKey: .instance_id)
+            try container.encode(productId, forKey: .product_conversation_id)
+            try container.encode(transcriptId, forKey: .transcript_id)
+            try container.encode(sourceCall, forKey: .source_call)
         case let .internalConversation(productId, transcriptId, sourceCall):
             try container.encode("internal_conversation", forKey: .kind)
             try container.encode(productId, forKey: .product_conversation_id)
@@ -503,33 +537,51 @@ enum InputOrigin: Codable, Equatable, Sendable {
 
     func sourceTranscriptURL(serverURL: String) -> URL? {
         guard case let .internalConversation(_, transcriptId, _) = self,
-              let base = URL(string: serverURL),
-              base.scheme == "https" || base.scheme == "http", base.host != nil else { return nil }
+            let base = URL(string: serverURL),
+            base.scheme == "https" || base.scheme == "http", base.host != nil
+        else { return nil }
         return base.appendingPathComponent("c").appendingPathComponent(transcriptId)
     }
 
     func sourceCallURL(serverURL: String) -> URL? {
         guard case let .internalConversation(_, transcriptId, sourceCall) = self,
-              let sourceCall, let base = sourceTranscriptURL(serverURL: serverURL),
-              var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
-        components.queryItems = [URLQueryItem(name: "source_transcript", value: transcriptId), URLQueryItem(name: "source_tool", value: sourceCall.tool_use_id)]
+            let sourceCall, let base = sourceTranscriptURL(serverURL: serverURL),
+            var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.queryItems = [
+            URLQueryItem(name: "source_transcript", value: transcriptId),
+            URLQueryItem(name: "source_tool", value: sourceCall.tool_use_id),
+        ]
         components.fragment = "message-\(sourceCall.message_id)"
         return components.url
     }
 
     var sourceCallUnavailable: Bool {
-        if case .internalConversation(_, _, nil) = self { return true }
-        return false
+        switch self {
+        case .internalConversation(_, _, nil), .remoteConversation(_, _, _, nil), .remoteCoordinator(_, _, _, nil): true
+        default: false
+        }
     }
 
     var isUserApiInput: Bool {
         self == .userApi
     }
 
+    private static func remoteSourceCallLabel(_ sourceCall: SourceToolCall?) -> String {
+        guard let sourceCall else { return "" }
+        return " — source message \(sourceCall.message_id), tool \(sourceCall.tool_use_id)"
+    }
+
     var label: String {
         switch self {
         case .unknownHistorical: "Unknown input"
         case .userApi: "User API"
+        case let .remoteApi(instanceId):
+            "Remote API from @instance:\(instanceId.uuidString.lowercased())"
+        case let .remoteConversation(instanceId, productId, transcriptId, sourceCall):
+            "Remote conversation from @instance:\(instanceId.uuidString.lowercased()) @transcript:\(transcriptId) (conversation ID \(productId))\(Self.remoteSourceCallLabel(sourceCall))"
+        case let .remoteCoordinator(instanceId, productId, transcriptId, sourceCall):
+            "Remote coordinator from @instance:\(instanceId.uuidString.lowercased()) @transcript:\(transcriptId) (conversation ID \(productId))\(Self.remoteSourceCallLabel(sourceCall))"
         case let .internalConversation(productId, transcriptId, _):
             "Conversation from @transcript:\(transcriptId) (conversation ID \(productId))"
         case .systemGenerated: "System input"

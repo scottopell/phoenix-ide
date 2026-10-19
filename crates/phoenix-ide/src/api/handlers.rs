@@ -562,6 +562,32 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
         .route(
+            "/api/federation/subscriptions/notifications",
+            get(super::federation::subscriptions::owner_notifications),
+        )
+        .route(
+            "/api/federation/subscriptions",
+            get(super::federation::subscriptions::owner_list),
+        )
+        .route(
+            "/api/federation/subscriptions/create",
+            post(super::federation::subscriptions::owner_create).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/subscriptions/sync-once",
+            post(super::federation::subscriptions::owner_sync).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/subscriptions/unsubscribe",
+            post(super::federation::subscriptions::owner_unsubscribe).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
             "/api/federation/enrollments",
             post(super::federation::issue_enrollment),
         )
@@ -640,8 +666,53 @@ pub fn create_router(state: AppState) -> Router {
     // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
     let peer_router = Router::new()
         .route(
+            "/api/federation/peer/subscriptions/create",
+            post(super::federation::subscriptions::create).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/replay",
+            post(super::federation::subscriptions::replay).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/authorize",
+            post(super::federation::subscriptions::authorize).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/unsubscribe",
+            post(super::federation::subscriptions::unsubscribe).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/send-conversation-message",
+            post(super::federation::send_conversation_message).layer(DefaultBodyLimit::max(
+                super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
             "/api/federation/peer/query-database",
             post(super::federation::query_database)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/search-conversations",
+            post(super::federation::search_conversations)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/read-conversation",
+            post(super::federation::read_conversation)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/resolve-reference",
+            post(super::federation::resolve_reference)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
         .layer(middleware::from_fn_with_state(
