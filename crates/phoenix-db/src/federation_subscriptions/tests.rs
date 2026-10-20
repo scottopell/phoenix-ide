@@ -483,26 +483,10 @@ async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_
 }
 
 async fn coordinator(db: &Database) -> String {
-    let c = db
-        .create_conversation(
-            "federation-coordinator",
-            "coordinator",
-            "/tmp",
-            true,
-            None,
-            None,
-        )
+    db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
         .await
-        .unwrap();
-    sqlx::query("UPDATE product_conversations SET kind = 'coordinator', ordinary_lifecycle = NULL WHERE id = ?1").bind(c.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
-    sqlx::query(
-        "UPDATE conversations SET runtime_role = 'coordinator', coordinator_head = 1 WHERE id = ?1",
-    )
-    .bind(&c.id)
-    .execute(db.pool())
-    .await
-    .unwrap();
-    c.id
+        .unwrap()
+        .id
 }
 async fn remote_fixture(db: &Database) -> RemoteSubscription {
     let reference = SubscriptionReference {

@@ -1102,7 +1102,7 @@ async fn real_migrations_goal_binding_successful_report_and_hard_delete_remove_a
     }
 }
 
-async fn assert_current_135_schema_and_goal_ledger(reopened: &Database) {
+async fn assert_current_135_schema_and_goal_ledger(reopened: &Database, baseline: &Database) {
     let ledger: Vec<(i64, String)> =
         sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=132 ORDER BY version")
             .fetch_all(reopened.pool())
@@ -1117,7 +1117,6 @@ async fn assert_current_135_schema_and_goal_ledger(reopened: &Database) {
             (135, "local_watch_goal_capture".into()),
         ]
     );
-    let fresh = Database::open_in_memory().await.unwrap();
     let schema =
         "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name";
     let actual: Vec<(String, String, String, String)> = sqlx::query_as(schema)
@@ -1125,22 +1124,18 @@ async fn assert_current_135_schema_and_goal_ledger(reopened: &Database) {
         .await
         .unwrap();
     let expected: Vec<(String, String, String, String)> = sqlx::query_as(schema)
-        .fetch_all(fresh.pool())
+        .fetch_all(baseline.pool())
         .await
         .unwrap();
     assert_eq!(actual, expected);
 }
 
-#[tokio::test]
-async fn prior_schema_131_upgrade_applies_132_through_135_preserves_source_rows_and_is_idempotent()
-{
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("prior-goals.db");
+async fn prior_131_file(path: &std::path::Path) -> Database {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
             SqliteConnectOptions::new()
-                .filename(&path)
+                .filename(path)
                 .create_if_missing(true)
                 .foreign_keys(true),
         )
@@ -1151,6 +1146,28 @@ async fn prior_schema_131_upgrade_applies_132_through_135_preserves_source_rows_
     crate::migrations::run_before_goal_storage_for_test(db.pool())
         .await
         .unwrap();
+    db
+}
+
+async fn reopened_current_from_prior_131(path: &std::path::Path) -> Database {
+    let db = prior_131_file(path).await;
+    db.pool().close().await;
+    let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        crate::migrations::run_pending_migrations(reopened.pool())
+            .await
+            .unwrap(),
+        4
+    );
+    reopened
+}
+
+#[tokio::test]
+async fn prior_schema_131_upgrade_applies_132_through_135_preserves_source_rows_and_is_idempotent()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prior-goals.db");
+    let db = prior_131_file(&path).await;
     let goal_tables_before: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'conversation_goal_%'",
     )
@@ -1184,7 +1201,8 @@ async fn prior_schema_131_upgrade_applies_132_through_135_preserves_source_rows_
             .unwrap(),
         0
     );
-    assert_current_135_schema_and_goal_ledger(&reopened).await;
+    let baseline = reopened_current_from_prior_131(&dir.path().join("baseline-goals.db")).await;
+    assert_current_135_schema_and_goal_ledger(&reopened, &baseline).await;
     let notes: (String, i64, String) = sqlx::query_as(
         "SELECT type,\"notnull\",dflt_value FROM pragma_table_info('federation_peer_connections') WHERE name='notes'",
     ).fetch_one(reopened.pool()).await.unwrap();

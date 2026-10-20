@@ -8,7 +8,7 @@ standalone event; Installed captures only newly inserted eligible subscription
 events. Mandatory Close/federation remain unchanged. These gate amendments are
 source-only; implementation/validation evidence is recorded separately below.
 
-## Bounded local typed-watch source — unexecuted review candidate
+## Bounded local typed-watch source and qualification record
 
 REQ-GOAL-011–014, REQ-GR-015 and REQ-CEVT-006 now define the locked local
 watch increment. ADR-184 records causal ordering/failure ownership; ADR-185
@@ -17,7 +17,9 @@ through terminal, steering, creation, summary and wait helpers, captures only
 newly inserted local subscription events, and adds standalone settled Create/State
 obligations at their admitted write owners. Report checkpoints do not append
 standalone events. Stop, mandatory Close and federation semantics are unchanged.
-This source is **not compiled or executed** and has not passed independent review.
+Initial freezes were uncompiled source-review candidates. Exact-HEAD hosted
+results and remaining gates are recorded below; no complete passing expanded
+qualification or activation is claimed.
 
 ### Privacy correction after independent source review
 
@@ -194,6 +196,47 @@ These source/selector/test corrections are **UNRUN**. Only direct rustfmt on the
 two owned Rust test files, source/hash/byte comparisons and whitespace inspection
 ran locally. No Cargo/compiler/tests/SQL/CI/push or service installation ran;
 parent independent review and explicit next direction remain required.
+
+### Expanded hosted qualification: two fixture roots, not watch regressions
+
+Run `39476004213` at exact `7ed02dab5524825e372f37227edd70d1deb6b40a`
+terminated failed; artifact `12292195187` is retained by the parent. Compile
+(502.6 seconds), codegen (1.2 seconds) and actual generated freshness passed.
+UI passed all 12 checks (243.3 seconds). Owned Clippy roots cleared; aggregate
+13 library/17 test errors are shared and **unwaived**. Expanded focused execution
+ran 233 tests: 231 passed, two failed, 3387 skipped (292.454 seconds). Retained
+selection/log evidence confirms passing local goal-facts, migration-135,
+shared-notification privacy and executor watch-context tests. This is not a
+233-pass result or a new complete qualification floor.
+
+The full-schema prior-131 failure compared a reopened file against a never-reopened
+fresh memory database. The existing base DDL recreates `idx_messages_conversation`
+on open, while historical migration 094 drops it in favor of the unique sequence
+index. Thus the reopened fixture has one extra original-DDL index (536 versus
+535 schema objects), not a watch-schema delta. The correction shares the genuine
+prior-131 bootstrap helper and compares the populated subject against an empty
+file built from the **same 131 prefix, close/reopen, then 132–135 runner sequence**.
+The exact named ledger and full non-null-SQL schema equality remain; no index is
+ignored, normalized, dropped or created by test-only SQL. Memory upgrade tests
+continue comparing with fresh memory schema. Existing source-row preservation,
+exact replay, rollback/idempotence and all migration SQL remain unchanged.
+
+The stable-ID collision fixture failed before exercising the collision because
+its shared Coordinator helper mutated immutable product kind/runtime role. It
+now uses existing `get_or_create_coordinator`, which creates the correct product
+and runtime identity transactionally. No trigger bypass, kind update, protocol,
+remote authorization or collision assertion changes. Only fixture construction
+and the paired schema baseline change in the corrective packet; assertions are
+**UNRUN** after correction, with authorized owned-Rust formatting/whitespace
+inspection only. No local compiler/tests/SQL execution, push or CI ran.
+
+Broad execution again timed out at 1499.612 seconds: partial 4981/5531 run,
+4945 passed, 36 failed, 194 skipped. Neither partial run is a completed broad
+comparison. The standing full-qualification floor remains UI+209 at exact efcc;
+this 7ed run has exact-head UI/freshness and partial focused evidence only.
+Default OFF, services uninstalled, protected target ceiling, old SQL and all
+shared broad/Clippy gates remain unchanged. Parent review and explicit next
+push/qualification direction are required before further execution.
 
 | Contract | Implementation/verification boundary |
 |---|---|

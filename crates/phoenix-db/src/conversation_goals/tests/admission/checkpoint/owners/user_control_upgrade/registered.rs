@@ -35,7 +35,8 @@ async fn assert_registered(db: &Database) {
         .await
         .unwrap();
     assert_eq!(name, MIGRATION_NAME);
-    crate::conversation_goals::tests::assert_current_135_schema_and_goal_ledger(db).await;
+    let fresh = Database::open_in_memory().await.unwrap();
+    crate::conversation_goals::tests::assert_current_135_schema_and_goal_ledger(db, &fresh).await;
     assert_eq!(
         db.goal_control_installation(),
         GoalControlInstallation::Disabled
