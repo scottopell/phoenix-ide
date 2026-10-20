@@ -246,34 +246,46 @@ async fn retained_retry(shape: Shape, replay: Replay, refused: bool) {
         .unwrap();
     let durable = db.get_conversation(&fixture.source).await.unwrap();
     let before = snapshot(&fixture).await;
-    let reserved_floor = runtime.broadcast_tx.current_seq();
-    runtime.pending_provider_replay_update = update;
-    let _product = fixture
-        .runtime
-        .lock_product_message_admission(fixture.target.as_str())
-        .await;
-    let _transcript = fixture
-        .runtime
-        .lock_message_acceptance("management-target")
-        .await;
-    apply(&mut runtime, shape, checkpoint).await.unwrap();
-    assert_eq!(snapshot(&fixture).await, before);
-    assert_eq!(
-        serde_json::to_value(published_messages(&mut receiver)).unwrap(),
-        serde_json::to_value(&first).unwrap()
-    );
-    assert!(runtime.broadcast_tx.current_seq() > reserved_floor);
-    assert_eq!(runtime.state, later);
-    assert_eq!(runtime.state_updated_at, durable.state_updated_at);
-    assert_eq!(*watch_rx.borrow(), later);
-    assert!(runtime.pending_provider_replay_update.is_none());
-    assert!(matches!(
-        runtime.local_terminal_authority,
-        LocalTerminalAuthority::Classified
-    ));
-    assert_eq!(runtime.active_direct_turn.as_deref(), Some(&fixture.active));
-    assert!(client.requests.lock().unwrap().is_empty());
-    assert!(tools.recorded_executions().is_empty());
+    for hold_gates in [false, true] {
+        let product = fixture
+            .runtime
+            .try_lock_product_message_admission(fixture.target.as_str())
+            .await
+            .expect("target product gate is available before retry");
+        let transcript = fixture
+            .runtime
+            .try_lock_message_acceptance("management-target")
+            .await
+            .expect("target transcript gate is available before retry");
+        let _guards = if hold_gates {
+            Some((product, transcript))
+        } else {
+            drop((product, transcript));
+            None
+        };
+        let reserved_floor = runtime.broadcast_tx.current_seq();
+        runtime.pending_provider_replay_update = update.clone();
+        apply(&mut runtime, shape, checkpoint.clone())
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&fixture).await, before);
+        assert_eq!(
+            serde_json::to_value(published_messages(&mut receiver)).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        assert!(runtime.broadcast_tx.current_seq() > reserved_floor);
+        assert_eq!(runtime.state, later);
+        assert_eq!(runtime.state_updated_at, durable.state_updated_at);
+        assert_eq!(*watch_rx.borrow(), later);
+        assert!(runtime.pending_provider_replay_update.is_none());
+        assert!(matches!(
+            runtime.local_terminal_authority,
+            LocalTerminalAuthority::Classified
+        ));
+        assert_eq!(runtime.active_direct_turn.as_deref(), Some(&fixture.active));
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(tools.recorded_executions().is_empty());
+    }
 }
 
 async fn assert_committed(fixture: &Fixture, shape: Shape, refused: bool, messages: &[Message]) {

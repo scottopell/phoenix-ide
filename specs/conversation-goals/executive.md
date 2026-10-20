@@ -1,5 +1,19 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Post282 source coverage refinement — free and held target gates
+
+Parent captured exact282 for run **39375980176** and owns its monitoring and
+artifact. No result is claimed here. The runtime exact-retry matrix now checks
+each of its twelve cases twice: first after proving both target gates available
+and releasing both, then with both held. This specifically closes the earlier
+retained-refusal limitation: retry must not turn a saved refusal into a new
+success when admission becomes possible. Each stage retains the exact saved
+message publications, typed provider data, goal history, proposal, source state,
+turn ownership and watcher assertions. These remain authored, unexecuted tests.
+Negative cases assert **no Message publication**, not total SSE silence; provider
+reads compare **typed private data**, not raw DB encoding. No production source,
+UI, watch routing, autocontinuation, activation or migration registry is changed.
+
 ## Latest actual qualification — exact737 failed before focused execution
 
 Parent-owned run **39374941681**, exact
