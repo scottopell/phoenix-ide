@@ -332,6 +332,8 @@ THE SYSTEM SHALL durably establish its immutable logical identity, exact executi
 
 THE SYSTEM SHALL distinguish an admitted intent from its transport attempts and its completed checkpoint. Reusing an identity with different owner, goal, execution, purpose or canonical intent SHALL fail as an identity conflict. Request usage SHALL be derivable from normalized unique admission records, without an independently writable used counter or goal-wide reset operation. The exact table/key layout is not prescribed.
 
+THE SYSTEM SHALL distinguish the immutable logical intent (its causal slot, purpose and observed binding) from its attempt-local provider prompt projection. Draining accepted input or rebuilding context before a send SHALL preserve the admitted identity and charge while rebuilding the projection from the incorporated input. Prompt bytes SHALL NOT define a new causal slot or authorize dispatch. The actual send grant SHALL serialize with acceptance, claim invalidation and Stop, using non-resetting accepted/incorporated revisions rather than an empty-queue observation alone.
+
 WHEN failure occurs before admission commits
 THE SYSTEM SHALL retain neither a charge nor an admitted request state and SHALL NOT dispatch the provider.
 

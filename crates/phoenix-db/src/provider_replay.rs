@@ -233,7 +233,7 @@ impl Database {
             input,
             state,
             state_updated_at,
-            self.goal_control_installation,
+            self.goal_write_policies(),
         )
         .await?;
         let (state, state_updated_at) = selected_state_tx(

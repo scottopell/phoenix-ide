@@ -16,6 +16,7 @@ type GoalTx<'a> = Transaction<'a, Sqlite>;
 mod admission;
 pub(crate) mod checkpoint;
 pub mod control;
+pub mod execution;
 pub mod management;
 pub mod round;
 pub mod user_commands;
@@ -360,13 +361,13 @@ async fn apply_goal_tx(
     mutation: &GoalMutation,
     expected_transcript: Option<&str>,
     at: GoalTimestampUs,
-    control_installation: control::GoalControlInstallation,
+    policies: execution::GoalWritePolicies,
 ) -> Result<GoalHistoryEntry> {
     if let Some(previous) = retry_tx(tx, mutation).await? {
         return Ok(previous);
     }
     if let (control::GoalControlInstallation::Installed, GoalChange::Report { binding, .. }) =
-        (control_installation, &mutation.change)
+        (policies.control, &mutation.change)
     {
         control::require_current_control_tx(tx, &binding.owner, binding.execution).await?;
     }
@@ -392,6 +393,7 @@ async fn apply_goal_tx(
             .bind(objective.as_str())
             .execute(&mut **tx)
             .await?;
+            execution::capture_created_limit_tx(tx, policies.execution, goal_id).await?;
             ("create", None)
         }
         GoalChange::SetDisposition { .. } => ("state", None),
@@ -578,7 +580,7 @@ impl Database {
             mutation,
             expected_transcript,
             at,
-            self.goal_control_installation,
+            self.goal_write_policies(),
         )
         .await?;
         if !replayed && !matches!(&mutation.change, GoalChange::Report { .. }) {

@@ -203,7 +203,7 @@ pub(crate) async fn finalize_report_tx(
     report: &GoalPendingReport,
     duration_ms: u64,
     at: GoalTimestampUs,
-    control_installation: super::control::GoalControlInstallation,
+    policies: super::execution::GoalWritePolicies,
 ) -> Result<ToolResult> {
     verify_source_tx(tx, assistant, execution, report).await?;
     let result_message_id =
@@ -218,7 +218,7 @@ pub(crate) async fn finalize_report_tx(
         &mutation,
         Some(report.call().transcript_id.as_str()),
         at,
-        control_installation,
+        policies,
     )
     .await;
     let mut result = match outcome {

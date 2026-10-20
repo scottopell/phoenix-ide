@@ -56,7 +56,7 @@ pub(crate) async fn write_round_tx(
     input: ToolRoundWrite<'_>,
     state: &ConvState,
     state_updated_at: DateTime<Utc>,
-    control_installation: super::control::GoalControlInstallation,
+    policies: super::execution::GoalWritePolicies,
 ) -> DbResult<(Vec<Message>, bool)> {
     if conversation_id != assistant.conversation_id {
         return Err(DbError::Serialization(
@@ -81,7 +81,7 @@ pub(crate) async fn write_round_tx(
                 state,
                 state_updated_at,
             },
-            control_installation,
+            policies,
             Some(targets),
         )
         .await
@@ -95,7 +95,7 @@ pub(crate) async fn write_round_tx(
                 state,
                 state_updated_at,
             },
-            control_installation,
+            policies,
         )
         .await
         .map_err(db_error),
@@ -330,15 +330,15 @@ pub(crate) async fn retained_round_tx(
 pub(crate) async fn finalize_round_tx(
     tx: &mut GoalTx<'_>,
     checkpoint: &GoalRoundCheckpoint<'_>,
-    control_installation: super::control::GoalControlInstallation,
+    policies: super::execution::GoalWritePolicies,
 ) -> Result<(Vec<Message>, bool)> {
-    finalize_round_with_management_tx(tx, checkpoint, control_installation, None).await
+    finalize_round_with_management_tx(tx, checkpoint, policies, None).await
 }
 
 async fn finalize_round_with_management_tx(
     tx: &mut GoalTx<'_>,
     checkpoint: &GoalRoundCheckpoint<'_>,
-    control_installation: super::control::GoalControlInstallation,
+    policies: super::execution::GoalWritePolicies,
     targets: Option<&[super::management::GoalManagementTarget]>,
 ) -> Result<(Vec<Message>, bool)> {
     validate_round_shape(checkpoint)?;
@@ -386,7 +386,7 @@ async fn finalize_round_with_management_tx(
                         management,
                         *duration_ms,
                         targets,
-                        control_installation,
+                        policies,
                     )
                     .await?
                 }
@@ -402,7 +402,7 @@ async fn finalize_round_with_management_tx(
                     report,
                     *duration_ms,
                     GoalTimestampUs::parse(checkpoint.state_updated_at.timestamp_micros())?,
-                    control_installation,
+                    policies,
                 )
                 .await?
             }

@@ -1578,6 +1578,7 @@ impl SteeringCapacityTestControl {
 pub struct Database {
     pool: SqlitePool,
     goal_control_installation: conversation_goals::control::GoalControlInstallation,
+    goal_execution_installation: conversation_goals::execution::GoalExecutionInstallation,
     goal_control_runtime: std::sync::Arc<conversation_goals::control::dispatch::GoalControlRuntime>,
     sqlite_workload_collector: SqliteWorkloadCollector,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
@@ -1604,6 +1605,7 @@ impl Clone for Database {
         Self {
             pool: self.pool.clone(),
             goal_control_installation: self.goal_control_installation,
+            goal_execution_installation: self.goal_execution_installation,
             goal_control_runtime: self.goal_control_runtime.clone(),
             sqlite_workload_collector: self.sqlite_workload_collector.clone(),
             path: self.path.clone(),
@@ -1837,6 +1839,8 @@ impl Database {
             pool,
             goal_control_installation:
                 conversation_goals::control::GoalControlInstallation::Disabled,
+            goal_execution_installation:
+                conversation_goals::execution::GoalExecutionInstallation::Disabled,
             goal_control_runtime: std::sync::Arc::default(),
             sqlite_workload_collector,
             path,
@@ -10183,7 +10187,7 @@ impl Database {
             input,
             state,
             state_updated_at,
-            self.goal_control_installation,
+            self.goal_write_policies(),
         )
         .await?;
         if replayed {
@@ -10320,7 +10324,7 @@ impl Database {
             input,
             state,
             state_updated_at,
-            self.goal_control_installation,
+            self.goal_write_policies(),
         )
         .await?;
         let (state, state_updated_at) = conversation_goals::round::selected_state_tx(
@@ -10407,7 +10411,7 @@ impl Database {
             input,
             &obligation.projection.state,
             obligation.projection.state_updated_at,
-            self.goal_control_installation,
+            self.goal_write_policies(),
         )
         .await?;
         if !replayed {

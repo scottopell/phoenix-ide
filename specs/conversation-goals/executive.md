@@ -1,5 +1,36 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Per-goal execution: first source milestone (unqualified)
+
+The parent reserved forward ordinal **136** for the bounded execution cut.
+`per_goal_execution_requests` registers new root-owned limit/admission/checkpoint
+storage; SQL for 132–135 is unchanged. A private `Database` policy defaults to
+Disabled and is preserved by cloning; no production installer, numeric default,
+schema-existence activation or model dispatch has been added. All central Create
+callers now carry both explicit policies, including user commands, management
+rounds, provider replay and Stop settlement. Genuine Create captures its limit in
+the goal-ID/history transaction; exact replay cannot refill or backfill it.
+
+The transactional repository authors exact identity/causal-slot replay before
+capacity, checked integer ordinal allocation, immutable checkpoint evidence and
+live-turn SET NULL detachment. The initial causal slot is independent of claim
+generation: restored claims retain the historical intent and use their current
+claim generation for a new checkpoint. Request phase derives from checkpoint-row
+presence, without an independently writable usage or phase counter. These are
+low-level transaction operations, **not yet joined to runtime request-state or
+response checkpoints**, and confer no send authority.
+
+Authored regressions cover absent-schema Disabled paths, all three attributed
+Create actors, changed-policy replay/new goals, pre-policy ineligibility,
+capacity/cause conflicts, summary charges, cleanup retention/root deletion,
+detached/stale claims, transaction rollback, competing UUIDs and SQL
+replacement/gap/integer bounds. They are **UNRUN**. Direct owned-file rustfmt and
+Git/source inspection are the only local validation permitted. Typed Start,
+materialization, actual queue/Stop send grant and host deciding/yield/exhaustion
+remain implementation work; full broad checks and Clippy remain unwaived. The
+qualified floor is still `fab412e9` / hosted `39482419906`, UI12 + 233/233.
+
+
 ADR-185 refines the locked installation boundary: the existing owner-propagated
 GoalControlInstallation policy defaults Disabled; schema 135 does not install
 a consumer. New local events distinguish disabled capture from legacy absence,

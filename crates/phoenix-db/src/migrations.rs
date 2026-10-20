@@ -694,6 +694,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "local_watch_goal_capture",
         sql: include_str!("coordinator_watches/goal_capture.sql"),
     },
+    Migration {
+        version: 136,
+        name: "per_goal_execution_requests",
+        sql: include_str!("conversation_goals/execution_candidate.sql"),
+    },
 ];
 
 const MIGRATION_134: &str = concat!(
@@ -15031,6 +15036,8 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (136, "per_goal_execution_requests"),
+            (135, "local_watch_goal_capture"),
             (134, "durable_conversation_goal_user_control"),
             (133, "opaque_federation_peer_notes"),
             (132, "durable_conversation_goal_storage"),

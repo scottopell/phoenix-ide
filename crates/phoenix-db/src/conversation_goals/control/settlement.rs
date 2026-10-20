@@ -145,7 +145,7 @@ impl Database {
             input,
             &obligation.projection.state,
             obligation.projection.state_updated_at,
-            self.goal_control_installation,
+            self.goal_write_policies(),
         )
         .await?;
         if !replayed {

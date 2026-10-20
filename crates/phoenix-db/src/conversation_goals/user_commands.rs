@@ -342,7 +342,7 @@ impl Database {
             &mutation,
             Some(expected_transcript),
             at,
-            self.goal_control_installation(),
+            self.goal_write_policies(),
         )
         .await?;
         crate::coordinator_watches::goal_facts::settled_change_tx(

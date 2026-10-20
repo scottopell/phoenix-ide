@@ -103,6 +103,17 @@ Extend the existing logical-request identity concept across normal requests,
 summary requests and restored dispatch. Do not add a second goal-only random
 counter or treat each transport attempt as new work.
 
+The immutable intent is the causal slot, purpose and observed execution/goal
+binding, not a frozen provider prompt. Accepted input may change attempt-local
+context: drain it, rebuild/budget/freeze the projection and revalidate a shared
+send grant without minting another intent or charge. Non-resetting accepted and
+incorporated revisions distinguish a genuinely incorporated queue from an empty
+queue ABA. The first externally acting provider poll is serialized with message
+acceptance, live claim invalidation and Stop. Preserve database-writer-before-
+epoch ordering, release short gates on Pending and retain cancellation through
+the existing dispatch epoch; neither a mutex held for the whole stream nor an
+unguarded reusable send closure implements this boundary.
+
 | Cut | Required durable result and recovery |
 |---|---|
 | Before first request admission commits | No charge or admitted state; no provider dispatch. Retrying planning may establish one intent only under fresh authority. |

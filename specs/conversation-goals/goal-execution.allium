@@ -222,6 +222,9 @@ rule AdmitNewLogicalRequest {
         -- admission and next durable request state atomically. No commit means
         -- no charge and no dispatch. Commit followed by interruption restores the
         -- same identity; a new process UUID is not a new accounting decision.
+        -- Canonical intent identifies the immutable causal slot, purpose and
+        -- observed binding, not attempt-local prompt bytes. Drain/reassembly
+        -- rebuilds the provider projection without changing that intent/charge.
         -- Initial/tool/no-tool/goal-bound-summary/new-successor calls all enter
         -- here. Acceptance of queued input is not automatic follow-through: drain
         -- it first, then re-evaluate its actual request/binding under this contract.
@@ -247,6 +250,9 @@ rule DeferAdmittedDispatchForAcceptedQueue {
         -- input before rechecking dispatch; this rule grants no provider send.
         -- Existing Stop permission is not a queue predicate. Queue observation
         -- and send admission must be revalidated under the actual owning gate.
+        -- Non-resetting accepted/incorporated revisions prevent an empty queue
+        -- ABA from validating stale context. A stale projection is discarded;
+        -- draining and reassembly retain the same admitted logical intent.
 }
 
 rule DispatchOrRetryAdmittedIntent {
@@ -271,6 +277,10 @@ rule DispatchOrRetryAdmittedIntent {
         -- on provider/overload retry; this rule creates no admission row.
         -- Already committed admission does not grant immunity to Stop or scope
         -- revocation. Provider-side exactly-once delivery is not promised.
+        -- The same grant serializes acceptance, live claim invalidation and Stop
+        -- with the first externally acting provider poll. Release short gates on
+        -- Pending; never hold a mutex across the provider stream, acquire the DB
+        -- writer under an epoch poll gate, or return a reusable unguarded send.
 }
 
 rule CheckpointPermittedResponse {

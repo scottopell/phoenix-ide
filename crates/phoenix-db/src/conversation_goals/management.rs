@@ -122,7 +122,7 @@ impl Database {
                     input,
                     checkpoint.state,
                     checkpoint.state_updated_at,
-                    self.goal_control_installation,
+                    self.goal_write_policies(),
                 )
                 .await?;
                 if !replayed {
@@ -299,7 +299,7 @@ pub(super) async fn finalize_tx(
     intent: &GoalPendingManagement,
     duration: u64,
     targets: &[GoalManagementTarget],
-    installation: super::control::GoalControlInstallation,
+    policies: super::execution::GoalWritePolicies,
 ) -> Result<ToolResult> {
     let assistant = checkpoint.assistant;
     let execution = checkpoint.execution;
@@ -320,19 +320,11 @@ pub(super) async fn finalize_tx(
         return Ok(refused_result(intent.source(), duration));
     };
     let mut savepoint = sqlx::Acquire::begin(&mut **tx).await?;
-    match super::apply_goal_tx(
-        &mut savepoint,
-        &mutation,
-        Some(transcript),
-        at,
-        installation,
-    )
-    .await
-    {
+    match super::apply_goal_tx(&mut savepoint, &mutation, Some(transcript), at, policies).await {
         Ok(entry) => {
             crate::coordinator_watches::goal_facts::settled_change_tx(
                 &mut savepoint,
-                installation,
+                policies.control,
                 &entry,
                 transcript,
             )

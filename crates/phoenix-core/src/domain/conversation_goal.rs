@@ -4,6 +4,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::product_conversation::ProductConversationId;
 
+mod execution;
+pub use execution::{
+    GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalRequestLimit, GoalRequestPurpose,
+};
+
 mod pending_management;
 pub use pending_management::{
     GoalCommandDisposition, GoalManagementRequest, GoalPendingManagement,

@@ -7,6 +7,9 @@ mod admission;
 #[path = "tests/control_candidate.rs"]
 mod control_candidate;
 
+#[path = "tests/execution.rs"]
+mod execution;
+
 fn goal_count_sql(table: &str, owner_scoped: bool) -> &'static str {
     let (all, owner) = match table {
         "conversation_goal_ids" => (
