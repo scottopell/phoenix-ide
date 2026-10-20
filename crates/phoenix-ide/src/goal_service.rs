@@ -67,5 +67,8 @@ pub(crate) async fn apply(
     }
 }
 
+#[allow(dead_code, reason = "authenticated Create adapter is not installed")]
+pub(crate) mod user_create;
+
 #[cfg(test)]
 mod tests;

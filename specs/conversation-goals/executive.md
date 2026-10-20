@@ -94,6 +94,46 @@ upgrade qualification remain owed.134 is still unregistered pending actual133.
 Runtime cancellation/linearization qualification, service, public tools/UI/watch
 and automatic continuation remain unfinished.
 
+## Stop ownership boundary and dormant authenticated Create
+
+The permit orders **each synchronous parent-future poll** against a control commit
+on clones of the same Database instance, not just the first poll. An added
+Goal/NoGoal two-poll regression returns Pending before a deferred send, commits
+Stop then Release, and asserts that the second inner poll/send never occurs.
+It does not prove remote quiescence, undo effects already handed to a backend,
+or establish cross-process/cross-Database ordering. Inflight teardown retains the
+existing cancellation semantics, including asynchronous resource reclamation
+(REQ-BED-005/005a), rather than a new strict remote transport contract.
+
+Actual handoffs inspected: Anthropic/OpenAI HTTP streaming awaits reqwest send
+and response consumption inside the guarded completion future; Codex WebSocket
+completion uses the shared backend session/socket. Dropping that completion
+future stops its local polling, not a provider request already transmitted.
+`ToolRegistryExecutor::execute` awaits the selected tool run; MCP adapters pass
+`ToolContext.cancel` through `McpClientManager::call_tool_cancellable_with_schema`
+to its managed actor/transport path. The actor/backend can already own queued
+work when the parent future drops; cancellation remains the existing token and
+transport behavior, not remote rollback. Bash process ownership and reclaiming
+remain with its existing process/handle registry. Unowned delegation through
+`spawn_agents` is refused on the installed goal path. None of this authorizes
+new goal turns or revives an old execution after Release.
+
+Source after exact87 adds a default-disabled authenticated Create service and
+its typed DB primitive. Owner authentication is required before host principal
+derivation; the DTO cannot supply principal, actor or goal identity. Existing
+product-message and transcript-acceptance gates select fresh admission versus
+a retained busy refusal. A single owning transaction revalidates the live
+ordinary owner before receipt access, retains exact refusal/replay evidence,
+and commits the accepted request, canonical goal identity/history and shared
+UserControl attribution together. Accepted objective replay reads canonical
+identity; same-text replacement creates a fresh identity. Create neither inserts
+chat nor clears Stop. Four authored, unexecuted service tests cover attribution,
+held gates and historical retry, exact-input conflict, Stop preservation, actual
+history-insert rollback and auth/default-off boundaries. This is not public
+installation or State/AUQ/tools/UI/watch/automatic-continuation completion.
+The only active qualification run is parent-owned39358832109 at exact87; these
+subsequent source changes are outside that captured head and are unqualified.
+
 ## UserControl candidate source, not installed
 
 REQ-GOAL-004.1 and ADR-183 record the no-chat, command-specific attribution contract;

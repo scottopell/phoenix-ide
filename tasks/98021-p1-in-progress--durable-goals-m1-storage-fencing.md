@@ -34,6 +34,37 @@ actual federation133 integrates; production stays Disabled/emitterNone/route503.
 The full authenticated commands/tools/UI/watch/automatic-continuation feature
 remains commissioned and unfinished; this checkpoint does not close the task.
 
+## Authenticated Create and every-poll regression — next source unit
+
+Parent-owned CI39358832109 has captured exact87b499e963bfc70c1727ac2086db63a484951e87
+and remains the sole qualification run. Subsequent source is outside that run.
+The requested minimal Goal/NoGoal future test returns Pending before a deferred
+send; Stop then Release must leave the old operation revoked with one inner
+poll and zero sends. Executive status limits this to synchronous every-poll
+ordering on a shared Database instance, documents actual provider/tool handoffs,
+and claims neither remote quiescence/rollback nor cross-process ordering.
+
+Dormant authenticated Create now has a typed request/receipt service and an
+owning DB transaction. The host alone derives its principal after authentication;
+DTOs deny actor/auth/goal-identity input. Existing product then transcript gates
+control fresh acceptance; exact historical retries bypass held gates without
+new admission. Owner/open/close eligibility is rechecked before all receipt
+lookup. Accepted canonical identity/history/UserControl attribution and receipt
+co-commit through the candidate's existing deferred cycle; no FK is weakened.
+Version and gate/settlement busy refusals retain their original payload/result.
+Same-text replacement creates a new ID; Create never clears Stop or inserts a
+fake chat message, and does not install automatic execution.
+
+Four source-only service regressions cover real host attribution, replacement,
+exact replay/conflicts with held gates, stable busy/version refusals, unchanged
+Stop/no-chat, actual history-write failure rollback, unavailable-owner replay
+denial, unknown identity/auth fields and default-disabled construction. A frozen
+read-only review of this leaf found no actionable SQL/Rust/source issue; no
+compiler/test/SQL/browser execution occurred locally. State/Blocked recovery,
+Underway AUQ, Global/User/owning-agent command authority, tools/UI/watch and
+automatic continuation remain commissioned and unfinished. Public activation,
+134 registration and any deployment are still prohibited by the existing gates.
+
 ## Qualified bounded foundation checkpoint — actual hosted execution
 
 Exact **ed25a228e092b41d5c112e1c7585aab406944ca3**, CI39320605328/Rust118293499801 focused **70 executed,70 passed,3397 skipped/filtered (39.155s)**; full individual statuses artifact12221238348. Includes registered fresh/upgrade/idempotence/deletion coverage, service/admission/capture and genuine continuation/Steering replay+commit-cut tests. This is not whole PR qualification or report activation. Whole Rust independently red:5213/5377executed,5175pass,38fail,191skip;164notrun afterSIGTERM. Outside-focused failure ownership/root causes require assertions, not names.

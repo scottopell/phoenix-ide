@@ -12,7 +12,7 @@ use phoenix_llm::ModelRegistry;
 
 use super::*;
 
-fn test_runtime_manager(db: Database) -> Arc<RuntimeManager> {
+pub(super) fn test_runtime_manager(db: Database) -> Arc<RuntimeManager> {
     Arc::new(RuntimeManager::new(
         db,
         Arc::new(ModelRegistry::new_empty()),

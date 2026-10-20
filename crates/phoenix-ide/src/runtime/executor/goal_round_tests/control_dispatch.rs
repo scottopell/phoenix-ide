@@ -504,6 +504,42 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
 }
 
 #[tokio::test]
+async fn conversation_goal_stop_release_between_pending_polls_prevents_deferred_external_send() {
+    use std::{future::Future, task::Poll};
+    for with_goal in [false, true] {
+        let (db, owner, active) = fixture(with_goal).await;
+        let permit = db
+            .admit_goal_control_dispatch(
+                CONVERSATION,
+                Some((i64::try_from(active.turn_id.0).unwrap(), active.generation)),
+            )
+            .await
+            .unwrap();
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let sends = std::sync::atomic::AtomicUsize::new(0);
+        let operation = std::future::poll_fn(|_| {
+            if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Poll::Pending
+            } else {
+                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Poll::Ready(())
+            }
+        });
+        let mut operation = Box::pin(permit.run(operation));
+        std::future::poll_fn(|cx| {
+            assert!(operation.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        control(&db, &owner, ControlCommand::Stop, 1).await;
+        control(&db, &owner, ControlCommand::Release, 2).await;
+        assert!(operation.await.is_err());
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn conversation_goal_stop_waiting_for_database_does_not_hold_the_external_poll_gate() {
     use std::{future::Future, task::Poll};
     for with_goal in [false, true] {
