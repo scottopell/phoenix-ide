@@ -1,5 +1,38 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest actual qualification — exact239184/185, cancellation expectation corrected
+
+Parent run **39383636793**, exact
+`239cbbc56aed18d86395f5aac7635d26423fca92`, is **terminal failed**, artifact
+**12247587393**. Focused185executed:184passed,1failed,3393skipped in117.498s.
+All six earlier focused failures passed here, including signed provider replay,
+rollback, source authority, candidate user-state installation and real132+133
+migration tests. This qualifies those specific test results at239, not activation
+or a fully green focused floor.156/156 at e4d remains the last full focused green.
+Broad Rust completed:5492run,5461passed,31failed,191skipped in846.453s; it is not
+the earlier timeout. UI/specs and E2E fully passed. Shared Clippy remains red with
+12lib/15lib-test error summaries in the retained tail; those blockers are unwaived.
+
+The sole focused failure is the new management cancellation test expecting
+`is_error=true`. The actual ToolAborted transition calls
+`build_cancellation_results` with `Cancelled by user`; for `goal_manage` it uses
+`ToolResult::cancelled`, whose typed outcome is `ToolOutcome::Cancelled` and whose
+persisted content is intentionally **non-error**. The distinct goal-report error
+special-case does not apply to management. No production cancellation policy is
+changed. The source correction asserts the exact cancellation outcome/message,
+`is_error=false`, and full equality with the canonical builder's persisted tool
+content, including call ID and images. It retains the one-result count and every
+terminal/no-mutation/no-replay/no-dispatch assertion.
+
+At239 the failed test already established Idle, no active turn, no pending/DB
+private replay, no target mutation and one canonical result before failing. The
+later `Cancelled`/owns_conversation0 SQL assertion and final provider/tool count
+assertions were **not reached**; they remain in place for the next qualification,
+not retrospectively claimed passed. This correction is source-only, with
+standalone formatting/whitespace checks and no local compiler/tests/SQL/browser,
+push, new CI, feature expansion or activation. Eleven stashes and immutable132
+remain intact;134 is unregistered/default-off.
+
 ## Latest actual qualification — exact07 production import failure
 
 Parent run **39382847878**, exact
@@ -100,7 +133,7 @@ checkpoint rollback, and still demand signed second-request wire plus canonical
 result after successful commit. An authored cancellation regression retains private
 replay through the actual UserCancel/CancellingTool transition and supplies the
 ToolAborted completion to the existing terminal checkpoint, asserting one canonical
-error result, cancelled ownership release, no goal mutation and no stranded replay.
+cancellation result, cancelled ownership release, no goal mutation and no stranded replay.
 This is a deterministic event-boundary test, not an OS/tool-task cancellation race
 or restart-recovery proof. Existing terminal/recovery owner coverage remains in
 scope; no new restart-replay policy is claimed.

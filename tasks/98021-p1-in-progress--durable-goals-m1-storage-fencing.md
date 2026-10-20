@@ -1,5 +1,25 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual239 sole focused failure — exact typed non-error cancellation contract
+
+Parent39383636793 exact239 terminalFAIL/artifact12247587393. Focused185executed
+184PASS1FAIL3393skip117.498s. Prior6roots allPASS inclsignedreplay/rollback/source/
+userstate/132+133migrationtests; specificsqualified239notactivation/newfullfloor.
+156ONLYe4d remainsfullgreenfloor. BroadCOMPLETE5492run5461pass31fail191skip846.453s,
+not oldtimeout; UI/specs+E2EFULLPASS; sharedClippy12lib15libtesttailred/unwaived.
+
+Solefailure results[0].is_error expectedtrue but actual ToolAborted builder invokes
+ToolResult::cancelled(id,"Cancelled by user") for goal_manage: typedCancelled is
+NONERROR. Goal-report's specific ECANCELLEDerror path is distinct. Sourceassert
+exacttypedCancelledmessage, persistednonerror/text and FULLToolContent equality
+with canonicalbuilder, not productionpolicychange or blanketassertweakening.
+Allterminal/noMutation/noReplay/dispatch assertions retained. Idle/noactive/
+noPending/noDBprivate/noTargetmutation/oneResult alreadyreached at239; later
+Cancelled/owns0SQL and finalrequest/tool counts NOTreached, notclaimedpassed.
+
+Onlystandaloneformat/diff/sourcechecks;0compiler/testsSQLbrowser/push/newCI/
+featurebreadth/activation.11stashes132immutable134unregistered/defaultoff.
+
 ## Actual07 compile failure — standalone production AssistantMessage import
 
 Parent39382847878 exact07 terminalFAIL/artifact12245899259, ZERO focusedexecuted.
@@ -61,7 +81,7 @@ Provider barriers compare exacttyped signedoutcome; noDBprivate/publicround or
 changedgoal/history beforecheckpoint; samepayload retained afteractualrollback;
 existingcanonicalresult/signedsecondwire assertions unchanged. One added authored
 UserCancel->CancellingTool->suppliedToolAborted terminalcheckpoint regression
-proves retainedreplayuntilsettlement/onecanonicalerror/no goalmutation/Cancelled
+proves retainedreplayuntilsettlement/onecanonicalcancellation/no goalmutation/Cancelled
 turnrelease/no replaystranding when run. Deterministic eventboundary, NOTOS-task
 cancelrace orrestartproof. Existingowner/recoverytests remain qualificationtarget.
 

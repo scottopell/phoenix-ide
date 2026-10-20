@@ -239,7 +239,17 @@ async fn conversation_goal_management_replay_stays_with_cancelled_round_until_te
         })
         .collect();
     assert_eq!(results.len(), 1);
-    assert!(results[0].is_error);
+    let expected = ToolResult::cancelled(
+        management.source().tool_use_id.as_str().into(),
+        "Cancelled by user",
+    );
+    assert!(
+        matches!(expected.outcome, crate::db::ToolOutcome::Cancelled { ref message }
+        if message == "Cancelled by user")
+    );
+    assert!(!results[0].is_error);
+    assert_eq!(results[0].content, "Cancelled by user");
+    assert_eq!(results[0], &expected.persisted_tool_content());
     let ownership: (Option<String>, i64) =
         sqlx::query_as("SELECT terminal_kind,owns_conversation FROM durable_turns WHERE turn_id=?")
             .bind(i64::try_from(fixture.active.turn_id.0).unwrap())
