@@ -138,6 +138,32 @@ the corrected follow-up found no further concrete source failures, not a passing
 compiler or runtime qualification. Captured run39371603386 is at exact`9a3` and
 does not contain this later journey work; its monitoring remains parent-owned.
 
+Run **39371603386** at exact`9a3bf84748403b1607ea381337b48fe29bf45775`
+terminated before focused execution: the materialized-turn fixture imported four
+prepared/submitted payload types from `phoenix_workflow` instead of their actual
+`phoenix_core::domain::sm_event` declarations. The shared extracted fixture now
+uses those declarations. The owned Clippy panic-documentation failure on
+`GoalPendingManagement::mutation` has an explicit `# Panics` section. Both owned
+test barrier waits identified by `rust-test-timing` are bounded by30-second
+outer liveness guards while retaining their Notify evidence. No ignore or lint
+allowance was added. UI TypeScript, ESLint, Stylelint, Vitest and ast-grep passed
+in that run; the UI/spec lane failed only on the two timing findings. Zero new
+focused tests executed, so the focused156-test green floor remains exact`e4d`.
+
+The provider journey's second-request assertion selects the exact user-role
+`tool_result` by call ID and compares its content and non-error flag with the
+persisted canonical result. It also checks ordered signed-thinking/tool-use
+blocks and consistent Opus model identity. Tagged-state tests include a valid
+blocked-to-underway recovery and schema-object representations for all four
+states. These later corrections are source-only, not qualified results.
+
+The parent verified actual PR902 source at
+`83478ea102d5a5e346c32ca4862aeebba1242a27` with schema133
+`opaque_federation_peer_notes`, and exact byte parity of its schema132 with the
+accepted goal schema. That evidence supersedes earlier absence statements;
+the narrow non-destructive133 source integration is separate pending work.
+Schema134 remains unregistered through that integration and qualification gate.
+
 The production service/emitter is absent, public tool registration and UI remain
 unfinished, and watches/autocontinuation are not claimed. Schema132 is untouched;
 134 remains unregistered and activation remains off.

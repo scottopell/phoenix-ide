@@ -767,7 +767,9 @@ async fn conversation_goal_stop_waiting_for_database_does_not_hold_the_external_
                     .run(async move {
                         let tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
                         entered.notify_one();
-                        resume.notified().await;
+                        tokio::time::timeout(Duration::from_secs(30), resume.notified())
+                            .await
+                            .expect("database dispatch test barrier was not resumed");
                         tx.commit().await.unwrap();
                     })
                     .await

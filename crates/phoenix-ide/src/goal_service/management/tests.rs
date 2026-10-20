@@ -615,3 +615,36 @@ async fn assert_target_gates_are_free(fixture: &Fixture) {
             .unwrap(),
     );
 }
+
+#[test]
+fn conversation_goal_management_schema_exposes_tagged_state_objects_not_string_dispositions() {
+    let definition = GoalManagementService::definition();
+    let schema = &definition.input_schema["oneOf"][1]["properties"]["disposition"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(
+        schema["oneOf"][0]["properties"]["state"]["enum"],
+        serde_json::json!(["underway"])
+    );
+    assert_eq!(schema["oneOf"][0]["required"], serde_json::json!(["state"]));
+    assert_eq!(
+        schema["oneOf"][1]["properties"]["state"]["enum"],
+        serde_json::json!(["blocked", "complete", "exhausted"])
+    );
+    assert_eq!(
+        schema["oneOf"][1]["required"],
+        serde_json::json!(["state", "reason"])
+    );
+    for state in ["underway", "blocked", "complete", "exhausted"] {
+        let disposition = if state == "underway" {
+            serde_json::json!({"state":state})
+        } else {
+            serde_json::json!({"state":state,"reason":"verified reason"})
+        };
+        let request = serde_json::json!({"op":"state","owner":"target","expected_version":1,
+            "goal_id":"goal","disposition":disposition});
+        assert!(serde_json::from_value::<GoalManagementRequest>(request).is_ok());
+        let string_request = serde_json::json!({"op":"state","owner":"target","expected_version":1,
+            "goal_id":"goal","disposition":state});
+        assert!(serde_json::from_value::<GoalManagementRequest>(string_request).is_err());
+    }
+}

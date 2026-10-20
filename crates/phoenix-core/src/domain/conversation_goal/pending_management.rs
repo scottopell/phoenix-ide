@@ -91,6 +91,10 @@ impl GoalPendingManagement {
         &self.request
     }
 
+    /// Build the version-checked mutation for this canonical management call.
+    ///
+    /// # Panics
+    /// Panics if the typed source cannot serialize or fixed hash-based identifiers are invalid.
     #[must_use]
     pub fn mutation(&self) -> GoalMutation {
         let identity = format!(

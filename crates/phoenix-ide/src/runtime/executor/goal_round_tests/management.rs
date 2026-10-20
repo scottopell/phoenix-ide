@@ -27,7 +27,7 @@ fn signed_management_response(request: &GoalManagementRequest) -> LlmResponse {
         AnthropicResponseSet::with_public_content(
             AnthropicResponseIdentity {
                 response_id: "management-provider-response".into(),
-                model: "claude-sonnet-4-5".into(),
+                model: "claude-opus-5-5".into(),
             },
             public,
             vec![AnthropicPrivateBlock::Thinking {
@@ -60,7 +60,7 @@ fn provider_runtime(
     let mut context = ConvContext::new(
         fixture.source.clone(),
         fixture.home.path().to_path_buf(),
-        "claude-sonnet-4-5",
+        "claude-opus-5-5",
         200_000,
     );
     context.is_coordinator = true;
@@ -165,31 +165,8 @@ async fn conversation_goal_coordinator_provider_management_commits_only_at_its_c
             .await
             .unwrap();
     assert_eq!(ownership, (Some("Completed".into()), 0));
-    let requests = client.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    for request in requests.iter() {
-        assert_eq!(
-            request
-                .tool_availability
-                .declarations()
-                .iter()
-                .filter(|tool| tool.name == "goal_manage")
-                .count(),
-            1
-        );
-        assert!(!request
-            .tool_availability
-            .declarations()
-            .iter()
-            .any(|tool| tool.name == "goal_report"));
-    }
-    let wires = client.wires.lock().unwrap();
-    let delivered = &wires[1];
-    assert!(delivered.to_string().contains("provider-management-call"));
-    assert!(delivered.to_string().contains("journey-opaque-signature"));
-    assert!(delivered
-        .to_string()
-        .contains("Canonical Coordinator provider objective"));
+    assert_provider_declarations(&client);
+    assert_canonical_delivery(&fixture, &client, &call).await;
     assert!(tools.recorded_executions().is_empty());
 }
 
@@ -449,13 +426,18 @@ async fn conversation_goal_coordinator_provider_state_commands_use_the_tagged_di
 {
     use phoenix_core::domain::conversation_goal::{GoalCommandDisposition, GoalDisposition};
     for disposition in [
+        GoalCommandDisposition::Underway,
         GoalCommandDisposition::Blocked(GoalText::parse("blocked by dependency").unwrap()),
         GoalCommandDisposition::Complete(GoalText::parse("verified complete").unwrap()),
         GoalCommandDisposition::Exhausted(GoalText::parse("budget exhausted").unwrap()),
     ] {
         let fixture = fixture(true).await;
         let db = fixture.runtime.db();
-        let seed = seed_target_goal(&fixture).await;
+        let seed = seed_target_goal(
+            &fixture,
+            matches!(disposition, GoalCommandDisposition::Underway),
+        )
+        .await;
         let request = GoalManagementRequest::State {
             owner: fixture.target.clone(),
             expected_version: seed.version,
@@ -478,14 +460,14 @@ async fn conversation_goal_coordinator_provider_state_commands_use_the_tagged_di
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(goal.version.get(), 2);
+        assert_eq!(goal.version.get(), seed.version.get() + 1);
         assert_eq!(goal.state, GoalDisposition::from(disposition).state());
         assert_eq!(
             db.conversation_goal_history(&fixture.target, GoalVersion::INITIAL)
                 .await
                 .unwrap()
                 .len(),
-            2
+            usize::try_from(seed.version.get() + 1).unwrap()
         );
         let (generation, outcome) =
             tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
@@ -503,7 +485,7 @@ async fn conversation_goal_coordinator_provider_state_commands_use_the_tagged_di
     }
 }
 
-async fn seed_target_goal(fixture: &Fixture) -> GoalSnapshot {
+async fn seed_target_goal(fixture: &Fixture, blocked: bool) -> GoalSnapshot {
     use phoenix_db::conversation_goals::user_commands::{
         GoalUserChange, GoalUserCommand, GoalUserResult,
     };
@@ -528,5 +510,108 @@ async fn seed_target_goal(fixture: &Fixture) -> GoalSnapshot {
     let GoalUserResult::Accepted { entry } = receipt.result else {
         panic!("seed goal accepted")
     };
+    if !blocked {
+        return entry.snapshot;
+    }
+    let blocked = GoalUserCommand {
+        request_id: uuid::Uuid::new_v4(),
+        expected_version: entry.snapshot.version,
+        change: GoalUserChange::State {
+            goal_id: entry.snapshot.goal_id,
+            disposition: phoenix_core::domain::conversation_goal::GoalDisposition::Blocked(
+                GoalText::parse("seed dependency").unwrap(),
+            ),
+        },
+        ..command
+    };
+    let receipt = db
+        .apply_user_goal_command(
+            &blocked,
+            "management-target",
+            GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let GoalUserResult::Accepted { entry } = receipt.result else {
+        panic!("blocked seed accepted")
+    };
     entry.snapshot
+}
+
+fn assert_provider_declarations(client: &RenderingAnthropicClient) {
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            request
+                .tool_availability
+                .declarations()
+                .iter()
+                .filter(|tool| tool.name == "goal_manage")
+                .count(),
+            1
+        );
+        assert!(!request
+            .tool_availability
+            .declarations()
+            .iter()
+            .any(|tool| tool.name == "goal_report"));
+    }
+}
+
+async fn assert_canonical_delivery(
+    fixture: &Fixture,
+    client: &RenderingAnthropicClient,
+    call: &phoenix_core::domain::conversation_goal::GoalAgentSource,
+) {
+    let persisted = fixture
+        .runtime
+        .db()
+        .get_messages(&fixture.source)
+        .await
+        .unwrap();
+    let canonical: Vec<_> = persisted
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Tool(result) if result.tool_use_id == call.tool_use_id.as_str() => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(canonical.len(), 1);
+    let wires = client.wires.lock().unwrap();
+    let wire = &wires[1];
+    assert_eq!(wire["model"], "claude-opus-5-5");
+    let messages = wire["messages"].as_array().unwrap();
+    let tool_results: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|block| {
+            block["type"] == "tool_result" && block["tool_use_id"] == call.tool_use_id.as_str()
+        })
+        .collect();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0]["content"], canonical[0].content);
+    assert_eq!(tool_results[0]["is_error"], false);
+    assert!(!canonical[0].is_error);
+    let assistant = messages
+        .iter()
+        .find(|message| {
+            message["role"] == "assistant"
+                && message["content"].as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block["type"] == "tool_use" && block["id"] == call.tool_use_id.as_str()
+                    })
+                })
+        })
+        .unwrap();
+    let blocks = assistant["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "private management reasoning");
+    assert_eq!(blocks[0]["signature"], "journey-opaque-signature");
+    assert_eq!(blocks[1]["type"], "tool_use");
+    assert_eq!(blocks[1]["id"], call.tool_use_id.as_str());
 }

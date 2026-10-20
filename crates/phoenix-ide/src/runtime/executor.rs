@@ -694,7 +694,9 @@ struct GoalDispatchTestBarrier {
 impl GoalDispatchTestBarrier {
     async fn pause(&self) {
         self.reached.notify_one();
-        self.resume.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.resume.notified())
+            .await
+            .expect("goal dispatch test barrier was not resumed");
     }
 }
 

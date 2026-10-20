@@ -1,6 +1,13 @@
 use super::GoalManagementService;
 use crate::runtime::{traits::ActiveDirectTurn, RuntimeManager};
-use phoenix_core::domain::{db_schema::InputOrigin, sm_state::ConvState};
+use phoenix_core::domain::{
+    db_schema::InputOrigin,
+    sm_event::{
+        PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
+        SubmittedDirectTurnIdentity,
+    },
+    sm_state::ConvState,
+};
 use phoenix_db::{
     workflow::{
         AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, LocalAuthorityResult,
@@ -9,9 +16,7 @@ use phoenix_db::{
     Database,
 };
 use phoenix_workflow::{
-    AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedDirectTurnDelivery,
-    PreparedDirectTurnPayload, PreparedTurn, SubmittedDirectTurnExpansionPolicy,
-    SubmittedDirectTurnIdentity, Timestamp, TurnOutcome,
+    AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp, TurnOutcome,
 };
 use std::sync::Arc;
 
