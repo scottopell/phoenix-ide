@@ -191,6 +191,7 @@ pub(crate) async fn capture_runtime_control_tx(
 pub(crate) fn db_error(error: ControlError) -> crate::DbError {
     match error {
         ControlError::Storage(error) => crate::DbError::Sqlx(error),
+        ControlError::Admission(error) => error,
         other @ (ControlError::OwnerUnavailable
         | ControlError::RequestConflict
         | ControlError::VersionRange

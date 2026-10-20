@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn conversation_goal_control_db_error_preserves_typed_admission() {
+    use crate::conversation_goals::control::{db_error, ControlError};
+    use phoenix_core::domain::product_conversation::ProductConversationId;
+
+    let owner = ProductConversationId::parse("unavailable-owner").unwrap();
+    let error = db_error(ControlError::Admission(
+        crate::DbError::ProductConversationUnavailable(owner.clone()),
+    ));
+    assert!(
+        matches!(error, crate::DbError::ProductConversationUnavailable(actual) if actual == owner)
+    );
+
+    let error = db_error(ControlError::Admission(
+        crate::DbError::ConversationNotFound("missing-owner".to_owned()),
+    ));
+    assert!(
+        matches!(error, crate::DbError::ConversationNotFound(actual) if actual == "missing-owner")
+    );
+}
+
 async fn control_fixture() -> (tempfile::TempDir, Database) {
     let (dir, db) = fixture().await;
     sqlx::raw_sql("ALTER TABLE product_conversations ADD COLUMN ordinary_lifecycle TEXT NOT NULL DEFAULT 'open' CHECK (ordinary_lifecycle IN ('open','history')); CREATE TABLE close_obligations (product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE, phase TEXT NOT NULL);")
