@@ -59,7 +59,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{migrations::run_pending_migrations, Database};
+    use crate::{migrations::run_before_goal_storage_for_test, Database};
 
     async fn history(pool: &SqlitePool) -> Vec<Vec<String>> {
         let mut snapshot = Vec::new();
@@ -120,8 +120,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            run_pending_migrations(db.pool()).await.unwrap() as usize,
-            super::super::MIGRATIONS.len() - 1
+            run_before_goal_storage_for_test(db.pool()).await.unwrap() as usize,
+            super::super::MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 130)
+                .count()
         );
         let source = db
             .create_conversation("historical-source", "source", "/tmp", true, None, None)
@@ -172,9 +175,27 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(
+            run_before_goal_storage_for_test(db.pool()).await.unwrap(),
+            1
+        );
         assert_eq!(history(db.pool()).await, before);
-        let fresh = Database::open_in_memory().await.unwrap();
+        let fresh_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let fresh = Database::from_pool_for_tests(fresh_pool, String::new());
+        fresh.run_migrations().await.unwrap();
+        assert_eq!(
+            run_before_goal_storage_for_test(fresh.pool())
+                .await
+                .unwrap() as usize,
+            super::super::MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 131)
+                .count()
+        );
         let schema = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name";
         assert_eq!(
             sqlx::query_as::<_, Schema>(schema)
@@ -200,6 +221,9 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+        assert_eq!(
+            run_before_goal_storage_for_test(db.pool()).await.unwrap(),
+            0
+        );
     }
 }
