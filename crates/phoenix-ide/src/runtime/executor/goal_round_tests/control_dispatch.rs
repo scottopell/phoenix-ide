@@ -400,31 +400,73 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_provider_future() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_context() {
-    use super::super::{PendingExternalCall, MCP_TOOL};
     for (with_goal, fail_settlement) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        revoked_tool_scenario(with_goal, fail_settlement, false).await;
+    }
+}
+
+#[tokio::test]
+async fn conversation_goal_pending_report_and_inflight_mcp_revoke_in_one_atomic_retry() {
+    revoked_tool_scenario(true, true, true).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn revoked_tool_scenario(with_goal: bool, fail_settlement: bool, pending_report: bool) {
+    use super::super::{PendingExternalCall, MCP_TOOL};
     {
         let (db, owner, active) = fixture(with_goal).await;
         let turn_id = i64::try_from(active.turn_id.0).unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let mut blocks = Vec::new();
+        if pending_report {
+            blocks.push(ContentBlock::ToolUse {
+                id: "pending-report".into(), name: "goal_report".into(),
+                input: serde_json::json!({"status":"complete","reason":"prepared before revocation"}),
+            });
+        }
+        blocks.push(ContentBlock::ToolUse {
+            id: "inflight-tool".into(),
+            name: MCP_TOOL.into(),
+            input: serde_json::json!({}),
+        });
         let client = Arc::new(RenderingAnthropicClient::scripted(vec![journey_response(
-            vec![ContentBlock::ToolUse {
-                id: "inflight-tool".into(),
-                name: MCP_TOOL.into(),
-                input: serde_json::json!({}),
-            }],
-            false,
+            blocks, false,
         )]));
         let pending = Arc::new(PendingExternalCall::default());
         let mut catalog = DeferredMcpCatalog::new(true);
         catalog.2 = Some(pending.clone());
         let tools = Arc::new(catalog);
-        let mut rt = runtime(db.clone(), dir.path(), client, tools.clone())
+        let mut rt = runtime(db.clone(), dir.path(), client.clone(), tools.clone())
             .with_active_direct_turn(Some(active));
+        if pending_report {
+            let workflow_id: i64 =
+                sqlx::query_scalar("SELECT workflow_id FROM durable_turns WHERE turn_id=?")
+                    .bind(turn_id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            let execution = GoalExecution::parse(workflow_id, turn_id).unwrap();
+            let binding = db
+                .conversation_goal_execution_binding(execution)
+                .await
+                .unwrap()
+                .unwrap();
+            rt.goal_report_emitter = Some(GoalReportEmitter {
+                binding: binding.try_into().unwrap(),
+            });
+        }
         rt.state = ConvState::LlmRequesting { attempt: 1 };
         dispatch(&mut rt).await;
         journey_provider_step(&mut rt).await;
+        if pending_report {
+            journey_report_step(&mut rt).await;
+            assert!(
+                matches!(&rt.state, ConvState::ToolExecuting { completed_results, .. }
+                if matches!(completed_results.as_slice(), [ToolRoundResult::PendingGoalReport { .. }]))
+            );
+        }
         assert!(matches!(rt.state, ConvState::ToolExecuting { .. }));
         tokio::time::timeout(Duration::from_secs(5), pending.entered.notified())
             .await
@@ -446,6 +488,13 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
             let before = db.get_conversation(CONVERSATION).await.unwrap().state;
             let before_messages =
                 serde_json::to_value(db.get_messages(CONVERSATION).await.unwrap()).unwrap();
+            let before_replay = db.load_provider_replay_state(CONVERSATION).await.unwrap();
+            let before_goal = db.conversation_goal(&owner).await.unwrap();
+            let before_history = db
+                .conversation_goal_history(&owner, GoalVersion::INITIAL)
+                .await
+                .unwrap();
+            let mut publications = rt.broadcast_tx.subscribe();
             sqlx::query("CREATE TRIGGER fail_revoked_tool_settlement BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT,'revoked tool settlement failed'); END")
                 .execute(db.pool()).await.unwrap();
             assert!(rt
@@ -461,6 +510,23 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
                 serde_json::to_value(db.get_messages(CONVERSATION).await.unwrap()).unwrap(),
                 before_messages
             );
+            assert_eq!(
+                db.load_provider_replay_state(CONVERSATION).await.unwrap(),
+                before_replay
+            );
+            assert_eq!(db.conversation_goal(&owner).await.unwrap(), before_goal);
+            assert_eq!(
+                db.conversation_goal_history(&owner, GoalVersion::INITIAL)
+                    .await
+                    .unwrap(),
+                before_history
+            );
+            while let Ok(event) = publications.try_recv() {
+                assert!(!matches!(
+                    event,
+                    SseEvent::Message { .. } | SseEvent::StateChange { .. }
+                ));
+            }
             let ownership: (Option<String>, i64) = sqlx::query_as(
                 "SELECT terminal_kind,owns_conversation FROM durable_turns WHERE turn_id=?",
             )
@@ -482,10 +548,45 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
                 "the sole revoked outcome must survive a failed write"
             );
             let prepared = rt.prepared_revoked_goal_tool_round.as_ref().unwrap();
-            let expected_messages: Vec<_> = std::iter::once(prepared.assistant.clone())
-                .chain(prepared.results.iter().cloned())
-                .collect();
+            let expected_messages = match &prepared.results {
+                RevokedGoalToolResults::Finalized(messages) => {
+                    std::iter::once(prepared.assistant.clone())
+                        .chain(messages.iter().cloned())
+                        .collect::<Vec<_>>()
+                }
+                RevokedGoalToolResults::Pending { results, .. } => {
+                    assert!(matches!(
+                        results.as_slice(),
+                        [
+                            ToolRoundResult::PendingGoalReport { .. },
+                            ToolRoundResult::Finalized(_)
+                        ]
+                    ));
+                    vec![prepared.assistant.clone()]
+                }
+            };
             let expected_state_time = prepared.settlement.state_updated_at;
+            let expected_pending = match &prepared.results {
+                RevokedGoalToolResults::Pending { results, .. } => {
+                    Some(serde_json::to_value(results).unwrap())
+                }
+                RevokedGoalToolResults::Finalized(_) => None,
+            };
+            if pending_report {
+                control(&db, &owner, ControlCommand::Release, 2).await;
+                let RevokedGoalToolResults::Pending { results, .. } = &rt
+                    .prepared_revoked_goal_tool_round
+                    .as_ref()
+                    .unwrap()
+                    .results
+                else {
+                    panic!("mixed report command was not retained");
+                };
+                assert_eq!(
+                    Some(serde_json::to_value(results).unwrap()),
+                    expected_pending
+                );
+            }
             sqlx::query("DROP TRIGGER fail_revoked_tool_settlement")
                 .execute(db.pool())
                 .await
@@ -536,6 +637,7 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
         assert!(rt.active_direct_turn.is_none());
         assert!(rt.pending_direct_turn_terminal.is_none());
         let messages = db.get_messages(CONVERSATION).await.unwrap();
+        assert_eq!(messages.len(), if pending_report { 4 } else { 3 });
         let results: Vec<_> = messages
             .iter()
             .filter_map(|message| match &message.content {
@@ -546,8 +648,38 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
             })
             .collect();
         assert_eq!(results.len(), 1);
-        assert!(results[0].is_error);
+        assert!(!results[0].is_error);
         assert_eq!(results[0].content, "Cancelled by user");
+        if pending_report {
+            let reports: Vec<_> = messages
+                .iter()
+                .filter_map(|message| match &message.content {
+                    MessageContent::Tool(content) if content.tool_use_id == "pending-report" => {
+                        Some(content)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reports.len(), 1);
+            assert!(reports[0].is_error);
+            assert!(reports[0].content.contains("Goal report rejected"));
+            let goal = db.conversation_goal(&owner).await.unwrap().unwrap();
+            assert_eq!(goal.version.get(), 1);
+            assert!(matches!(goal.state, GoalState::Underway));
+            assert_eq!(
+                db.conversation_goal_history(&owner, GoalVersion::INITIAL)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert!(db
+            .load_provider_replay_state(CONVERSATION)
+            .await
+            .unwrap()
+            .is_none());
         let calls = messages
             .iter()
             .filter(|message| {
@@ -569,7 +701,9 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
             .as_ref()
             .unwrap()
             .is_cancelled());
-        control(&db, &owner, ControlCommand::Release, 2).await;
+        if !pending_report {
+            control(&db, &owner, ControlCommand::Release, 2).await;
+        }
         assert_eq!(tools.recorded_executions().len(), 1);
     }
 }

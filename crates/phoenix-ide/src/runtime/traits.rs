@@ -436,6 +436,20 @@ pub trait MessageStore: Send + Sync {
         phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
     >;
 
+    async fn persist_revoked_pending_goal_tool_round(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _settlement: &ActiveDirectTurnSettlement,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        tracing::debug!("storage cannot commit an atomic revoked pending-goal settlement");
+        TerminalMutationEstablishment::KnownNotCommitted(
+            "storage does not support atomic revoked pending-goal settlement".into(),
+        )
+    }
+
     async fn persist_revoked_goal_tool_round(
         &self,
         _conv_id: &str,
@@ -474,6 +488,25 @@ pub enum TerminalMutationEstablishment<T = ()> {
     Retired,
     KnownNotCommitted(String),
     Unclassifiable(String),
+}
+
+impl<T> TerminalMutationEstablishment<T> {
+    pub(crate) fn map<U>(self, convert: impl FnOnce(T) -> U) -> TerminalMutationEstablishment<U> {
+        match self {
+            Self::Established {
+                transcript_generation,
+                value,
+            } => TerminalMutationEstablishment::Established {
+                transcript_generation,
+                value: convert(value),
+            },
+            Self::Retired => TerminalMutationEstablishment::Retired,
+            Self::KnownNotCommitted(error) => {
+                TerminalMutationEstablishment::KnownNotCommitted(error)
+            }
+            Self::Unclassifiable(error) => TerminalMutationEstablishment::Unclassifiable(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1195,6 +1228,19 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 tool_results,
                 settlement,
             )
+            .await
+    }
+
+    async fn persist_revoked_pending_goal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        (**self)
+            .persist_revoked_pending_goal_tool_round(checkpoint, settlement, update)
             .await
     }
 
@@ -2418,6 +2464,47 @@ impl MessageStore for DatabaseStorage {
                     &obligation,
                     error.to_string(),
                     None,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn persist_revoked_pending_goal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        if settlement.terminal != ActiveDirectTurnTerminal::GoalControlRevoked {
+            return TerminalMutationEstablishment::KnownNotCommitted(
+                "atomic revoked pending-goal settlement requires control revocation".into(),
+            );
+        }
+        let obligation = terminal_obligation(settlement, None);
+        match self
+            .db
+            .persist_revoked_pending_goal_tool_round(checkpoint, &obligation, update)
+            .await
+        {
+            Ok(value) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+                value,
+            },
+            Err(error) => {
+                let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::GoalRound {
+                    assistant: Box::new(checkpoint.assistant.clone()),
+                    execution: checkpoint.execution,
+                    results: checkpoint.results.to_vec(),
+                };
+                classify_goal_terminal_mutation(
+                    &self.db,
+                    checkpoint,
+                    &evidence,
+                    &obligation,
+                    error.to_string(),
                 )
                 .await
             }

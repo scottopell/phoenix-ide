@@ -83,10 +83,18 @@ fn terminal_tool_messages(
 struct PreparedRevokedGoalToolRound {
     _reservation: crate::runtime::ReservedBroadcastRange,
     assistant: crate::db::Message,
-    results: Vec<crate::db::Message>,
+    results: RevokedGoalToolResults,
     settlement: crate::runtime::traits::ActiveDirectTurnSettlement,
     provider_replay: Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     trusted_results: Vec<PendingTrustedToolResult>,
+}
+
+enum RevokedGoalToolResults {
+    Finalized(Vec<crate::db::Message>),
+    Pending {
+        execution: phoenix_core::domain::conversation_goal::GoalExecution,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+    },
 }
 
 enum AuthoritativeEffect {
@@ -9363,6 +9371,55 @@ where
         Ok(None)
     }
 
+    fn prepare_revoked_goal_tool_round(
+        &mut self,
+        agent_msg: crate::db::Message,
+        tool_results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+        reservation: crate::runtime::ReservedBroadcastRange,
+        reserved_seqs: Vec<i64>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<(), String> {
+        let finalized: Vec<_> = tool_results
+            .iter()
+            .filter_map(|result| result.finalized().cloned())
+            .collect();
+        let trusted_results = trusted_tool_results(&agent_msg.message_id, &finalized);
+        let results = if contains_pending_goal_report(&tool_results) {
+            let execution = tool_results.iter().find_map(|entry| {
+                if let phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { report, .. } = entry {
+                    Some(report.execution())
+                } else { None }
+            }).ok_or("revoked pending goal round has no report execution")?;
+            let active = self
+                .active_direct_turn
+                .as_deref()
+                .ok_or("revoked pending goal round has no active direct turn")?;
+            if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
+                return Err("revoked pending report differs from active direct turn".into());
+            }
+            RevokedGoalToolResults::Pending {
+                execution,
+                results: tool_results,
+            }
+        } else {
+            let finalized = finalized_round_results(&tool_results)?;
+            RevokedGoalToolResults::Finalized(terminal_tool_messages(
+                &agent_msg,
+                finalized,
+                reserved_seqs.into_iter().skip(1),
+            ))
+        };
+        self.prepared_revoked_goal_tool_round = Some(Box::new(PreparedRevokedGoalToolRound {
+            _reservation: reservation,
+            assistant: agent_msg,
+            results,
+            settlement: settlement.clone(),
+            provider_replay: self.pending_provider_replay_update.take(),
+            trusted_results,
+        }));
+        Ok(())
+    }
+
     async fn persist_prepared_revoked_goal_tool_round(
         &mut self,
         admitted: &mut crate::runtime::AdmittedOperation,
@@ -9374,19 +9431,39 @@ where
         if self.state != command.settlement.state {
             return Err("revoked-goal checkpoint target differs from the retained command".into());
         }
-        let establishment = self
-            .storage
-            .persist_revoked_goal_tool_round(
-                &command.assistant.conversation_id,
-                &command.assistant,
-                &command.results,
-                &command.settlement,
-                command.provider_replay.as_ref(),
-            )
-            .await;
-        let publish = match establishment {
-            TerminalMutationEstablishment::Established { .. } => true,
-            TerminalMutationEstablishment::Retired => false,
+        let establishment = match &command.results {
+            RevokedGoalToolResults::Finalized(messages) => self
+                .storage
+                .persist_revoked_goal_tool_round(
+                    &command.assistant.conversation_id,
+                    &command.assistant,
+                    messages,
+                    &command.settlement,
+                    command.provider_replay.as_ref(),
+                )
+                .await
+                .map(|()| messages.clone()),
+            RevokedGoalToolResults::Pending { execution, results } => {
+                let checkpoint = phoenix_db::conversation_goals::round::GoalRoundCheckpoint {
+                    assistant: &command.assistant,
+                    execution: *execution,
+                    results,
+                    state: &command.settlement.state,
+                    state_updated_at: command.settlement.state_updated_at,
+                };
+                self.storage
+                    .persist_revoked_pending_goal_tool_round(
+                        &checkpoint,
+                        &command.settlement,
+                        command.provider_replay.as_ref(),
+                    )
+                    .await
+                    .map(|committed| committed.results)
+            }
+        };
+        let publication = match establishment {
+            TerminalMutationEstablishment::Established { value, .. } => Some(value),
+            TerminalMutationEstablishment::Retired => None,
             TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
             TerminalMutationEstablishment::Unclassifiable(error) => {
                 self.local_terminal_authority = LocalTerminalAuthority::Fatal;
@@ -9404,7 +9481,7 @@ where
         self.direct_turn_cancellation_initiated = false;
         self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
         self.settle_turn_span();
-        if publish {
+        if let Some(messages) = publication {
             merge_trusted_tool_results(
                 &mut self.pending_trusted_tool_results,
                 command.trusted_results,
@@ -9413,7 +9490,7 @@ where
                 .broadcast_tx
                 .admitted_publication(admitted)
                 .persisted_message(command.assistant);
-            for message in command.results {
+            for message in messages {
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
@@ -9453,7 +9530,6 @@ where
             .await
             .reserve_next_range(1 + tool_results.len())
             .expect("executor holds exclusive persisted-message reservation authority");
-        let _reserved_broadcast_range = reserved_broadcast_range;
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_msg = crate::db::Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
@@ -9466,6 +9542,20 @@ where
             usage_data: assistant_message.usage,
             created_at: assistant_message.created_at,
         };
+        if settlement.terminal
+            == crate::runtime::traits::ActiveDirectTurnTerminal::GoalControlRevoked
+        {
+            self.prepare_revoked_goal_tool_round(
+                agent_msg,
+                tool_results,
+                reserved_broadcast_range,
+                reserved_seqs,
+                settlement,
+            )?;
+            return self
+                .persist_prepared_revoked_goal_tool_round(admitted)
+                .await;
+        }
         if contains_pending_goal_report(&tool_results) {
             return self
                 .persist_pending_goal_round(
@@ -9481,21 +9571,6 @@ where
         let new_trusted_results = trusted_tool_results(&agent_msg.message_id, &tool_results);
         let tool_msgs =
             terminal_tool_messages(&agent_msg, tool_results, reserved_seqs.into_iter().skip(1));
-        let atomic_revocation = settlement.terminal
-            == crate::runtime::traits::ActiveDirectTurnTerminal::GoalControlRevoked;
-        if atomic_revocation {
-            self.prepared_revoked_goal_tool_round = Some(Box::new(PreparedRevokedGoalToolRound {
-                _reservation: _reserved_broadcast_range,
-                assistant: agent_msg,
-                results: tool_msgs,
-                settlement: settlement.clone(),
-                provider_replay: self.pending_provider_replay_update.take(),
-                trusted_results: new_trusted_results,
-            }));
-            return self
-                .persist_prepared_revoked_goal_tool_round(admitted)
-                .await;
-        }
         let establishment = self
             .storage
             .persist_tool_round_with_terminal_obligation(

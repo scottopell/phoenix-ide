@@ -1,10 +1,16 @@
-use phoenix_core::domain::{provider_replay::ProviderReplayUpdate, sm_state::ConvState};
-use phoenix_workflow::{TurnCommand, TurnTerminal};
+use phoenix_core::domain::{
+    provider_replay::{ProviderReplaySettlement, ProviderReplayUpdate},
+    sm_state::ConvState,
+};
+use phoenix_workflow::{TurnCommand, TurnOutcome, TurnTerminal};
 
 use crate::{
     conversation_goals::{
         control::GoalControlInstallation,
-        round::{write_round_tx, ToolRoundWrite},
+        round::{
+            db_error, retained_round_tx, write_round_tx, CommittedGoalTerminalRound,
+            GoalRoundCheckpoint, ToolRoundWrite,
+        },
     },
     workflow::{DirectTurnTerminalObligationInput, TerminalizeAuthoritativeTurnInput},
     Database, DbError, DbResult, Message,
@@ -23,6 +29,58 @@ impl Database {
         obligation: &DirectTurnTerminalObligationInput,
         update: Option<&ProviderReplayUpdate>,
     ) -> DbResult<()> {
+        self.persist_revoked_goal_round_input(
+            conversation_id,
+            assistant,
+            ToolRoundWrite::Finalized(results),
+            obligation,
+            update,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Finalize pending report intents in the same transaction as revoked terminal ownership.
+    ///
+    /// # Errors
+    /// Rejects invalid report sources, revoked-settlement authority, or partial retained evidence.
+    pub async fn persist_revoked_pending_goal_tool_round(
+        &self,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+        obligation: &DirectTurnTerminalObligationInput,
+        update: Option<&ProviderReplayUpdate>,
+    ) -> DbResult<CommittedGoalTerminalRound> {
+        if checkpoint.state != &obligation.projection.state
+            || checkpoint.state_updated_at != obligation.projection.state_updated_at
+        {
+            return Err(DbError::Serialization(
+                "revoked pending round projection differs".into(),
+            ));
+        }
+        if let Some(update) = update {
+            crate::provider_replay::validate_goal_round_replay(checkpoint.assistant, update)?;
+        }
+        self.persist_revoked_goal_round_input(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            obligation,
+            update,
+        )
+        .await
+    }
+
+    async fn persist_revoked_goal_round_input(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: ToolRoundWrite<'_>,
+        obligation: &DirectTurnTerminalObligationInput,
+        update: Option<&ProviderReplayUpdate>,
+    ) -> DbResult<CommittedGoalTerminalRound> {
         if self.goal_control_installation != GoalControlInstallation::Installed
             || obligation.terminal != TurnTerminal::Cancelled
             || obligation.projection.state != ConvState::Idle
@@ -52,12 +110,34 @@ impl Database {
                 "tool round has no revoked goal-control binding".into(),
             ));
         }
-        let replayed = retained_pair_tx(&mut tx.tx, assistant, results).await?;
-        write_round_tx(
+        let replayed = match &input {
+            ToolRoundWrite::Finalized(results) => {
+                retained_pair_tx(&mut tx.tx, assistant, results).await?
+            }
+            ToolRoundWrite::Pending { execution, results } => {
+                if execution.turn_id() != turn_id {
+                    return Err(DbError::Serialization(
+                        "pending revoked round execution differs".into(),
+                    ));
+                }
+                let checkpoint = GoalRoundCheckpoint {
+                    assistant,
+                    execution: *execution,
+                    results,
+                    state: &obligation.projection.state,
+                    state_updated_at: obligation.projection.state_updated_at,
+                };
+                retained_round_tx(&mut tx.tx, &checkpoint)
+                    .await
+                    .map_err(db_error)?
+                    .is_some()
+            }
+        };
+        let (results, _) = write_round_tx(
             &mut tx.tx,
             conversation_id,
             assistant,
-            ToolRoundWrite::Finalized(results),
+            input,
             &obligation.projection.state,
             obligation.projection.state_updated_at,
             self.goal_control_installation,
@@ -78,21 +158,20 @@ impl Database {
                         expected_generation: obligation.expected_generation,
                     },
                     projection: Some(obligation.projection.clone()),
+                    provider_replay_settlement: ProviderReplaySettlement::for_conversation_state(
+                        conversation_id,
+                        &obligation.projection.state,
+                    ),
                 },
             )
             .await?;
-        if !replayed
-            && matches!(
-                terminal,
-                crate::workflow::TerminalizeAuthoritativeTurnOutcome::AlreadyReconciled(_)
-            )
-        {
+        if !replayed && matches!(terminal.outcome, TurnOutcome::TerminalReplay { .. }) {
             return Err(DbError::Serialization(
                 "settled revoked tool round lost its exact pair".into(),
             ));
         }
         tx.tx.commit().await?;
-        Ok(())
+        Ok(CommittedGoalTerminalRound { results, replayed })
     }
 }
 
