@@ -37,6 +37,15 @@ pub enum GoalControlServiceError {
 }
 
 impl GoalControlService {
+    pub(crate) fn from_installed_database(db: Database) -> Result<Self, GoalControlServiceError> {
+        if db.goal_control_installation()
+            != phoenix_db::conversation_goals::control::GoalControlInstallation::Installed
+        {
+            return Err(GoalControlServiceError::Disabled);
+        }
+        Ok(Self { storage: Some(db) })
+    }
+
     /// Apply an owner-authenticated control request using the server's stable owner principal.
     /// The default service is disabled and no public route installs it.
     ///

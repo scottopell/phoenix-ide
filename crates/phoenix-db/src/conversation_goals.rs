@@ -95,6 +95,20 @@ fn snapshot(row: &SqliteRow) -> Result<GoalSnapshot> {
     })
 }
 
+async fn history_tx(
+    tx: &mut GoalTx<'_>,
+    owner: &ProductConversationId,
+    after: GoalVersion,
+) -> Result<Vec<GoalHistoryEntry>> {
+    let rows = sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? AND version>? ORDER BY version LIMIT 100")
+        .bind(owner.as_str()).bind(after.get()).fetch_all(&mut **tx).await?;
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in &rows {
+        entries.push(history_entry(tx, row).await?);
+    }
+    Ok(entries)
+}
+
 async fn current_tx(
     tx: &mut GoalTx<'_>,
     owner: &ProductConversationId,
@@ -442,6 +456,50 @@ impl Database {
         Ok(snapshot)
     }
 
+    /// Read the current immutable fact, including its persisted attribution and reason.
+    ///
+    /// # Errors
+    /// Rejects missing or inconsistent current history and malformed persisted data.
+    pub async fn conversation_goal_current_entry(
+        &self,
+        owner: &ProductConversationId,
+    ) -> Result<Option<GoalHistoryEntry>> {
+        let mut tx = self.pool().begin().await?;
+        Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
+        let Some(snapshot) = current_tx(&mut tx, owner).await? else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let row = sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE h.owner_id=? AND h.version=?")
+            .bind(owner.as_str())
+            .bind(snapshot.version.get())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(GoalDbError::Integrity("current goal history missing"))?;
+        let entry = history_entry(&mut tx, &row).await?;
+        if entry.snapshot != snapshot {
+            return Err(GoalDbError::Integrity("current goal history mismatch"));
+        }
+        tx.commit().await?;
+        Ok(Some(entry))
+    }
+
+    /// Read a bounded immutable page after resolving its canonical ordinary owner in the same snapshot.
+    ///
+    /// # Errors
+    /// Rejects unavailable/nonordinary owners and malformed persisted data.
+    pub async fn ordinary_conversation_goal_history(
+        &self,
+        owner: &ProductConversationId,
+        after: GoalVersion,
+    ) -> Result<Vec<GoalHistoryEntry>> {
+        let mut tx = self.pool().begin().await?;
+        Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
+        let entries = history_tx(&mut tx, owner, after).await?;
+        tx.commit().await?;
+        Ok(entries)
+    }
+
     /// Returns at most 100 immutable changes, oldest first, after the supplied owner version.
     ///
     /// # Errors
@@ -452,12 +510,7 @@ impl Database {
         after: GoalVersion,
     ) -> Result<Vec<GoalHistoryEntry>> {
         let mut tx = self.pool().begin().await?;
-        let rows = sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? AND version>? ORDER BY version LIMIT 100")
-            .bind(owner.as_str()).bind(after.get()).fetch_all(&mut *tx).await?;
-        let mut entries = Vec::with_capacity(rows.len());
-        for row in &rows {
-            entries.push(history_entry(&mut tx, row).await?);
-        }
+        let entries = history_tx(&mut tx, owner, after).await?;
         tx.commit().await?;
         Ok(entries)
     }

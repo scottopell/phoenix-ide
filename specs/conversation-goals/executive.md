@@ -1,5 +1,59 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Private authenticated install seam — source cut
+
+The API has a crate-private `goal_control::private_install` seam that constructs
+command/control services only when the supplied runtime's existing database
+handle is already `GoalControlInstallation::Installed`. It does not change that
+flag, install migrations, read an environment switch, or attach itself to normal
+startup. Default services retain `None`; the normal router merges only the
+uninstalled routes. Authenticated, valid requests to those uninstalled routes
+return 503. No public installer or production activation is included.
+
+All adapters extract the existing `OwnerAuthenticated` capability before
+accessing services. Installed-router tests use the real authentication
+middleware, not a trusted request header. Create/state bodies reuse the existing
+`deny_unknown_fields` DTOs; attribution is derived by the existing command
+services from the host instance identity, not caller-supplied actor data.
+
+| Method / stable-owner path | Result / delegated authority |
+|---|---|
+| GET `/api/product-conversations/:reference/goal` | Current immutable `GoalHistoryEntry`, or JSON null when no goal exists; goal ID, objective, version, state/reason and persisted attribution remain factual |
+| GET `/api/product-conversations/:reference/goal/history?after=<GoalVersion>` | Immutable changes ordered by owner version, at most 100, strictly after the typed cursor |
+| POST `/api/product-conversations/:reference/goal` | Existing `GoalCommandService::create`, including host identity, exact request replay, settled/latest/Close fencing and Stop preservation |
+| POST `/api/product-conversations/:reference/goal/state` | Existing `GoalCommandService::state`; explicit user disposition, never completion inferred from execution state |
+| POST `/api/product-conversations/:reference/goal-control` | Existing `GoalControlService::apply` and its unchanged typed receipt/status mapping |
+
+Factual reads resolve the canonical ordinary ProductConversation via the existing
+`get_ordinary_product_conversation_on` and read facts on **the same SQLite read
+transaction**. They do not resolve arbitrary transcript/peer aliases, create a
+goal/control row, record a command receipt, or append chat. Current-entry reads
+validate the exact current immutable snapshot/history match. History uses the
+same bounded SQL/decoder as the existing raw history reader; existing raw-reader
+fixture semantics are unchanged. Reads deliberately do not use mutation/Close
+admission or infer goal completion from conversation state.
+
+Six new `conversation_goal_private_install_*` router tests are authored for
+default-OFF/auth ordering/all-or-nothing installation, guest/peer/header/DTO
+spoof rejection and canonical/coordinator rejection, host attribution and exact
+replay, Stop preservation and factual blocker reasons, genuine continuation and
+live-Close read/write fences, settled product/acceptance gates, and bounded typed
+history pagination with no read-side rows/chat. They are **not executed or
+qualified** in this source cut. Completed-History read eligibility is source-only:
+the canonical read path admits its lifecycle, but the new tests do not execute
+full Close retirement. No fake Close phase/ledger fixture substitutes for that
+coverage. No UI, watch/outbox delivery or normal-startup installation is added.
+
+The latest hosted focused receipt is **198/198 at exact
+`21364ad088eaee872e1d84a7bc8360eedad2c0f0`** with captured full-workspace harnesses
+(run `39413982513`, artifact `12262104375`, 236.989 seconds). Owned Python command
+assertions and UI/specs/e2e also passed there. That receipt does not qualify this
+new source cut and does not imply isolated-three-package build equivalence.
+Overall CI remained red: the broad 1500-second run was partial (5313/5496 ran,
+5280 passed, 33 failed, 191 skipped), and Clippy remained red. These are unwaived;
+production activation remains OFF. The dated paragraphs below retain earlier
+checkpoint history, not newer qualification claims.
+
 ## Latest actual134 qualification — exact778 SQL-safe-string compile failure
 
 Parent run **39394922634**, exact

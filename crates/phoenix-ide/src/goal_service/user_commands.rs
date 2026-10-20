@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use phoenix_core::domain::{
     conversation_goal::{
-        GoalCommandDisposition as UserGoalDisposition, GoalId, GoalText, GoalTimestampUs,
-        GoalVersion,
+        GoalCommandDisposition as UserGoalDisposition, GoalHistoryEntry, GoalId, GoalText,
+        GoalTimestampUs, GoalVersion,
     },
     product_conversation::ProductConversationId,
 };
@@ -53,6 +53,47 @@ pub(crate) enum GoalCommandServiceError {
 }
 
 impl GoalCommandService {
+    pub(crate) fn from_installed_runtime(
+        runtime: Arc<RuntimeManager>,
+    ) -> Result<Self, GoalCommandServiceError> {
+        if runtime.db().goal_control_installation()
+            != phoenix_db::conversation_goals::control::GoalControlInstallation::Installed
+        {
+            return Err(GoalCommandServiceError::Disabled);
+        }
+        Ok(Self {
+            runtime: Some(runtime),
+        })
+    }
+
+    pub(crate) async fn current(
+        &self,
+        _authenticated_owner: OwnerAuthenticated,
+        owner: ProductConversationId,
+    ) -> Result<Option<GoalHistoryEntry>, GoalCommandServiceError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(GoalCommandServiceError::Disabled)?;
+        Ok(runtime.db().conversation_goal_current_entry(&owner).await?)
+    }
+
+    pub(crate) async fn history(
+        &self,
+        _authenticated_owner: OwnerAuthenticated,
+        owner: ProductConversationId,
+        after: GoalVersion,
+    ) -> Result<Vec<GoalHistoryEntry>, GoalCommandServiceError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(GoalCommandServiceError::Disabled)?;
+        Ok(runtime
+            .db()
+            .ordinary_conversation_goal_history(&owner, after)
+            .await?)
+    }
+
     pub(crate) async fn create(
         &self,
         authenticated: OwnerAuthenticated,
