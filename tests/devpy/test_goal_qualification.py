@@ -245,6 +245,14 @@ class GoalQualificationTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         expression = next(line for line in workflow.splitlines() if "goal_filter='test(/conversation_goal" in line).split("'")[1]
         self.assertEqual(self.helper.digest(expression.encode()),
+                         "c48b9059938ada212c42e489a65914b3600d1bdcdb31734a152ed587bb6f5d5a")
+        expression = expression.replace(
+            "coordinator_watches::goal_facts::|migrations::local_goal_watch::|"
+            "runtime::executor::watch_goal_context_tests::|captured_notification_shared_|"
+            "actual_local_and_remote_stable_id_collision_never_reinterprets_remote_fact_as_local_watch|",
+            "",
+        )
+        self.assertEqual(self.helper.digest(expression.encode()),
                          "2783437b7a762c80522985f3795913782b8ca0502584998274caca513d13204a")
         for text in ("timeout --signal=TERM --kill-after=10s 7m python3 scripts/goal_qualification.py focused",
                      "timeout-minutes: 8", "RUST_TEST_THREADS: \"2\"", "CARGO_BUILD_JOBS: \"2\"",

@@ -1102,8 +1102,37 @@ async fn real_migrations_goal_binding_successful_report_and_hard_delete_remove_a
     }
 }
 
+async fn assert_current_135_schema_and_goal_ledger(reopened: &Database) {
+    let ledger: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=132 ORDER BY version")
+            .fetch_all(reopened.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        ledger,
+        vec![
+            (132, "durable_conversation_goal_storage".into()),
+            (133, "opaque_federation_peer_notes".into()),
+            (134, "durable_conversation_goal_user_control".into()),
+            (135, "local_watch_goal_capture".into()),
+        ]
+    );
+    let fresh = Database::open_in_memory().await.unwrap();
+    let schema =
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name";
+    let actual: Vec<(String, String, String, String)> = sqlx::query_as(schema)
+        .fetch_all(reopened.pool())
+        .await
+        .unwrap();
+    let expected: Vec<(String, String, String, String)> = sqlx::query_as(schema)
+        .fetch_all(fresh.pool())
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
 #[tokio::test]
-async fn prior_schema_131_upgrade_applies_132_through_134_preserves_source_rows_and_is_idempotent()
+async fn prior_schema_131_upgrade_applies_132_through_135_preserves_source_rows_and_is_idempotent()
 {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prior-goals.db");
@@ -1144,7 +1173,7 @@ async fn prior_schema_131_upgrade_applies_132_through_134_preserves_source_rows_
         crate::migrations::run_pending_migrations(reopened.pool())
             .await
             .unwrap(),
-        3
+        4
     );
     let after: (String,String,String,String) = sqlx::query_as("SELECT c.id,c.product_conversation_id,m.message_id,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.id='upgrade-root'")
         .fetch_one(reopened.pool()).await.unwrap();
@@ -1155,20 +1184,7 @@ async fn prior_schema_131_upgrade_applies_132_through_134_preserves_source_rows_
             .unwrap(),
         0
     );
-    let ledger: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT version,name FROM _migrations WHERE version IN (132,133,134) ORDER BY version",
-    )
-    .fetch_all(reopened.pool())
-    .await
-    .unwrap();
-    assert_eq!(
-        ledger,
-        vec![
-            (132, "durable_conversation_goal_storage".into()),
-            (133, "opaque_federation_peer_notes".into()),
-            (134, "durable_conversation_goal_user_control".into()),
-        ]
-    );
+    assert_current_135_schema_and_goal_ledger(&reopened).await;
     let notes: (String, i64, String) = sqlx::query_as(
         "SELECT type,\"notnull\",dflt_value FROM pragma_table_info('federation_peer_connections') WHERE name='notes'",
     ).fetch_one(reopened.pool()).await.unwrap();

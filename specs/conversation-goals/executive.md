@@ -166,6 +166,35 @@ freshness or green UI/Rust at the correction HEAD. The only qualified floor
 remains exact efcc / `39451089782` UI12+209. Default OFF and uninstalled services
 remain unchanged; no push/CI/installation follows without parent direction.
 
+### Current-registry fixture correction and focused coverage selection
+
+The four failures in the second diagnostic come from tests that invoke the real
+pending-current runner, not an exact historical-134 prefix. Their corrected names
+and expectations explicitly target current 135: prior-133 fixtures apply exactly
+134+135, and the prior-131 fixture applies exactly 132–135. A shared assertion
+checks the exact named 132–135 ledger and compares all persisted schema objects
+(type/name/table/SQL, excluding SQLite's implicit null-SQL objects) against a
+fresh current database. Existing goal-row/source-row preservation, exact replay,
+forced failure/rollback, idempotence, disabled installation, FK and integrity
+assertions remain. This is not a blind count bump or a change to historical SQL.
+
+The existing `goal_filter` adds only the bounded goal-facts module, migration-135
+module, executor watch-context module, shared-captured-notification tests, and
+existing owned stable-ID collision regression. The original selector, including
+its nine anchored migration alternatives, is retained byte-for-byte after
+removing those additions. The existing selector regression records both the new
+hash `c48b9059938ada212c42e489a65914b3600d1bdcdb31734a152ed587bb6f5d5a`
+and original hash `2783437b7a762c80522985f3795913782b8ca0502584998274caca513d13204a`.
+No new lane/framework or timeout/thread/resource/freshness change is made: the
+same focused step retains seven minutes, two test threads, existing admission,
+and full artifact evidence. This extends future selection; it does not claim
+execution or passing coverage for tests skipped by the preceding run.
+
+These source/selector/test corrections are **UNRUN**. Only direct rustfmt on the
+two owned Rust test files, source/hash/byte comparisons and whitespace inspection
+ran locally. No Cargo/compiler/tests/SQL/CI/push or service installation ran;
+parent independent review and explicit next direction remain required.
+
 | Contract | Implementation/verification boundary |
 |---|---|
 | REQ-GOAL-011 | Existing terminal/wait outbox transactions must capture saved current goal or observed absence, distinct from legacy not-captured; usage explicitly unavailable. Storage and boundary tests owed. |

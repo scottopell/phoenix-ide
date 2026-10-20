@@ -35,6 +35,7 @@ async fn assert_registered(db: &Database) {
         .await
         .unwrap();
     assert_eq!(name, MIGRATION_NAME);
+    crate::conversation_goals::tests::assert_current_135_schema_and_goal_ledger(db).await;
     assert_eq!(
         db.goal_control_installation(),
         GoalControlInstallation::Disabled
@@ -49,7 +50,7 @@ async fn assert_registered(db: &Database) {
 }
 
 #[tokio::test]
-async fn conversation_goal_registered_134_fresh_and_real_133_upgrade_have_same_schema_and_stay_disabled(
+async fn conversation_goal_registered_134_through_135_fresh_and_real_133_upgrade_have_same_schema_and_stay_disabled(
 ) {
     let fresh = Database::open_in_memory().await.unwrap();
     assert_registered(&fresh).await;
@@ -67,7 +68,7 @@ async fn conversation_goal_registered_134_fresh_and_real_133_upgrade_have_same_s
         crate::migrations::run_pending_migrations(prior.pool())
             .await
             .unwrap(),
-        1
+        2
     );
     assert_eq!(schema(&prior).await, schema(&fresh).await);
     assert_registered(&prior).await;
@@ -110,8 +111,8 @@ async fn source_rows(db: &Database) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn conversation_goal_registered_134_preserves_real_report_cycle_and_exact_checkpoint_replay()
-{
+async fn conversation_goal_registered_134_through_135_preserves_real_report_cycle_and_exact_checkpoint_replay(
+) {
     for owner in [Owner::Normal, Owner::Anthropic, Owner::Responses] {
         populated_upgrade(owner).await;
     }
@@ -139,7 +140,7 @@ async fn populated_upgrade(owner: Owner) {
         crate::migrations::run_pending_migrations(db.pool())
             .await
             .unwrap(),
-        1
+        2
     );
     assert_eq!(retained(&db).await, before);
     assert_eq!(source_rows(&db).await, source);
@@ -200,7 +201,8 @@ async fn replay_report(owner: Owner, db: &Database, report: &GoalPendingReport) 
 }
 
 #[tokio::test]
-async fn conversation_goal_registered_134_real_runner_failure_rolls_back_cycle_schema_and_ledger() {
+async fn conversation_goal_registered_134_through_135_real_runner_failure_rolls_back_cycle_schema_and_ledger(
+) {
     let (db, _) = populated_at(GoalControlInstallation::Disabled).await;
     sqlx::query("CREATE TRIGGER fail_registered_goal_rebuild BEFORE DELETE ON conversation_goal_bindings BEGIN SELECT RAISE(ABORT,'registered goal rebuild cut'); END")
         .execute(db.pool()).await.unwrap();
@@ -231,7 +233,7 @@ async fn conversation_goal_registered_134_real_runner_failure_rolls_back_cycle_s
         crate::migrations::run_pending_migrations(db.pool())
             .await
             .unwrap(),
-        1
+        2
     );
     assert_eq!(retained(&db).await, before);
     assert_registered(&db).await;
@@ -278,7 +280,8 @@ async fn assert_receipt_without_next_history_rejected(db: &Database, command: &G
 }
 
 #[tokio::test]
-async fn conversation_goal_registered_134_receipts_replay_exactly_and_reject_changed_intent() {
+async fn conversation_goal_registered_134_through_135_receipts_replay_exactly_and_reject_changed_intent(
+) {
     let (db, owner) = full_substrate().await;
     let command = GoalUserCommand {
         owner,
