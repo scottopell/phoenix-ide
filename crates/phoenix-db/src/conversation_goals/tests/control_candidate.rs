@@ -49,6 +49,47 @@ async fn binding_is_current(db: &Database, turn: i64) -> bool {
 }
 
 #[tokio::test]
+async fn conversation_goal_control_candidate_replace_cannot_rewrite_receipt_rewind_or_recapture() {
+    let (_dir, db) = control_fixture().await;
+    accepted(&db, "release", 0, 1).await.unwrap();
+    bind_open(&db, 1, 1, 1).await.unwrap();
+    accepted(&db, "stop", 1, 2).await.unwrap();
+    accepted(&db, "release", 2, 3).await.unwrap();
+    assert!(sqlx::query("INSERT OR REPLACE INTO conversation_goal_control_bindings (owner_id,turn_id,workflow_id,control_version,principal_id,request_id) VALUES ('owner',1,1,3,?1,?2)")
+        .bind(vec![1_u8;16]).bind(vec![3_u8;16]).execute(db.pool()).await.is_err());
+    let version: i64 = sqlx::query_scalar(
+        "SELECT control_version FROM conversation_goal_control_bindings WHERE turn_id=1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(version, 1);
+    assert!(sqlx::query("INSERT OR REPLACE INTO conversation_goal_controls (owner_id,control_version,stopped,principal_id,request_id) VALUES ('owner',1,0,?1,?2)")
+        .bind(vec![1_u8;16]).bind(vec![1_u8;16]).execute(db.pool()).await.is_err());
+    assert_eq!(control_version(&db).await, Some((3, 0)));
+    let rejected = "INSERT INTO conversation_goal_control_requests (owner_id,principal_id,request_id,command,expected_control_version,outcome,rejection,result_control_version,result_stopped,recorded_at_us) VALUES ('owner',?1,?2,'stop',10,'rejected','control_version_conflict',3,0,10)";
+    sqlx::query(rejected)
+        .bind(vec![1_u8; 16])
+        .bind(vec![4_u8; 16])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(sqlx::query("INSERT OR REPLACE INTO conversation_goal_control_requests (owner_id,principal_id,request_id,command,expected_control_version,outcome,rejection,result_control_version,result_stopped,recorded_at_us) VALUES ('owner',?1,?2,'stop',10,'rejected','control_version_conflict',3,0,99)")
+        .bind(vec![1_u8; 16])
+        .bind(vec![4_u8; 16])
+        .execute(db.pool())
+        .await
+        .is_err());
+    let recorded: i64 = sqlx::query_scalar(
+        "SELECT recorded_at_us FROM conversation_goal_control_requests WHERE outcome='rejected'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(recorded, 10);
+}
+
+#[tokio::test]
 async fn conversation_goal_control_candidate_null_owner_cannot_bypass_receipt_foreign_key() {
     let (_dir, db) = control_fixture().await;
     let error = sqlx::query("INSERT INTO conversation_goal_controls (owner_id,control_version,stopped,principal_id,request_id) VALUES (NULL,1,0,?1,?2)")

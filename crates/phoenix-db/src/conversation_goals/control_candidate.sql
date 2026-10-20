@@ -90,6 +90,28 @@ WHEN NOT EXISTS (
       AND t.owns_conversation = 1 AND t.canonical_message_id IS NULL)
 BEGIN SELECT RAISE(ABORT, 'control binding must match open admission'); END;
 
+CREATE TRIGGER conversation_goal_control_requests_no_reinsert
+BEFORE INSERT ON conversation_goal_control_requests
+WHEN EXISTS (SELECT 1 FROM conversation_goal_control_requests r WHERE r.owner_id = NEW.owner_id
+    AND ((r.principal_id = NEW.principal_id AND r.request_id = NEW.request_id)
+        OR (r.outcome = 'accepted' AND NEW.outcome = 'accepted' AND r.result_control_version = NEW.result_control_version)))
+BEGIN SELECT RAISE(ABORT, 'control request is retained without replacement'); END;
+
+CREATE TRIGGER conversation_goal_control_bindings_no_reinsert
+BEFORE INSERT ON conversation_goal_control_bindings
+WHEN EXISTS (SELECT 1 FROM conversation_goal_control_bindings WHERE turn_id = NEW.turn_id)
+BEGIN SELECT RAISE(ABORT, 'control admission cannot be recaptured'); END;
+
+CREATE TRIGGER conversation_goal_controls_no_replace
+BEFORE INSERT ON conversation_goal_controls
+WHEN EXISTS (SELECT 1 FROM conversation_goal_controls old WHERE old.owner_id = NEW.owner_id
+    AND (NEW.control_version <> old.control_version + 1 OR NOT EXISTS (
+        SELECT 1 FROM conversation_goal_control_requests r WHERE r.owner_id = NEW.owner_id
+          AND r.principal_id = NEW.principal_id AND r.request_id = NEW.request_id
+          AND r.outcome = 'accepted' AND r.expected_control_version = old.control_version
+          AND r.result_control_version = NEW.control_version AND r.result_stopped = NEW.stopped)))
+BEGIN SELECT RAISE(ABORT, 'control state cannot be replaced by historical evidence'); END;
+
 CREATE TRIGGER conversation_goal_control_requests_no_update BEFORE UPDATE ON conversation_goal_control_requests
 BEGIN SELECT RAISE(ABORT, 'control request receipt is immutable'); END;
 CREATE TRIGGER conversation_goal_control_requests_no_delete BEFORE DELETE ON conversation_goal_control_requests
