@@ -2503,29 +2503,13 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
         facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).len(),
         1
     );
-    f.db.add_message(
-        "successful-summary",
-        &f.source.id,
-        &crate::MessageContent::continuation("successful summary"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    f.db.update_conversation_state(
-        &f.source.id,
-        &ConvState::ContextExhausted {
-            summary: "successful summary".into(),
-        },
-    )
-    .await
-    .unwrap();
+    continuation_candidate(&f).await;
     let (outcome, intent) =
         f.db.continue_conversation_with_intent(
             &f.source.id,
             crate::NewContinuationDispatchIntent::generated_predecessor_context(
-                ClientTurnKey::new("summary-successor-opening").unwrap(),
-                "successful summary".into(),
+                ClientTurnKey::new("federation-successor-first").unwrap(),
+                "source summary".into(),
             ),
         )
         .await
@@ -2537,7 +2521,7 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
     f.db.add_message(
         intent.message_id.as_str(),
         &successor.id,
-        &crate::MessageContent::continuation("successful summary"),
+        &crate::MessageContent::continuation("source summary"),
         None,
         None,
     )
