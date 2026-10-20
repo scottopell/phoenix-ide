@@ -2535,7 +2535,7 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
         panic!("successor required")
     };
     f.db.add_message(
-        &intent.message_id,
+        intent.message_id.as_str(),
         &successor.id,
         &crate::MessageContent::continuation("successful summary"),
         None,
