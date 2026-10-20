@@ -150,7 +150,7 @@ impl LlmClient for RenderingAnthropicClient {
                     telemetry,
                     "anthropic",
                     "test-model",
-                    phoenix_core::domain::llm_types::LlmTransport::Http,
+                    phoenix_core::domain::llm_types::LlmTransport::InProcess,
                 );
             }
             let _drop = PendingExternalDrop(pending.clone());

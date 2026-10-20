@@ -390,7 +390,7 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_provider_future() {
             .unwrap();
         assert_eq!(metrics.len(), 1);
         assert_eq!(
-            metrics[0].outcome,
+            metrics[0].metrics.outcome,
             phoenix_core::domain::llm_types::LlmAttemptOutcome::Cancelled
         );
         control(&db, &owner, ControlCommand::Release, 2).await;

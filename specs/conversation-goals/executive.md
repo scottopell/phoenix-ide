@@ -26,6 +26,14 @@ This partial result does **not** supersede the wholly passing exact2ec floor.
 Broad Rust, clippy and UI/specs are red; shared failures are not waived. One
 owned non-exhaustive control-error match is source-corrected here.
 
+Exact87b499e963bfc70c1727ac2086db63a484951e87 run **39358832109** also
+completed FAILED. Rust artifact **12236746272** contains two owned fixture
+compile failures in both normal and focused stages: `LlmRequestMetricsRow`
+requires `metrics.outcome`, and the in-process provider test named a nonexistent
+`LlmTransport::Http` variant. **Zero focused tests executed at exact87.** These
+fixture APIs are source-corrected after87; the partial exact4e result and wholly
+green exact2ec floor remain distinct, and neither qualifies the corrected source.
+
 The subsequent Stop-ordering and identity corrections remain source-only until
 an exact corrected-head run. No duplicate CI or local heavy execution was
 performed. Production stays Disabled, emitter None, route503; actual133 is
@@ -131,8 +139,9 @@ chat nor clears Stop. Four authored, unexecuted service tests cover attribution,
 held gates and historical retry, exact-input conflict, Stop preservation, actual
 history-insert rollback and auth/default-off boundaries. This is not public
 installation or State/AUQ/tools/UI/watch/automatic-continuation completion.
-The only active qualification run is parent-owned39358832109 at exact87; these
+Parent-owned39358832109 captured exact87 and is now terminal compile-red; these
 subsequent source changes are outside that captured head and are unqualified.
+No replacement or duplicate run has been dispatched by this writer.
 
 ## UserControl candidate source, not installed
 

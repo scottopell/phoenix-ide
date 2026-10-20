@@ -36,8 +36,14 @@ remains commissioned and unfinished; this checkpoint does not close the task.
 
 ## Authenticated Create and every-poll regression — next source unit
 
-Parent-owned CI39358832109 has captured exact87b499e963bfc70c1727ac2086db63a484951e87
-and remains the sole qualification run. Subsequent source is outside that run.
+Parent-owned CI39358832109 captured exact87b499e963bfc70c1727ac2086db63a484951e87
+and is now terminal FAILED. Downloaded Rust artifact12236746272 proves zero
+focused tests executed: both normal and focused compilation failed on the owned
+fixture's `LlmRequestMetricsRow.outcome` access and nonexistent `LlmTransport::Http`.
+The actual definitions select `metrics.outcome` and `InProcess`; both are source
+corrected after87. The Create leaf is local commitdea44a23824d485dafcfb5aefec25bef60401ef6,
+source-only and outside the captured87 head. This writer dispatched no duplicate
+run. Partial4e139/140 and wholly passing2ec127/127 remain distinct evidence.
 The requested minimal Goal/NoGoal future test returns Pending before a deferred
 send; Stop then Release must leave the old operation revoked with one inner
 poll and zero sends. Executive status limits this to synchronous every-poll
