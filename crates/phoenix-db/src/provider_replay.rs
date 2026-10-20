@@ -144,7 +144,13 @@ impl Database {
                 .bind(conversation_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
+        crate::coordinator_watches::record_wait_entry_tx(
+            &mut tx,
+            conversation_id,
+            state,
+            self.goal_control_installation,
+        )
+        .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let result = sqlx::query(
@@ -161,7 +167,13 @@ impl Database {
             return Err(DbError::ConversationNotFound(conversation_id.to_string()));
         }
         if previous_kind != crate::conv_state_kind(state) {
-            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
+            crate::record_initial_execution_outcome_tx(
+                &mut tx,
+                conversation_id,
+                state,
+                self.goal_control_installation,
+            )
+            .await?;
         }
         apply_replay_tx(&mut tx, conversation_id, update).await?;
         tx.commit().await?;
@@ -224,10 +236,16 @@ impl Database {
             self.goal_control_installation,
         )
         .await?;
-        let (state, state_updated_at) =
-            selected_state_tx(&mut tx, conversation_id, state, state_updated_at, replayed)
-                .await
-                .map_err(db_error)?;
+        let (state, state_updated_at) = selected_state_tx(
+            &mut tx,
+            conversation_id,
+            state,
+            state_updated_at,
+            replayed,
+            self.goal_control_installation,
+        )
+        .await
+        .map_err(db_error)?;
         if !replayed {
             apply_replay_tx(&mut tx, conversation_id, update).await?;
         }
@@ -331,7 +349,13 @@ impl Database {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
-        crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
+        crate::coordinator_watches::record_wait_entry_tx(
+            &mut tx,
+            conversation_id,
+            state,
+            self.goal_control_installation,
+        )
+        .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")

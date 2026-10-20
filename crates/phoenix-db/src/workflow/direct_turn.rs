@@ -2499,6 +2499,7 @@ impl WorkflowRepository {
                     &mut tx.tx,
                     occurrence.expect("guarded occurrence"),
                     &terminal,
+                    self.goal_control_installation,
                 )
                 .await?;
                 telemetry
@@ -2516,7 +2517,13 @@ impl WorkflowRepository {
                     "terminal command produced nonterminal outcome".to_string(),
                 ));
             };
-            settle_captured_execution_occurrence_tx(&mut tx.tx, occurrence, terminal).await?;
+            settle_captured_execution_occurrence_tx(
+                &mut tx.tx,
+                occurrence,
+                terminal,
+                self.goal_control_installation,
+            )
+            .await?;
         }
         if cut == TransactionCut::BeforeCommit {
             telemetry
@@ -2695,6 +2702,7 @@ impl WorkflowRepository {
                     .map(|projection| &projection.state),
                 Some(ConvState::ContextExhausted { .. })
             ),
+            self.goal_control_installation,
         )
         .await?;
         sqlx::query("DELETE FROM direct_turn_terminal_obligations WHERE turn_id = ?1")
@@ -3198,6 +3206,7 @@ async fn settle_captured_execution_occurrence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     occurrence: CapturedExecutionOccurrence,
     terminal: &TurnTerminal,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     let (terminal_kind, terminal_reason) = match terminal {
         TurnTerminal::Completed => ("Completed", None),
@@ -3213,6 +3222,7 @@ async fn settle_captured_execution_occurrence_tx(
         &occurrence.conversation_id,
         terminal_kind,
         terminal_reason,
+        installation,
     )
     .await?;
     sqlx::query("DELETE FROM steering_execution_occurrences WHERE message_id = ?1")
@@ -4023,7 +4033,7 @@ fn row_to_turn_stub(
         other => {
             return Err(DbError::Serialization(format!(
                 "unknown disposition {other}"
-            )))
+            )));
         }
     };
     let terminal_kind = row.get::<Option<String>, _>("terminal_kind");
@@ -4071,7 +4081,7 @@ fn row_to_turn_stub(
         Some(other) => {
             return Err(DbError::Serialization(format!(
                 "unknown terminal kind {other}"
-            )))
+            )));
         }
     };
     let expected_owns_conversation = matches!(

@@ -1,3 +1,4 @@
+import type { WatchGoalCapture } from '../generated/WatchGoalCapture';
 import { useLayoutEffect, useRef, type ReactNode } from 'react';
 import { Link as RouterLink, useLocation } from 'react-router-dom';
 import type { EventPresentation } from '../generated/EventPresentation';
@@ -5,6 +6,22 @@ import type { ConversationHighlight } from './MessageComponents';
 import { CopyButton } from './CopyButton';
 import { coordinatorConversationLinkState } from './conversationReturnOrigin';
 import './ConversationEventCard.css';
+
+function savedGoalText(capture: WatchGoalCapture | null): string[] {
+  if (capture === null) return [];
+  switch (capture.kind) {
+    case 'legacy_not_captured': return ['Goal facts: not captured (historical event)'];
+    case 'not_captured_disabled': return ['Goal facts: capture disabled at event time'];
+    case 'captured_no_goal': return [`Goal facts: no recorded goal · owner ${capture.owner_id} · v${capture.owner_version}`, 'Goal usage: unavailable (not captured)'];
+    case 'captured_saved_goal': return [
+      `Saved goal: ${capture.goal_id} · owner ${capture.owner_id} · v${capture.owner_version}`,
+      `Objective: ${capture.objective}`,
+      `Goal state: ${capture.state.kind}`,
+      ...('reason' in capture.state ? [`Goal reason: ${capture.state.reason}`] : []),
+      'Goal usage: unavailable (not captured)',
+    ];
+  }
+}
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function eventCardFragments(presentation: EventPresentation | null, eventId: string) {
@@ -34,6 +51,7 @@ export function eventCardFragments(presentation: EventPresentation | null, event
   const outcome = presentation.outcome;
   const labels = {
     turn_finished: 'Turn finished', failed: 'Failed', cleanup_failed: 'Cleanup failed',
+    goal_changed: 'Goal changed',
     cancelled: 'Cancelled', awaiting_user_response: 'Awaiting user response', awaiting_task_approval: 'Awaiting task approval',
   };
   const date = new Date(presentation.occurred_at_us / 1000);
@@ -47,6 +65,7 @@ export function eventCardFragments(presentation: EventPresentation | null, event
       `Transcript ID: ${presentation.source_transcript_id}`, `Occurrence kind: ${presentation.source_occurrence_kind}`,
       `Occurrence ID: ${presentation.source_occurrence_id}`, `Generation: ${presentation.source_generation}`,
       `Time (microseconds): ${presentation.occurred_at_us}`, `Provenance: ${presentation.provenance}`,
+      ...savedGoalText(presentation.goal_capture),
     ].join('\n'),
   };
 }

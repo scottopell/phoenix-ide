@@ -1,3 +1,5 @@
+mod local_watch;
+
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     conversation_goal::{

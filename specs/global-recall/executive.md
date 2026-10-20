@@ -1,5 +1,13 @@
 # Phoenix Coordinator — Executive Summary
 
+ADR-185 refines the locked installation boundary: the existing owner-propagated
+GoalControlInstallation policy defaults Disabled; schema 135 does not install
+a consumer. New local events distinguish disabled capture from legacy absence,
+observed NoGoal and saved goal. Disabled adds no goal SQL, capture child row or
+standalone event; Installed captures only newly inserted eligible subscription
+events. Mandatory Close/federation remain unchanged. These gate amendments are
+source-only; implementation/validation evidence is recorded separately below.
+
 ## Requirements Summary
 
 Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. The Coordinator obtains fresh relational facts on demand through `query_database`; ordinary requests contain no automatically injected activity snapshot. Both the Coordinator and write-capable ordinary ProductConversations receive bounded natural-language history search, conversation reading, read-only operational SQLite, and singular cross-conversation messaging; stable reference resolution remains Coordinator-only.
@@ -49,14 +57,17 @@ watched target emits a standalone goal-change occurrence. Normal execution
 occurrences are not deduplicated by goal version. Stop, continuation, mandatory
 Close and federation terminal-fact semantics remain unchanged.
 
-This is docs-first source, not watch implementation or execution evidence.
+The docs-first contract now has an authored bounded source candidate; it is not
+compiled or executed watch evidence.
 Standalone nonboundary-report coverage, remote goal-change fanout, usage
 accounting and automatic follow-through are deferred. Capture uses event-owned
 immutable evidence with explicit unavailable usage, not source-pinning foreign
 keys or current-state reprojection. Parent coordination reserved forward migration
-135; no registry entry or DDL is authored and imported SQL is untouched.
+135; its registry/runner/new capture DDL are authored but unexecuted review
+candidates, while imported SQL is untouched.
 Existing watch qualification below does not cover these additions. Transaction
-rollback, enrollment/retry, preservation, read-path and privacy tests remain owed.
+rollback, enrollment/retry, preservation and read-path tests are authored and
+unrun; new watch qualification and privacy-path execution remain owed.
 No new worker, startup installation, activation or local validation is included.
 
 ## Verification Summary

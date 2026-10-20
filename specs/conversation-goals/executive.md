@@ -1,11 +1,23 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
-## Bounded local typed-watch contract — docs first, implementation owed
+ADR-185 refines the locked installation boundary: the existing owner-propagated
+GoalControlInstallation policy defaults Disabled; schema 135 does not install
+a consumer. New local events distinguish disabled capture from legacy absence,
+observed NoGoal and saved goal. Disabled adds no goal SQL, capture child row or
+standalone event; Installed captures only newly inserted eligible subscription
+events. Mandatory Close/federation remain unchanged. These gate amendments are
+source-only; implementation/validation evidence is recorded separately below.
+
+## Bounded local typed-watch source — unexecuted review candidate
 
 REQ-GOAL-011–014, REQ-GR-015 and REQ-CEVT-006 now define the locked local
-watch increment. ADR-184 records causal ordering and failure ownership. This is
-a contract-only cut; no watch capture, fanout, schema, decoder or UI implementation
-is included, and no watch execution result is claimed.
+watch increment. ADR-184 records causal ordering/failure ownership; ADR-185
+locks explicit installation. Source now threads the owning installation enum
+through terminal, steering, creation, summary and wait helpers, captures only
+newly inserted local subscription events, and adds standalone settled Create/State
+obligations at their admitted write owners. Report checkpoints do not append
+standalone events. Stop, mandatory Close and federation semantics are unchanged.
+This source is **not compiled or executed** and has not passed independent review.
 
 | Contract | Implementation/verification boundary |
 |---|---|
@@ -20,9 +32,15 @@ accounting and automatic follow-through are deferred, not completed features.
 The cut does not install services, start another worker or activate normal
 startup. Parent migration coordination reserved **135** for this bounded local
 watch forward migration after checking the live federation stack and other
-owners. **No registry entry or DDL is authored** in this docs cut. Reservation
-is not import/stacking authority or execution evidence. Migrations 132/133/134
-and all other owners' SQL remain untouched.
+owners. Registry entry 135, an in-place CHECK-widening runner and new
+`coordinator_watches/goal_capture.sql` are authored candidates, not executed or
+approved migration evidence. No watch parent-table drop/rebuild is used, avoiding
+cascade deletion of retained delivery identities. The runner matches each expected
+CHECK exactly once, bumps schema version, applies event-owned capture DDL in the
+same transaction, checks FK/integrity before recording the ledger, and restores
+the existing writable-schema guard on return.
+Migrations 132/133/134 and all prior SQL remain byte-for-byte unchanged. Reservation
+is not import/stacking authority, consumer installation or execution evidence.
 
 Preservation review must inventory the latest `question_wait_outbox.sql` plus
 federation/retirement overlays, including wait/mandatory route constraints,
@@ -31,10 +49,58 @@ three message/steering/turn inbound origins, delivery identities and retirement
 dependencies. Tests must retain IDs, payloads, acceptance/continuation state and
 source-delete behavior, and distinguish legacy absence without live backfill.
 
-Docs use the existing locked transaction matrix; they add no Allium file or wire
-variant. Source inspection and whitespace checks are not executed validation.
-Spec-shape/Allium/anchor checks have not run on this docs cut; no local compiler,
-test, SQL, browser, Cargo metadata, push or CI dispatch is included.
+The source adds typed WatchGoalCapture/State/Usage, a local GoalChanged outcome,
+immutable capture marker/child storage, pending and historical event projections,
+LLM-bound factual diagnostics and existing event-card details/search metadata.
+Disabled returns before goal SQL or standalone fanout, persisting only its marker
+on ordinary existing events; legacy is distinct and never backfilled. Relevant
+capture failure propagates through the owning transaction. There is no usage
+ledger, source-pinning capture FK, live goal reprojection, second worker or startup
+installer. Existing report/terminal transactions are not claimed atomic together.
+
+Authored tests cover disabled boundary helpers with unavailable goal SQL, policy
+propagation, four capture cases, immutable historical state/reason, same-version
+distinct execution events, standalone replay/enrollment/rollback, actual report
+checkpoint → wait and report → terminal failure ownership, deferred nonboundary
+reports, and Stop/cancellation independence. Migration tests author real pre-135
+upgrade with delivery identities, all three populated inbound origins, wait and
+mandatory rows, retirement receipt, ledger/root preservation, forced partial-DDL
+failure/retry, unexpected CHECK rejection, pooled reparse, FK and integrity checks.
+API/UI tests author saved-fact wire/search/render cases and unsafe/incomplete
+payload rejection. These tests have **not run**; omission of execution evidence
+is not a waiver or a passing migration/coverage claim.
+
+Final source inspection corrected the API payload test constructor/conversion,
+required generations in authored raw event fixtures, the pre-135 base-schema
+bootstrap, and the populated mandatory-Close fixture to use its genuine failure
+record and existing append helper. Preservation assertions compare all retained
+columns across outbox/delivery identities, all three inbound origins, workflows,
+retirement, Close and goal tables, plus schema/ledger/root state; forced rollback
+also compares schema_version. An authored deletion test reads saved capture from
+historical presentation after source removal and checks child event lifetime.
+These are **unrun assertions**, not migration or source-delete qualification.
+Static inbound-FK inspection includes subscription_delivery_identities and
+coordinator_event_feature_retirements pointing to the event parent, the three
+message/steering/turn origin references pointing to delivery identities, and the
+new event-owned capture/back-reference. No existing parent or inbound definition
+is rebuilt or rewritten by migration 135.
+
+Direct rustfmt parsing/formatting of owned Rust sources was separately authorized;
+it is not compiler or runtime qualification. Unrelated formatter-only changes
+were removed. Source whitespace and anchor inspection are the only other local
+checks. No local compiler, tests, SQL, browser, Cargo metadata, push or CI dispatch
+is included.
+
+Generated TypeScript is deliberately **not hand-edited**. This source imports the
+new exports and is not a qualified UI/buildable cut until authentic codegen is
+captured. Parent's approved route is immutable review, then one existing guarded
+hosted run as explicit codegen-capture/diagnostic: its always-retained Rust artifact
+already includes hash-bound `target/codegen-scratch/**/*.ts`. Only after actual
+Rust compilation/codegen success and artifact completeness verification may the
+sole writer import those exact exports with source/run provenance, commit/review,
+and enter one corrective guarded qualification. A failed codegen run supplies no
+valid export claim. Freshness stays unchanged; no new harness, lane, resources,
+parallel CI or stale-UI qualification waiver is introduced.
 
 ## Latest executed floor — ordinary UI and focused backend, not typed watch
 

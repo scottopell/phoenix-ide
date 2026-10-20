@@ -420,9 +420,17 @@ pub(crate) async fn selected_state_tx(
     state: &ConvState,
     state_updated_at: DateTime<Utc>,
     replayed: bool,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> Result<(ConvState, DateTime<Utc>)> {
     if !replayed {
-        crate::persist_tool_round_state_tx(tx, conversation_id, state, state_updated_at).await?;
+        crate::persist_tool_round_state_tx(
+            tx,
+            conversation_id,
+            state,
+            state_updated_at,
+            installation,
+        )
+        .await?;
         return Ok((state.clone(), state_updated_at));
     }
     let row = sqlx::query("SELECT state,state_updated_at FROM conversations WHERE id=?")

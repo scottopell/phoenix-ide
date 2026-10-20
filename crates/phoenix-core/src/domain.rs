@@ -34,4 +34,5 @@ pub mod sm_state;
 pub mod tool_availability;
 pub mod tool_result_identity;
 pub mod tool_wire;
+pub mod watch_goal;
 pub mod work_scope_inventory;

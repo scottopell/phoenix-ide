@@ -26,7 +26,7 @@ WHEN a reader follows an event's conversation link, THE SYSTEM SHALL use the can
 
 ## REQ-CEVT-006 — Saved goal facts without outcome reinterpretation
 
-WHEN a local subscription event carries goal facts under `specs/conversation-goals/requirements.md` REQ-GOAL-011 through REQ-GOAL-014, THE SYSTEM SHALL project the event-owned saved facts, not a later current goal or an admission-time execution binding. The presentation SHALL distinguish a captured goal (owner, immutable identity/objective, owner/status version, state and exact reason), captured absence of a goal, historical facts not captured, and explicitly unavailable usage.
+WHEN a local subscription event carries goal facts under `specs/conversation-goals/requirements.md` REQ-GOAL-011 through REQ-GOAL-014, THE SYSTEM SHALL project the event-owned saved facts, not a later current goal or an admission-time execution binding. The presentation SHALL distinguish a captured goal (owner, immutable identity/objective, owner/status version, state and exact reason), captured absence of a goal, event-time capture disabled by installation policy, legacy historical facts not captured, and explicitly unavailable usage. Disabled capture SHALL NOT be interpreted as NoGoal or enriched after installation changes.
 
 THE SYSTEM SHALL keep goal facts separate from the event's execution, wait or goal-change outcome. A completed execution SHALL remain “Turn finished” regardless of saved goal state. A standalone goal-change event SHALL be identified as a goal change, not execution completion, permission to execute, or an instruction to recover or continue.
 

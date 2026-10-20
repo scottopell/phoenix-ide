@@ -429,6 +429,13 @@ pub struct WorkflowRepository {
 }
 
 impl WorkflowRepository {
+    #[cfg(test)]
+    pub(crate) fn goal_control_installation_for_tests(
+        &self,
+    ) -> crate::conversation_goals::control::GoalControlInstallation {
+        self.goal_control_installation
+    }
+
     pub(crate) async fn begin_tx(&self) -> DbResult<WorkflowTx<'_>> {
         Ok(WorkflowTx::new(self.pool.begin().await?))
     }
@@ -2682,7 +2689,7 @@ fn parse_capability(kind: &str, stable_command_id: Option<i64>) -> DbResult<Exec
         other => {
             return Err(DbError::Serialization(format!(
                 "unknown capability kind: {other}"
-            )))
+            )));
         }
     })
 }

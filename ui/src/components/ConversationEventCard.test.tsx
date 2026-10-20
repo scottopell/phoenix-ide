@@ -1,3 +1,4 @@
+import type { WatchGoalCapture } from '../generated/WatchGoalCapture';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen } from '@testing-library/react';
@@ -15,7 +16,7 @@ vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValu
 const available = {
   status: 'available', event_id: 'event-exact', product_conversation_id: 'product-1', display_name: 'Fix routing',
   source_transcript_id: 'transcript-exact', source_occurrence_kind: 'turn', source_occurrence_id: 'occurrence-exact',
-  source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
+  source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', goal_capture: { kind: 'not_captured_disabled' }, outcome: { kind: 'turn_finished' },
 } satisfies EventPresentation;
 const original = '[original provider text]\nTask complete is not inferred.';
 function Location() {
@@ -191,5 +192,52 @@ describe('instance-qualified subscription events', () => {
     mount({ status: 'unavailable', event_id: federatedFact.event_id, reason: 'redacted' });
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
     expect(screen.queryByText('Remote conversation · 11111111')).not.toBeInTheDocument();
+  });
+});
+
+const savedGoal = {
+  kind: 'captured_saved_goal', owner_id: 'product-1', goal_id: 'immutable-goal', objective: '  exact objective  ',
+  owner_version: 4, state: { kind: 'blocked', reason: '  exact blocked reason  ' }, usage: 'unavailable_not_captured',
+} satisfies WatchGoalCapture;
+
+describe('saved local goal event facts', () => {
+  it('keeps execution completion independent of a saved blocked goal and exposes exact searchable evidence', () => {
+    const event = { ...available, goal_capture: savedGoal } satisfies EventPresentation;
+    const { container } = mount(event, 'event-provenance');
+    expect(screen.getByText('Turn finished')).toBeVisible();
+    const provenance = container.querySelector('[data-fragment-id="event-provenance"]')!;
+    expect(provenance.textContent).toContain('Objective:   exact objective  ');
+    expect(provenance.textContent).toContain('Goal reason:   exact blocked reason  ');
+    expect(provenance.textContent).toContain('Goal state: blocked');
+    expect(provenance.textContent).toContain('Goal usage: unavailable (not captured)');
+    expect(provenance.textContent).not.toContain('budget consumed');
+    expect(buildConversationSearchProjection([{ kind: 'user', key: 'msg', message: message(event) }], 'exact blocked reason').matches).toHaveLength(1);
+  });
+  it.each([
+    { kind: 'legacy_not_captured' }, { kind: 'not_captured_disabled' },
+    { kind: 'captured_no_goal', owner_id: 'product-1', owner_version: 0, usage: 'unavailable_not_captured' },
+    savedGoal,
+  ] satisfies WatchGoalCapture[])('retains distinct saved case $kind through the typed message boundary', (goal_capture) => {
+    const event = { ...available, goal_capture };
+    const payload = { sequence_id: 400, opening: null, message: message(event) };
+    expect(v.parse(SseMessageDataSchema, payload).message.event_presentation).toEqual(event);
+    const text = eventCardFragments(event, available.event_id).provenance;
+    if (goal_capture.kind === 'not_captured_disabled') {
+      expect(text).toContain('capture disabled at event time');
+      expect(text).not.toContain('no recorded goal');
+    }
+  });
+  it('labels only the explicit standalone occurrence Goal changed, with no execution implication', () => {
+    mount({ ...available, goal_capture: savedGoal, source_occurrence_kind: 'goal_change', source_occurrence_id: 'product-1', source_generation: 4, outcome: { kind: 'goal_changed' } });
+    expect(screen.getByText('Goal changed')).toBeVisible();
+    expect(screen.queryByText('Turn finished')).not.toBeInTheDocument();
+  });
+  it('rejects unsafe or incomplete captured facts rather than fabricating an absence', () => {
+    for (const goal_capture of [
+      { ...savedGoal, owner_version: Number.MAX_SAFE_INTEGER + 1 },
+      { ...savedGoal, owner_version: 0 }, { ...savedGoal, owner_id: 'foreign-owner' }, { ...savedGoal, state: { kind: 'complete' } },
+      { ...savedGoal, state: { kind: 'blocked', reason: '' } },
+      { ...savedGoal, usage: 0 }, { kind: 'not_captured_disabled', objective: 'fabricated' },
+    ]) expect(v.safeParse(EventPresentationSchema, { ...available, goal_capture }).success).toBe(false);
   });
 });

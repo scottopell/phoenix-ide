@@ -345,6 +345,14 @@ impl Database {
             self.goal_control_installation(),
         )
         .await?;
+        crate::coordinator_watches::goal_facts::settled_change_tx(
+            &mut tx,
+            self.goal_control_installation(),
+            &entry,
+            expected_transcript,
+        )
+        .await
+        .map_err(GoalDbError::from)?;
         tx.commit().await?;
         Ok(GoalUserReceipt {
             request_id: input.request_id,

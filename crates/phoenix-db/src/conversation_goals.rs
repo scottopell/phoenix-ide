@@ -567,6 +567,12 @@ impl Database {
         at: GoalTimestampUs,
     ) -> Result<GoalHistoryEntry> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let replayed = match self.goal_control_installation {
+            control::GoalControlInstallation::Disabled => false,
+            control::GoalControlInstallation::Installed => {
+                retry_tx(&mut tx, mutation).await?.is_some()
+            }
+        };
         let accepted = apply_goal_tx(
             &mut tx,
             mutation,
@@ -575,6 +581,17 @@ impl Database {
             self.goal_control_installation,
         )
         .await?;
+        if !replayed && !matches!(&mutation.change, GoalChange::Report { .. }) {
+            if let Some(transcript) = expected_transcript {
+                crate::coordinator_watches::goal_facts::settled_change_tx(
+                    &mut tx,
+                    self.goal_control_installation,
+                    &accepted,
+                    transcript,
+                )
+                .await?;
+            }
+        }
         tx.commit().await?;
         Ok(accepted)
     }

@@ -5774,6 +5774,7 @@ impl Database {
             conversation_id,
             "Cancelled",
             None,
+            self.goal_control_installation,
         )
         .await?;
         tx.commit().await?;
@@ -6504,6 +6505,7 @@ impl Database {
                 &source,
                 "Failed",
                 Some(error),
+                self.goal_control_installation,
             )
             .await?;
             tx.commit().await?;
@@ -6660,8 +6662,15 @@ impl Database {
             &now_text,
         )
         .await?;
-        classify_creation_watch_outcome(&mut tx, job_id, conversation_id, claim.generation, state)
-            .await?;
+        classify_creation_watch_outcome(
+            &mut tx,
+            job_id,
+            conversation_id,
+            claim.generation,
+            state,
+            self.goal_control_installation,
+        )
+        .await?;
         clear_creation_job_attachments(&mut tx, job_id).await?;
         tx.commit().await?;
         let message = Message {
@@ -6728,8 +6737,15 @@ impl Database {
             &now,
         )
         .await?;
-        classify_creation_watch_outcome(&mut tx, job_id, conversation_id, claim.generation, state)
-            .await?;
+        classify_creation_watch_outcome(
+            &mut tx,
+            job_id,
+            conversation_id,
+            claim.generation,
+            state,
+            self.goal_control_installation,
+        )
+        .await?;
         clear_creation_job_attachments(&mut tx, job_id).await?;
         tx.commit().await?;
         Ok(CreationCasOutcome::Applied)
@@ -7541,7 +7557,13 @@ impl Database {
                 .fetch_one(&mut *tx)
                 .await?;
 
-        coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
+        coordinator_watches::record_wait_entry_tx(
+            &mut tx,
+            id,
+            state,
+            self.goal_control_installation,
+        )
+        .await?;
 
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -7558,7 +7580,8 @@ impl Database {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         if previous_kind != conv_state_kind(state) {
-            record_initial_execution_outcome_tx(&mut tx, id, state).await?;
+            record_initial_execution_outcome_tx(&mut tx, id, state, self.goal_control_installation)
+                .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -8040,6 +8063,7 @@ impl Database {
             conversation_id,
             terminal_kind,
             terminal_reason,
+            self.goal_control_installation,
         )
         .await?;
         tx.commit().await?;
@@ -10183,10 +10207,16 @@ impl Database {
         } else {
             insert_fork_proposal_tx(&mut tx, proposal).await?;
         }
-        let (state, state_updated_at) =
-            selected_state_tx(&mut tx, origin_conv_id, state, state_updated_at, replayed)
-                .await
-                .map_err(db_error)?;
+        let (state, state_updated_at) = selected_state_tx(
+            &mut tx,
+            origin_conv_id,
+            state,
+            state_updated_at,
+            replayed,
+            self.goal_control_installation,
+        )
+        .await
+        .map_err(db_error)?;
         if !replayed {
             if let Some(update) = update {
                 provider_replay::apply_replay_tx(&mut tx, origin_conv_id, update).await?;
@@ -10299,6 +10329,7 @@ impl Database {
             state,
             state_updated_at,
             replayed,
+            self.goal_control_installation,
         )
         .await
         .map_err(conversation_goals::round::db_error)?;
@@ -15808,8 +15839,9 @@ async fn persist_tool_round_state_tx(
     conversation_id: &str,
     state: &ConvState,
     state_updated_at: DateTime<Utc>,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
-    coordinator_watches::record_wait_entry_tx(tx, conversation_id, state).await?;
+    coordinator_watches::record_wait_entry_tx(tx, conversation_id, state, installation).await?;
     let state_json = serde_json::to_string(state).unwrap();
     let result = sqlx::query(
         "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
@@ -15998,10 +16030,16 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
     state: &ConvState,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     if let ConvState::RecoverableContinuationFailure { failure } = state {
-        return crate::coordinator_watches::record_summary_failure_tx(tx, conversation_id, failure)
-            .await;
+        return crate::coordinator_watches::record_summary_failure_tx(
+            tx,
+            conversation_id,
+            failure,
+            installation,
+        )
+        .await;
     }
     let steering: Option<(String, String)> = sqlx::query_as(
         "SELECT message_id, source_kind FROM steering_execution_occurrences WHERE conversation_id = ?1 AND source_kind IN ('steering', 'seeded_fork', 'interaction_response')",
@@ -16046,6 +16084,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
                 conversation_id,
                 kind,
                 reason,
+                installation,
             )
             .await?;
             sqlx::query("DELETE FROM steering_execution_occurrences WHERE conversation_id = ?1")
@@ -16068,6 +16107,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
             conversation_id,
             generation,
             state,
+            installation,
         )
         .await?;
     }
@@ -16080,6 +16120,7 @@ async fn classify_creation_watch_outcome(
     conversation_id: &str,
     generation: u64,
     state: &ConvState,
+    installation: conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     let (terminal_kind, reason) = match state {
         ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => ("Completed", None),
@@ -16113,6 +16154,7 @@ async fn classify_creation_watch_outcome(
         conversation_id,
         terminal_kind,
         reason,
+        installation,
     )
     .await
 }

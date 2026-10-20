@@ -409,6 +409,7 @@ async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_
         &f.source.id,
         "Completed",
         None,
+        crate::conversation_goals::control::GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -440,6 +441,7 @@ async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_
             &f.source.id,
             category,
             None,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -452,6 +454,7 @@ async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_
         "Failed",
         None,
         false,
+        crate::conversation_goals::control::GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -462,6 +465,7 @@ async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_
         &f.source.id,
         "Failed",
         None,
+        crate::conversation_goals::control::GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();

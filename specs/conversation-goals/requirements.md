@@ -215,10 +215,17 @@ THE SYSTEM SHALL NOT treat an existing result row alone as proof of an identical
 
 ### REQ-GOAL-011 — Saved current facts at a local watch occurrence
 
-WHEN an enrolled local watch records a genuine execution-terminal or wait-entry occurrence
+WHEN explicitly installed goal consumers record a newly inserted eligible local subscription execution-terminal or wait-entry occurrence
 THE SYSTEM SHALL capture the ordinary owner's current persisted goal facts in that occurrence's owning transaction, independently of the execution outcome and admission-time report binding.
 
-THE SYSTEM SHALL distinguish a captured current goal, captured absence of a goal with its observed owner version, and a historical event for which goal facts were not captured.
+THE SYSTEM SHALL distinguish four persisted event-time cases: a captured current goal, captured absence of a goal with its observed owner version, capture disabled by explicit installation policy, and legacy historical facts not captured. Disabled and legacy cases SHALL NOT mean NoGoal, and later installation SHALL NOT enrich or reclassify them.
+
+THE SYSTEM SHALL require the existing `GoalControlInstallation` policy from the owning Database or WorkflowRepository at each capture/fanout boundary. Normal constructors SHALL remain Disabled. Schema presence, migration application, current goals, control rows and environment guesses SHALL NOT install a consumer.
+
+WHILE goal consumers are Disabled
+THE SYSTEM SHALL retain existing execution/wait notifications with an immutable disabled marker, SHALL NOT read goal SQL or create goal-capture child rows, and SHALL NOT append standalone goal-change events. Standalone fanout SHALL return before querying.
+
+THE SYSTEM SHALL capture only newly inserted eligible local subscription events when Installed, not deduplication conflicts, mandatory Close routes or federation terminal facts.
 
 WHEN a current goal is captured
 THE SYSTEM SHALL retain its ordinary owner identity, immutable goal identity and objective, monotonic owner/status version, factual state and exact state reason where present, including inactive states.
@@ -229,7 +236,7 @@ THE SYSTEM SHALL identify usage as explicitly unavailable because it was not cap
 
 ### REQ-GOAL-012 — One causal notification owner
 
-WHEN an accepted settled Create/State mutation changes a watched ordinary owner without a target execution boundary
+WHEN explicitly installed goal consumers accept a settled Create/State mutation that changes a watched ordinary owner without a target execution boundary
 THE SYSTEM SHALL append a distinct local goal-change obligation in the same owning transaction as the accepted mutation and its retained result.
 
 THE SYSTEM SHALL identify this standalone occurrence by ordinary owner, accepted status version and retained watch enrollment identity, SHALL retain the existing subscription delivery identity, and SHALL create no additional occurrence for a rejected mutation, exact accepted retry or re-enrollment replay.

@@ -12,6 +12,7 @@ use phoenix_core::work_scope::WorkScopeId;
 use super::{DbError, DbResult, ProjectSeedId};
 
 mod federated_subscriptions;
+mod local_goal_watch;
 mod retire_commission_review;
 mod settle_historical_continuation;
 
@@ -687,6 +688,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 134,
         name: "durable_conversation_goal_user_control",
         sql: MIGRATION_134,
+    },
+    Migration {
+        version: 135,
+        name: "local_watch_goal_capture",
+        sql: include_str!("coordinator_watches/goal_capture.sql"),
     },
 ];
 
@@ -12174,6 +12180,11 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 135 {
+            local_goal_watch::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
         if migration.version == 130 {
             run_migration_130(pool, migration).await?;
             applied += 1;

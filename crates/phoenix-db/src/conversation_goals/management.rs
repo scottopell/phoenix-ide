@@ -330,6 +330,13 @@ pub(super) async fn finalize_tx(
     .await
     {
         Ok(entry) => {
+            crate::coordinator_watches::goal_facts::settled_change_tx(
+                &mut savepoint,
+                installation,
+                &entry,
+                transcript,
+            )
+            .await?;
             let result = accepted_result(intent.source(), &entry, duration)?;
             savepoint.commit().await?;
             Ok(result)

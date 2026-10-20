@@ -40,6 +40,7 @@ pub struct EventPresentationPayload {
     pub outcome: EventOutcome,
     pub occurred_at_us: i64,
     pub provenance: EventProvenance,
+    pub goal_capture: Option<phoenix_core::domain::watch_goal::WatchGoalCapture>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -52,6 +53,7 @@ pub enum EventOutcome {
     Cancelled,
     AwaitingUserResponse,
     AwaitingTaskApproval,
+    GoalChanged,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -150,6 +152,7 @@ impl From<WatchEventPresentation> for EventPresentationPayload {
             source_occurrence_id: event.source_occurrence_id,
             source_generation: event.source_generation,
             occurred_at_us: event.occurred_at_us,
+            goal_capture: event.goal_capture,
             outcome: match event.outcome {
                 WatchOutcome::Completed => EventOutcome::TurnFinished,
                 WatchOutcome::Failed { reason } => EventOutcome::Failed { reason },
@@ -157,6 +160,7 @@ impl From<WatchEventPresentation> for EventPresentationPayload {
                 WatchOutcome::Cancelled => EventOutcome::Cancelled,
                 WatchOutcome::AwaitingUserResponse => EventOutcome::AwaitingUserResponse,
                 WatchOutcome::AwaitingTaskApproval => EventOutcome::AwaitingTaskApproval,
+                WatchOutcome::GoalChanged => EventOutcome::GoalChanged,
             },
             provenance: match event.provenance {
                 WatchEventProvenance::Subscription => EventProvenance::Subscription,
@@ -298,7 +302,7 @@ async fn federated_navigation(
         _ => {
             return FederatedEventNavigation::Unavailable {
                 reason: FederatedNavigationUnavailableReason::MissingConnection,
-            }
+            };
         }
     };
     let Some((stable_path, source_path)) = locator else {

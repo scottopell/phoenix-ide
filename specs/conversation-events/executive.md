@@ -1,23 +1,35 @@
 # Conversation events — implementation and qualification
 
+ADR-185 refines the locked installation boundary: the existing owner-propagated
+GoalControlInstallation policy defaults Disabled; schema 135 does not install
+a consumer. New local events distinguish disabled capture from legacy absence,
+observed NoGoal and saved goal. Disabled adds no goal SQL, capture child row or
+standalone event; Installed captures only newly inserted eligible subscription
+events. Mandatory Close/federation remain unchanged. These gate amendments are
+source-only; implementation/validation evidence is recorded separately below.
+
 Implemented on the compact-conversation-events branch; not a deployment or merge claim. Durable metadata joins and typed presentation are separate from persisted diagnostic evidence. Available EventPresentation fields are flattened beside `status: available`; unavailable carries event_id/reason. EnrichedMessage.event_presentation is explicitly nullable. Genuine ts-rs exports are checked in, not handwritten.
 
-## Bounded local goal facts — contract-only extension
+## Bounded local goal facts — unexecuted source candidate
 
 REQ-CEVT-006 and ADR-184 specify saved goal metadata on existing local watch
-packets and standalone settled Create/State events. This extension is not
-implemented or executed. No wire variant, generated export, decoder, event card,
-mandatory Close route or federation terminal-fact protocol changes are included
-in the contract cut.
+packets and standalone settled Create/State events. Rust wire metadata, local
+GoalChanged outcome, runtime decoder and existing card details/search source are
+authored but unexecuted. Mandatory Close and federation terminal-fact payloads
+are unchanged. No generated export is hand-edited: authentic hosted codegen must
+supply new WatchGoalCapture/State/Usage and changed event exports before corrected
+UI qualification. The existing freshness guard is not waived.
 
 Saved current facts, observed absence and legacy not-captured must remain
 distinct; usage is explicitly unavailable. Execution outcomes keep their own
 meaning, including “Turn finished.” Existing authenticated read paths,
 unavailable fallback, shared redaction and source navigation remain authoritative.
-New DB/API/wire/UI tests and coordinated migration preservation are owed under
-`../conversation-goals/executive.md`; existing presentation evidence below does
-not qualify this extension. No local validation, activation or browser run was
-performed for these docs.
+New DB/API/wire/UI tests and migration preservation cases are authored, not run;
+remaining qualification is tracked in `../conversation-goals/executive.md`.
+Existing presentation evidence below does not qualify this extension. Only
+source inspection, whitespace checks and separately authorized owned Rust
+formatting occurred locally; no compiler, test, SQL, browser, activation or
+Cargo metadata run supplies evidence for this candidate.
 
 ## Verification
 

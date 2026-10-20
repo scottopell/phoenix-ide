@@ -138,4 +138,5 @@ not manually edit generated exports or alter provider diagnostic originals.
 - [ADR-070](070_trusted-input-provenance-and-global-watches.md): existing watch lane.
 - [ADR-182](182_immutable-conversation-goals-use-owner-version-fences.md): immutable goals and no objective revisions.
 - [ADR-183](183_owner-goal-controls-reference-accepted-command-receipts.md): independent command receipts.
+- [ADR-185](185_goal-control-installation-is-an-explicit-owner-policy.md): explicit owner policy for local goal-control installation.
 - [ADR-180](180_federated-subscriptions-carry-bounded-terminal-facts.md) and [ADR-181](181_federated-subscriptions-end-with-their-source.md): unchanged federation boundary.
