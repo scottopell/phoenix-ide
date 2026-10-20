@@ -7,6 +7,7 @@ use phoenix_core::domain::conversation_goal::{
 
 const CANDIDATE: &str = include_str!("../../../../user_control_candidate.sql");
 
+#[path = "user_control_upgrade/registered.rs"]
 mod registered;
 
 type ActorRow = (

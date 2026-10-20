@@ -1,5 +1,41 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest actual134 qualification — exact91 module resolution and registry grammar failures
+
+Parent run **39393190783**, exact
+`91ff9f77bde08c3be5ac8e1730458fdf9732828c`, is **terminal failed**, artifact
+**12251126226**, with **zero focused tests executed**. Rust E0583 and Cargo fmt
+could not resolve the new `registered` child from its path-attributed parent.
+The source correction explicitly points to `user_control_upgrade/registered.rs`.
+Standalone rustfmt traverses that child successfully after the correction; this
+is module-resolution/format evidence, not compilation or test execution. Child
+imports were audited against explicit goal-domain imports, root fixture imports,
+and the parent chain's Database/message/checkpoint/report/owner/replay helpers.
+The earlier bounded review missed the module path; compiler evidence supersedes it.
+
+The completed Clippy118529529748 and UI118529529732 logs were inspected. E2E
+passed, but UI/specs **did not fully pass**:1098 dev.py unit tests had2failures,
+2errors and1skip. All four roots reject the actual candidate migration registry.
+The new inline134 `concat!` expression is outside both deployment helpers' existing
+strict grammar. The correction names the same expression `MIGRATION_134` outside
+the registry and uses `sql: MIGRATION_134` inside, matching existing supported
+constant entries. Control SQL, newline and user-control SQL remain identical;
+no executable SQL, ledger identity, parser grammar, protected hash policy or
+qualified-target128 fence is changed. Shared Clippy12lib/15lib-test summaries
+remain unwaived; no hidden inventory is declared clean.
+
+Two authored Python regressions check the actual134 registry under ordinary
+parsing and preserve protected-target rejection: launchd uses
+`qualified_current_target=False` for exact134-name/full-ledger inspection, then
+requires the ordinary default protected qualification to reject newer targets;
+systemd checks ordinary parsing and target128 rejection even with the fixture's
+reviewed hash matched. No helper policy or production deployment is changed.
+
+This is a coherent source correction, not newly qualified134. Only standalone
+rustfmt, whitespace, source/API/import review and immutable-file comparisons ran;
+no compiler/tests/SQL/browser, push, new CI, activation or resource expansion.
+185/185 remains the focused floor **only at d4c**. Eleven stashes are preserved.
+
 ## Independent ca49 review corrections — exact FK timing and migrated fixture inventory
 
 Review found two pre-execution blockers in the134 registration cut. The actor

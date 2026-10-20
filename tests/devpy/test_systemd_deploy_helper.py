@@ -2301,6 +2301,22 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                     helper.activate(mutated, ctl)
                 self.assertNotIn("stop", ctl.events)
 
+    def test_actual_registry134_named_sql_parses_only_as_ordinary_target(self):
+        manifest = self.protected()
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        artifact = helper.Artifact(str(actual_registry), digest(actual_registry))
+        ordinary = dataclasses.replace(
+            manifest, mode="ordinary", manifest_version=1, controller_source_commit=None,
+            controller_helper=None, release_asset_name=None, release_asset_sha256=None,
+            registry=artifact,
+        )
+        ledger = helper.candidate_registry(ordinary)
+        self.assertEqual(ledger[-1], (134, "durable_conversation_goal_user_control"))
+        protected = dataclasses.replace(manifest, registry=artifact)
+        with mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", artifact.sha256):
+            with self.assertRaisesRegex(helper.ActivationError, "exact qualified target128"):
+                helper.candidate_registry(protected)
+
     def test_actual_registry_with_migration129_is_rejected_by_protected_fixture(self):
         manifest = self.protected()
         actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"

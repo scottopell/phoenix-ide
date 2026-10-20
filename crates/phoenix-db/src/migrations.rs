@@ -686,13 +686,15 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 134,
         name: "durable_conversation_goal_user_control",
-        sql: concat!(
-            include_str!("conversation_goals/control_candidate.sql"),
-            "\n",
-            include_str!("conversation_goals/user_control_candidate.sql"),
-        ),
+        sql: MIGRATION_134,
     },
 ];
+
+const MIGRATION_134: &str = concat!(
+    include_str!("conversation_goals/control_candidate.sql"),
+    "\n",
+    include_str!("conversation_goals/user_control_candidate.sql"),
+);
 
 async fn run_migration_130(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;

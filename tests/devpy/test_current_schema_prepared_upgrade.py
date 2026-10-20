@@ -585,6 +585,14 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
 
         self.assertEqual(ledger, tuple(compiled_ledger()))
 
+    def test_actual_registry134_named_sql_parses_without_qualifying_protected_target(self) -> None:
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        ledger = helper.migration_registry(actual_registry, qualified_current_target=False)
+        self.assertEqual(ledger[-1], (134, "durable_conversation_goal_user_control"))
+        self.assertEqual(ledger, tuple(compiled_ledger(through=None)))
+        with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
+            helper.migration_registry(actual_registry)
+
     def test_candidate_registry_must_contain_qualified_source_baseline(self) -> None:
         for source_kind, baseline in (("prepared_artifact", 123), ("published_release", 114)):
             for migrated in (False, True):

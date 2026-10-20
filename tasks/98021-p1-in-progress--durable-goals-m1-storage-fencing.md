@@ -1,5 +1,26 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual91 zero-execution module and registry-expression correction
+
+Parent39393190783 exact91 terminalFAIL/artifact12251126226/ZEROFOCUSED. E0583+
+fmtfailed childregistered defaultpath with #[path]parent. Explicitchildpath
+user_control_upgrade/registered.rs nowstandalonerustfmtTRAVERSEDsuccessful, not
+compiler/testclaim. Registeredimports audited againstcoregoal/rootfixtures/parent
+Database/report/checkpoint/owner/replayhelpers; earlierstaticreviewmissedpath.
+
+ReadcompletedClippy118529529748/UI118529529732 logs. E2EPASS, UI/specsNOTfullPASS:
+1098devpytests2fail2err1skip, fouractualregistryINVALIDroots. Inlineconcat134 is
+outsideexistingstrictlaunchd/systemd grammars. LiftIDENTICALconcat into named
+MIGRATION_134 outsidearray, registryusesidentifier. Nohelperparser/policychange,
+protected128fence/hashrelaxation, executableSQLbytes/ledgerchanges. Twoauthored
+actualregistryregressions ensureordinary134exactname parse andprotectednewer128
+rejection; helperhashmock onlyexistingreviewedfixturepattern. SharedClippy12/15
+tailsummaryredunwaived; nohiddeninventorycleanclaim.
+
+Onlystandaloneformat/whitespace/import-sourceAPI/immutablechecks;0compiler/tests
+SQLbrowser/newCI/push/activation/resources.134sourceNOTqualified185floorONLYd4c,
+11stashes132immutable/defaultOFF unchanged. Returncoherent91..nextcut forreview.
+
 ## ca49 independent review corrections before134 qualification
 
 Two P1sourceblockers corrected: valid UserControl actor uses actualcontrol_*columns
