@@ -483,7 +483,7 @@ mod tests {
             collision,
             "other",
             &"https://other.example".parse().unwrap(),
-            &credential('f'),
+            &PeerBearerCredential::parse(format!("phx_peer_{}", "f".repeat(43))).unwrap(),
             &PeerTlsTrust::PlatformRoots,
         )
         .await

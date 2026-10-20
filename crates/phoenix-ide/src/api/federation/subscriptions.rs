@@ -495,7 +495,7 @@ pub(crate) async fn unsubscribe_saved_peer(
     unsubscribe_remote(db, &peer, &remote).await
 }
 
-async fn unsubscribe_remote(
+pub(crate) async fn unsubscribe_remote(
     db: &Database,
     peer: &FederationPeerConnection,
     remote: &RemoteSubscription,

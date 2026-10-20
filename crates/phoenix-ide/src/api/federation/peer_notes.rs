@@ -121,9 +121,7 @@ async fn put_notes(
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
-    use phoenix_core::domain::instance_identity::{
-        InstanceId, PeerBearerCredential, PeerTlsTrust, SecretExpose,
-    };
+    use phoenix_core::domain::instance_identity::{InstanceId, PeerBearerCredential, PeerTlsTrust};
     use tower::ServiceExt;
 
     async fn app() -> (axum::Router, AppState) {
@@ -244,7 +242,7 @@ mod tests {
                 "GET",
                 &path,
                 Some("owner-test-password"),
-                serde_json::Value::Null,
+                &serde_json::Value::Null,
             )
             .await;
             assert_eq!(status, StatusCode::OK);
@@ -272,7 +270,7 @@ mod tests {
             "GET",
             "/api/federation/peers",
             Some("owner-test-password"),
-            serde_json::Value::Null,
+            &serde_json::Value::Null,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
