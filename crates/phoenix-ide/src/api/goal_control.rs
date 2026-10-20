@@ -181,7 +181,10 @@ fn command_error(error: &GoalCommandServiceError) -> ApiError {
             StatusCode::CONFLICT,
             "goal command admission changed or is fenced",
         ),
-        error => {
+        error @ (GoalCommandServiceError::Storage(_)
+        | GoalCommandServiceError::Goal(_)
+        | GoalCommandServiceError::HostIdentity(_)
+        | GoalCommandServiceError::Clock) => {
             tracing::error!(%error, "goal command or factual read failed");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "goal persistence failed")
         }

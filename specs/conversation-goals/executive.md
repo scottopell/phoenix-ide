@@ -33,13 +33,14 @@ same bounded SQL/decoder as the existing raw history reader; existing raw-reader
 fixture semantics are unchanged. Reads deliberately do not use mutation/Close
 admission or infer goal completion from conversation state.
 
-Six new `conversation_goal_private_install_*` router tests are authored for
-default-OFF/auth ordering/all-or-nothing installation, guest/peer/header/DTO
-spoof rejection and canonical/coordinator rejection, host attribution and exact
-replay, Stop preservation and factual blocker reasons, genuine continuation and
-live-Close read/write fences, settled product/acceptance gates, and bounded typed
-history pagination with no read-side rows/chat. They are **not executed or
-qualified** in this source cut. Completed-History read eligibility is source-only:
+Six `conversation_goal_private_install_*` router tests cover default-OFF/auth
+ordering/all-or-nothing installation, guest/peer/header/DTO spoof rejection and
+canonical/coordinator rejection, host attribution and exact replay, Stop
+preservation and factual blocker reasons, genuine continuation and live-Close
+read/write fences, settled product/acceptance gates, and bounded typed history
+pagination with no read-side rows/chat. All six and the typed admission-mapper
+unit test **passed at exact `022ec5fd02e423614ed305f3bc97e01f30a6b36d`** in the
+hosted focused qualification described below. Completed-History read eligibility is source-only:
 the canonical read path admits its lifecycle, but the new tests do not execute
 full Close retirement. No fake Close phase/ledger fixture substitutes for that
 coverage. A separate authored mapper unit regression covers both direct-storage
@@ -49,14 +50,22 @@ fixture uses the existing test-support `create_conversation` API with its actual
 parent ID, preserving inherited ProductConversation identity and transcript-alias
 rejection without an invented subagent constructor. No UI, watch/outbox delivery or normal-startup installation is added.
 
-The latest hosted focused receipt is **198/198 at exact
-`21364ad088eaee872e1d84a7bc8360eedad2c0f0`** with captured full-workspace harnesses
-(run `39413982513`, artifact `12262104375`, 236.989 seconds). Owned Python command
-assertions and UI/specs/e2e also passed there. That receipt does not qualify this
-new source cut and does not imply isolated-three-package build equivalence.
-Overall CI remained red: the broad 1500-second run was partial (5313/5496 ran,
-5280 passed, 33 failed, 191 skipped), and Clippy remained red. These are unwaived;
-production activation remains OFF. The dated paragraphs below retain earlier
+The latest hosted focused receipt is **205/205 at exact
+`022ec5fd02e423614ed305f3bc97e01f30a6b36d`** with captured full-workspace harnesses
+(run `39421627851`, artifact `12265740941`, 181.846 seconds, 3384 skipped).
+Capture took 187.6 seconds, codegen reuse 1.9 seconds, and the codegen-stale
+check passed. Command-budget, UI/specs, and e2e passed. This supersedes the
+198-test focused floor at `21364` without implying isolated-three-package build
+equivalence or transferring qualification to later edits.
+
+Overall CI remained red. Broad execution completed: 5503 ran, 5473 passed,
+30 failed, and 191 skipped in 1207.529 seconds. All 30 failures remain unwaived.
+Clippy remained red, including two owned findings: the API error mapper's
+future-variant wildcard and a manually constructed empty string in the live-Close
+test. A bounded follow-up explicitly enumerates the remaining error variants
+and uses `String::new()`; those lint fixes have not yet been typechecked or
+executed. Shared Clippy findings are not waived. Production activation remains
+OFF. The dated paragraphs below retain earlier
 checkpoint history, not newer qualification claims.
 
 ## Latest actual134 qualification — exact778 SQL-safe-string compile failure

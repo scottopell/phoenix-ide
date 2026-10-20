@@ -452,7 +452,7 @@ async fn conversation_goal_private_install_continuation_live_close_and_history_r
         .unwrap();
     let before = counts(&state.db).await;
     for (method, suffix, body) in [
-        (Method::POST, "".to_owned(), create_body(Uuid::new_v4(), 2)),
+        (Method::POST, String::new(), create_body(Uuid::new_v4(), 2)),
         (
             Method::POST,
             "/state".to_owned(),

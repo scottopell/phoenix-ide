@@ -84,6 +84,28 @@ the actual installed nextest version; unsupported output fails closed.
 
 ## Verification status
 
+### Latest hosted receipt: exact `022ec5fd`
+
+[Run 39421627851](https://github.com/scottopell/phoenix-ide/actions/runs/39421627851)
+passed **205/205 focused tests in 181.846 seconds** (3384 skipped) at exact
+`022ec5fd02e423614ed305f3bc97e01f30a6b36d`, using the captured full-workspace
+harnesses. This includes all six private-install router tests and the typed
+admission-error mapper regression. Artifact `12265740941` retains the actual
+qualification evidence. Capture took 187.6 seconds; codegen reuse took 1.9
+seconds and the stale check passed. Command-budget, UI/specs, and e2e passed.
+
+Broad execution **completed**, with 5503 run, 5473 passed, 30 failed, and 191
+skipped in 1207.529 seconds. All 30 failures remain unwaived; this is not an
+overall-green receipt. Clippy remained red, including two owned findings now
+corrected in source without suppressions: explicit remaining error variants in
+the API mapper and `String::new()` in its test. Those later edits are not yet
+qualified. The 205-test floor belongs only to exact `022ec5fd`; full-workspace
+semantics do not establish isolated-three-package build equivalence. Default
+OFF and normal-startup services-uninstalled behavior remain unchanged.
+Completed-History retirement coverage remains source-only.
+
+### Earlier checkpoint: exact `41fe2041`
+
 Hosted [run 39409786797](https://github.com/scottopell/phoenix-ide/actions/runs/39409786797)
 qualified **198/198 focused tests in 231.127 seconds** at exact commit
 `41fe2041f368aab45ec319c1029e44b71412857e`, using the captured full-workspace
