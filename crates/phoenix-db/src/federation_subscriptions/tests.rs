@@ -2520,7 +2520,7 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
     )
     .await
     .unwrap();
-    let (outcome, _) =
+    let (outcome, intent) =
         f.db.continue_conversation_with_intent(
             &f.source.id,
             crate::NewContinuationDispatchIntent::generated_predecessor_context(
@@ -2530,11 +2530,12 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
         )
         .await
         .unwrap();
+    let intent = intent.expect("continuation dispatch intent");
     let crate::ContinueOutcome::Created(successor) = outcome else {
         panic!("successor required")
     };
     f.db.add_message(
-        "summary-successor-opening",
+        &intent.message_id,
         &successor.id,
         &crate::MessageContent::continuation("successful summary"),
         None,

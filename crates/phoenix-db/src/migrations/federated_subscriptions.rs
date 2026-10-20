@@ -134,13 +134,6 @@ mod tests {
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO coordinator_roots(product_conversation_id,name) VALUES (?1,'historical')",
-        )
-        .bind(target.product_conversation_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
         db.watch_product_conversation(&source.product_conversation_id)
             .await
             .unwrap();
