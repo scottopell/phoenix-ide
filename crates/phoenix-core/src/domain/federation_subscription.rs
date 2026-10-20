@@ -8,7 +8,8 @@ use super::{
 /// A sequence position, not an event identity. Zero precedes all future facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "i64", into = "i64")]
-pub struct SubscriptionCursor(i64);
+#[derive(schemars::JsonSchema)]
+pub struct SubscriptionCursor(#[schemars(range(min = 0))] i64);
 impl SubscriptionCursor {
     pub const START: Self = Self(0);
     /// The committed sequence position represented by this cursor.
@@ -35,6 +36,7 @@ impl From<SubscriptionCursor> for i64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum TerminalFactOutcome {
     Completed,
     Failed,
@@ -64,6 +66,7 @@ impl TryFrom<&str> for TerminalFactOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct SubscriptionReference {
     pub instance_id: InstanceId,
     pub product_conversation_id: ProductConversationId,
@@ -71,18 +74,21 @@ pub struct SubscriptionReference {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionCurrentState {
     Nonterminal,
     Terminal { outcome: TerminalFactOutcome },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct SubscriptionSnapshot {
     pub transcript_id: TranscriptConversationId,
     pub state: SubscriptionCurrentState,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct FederatedTerminalFact {
     pub event_id: uuid::Uuid,
     pub sequence: SubscriptionCursor,
@@ -92,6 +98,7 @@ pub struct FederatedTerminalFact {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct SubscriptionGap {
     pub requested_after: SubscriptionCursor,
     pub resume_after: SubscriptionCursor,
@@ -99,6 +106,7 @@ pub struct SubscriptionGap {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionDelivery {
     Fact { fact: FederatedTerminalFact },
     Gap { gap: SubscriptionGap },
@@ -128,6 +136,7 @@ impl SubscriptionDelivery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionAuthorization {
     Authorized { authorization_id: uuid::Uuid },
     Rejected { reason: SubscriptionEnd },
@@ -171,6 +180,7 @@ impl SubscriptionCurrentState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionEnd {
     Unsubscribed,
     Revoked,
@@ -178,6 +188,7 @@ pub enum SubscriptionEnd {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionReplay {
     Facts { events: Vec<FederatedTerminalFact> },
     Gap { gap: SubscriptionGap },
@@ -186,6 +197,7 @@ pub enum SubscriptionReplay {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionState {
     Active,
     Unsubscribed,

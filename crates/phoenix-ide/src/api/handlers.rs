@@ -591,6 +591,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/federation/enrollments",
             post(super::federation::issue_enrollment),
         )
+        .merge(super::federation::owner::router())
         .merge(super::federation::peer_notes::router())
         .route(
             "/api/federation/peers/import",
@@ -695,6 +696,12 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::send_conversation_message).layer(DefaultBodyLimit::max(
                 super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
             )),
+        )
+        .route(
+            "/api/federation/peer/send-authored-conversation-message",
+            post(super::federation::send_authored_conversation_message).layer(
+                DefaultBodyLimit::max(super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES),
+            ),
         )
         .route(
             "/api/federation/peer/query-database",

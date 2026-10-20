@@ -31,7 +31,7 @@ pub struct ResolveGlobalReferenceRequest {
     pub reference: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResolveGlobalReferenceResponse {
     pub reference: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub href: Option<String>,
@@ -40,11 +40,13 @@ pub struct ResolveGlobalReferenceResponse {
     pub path_owner_instance_id: Option<phoenix_core::domain::instance_identity::InstanceId>,
     pub related_references:
         Vec<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub source_call: Option<phoenix_core::domain::db_schema::SourceToolCall>,
     pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum ResolvedWorkScope {
     Missing,
     Unavailable {
@@ -64,6 +66,7 @@ pub enum ResolvedWorkScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum WorkScopeUnavailableReason {
     RecordNotFound,
     InvalidRecord,
@@ -72,6 +75,7 @@ pub enum WorkScopeUnavailableReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum ResolvedEnvironmentKind {
     CoordinatorHome,
     AllocatedWorktree,
@@ -81,6 +85,7 @@ pub enum ResolvedEnvironmentKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum ServerPathSemantics {
     ServerFilesystem,
 }
@@ -1529,7 +1534,7 @@ async fn ordinary_product_citation(
         }))
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct QualifiedConversationRead {
     pub requested: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub resolved: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
@@ -1542,20 +1547,22 @@ pub struct QualifiedConversationRead {
     pub stable_navigation: Option<QualifiedSearchNavigation>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct QualifiedSearchSender {
     pub stable: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub exact: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub source_call: Option<phoenix_core::domain::db_schema::SourceToolCall>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum QualifiedSearchNavigation {
     AppLocal { path: String },
     Peer { url: String },
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct QualifiedSearchHit {
     pub source: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub source_navigation: Option<QualifiedSearchNavigation>,
@@ -2107,6 +2114,7 @@ fn remote_qualified_sender(
     let transcript_id = TranscriptConversationId::parse(transcript_id)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     Ok(Some(QualifiedSearchSender {
+        source_call: origin.source_call().cloned(),
         stable: QualifiedConversationReference::new(instance_id, stable_target),
         exact: QualifiedConversationReference::new(
             instance_id,
@@ -2161,6 +2169,7 @@ async fn qualified_search_sender(
     let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(transcript_id)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     Ok(Some(QualifiedSearchSender {
+        source_call: origin.source_call().cloned(),
         stable: QualifiedConversationReference::new(instance_id, stable_target),
         exact: QualifiedConversationReference::new(
             instance_id,
@@ -2808,6 +2817,7 @@ async fn resolved_product_reference(
             .or(aggregate.root.conversation.slug.clone()),
         work_scope: current.work_scope,
         path_owner_instance_id: None,
+        source_call: None,
         related_references,
         summary: format!(
             "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
@@ -3031,6 +3041,7 @@ async fn resolve_conversation(
         title: title.clone(),
         work_scope: resolve_work_scope(service, &conv).await,
         path_owner_instance_id: None,
+        source_call: None,
         related_references: Vec::new(),
         summary: format!(
             "conversation {} updated {} state {}",
@@ -3051,7 +3062,12 @@ async fn resolve_message(
         .db
         .get_message_by_id(message_id)
         .await
-        .map_err(|_| AppError::NotFound("message reference target not found".to_string()))?;
+        .map_err(|error| match error {
+            DbError::MessageNotFound(_) => {
+                AppError::NotFound("message reference target not found".to_string())
+            }
+            other => AppError::Internal(other.to_string()),
+        })?;
     if message.conversation_id != conv.id {
         return Err(AppError::NotFound(
             "message reference target not found".to_string(),
@@ -3076,13 +3092,11 @@ async fn resolve_message(
         } => {
             let mut references =
                 qualified_transcript_references(service, [transcript_id.as_str()]).await?;
-            references.push(
-                qualified_reference(
-                    service,
-                    stable_reference_target(service, product_conversation_id.clone()).await?,
-                )
-                .await?,
-            );
+            match stable_reference_target(service, product_conversation_id.clone()).await {
+                Ok(target) => references.push(qualified_reference(service, target).await?),
+                Err(AppError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
             references
         }
         phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { .. }
@@ -3120,6 +3134,7 @@ async fn resolve_message(
         title,
         work_scope: resolve_work_scope(service, &conv).await,
         path_owner_instance_id: None,
+        source_call: message.origin.source_call().cloned(),
         related_references,
         summary: format!(
             "{}{} message {} in @transcript:{} at {}: {}",
@@ -3216,6 +3231,7 @@ async fn resolve_chain(
         title: root.title.clone().or(root.slug.clone()),
         work_scope,
         path_owner_instance_id: None,
+        source_call: None,
         related_references,
         summary: format!(
             "legacy chain rooted at @transcript:{root_id} with {} member(s); current/latest {}; ordered members: {}",
@@ -3293,6 +3309,7 @@ async fn resolve_work(
         title: Some(title),
         work_scope: resolve_work_scope(service, current).await,
         path_owner_instance_id: None,
+        source_call: None,
         related_references,
         summary: format!(
             "work reference identity; root @transcript:{}; current/latest @transcript:{}; current state {}; state updated {}; conversation updated {}; archived {}",
@@ -4192,6 +4209,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_hidden_read_batches_terminate_with_monotonic_cursor() {
+        use phoenix_core::domain::db_schema::MessageContent;
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("all-hidden", "all-hidden", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..READ_MESSAGE_BATCH * 2 + 1 {
+            db.add_message(
+                &format!("all-hidden-{index}"),
+                &conv.id,
+                &MessageContent::user("invisible"),
+                Some(&serde_json::json!({"hidden": true})),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mut cursor = 0;
+        for page in 0..3 {
+            let (content, next, evidence) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_conversation_page_by_sequence(&db, &conv, cursor, "evidence", false),
+            )
+            .await
+            .expect("hidden pages must terminate")
+            .unwrap();
+            assert!(evidence.is_empty());
+            assert!(!content.contains("invisible"));
+            if page < 2 {
+                let next = next.expect("remaining scanned rows require a cursor");
+                assert!(next > cursor);
+                cursor = next;
+            } else {
+                assert!(next.is_none());
+                assert!(content.contains("(end of conversation)"));
+            }
+        }
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::render_message_page(&db, &conv, 0),
+        )
+        .await
+        .expect("legacy hidden scan must terminate")
+        .unwrap();
+        assert_eq!(body, "(end of conversation)");
+    }
+
+    #[tokio::test]
     async fn remote_page_cursor_advances_past_hidden_only_batch() {
         use phoenix_core::domain::db_schema::MessageContent;
 
@@ -4369,6 +4435,12 @@ mod tests {
                     source_call: None,
                 }
             };
+            let origin = origin
+                .with_source_call_columns(
+                    Some("same-source-message".into()),
+                    Some("remote-exact-tool".into()),
+                )
+                .unwrap();
             let mut cache = std::collections::HashMap::from([(
                 product.clone(),
                 Some(if coordinator {
@@ -4390,6 +4462,11 @@ mod tests {
                 .unwrap();
             assert_eq!(sender.stable.instance_id, remote_instance);
             assert_eq!(sender.exact.instance_id, remote_instance);
+            assert_eq!(sender.source_call, origin.source_call().cloned());
+            assert_eq!(
+                sender.source_call.as_ref().unwrap().tool_use_id,
+                "remote-exact-tool"
+            );
             assert_eq!(
                 sender.stable.target,
                 if coordinator {
@@ -4596,6 +4673,196 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("closed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn message_resolution_keeps_exact_sender_after_delete_and_on_remote_collision() {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget,
+            db_schema::{InputOrigin, MessageContent, SourceToolCall},
+            instance_identity::InstanceId,
+        };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let reader = db
+            .create_conversation("resolve-reader", "resolve-reader", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let sender = db
+            .create_conversation("resolve-sender", "resolve-sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let remote_instance = InstanceId::new();
+        let call = SourceToolCall {
+            message_id: "recorded-source-message".into(),
+            tool_use_id: "recorded-source-tool".into(),
+        };
+        let origins = [
+            InputOrigin::InternalConversation {
+                product_conversation_id: sender.product_conversation_id.clone(),
+                transcript_id: sender.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            },
+            InputOrigin::RemoteConversation {
+                instance_id: remote_instance,
+                product_conversation_id: reader.product_conversation_id.clone(),
+                transcript_id: reader.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id: remote_instance,
+                product_conversation_id: reader.product_conversation_id.clone(),
+                transcript_id: reader.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            },
+        ];
+        for (index, origin) in origins.iter().enumerate() {
+            db.add_message_with_seq_and_origin(
+                &format!("resolve-input-{index}"),
+                &reader.id,
+                i64::try_from(index + 1).unwrap(),
+                &MessageContent::user("retained input"),
+                None,
+                None,
+                origin,
+            )
+            .await
+            .unwrap();
+        }
+        db.delete_conversation(&sender.id).await.unwrap();
+        assert_eq!(
+            db.product_conversation_kind(&sender.product_conversation_id)
+                .await
+                .unwrap(),
+            None
+        );
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let local_instance = db.instance_id().await.unwrap();
+        for (index, _) in origins.iter().enumerate() {
+            let result = super::resolve_message(
+                &service,
+                reader.clone(),
+                &format!("resolve-input-{index}"),
+                false,
+            )
+            .await
+            .unwrap();
+            let (instance, transcript) = if index == 0 {
+                (local_instance, &sender.id)
+            } else {
+                (remote_instance, &reader.id)
+            };
+            assert_eq!(result.source_call, Some(call.clone()));
+            assert!(result.related_references.iter().any(|reference| reference.instance_id == instance && matches!(&reference.target, ConversationReferenceTarget::Transcript { transcript_id } if transcript_id.as_str() == transcript)));
+            assert_eq!(
+                result.related_references.len(),
+                if index == 0 { 1 } else { 2 }
+            );
+            let wire = serde_json::to_value(&result).unwrap();
+            let decoded: super::ResolveGlobalReferenceResponse =
+                serde_json::from_value(wire).unwrap();
+            assert_eq!(decoded.source_call, Some(call.clone()));
+        }
+        db.pool().close().await;
+        assert!(matches!(
+            super::stable_reference_target(&service, sender.product_conversation_id).await,
+            Err(crate::api::handlers::AppError::Internal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_resolution_surfaces_sender_classification_database_errors() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let reader = db
+            .create_conversation(
+                "classification-error",
+                "classification-error",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: reader.product_conversation_id.clone(),
+            transcript_id: reader.id.clone(),
+            source_call: None,
+        };
+        db.add_message_with_seq_and_origin(
+            "classification-error-input",
+            &reader.id,
+            1,
+            &MessageContent::user("retained message"),
+            None,
+            None,
+            &origin,
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE product_conversations RENAME COLUMN kind TO unavailable_kind")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let error = super::resolve_message(&service, reader, "classification-error-input", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::api::handlers::AppError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn local_search_sender_preserves_recorded_call_for_ordinary_and_coordinator() {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let ordinary = db
+            .create_conversation("call-sender", "call-sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let instance = db.instance_id().await.unwrap();
+        for (index, conv) in [ordinary, coordinator].iter().enumerate() {
+            let call = SourceToolCall {
+                message_id: "same-message".into(),
+                tool_use_id: format!("exact-tool-{index}"),
+            };
+            let origin = InputOrigin::InternalConversation {
+                product_conversation_id: conv.product_conversation_id.clone(),
+                transcript_id: conv.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            };
+            let message_id = format!("recorded-call-{index}");
+            db.add_message_with_seq_and_origin(
+                &message_id,
+                &conv.id,
+                1,
+                &MessageContent::user("recorded sender"),
+                None,
+                None,
+                &origin,
+            )
+            .await
+            .unwrap();
+            let recorded = db.get_message_by_id(&message_id).await.unwrap();
+            assert_eq!(recorded.origin.source_call(), Some(&call));
+            let sender = super::qualified_search_sender(
+                &db,
+                instance,
+                &recorded.origin,
+                &mut std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(sender.source_call, Some(call.clone()));
+            let wire = serde_json::to_value(&sender).unwrap();
+            assert_eq!(wire["source_call"]["tool_use_id"], call.tool_use_id);
+            let decoded: super::QualifiedSearchSender = serde_json::from_value(wire).unwrap();
+            assert_eq!(decoded.source_call, Some(call));
+        }
     }
 
     #[tokio::test]

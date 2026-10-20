@@ -1,6 +1,7 @@
 use super::TestInstance;
 use crate::api::federation::{
-    send_remote_conversation_message, RemoteMessageAcceptance, RemoteMessageText,
+    send_remote_authored_conversation_message, send_remote_conversation_message,
+    RemoteAuthoredSendMessageRequest, RemoteMessageAcceptance, RemoteMessageText,
     RemoteSendDisposition, RemoteSendMessageRequest, RemoteSendMessageResponse, RemoteSendReceipt,
     RemoteSendRejectionCode, RemoteSendTarget, RemoteSenderAttestation,
 };
@@ -27,7 +28,6 @@ fn request(destination: InstanceId, target: RemoteSendTarget) -> RemoteSendMessa
         target,
         message_id: uuid::Uuid::new_v4(),
         message: RemoteMessageText::parse("literal @conv:do-not-expand".into()).unwrap(),
-        sender: RemoteSenderAttestation::RemoteApi {},
     }
 }
 
@@ -82,6 +82,7 @@ async fn stored_payload(receiver: &TestInstance, id: &str) -> PreparedDirectTurn
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn https_send_requires_peer_auth_and_checks_destination_and_closed_body() {
     let caller = TestInstance::start().await;
     let receiver = TestInstance::start().await;
@@ -132,11 +133,25 @@ async fn https_send_requires_peer_auth_and_checks_destination_and_closed_body() 
     let valid = serde_json::to_value(&request).unwrap();
     for (field, value) in [
         ("source_instance_id", serde_json::json!(InstanceId::new())),
+        ("caller_instance_id", serde_json::json!(InstanceId::new())),
+        ("instance_id", serde_json::json!(InstanceId::new())),
+        (
+            "sender",
+            serde_json::json!({"kind":"coordinator", "product_conversation_id":"forged-coordinator", "transcript_id":"forged-source", "source_call":{"message_id":"forged-message", "tool_use_id":"forged-call"}}),
+        ),
+        (
+            "sender",
+            serde_json::json!({"kind":"conversation", "product_conversation_id":"forged-conversation", "transcript_id":"forged-source", "source_call":{"message_id":"forged-message", "tool_use_id":"forged-call"}}),
+        ),
+        ("sender", serde_json::json!({"kind":"remote_api"})),
         ("message", serde_json::json!("x".repeat(32 * 1024 + 1))),
         ("message_id", serde_json::json!("invalid")),
     ] {
         let mut invalid = valid.clone();
         invalid[field] = value;
+        if field == "sender" {
+            invalid["target"] = serde_json::json!({"kind":"coordinator"});
+        }
         let response = receiver
             .client
             .post(&endpoint)
@@ -146,6 +161,13 @@ async fn https_send_requires_peer_auth_and_checks_destination_and_closed_body() 
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        if field == "sender" {
+            assert!(response
+                .text()
+                .await
+                .unwrap()
+                .contains("unknown field `sender`"));
+        }
     }
     let mut oversized = valid;
     oversized["message"] = serde_json::json!("x".repeat(257 * 1024));
@@ -158,6 +180,110 @@ async fn https_send_requires_peer_auth_and_checks_destination_and_closed_body() 
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let response = receiver
+        .client
+        .post(&endpoint)
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response: RemoteSendMessageResponse = response.json().await.unwrap();
+    assert!(matches!(
+        response.receipt,
+        RemoteSendReceipt::Accepted { .. }
+    ));
+    assert_eq!(
+        stored_payload(&receiver, &target.id).await.submitted.origin,
+        InputOrigin::RemoteApi {
+            instance_id: caller.state.db.instance_id().await.unwrap()
+        }
+    );
+    caller.stop().await;
+    receiver.stop().await;
+}
+
+#[tokio::test]
+async fn https_authored_send_rejects_api_senders_and_instance_claims() {
+    let caller = TestInstance::start().await;
+    let receiver = TestInstance::start().await;
+    let source = ordinary(&caller, "authored-source").await;
+    let target = ordinary(&receiver, "authored-target").await;
+    let peer = caller.connect_to(&receiver).await;
+    let api_request = request(
+        peer.peer_instance_id,
+        RemoteSendTarget::Transcript {
+            transcript_id: TranscriptConversationId::parse(target.id.clone()).unwrap(),
+        },
+    );
+    let sender = RemoteSenderAttestation::from_conversation(
+        source,
+        SourceToolCall {
+            message_id: "source-assistant".into(),
+            tool_use_id: "source-send-call".into(),
+        },
+    )
+    .unwrap();
+    let authored = RemoteAuthoredSendMessageRequest::from_message(api_request.clone(), sender);
+    let endpoint = receiver.endpoint("api/federation/peer/send-authored-conversation-message");
+    assert_eq!(
+        receiver
+            .client
+            .post(&endpoint)
+            .json(&authored)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let valid = serde_json::to_value(authored).unwrap();
+    let mut malformed = vec![serde_json::to_value(api_request).unwrap()];
+    for sender in [
+        serde_json::json!({"kind":"remote_api"}),
+        serde_json::json!({"kind":"conversation", "product_conversation_id":"source", "transcript_id":"source", "source_call":null}),
+        serde_json::json!({"kind":"coordinator", "product_conversation_id":"source", "transcript_id":"source"}),
+        serde_json::json!({"kind":"conversation", "product_conversation_id":"source", "transcript_id":"source", "source_call":{"message_id":"half-call"}}),
+        serde_json::json!({"kind":"conversation", "product_conversation_id":"source", "transcript_id":"source", "source_call":{"message_id":"m", "tool_use_id":"t", "instance_id":InstanceId::new()}}),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["sender"] = sender;
+        malformed.push(invalid);
+    }
+    for field in [
+        "source_instance_id",
+        "caller_instance_id",
+        "instance_id",
+        "origin",
+        "extra",
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = serde_json::json!(InstanceId::new());
+        malformed.push(invalid);
+        let mut invalid = valid.clone();
+        invalid["sender"][field] = serde_json::json!(InstanceId::new());
+        malformed.push(invalid);
+    }
+    for invalid in malformed {
+        let response = receiver
+            .client
+            .post(&endpoint)
+            .bearer_auth(peer.bearer_credential.expose())
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert!(receiver
+        .state
+        .db
+        .workflow_repository()
+        .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(target.id))
+        .await
+        .unwrap()
+        .is_none());
     caller.stop().await;
     receiver.stop().await;
 }
@@ -208,7 +334,7 @@ async fn https_tool_same_local_and_remote_ids_are_not_self_and_replays_bind_inst
     assert_eq!(accepted.submitted.text, "literal @conv:do-not-expand");
     assert_eq!(accepted.delivery.text, accepted.submitted.text);
     assert!(
-        matches!(&accepted.submitted.origin, InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, source_call:Some(call) } if *instance_id == caller_id && product_conversation_id == &source.product_conversation_id && transcript_id == &source.id && call.tool_use_id == "source-send-call")
+        matches!(&accepted.submitted.origin, InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, source_call:Some(call) } if *instance_id == caller_id && product_conversation_id == &source.product_conversation_id && transcript_id == &source.id && call.message_id == "source-assistant" && call.tool_use_id == "source-send-call")
     );
     let output = tool
         .run(
@@ -222,15 +348,21 @@ async fn https_tool_same_local_and_remote_ids_are_not_self_and_replays_bind_inst
         RemoteSendReceipt::Duplicate { .. }
     ));
     assert_eq!(acceptance(&response), acceptance(&replay));
+    let mut api_replay = request(peer.peer_instance_id, response.target.clone());
+    api_replay.message_id = id;
+    let api_replay = send_remote_conversation_message(&caller.state.db, &peer, &api_replay)
+        .await
+        .unwrap();
+    assert!(matches!(
+        api_replay.receipt,
+        RemoteSendReceipt::Rejected {
+            code: RemoteSendRejectionCode::IdempotencyConflict,
+            ..
+        }
+    ));
     assert_eq!(
-        stored_payload(&receiver, &target.id)
-            .await
-            .submitted
-            .origin
-            .source_call()
-            .unwrap()
-            .tool_use_id,
-        "source-send-call"
+        stored_payload(&receiver, &target.id).await.submitted.origin,
+        accepted.submitted.origin
     );
 
     receiver
@@ -265,9 +397,9 @@ async fn https_tool_same_local_and_remote_ids_are_not_self_and_replays_bind_inst
     .unwrap();
     let mut conflict = request(peer.peer_instance_id, response.target);
     conflict.message_id = id;
-    conflict.sender = sender;
+    let conflict = RemoteAuthoredSendMessageRequest::from_message(conflict, sender);
     let changed_instance =
-        send_remote_conversation_message(&other_caller.state.db, &other_peer, &conflict)
+        send_remote_authored_conversation_message(&other_caller.state.db, &other_peer, &conflict)
             .await
             .unwrap();
     assert!(matches!(
@@ -416,28 +548,31 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         .await
         .unwrap()
         .unwrap();
+    let caller_id = caller.state.db.instance_id().await.unwrap();
     for target in [
         RemoteSendTarget::Coordinator {},
         RemoteSendTarget::Transcript {
             transcript_id: TranscriptConversationId::parse(coordinator_id.clone()).unwrap(),
         },
     ] {
-        for sender in [
-            RemoteSenderAttestation::RemoteApi {},
-            RemoteSenderAttestation::from_conversation(
-                source.clone(),
-                SourceToolCall {
-                    message_id: "source".into(),
-                    tool_use_id: "call".into(),
-                },
-            )
-            .unwrap(),
-        ] {
-            let mut denied = request(peer.peer_instance_id, target.clone());
-            denied.sender = sender;
-            let response = send_remote_conversation_message(&caller.state.db, &peer, &denied)
+        let denied = request(peer.peer_instance_id, target);
+        let api_response = send_remote_conversation_message(&caller.state.db, &peer, &denied)
+            .await
+            .unwrap();
+        let sender = RemoteSenderAttestation::from_conversation(
+            source.clone(),
+            SourceToolCall {
+                message_id: "source".into(),
+                tool_use_id: "call".into(),
+            },
+        )
+        .unwrap();
+        let denied = RemoteAuthoredSendMessageRequest::from_message(denied, sender);
+        let authored_response =
+            send_remote_authored_conversation_message(&caller.state.db, &peer, &denied)
                 .await
                 .unwrap();
+        for response in [api_response, authored_response] {
             assert!(matches!(
                 response.receipt,
                 RemoteSendReceipt::Rejected {
@@ -473,7 +608,7 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         .await
         .unwrap();
     assert!(
-        matches!(stored.submitted.origin, InputOrigin::RemoteCoordinator { product_conversation_id, transcript_id, source_call:Some(_), .. } if product_conversation_id == source_coordinator.product_conversation_id && transcript_id == caller_coordinator_id)
+        matches!(&stored.submitted.origin, InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, source_call:Some(call) } if *instance_id == caller_id && product_conversation_id == &source_coordinator.product_conversation_id && transcript_id == &caller_coordinator_id && call.message_id == "source-assistant" && call.tool_use_id == "source-send-call")
     );
     let mut exact_coordinator = request(
         peer.peer_instance_id,
@@ -484,16 +619,18 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
     exact_coordinator.message_id = response.message_id;
     exact_coordinator.message =
         RemoteMessageText::parse("peer coordination, not completion".into()).unwrap();
-    exact_coordinator.sender = RemoteSenderAttestation::from_conversation(
+    let sender = RemoteSenderAttestation::from_conversation(
         source_coordinator.clone(),
         SourceToolCall {
-            message_id: "source-assistant".into(),
-            tool_use_id: "source-send-call".into(),
+            message_id: "retry-assistant".into(),
+            tool_use_id: "retry-call".into(),
         },
     )
     .unwrap();
+    let exact_coordinator =
+        RemoteAuthoredSendMessageRequest::from_message(exact_coordinator, sender);
     let exact_response =
-        send_remote_conversation_message(&caller.state.db, &peer, &exact_coordinator)
+        send_remote_authored_conversation_message(&caller.state.db, &peer, &exact_coordinator)
             .await
             .unwrap();
     assert!(matches!(
@@ -504,19 +641,26 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         acceptance(&exact_response).accepting_transcript.as_str(),
         coordinator_id
     );
+    assert_eq!(
+        stored_payload(&receiver, &coordinator_id)
+            .await
+            .submitted
+            .origin,
+        stored.submitted.origin
+    );
     receiver
         .state
         .db
         .set_legacy_conversation_archived(&coordinator_id)
         .await
         .unwrap();
-    let mut archived = request(
+    let archived = request(
         peer.peer_instance_id,
         RemoteSendTarget::Transcript {
             transcript_id: TranscriptConversationId::parse(coordinator_id).unwrap(),
         },
     );
-    archived.sender = RemoteSenderAttestation::from_conversation(
+    let sender = RemoteSenderAttestation::from_conversation(
         source_coordinator,
         SourceToolCall {
             message_id: "source".into(),
@@ -524,7 +668,8 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         },
     )
     .unwrap();
-    let response = send_remote_conversation_message(&caller.state.db, &peer, &archived)
+    let archived = RemoteAuthoredSendMessageRequest::from_message(archived, sender);
+    let response = send_remote_authored_conversation_message(&caller.state.db, &peer, &archived)
         .await
         .unwrap();
     assert!(matches!(
@@ -611,8 +756,8 @@ async fn https_coordinator_retry_after_continuation_returns_original_acceptance(
         .await
         .unwrap()
         .unwrap();
-    let mut send = request(peer.peer_instance_id, RemoteSendTarget::Coordinator {});
-    send.sender = RemoteSenderAttestation::from_conversation(
+    let send = request(peer.peer_instance_id, RemoteSendTarget::Coordinator {});
+    let sender = RemoteSenderAttestation::from_conversation(
         source,
         SourceToolCall {
             message_id: "source-assistant".into(),
@@ -620,7 +765,8 @@ async fn https_coordinator_retry_after_continuation_returns_original_acceptance(
         },
     )
     .unwrap();
-    let accepted = send_remote_conversation_message(&caller.state.db, &peer, &send)
+    let send = RemoteAuthoredSendMessageRequest::from_message(send, sender);
+    let accepted = send_remote_authored_conversation_message(&caller.state.db, &peer, &send)
         .await
         .unwrap();
     assert!(matches!(
@@ -674,7 +820,7 @@ async fn https_coordinator_retry_after_continuation_returns_original_acceptance(
             .as_deref(),
         Some(successor.id.as_str())
     );
-    let replay = send_remote_conversation_message(&caller.state.db, &peer, &send)
+    let replay = send_remote_authored_conversation_message(&caller.state.db, &peer, &send)
         .await
         .unwrap();
     assert!(matches!(
@@ -721,7 +867,7 @@ async fn https_send_then_search_resolve_and_rename_preserve_foreign_sender_and_e
         },
     );
     send.message = RemoteMessageText::parse("federationreceivedmarker".into()).unwrap();
-    send.sender = RemoteSenderAttestation::from_conversation(
+    let sender = RemoteSenderAttestation::from_conversation(
         source.clone(),
         SourceToolCall {
             message_id: "source-assistant".into(),
@@ -729,7 +875,8 @@ async fn https_send_then_search_resolve_and_rename_preserve_foreign_sender_and_e
         },
     )
     .unwrap();
-    let accepted = send_remote_conversation_message(&caller.state.db, &peer, &send)
+    let send = RemoteAuthoredSendMessageRequest::from_message(send, sender);
+    let accepted = send_remote_authored_conversation_message(&caller.state.db, &peer, &send)
         .await
         .unwrap();
     assert!(matches!(
@@ -806,7 +953,7 @@ async fn https_send_then_search_resolve_and_rename_preserve_foreign_sender_and_e
         current_resolution.href.as_deref(),
         Some(current_url.as_str())
     );
-    let replay = send_remote_conversation_message(&caller.state.db, &peer, &send)
+    let replay = send_remote_authored_conversation_message(&caller.state.db, &peer, &send)
         .await
         .unwrap();
     assert!(matches!(

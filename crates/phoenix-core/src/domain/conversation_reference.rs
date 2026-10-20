@@ -8,6 +8,7 @@ use super::product_conversation::ProductConversationId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
+#[derive(schemars::JsonSchema)]
 pub struct MessageId(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -49,6 +50,7 @@ impl fmt::Display for MessageId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum ConversationReferenceTarget {
     ProductConversation {
         product_conversation_id: ProductConversationId,
@@ -65,6 +67,7 @@ pub enum ConversationReferenceTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct QualifiedConversationReference {
     pub instance_id: InstanceId,
     pub target: ConversationReferenceTarget,

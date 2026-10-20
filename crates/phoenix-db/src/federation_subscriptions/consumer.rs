@@ -9,6 +9,7 @@ use super::{
 pub type RemoteNotificationContent = SubscriptionDelivery;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum RemoteNotificationDisposition {
     Pending,
     Authorizing,
@@ -20,7 +21,7 @@ pub enum RemoteNotificationDisposition {
         transcript_id: TranscriptConversationId,
     },
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct RemoteNotification {
     pub admission_id: String,
     pub reference: SubscriptionReference,

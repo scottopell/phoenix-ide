@@ -12,7 +12,8 @@ pub enum InstanceIdParseError {
     NotRfc4122,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, schemars::JsonSchema)]
+#[schemars(transparent)]
 pub struct InstanceId(uuid::Uuid);
 
 impl InstanceId {

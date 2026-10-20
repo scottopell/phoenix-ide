@@ -31,6 +31,7 @@ pub const REQUEST_BYTES: usize = 8 * 1024;
 pub(crate) const RESPONSE_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionOperation {
     Create,
     Replay { after: SubscriptionCursor },
@@ -39,6 +40,7 @@ pub enum SubscriptionOperation {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct SubscriptionRequest {
     pub caller_instance_id: InstanceId,
     pub reference: SubscriptionReference,
@@ -47,6 +49,7 @@ pub struct SubscriptionRequest {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum SubscriptionResult {
     Created {
         snapshot: SubscriptionSnapshot,
@@ -62,6 +65,7 @@ pub enum SubscriptionResult {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct SubscriptionResponse {
     pub caller_instance_id: InstanceId,
     pub reference: SubscriptionReference,
@@ -70,6 +74,7 @@ pub struct SubscriptionResponse {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct SubscriptionNavigation {
     pub stable_path: String,
     pub source_path: String,
@@ -78,7 +83,9 @@ pub struct SubscriptionNavigation {
 fn rejected(status: StatusCode) -> Response {
     (
         status,
-        Json(serde_json::json!({"error":"subscription request unavailable or invalid"})),
+        Json(super::openapi::MessageErrorBody {
+            error: "subscription request unavailable or invalid".into(),
+        }),
     )
         .into_response()
 }
@@ -374,14 +381,14 @@ struct SubscriptionNotificationLiteral<'a> {
     delivery: &'a SubscriptionDelivery,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(crate) struct RemoteWatchReceipt {
     #[serde(flatten)]
     pub subscription: RemoteSubscription,
     pub snapshot: SubscriptionSnapshot,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(crate) struct RemoteUnsubscribeReceipt {
     pub reference: SubscriptionReference,
     pub subscription_id: Uuid,
@@ -816,6 +823,7 @@ async fn sync_pass_inner(runtime: &Arc<RuntimeManager>) {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct OwnerSubscriptionRequest {
     pub instance: String,
     pub product_conversation_id: ProductConversationId,
@@ -870,7 +878,8 @@ pub async fn owner_sync(
     {
         Ok(Some(remote)) if remote.reference == reference => {
             match sync_once(&state.db, &state.runtime, &remote).await {
-                Ok(()) => Json(serde_json::json!({"synced_once":true})).into_response(),
+                Ok(()) => Json(super::openapi::SubscriptionSyncReceipt { synced_once: true })
+                    .into_response(),
                 Err(error) => {
                     tracing::debug!(%error, "owner subscription sync failed");
                     rejected(StatusCode::BAD_GATEWAY)
@@ -917,6 +926,7 @@ mod tests;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct NotificationQuery {
     pub destination_instance_id: InstanceId,
     pub subscription_id: Uuid,

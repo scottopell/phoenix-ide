@@ -12,6 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
 
+mod openapi;
+mod owner;
+
 mod send;
 mod smoke;
 mod subscriptions;

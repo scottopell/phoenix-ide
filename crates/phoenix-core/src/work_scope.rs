@@ -7,6 +7,7 @@ use uuid::Uuid;
 /// Opaque durable identifier for a unit of work.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
+#[derive(schemars::JsonSchema)]
 pub struct WorkScopeId(String);
 
 impl WorkScopeId {
@@ -258,6 +259,7 @@ impl EffectiveResourceAccess {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum WorkScopeLifecycle {
     Active,
     Retired,

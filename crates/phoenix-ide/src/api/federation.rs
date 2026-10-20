@@ -1,3 +1,6 @@
+pub(crate) mod openapi;
+
+pub(crate) mod owner;
 pub(crate) mod peer_notes;
 pub(crate) mod subscriptions;
 use axum::{
@@ -59,6 +62,7 @@ pub(crate) const MAX_REMOTE_SEND_REQUEST_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
+#[derive(schemars::JsonSchema)]
 pub struct RemoteMessageText(String);
 
 impl RemoteMessageText {
@@ -78,6 +82,7 @@ impl<'de> Deserialize<'de> for RemoteMessageText {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum RemoteSendTarget {
     ProductConversation {
         product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
@@ -89,6 +94,16 @@ pub enum RemoteSendTarget {
 }
 
 impl RemoteSendTarget {
+    fn locators_are_bounded(&self) -> bool {
+        match self {
+            Self::ProductConversation {
+                product_conversation_id,
+            } => product_conversation_id.as_str().len() <= 1024,
+            Self::Transcript { transcript_id } => transcript_id.as_str().len() <= 1024,
+            Self::Coordinator {} => true,
+        }
+    }
+
     pub(crate) fn parse_tool_target(raw: &str) -> Result<Self, String> {
         if raw == "@coordinator" {
             return Ok(Self::Coordinator {});
@@ -112,6 +127,7 @@ impl RemoteSendTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct RemoteSourceToolCall {
     message_id: RemoteSenderLocator,
     tool_use_id: RemoteSenderLocator,
@@ -119,6 +135,7 @@ pub struct RemoteSourceToolCall {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
+#[derive(schemars::JsonSchema)]
 struct RemoteSenderLocator(String);
 
 impl RemoteSenderLocator {
@@ -138,17 +155,17 @@ impl<'de> Deserialize<'de> for RemoteSenderLocator {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum RemoteSenderAttestation {
-    RemoteApi {},
     Conversation {
         product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
         transcript_id: phoenix_core::domain::close::TranscriptConversationId,
-        source_call: Option<RemoteSourceToolCall>,
+        source_call: RemoteSourceToolCall,
     },
     Coordinator {
         product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
         transcript_id: phoenix_core::domain::close::TranscriptConversationId,
-        source_call: Option<RemoteSourceToolCall>,
+        source_call: RemoteSourceToolCall,
     },
 }
 
@@ -169,13 +186,13 @@ impl RemoteSenderAttestation {
                 Self::Coordinator {
                     product_conversation_id,
                     transcript_id,
-                    source_call: Some(call),
+                    source_call: call,
                 }
             } else {
                 Self::Conversation {
                     product_conversation_id,
                     transcript_id,
-                    source_call: Some(call),
+                    source_call: call,
                 }
             },
         )
@@ -183,16 +200,13 @@ impl RemoteSenderAttestation {
 
     fn into_origin(self, instance_id: InstanceId) -> phoenix_core::domain::db_schema::InputOrigin {
         use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
-        let convert_call = |call: Option<RemoteSourceToolCall>| {
-            call.map(|call| {
-                Box::new(SourceToolCall {
-                    message_id: call.message_id.0,
-                    tool_use_id: call.tool_use_id.0,
-                })
+        let convert_call = |call: RemoteSourceToolCall| {
+            Box::new(SourceToolCall {
+                message_id: call.message_id.0,
+                tool_use_id: call.tool_use_id.0,
             })
         };
         match self {
-            Self::RemoteApi {} => InputOrigin::RemoteApi { instance_id },
             Self::Conversation {
                 product_conversation_id,
                 transcript_id,
@@ -201,7 +215,7 @@ impl RemoteSenderAttestation {
                 instance_id,
                 product_conversation_id,
                 transcript_id: transcript_id.to_string(),
-                source_call: convert_call(source_call),
+                source_call: Some(convert_call(source_call)),
             },
             Self::Coordinator {
                 product_conversation_id,
@@ -211,7 +225,7 @@ impl RemoteSenderAttestation {
                 instance_id,
                 product_conversation_id,
                 transcript_id: transcript_id.to_string(),
-                source_call: convert_call(source_call),
+                source_call: Some(convert_call(source_call)),
             },
         }
     }
@@ -219,7 +233,24 @@ impl RemoteSenderAttestation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct RemoteSendMessageRequest {
+    pub destination_instance_id: InstanceId,
+    pub target: RemoteSendTarget,
+    pub message_id: uuid::Uuid,
+    pub message: RemoteMessageText,
+}
+
+impl RemoteSendMessageRequest {
+    fn locators_are_bounded(&self) -> bool {
+        self.target.locators_are_bounded()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteAuthoredSendMessageRequest {
     pub destination_instance_id: InstanceId,
     pub target: RemoteSendTarget,
     pub message_id: uuid::Uuid,
@@ -227,17 +258,47 @@ pub struct RemoteSendMessageRequest {
     pub sender: RemoteSenderAttestation,
 }
 
-impl RemoteSendMessageRequest {
+impl RemoteAuthoredSendMessageRequest {
+    pub(crate) fn from_message(
+        request: RemoteSendMessageRequest,
+        sender: RemoteSenderAttestation,
+    ) -> Self {
+        let RemoteSendMessageRequest {
+            destination_instance_id,
+            target,
+            message_id,
+            message,
+        } = request;
+        Self {
+            destination_instance_id,
+            target,
+            message_id,
+            message,
+            sender,
+        }
+    }
+
+    fn into_parts(self) -> (RemoteSendMessageRequest, RemoteSenderAttestation) {
+        let Self {
+            destination_instance_id,
+            target,
+            message_id,
+            message,
+            sender,
+        } = self;
+        (
+            RemoteSendMessageRequest {
+                destination_instance_id,
+                target,
+                message_id,
+                message,
+            },
+            sender,
+        )
+    }
+
     fn locators_are_bounded(&self) -> bool {
-        let target_bounded = match &self.target {
-            RemoteSendTarget::ProductConversation {
-                product_conversation_id,
-            } => product_conversation_id.as_str().len() <= 1024,
-            RemoteSendTarget::Transcript { transcript_id } => transcript_id.as_str().len() <= 1024,
-            RemoteSendTarget::Coordinator {} => true,
-        };
         let sender_bounded = match &self.sender {
-            RemoteSenderAttestation::RemoteApi {} => true,
             RemoteSenderAttestation::Conversation {
                 product_conversation_id,
                 transcript_id,
@@ -252,12 +313,13 @@ impl RemoteSendMessageRequest {
                     && transcript_id.as_str().len() <= 1024
             }
         };
-        target_bounded && sender_bounded
+        self.target.locators_are_bounded() && sender_bounded
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum RemoteSendDisposition {
     Delivered,
     Queued,
@@ -265,6 +327,7 @@ pub enum RemoteSendDisposition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct RemoteStableDestination {
     pub instance_id: InstanceId,
     pub product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
@@ -272,6 +335,7 @@ pub struct RemoteStableDestination {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum RemoteSendNavigation {
     AppLocal { path: String },
     Peer { url: String },
@@ -279,6 +343,7 @@ pub enum RemoteSendNavigation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct RemoteMessageAcceptance {
     pub accepting_transcript: phoenix_core::domain::close::TranscriptConversationId,
     pub stable_destination: RemoteStableDestination,
@@ -290,6 +355,7 @@ pub struct RemoteMessageAcceptance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum RemoteSendRejectionCode {
     DestinationMismatch,
     InvalidTarget,
@@ -304,6 +370,7 @@ pub enum RemoteSendRejectionCode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub enum RemoteSendReceipt {
     Accepted {
         acceptance: RemoteMessageAcceptance,
@@ -319,6 +386,7 @@ pub enum RemoteSendReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct RemoteSendMessageResponse {
     pub destination_instance_id: InstanceId,
     pub caller_instance_id: InstanceId,
@@ -331,6 +399,31 @@ pub async fn send_conversation_message(
     authenticated: PeerAuthenticated,
     State(state): State<AppState>,
     Json(request): Json<RemoteSendMessageRequest>,
+) -> Response {
+    let origin = phoenix_core::domain::db_schema::InputOrigin::RemoteApi {
+        instance_id: authenticated.caller_instance_id,
+    };
+    receive_remote_message(authenticated, state, request, origin).await
+}
+
+pub async fn send_authored_conversation_message(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteAuthoredSendMessageRequest>,
+) -> Response {
+    if !request.locators_are_bounded() {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let (request, sender) = request.into_parts();
+    let origin = sender.into_origin(authenticated.caller_instance_id);
+    receive_remote_message(authenticated, state, request, origin).await
+}
+
+async fn receive_remote_message(
+    authenticated: PeerAuthenticated,
+    state: AppState,
+    request: RemoteSendMessageRequest,
+    origin: phoenix_core::domain::db_schema::InputOrigin,
 ) -> Response {
     if !request.locators_are_bounded() {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
@@ -348,7 +441,7 @@ pub async fn send_conversation_message(
             message: "destination instance identity mismatch".into(),
         }
     } else {
-        admit_remote_message(&state, authenticated.caller_instance_id, &request).await
+        admit_remote_message(&state, &request, origin).await
     };
     Json(RemoteSendMessageResponse {
         destination_instance_id: destination,
@@ -363,7 +456,7 @@ pub async fn send_conversation_message(
 async fn resolve_remote_send_target(
     state: &AppState,
     target: &RemoteSendTarget,
-    sender: &RemoteSenderAttestation,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
 ) -> Result<crate::send_chat_service::SendChatTarget, RemoteSendReceipt> {
     use crate::send_chat_service::SendChatTarget;
     let rejected = |code, message: String| RemoteSendReceipt::Rejected {
@@ -398,7 +491,10 @@ async fn resolve_remote_send_target(
             ));
         }
         if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
-            if !matches!(sender, RemoteSenderAttestation::Coordinator { .. }) {
+            if !matches!(
+                origin,
+                phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { .. }
+            ) {
                 return Err(rejected(
                     RemoteSendRejectionCode::SenderNotAllowed,
                     "only a remote Coordinator may message the destination Coordinator".into(),
@@ -445,14 +541,14 @@ async fn resolve_remote_send_target(
 
 async fn admit_remote_message(
     state: &AppState,
-    caller: InstanceId,
     request: &RemoteSendMessageRequest,
+    origin: phoenix_core::domain::db_schema::InputOrigin,
 ) -> RemoteSendReceipt {
     use crate::send_chat_service::{
         MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatReplay,
         SendChatRequest, SendChatServiceError,
     };
-    let target = match resolve_remote_send_target(state, &request.target, &request.sender).await {
+    let target = match resolve_remote_send_target(state, &request.target, &origin).await {
         Ok(target) => target,
         Err(receipt) => return receipt,
     };
@@ -462,7 +558,7 @@ async fn admit_remote_message(
             target,
             SendChatRequest {
                 conversation_id: String::new(),
-                origin: request.sender.clone().into_origin(caller),
+                origin,
                 text: request.message.0.clone(),
                 message_id: request.message_id.to_string(),
                 images: Vec::new(),
@@ -589,6 +685,44 @@ pub async fn send_remote_conversation_message(
     peer: &phoenix_db::FederationPeerConnection,
     request: &RemoteSendMessageRequest,
 ) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    send_remote_message(
+        local_db,
+        peer,
+        request,
+        request,
+        "/api/federation/peer/send-conversation-message",
+    )
+    .await
+}
+
+pub(crate) async fn send_remote_authored_conversation_message(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    request: &RemoteAuthoredSendMessageRequest,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    if !request.locators_are_bounded() {
+        return Err(FederationClientError::RemoteRejected(
+            "send locators exceed the request budget".into(),
+        ));
+    }
+    let (message, _) = request.clone().into_parts();
+    send_remote_message(
+        local_db,
+        peer,
+        &message,
+        request,
+        "/api/federation/peer/send-authored-conversation-message",
+    )
+    .await
+}
+
+async fn send_remote_message(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    request: &RemoteSendMessageRequest,
+    body: &impl Serialize,
+    path: &str,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
     if !request.locators_are_bounded() {
         return Err(FederationClientError::RemoteRejected(
             "send locators exceed the request budget".into(),
@@ -598,13 +732,11 @@ pub async fn send_remote_conversation_message(
         return Err(FederationClientError::DestinationMismatch);
     }
     let caller = local_db.instance_id().await?;
-    let endpoint = peer
-        .base_url
-        .navigation_url("/api/federation/peer/send-conversation-message")?;
+    let endpoint = peer.base_url.navigation_url(path)?;
     let response = remote_query_client(&peer.tls_trust)?
         .post(endpoint.as_url().clone())
         .bearer_auth(peer.bearer_credential.expose())
-        .json(request)
+        .json(body)
         .send()
         .await?;
     let status = response.status();
@@ -709,34 +841,34 @@ fn decode_remote_send_response(
     Ok(response)
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RemoteQueryDatabaseRequest {
     pub destination_instance_id: InstanceId,
     pub sql: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteQueryDatabaseResponse {
     pub destination_instance_id: InstanceId,
     pub caller_instance_id: InstanceId,
     pub result: phoenix_db::CoordinatorQueryResult,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RemoteSearchRequest {
     pub caller_instance_id: InstanceId,
     pub destination_instance_id: InstanceId,
     pub query: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteSearchResponse {
     pub caller_instance_id: InstanceId,
     pub destination_instance_id: InstanceId,
     pub hits: Vec<crate::api::global_read::QualifiedSearchHit>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteReadConversationRequest {
     pub caller_instance_id: InstanceId,
     pub destination_instance_id: InstanceId,
@@ -744,21 +876,21 @@ pub struct RemoteReadConversationRequest {
     pub cursor: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteReadConversationResponse {
     pub caller_instance_id: InstanceId,
     pub destination_instance_id: InstanceId,
     pub read: crate::api::global_read::QualifiedConversationRead,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteResolveReferenceRequest {
     pub caller_instance_id: InstanceId,
     pub destination_instance_id: InstanceId,
     pub reference: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteResolveReferenceResponse {
     pub caller_instance_id: InstanceId,
     pub destination_instance_id: InstanceId,
@@ -767,6 +899,7 @@ pub struct RemoteResolveReferenceResponse {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 enum RemoteReadErrorCode {
     InvalidTarget,
     DestinationUnavailable,
@@ -775,7 +908,7 @@ enum RemoteReadErrorCode {
     DestinationMismatch,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 struct RemoteReadErrorResponse {
     code: RemoteReadErrorCode,
     message: String,
@@ -783,6 +916,7 @@ struct RemoteReadErrorResponse {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 enum RemoteResolveErrorCode {
     InvalidReference,
     DestinationUnavailable,
@@ -791,7 +925,7 @@ enum RemoteResolveErrorCode {
     DestinationMismatch,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 struct RemoteResolveErrorResponse {
     code: RemoteResolveErrorCode,
     message: String,
@@ -799,11 +933,12 @@ struct RemoteResolveErrorResponse {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 enum RemoteSearchErrorCode {
     SearchIndexUnavailable,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 struct RemoteSearchErrorResponse {
     code: RemoteSearchErrorCode,
     message: String,
@@ -893,6 +1028,18 @@ pub async fn resolve_remote_reference(
     if response.resolution.reference.instance_id != peer.peer_instance_id {
         return Err(FederationClientError::ResolveProvenanceMismatch);
     }
+    if response
+        .resolution
+        .source_call
+        .as_ref()
+        .is_some_and(|call| {
+            [&call.message_id, &call.tool_use_id]
+                .iter()
+                .any(|id| id.trim().is_empty() || id.len() > 1024)
+        })
+    {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
     if expected_target
         .as_ref()
         .is_some_and(|target| target != &response.resolution.reference.target)
@@ -915,10 +1062,7 @@ pub async fn resolve_remote_reference(
         return Err(FederationClientError::ResolveProvenanceMismatch);
     }
     if let Some(path) = &response.resolution.href {
-        if expected_target
-            .as_ref()
-            .is_some_and(|target| !resolved_reference_href_matches(target, path))
-        {
+        if !resolved_reference_href_matches(&response.resolution.reference.target, path) {
             return Err(FederationClientError::ResolveProvenanceMismatch);
         }
         response.resolution.href = Some(peer.base_url.navigation_url(path)?.as_url().to_string());
@@ -1293,12 +1437,18 @@ fn qualify_remote_read_navigation(
     let QualifiedSearchNavigation::AppLocal { path } = &read.source_navigation else {
         return Err(FederationClientError::ReadProvenanceMismatch);
     };
+    if !resolved_reference_href_matches(&read.resolved.target, path) {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    }
     let url = base_url.navigation_url(path)?.as_url().to_string();
     read.source_navigation = QualifiedSearchNavigation::Peer { url };
     if let Some(navigation) = &read.stable_navigation {
         let QualifiedSearchNavigation::AppLocal { path } = navigation else {
             return Err(FederationClientError::ReadProvenanceMismatch);
         };
+        if !crate::api::product_conversations::canonical_product_route_shape(path) {
+            return Err(FederationClientError::ReadProvenanceMismatch);
+        }
         let url = base_url.navigation_url(path)?.as_url().to_string();
         read.stable_navigation = Some(QualifiedSearchNavigation::Peer { url });
     }
@@ -1312,11 +1462,16 @@ fn qualify_remote_search_navigation(
     use crate::api::global_read::QualifiedSearchNavigation;
 
     for hit in hits {
-        let Some(QualifiedSearchNavigation::AppLocal { path }) = &hit.source_navigation else {
-            return Err(FederationClientError::SearchProvenanceMismatch);
-        };
-        let url = base_url.navigation_url(path)?.as_url().to_string();
-        hit.source_navigation = Some(QualifiedSearchNavigation::Peer { url });
+        match &hit.source_navigation {
+            None => {}
+            Some(QualifiedSearchNavigation::AppLocal { path }) => {
+                let url = base_url.navigation_url(path)?.as_url().to_string();
+                hit.source_navigation = Some(QualifiedSearchNavigation::Peer { url });
+            }
+            Some(QualifiedSearchNavigation::Peer { .. }) => {
+                return Err(FederationClientError::SearchProvenanceMismatch);
+            }
+        }
 
         match (&hit.stable_conversation, &hit.stable_navigation) {
             (None, None) => {}
@@ -1361,11 +1516,13 @@ fn decode_remote_search_response(
     }
     if response.hits.iter().any(|hit| {
         hit.source.instance_id != expected_destination
-            || !matches!(
-                &hit.source_navigation,
-                Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { path })
-                    if resolved_reference_href_matches(&hit.source.target, path)
-            )
+            || match &hit.source_navigation {
+                None => false,
+                Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { path }) => {
+                    !resolved_reference_href_matches(&hit.source.target, path)
+                }
+                Some(crate::api::global_read::QualifiedSearchNavigation::Peer { .. }) => true,
+            }
             || !matches!(
                 &hit.source.target,
                 ConversationReferenceTarget::Message { .. }
@@ -1387,6 +1544,11 @@ fn decode_remote_search_response(
             }
             || hit.sender.as_ref().is_some_and(|sender| {
                 sender.stable.instance_id != sender.exact.instance_id
+                    || sender.source_call.as_ref().is_some_and(|call| {
+                        [&call.message_id, &call.tool_use_id]
+                            .iter()
+                            .any(|id| id.trim().is_empty() || id.len() > 1024)
+                    })
                     || !matches!(
                         &sender.stable.target,
                         ConversationReferenceTarget::ProductConversation { .. }
@@ -1904,6 +2066,54 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn read_navigation_is_bound_before_same_origin_qualification() {
+        use crate::api::global_read::{QualifiedConversationRead, QualifiedSearchNavigation};
+        let instance = InstanceId::new();
+        let reference = serde_json::json!({
+            "instance_id": instance,
+            "target": {"kind":"message", "transcript_id":"exact", "message_id":"message"}
+        });
+        let make_read = |source: &str, stable: &str| -> QualifiedConversationRead {
+            serde_json::from_value(serde_json::json!({
+                "requested": reference, "resolved": reference,
+                "stable_conversation": {"instance_id":instance,"target":{"kind":"product_conversation","product_conversation_id":"product"}},
+                "evidence":[reference], "content":"evidence", "next_cursor":null,
+                "source_navigation":{"kind":"app_local","path":source},
+                "stable_navigation":{"kind":"app_local","path":stable}
+            })).unwrap()
+        };
+        let origin = "https://peer.example".parse().unwrap();
+        let exact = "/c/exact?source_transcript=exact#message-message";
+        for wrong in [
+            "/c/other?source_transcript=other#message-message",
+            "/c/exact?source_transcript=exact#message-other",
+            "/api/federation/peers",
+            "https://peer.example/c/exact?source_transcript=exact#message-message",
+        ] {
+            let mut read = make_read(wrong, "/c/current-slug");
+            assert!(qualify_remote_read_navigation(&origin, &mut read).is_err());
+        }
+        for wrong in [
+            "/settings",
+            "/c/current/extra",
+            "/c/current?source_transcript=other",
+            "/c/current#message-other",
+        ] {
+            let mut read = make_read(exact, wrong);
+            assert!(qualify_remote_read_navigation(&origin, &mut read).is_err());
+        }
+        let mut read = make_read(exact, "/c/renamed-slug");
+        qualify_remote_read_navigation(&origin, &mut read).unwrap();
+        assert!(matches!(
+            read.source_navigation,
+            QualifiedSearchNavigation::Peer { .. }
+        ));
+        // Non-rendered message kinds legitimately point at the exact transcript without a fragment.
+        let mut read = make_read("/c/exact?source_transcript=exact", "/c/current-slug");
+        qualify_remote_read_navigation(&origin, &mut read).unwrap();
+    }
+
     #[tokio::test]
     async fn enrollment_and_import_reject_uuid_display_names_but_accept_real_names() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -2130,7 +2340,6 @@ mod tests {
                         target: RemoteSendTarget::Coordinator {},
                         message_id: uuid::Uuid::new_v4(),
                         message: RemoteMessageText::parse("redirect test".into()).unwrap(),
-                        sender: RemoteSenderAttestation::RemoteApi {},
                     },
                 )
                 .await

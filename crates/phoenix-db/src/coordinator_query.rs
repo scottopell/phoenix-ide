@@ -71,7 +71,7 @@ impl std::fmt::Display for CoordinatorSqlitePhase {
     }
 }
 
-#[derive(Debug, serde::Deserialize, Serialize)]
+#[derive(Debug, serde::Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CoordinatorQueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<CoordinatorCell>>,
@@ -83,6 +83,7 @@ pub struct CoordinatorQueryResult {
 
 #[derive(Debug, serde::Deserialize, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum CoordinatorCell {
     Null,
     Integer(i64),
@@ -93,6 +94,7 @@ pub enum CoordinatorCell {
 
 #[derive(Debug, serde::Deserialize, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum CoordinatorReal {
     Finite(f64),
     PositiveInfinity,

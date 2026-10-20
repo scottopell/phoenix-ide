@@ -6,6 +6,7 @@ use ts_rs::TS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
+#[derive(schemars::JsonSchema)]
 pub struct ProductConversationId(String);
 
 impl<'de> Deserialize<'de> for ProductConversationId {

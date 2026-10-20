@@ -1547,6 +1547,7 @@ impl RecoverySettlementReason {
 /// attribution was recorded; it does not mean the API user authored the input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
+#[derive(schemars::JsonSchema)]
 pub struct SourceToolCall {
     pub message_id: String,
     pub tool_use_id: String,

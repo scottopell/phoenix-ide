@@ -330,7 +330,7 @@ async fn require_enrollment_tx(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct RemoteSubscription {
     pub reference: SubscriptionReference,
     pub subscription_id: Uuid,

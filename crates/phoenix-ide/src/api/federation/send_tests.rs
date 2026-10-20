@@ -14,7 +14,6 @@ fn request() -> RemoteSendMessageRequest {
         },
         message_id: uuid::Uuid::new_v4(),
         message: RemoteMessageText::parse("literal @conv:not-an-expansion".into()).unwrap(),
-        sender: RemoteSenderAttestation::RemoteApi {},
     }
 }
 
@@ -40,6 +39,9 @@ fn send_request_is_closed_and_does_not_accept_a_source_instance() {
         assert!(serde_json::from_value::<RemoteSendMessageRequest>(invalid).is_err());
     }
     for sender in [
+        json!({"kind":"remote_api"}),
+        json!({"kind":"coordinator", "product_conversation_id":"source", "transcript_id":"source", "source_call":null}),
+        json!({"kind":"conversation", "product_conversation_id":"source", "transcript_id":"source", "source_call":{"message_id":"m", "tool_use_id":"t"}}),
         json!({"kind":"remote_api", "instance_id":InstanceId::new()}),
         json!({"kind":"system_generated"}),
         json!({"kind":"coordinator", "product_conversation_id":"source", "transcript_id":"source", "source_call":{"message_id":"half-call"}}),
@@ -48,6 +50,56 @@ fn send_request_is_closed_and_does_not_accept_a_source_instance() {
         let mut invalid = wire.clone();
         invalid["sender"] = sender;
         assert!(serde_json::from_value::<RemoteSendMessageRequest>(invalid).is_err());
+    }
+}
+
+#[test]
+fn authored_request_is_closed_and_excludes_api_and_source_instance_claims() {
+    for kind in ["conversation", "coordinator"] {
+        let sender = json!({
+            "kind":kind,
+            "product_conversation_id":"stable-source",
+            "transcript_id":"exact-source",
+            "source_call":{"message_id":"assistant", "tool_use_id":"tool"},
+        });
+        let mut wire = serde_json::to_value(request()).unwrap();
+        wire["sender"] = sender.clone();
+        assert!(serde_json::from_value::<RemoteAuthoredSendMessageRequest>(wire.clone()).is_ok());
+        let mut missing = wire.clone();
+        missing.as_object_mut().unwrap().remove("sender");
+        assert!(serde_json::from_value::<RemoteAuthoredSendMessageRequest>(missing).is_err());
+        for field in [
+            "source_instance_id",
+            "caller_instance_id",
+            "instance_id",
+            "origin",
+            "extra",
+        ] {
+            let mut invalid = wire.clone();
+            invalid[field] = json!(InstanceId::new());
+            assert!(serde_json::from_value::<RemoteAuthoredSendMessageRequest>(invalid).is_err());
+            let mut invalid = wire.clone();
+            invalid["sender"][field] = json!(InstanceId::new());
+            assert!(serde_json::from_value::<RemoteAuthoredSendMessageRequest>(invalid).is_err());
+        }
+        for invalid_sender in [
+            json!({"kind":"remote_api"}),
+            json!({"kind":"system_generated"}),
+            json!({"kind":kind, "product_conversation_id":"source", "transcript_id":"source", "source_call":null}),
+            json!({"kind":kind, "product_conversation_id":"source", "transcript_id":"source"}),
+            json!({"kind":kind, "product_conversation_id":"source", "transcript_id":"source", "source_call":{"message_id":"half-call"}}),
+            json!({"kind":kind, "product_conversation_id":"source", "transcript_id":"source", "source_call":{"message_id":"m", "tool_use_id":"t", "instance_id":InstanceId::new()}}),
+        ] {
+            let mut invalid = wire.clone();
+            invalid["sender"] = invalid_sender;
+            assert!(serde_json::from_value::<RemoteAuthoredSendMessageRequest>(invalid).is_err());
+        }
+        wire["sender"]["transcript_id"] = json!("x".repeat(1025));
+        assert!(
+            !serde_json::from_value::<RemoteAuthoredSendMessageRequest>(wire)
+                .unwrap()
+                .locators_are_bounded()
+        );
     }
 }
 
@@ -121,7 +173,7 @@ async fn coordinator_sender_keeps_its_real_stable_identity_and_exact_member() {
     )
     .unwrap();
     assert!(
-        matches!(sender, RemoteSenderAttestation::Coordinator { product_conversation_id, transcript_id, source_call:Some(_) } if product_conversation_id == product && transcript_id.as_str() == id)
+        matches!(sender, RemoteSenderAttestation::Coordinator { product_conversation_id, transcript_id, source_call:call } if product_conversation_id == product && transcript_id.as_str() == id && call.message_id.0 == "assistant" && call.tool_use_id.0 == "send")
     );
 }
 
@@ -276,7 +328,7 @@ fn empty_send_variants_are_closed_in_requests_and_responses() {
     }
     assert!(serde_json::from_value::<RemoteSendTarget>(json!({"kind":"coordinator"})).is_ok());
     assert!(
-        serde_json::from_value::<RemoteSenderAttestation>(json!({"kind":"remote_api"})).is_ok()
+        serde_json::from_value::<RemoteSenderAttestation>(json!({"kind":"remote_api"})).is_err()
     );
 }
 
@@ -326,6 +378,7 @@ fn duplicate_and_rejected_receipts_remain_typed_and_do_not_claim_completion() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn search_attests_foreign_sender_without_changing_primary_evidence_ownership() {
     use crate::api::global_read::{
         QualifiedSearchHit, QualifiedSearchNavigation, QualifiedSearchSender,
@@ -357,6 +410,10 @@ fn search_attests_foreign_sender_without_changing_primary_evidence_ownership() {
             stable_navigation: None,
             role: "Remote conversation".into(),
             sender: Some(QualifiedSearchSender {
+                source_call: Some(phoenix_core::domain::db_schema::SourceToolCall {
+                    message_id: "colliding-message".into(),
+                    tool_use_id: "exact-source-tool".into(),
+                }),
                 stable: QualifiedConversationReference::new(
                     sender_instance,
                     ConversationReferenceTarget::ProductConversation {
@@ -388,8 +445,42 @@ fn search_attests_foreign_sender_without_changing_primary_evidence_ownership() {
     let sender = accepted[0].sender.as_ref().unwrap();
     assert_eq!(sender.stable.instance_id, sender_instance);
     assert_eq!(sender.exact.instance_id, sender_instance);
+    assert_eq!(
+        sender.source_call.as_ref().unwrap().message_id,
+        "colliding-message"
+    );
+    assert_eq!(
+        sender.source_call.as_ref().unwrap().tool_use_id,
+        "exact-source-tool"
+    );
+    let mut deleted_source = wire.clone();
+    deleted_source["hits"][0]["source_navigation"] = Value::Null;
+    let mut hits = decode(&deleted_source).unwrap();
+    qualify_remote_search_navigation(&"https://peer.example".parse().unwrap(), &mut hits).unwrap();
+    assert!(hits[0].source_navigation.is_none());
+    assert_eq!(
+        hits[0].sender.as_ref().unwrap().source_call,
+        sender.source_call
+    );
+    assert_eq!(hits[0].source, accepted[0].source);
+    let mut partial_call = wire.clone();
+    partial_call["hits"][0]["sender"]["source_call"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_use_id");
+    assert!(decode(&partial_call).is_err());
     for (path, replacement) in [
         ("/hits/0/source/instance_id", json!(sender_instance)),
+        ("/hits/0/sender/source_call/message_id", json!(" ")),
+        ("/hits/0/sender/source_call/tool_use_id", json!("")),
+        (
+            "/hits/0/sender/source_call/message_id",
+            json!("m".repeat(1025)),
+        ),
+        (
+            "/hits/0/sender/source_call/tool_use_id",
+            json!("雪".repeat(342)),
+        ),
         ("/hits/0/sender/exact/instance_id", json!(destination)),
         (
             "/hits/0/sender/stable/target",
@@ -410,5 +501,15 @@ fn search_attests_foreign_sender_without_changing_primary_evidence_ownership() {
             ),
             "accepted {path}"
         );
+        if path != "/hits/0/source_navigation" {
+            invalid["hits"][0]["source_navigation"] = Value::Null;
+            assert!(
+                matches!(
+                    decode(&invalid),
+                    Err(FederationClientError::SearchProvenanceMismatch)
+                ),
+                "accepted invalid {path} without navigation"
+            );
+        }
     }
 }

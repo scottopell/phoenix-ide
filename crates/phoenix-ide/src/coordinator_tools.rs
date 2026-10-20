@@ -1162,7 +1162,8 @@ impl SendConversationMessage {
         ctx: &ToolContext,
     ) -> ToolOutput {
         use crate::api::federation::{
-            RemoteMessageText, RemoteSendMessageRequest, RemoteSendTarget, RemoteSenderAttestation,
+            RemoteAuthoredSendMessageRequest, RemoteMessageText, RemoteSendMessageRequest,
+            RemoteSendTarget, RemoteSenderAttestation,
         };
         let selector = match phoenix_core::domain::instance_identity::InstanceSelector::parse(
             instance.to_string(),
@@ -1199,15 +1200,17 @@ impl SendConversationMessage {
             Ok(sender) => sender,
             Err(error) => return ToolOutput::error(error),
         };
-        let request = RemoteSendMessageRequest {
-            destination_instance_id: peer.peer_instance_id,
-            target,
-            message_id: uuid::Uuid::parse_str(&input.message_id)
-                .expect("tool input UUID validated"),
-            message,
+        let request = RemoteAuthoredSendMessageRequest::from_message(
+            RemoteSendMessageRequest {
+                destination_instance_id: peer.peer_instance_id,
+                target,
+                message_id: uuid::Uuid::parse_str(&input.message_id)
+                    .expect("tool input UUID validated"),
+                message,
+            },
             sender,
-        };
-        match crate::api::federation::send_remote_conversation_message(
+        );
+        match crate::api::federation::send_remote_authored_conversation_message(
             self.send_chat.db(),
             &peer,
             &request,

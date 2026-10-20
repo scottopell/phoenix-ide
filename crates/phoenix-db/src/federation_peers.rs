@@ -13,6 +13,7 @@ pub const MAX_FEDERATION_PEER_NOTES_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(transparent)]
+#[derive(schemars::JsonSchema)]
 pub struct FederationPeerNotes(String);
 
 impl FederationPeerNotes {
@@ -38,7 +39,7 @@ impl<'de> serde::Deserialize<'de> for FederationPeerNotes {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct FederationPeerSummary {
     pub peer_instance_id: InstanceId,
     pub peer_display_name: String,

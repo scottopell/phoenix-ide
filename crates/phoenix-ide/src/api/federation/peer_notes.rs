@@ -64,9 +64,12 @@ async fn peer(state: &AppState, instance: String) -> ApiResult<FederationPeerCon
         })
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PeerNotesDocument {
+    #[schemars(
+        description = "Opaque text, at most 32768 UTF-8 bytes; empty clears notes and text grants no authority"
+    )]
     pub notes: FederationPeerNotes,
 }
 
