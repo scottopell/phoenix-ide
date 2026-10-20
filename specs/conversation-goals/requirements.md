@@ -4,7 +4,7 @@
 
 As a Phoenix user, I need an ordinary conversation's immutable goal and attributed status history to remain inspectable across transcript changes, without an older execution affecting a replacement goal or a later status.
 
-This contract covers goal storage, mutation fencing, attribution consistency, immutable report bindings and settled-boundary application admission. It does not grant execution, resource, deployment or merge authority. Automatic follow-through, Stop integration, release/resume interpretation, ceilings, renewals, waiting and watch delivery are outside this contract.
+This contract covers goal storage, mutation fencing, attribution consistency, immutable report bindings, settled-boundary application admission and bounded local watch facts. It does not grant execution, resource, deployment or merge authority. Automatic follow-through, changes to independent Stop/release semantics, ceilings, renewals, standalone nonboundary-report notifications and remote goal-change fanout are outside this contract. Structured waiting remains an execution fact, not a goal disposition.
 
 ## Requirements
 
@@ -212,3 +212,73 @@ WHEN checkpoint recovery or exact retry encounters an already finalized report r
 THE SYSTEM SHALL verify the exact pending payload and assistant/tool-use/execution identity and retain the committed outcome, including a rejection whose preconditions have since changed.
 
 THE SYSTEM SHALL NOT treat an existing result row alone as proof of an identical report, or reinterpret a previously committed rejection as success.
+
+### REQ-GOAL-011 — Saved current facts at a local watch occurrence
+
+WHEN an enrolled local watch records a genuine execution-terminal or wait-entry occurrence
+THE SYSTEM SHALL capture the ordinary owner's current persisted goal facts in that occurrence's owning transaction, independently of the execution outcome and admission-time report binding.
+
+THE SYSTEM SHALL distinguish a captured current goal, captured absence of a goal with its observed owner version, and a historical event for which goal facts were not captured.
+
+WHEN a current goal is captured
+THE SYSTEM SHALL retain its ordinary owner identity, immutable goal identity and objective, monotonic owner/status version, factual state and exact state reason where present, including inactive states.
+
+THE SYSTEM SHALL NOT restrict saved facts to an Underway execution binding, infer goal completion from execution completion, introduce an objective-revision counter, or reinterpret an old event using a later current goal.
+
+THE SYSTEM SHALL identify usage as explicitly unavailable because it was not captured, rather than fabricate zero, aggregate transcript usage as goal usage, infer budget consumption, or choose a numeric ceiling.
+
+### REQ-GOAL-012 — One causal notification owner
+
+WHEN an accepted settled Create/State mutation changes a watched ordinary owner without a target execution boundary
+THE SYSTEM SHALL append a distinct local goal-change obligation in the same owning transaction as the accepted mutation and its retained result.
+
+THE SYSTEM SHALL identify this standalone occurrence by ordinary owner, accepted status version and retained watch enrollment identity, SHALL retain the existing subscription delivery identity, and SHALL create no additional occurrence for a rejected mutation, exact accepted retry or re-enrollment replay.
+
+THE SYSTEM SHALL distinguish accepted changes at different owner versions even when their states or objective text match, and SHALL NOT deduplicate distinct genuine execution or wait occurrences by goal version.
+
+THE SYSTEM SHALL assign notification ownership as follows:
+
+| Source sequence | Notification owner | Goal-change obligation |
+|---|---|---|
+| Report followed by an actual terminal occurrence | The actual execution-terminal transaction, using goal facts saved there | No standalone report obligation |
+| Report followed by an actual question or approval wait | The wait-entry transaction, after resolving the report in its owning checkpoint | No standalone report obligation |
+| Report with no actual terminal or wait boundary | No additional report-notification guarantee | No standalone report obligation; a later actual boundary captures facts then |
+| Accepted settled Create/State on the watched target | The accepted target-mutation transaction | One standalone obligation per accepted owner version and retained enrollment identity |
+| Stop followed by an actual Cancelled occurrence | Stop retains its independent control semantics; the actual cancellation transaction owns the execution occurrence | No Stop-induced goal-change or fabricated Suspended occurrence |
+| Continuation or context handoff | The existing occurrence and suppression rules under `specs/global-recall/requirements.md` | No synthetic terminal or report obligation |
+
+THE SYSTEM SHALL NOT treat a Coordinator caller's own execution completion as the watched target's execution boundary, or promise a terminal boundary merely because a report was accepted.
+
+THE SYSTEM SHALL preserve mandatory Close routing and federation's terminal-fact protocol, provenance, subscriptions, cursors and delivery semantics. A local goal-change occurrence SHALL NOT masquerade as a federated terminal execution fact.
+
+### REQ-GOAL-013 — Storage failure follows the owning transaction
+
+WHEN saving watch facts or appending a required goal-change obligation fails because of an unclassified SQL, persisted-fact decoding, constraint, I/O or commit error
+THE SYSTEM SHALL propagate a storage/checkpoint failure through the owning operation, SHALL NOT publish success or recast the error as semantic report refusal, and SHALL NOT commit a partial owning transaction.
+
+WHEN report resolution, wait entry and notification share a checkpoint transaction
+THE SYSTEM SHALL roll back their report changes, tool evidence, state and notification together on such a failure.
+
+WHEN a report checkpoint has committed before a later terminal transaction
+THE SYSTEM SHALL roll back the failed terminal transaction while retaining the already committed report and terminal obligation under the existing settlement protocol; this contract SHALL NOT imply atomicity across those transactions.
+
+WHEN a standalone settled mutation's notification append fails
+THE SYSTEM SHALL roll back that transaction's mutation, history, actors, request result and notification.
+
+THE SYSTEM SHALL add no watch append or capture dependency to the independent Stop control transaction, SHALL NOT fabricate a Stop recovery or cancellation guarantee, and SHALL NOT undo a committed Stop latch because a later cancellation-event transaction fails.
+
+THE SYSTEM SHALL capture only the relevant source owner's facts without decoding unrelated retained watch payloads. Post-commit delivery failure SHALL retain the existing pending-notification retry behavior rather than roll back committed source facts.
+
+### REQ-GOAL-014 — Event-owned retention and forward upgrade
+
+THE SYSTEM SHALL retain captured goal facts as normalized immutable event-owned data, distinct from the live goal authority, without foreign keys that pin source goal, goal-history, ProductConversation or transcript deletion.
+
+WHEN a captured event remains retained after a source goal change, replacement, continuation or supported source deletion
+THE SYSTEM SHALL preserve its saved facts rather than reconstruct them from a current owner or admission binding. Event-owned capture SHALL follow the event's existing retention and deletion lifecycle.
+
+WHEN the local watch schema is extended by a forward migration
+THE SYSTEM SHALL preserve existing event identities, payloads, mandatory and subscription routes, wait occurrences, enrollment and delivery identities, pending/accepted/suppressed state, accepted transcript references and continuation state, together with their acceptance, immutability and source-retention constraints and inbound references.
+
+THE SYSTEM SHALL classify pre-capture events as historical facts not captured, SHALL NOT backfill them from current goals, and SHALL leave existing goal, actor, history, binding and control data and already embedded migration identities unchanged.
+
+THE SYSTEM SHALL reuse the existing watch outbox and durable input admission without a second worker, scheduler or startup installation. Saved goal facts, unavailable usage and notification acceptance SHALL NOT grant authority to execute or automatically follow through.

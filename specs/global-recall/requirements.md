@@ -416,6 +416,16 @@ THE SYSTEM SHALL record a distinct wait-entry outcome through the same event out
 
 THE SYSTEM SHALL identify a question wait by its authoritative request identity when present. For a wait without a request identity, THE SYSTEM SHALL allocate its occurrence identity atomically with the committed wait entry and its notification obligations. Re-persisting an identical pending wait SHALL NOT create another occurrence; leaving and re-entering that wait SHALL create a new occurrence. Enrollment during an already-persisted wait SHALL NOT replay that wait.
 
+WHEN an enrolled local watch records an execution-terminal or wait-entry occurrence
+THE SYSTEM SHALL retain current goal facts saved in that event's owning transaction under `specs/conversation-goals/requirements.md` REQ-GOAL-011 through REQ-GOAL-014, without changing the execution or wait outcome.
+
+WHEN an accepted settled Create/State mutation changes the watched ordinary owner without a target execution boundary
+THE SYSTEM SHALL record a distinct local goal-change occurrence through the same subscription outbox, deduplicated by accepted owner version and retained watch enrollment identity.
+
+THE SYSTEM SHALL NOT create a separate goal-change occurrence for execution-bound reports, rejected or replayed mutations, independent Stop control, successful continuation handoff or an assumed future boundary. A report without an actual terminal or wait boundary SHALL NOT gain a standalone notification guarantee. Distinct genuine execution and wait occurrences SHALL NOT be deduplicated by goal version.
+
+THE SYSTEM SHALL preserve mandatory Close notifications and federated terminal-fact subscriptions as distinct typed routes with their existing provenance and delivery semantics; local goal-change occurrences SHALL NOT expand the federation terminal protocol.
+
 THE SYSTEM SHALL deliver factual packets with source identity, occurrence identity, outcome, time, and supported cause information, without behavioral instructions or recovery recommendations. Natural-language derived facts are permitted.
 
 THE SYSTEM SHALL admit notifications through ordinary durable input admission or steering, with stable replay identity, and SHALL NOT introduce a separate execution scheduler.

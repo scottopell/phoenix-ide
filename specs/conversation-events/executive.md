@@ -2,6 +2,23 @@
 
 Implemented on the compact-conversation-events branch; not a deployment or merge claim. Durable metadata joins and typed presentation are separate from persisted diagnostic evidence. Available EventPresentation fields are flattened beside `status: available`; unavailable carries event_id/reason. EnrichedMessage.event_presentation is explicitly nullable. Genuine ts-rs exports are checked in, not handwritten.
 
+## Bounded local goal facts — contract-only extension
+
+REQ-CEVT-006 and ADR-184 specify saved goal metadata on existing local watch
+packets and standalone settled Create/State events. This extension is not
+implemented or executed. No wire variant, generated export, decoder, event card,
+mandatory Close route or federation terminal-fact protocol changes are included
+in the contract cut.
+
+Saved current facts, observed absence and legacy not-captured must remain
+distinct; usage is explicitly unavailable. Execution outcomes keep their own
+meaning, including “Turn finished.” Existing authenticated read paths,
+unavailable fallback, shared redaction and source navigation remain authoritative.
+New DB/API/wire/UI tests and coordinated migration preservation are owed under
+`../conversation-goals/executive.md`; existing presentation evidence below does
+not qualify this extension. No local validation, activation or browser run was
+performed for these docs.
+
 ## Verification
 
 | Contract | Evidence | Remaining boundary |

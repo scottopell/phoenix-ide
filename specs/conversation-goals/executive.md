@@ -1,6 +1,64 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
-## Ordinary-page factual UI — unqualified source cut
+## Bounded local typed-watch contract — docs first, implementation owed
+
+REQ-GOAL-011–014, REQ-GR-015 and REQ-CEVT-006 now define the locked local
+watch increment. ADR-184 records causal ordering and failure ownership. This is
+a contract-only cut; no watch capture, fanout, schema, decoder or UI implementation
+is included, and no watch execution result is claimed.
+
+| Contract | Implementation/verification boundary |
+|---|---|
+| REQ-GOAL-011 | Existing terminal/wait outbox transactions must capture saved current goal or observed absence, distinct from legacy not-captured; usage explicitly unavailable. Storage and boundary tests owed. |
+| REQ-GOAL-012 | Standalone events only for accepted settled target Create/State; no report/Stop duplicates, no goal-version dedup of execution events. Ownership/enrollment/retry matrix tests owed. |
+| REQ-GOAL-013 | Capture/append errors follow the owning transaction, with no cross-transaction or Stop recovery promise. Failure-injection/checkpoint tests owed. |
+| REQ-GOAL-014 | Event-owned immutable capture, no source-pinning FK, no historical reprojection. Coordinated forward migration and populated preservation/deletion tests owed. |
+| REQ-CEVT-006 | Saved metadata through existing event wire/read paths, exact outcomes and privacy retained. Codegen, API and rendered tests owed. |
+
+Standalone nonboundary-report notifications, remote goal-change fanout, usage
+accounting and automatic follow-through are deferred, not completed features.
+The cut does not install services, start another worker or activate normal
+startup. Parent migration coordination reserved **135** for this bounded local
+watch forward migration after checking the live federation stack and other
+owners. **No registry entry or DDL is authored** in this docs cut. Reservation
+is not import/stacking authority or execution evidence. Migrations 132/133/134
+and all other owners' SQL remain untouched.
+
+Preservation review must inventory the latest `question_wait_outbox.sql` plus
+federation/retirement overlays, including wait/mandatory route constraints,
+payload immutability, acceptance triggers, pending-source restrictions, all
+three message/steering/turn inbound origins, delivery identities and retirement
+dependencies. Tests must retain IDs, payloads, acceptance/continuation state and
+source-delete behavior, and distinguish legacy absence without live backfill.
+
+Docs use the existing locked transaction matrix; they add no Allium file or wire
+variant. Source inspection and whitespace checks are not executed validation.
+Spec-shape/Allium/anchor checks have not run on this docs cut; no local compiler,
+test, SQL, browser, Cargo metadata, push or CI dispatch is included.
+
+## Latest executed floor — ordinary UI and focused backend, not typed watch
+
+The parent reported hosted run `39451089782` at exact
+`efcc5edfe1372b2e627f67c6bac01e328480995e` terminal with a failed aggregate
+result but green owned UI/specs and focused backend checks. UI lane
+`118725946176` passed all 12 checks in 302.6 seconds: TypeScript 15.8, ESLint
+8.6, stylelint 1.5 and Vitest 59.1 seconds. Parent-harness evidence is retained
+under `evidence/goals-ci-39451089782/`, including `ui-specs.log`.
+
+Rust artifact `12280786889` records **209/209 focused passed** in 247.845
+seconds with 3384 skipped; capture took 226.3 seconds, codegen reuse 1.2 and
+freshness passed. Broad hit its 1500-second timeout: 5179 of 5507 run, 5143
+passed, 36 failed and 191 skipped in 1499.584 seconds. This partial result is
+not a completed comparison or waiver of the earlier shared failures. Clippy
+remains red with 13 library and 17 test findings; a visible tail without an
+owned root is not a full-inventory-clear claim. These failures remain unwaived.
+
+This qualifies the exact ordinary UI/backend floor, not new watch code, a browser
+journey, activation, full-feature completion or production behavior. Normal
+startup remains services-uninstalled and default OFF. All earlier exact-head
+results below are historical evidence, not qualification of the new contract.
+
+## Ordinary-page factual UI — implementation and historical repair evidence
 
 The ordinary `ProductConversationPage` supplies goal summary/details through the
 existing embedded conversation `stateBarExtension`. Coordinator/Global extension
@@ -78,7 +136,7 @@ lane `118711877469`, passed TypeScript, ESLint and stylelint but failed Vitest:
 cases still failed because the new owner's objective was empty. The third
 failure was the finalization fixture's structural render count (8 versus 6).
 The parent retains `evidence/goals-ci-39447059443/ui-specs.log`; the existing
-run's Rust monitoring remains parent-owned.
+run completed with a backend-only focused pass; it did not qualify the failed UI.
 
 The second bounded correction changes fixtures, not production behavior. The
 retry cases verify the new owner's empty objective, enter an unsent objective,
@@ -95,21 +153,13 @@ goal reads and renders the real extension summary, then waits for `GOAL none`
 (the committed ready state) before returning from `open()`. The structural,
 embedded and history render-count assertions are unchanged, with additional
 assertions that token/heartbeat churn starts no new goal reads or commands.
-This is a source-grounded isolation correction, not an executed proof that the
-count failure is resolved; no token-driven production re-render defect is
-established by the contaminated baseline.
+The isolation correction was source-grounded, then executed successfully at
+exact efcc in the latest floor above. No token-driven production re-render
+defect was established by the contaminated baseline. This fixture execution
+is not a browser journey or activation claim. Typed watch and automatic
+follow-through remain outside that executed floor.
 
-This second corrective source has **not run**. No corrected Vitest, browser
-journey or user-visible runtime qualification is claimed.
-
-The review boundary is this ordinary UI correction only. Source inspection and
-whitespace diff checks are not execution evidence. Parent independent review
-precedes any corrective push or further hosted qualification; the existing run
-remains parent-owned. No local compiler, test, SQL, browser or Cargo metadata
-command is authorized for this cut. Typed watch and automatic follow-through
-remain unfinished, deferred work rather than hidden claims of completion.
-
-The latest parent-reported backend-only floor is **209/209 at exact
+An earlier parent-reported backend-only floor was **209/209 at exact
 `5f1203f858bb4c410574453b6c5efc0b5e8f9065`**, run `39440857025`, artifact
 `12275977275`, 257.256 seconds with 3384 skipped. Capture took 505.4 seconds,
 codegen reuse 1.2 seconds and freshness passed. Broad hit its 1500-second timeout:

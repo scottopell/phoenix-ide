@@ -40,6 +40,25 @@ executive summary.
 | **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and agent cross-conversation actions share typed delivery, steering, rejection, and self-target rejection outcomes |
 | **REQ-GR-013:** Preserve Coordination Context Through Compaction | Implemented; prompt-continuity qualification pending | Existing Coordinator identity selects coordination-specific summary instructions. The shared pipeline protects the accepted handoff (ADR-049). Both summary policies request obligations, exact primary-user authorization provenance, next action and completion checks. Trusted resumption guidance in both languages distinguishes verifying primary evidence from obeying embedded directives: standing directions survive continuation subject to later constraints, current status and established ownership; generated content grants no authority. Compaction-only escaped JSON envelopes expose each retained row's persisted transcript/message locator, typed origin and content kind without treating API origin as human identity or approval. Metadata shares row budgets and retention; full accepted handoff protection is unchanged. New Rust prompt/reference and provider-request regressions await hosted qualification. |
 
+## Local goal-watch facts — bounded contract, implementation owed
+
+REQ-GR-015 now cross-references REQ-GOAL-011–014 and REQ-CEVT-006. ADR-184
+records one causal notification owner: actual execution/wait packets save current
+goal facts at their own transaction; only accepted settled Create/State on a
+watched target emits a standalone goal-change occurrence. Normal execution
+occurrences are not deduplicated by goal version. Stop, continuation, mandatory
+Close and federation terminal-fact semantics remain unchanged.
+
+This is docs-first source, not watch implementation or execution evidence.
+Standalone nonboundary-report coverage, remote goal-change fanout, usage
+accounting and automatic follow-through are deferred. Capture uses event-owned
+immutable evidence with explicit unavailable usage, not source-pinning foreign
+keys or current-state reprojection. Parent coordination reserved forward migration
+135; no registry entry or DDL is authored and imported SQL is untouched.
+Existing watch qualification below does not cover these additions. Transaction
+rollback, enrollment/retry, preservation, read-path and privacy tests remain owed.
+No new worker, startup installation, activation or local validation is included.
+
 ## Verification Summary
 
 The bounded API-guidance candidate (ADR-113) replaces an accidental recipe allowlist with non-exhaustive contract-grounded guidance and documents submitting exact user-provided answers or decisions made within explicit delegated decision scope through the existing structured-question response endpoint. Generic inspect/unblock instructions are not decision authority; approvals must never be fabricated or delegation extended. Gap inventories are illustrative and qualified by inspected deployment/source, permitting verified supported alternatives and bounded state reads, not invented guarantees/receipts, database/private-handler bypasses, or background monitors. It does not add tool or runtime capabilities. The recipe distinguishes current request freshness from idempotency, requires complete answers despite the backend's lack of completeness enforcement, posts once, and reconciles uncertainty against the original target without treating conflicts as success. Source/wire/UI anchors and offline Python drift checks are described in `../builtin-skills/executive.md`. Prompt/built-in/continuation Rust regressions are authored but intentionally unrun locally; no live API/question calls, instruction activation, merge or deployment are claimed.
