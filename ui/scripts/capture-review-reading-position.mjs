@@ -129,7 +129,12 @@ function compare(id, stage, before, after, geometry) {
   }
   if (after.sends !== before.sends) mismatch(id, stage, 'Review sent a network/API message', before.sends, after.sends);
   if (!geometry) return;
-  for (const field of ['scrollTop', 'anchorOffset', 'anchorViewportTop']) {
+  const pinned = id.includes('-bottom-');
+  if (pinned) {
+    const gap = after.scrollHeight - after.clientHeight - after.scrollTop;
+    if (Math.abs(gap) > 2) mismatch(id, stage, 'pinned reader lost bottom', 0, gap);
+  }
+  for (const field of pinned ? [] : ['scrollTop', 'anchorOffset', 'anchorViewportTop']) {
     if (after[field] === null || Math.abs(before[field] - after[field]) > 2) mismatch(id, stage, `${field} jumped`, before[field], after[field]);
   }
   if (before.anchorText !== after.anchorText) mismatch(id, stage, 'paragraph anchor lost', before.anchorText, after.anchorText);

@@ -13,7 +13,10 @@ function reviewHistory(messages: EnrichedMessage[]): EnrichedMessage[] {
       content: [{ type: 'text' as const, text: `Recovery step ${index + 1}: preserve the completed result and the unfinished draft. Replay accepted events in order and reject stale completions.\n\nVerify that the result stays attached to its original conversation. Retrying must not duplicate an answer or move feedback to another source.` }] },
   ]).flat();
   return [...messages, ...turns, {
-    ...answer, message_id: 'review-tail-answer', sequence_id: nextSequence + turns.length,
+    ...prompt, message_id: 'review-tail-question', sequence_id: nextSequence + turns.length,
+    content: { text: 'Summarize the final recovery check.' },
+  }, {
+    ...answer, message_id: 'review-tail-answer', sequence_id: nextSequence + turns.length + 1,
     content: [{ type: 'text', text: 'Recovery checks complete. Review this final result.' }],
   }];
 }
