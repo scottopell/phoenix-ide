@@ -1096,6 +1096,12 @@ async fn prior_schema_upgrade_adds_empty_goal_storage_preserves_source_rows_and_
     crate::migrations::run_before_goal_storage_for_test(db.pool())
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO _migrations (version, name) VALUES (133, 'opaque_federation_peer_notes')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     let goal_tables_before: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'conversation_goal_%'",
     )
