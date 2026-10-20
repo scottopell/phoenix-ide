@@ -282,9 +282,8 @@ async fn all_actor_writes_compete_on_observed_version() {
         db.mutate_conversation_goal(&global, at())
     );
     assert_ne!(a.is_ok(), b.is_ok());
-    let error = match (a, b) {
-        (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
-        (Ok(_), Ok(_)) | (Err(_), Err(_)) => unreachable!("assertion above failed"),
+    let ((Err(error), Ok(_)) | (Ok(_), Err(error))) = (a, b) else {
+        unreachable!("assertion above failed")
     };
     assert!(matches!(error, GoalDbError::Domain(GoalError::Conflict)));
     assert_eq!(
