@@ -1,5 +1,27 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Independent72e review correction — missing active authority fails before replay take
+
+Review of exact72e found an owned fail-closed gap: the installed-service path
+combined absent service and absent active turn as `Ok(false)`, permitting the
+state-progress writer to consume signed replay before tool dispatch rejected the
+missing turn. Source correction keeps absent service and ineligible role behavior
+unchanged but recognizes a canonical typed management candidate/pending intent
+before requiring the active turn. Missing authority now returns an error before
+`take_state_progress_replay` can take or persist the payload. Stale authority
+continues through the existing host-service validation error; tool name alone
+still cannot defer replay. Both current/remaining call and typed pending branches
+use this ordering, including their cancelling-state callers.
+
+The negative provider fixture retains all existing public-message/goal/dispatch
+assertions, captures the exact typed signed replay from its real outcome and
+checks it remains pending with no persisted Anthropic or Responses replay on
+missing or stale active authority. Missing-turn errors are checked explicitly.
+The ordinary-role branch is not forced into Coordinator replay semantics. These
+are source-only assertions, not executed results. No CI, push, activation,
+registration, compiler/tests/SQL/browser or resource changes;11stashes preserved.
+The full focused floor remains156onlye4d;178/184 atade is partial evidence.
+
 ## Latest actual qualification — exactade178/184 is a partial result, not a floor
 
 Parent run **39377097203**, exact

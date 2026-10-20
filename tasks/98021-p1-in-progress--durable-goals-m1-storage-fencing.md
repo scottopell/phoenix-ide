@@ -1,5 +1,21 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Independent72e P2 correction — missing-turn replay fail-closed
+
+Parent exactade..72e review found installed Coordinator management missingactive
+returnedOkfalse with missingservice, allowing prematureprivatecommit before
+ExecuteTool rejection. Separate missingservice eligibility from activeauthority:
+canonicaltypedcandidate/pending recognized first, then requireactive Err before
+any replaytake/persist. Stalehostvalidation remains; ordinary/defaultoff and
+nonmanagement behavior unchanged. No name-only/DTO authorization.
+
+Provider negative fixture now captures exactsigned outcome/owner and asserts
+missing+stale retain samependingreplay with bothDBprivate stores absent; missing
+error text explicit, oldpublic/goal/dispatch assertions preserved. No ordinary-role
+replaydeferral added. Sourceonlyformat/diffchecks;0compiler/testsSQLbrowser/CI/
+push/activation/134registration/resourcechange.11stashes132immutable;156ONLYe4d
+remainsfullfloor178/184adepartial. Coherentpacket includes922+sixrootfix+thisP2.
+
 ## Actualade six focused failures — coherent source correction with922
 
 Run39377097203 exacteade terminalFAIL/artifact12245117981. Actualfocused184:

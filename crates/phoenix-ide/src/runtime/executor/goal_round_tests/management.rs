@@ -272,11 +272,41 @@ async fn conversation_goal_coordinator_provider_management_rejects_missing_or_st
                 .await
                 .unwrap()
                 .unwrap();
+        let expected_replay = match &outcome {
+            LlmOutcome::Response {
+                provider_replay: Some(update),
+                request_id,
+                ..
+            } => update.clone().with_owner_message_id(request_id.clone()),
+            _ => panic!("capturing provider fixture must return signed private replay"),
+        };
         assert!(!runtime.llm_outcome_is_stale(generation));
-        assert!(runtime
+        let error = runtime
             .process_outcome(EffectOutcome::Llm(outcome))
             .await
-            .is_err());
+            .unwrap_err();
+        if authority != "ordinary" {
+            assert_eq!(
+                runtime.pending_provider_replay_update.as_ref(),
+                Some(&expected_replay)
+            );
+            assert!(db
+                .load_provider_replay_state(&fixture.source)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(db
+                .load_responses_replay_state(&fixture.source)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        if authority == "missing" {
+            assert!(
+                error.contains("goal management has no active direct turn"),
+                "{error}"
+            );
+        }
         assert!(runtime.event_rx.try_recv().is_err());
         assert_no_target_mutation(&fixture).await;
         assert_eq!(db.get_messages(&fixture.source).await.unwrap().len(), 1);

@@ -8918,9 +8918,7 @@ where
 
     async fn management_checkpoint_owns_replay(&self) -> Result<bool, String> {
         use phoenix_core::domain::conversation_goal::{GoalManagementRequest, ToolRoundResult};
-        let (Some(service), Some(turn)) =
-            (&self.goal_management, self.active_direct_turn.as_deref())
-        else {
+        let Some(service) = &self.goal_management else {
             return Ok(false);
         };
         if !self.context.is_coordinator || self.context.is_sub_agent {
@@ -8964,6 +8962,10 @@ where
                     management.source().tool_use_id.as_str(),
                     management.request(),
                 )?;
+                let turn = self
+                    .active_direct_turn
+                    .as_deref()
+                    .ok_or("goal management has no active direct turn")?;
                 let verified = service
                     .prepare(
                         &self.context.conversation_id,
@@ -8989,6 +8991,10 @@ where
                 continue;
             };
             require_canonical_management_call(assistant, &call.id, &request)?;
+            let turn = self
+                .active_direct_turn
+                .as_deref()
+                .ok_or("goal management has no active direct turn")?;
             service
                 .prepare(
                     &self.context.conversation_id,
