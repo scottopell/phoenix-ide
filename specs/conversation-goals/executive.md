@@ -86,8 +86,22 @@ The parent captured run **39368026538** at exact
 two temporary bindings are inlined in later source without changing channel or
 catalog ownership or adding an allowance. The lib-test diagnostic tail names
 shared federation fixtures, not additional owned goal-test diagnostics. The run's
-Rust result and generated artifact qualification remain parent-owned; no passing
-claim is made here.
+Rust result and generated artifact qualification remain parent-owned. The terminal
+run's focused selection passed **156/156** in152.811s with3391 skipped, including
+the four prior owned failures and the mixed report/MCP regression. This establishes
+a focused green floor only at exact`e4d`; it does not qualify later management
+commits. The broad run reported5460 tests:5428 passed,32 failed and191 skipped;
+those failures, Clippy and UI remain unwaived.
+
+Artifact **12241064742** contains the successful exact`e4d` ts-rs producer output
+under `target/codegen-scratch/ui/src/generated/`; `check.log` records compile214.3s
+and codegen142.2s success followed by the stale-output guard. All185 artifact
+exports were compared byte-for-byte with the repository. Eight generated files
+were copied verbatim: six missing federation types and the stale
+`EventPresentation.ts`/`InputOrigin.ts`. Handwritten `sse.ts` is the sole
+repository-only TypeScript file and remains byte-identical. No local export or
+build was run. These recovered bytes still require qualification with their
+consumer UI; copying them is not a UI passing claim.
 
 Internal `goal_manage` preparation now requires the parent Coordinator, its
 canonical current assistant/tool-use, and a live generation-fenced materialized
