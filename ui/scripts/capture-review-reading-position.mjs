@@ -41,13 +41,14 @@ const fixtures = [
 const cases = [];
 for (const fixture of fixtures) for (const width of [390, 1100, 1440]) for (const position of ['middle', 'bottom']) {
   cases.push({ fixture, width, position, exit: 'close' });
-  cases.push({ fixture, width, position, exit: (width === 1100) === (position === 'middle') ? 'send' : 'discard' });
+  cases.push({ fixture, width, position, exit: 'send' });
+  cases.push({ fixture, width, position, exit: 'discard' });
 }
 for (const fixture of fixtures) {
   for (const width of [390, 1100]) cases.push({ fixture, width, position: 'middle', exit: 'escape' });
   cases.push({ fixture, width: 1440, position: 'middle', exit: 'fullscreen-return' });
 }
-assert.equal(cases.length, 30);
+assert.equal(cases.length, 42);
 
 // Wait for geometry to remain stable over animation frames, with enough frames
 // to include the short CSS transitions. No wall-clock journey sleeps.
