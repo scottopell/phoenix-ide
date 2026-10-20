@@ -390,17 +390,19 @@ async fn auth_is_document_only_and_fetch_requires_explicit_saved_instance() {
             (StatusCode::NOT_FOUND, json!({"code":"peer_not_found"}))
         );
     }
-    for endpoint in [
-        "https://peer-one.invalid:8443",
-        "https://peer-two.invalid:9443",
+    for (endpoint, fill) in [
+        ("https://peer-one.invalid:8443", "b"),
+        ("https://peer-two.invalid:9443", "c"),
     ] {
+        let saved_credential =
+            PeerBearerCredential::parse(format!("phx_peer_{}", fill.repeat(43))).unwrap();
         state
             .db
             .save_federation_peer_connection(
                 InstanceId::new(),
                 "duplicate",
                 &endpoint.parse().unwrap(),
-                &credential,
+                &saved_credential,
                 &PeerTlsTrust::PlatformRoots,
             )
             .await

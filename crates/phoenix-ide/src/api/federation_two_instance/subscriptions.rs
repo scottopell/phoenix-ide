@@ -173,7 +173,7 @@ async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and
     );
     let local_collision = self::source(&a).await;
     assert_eq!(local_collision.id, source.id);
-    assert_eq!(
+    assert_ne!(
         local_collision.product_conversation_id,
         source.product_conversation_id
     );

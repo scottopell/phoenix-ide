@@ -280,14 +280,14 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn all_facades_require_owner_and_explicit_unambiguous_instance() {
         let (app, state) = app().await;
-        let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
-            format!("phx_peer_{}", "a".repeat(43)),
-        )
-        .unwrap();
-        for endpoint in [
-            "https://peer-one.invalid:8443",
-            "https://peer-two.invalid:9443",
+        for (endpoint, fill) in [
+            ("https://peer-one.invalid:8443", "a"),
+            ("https://peer-two.invalid:9443", "b"),
         ] {
+            let credential = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
+                format!("phx_peer_{}", fill.repeat(43)),
+            )
+            .unwrap();
             state
                 .db
                 .save_federation_peer_connection(

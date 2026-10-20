@@ -661,10 +661,9 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         stored.submitted.origin
     );
     let archived_target = ordinary(&receiver, "archived-ordinary").await;
-    receiver
-        .state
-        .db
-        .set_legacy_conversation_archived(&archived_target.id)
+    sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1")
+        .bind(archived_target.product_conversation_id.as_str())
+        .execute(receiver.state.db.pool())
         .await
         .unwrap();
     let archived = request(
