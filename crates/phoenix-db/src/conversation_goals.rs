@@ -1,9 +1,10 @@
-//! Dormant goal-specific persistence. No runtime, HTTP or tool caller is installed.
+//! Goal-specific persistence and owning-transaction checkpoint operations.
 
 use phoenix_core::domain::conversation_goal::{
     GoalActor, GoalAdmissionObservation, GoalAgentSource, GoalAttribution, GoalChange,
     GoalDisposition, GoalError, GoalExecution, GoalExecutionBinding, GoalFence, GoalHistoryEntry,
-    GoalId, GoalMutation, GoalSnapshot, GoalState, GoalText, GoalTimestampUs, GoalVersion,
+    GoalId, GoalMutation, GoalSnapshot, GoalState, GoalText, GoalTimestampUs, GoalUserCommandKind,
+    GoalVersion,
 };
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
@@ -145,6 +146,19 @@ async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
         .await?;
     let kind: String = row.try_get("kind")?;
     match kind.as_str() {
+        "user_control" => Ok(GoalActor::UserControl {
+            principal_id: uuid::Uuid::from_slice(
+                &row.try_get::<Vec<u8>, _>("control_principal_id")?,
+            )
+            .map_err(|_| GoalDbError::Integrity("goal control principal identity"))?,
+            request_id: uuid::Uuid::from_slice(&row.try_get::<Vec<u8>, _>("control_request_id")?)
+                .map_err(|_| GoalDbError::Integrity("goal control request identity"))?,
+            command: match row.try_get::<String, _>("control_command")?.as_str() {
+                "create" => GoalUserCommandKind::Create,
+                "state" => GoalUserCommandKind::State,
+                _ => return Err(GoalDbError::Integrity("goal control command kind")),
+            },
+        }),
         "user_api" => Ok(GoalActor::UserApi {
             transcript_id: text(row.try_get("transcript_id")?)?,
             message_id: text(row.try_get("message_id")?)?,
@@ -177,6 +191,7 @@ async fn insert_actor(
     tx: &mut GoalTx<'_>,
     owner: &ProductConversationId,
     actor: &GoalActor,
+    result_version: GoalVersion,
 ) -> Result<i64> {
     if let GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) = actor {
         let row = sqlx::query(
@@ -197,6 +212,27 @@ async fn insert_actor(
         }
     }
     let (kind, source_product, transcript, workflow, turn, message, tool, host) = match actor {
+        GoalActor::UserControl {
+            principal_id,
+            request_id,
+            command,
+        } => {
+            let command = match command {
+                GoalUserCommandKind::Create => "create",
+                GoalUserCommandKind::State => "state",
+            };
+            let existing: Option<i64> = sqlx::query_scalar("SELECT actor_id FROM conversation_goal_actors WHERE kind='user_control' AND owner_id=?1 AND control_principal_id=?2 AND control_request_id=?3 AND control_command=?4 AND control_result_version=?5")
+                .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
+                .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
+                .fetch_optional(&mut **tx).await?;
+            if let Some(existing) = existing {
+                return Ok(existing);
+            }
+            return Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,control_principal_id,control_request_id,control_command,control_result_version) VALUES (?1,'user_control',?2,?3,?4,?5)")
+                .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
+                .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
+                .execute(&mut **tx).await?.last_insert_rowid());
+        }
         GoalActor::UserApi {
             transcript_id,
             message_id,
@@ -344,8 +380,20 @@ async fn apply_goal_tx(
             ("report", Some(binding.execution.turn_id()))
         }
     };
-    let requester = insert_actor(tx, &mutation.owner, &mutation.attribution.requested_by).await?;
-    let applier = insert_actor(tx, &mutation.owner, &mutation.attribution.applied_by).await?;
+    let requester = insert_actor(
+        tx,
+        &mutation.owner,
+        &mutation.attribution.requested_by,
+        next.version,
+    )
+    .await?;
+    let applier = insert_actor(
+        tx,
+        &mutation.owner,
+        &mutation.attribution.applied_by,
+        next.version,
+    )
+    .await?;
     let (state, reason) = state_columns(&next.state);
     sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
         .bind(next.owner.as_str()).bind(next.version.get()).bind(next.goal_id.as_str())

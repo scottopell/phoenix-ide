@@ -57,7 +57,7 @@ THE SYSTEM SHALL retain neither a partial state change nor orphaned accepted-att
 
 ### REQ-GOAL-004 — Concrete attribution without authority fabrication
 
-THE SYSTEM SHALL distinguish trusted user-input-channel origin, owning-agent origin, Coordinator origin and generated-host origin.
+THE SYSTEM SHALL distinguish trusted user-input-channel origin, authenticated owner-control-request origin, owning-agent origin, Coordinator origin and generated-host origin.
 
 THE SYSTEM SHALL preserve the requester separately from the applier and record the concrete causative input/action identity.
 
@@ -69,6 +69,22 @@ THE SYSTEM SHALL check ordinary-owner versus Coordinator kind and membership con
 THE SYSTEM SHALL treat exact invocation assignment as trusted runtime context rather than infer it from a matching transcript, a model-supplied actor label or arbitrary retrieved text.
 
 THE SYSTEM SHALL NOT describe user-API channel provenance as proof of biological human identity or actor attribution as commission/resource authorization.
+
+#### REQ-GOAL-004.1 — Request-backed owner controls
+
+WHEN a goal mutation originates from an authenticated owner control without a chat message
+THE SYSTEM SHALL attribute it to the actual accepted goal command request, not a fabricated message or a principal claimed by the caller.
+
+THE SYSTEM SHALL authenticate and authorize the current ordinary, open owner at the application boundary before looking up retained request results, without treating attribution evidence as authorization.
+
+THE SYSTEM SHALL require agreement between the accepted request and mutation on owner, request identity, command, expected/result versions and goal identity, and SHALL commit them atomically.
+
+THE SYSTEM SHALL NOT use an accepted Stop or release request as evidence of an accepted goal command.
+
+WHEN a control request is retried with identical command input
+THE SYSTEM SHALL retain its original result, and SHALL reject changed input at the same request identity.
+
+THE SYSTEM SHALL apply settled-boundary admission to a new owner goal command without clearing the independent Stop latch.
 
 ### REQ-GOAL-005 — Immutable execution observation and stale reports
 

@@ -176,9 +176,21 @@ pub struct GoalAgentSource {
     pub tool_use_id: GoalText,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalUserCommandKind {
+    Create,
+    State,
+}
+
 /// `UserApi` denotes the trusted input channel, not proof of biological authorship.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalActor {
+    UserControl {
+        principal_id: uuid::Uuid,
+        request_id: uuid::Uuid,
+        command: GoalUserCommandKind,
+    },
     UserApi {
         transcript_id: GoalText,
         message_id: GoalText,
@@ -302,6 +314,19 @@ impl GoalMutation {
         if version != self.expected_version || current.is_some_and(|s| s.owner != self.owner) {
             return Err(GoalError::Conflict);
         }
+        for actor in [&self.attribution.requested_by, &self.attribution.applied_by] {
+            if let GoalActor::UserControl { command, .. } = actor {
+                let applicable = match command {
+                    GoalUserCommandKind::Create => matches!(self.change, GoalChange::Create { .. }),
+                    GoalUserCommandKind::State => {
+                        matches!(self.change, GoalChange::SetDisposition { .. })
+                    }
+                };
+                if !applicable {
+                    return Err(GoalError::Inapplicable);
+                }
+            }
+        }
         if let GoalChange::Create { goal_id, objective } = &self.change {
             if current.is_some_and(|s| s.goal_id == *goal_id) {
                 return Err(GoalError::Inapplicable);
@@ -355,6 +380,7 @@ impl GoalMutation {
                             && source.execution == binding.execution => {}
                     GoalActor::OwningAgent(_)
                     | GoalActor::UserApi { .. }
+                    | GoalActor::UserControl { .. }
                     | GoalActor::Coordinator(_)
                     | GoalActor::GeneratedHost { .. } => {
                         return Err(GoalError::ReportBindingRequired)

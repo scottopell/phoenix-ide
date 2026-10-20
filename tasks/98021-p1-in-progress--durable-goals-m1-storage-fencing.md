@@ -796,3 +796,103 @@ snapshot table. Candidate rebuild/source work is still owed; actual133 remains
 absent,134 reserved/unregistered. Runtime Stop cancellation/linearization,
 UserControl mutation service, tools/UI/watch/automatic continuation remain
 commissioned and are not closed by this increment. Parent retains integration.
+
+### UserControl candidate actor integration, still unregistered/unqualified
+
+Continued beyond369's effect-path slice. Added typed `GoalActor::UserControl`
+with UUID principal/request and Create/State command kind. Pure mutation matching
+rejects wrong-command sources in either attribution slot and excludes UserControl
+from owning-agent reports. Actual DB actor insert/decode paths map this kind;
+legacy132 branches do not access absent candidate columns. There is no new
+principal/authentication source: actor metadata is still not authorization.
+
+Unnumbered `user_control_candidate.sql` prepares the populated132 actor rebuild:
+transaction-deferred actor/history/binding staging with exact actor IDs and retained
+locators, no rename-parent FK retarget, historical-source/admission validators
+removed only during restoration and reinstated afterward. Goal identities/history/
+bindings are retained unchanged, not copied into a product snapshot table.
+Separate create/state request receipts require actual accepted matching command,
+owner/principal/request, expected/result version and target. Accepted input reads
+its canonical objective/state from immutable identity/history rather than storing
+a second authoritative accepted payload. Rejected inputs retain their own scalar
+payload. Stop/release receipts cannot attribute goal creation or change the latch.
+
+UserControl actor rows are unique per accepted request, carry its result-version
+FK and a deferred FK into both attribution slots of that exact history row.
+Production insert_actor reuses the same row for the two direct-control roles
+inside the owning transaction. An AFTER INSERT history/receipt identity guard
+rejects REPLACE relabelling to a legacy source; replacing the natural-key actor
+with another row ID violates the retained immediate history FK. No BEFORE INSERT
+rowid sentinel assumptions or132 edits were added.
+
+Four authored/unexecuted candidate tests cover a genuine populated report↔binding
+cycle with/without deleted source messages, exact retained row/history equality,
+mid-rebuild fault rollback and retry, request replacement refusal, typed positive
+Create actor insert/read/serde and wrong-command/owner/principal/request/version/
+source-mixing refusals, actor replacement, stopped-latch preservation and owner
+cascade with a separate owner retained. This is a private storage/migration
+composition proof, NOT authenticated service/route or actual133→134 qualification.
+Accepted State command application and the complete legacy-actor upgrade matrix
+remain owed. Existing legacy132 raw actor-REPLACE semantics outside the new
+UserControl receipt-backed history are a captured TODO, not silently claimed fixed.
+
+Independent source review caught and corrected a missing enum import, SQLx0.9's
+static-SQL requirement in new tests and the exact GoalHistoryEntry field path.
+Another review corrected the actor-replacement fixture to assert the actual
+immediate FK statement failure and await rollback instead of expecting only a
+commit failure. These are source checks, not compilation/execution qualification.
+
+The same review found the SQLite REPLACE bypass of receipt UPDATE/DELETE guards.
+The two unregistered candidate receipt relations now reject conflicting INSERTs;
+control binding recapture and latch rewind by REPLACE are guarded without blocking
+normal receipt-triggered one-step UPSERT. One additional authored regression covers
+that control path. All source remains outside parent CI39349884955/exact2ec, which
+is still active in its normal Rust check at this entry; no counts are inferred
+from job status or source preflight. No duplicate dispatch/local execution.
+
+Next implementation remains the owner-authenticated goal command service with
+current owner authorization before receipt lookup, settled-boundary new commands,
+exact accepted/rejected replay and transaction-owned receipt+actor+history commit.
+That must consume real authenticated context, never caller principal or synthetic
+chat. UserControl candidate is not installed outside isolated authored tests.
+Actual133 is still absent and134 remains reserved/unregistered;132 unchanged.
+Production stays Disabled/emitterNone/control503. Runtime Stop/send linearization
+and cancellation, goal tools/UI/watch/automatic continuation remain commissioned.
+
+### Actual parent2ec terminal qualification — new focused floor127/127
+
+Parent run **39349884955**, exact **2ec904a6720140469eb840b0607302c64dc9da24**,
+is terminal FAILED overall. Downloaded/read Rust job **118391408991**, artifact
+**12234006411**. Focused execution **127 tests:127 passed,3391 filtered/skipped,
+119.396s**. All five e19 assertion roots are individually PASS, including actual
+prepared-report Stop, mixed trusted payload, ordinary-tool cancellation, stale
+terminal retirement, and terminal response-loss receipt reconstruction. This is
+the new wholly green focused floor and supersedes historical f6's96/96.64322
+remains compile-zero-execution; e19 remains historical109/5, not green.
+
+Normal Rust compiled then exceeded its configured1500s budget:
+**5115/5429 executed,5080 passed,35 failed,191 skipped;314 not run**. These35
+failures are not blanket-waived or inferred upstream from names. Clippy/UI are
+red; E2E/geometry/task/worker-budget lanes passed separately. Own2ec String/unit
+fixture lints are source-fixed at369, outside this run. No qualification of369
+or the later UserControl source follows from the127-pass artifact. No active
+run remains; no duplicate dispatch or local execution occurred. PR959 comment
+6281250089 records this terminal scope for the parent integrator.
+
+REQ-GOAL-004.1 and ADR-183 record the approved no-chat, command-specific control
+attribution contract without claiming application installation or new compatibility
+promises. Source preflight followed AUTHORING routing/wire/grammar/traceability
+checks: no Allium or generated wire file changed, timeless requirement has no
+status/task/date content, ADR is point-in-time, executive tracks partial status.
+No new task file was allocated; current task filename/status is unchanged.
+
+The later actor candidate now also closes the new UserControl REPLACE hole via
+exact version-bound receipt/history FKs and canonical-history source validation.
+Its natural-key replacement regression expects the actual immediate historical
+FK refusal and awaits rollback; it does not weaken constraints to force a later
+commit failure. Positive Create runs actual actor write/read/serde and preserves
+an actual stopped latch at version2. This is not accepted-State application or
+authenticated service proof. Next remains the real owner-authenticated goal
+command service and subsequent tools/UI/watch/automatic continuation, with
+strict Stop/send ownership/cancellation still an activation gate.134 remains
+unregistered pending actual133; immutable132 and all stashes remain preserved.

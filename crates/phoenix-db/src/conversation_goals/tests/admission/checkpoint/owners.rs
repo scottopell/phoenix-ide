@@ -26,6 +26,9 @@ use phoenix_workflow::{
 };
 
 use super::super::{fixture, t};
+
+#[path = "owners/user_control_upgrade.rs"]
+mod user_control_upgrade;
 use crate::{
     conversation_goals::round::{GoalRoundCheckpoint, ToolRoundWrite},
     workflow::{

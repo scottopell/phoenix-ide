@@ -2,13 +2,33 @@
 
 ## Current qualification boundary
 
+Parent-owned run **39349884955**, exact **`2ec904a6720140469eb840b0607302c64dc9da24`**,
+is terminal FAILED overall. Downloaded Rust job118391408991 artifact12234006411
+proves focused execution: **127 tests,127 passed,3391 filtered/skipped,119.396s**.
+All five e19 failure roots individually pass, including the actual prepared-report
+Stop race and terminal-response-loss reconstruction. This is the new wholly green
+focused floor, superseding f6's96/96; it qualifies neither later369 source nor the
+UserControl candidate.
+
+Normal Rust checks compiled then exceeded their configured1500s budget:
+5115/5429 tests executed,5080 passed,35 failed,191 skipped;314 did not run after
+termination. Those35 assertions are not blanket-classified as upstream. Clippy
+and UI/specs also failed; E2E, geometry, tasks and worker-budget lanes passed.
+Two owned fixture Clippy lints are source-fixed in369, outside tested2ec.
+
+Actual-path369 and subsequent actor/candidate work remain execution-unqualified.
+No duplicate CI or local heavy execution was performed. Production stays Disabled,
+emitter None, route503; actual133 is absent and134 remains unregistered.
+
+### Earlier64322 compile diagnostic
+
 Run **39348937685**, exact `64322db7480f1452d00357eaf20c209c16a54003`, is terminal
 **FAILED**. Rust job118388364345/artifact12231779623 failed before test execution
 in both normal and focused stages: two candidate-test helpers resolved the parent
 one-parameter `Result` alias with two arguments (four diagnostics), and the IDE
 Blocked-report fixture omitted the checked GoalReportBinding conversion. **Zero
 new focused tests executed.** This does not supersede e19's actual109/5 result or
-f6's last wholly green96/96 focused floor.
+f6's then-current green96/96 focused floor; the later2ec127/127 result supersedes both as the current floor.
 
 All identified owned compiler/lint roots are source-corrected after64322, including
 explicit standard Result types, checked binding conversion and borrowed HTTP
@@ -16,7 +36,7 @@ error classification. Source audit also corrected the minimal schema fixture's
 settled-admission setup and switched its Goal/NoGoal capture to the actual
 `capture_goal_at_new_turn_tx` production helper. None of those later repairs or
 the transactional control-recheck increment has exact-head execution evidence.
-The parent subsequently commissioned/dispatched corrected-head run39349884955 at exact2ec; it does not cover later source. No duplicate run was dispatched.
+The parent subsequently commissioned exact2ec run39349884955, whose terminal127/127 focused evidence is recorded above. It does not cover later source. No duplicate run was dispatched.
 
 E2E, geometry, task validation and worker-budget jobs passed separately. Clippy
 and UI/specs failed; their remaining federation/shared paths are unchanged from
@@ -48,9 +68,44 @@ Read-only review caught/fixed the admission-vs-effect canonical-message predicat
 and canonical-ID expectation before publishing. Parent2ec Clippy's two owned
 fixture lints are source-fixed here; that is not test qualification. UserControl
 requires a goal-command-specific receipt, never a Stop/release receipt masquerading
-as goal creation; actor-cycle upgrade/service source remains owed.134 is still
-unregistered pending actual133. Runtime cancellation/linearization, actor/service,
-public tools/UI/watch and automatic continuation remain unfinished.
+as goal creation. Later candidate source supplies the typed actor and cyclic
+rebuild groundwork described below; authenticated command service and complete
+upgrade qualification remain owed.134 is still unregistered pending actual133.
+Runtime cancellation/linearization, service, public tools/UI/watch and automatic
+continuation remain unfinished.
+
+## UserControl candidate source, not installed
+
+REQ-GOAL-004.1 and ADR-183 record the no-chat, command-specific attribution contract;
+application authentication and public command installation remain unfinished.
+
+Typed UserControl actor metadata now carries UUID principal/request and explicit
+Create/State command kind through actual core validation and DB insert/decode.
+Legacy132 actor paths never query absent candidate columns. An unregistered SQL
+candidate stages/restores the populated actor/history/binding cycle under deferred
+FKs without revalidating historical message/admission locators. Its separate
+accepted goal-command receipts bind exact actor owner/request/command/result and
+history target; accepted payload reads canonical identity/history rather than a
+second authoritative copy. Stop/release evidence is not a goal-command receipt.
+
+The new actor is unique per accepted request and deferred-FK-bound into both
+attribution slots of that command's exact history row; actual insertion reuses it
+for direct requested/applied roles. An AFTER INSERT guard plus retained history
+FKs rejects value/row-ID replacement. Candidate receipt INSERT-conflict guards
+also prevent SQLite REPLACE from rewriting retry evidence, rewinding control or
+recapturing an old binding while preserving normal one-step control UPSERT.
+
+Four unexecuted UserControl tests exercise genuine populated132 report/binding
+cycles, retained equality/source removal/owner deletion, mid-rebuild rollback,
+receipt immutability and positive typed Create insert/read/serde with adversarial
+source/command/reference checks. A fifth authored regression covers control
+REPLACE. This is isolated storage composition, not public authentication or
+actual133→134 qualification. Accepted State application, complete legacy upgrade
+matrix and authenticated owner command service remain owed. Legacy132 actor
+REPLACE behavior outside the new receipt-backed history is captured as a TODO.
+Read-only reviews corrected concrete API/SQLx-static-SQL/fixture issues before
+publication; none is compilation or test qualification. Parent2ec CI does not
+cover this later source. No migration registration or production activation.
 
 ## Historical foundation qualification
 
@@ -143,6 +198,7 @@ Draft PR #959 runs existing normal hosted CI, without workflow edits, repeat dis
 | REQ-GOAL-002 all-writer owner CAS | `GoalMutation::advance`, `Database::apply_conversation_goal`, owner/version primary key | `all_actor_writes_compete_on_observed_version`, `objective_cannot_change_under_current_identity_and_supersession_needs_observed_version` |
 | REQ-GOAL-003 atomic history/retry | action uniqueness; transaction-scoped identity and actor inserts | `normalized_history_roundtrips_all_actors_and_exact_retries`, `failed_history_insert_rolls_back_both_actor_rows`, `agent_locator_must_name_a_real_assistant_tool_call_for_both_actor_roles` |
 | REQ-GOAL-004 actor distinction | `GoalActor`, `insert_actor`, `conversation_goal_actor_source` | all-actor round trip, wrong-role/channel, invented-call and user-message-as-agent cases |
+| REQ-GOAL-004.1 no-chat controls | typed UserControl insert/decode and unregistered command-receipt/cyclic-rebuild candidate; owner command service not installed | authored storage/upgrade/Create attribution cases, unexecuted; authenticated service/exact State application remain owed |
 | REQ-GOAL-005 execution/report fence | `GoalExecutionBinding`, `bind_goal_at_admission_tx`, `conversation_goal_report_fence` | `admitted_binding_is_immutable_and_late_report_cannot_rebind_to_replacement`, `raw_report_row_cannot_reference_another_owner_or_wrong_version`, `no_goal_admission_cannot_acquire_a_later_goal`, `replacement_changes_identity_and_fences_admitted_report_even_with_same_text` |
 | REQ-GOAL-006 immutable identity/status terminality | `GoalChange`, `GoalDisposition`, `GoalMutation::advance`, `conversation_goal_history_transition` | `complete_and_exhausted_are_distinct_terminal_outcomes_and_cannot_reopen`, `blocked_underway_roundtrip_keeps_objective_and_fences_previous_execution`, `terminal_success_and_exhaustion_roundtrip_cannot_reopen_but_allow_new_identity`, `suspended_representation_rejects_fresh_report_or_status_release_without_claiming_stop_enforcement` |
 | REQ-GOAL-007 scoped retention/deletion | owner cascades and owner-existence no-delete guards; evidence locators | `real_migrations_user_goal_supersession_and_supported_hard_delete_do_not_pin_aggregate`, `real_migrations_terminal_and_superseded_goals_do_not_pin_supported_hard_delete`, `real_migrations_no_goal_binding_does_not_pin_supported_hard_delete`, `history_and_binding_rows_cannot_be_rewritten_or_deleted`, `real_migrations_goal_binding_successful_report_and_hard_delete_remove_all_goal_rows` |
