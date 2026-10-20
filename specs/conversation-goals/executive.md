@@ -56,16 +56,32 @@ updates, exact unknown retry after failed refresh or a rejected retry, owner
 switchback/unmount fences, late control/history reads and mutation refetch,
 independent CAS values, explicit reasons, null-to-zero Stop, bounded history
 pagination and fail-closed page rejection, mounted ordinary extension controls,
-read-only History and preservation of the supplied coordinator extension. These
-tests have **not run**; no TypeScript typecheck, browser journey or user-visible
-runtime qualification is claimed for this source cut.
+read-only History and preservation of the supplied coordinator extension.
 
-The review boundary is this ordinary UI cut only. Source inspection and whitespace
-diff checks are not execution evidence. Parent independent review precedes any
-push and the parent-owned single hosted qualification. No local compiler, test,
-SQL, browser or Cargo metadata command is authorized for this cut. Typed watch
-and automatic follow-through remain unfinished, deferred work rather than hidden
-claims of completion.
+The parent reported terminal failure of the UI lane `118690151347` in hosted run
+`39440857025` at exact `5f1203f858bb4c410574453b6c5efc0b5e8f9065`, retaining
+`evidence/goals-ci-39440857025/ui-specs.log` in the parent harness. TypeScript and
+ESLint failed; Vitest reported 3808 passed, 2 failed and 2 skipped across 182
+files (181 passed). The two failed cases were the 403/503 unknown-retry tests,
+which asserted the new owner's enabled Create control before its facts settled.
+Stylelint, ast-grep, manual-SQL audit, spec shape, Allium, dev.py and package-lock
+checks passed in that lane. Static review missed these three owned roots; it did
+not qualify UI execution. Rust was still active when the parent relayed this
+result and remains parent-monitored, not classified here.
+
+The bounded correction separates unavailable/error discriminants in `Facts`,
+replaces a type-only unused disposition schema with the equivalent explicit
+request DTO union, and waits for the new owner's enabled control in the two retry
+cases without weakening UUID/payload retention assertions. This corrective
+source has **not run**; no corrected TypeScript, ESLint, Vitest, browser journey
+or user-visible runtime qualification is claimed.
+
+The review boundary is this ordinary UI correction only. Source inspection and
+whitespace diff checks are not execution evidence. Parent independent review
+precedes any corrective push or further hosted qualification; the existing run
+remains parent-owned. No local compiler, test, SQL, browser or Cargo metadata
+command is authorized for this cut. Typed watch and automatic follow-through
+remain unfinished, deferred work rather than hidden claims of completion.
 
 The latest qualified backend floor is **209/209 at exact
 `245da1764bf1085dc25d6dff29e3b8b79114de34`**, run `39431777571`, artifact

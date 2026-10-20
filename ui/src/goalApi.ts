@@ -4,12 +4,6 @@ const text = v.pipe(v.string(), v.check((value) => value.trim().length > 0, 'Exp
 const counter = v.pipe(v.number(), v.safeInteger(), v.minValue(0));
 const positive = v.pipe(counter, v.minValue(1));
 const uuid = v.pipe(v.string(), v.uuid());
-const disposition = v.variant('state', [
-  v.strictObject({ state: v.literal('underway') }),
-  v.strictObject({ state: v.literal('blocked'), reason: text }),
-  v.strictObject({ state: v.literal('complete'), reason: text }),
-  v.strictObject({ state: v.literal('exhausted'), reason: text }),
-]);
 const state = v.union([
   v.literal('Underway'),
   v.strictObject({ Blocked: text }),
@@ -58,7 +52,11 @@ const controlReceipt = v.strictObject({
 });
 export type GoalEntry = v.InferOutput<typeof goalEntrySchema>;
 export type GoalControl = v.InferOutput<typeof controlSchema>;
-export type GoalDisposition = v.InferOutput<typeof disposition>;
+export type GoalDisposition =
+  | { state: 'underway' }
+  | { state: 'blocked'; reason: string }
+  | { state: 'complete'; reason: string }
+  | { state: 'exhausted'; reason: string };
 export type GoalCommand =
   | { kind: 'create'; body: { request_id: string; expected_version: number; objective: string } }
   | { kind: 'state'; body: { request_id: string; expected_version: number; goal_id: string; disposition: GoalDisposition } }

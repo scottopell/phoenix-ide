@@ -4,7 +4,8 @@ import type { GoalCommand, GoalControl, GoalEntry } from '../goalApi';
 
 type Facts =
   | { owner: string | null; kind: 'loading' }
-  | { owner: string; kind: 'unavailable' | 'error'; message: string }
+  | { owner: string; kind: 'unavailable'; message: string }
+  | { owner: string; kind: 'error'; message: string }
   | { owner: string; kind: 'ready'; current: GoalEntry | null; control: GoalControl | null; history: GoalEntry[]; more: boolean };
 type Pending = { command: GoalCommand; outcome: 'sending' | 'unknown' };
 

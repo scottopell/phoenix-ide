@@ -111,7 +111,7 @@ describe('ordinary conversation goal extension', () => {
     expect(await screen.findByText('No recorded goal.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Create goal' })).toBeDisabled();
     view.rerender(<Harness owner="pc-2" />);
-    expect(await screen.findByRole('button', { name: 'Create goal' })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Create goal' })).toBeEnabled());
     view.rerender(<Harness owner="pc-1" />);
     fireEvent.click(await screen.findByRole('button', { name: 'Retry exact command' }));
     await waitFor(() => expect(command).toHaveBeenCalledTimes(3));
