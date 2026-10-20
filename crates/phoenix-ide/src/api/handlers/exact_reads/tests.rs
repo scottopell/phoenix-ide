@@ -1,8 +1,9 @@
-use super::*;
-use crate::api::handlers::hard_delete_cascade_tests::make_test_state;
+use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
 use axum::{
     body::{to_bytes, Body},
-    http::Request,
+    http::{Request, StatusCode},
+    response::IntoResponse,
+    Router,
 };
 use phoenix_core::domain::db_schema::MessageContent;
 use serde_json::{json, Value};
@@ -179,7 +180,7 @@ async fn exact_read_product_ids_follow_the_nonblank_text_schema_contract() {
 }
 
 #[tokio::test]
-async fn exact_read_coordinator_routes_and_history_keep_membership() {
+async fn exact_read_coordinator_uuid_routes_and_history_match_legacy() {
     let state = make_test_state().await;
     let coordinator = state
         .db
@@ -230,9 +231,14 @@ async fn exact_read_coordinator_routes_and_history_keep_membership() {
                 .unwrap();
         assert_eq!(exact, legacy);
     }
-    sqlx::query("DELETE FROM messages WHERE conversation_id = ?1")
-        .bind(&coordinator.id)
-        .execute(state.db.pool())
+}
+
+#[tokio::test]
+async fn exact_read_coordinator_schema_rekeys_keep_membership() {
+    let state = make_test_state().await;
+    let coordinator = state
+        .db
+        .get_or_create_coordinator(None, crate::llm_language::LlmLanguage::default())
         .await
         .unwrap();
 
