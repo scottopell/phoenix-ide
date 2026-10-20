@@ -2,6 +2,8 @@ use super::*;
 
 async fn control_fixture() -> (tempfile::TempDir, Database) {
     let (dir, db) = fixture().await;
+    sqlx::raw_sql("ALTER TABLE product_conversations ADD COLUMN ordinary_lifecycle TEXT NOT NULL DEFAULT 'open' CHECK (ordinary_lifecycle IN ('open','history')); CREATE TABLE close_obligations (product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE, phase TEXT NOT NULL);")
+        .execute(db.pool()).await.unwrap();
     sqlx::raw_sql(include_str!("../control_candidate.sql"))
         .execute(db.pool())
         .await
@@ -173,7 +175,7 @@ async fn conversation_goal_control_candidate_goal_or_no_goal_capture_shares_atom
         };
         assert_eq!(control_version(&db).await, Some((1, 1)));
         let binding = GoalExecutionBinding {
-            owner: ProductConversationId::new("owner").unwrap(),
+            owner: ProductConversationId::parse("owner").unwrap(),
             execution: GoalExecution::parse(1, 1).unwrap(),
             observation,
         };

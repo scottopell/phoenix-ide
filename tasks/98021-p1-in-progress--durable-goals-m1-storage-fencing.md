@@ -546,8 +546,10 @@ No principal/session registry or model-provided actor was added.
 Added the real owner-only HTTP adapter at
 `POST /api/product-conversations/:reference/goal-control`, always backed by the
 default disabled service: authenticated normal requests receive503 without any
-control DB access; guest requests receive401 and forged principal fields are
-rejected by the actual JSON extractor. **The route is present, installation is
+control DB access; the isolated owner-extractor router returns403 for a missing
+owner marker, and forged principal fields are rejected by the actual JSON
+extractor. Production authentication middleware's separate401 behavior is not
+proved by that isolated router test. **The route is present, installation is
 not.** No runtime Stop cancellation, goal mutation, continuation, control-release
 or production activation can occur through this adapter in this source state.
 
@@ -563,10 +565,12 @@ Additional unexecuted tests cover real accepted receipt retry after later change
 rejected receipt replay after later changes, same-ID changed input conflict,
 authorization re-check before old receipt replay when owner closes, guest/peer
 extractor refusal, forged input refusal, disabled default, and actual HTTP
-401/503/422 behavior. Concrete symbols were read before publication:
+403/503/422 behavior. The original declaration-audit claim below was too broad:
+parent review found the ProductConversationId constructor assertion was wrong;
+the corrected parse declaration is recorded in the follow-up. Listed references:
 `GoalExecution::turn_id()/workflow_id()` (private fields),
 `Database::conversation_goal_execution_binding(GoalExecution)`,
-`InstanceId::Display/from_uuid`, `Database::instance_id`, `ProductConversationId::new`,
+`InstanceId::Display/from_uuid`, `Database::instance_id`, `ProductConversationId::parse`,
 `OwnerAuthenticated::from_request_parts`, `PeerAuthenticated`'s three fields,
 `ControlSnapshot`'s nonzero version, SQLx transaction/query APIs, and the existing
 Axum Router/Tower oneshot fixture convention. The candidate include path was
@@ -578,3 +582,26 @@ Stop/release receipts do not pretend to be a completed actor migration or public
 admission installation. Registration134 still waits for actual133 import. Current
 hosted e19 run39343463637 remains the only active qualification; this increment
 is not in that older run, and no duplicate/new run was dispatched.
+
+### Parent service review corrections (no new dispatch)
+
+Exact1e..6b independent parent review found three owned defects, accepted and
+fixed immediately rather than waiting for old CI: `ProductConversationId::new()`
+is zero-argument identity generation; `parse(value)` is the fallible existing-ID
+API. Both the HTTP owner parse and atomic-capture test now use `parse`. The
+minimal control schema fixture now supplies the actual ordinary-lifecycle
+`open/history` shape and the queried close-obligation projection before installing
+the candidate SQL; it no longer lacks columns/tables needed by its triggers.
+The HTTP isolated-router expectation is403, matching the actual `OwnerAuthenticated`
+extractor, not production middleware401. The application service fixtures already
+use the real full migrated DB substrate; the minimal schema proofs are not
+relabeled full-upgrade tests.
+
+Reading the actual migration CHECK during this correction also exposed the new
+service test's invented `closing` lifecycle literal. It now transitions the
+ordinary owner to actual `history` before reauthorization/retry refusal. The
+previous source-grounding claim did not establish compile/API completeness;
+these concrete corrections supersede it. No auth behavior,134 registry slot,
+activation, or production migration changed. Currente19 run39343463637 progressed
+to its Focused goal qualification stage; no terminal result or timeout is inferred
+from its earlier long broad-check stage.

@@ -14,7 +14,7 @@ pub(super) async fn apply(
     Path(owner): Path<String>,
     Json(request): Json<GoalControlRequest>,
 ) -> Result<(StatusCode, Json<ControlReceipt>), ApiError> {
-    let owner = ProductConversationId::new(owner)
+    let owner = ProductConversationId::parse(owner)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid owner identity"))?;
     let receipt = GoalControlService::default()
         .apply(authenticated, owner, request)
@@ -83,7 +83,7 @@ mod tests {
     async fn conversation_goal_control_http_requires_owner_and_remains_structurally_disabled() {
         let router = Router::new().route("/control/:owner", post(apply));
         let response = router.clone().oneshot(request(false)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let router = router.layer(Extension(OwnerAuthenticated));
         let response = router.clone().oneshot(request(false)).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

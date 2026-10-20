@@ -229,7 +229,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle='closing' WHERE id=?")
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id=?")
             .bind(owner.as_str())
             .execute(service.storage.as_ref().unwrap().pool())
             .await
