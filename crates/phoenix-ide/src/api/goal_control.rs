@@ -265,18 +265,25 @@ mod tests {
 
     #[test]
     fn conversation_goal_command_http_maps_history_and_close_admission_to_conflict() {
+        let history_owner = ProductConversationId::parse("history-owner").unwrap();
+        let fence = phoenix_db::CloseAdmissionFence {
+            product_conversation_id: ProductConversationId::parse("closing-owner").unwrap(),
+            attempt_id: phoenix_core::domain::close::CloseAttemptId::parse("closing-attempt")
+                .unwrap(),
+            phase: phoenix_core::domain::close::ClosePhase::SettlingActiveWork,
+        };
         for error in [
             GoalCommandServiceError::Storage(phoenix_db::DbError::ProductConversationUnavailable(
-                "history-owner".into(),
+                history_owner.clone(),
             )),
             GoalCommandServiceError::Goal(GoalDbError::Admission(
-                phoenix_db::DbError::ProductConversationUnavailable("history-owner".into()),
+                phoenix_db::DbError::ProductConversationUnavailable(history_owner),
             )),
             GoalCommandServiceError::Storage(phoenix_db::DbError::CloseAdmissionFenced(
-                "closing-owner".into(),
+                fence.clone(),
             )),
             GoalCommandServiceError::Goal(GoalDbError::Admission(
-                phoenix_db::DbError::CloseAdmissionFenced("closing-owner".into()),
+                phoenix_db::DbError::CloseAdmissionFenced(fence),
             )),
         ] {
             let (status, Json(body)) = command_error(&error);
