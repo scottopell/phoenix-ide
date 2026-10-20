@@ -33,8 +33,8 @@ const browser = await chromium.launch({ headless: true, timeout: 15000 }).catch(
   throw error;
 });
 const fixtures = [
-  { kind: 'ordinary', story: 'product-conversation--inline-message-reactions', ready: 'inline-message-reactions',
-    entry: '/product-conversations/pc-inline-reactions?source_transcript=reaction-history#message-recovery-answer-0' },
+  { kind: 'ordinary', story: 'review-reading-position--ordinary-long-history', ready: 'ordinary-lazy-history',
+    entry: '/product-conversations/fixture-product-conversation?source_transcript=history-3#message-history-answer-3' },
   { kind: 'global', story: 'review-reading-position--global-long-history', ready: 'global-lazy-history',
     entry: '/global/history-3?source_transcript=history-3#message-history-answer-3' },
 ];
@@ -67,13 +67,15 @@ async function settle(page) {
   }));
 }
 
-async function measure(page, initialize = false) {
+async function measure(page, initialize = null) {
   return page.evaluate(initialize => {
     const el = document.querySelector('#messages');
     if (!el) throw new Error('Missing #messages');
     const rect = el.getBoundingClientRect();
     if (initialize) {
-      const candidates = [...el.querySelectorAll('[data-render-unit-key] p')].filter(p => {
+      const selectedRow = [...el.querySelectorAll('[data-render-unit-key]')].find(row => row.dataset.renderUnitKey === initialize);
+      if (!selectedRow) throw new Error('Selected Review row is not mounted');
+      const candidates = [...selectedRow.querySelectorAll('p')].filter(p => {
         const r = p.getBoundingClientRect();
         return r.top >= rect.top && r.bottom <= rect.bottom && r.height > 0;
       });
@@ -114,8 +116,13 @@ function mismatch(id, stage, reason, before, after) {
 }
 function compare(id, stage, before, after, geometry) {
   if (!after.sameNode || !after.originalNodeConnected) mismatch(id, stage, 'messages node replaced', before.sameNode, after.sameNode);
-  for (const field of ['location', 'browser']) if (JSON.stringify(before[field]) !== JSON.stringify(after[field])) {
-    mismatch(id, stage, `${field} changed`, before[field], after[field]);
+  const readerUrl = value => {
+    const url = new URL(typeof value === 'string' ? value : `${value.pathname}${value.search}${value.hash}`, 'http://fixture.invalid');
+    if (stage !== 'exit') for (const key of ['viewer', 'presentation', 'target', 'file', 'root', 'line', 'endLine', 'handle', 'message', 'review', 'message_id', 'occurrence']) url.searchParams.delete(key);
+    return `${url.pathname}${url.search}${url.hash}`;
+  };
+  for (const field of ['location', 'browser']) if (readerUrl(before[field]) !== readerUrl(after[field])) {
+    mismatch(id, stage, `${field} reader navigation changed`, before[field], after[field]);
   }
   if (after.sends !== before.sends) mismatch(id, stage, 'Review sent a network/API message', before.sends, after.sends);
   if (!geometry) return;
@@ -159,24 +166,52 @@ try {
         el.scrollTop = position === 'bottom' ? el.scrollHeight : (el.scrollHeight - el.clientHeight) * 0.52;
       }, position);
       await settle(page);
-      // Choose a genuinely visible native Review button; do not scrollIntoView,
-      // synthesize viewer events, or change the selected chapter to open it.
-      const key = await page.evaluate(() => {
+      // Middle setup explicitly aligns a mounted Review header, then freezes the
+      // baseline. This is header-adjacent reading, not arbitrary paragraph reading.
+      if (position === 'middle') {
+        await scroller.evaluate(el => {
+          const box = el.getBoundingClientRect();
+          const buttons = [...el.querySelectorAll('button[aria-label="Open message reviewer"]')];
+          const button = buttons.sort((a, b) => Math.abs(a.getBoundingClientRect().top - box.top - 64)
+            - Math.abs(b.getBoundingClientRect().top - box.top - 64))[0];
+          if (!button) throw new Error('No mounted Review header near middle');
+          el.scrollTop += button.getBoundingClientRect().top - box.top - 64;
+        });
+        await settle(page);
+      }
+      // Bottom never aligns a header: the short final answer must be visible at
+      // the physical tail. Missing controls fail instead of scrolling the reader.
+      const key = await page.evaluate(position => {
         const root = document.querySelector('#messages'); const box = root.getBoundingClientRect();
         const button = [...root.querySelectorAll('button[aria-label="Open message reviewer"]')].find(b => {
           const r = b.getBoundingClientRect();
-          return r.top >= box.top + 2 && r.bottom <= box.bottom - 2;
+          const row = b.closest('[data-render-unit-key]');
+          return (position !== 'bottom' || row.dataset.renderUnitKey === 'review-tail-answer')
+            && r.width > 0 && r.height > 0 && r.top >= Math.max(box.top, 0) + 2
+            && r.bottom <= Math.min(box.bottom, innerHeight) - 2
+            && r.left >= Math.max(box.left, 0) && r.right <= Math.min(box.right, innerWidth);
         });
         if (!button) throw new Error('No native Review button inside reader viewport');
         return button.closest('[data-render-unit-key]').dataset.renderUnitKey;
-      });
-      const before = result.stages.before = await measure(page, true);
+      }, position);
+      result.setup = { position, reviewRow: key, alignment: position === 'middle' ? 'Review header near top, then frozen' : 'physical tail, no header alignment' };
+      const before = result.stages.before = await measure(page, key);
       assert.equal(before.location, fixture.entry, 'Setup must preserve the exact source pin/hash');
       const tailDistance = before.scrollHeight - before.clientHeight - before.scrollTop;
       if (position === 'bottom') assert(Math.abs(tailDistance) <= 2, 'Bottom case must start at the physical tail');
       else assert(before.scrollTop > before.clientHeight && tailDistance > before.clientHeight, 'Middle case must be away from either edge');
       await page.screenshot({ path: path.join(out, `${id}-before.png`) });
-      await page.locator(`[data-render-unit-key=${JSON.stringify(key)}]`).getByRole('button', { name: 'Open message reviewer', exact: true }).click();
+      const clickPoint = await page.locator(`[data-render-unit-key=${JSON.stringify(key)}]`).getByRole('button', { name: 'Open message reviewer', exact: true }).evaluate(button => {
+        const r = button.getBoundingClientRect();
+        const box = document.querySelector('#messages').getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || r.top < Math.max(box.top, 0) || r.bottom > Math.min(box.bottom, innerHeight)
+          || r.left < Math.max(box.left, 0) || r.right > Math.min(box.right, innerWidth)) throw new Error('Review button left the frozen viewport');
+        const x = r.left + r.width / 2; const y = r.top + r.height / 2;
+        if (!button.contains(document.elementFromPoint(x, y))) throw new Error('Review button is obscured');
+        return { x, y };
+      });
+      // Real pointer input without Locator.click's automatic scrollIntoView.
+      await page.mouse.click(clickPoint.x, clickPoint.y);
       const viewer = page.locator('.viewer-shell').filter({ has: page.locator('.viewer-shell-title') });
       await viewer.waitFor({ state: 'visible' });
       await settle(page);
