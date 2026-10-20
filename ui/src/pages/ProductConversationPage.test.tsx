@@ -5,7 +5,10 @@ import { MemoryRouter, Route, Routes, useNavigate, useLocation } from 'react-rou
 import { ProductConversationPage } from './ProductConversationPage';
 import { ViewJourneyLifecycle, defaultViewIdentity } from '../hooks/conversationViewLifecycle';
 import { ViewJourneyReporter } from '../hooks/conversationViewTelemetry';
-import { ProductConversationAliasRedirect } from '../App';
+import { ConversationRouteRedirect } from '../App';
+import { MarkdownRenderer } from '../components/MarkdownRenderer';
+import { CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents } from '../components/conversationMarkdownImages';
+
 import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { transcriptPositioningCommandKey, type TranscriptPositioningCompletion, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 const actualHistory = vi.hoisted(() => ({ enabled: false, handled: vi.fn() }));
@@ -380,6 +383,11 @@ function makeChain(overrides: Partial<ChainView> = {}): ChainView {
   };
 }
 
+function ExactCitation() {
+  return <MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+    {'[Exact chapter](@transcript:row-1)'}
+  </MarkdownRenderer>;
+}
 function ProductRouteSwitch() {
   const navigate = useNavigate();
   return <>
@@ -387,6 +395,7 @@ function ProductRouteSwitch() {
     <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>
     <button onClick={() => navigate('/global/row-2')}>open second Global member</button>
     <button onClick={() => navigate('/global/row-4')}>open newly created Global member</button>
+    <ExactCitation />
   </>;
 }
 
@@ -449,7 +458,8 @@ function renderPage(initialEntry: string | Partial<Location> = '/product-convers
             {withRouteSwitch && <ProductRouteSwitch />}
             <HistoryRouteControls />
             <Routes>
-              <Route path="/c/:slug" element={<ProductConversationAliasRedirect reference="pc-1" />} />
+              <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
+              <Route path="/transcript" element={<ConversationRouteRedirect />} />
               <Route path="/global/:slug" element={<ProductConversationPage journey={journey} productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: undefined }} />} />
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage journey={journey} />} />
             </Routes>
@@ -536,6 +546,90 @@ async function waitForPageReady() {
 }
 
 describe('ProductConversationPage', () => {
+  it('keeps the admitted exact reader and acquired history when selecting a pending chapter', async () => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ canonical_route: '/c/pc-1', latest_opening: pendingOpening(), writable_transcript_row_id: null });
+    const acquired = { ...snapshot, before: null, has_older: false, segments: snapshot.segments.map((segment, index) => index === 0
+      ? { ...segment, messages: [makeMessage('local-acquired', 0, 'row-1'), ...segment.messages] }
+      : segment) };
+    vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: null });
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async reference => ({
+      ...snapshot, requested_transcript_row_id: reference, segments: snapshot.segments.map(segment => ({ ...segment, handoff: null })),
+    }));
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(snapshot).mockResolvedValueOnce(acquired);
+    renderPage('/transcript?source_transcript=row-1');
+    await waitForPageReady();
+    const owner = screen.getByTestId('product-conversation-page');
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired'));
+    fireEvent.click(screen.getByRole('button', { name: 'select pending chapter' }));
+    await waitFor(() => expect(owner).toBeVisible());
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByTestId('product-conversation-page')).toBe(owner);
+    expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
+    expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1');
+    expect(JSON.parse(screen.getByTestId('history-location-state').textContent!)).toEqual({ chapterSelection: 'pending' });
+    expect(currentPositioning().kind).toBe('idle');
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(owner).toBeVisible());
+    expect(screen.getByTestId('history-location')).toHaveTextContent('source_transcript=row-1');
+    expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
+    fireEvent.click(screen.getByRole('button', { name: 'history forward' }));
+    await waitFor(() => expect(owner).toBeVisible());
+    expect(screen.getByTestId('product-conversation-page')).toBe(owner);
+    expect(currentPositioning().kind).toBe('idle');
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains acquired history and the same reader through a Markdown exact alias and Back/Forward', async () => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ canonical_route: '/c/pc-1' });
+    const acquired = { ...snapshot, before: null, has_older: false, segments: snapshot.segments.map((segment, index) => index === 0
+      ? { ...segment, messages: [makeMessage('local-acquired', 0, 'row-1'), ...segment.messages] }
+      : segment) };
+    vi.mocked(api.resolveCoordinatorRoute).mockResolvedValue({ coordinator_id: null });
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async reference => ({
+      ...snapshot, requested_transcript_row_id: reference, segments: snapshot.segments.map(segment => ({ ...segment, handoff: null })),
+    }));
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValueOnce(snapshot).mockResolvedValueOnce(acquired);
+    renderPage('/c/pc-1', true);
+    await waitForPageReady();
+    const owner = screen.getByTestId('product-conversation-page');
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired'));
+    const citation = screen.getByRole('link', { name: 'Exact chapter' });
+    expect(citation).toHaveAttribute('href', '/transcript?source_transcript=row-1');
+    fireEvent.click(citation);
+    await waitFor(() => expect(screen.getByTestId('product-conversation-page')).toBeVisible());
+    expect(screen.getByTestId('product-conversation-page')).toBe(owner);
+    expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1?source_transcript=row-1');
+    expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
+    for (const direction of ['history back', 'history forward']) {
+      fireEvent.click(screen.getByRole('button', { name: direction }));
+      await waitFor(() => expect(owner).toBeVisible());
+      expect(screen.getByTestId('product-conversation-page')).toBe(owner);
+      expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
+    }
+    expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['old%2Frow', 'old%2frow'])('hydrates a bare Global encoded literal path exactly once: %s', async id => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ before: null, has_older: false });
+    const global = { ...coordinatorSnapshot(snapshot), requested_transcript_row_id: id, segments: snapshot.segments.map((segment, index) => index === 0
+      ? { ...segment, transcript_row_id: id, slug: id, messages: segment.messages.map(message => ({ ...message, conversation_id: id })) }
+      : segment) };
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(global);
+    const hydration = vi.spyOn(ViewJourneyLifecycle.prototype, 'hydrationReady');
+    renderPage(`/global/${encodeURIComponent(id)}`);
+    await waitForPageReady();
+    await waitFor(() => expect(hydration).toHaveBeenCalledWith('pc-1', id, expect.any(Number)));
+    expect(screen.queryByText('Original source transcript unavailable.')).not.toBeInTheDocument();
+    expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } });
+    expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['applied', 'superseded'] as const)('keeps a held hidden alias jump when an earlier page arrives before completion (%s)', async (terminal) => {
     const { api } = await import('../api');
     actualHistory.enabled = true;

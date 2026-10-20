@@ -1,4 +1,7 @@
 import { createElement } from 'react';
+import type { Nodes, Root } from 'mdast';
+import type { Plugin } from 'unified';
+import { transcriptReferenceHref } from '../transcriptReference';
 import { defaultUrlTransform, type Components } from 'react-markdown';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 
@@ -38,11 +41,33 @@ function conversationMarkdownUrlTransform(url: string, key: string): string | nu
   if (key === 'href') {
     const conversation = /^@conv:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(trimmed);
     if (conversation) return `/c/${conversation[1]}`;
-    const transcript = /^@transcript:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(#message-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/i.exec(trimmed);
-    if (transcript) return `/c/${transcript[1]}?source_transcript=${transcript[1]}${transcript[2] ?? ''}`;
   }
   return defaultUrlTransform(url);
 }
+
+export const remarkConversationTranscriptLinks: Plugin<[], Root> = () => (tree) => {
+  const definitions = new Map<string, Extract<Nodes, { type: 'definition' }>>();
+  function collect(node: Nodes) {
+    if (node.type === 'definition' && !definitions.has(node.identifier.toUpperCase())) {
+      definitions.set(node.identifier.toUpperCase(), node);
+    }
+    if ('children' in node) node.children.forEach(collect);
+  }
+  collect(tree);
+  function rewrite(node: Nodes): Nodes {
+    if (node.type === 'linkReference') {
+      const definition = definitions.get(node.identifier.toUpperCase());
+      const href = definition && transcriptReferenceHref(definition.url);
+      if (definition && href) return { type: 'link', children: node.children, url: href, title: definition.title, position: node.position };
+    }
+    if (node.type === 'link') {
+      const href = transcriptReferenceHref(node.url);
+      if (href) return { ...node, url: href };
+    }
+    return 'children' in node ? { ...node, children: node.children.map(rewrite) } as Nodes : node;
+  }
+  return rewrite(tree) as Root;
+};
 
 export function resolveConversationMarkdownImageSrc(src: string | undefined, rootDir?: string | undefined): string | undefined {
   if (!src) return src;

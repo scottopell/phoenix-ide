@@ -1,6 +1,7 @@
 import { Suspense, lazy, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
+import { decodedRouteReference } from '../transcriptReference';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
@@ -885,6 +886,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const productConversationId = productId ?? params.productConversationId;
   const viewerSlot = useViewerSlot();
   const location = useLocation();
+  const routeReference = params.slug === undefined ? undefined : decodedRouteReference(location.pathname);
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const scrollCommandTokenRef = useRef(0);
   const readerNavigationKey = useReaderNavigationKey();
@@ -1405,8 +1407,8 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   if (snapshot && (routeReaderSelectionRef.current?.pathname !== location.pathname
     || routeReaderSelectionRef.current.productConversationId !== productConversationId || routeReaderSelectionRef.current.awaitingTopology)) {
     const routeMemberId = snapshot.kind === 'coordinator'
-      ? snapshot.segments.find(segment => segment.transcript_row_id === params.slug || segment.slug === params.slug)?.transcript_row_id
-        ?? params.slug ?? snapshot.requested_transcript_row_id
+      ? snapshot.segments.find(segment => segment.transcript_row_id === routeReference || segment.slug === routeReference)?.transcript_row_id
+        ?? routeReference ?? snapshot.requested_transcript_row_id
       : null;
     routeReaderSelectionRef.current = {
       pathname: location.pathname,
