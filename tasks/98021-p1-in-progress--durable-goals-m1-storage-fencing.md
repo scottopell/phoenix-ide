@@ -708,3 +708,40 @@ its actual focused execution/artifacts must be read before reporting counts.
 Only one corrected-head dispatch was authorized and used. No second run or retry
 was requested; later source is blocked on renewed exact-head hosted qualification,
 not an excuse for local builds or weakened checks. Production stays None/503.
+
+### Terminal64322 result — no new goal execution, remaining source repairs
+
+Sole run **39348937685** at exact64322 is terminal **FAILED**. Downloaded/read
+Rust job118388364345 artifact **12231779623**. Both normal compilation and the
+focused stage failed before tests executed. Candidate schema fixture helpers
+`accepted` and `bind_open` inherited the parent's one-parameter `Result<T>` alias
+but supplied a SQLx error parameter: two E0107 plus two dependent E0308 diagnostics.
+Those OWN helper signatures now explicitly use `std::result::Result`.
+The normal log independently confirms the IDE checked-binding mismatch fixed in
+05acd. **0 focused tests executed,0 new passes proved.** This is not a repeat of
+e19's109/5 execution; f6 remains the last wholly green96/96 focused floor.
+
+Source follow-through found one more fixture-substrate mistake before another
+run: the isolated schema test used full settled admission against a deliberately
+minimal database already containing live turns. Goal seeding now uses that
+module's existing private test-only storage mutation, and composition itself
+uses the actual production `capture_goal_at_new_turn_tx`, not the cfg(test)
+`bind_goal_at_admission_tx`. No production admission is bypassed or changed;
+the test remains an isolated transaction-composition proof, not public/runtime
+installation or populated migration qualification.
+
+E2E, geometry, task validation and worker-budget jobs passed. Clippy and UI/specs
+failed. All12 remaining Clippy source paths and the relevant UI/generated origin/
+event/schema paths are byte-unchanged from the accepted ed25 cut by empty scoped
+Git diff; they remain inherited blocking issues, not waived green. This does not
+classify the35 other e19 broad failures from their names or assert they share one
+root. UserControl actor-cycle source preparation is still owed; populated upgrade
+qualification and migration134 registration await actual133 import. Current
+reachable PR902 still7bc6 ends131.
+
+No active qualification remains and no second run was dispatched. Later source
+repairs/control verifier are unqualified pending an authorized exact-head hosted
+run. Parent retains integration; commissioned runtime/tools/UI/watch/continuation
+is incomplete, not closed at the foundation checkpoint. No local compiler/test,
+SQL/browser/VM, merge, deployment, live migration or activation occurred. All
+stashes and132 source/registration are preserved.

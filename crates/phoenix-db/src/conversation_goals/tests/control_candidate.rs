@@ -16,14 +16,19 @@ async fn accepted(
     command: &str,
     expected: i64,
     request: u8,
-) -> Result<(), sqlx::Error> {
+) -> std::result::Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO conversation_goal_control_requests (owner_id,principal_id,request_id,command,expected_control_version,outcome,result_control_version,result_stopped,recorded_at_us) VALUES ('owner',?1,?2,?3,?4,'accepted',?5,?6,10)")
         .bind(vec![1_u8; 16]).bind(vec![request; 16]).bind(command).bind(expected)
         .bind(expected + 1).bind(i64::from(command == "stop"))
         .execute(db.pool()).await.map(|_| ())
 }
 
-async fn bind_open(db: &Database, turn: i64, version: i64, request: u8) -> Result<(), sqlx::Error> {
+async fn bind_open(
+    db: &Database,
+    turn: i64,
+    version: i64,
+    request: u8,
+) -> std::result::Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO conversation_goal_control_bindings (owner_id,turn_id,workflow_id,control_version,principal_id,request_id) VALUES ('owner',?1,?1,?2,?3,?4)")
         .bind(turn).bind(version).bind(vec![1_u8; 16]).bind(vec![request; 16])
         .execute(db.pool()).await.map(|_| ())
@@ -303,7 +308,7 @@ async fn conversation_goal_control_candidate_goal_or_no_goal_capture_shares_atom
         accepted(&db, "stop", 0, 1).await.unwrap();
         let observation = if with_goal {
             let goal = db
-                .apply_conversation_goal(&create(), "root", at())
+                .mutate_conversation_goal(&create(), at())
                 .await
                 .unwrap()
                 .snapshot;
@@ -320,7 +325,9 @@ async fn conversation_goal_control_candidate_goal_or_no_goal_capture_shares_atom
             observation,
         };
         let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
-        bind_goal_at_admission_tx(&mut tx, &binding).await.unwrap();
+        crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx, binding.execution)
+            .await
+            .unwrap();
         assert!(matches!(
             bind_control_at_admission_tx(&mut tx, &binding.owner, binding.execution).await,
             Err(ControlError::AdmissionStopped)
@@ -334,7 +341,9 @@ async fn conversation_goal_control_candidate_goal_or_no_goal_capture_shares_atom
         assert_eq!(rows, 0);
         accepted(&db, "release", 1, 2).await.unwrap();
         let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
-        bind_goal_at_admission_tx(&mut tx, &binding).await.unwrap();
+        crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx, binding.execution)
+            .await
+            .unwrap();
         bind_control_at_admission_tx(&mut tx, &binding.owner, binding.execution)
             .await
             .unwrap();

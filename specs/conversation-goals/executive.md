@@ -1,6 +1,31 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
-## Latest execution evidence
+## Current qualification boundary
+
+Run **39348937685**, exact `64322db7480f1452d00357eaf20c209c16a54003`, is terminal
+**FAILED**. Rust job118388364345/artifact12231779623 failed before test execution
+in both normal and focused stages: two candidate-test helpers resolved the parent
+one-parameter `Result` alias with two arguments (four diagnostics), and the IDE
+Blocked-report fixture omitted the checked GoalReportBinding conversion. **Zero
+new focused tests executed.** This does not supersede e19's actual109/5 result or
+f6's last wholly green96/96 focused floor.
+
+All identified owned compiler/lint roots are source-corrected after64322, including
+explicit standard Result types, checked binding conversion and borrowed HTTP
+error classification. Source audit also corrected the minimal schema fixture's
+settled-admission setup and switched its Goal/NoGoal capture to the actual
+`capture_goal_at_new_turn_tx` production helper. None of those later repairs or
+the transactional control-recheck increment has exact-head execution evidence.
+No second run was dispatched under the one-run allowance.
+
+E2E, geometry, task validation and worker-budget jobs passed separately. Clippy
+and UI/specs failed; their remaining federation/shared paths are unchanged from
+ed25 by source diff, not waived as green.134 stays unregistered pending actual133;
+132 is unchanged. Private emitter stays None and the public control route stays
+503. UserControl actor-cycle upgrade and installed runtime/tools/UI/watch/automatic
+continuation remain commissioned and incomplete.
+
+## Historical foundation qualification
 
 Existing CI39320605328 tested exact **`ed25a228e092b41d5c112e1c7585aab406944ca3`**. Rust job118293499801's focused nextest step **executed70 tests:70 passed,3397 skipped/filtered** (39.155s), with individual statuses/full assertions in artifact12221238348. This is actual bounded foundation qualification, not an authored-count inference or complete PR/product qualification. Individual passes include registered fresh initialization/replay, prior-schema upgrade/idempotence, real-migration supported hard deletion, admission/service/capture, actual settled continuation, and Steering ownership/replay/commit-cut regressions.
 
@@ -10,13 +35,13 @@ The full Rust lane remains independently red:5213/5377 executed,5175 passed,38 f
 
 Published source through `fd5a46849c31308d4f85658ba937334866e062e5` is **not covered by the green checkpoint above**. Ordinary, Anthropic/Responses replay, fork and terminal transaction owners share pending-round finalization; provider replay co-commits with either side owner. Persisted `ToolExecuting`/`CancellingTool` state and `CheckpointData` retain typed pending intent, and actual executor checkpoints install committed nonterminal state/results before publication. The existing terminal establishment carries its committed payload and probes exact retained rows, arguments, binding/history and provenance without predicting results or rerunning mutation; selected terminal state remains in the existing obligation until `TurnCommand` settlement. Interrupted uncommitted reports become canonical paired errors, while staged terminal obligations remain excluded from startup materialization. Durable trusted-tool projection shares the existing redaction policy without changing legacy `ToolResult` encoding.
 
-CI39331620726 tests exact `f6a5ea5570a3d4a086ef4a427b9c4f7745c70e08`; focused execution is still pending at this source checkpoint. Its completed Clippy/UI logs exposed own exhaustive-match/manual-savepoint lint failures, corrected in the newer source with exhaustive matches and SQLx-owned nested transactions, alongside separate federation failures. None of those source corrections or the new runtime/combined-owner regressions has execution qualification yet. `Event::ToolComplete` remains finalized-only: there is no production pending-report emitter, public report tool or automatic runtime activation. Stop/UserControl fencing after the separately owned federation migration remains an activation gate; schema132 is unchanged. Remaining runtime emitter/context, tools, UI and watch delivery is still in scope. Earlier zero-execution/source-only statements below describe historical checkpoints, not qualification of this increment.
+The historical f6 source checkpoint recorded CI39331620726 at exact `f6a5ea5570a3d4a086ef4a427b9c4f7745c70e08` as pending; the terminal96/96 evidence recorded below supersedes that pending state. Its completed Clippy/UI logs exposed own exhaustive-match/manual-savepoint lint failures, corrected in the newer source with exhaustive matches and SQLx-owned nested transactions, alongside separate federation failures. None of those source corrections or the new runtime/combined-owner regressions has execution qualification yet. `Event::ToolComplete` remains finalized-only: there is no production pending-report emitter, public report tool or automatic runtime activation. Stop/UserControl fencing after the separately owned federation migration remains an activation gate; schema132 is unchanged. Remaining runtime emitter/context, tools, UI and watch delivery is still in scope. Earlier zero-execution/source-only statements below describe historical checkpoints, not qualification of this increment.
 
 The three installer historical-registry fixture repairs at431296d7 and8860bf87 passed the actual `dev.py unit tests` stage at86ab (UI job118227195421,93.9s). Production helper targets/pins and actual-newer-schema rejection are unchanged. Inherited federation UI wire parity and large Effect Clippy failures remain separate blockers.
 
 ## Status
 
-M1 source is authored as a dormant core/DB increment under the approved immutable-objective and source-registration amendments. Migration **132** registers the single `crates/phoenix-db/src/conversation_goals/schema.sql` source after coordinated federation migrations130/131 on exact source stack `f744df85865180597118c08b4f142b27fda57ee1`; non-destructive merge `b4f2aa52eee7b3ad560be2a2baa6c48675742758` preserves both histories. Normal fresh initialization replays the same migration, with no duplicate base-DDL application. ADR-182 records the bounded decision. No runtime caller, HTTP endpoint, goal tool, UI/SSE, automatic follow-through, Stop integration or watch change is installed. Source registration is not a production migration or feature activation.
+M1 source is authored as a dormant core/DB increment under the approved immutable-objective and source-registration amendments. Migration **132** registers the single `crates/phoenix-db/src/conversation_goals/schema.sql` source after coordinated federation migrations130/131 on exact source stack `f744df85865180597118c08b4f142b27fda57ee1`; non-destructive merge `b4f2aa52eee7b3ad560be2a2baa6c48675742758` preserves both histories. Normal fresh initialization replays the same migration, with no duplicate base-DDL application. ADR-182 records the bounded decision. Later source adds a default-disabled owner-authenticated control HTTP endpoint and private test-only emitter installation. Public goal tools, UI/SSE, automatic follow-through, durable runtime Stop integration and goal watch delivery remain uninstalled. Source registration is not a production migration or feature activation.
 
 The original mutable-objective source at `4a71cba3976a2c3f1f02c1e1ef6931e27887907c` is preserved historical evidence, not the selected contract. `f6604cd89afdf93071d482ab0d38593c78e114d6` records the amended approval brief, not the completed feature. Subsequent source implements the immutable model. No compatibility bridge/backfill for the stale DDL is needed: it was never registered or applied.
 
