@@ -71,6 +71,38 @@ Underway AUQ, Global/User/owning-agent command authority, tools/UI/watch and
 automatic continuation remain commissioned and unfinished. Public activation,
 134 registration and any deployment are still prohibited by the existing gates.
 
+## Shared authenticated Create/State command slice — source only
+
+The command owner is now `conversation_goals/user_commands.rs` and
+`goal_service/user_commands.rs`, extending the existing Create transaction and
+host gate path rather than adding a parallel State persistence path. Explicit
+Blocked→Underway recovery keeps canonical identity/objective, accepted State
+uses its own exact accepted State receipt/UserControl actor, and wrong target
+or terminal revival gets a retained transition refusal. Public input excludes
+legacy Suspended. Neither command clears Stop or activates/materializes work.
+
+Nine authored service tests include the prior four Create cases plus accepted
+historical State replay, changed command/reason conflicts, wrong-target and
+terminal-refusal replay, genuine State history-insert rollback, and a persisted
+AUQ wait that stays Underway and retains its Busy refusal after becoming Idle.
+The integrator's requested Create strengthening is included: drop the held gate
+then retry the same Busy request while version/eligibility are unchanged;
+changed expected-version/rejected-objective conflicts; and genuine continuation
+followed by stale prior-transcript and real Close fences before receipt lookup.
+
+A read-only frozen-source review caught two new test-only errors: an invented
+GoalDbError::AdmissionFenced variant (actual error wraps DbError::CloseAdmissionFenced)
+and a missing transcript fixture masquerading as stale latest. Both are fixed
+from the actual API: the fixture now creates a real continuation, proves old
+transcript denial/new latest retained replay, then begins real direct Close and
+asserts the wrapped refusal. A follow-up frozen-source review of the corrected
+shared slice found no actionable finding. No local compiler/test/SQL/browser
+ran. The shared slice is not build-qualified; old exact87 remains compile-red,764 fixes its two
+focused diagnostic roots, and the127/127 exact2ec floor is unchanged. Parent
+retains the one-run qualification decision; no new dispatch while this slice
+was dirty. Public installation, runtime/owning-agent/Global authority tools,
+UI/watch and automatic continuation remain commissioned and unfinished.
+
 ## Qualified bounded foundation checkpoint — actual hosted execution
 
 Exact **ed25a228e092b41d5c112e1c7585aab406944ca3**, CI39320605328/Rust118293499801 focused **70 executed,70 passed,3397 skipped/filtered (39.155s)**; full individual statuses artifact12221238348. Includes registered fresh/upgrade/idempotence/deletion coverage, service/admission/capture and genuine continuation/Steering replay+commit-cut tests. This is not whole PR qualification or report activation. Whole Rust independently red:5213/5377executed,5175pass,38fail,191skip;164notrun afterSIGTERM. Outside-focused failure ownership/root causes require assertions, not names.

@@ -143,6 +143,25 @@ Parent-owned39358832109 captured exact87 and is now terminal compile-red; these
 subsequent source changes are outside that captured head and are unqualified.
 No replacement or duplicate run has been dispatched by this writer.
 
+The next shared `user_commands` source owner extends the same transaction and
+host gate path to explicit State commands: Blocked recovery to Underway retains
+the goal identity/objective; terminal revival and wrong target are retained
+transition refusals. Accepted State references its own exact command receipt and
+UserControl actor, not a fabricated Create receipt. User input structurally
+excludes legacy Suspended. State and Create preserve Stop and do not materialize
+a turn. Additional source-only regressions cover accepted historical State replay,
+changed reason/command, terminal and wrong-target refusals, real State-insert
+rollback, and a persisted structured-question wait that remains Underway and
+retains a busy refusal even after becoming Idle. Parent-requested Create cases
+also retry Busy after gate release at the same otherwise-eligible owner version,
+refuse changed expected version/rejected objective, and exercise genuine
+continuation followed by stale-prior-transcript and real Close fences before
+retained replay. Nine service tests are authored, none executed locally.
+Read-only review caught a nonexistent wrapped-close error pattern and a missing
+rather than genuinely stale transcript fixture; both are source-corrected.
+This remains default-disabled and unqualified, with public command authority,
+owning-agent/Global tools, UI/watch and automatic-continuation integration owed.
+
 ## UserControl candidate source, not installed
 
 REQ-GOAL-004.1 and ADR-183 record the no-chat, command-specific attribution contract;
@@ -173,8 +192,9 @@ immutability and positive typed Create attribution passed; populated132 retained
 history/source-removal decoding failed at the cached projection boundary above.
 The corrected decoder and expanded identity-REPLACE regression remain
 execution-unqualified. This is isolated storage composition, not public
-authentication or actual133→134 qualification. Accepted State application, complete legacy upgrade
-matrix and authenticated owner command service remain owed. Legacy132 actor
+authentication or actual133→134 qualification. Accepted State execution,
+complete legacy upgrade qualification and public authenticated command-service
+installation remain owed. Legacy132 actor
 REPLACE behavior outside the new receipt-backed history is captured as a TODO.
 Read-only reviews corrected concrete API/SQLx-static-SQL/fixture issues before
 publication; none is compilation or test qualification. Parent2ec CI does not

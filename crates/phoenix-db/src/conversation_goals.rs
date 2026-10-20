@@ -17,7 +17,7 @@ mod admission;
 pub(crate) mod checkpoint;
 pub mod control;
 pub mod round;
-pub mod user_create;
+pub mod user_commands;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GoalDbError {

@@ -67,8 +67,8 @@ pub(crate) async fn apply(
     }
 }
 
-#[allow(dead_code, reason = "authenticated Create adapter is not installed")]
-pub(crate) mod user_create;
+#[allow(dead_code, reason = "authenticated command adapter is not installed")]
+pub(crate) mod user_commands;
 
 #[cfg(test)]
 mod tests;
