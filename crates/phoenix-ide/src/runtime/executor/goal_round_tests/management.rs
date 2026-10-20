@@ -91,10 +91,22 @@ async fn provider_preparation(runtime: &mut TestRuntime) -> Event {
             .await
             .unwrap()
             .unwrap();
+    let expected_replay = match &outcome {
+        LlmOutcome::Response {
+            provider_replay: Some(update),
+            request_id,
+            ..
+        } => update.clone().with_owner_message_id(request_id.clone()),
+        _ => panic!("capturing provider fixture must return signed private replay"),
+    };
     assert!(!runtime.llm_outcome_is_stale(generation));
     runtime
         .process_generation_tagged_llm_outcome(generation, outcome)
         .await;
+    assert_eq!(
+        runtime.pending_provider_replay_update.as_ref(),
+        Some(&expected_replay)
+    );
     let event = runtime.event_rx.try_recv().unwrap();
     assert!(matches!(event, Event::GoalManagementPrepared { .. }));
     event
@@ -168,6 +180,74 @@ async fn conversation_goal_coordinator_provider_management_commits_only_at_its_c
     assert_eq!(ownership, (Some("Completed".into()), 0));
     assert_provider_declarations(&client);
     assert_canonical_delivery(&fixture, &client, &call).await;
+    assert!(tools.recorded_executions().is_empty());
+}
+
+#[tokio::test]
+async fn conversation_goal_management_replay_stays_with_cancelled_round_until_terminal_checkpoint()
+{
+    let fixture = fixture(true).await;
+    let db = fixture.runtime.db();
+    let (mut runtime, client, tools) = provider_runtime(&fixture, &create(&fixture));
+    let prepared = provider_preparation(&mut runtime).await;
+    let Event::GoalManagementPrepared { management, .. } = prepared else {
+        panic!("prepared current management call")
+    };
+    let expected_replay = runtime.pending_provider_replay_update.clone().unwrap();
+    runtime
+        .process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(runtime.state, ConvState::CancellingTool { .. }));
+    assert_eq!(
+        runtime.pending_provider_replay_update.as_ref(),
+        Some(&expected_replay)
+    );
+    assert_no_target_mutation(&fixture).await;
+    assert_eq!(db.get_messages(&fixture.source).await.unwrap().len(), 1);
+    assert!(db
+        .load_provider_replay_state(&fixture.source)
+        .await
+        .unwrap()
+        .is_none());
+    runtime
+        .process_event(Event::ToolAborted {
+            tool_use_id: management.source().tool_use_id.as_str().into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(runtime.state, ConvState::Idle));
+    assert!(runtime.active_direct_turn.is_none());
+    assert!(runtime.pending_provider_replay_update.is_none());
+    assert!(db
+        .load_provider_replay_state(&fixture.source)
+        .await
+        .unwrap()
+        .is_none());
+    assert_no_target_mutation(&fixture).await;
+    let messages = db.get_messages(&fixture.source).await.unwrap();
+    let results: Vec<_> = messages
+        .iter()
+        .filter_map(|message| {
+            let MessageContent::Tool(result) = &message.content else {
+                return None;
+            };
+            (result.tool_use_id == management.source().tool_use_id.as_str()).then_some(result)
+        })
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error);
+    let ownership: (Option<String>, i64) =
+        sqlx::query_as("SELECT terminal_kind,owns_conversation FROM durable_turns WHERE turn_id=?")
+            .bind(i64::try_from(fixture.active.turn_id.0).unwrap())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(ownership, (Some("Cancelled".into()), 0));
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
     assert!(tools.recorded_executions().is_empty());
 }
 
@@ -323,7 +403,13 @@ async fn conversation_goal_coordinator_provider_management_rolls_back_replay_and
     let db = fixture.runtime.db();
     let (mut runtime, client, tools) = provider_runtime(&fixture, &create(&fixture));
     let prepared = provider_preparation(&mut runtime).await;
-    assert!(runtime.pending_provider_replay_update.is_some());
+    let expected_replay = runtime.pending_provider_replay_update.clone().unwrap();
+    assert_no_target_mutation(&fixture).await;
+    assert!(db
+        .load_provider_replay_state(&fixture.source)
+        .await
+        .unwrap()
+        .is_none());
     let before = serde_json::to_value(db.get_messages(&fixture.source).await.unwrap()).unwrap();
     sqlx::query("CREATE TRIGGER fail_provider_management BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT,'provider management state failed'); END")
         .execute(db.pool()).await.unwrap();
@@ -338,7 +424,10 @@ async fn conversation_goal_coordinator_provider_management_rolls_back_replay_and
         .await
         .unwrap()
         .is_none());
-    assert!(runtime.pending_provider_replay_update.is_some());
+    assert_eq!(
+        runtime.pending_provider_replay_update.as_ref(),
+        Some(&expected_replay)
+    );
     assert_eq!(client.requests.lock().unwrap().len(), 1);
     assert!(tools.recorded_executions().is_empty());
     sqlx::query("DROP TRIGGER fail_provider_management")

@@ -1,9 +1,73 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
-## Exactade qualification in progress — narrow completed Clippy correction
+## Latest actual qualification — exactade178/184 is a partial result, not a floor
 
-Parent-owned run39377097203 at exacteade remains in progress per parent; no
-focused outcome or new floor is claimed. Completed Clippy job118477650972 has
+Parent run **39377097203**, exact
+`ade9ea18ab6fb5181e0f4b58a1c9a8b4a44cf169`, is **terminal failed**, artifact
+**12245117981**. Focused qualification executed184:178passed,6failed,3393skipped
+in222.530s. Compile223.9s, codegen146.8s and generated-stale guard passed. The new
+shared-future16KiB/unpolled-drop regression and runtime management owner/replay
+retry/recovery tests passed at this HEAD. That is bounded actual evidence, not a
+new fully green floor;156/156 at exacte4d remains the last full focused green.
+Broad Rust timed out at1500s with a partial5491-test plan:4940executed,
+4905passed,35failed,191skipped. It is not a completed full-suite result.
+UI/specs fully succeeded per parent. Shared Clippy blockers remain unwaived;
+only the visible goal-owned request-guard issue is source-corrected in922.
+
+The six focused failures have four traced setup/behavior roots:
+
+- The prior131 upgrade really applies132 **and**133. Its test now names both,
+  expects two applied migrations, checks both exact ledger names, asserts133's
+  notes column shape, and keeps preserved source rows, empty132 goal storage,
+  rerun idempotence and legacy UserApi goal-history checks. It does not change
+  either migration or pretend to isolate132 by merely changing a count.
+- Both ordinary-source rejection fixtures failed while materializing their own
+  canonical turn. Test setup now uses actual `apply_goal_control(Release)` with
+  the saved current version before authoritative submission; rejection assertions
+  remain at the management service/provider boundaries, not an earlier setup error.
+- The user-state provider fixture needs normalized user-request tables. Its
+  isolated test database now installs `user_control_candidate.sql` in a transaction,
+  following the existing user-command fixture pattern.134 remains unregistered;
+  this is not production installation or activation.
+- Both signed provider journeys exposed premature private replay persistence:
+  `RenderingAnthropicClient` returns signed metadata, `process_outcome` captures
+  it with the canonical owner, then the core ToolExecuting transition emits
+  `PersistState` before `ExecuteTool`. That state-progress write took the pending
+  replay before the canonical management transaction. Assertions were not weakened.
+
+The source correction leaves intermediate state writes intact but defers private
+replay consumption while the actual host-installed management service validates
+active Coordinator turn/generation and canonical assistant/tool/request ownership.
+Current and remaining calls are parsed to the typed request, then host-verified;
+pending typed intents are reverified and compared with the captured source.
+CancellingTool recovers its current call by canonical ID before the same typed
+host check, and covers skipped/pending calls too. A name string or request DTO
+alone never authorizes deferral. Missing service/role or non-management rounds
+keep the existing state-progress replay behavior. No dispatch or new durable
+owner is introduced; the validation future is heap-pinned and immediately awaited
+at the existing owner boundary, with the same borrowed lifecycle.
+
+The original provider barriers now compare the exact typed signed replay captured
+from the real outcome, require no DB private rows/public assistant/result or
+changed goal/history before checkpoint, preserve the exact payload after a real
+checkpoint rollback, and still demand signed second-request wire plus canonical
+result after successful commit. An authored cancellation regression retains private
+replay through the actual UserCancel/CancellingTool transition and supplies the
+ToolAborted completion to the existing terminal checkpoint, asserting one canonical
+error result, cancelled ownership release, no goal mutation and no stranded replay.
+This is a deterministic event-boundary test, not an OS/tool-task cancellation race
+or restart-recovery proof. Existing terminal/recovery owner coverage remains in
+scope; no new restart-replay policy is claimed.
+
+This correction packet includes922's lexical guard fix and has only source-format,
+whitespace and bounded source review locally. No compiler/tests/SQL/browser,
+push, new CI or activation. Eleven stashes and immutable132 are preserved;
+133 remains not fully focused-qualified and134 unregistered/default-off.
+
+## Interim exactade Clippy observation — superseded by terminal result above
+
+Before Rust terminated, parent reported run39377097203 at exacteade still in
+progress; this interim observation made no focused outcome or new-floor claim. Completed Clippy job118477650972 has
 lib12/lib-test16 error summaries in its diagnostic tail. The prior twelve visible
 large-future and three Option-loop reports are absent from that tail, not blanket
 clearance of hidden diagnostics or execution of the future-size regression.

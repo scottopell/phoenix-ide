@@ -720,6 +720,38 @@ impl GoalReportEmitter {
     }
 }
 
+fn cancelling_management_call(assistant: &AssistantMessage, tool_use_id: &str) -> Option<ToolCall> {
+    assistant.content.iter().find_map(|block| {
+        let phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, input } = block
+        else {
+            return None;
+        };
+        (id == tool_use_id && name == "goal_manage").then(|| {
+            ToolCall::new(
+                id.clone(),
+                ToolInput::from_name_and_value(name, input.clone()),
+            )
+        })
+    })
+}
+
+fn require_canonical_management_call(
+    assistant: &AssistantMessage,
+    tool_use_id: &str,
+    request: &phoenix_core::domain::conversation_goal::GoalManagementRequest,
+) -> Result<(), String> {
+    let input = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    let canonical = assistant.content.iter().any(|block| {
+        matches!(block,
+        phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, input: actual }
+        if id == tool_use_id && name == "goal_manage" && actual == &input)
+    });
+    if !canonical {
+        return Err("management replay owner differs from canonical assistant call".into());
+    }
+    Ok(())
+}
+
 fn contains_pending_goal_result(
     results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
 ) -> bool {
@@ -4882,7 +4914,7 @@ where
         ) {
             self.settle_pending_direct_turn(turn, Box::new(terminal))
                 .await?;
-        } else if let Some(update) = self.pending_provider_replay_update.take() {
+        } else if let Some(update) = self.take_state_progress_replay().await? {
             self.storage
                 .update_state_and_provider_replay(
                     &self.context.conversation_id,
@@ -8873,6 +8905,104 @@ where
         self.create_tool_llm_metrics_sink(admitted)
     }
 
+    async fn take_state_progress_replay(
+        &mut self,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>, String> {
+        if self.pending_provider_replay_update.is_some()
+            && Box::pin(self.management_checkpoint_owns_replay()).await?
+        {
+            return Ok(None);
+        }
+        Ok(self.pending_provider_replay_update.take())
+    }
+
+    async fn management_checkpoint_owns_replay(&self) -> Result<bool, String> {
+        use phoenix_core::domain::conversation_goal::{GoalManagementRequest, ToolRoundResult};
+        let (Some(service), Some(turn)) =
+            (&self.goal_management, self.active_direct_turn.as_deref())
+        else {
+            return Ok(false);
+        };
+        if !self.context.is_coordinator || self.context.is_sub_agent {
+            return Ok(false);
+        }
+        let (assistant, calls, results) = match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message,
+                current_tool,
+                remaining_tools,
+                completed_results,
+                ..
+            } => (
+                assistant_message,
+                std::iter::once(current_tool)
+                    .chain(remaining_tools)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                completed_results,
+            ),
+            ConvState::CancellingTool {
+                assistant_message,
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                ..
+            } => (
+                assistant_message,
+                cancelling_management_call(assistant_message, tool_use_id)
+                    .into_iter()
+                    .chain(skipped_tools.iter().cloned())
+                    .collect(),
+                completed_results,
+            ),
+            _ => return Ok(false),
+        };
+        for entry in results {
+            if let ToolRoundResult::PendingGoalManagement { management, .. } = entry {
+                require_canonical_management_call(
+                    assistant,
+                    management.source().tool_use_id.as_str(),
+                    management.request(),
+                )?;
+                let verified = service
+                    .prepare(
+                        &self.context.conversation_id,
+                        turn,
+                        &assistant.message_id,
+                        management.source().tool_use_id.as_str(),
+                        management.request().clone(),
+                    )
+                    .await?;
+                if &verified != management {
+                    return Err("pending management replay owner differs from host source".into());
+                }
+                return Ok(true);
+            }
+        }
+        for call in calls {
+            if call.name() != "goal_manage" {
+                continue;
+            }
+            let Ok(request) =
+                serde_json::from_value::<GoalManagementRequest>(call.input.to_value())
+            else {
+                continue;
+            };
+            require_canonical_management_call(assistant, &call.id, &request)?;
+            service
+                .prepare(
+                    &self.context.conversation_id,
+                    turn,
+                    &assistant.message_id,
+                    &call.id,
+                    request,
+                )
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     async fn prepare_goal_management(&self, tool: &ToolCall) -> Result<Event, String> {
         use phoenix_core::domain::conversation_goal::GoalManagementRequest;
         if !self.context.is_coordinator || self.context.is_sub_agent {
@@ -8904,6 +9034,7 @@ where
                 })
             }
         };
+        require_canonical_management_call(assistant_message, &tool.id, &request)?;
         let service = self
             .goal_management
             .as_ref()

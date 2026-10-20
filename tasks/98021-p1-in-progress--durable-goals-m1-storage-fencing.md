@@ -1,5 +1,43 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actualade six focused failures — coherent source correction with922
+
+Run39377097203 exacteade terminalFAIL/artifact12245117981. Actualfocused184:
+178PASS6FAIL3393skip222.530s; compile223.9s/codegen146.8s/staleguardPASS. Future
+<=16KiB/unpolleddrop and runtime12case/recovery tests actuallyPASS atade. This is
+partial evidence, NOTnewfloor:156/156ONLYe4d remains. BroadTIMEOUT1500spartial
+4940/5491run4905pass35fail191skip, NOTfullsuite. UI/specs actualFULLSUCCESS.
+
+Source packet includes922guardfix plus allfour traced roots behind6failures:
+1. Prior131 fixture intentionallyrenamed132+133upgrade, applies2 and assertsboth
+   exactledgers/133notescolumn typeNOTNULLdefault plus132emptygoalstorage/source
+   preservation/idempotence/legacyuserapi unchanged. No blindcountonlyadjustment.
+2. Ordinary canonical source fixtures now actualRelease via apply_goal_control
+   using saved currentversion before authoritativeaccept/materialize, rather than
+   failing setup before management rejection assertions.
+3. CandidateusercommandSQL installed transactionally test-only in management
+   fixture, following existing usercommandtest pattern; no134registration/install.
+4. Signedcaptureclient metadata is present; process_outcome capturesowner then
+   intermediateToolExecuting PersistState prematurely consumes it. Production fix
+   keeps statewrite but defers payload for hostverified Coordinator activegeneration
+   canonicalassistant/tool/typedrequest, includingcurrent/remaining/pending and
+   cancellingcurrent/skipped/pending. Reverifytypedpending source; compareexact
+   canonicalpayload. No arbitraryname/DTOauthority, newowner or newrestartpolicy.
+   Nonmanagement/missingservice-role progress behavior unchanged; validationboxed
+   inlineawait sameborrow/drop owner, pendingpayload nottaken on validationerror.
+
+Provider barriers compare exacttyped signedoutcome; noDBprivate/publicround or
+changedgoal/history beforecheckpoint; samepayload retained afteractualrollback;
+existingcanonicalresult/signedsecondwire assertions unchanged. One added authored
+UserCancel->CancellingTool->suppliedToolAborted terminalcheckpoint regression
+proves retainedreplayuntilsettlement/onecanonicalerror/no goalmutation/Cancelled
+turnrelease/no replaystranding when run. Deterministic eventboundary, NOTOS-task
+cancelrace orrestartproof. Existingowner/recoverytests remain qualificationtarget.
+
+Onlystandaloneformat/diff/sourcechecks locally;0compiler/testsSQLbrowser/newCI/
+push/activation.11stashes,132immutable,133notfullyqualified134unregistered/defaultoff.
+Parentownsnextreview/qualification; no featurebreadth accumulation.
+
 ## Exactade completed Clippy owned guard root — source correction only
 
 Parent39377097203 stillrunningRust per parent; no focused outcome/floor change.

@@ -1081,7 +1081,7 @@ async fn real_migrations_goal_binding_successful_report_and_hard_delete_remove_a
 }
 
 #[tokio::test]
-async fn prior_schema_upgrade_adds_empty_goal_storage_preserves_source_rows_and_is_idempotent() {
+async fn prior_schema_131_upgrade_applies_132_and_133_preserves_source_rows_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prior-goals.db");
     let pool = SqlitePoolOptions::new()
@@ -1121,7 +1121,7 @@ async fn prior_schema_upgrade_adds_empty_goal_storage_preserves_source_rows_and_
         crate::migrations::run_pending_migrations(reopened.pool())
             .await
             .unwrap(),
-        1
+        2
     );
     let after: (String,String,String,String) = sqlx::query_as("SELECT c.id,c.product_conversation_id,m.message_id,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.id='upgrade-root'")
         .fetch_one(reopened.pool()).await.unwrap();
@@ -1132,13 +1132,23 @@ async fn prior_schema_upgrade_adds_empty_goal_storage_preserves_source_rows_and_
             .unwrap(),
         0
     );
-    let ledger: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM _migrations WHERE name='durable_conversation_goal_storage'",
+    let ledger: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT version,name FROM _migrations WHERE version IN (132,133) ORDER BY version",
     )
-    .fetch_one(reopened.pool())
+    .fetch_all(reopened.pool())
     .await
     .unwrap();
-    assert_eq!(ledger, 1);
+    assert_eq!(
+        ledger,
+        vec![
+            (132, "durable_conversation_goal_storage".into()),
+            (133, "opaque_federation_peer_notes".into()),
+        ]
+    );
+    let notes: (String, i64, String) = sqlx::query_as(
+        "SELECT type,\"notnull\",dflt_value FROM pragma_table_info('federation_peer_connections') WHERE name='notes'",
+    ).fetch_one(reopened.pool()).await.unwrap();
+    assert_eq!(notes, ("TEXT".into(), 1, "''".into()));
     for table in [
         "conversation_goal_ids",
         "conversation_goal_history",

@@ -54,6 +54,10 @@ pub(crate) async fn fixture(coordinator: bool) -> Fixture {
             .id
     };
     let db = db.install_goal_controls_for_tests().await.unwrap();
+    install_user_commands(&db).await;
+    if !coordinator {
+        release_ordinary_source_control(&db, &source).await;
+    }
     let prepared = prepared_input();
     let repo = db.workflow_repository();
     let accepted = repo
@@ -112,6 +116,50 @@ pub(crate) async fn fixture(coordinator: bool) -> Fixture {
         target: target.product_conversation_id,
         active,
     }
+}
+
+async fn install_user_commands(db: &Database) {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../phoenix-db/src/conversation_goals/user_control_candidate.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn release_ordinary_source_control(db: &Database, source: &str) {
+    use phoenix_core::domain::conversation_goal::GoalTimestampUs;
+    use phoenix_db::conversation_goals::control::{ControlCommand, ControlOutcome, ControlRequest};
+    let owner = db
+        .get_conversation(source)
+        .await
+        .unwrap()
+        .product_conversation_id;
+    let version: Option<i64> = sqlx::query_scalar(
+        "SELECT control_version FROM conversation_goal_controls WHERE owner_id=?",
+    )
+    .bind(owner.as_str())
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    let expected_control_version = u64::try_from(version.unwrap_or(0)).unwrap();
+    let receipt = db
+        .apply_goal_control(
+            &ControlRequest {
+                owner,
+                principal_id: uuid::Uuid::parse_str(&db.instance_id().await.unwrap().to_string())
+                    .unwrap(),
+                request_id: uuid::Uuid::new_v4(),
+                command: ControlCommand::Release,
+                expected_control_version,
+            },
+            GoalTimestampUs::parse(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(receipt.result, ControlOutcome::Accepted { snapshot } if !snapshot.stopped()));
 }
 
 fn prepared_input() -> PreparedDirectTurnPayload {
