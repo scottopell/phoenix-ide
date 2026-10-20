@@ -1,0 +1,382 @@
+-- allium: 3
+-- Implements REQ-GOAL-015..018; storage/history/report fences remain governed by
+-- requirements.md. This is a logical contract, not a table or wire schema.
+-- No external Allium modules are imported: boundary observations below name
+-- obligations of existing runtime/admission/dispatch owners, not new authority.
+
+-- Boundary vocabulary (logical events, not claims about existing wire/types):
+-- StartRequested(policy: ExecutionPolicy, boundary: Boundary, goal: Goal,
+--   request_id: String, expected_version: Integer, requester: VerifiedPrincipal,
+--   canonical_intent: String, execution_id: String): new typed Start admission.
+-- StartReplayRequested(boundary: Boundary, receipt: StartReceipt,
+--   canonical_intent: String): authorized exact accepted-input replay.
+-- RequestPlanned(policy: ExecutionPolicy, boundary: Boundary,
+--   execution: Execution, request_id: String, purpose: RequestPurpose,
+--   canonical_intent: String): first logical request admission, not transport.
+-- DispatchRequested(policy: ExecutionPolicy, boundary: Boundary,
+--   request: RequestIntent): initial/restored/retry provider-dispatch check.
+-- ResponseCheckpointCommitted(request: RequestIntent): the authoritative
+--   response/tool/report checkpoint, never merely observing provider bytes.
+-- CheckpointRecoveryRequested(request: RequestIntent): restore that checkpoint.
+-- HostDecisionRequested(policy: ExecutionPolicy, boundary: Boundary,
+--   execution: Execution): serialized next-request/settle decision.
+-- StartReceiptReturned, ProviderDispatchAuthorized, ResumeHostDecision and
+-- AcceptedInputDrainRequired are boundary outcomes consumed by the existing
+-- admission/runtime/dispatch owners. They are not new workers or permits.
+
+-- Installation and numeric calibration are distinct. There is no config default.
+external entity ExecutionPolicy {
+    installed: Boolean
+    explicit_ceiling: Integer
+}
+
+external entity Owner {
+    id: String
+}
+
+external entity VerifiedPrincipal {
+    kind: authenticated_owner | existing_coordinator
+    authorized_target: Owner
+}
+
+-- A boundary observation is valid only within its owning serialized operation.
+-- It is not a reusable permit; dispatch revalidates the existing authority.
+external entity Boundary {
+    owner: Owner
+    caller_authorized: Boolean
+    active_open_latest: Boolean
+    execution_authorized: Boolean
+    stopped: Boolean
+    queued_input: Boolean
+    structured_wait: Boolean
+    settled_for_start: Boolean
+}
+
+enum GoalState { underway | blocked | suspended | complete | exhausted }
+enum RequestPurpose { normal | summary }
+enum RequestPhase { admitted | checkpointed }
+enum ExecutionPhase { ready | requesting | deciding | suspended | settled }
+
+entity Goal {
+    id: String
+    owner: Owner
+    state: GoalState
+    version: Integer
+    current: Boolean
+    limit: Integer?
+    requests: RequestIntent with goal = this
+    used: requests.count
+
+}
+
+entity Execution {
+    id: String
+    owner: Owner
+    goal: Goal?
+    phase: ExecutionPhase
+    start_receipt: StartReceipt?
+
+}
+
+entity StartReceipt {
+    id: String
+    owner: Owner
+    goal: Goal
+    expected_version: Integer
+    requester: VerifiedPrincipal
+    canonical_intent: String
+    execution_id: String
+
+}
+
+entity RequestIntent {
+    id: String
+    execution: Execution
+    goal: Goal
+    purpose: RequestPurpose
+    canonical_intent: String
+    phase: RequestPhase
+
+}
+
+invariant FinitePolicy {
+    ExecutionPolicy.all(policy => policy.installed implies policy.explicit_ceiling > 0)
+}
+
+invariant GoalRequestCapacity {
+    Goal.all(goal => goal.limit != null implies (goal.limit > 0 and goal.used <= goal.limit))
+}
+
+invariant RequestIdentityUnique {
+    RequestIntent.all(request => RequestIntent.all(r => r.id != request.id or r = request))
+}
+
+invariant StartIdentityUnique {
+    StartReceipt.all(receipt => StartReceipt.all(r => r.id != receipt.id or r = receipt))
+}
+
+invariant RequestBindingMatches {
+    RequestIntent.all(request => request.execution.goal = request.goal and
+                                 request.execution.owner = request.goal.owner)
+}
+
+rule AcceptTypedStart {
+    when: StartRequested(policy, boundary, goal, request_id, expected_version,
+                         requester, canonical_intent, execution_id)
+    requires: requester.authorized_target = goal.owner
+    requires: expected_version = goal.version
+    requires: policy.installed
+    requires: boundary.caller_authorized
+    requires: boundary.owner = goal.owner
+    requires: boundary.active_open_latest
+    requires: boundary.settled_for_start
+    requires: not boundary.stopped
+    requires: not boundary.queued_input
+    requires: not boundary.structured_wait
+    requires: goal.current
+    requires: goal.state = underway
+    requires: goal.limit != null
+    requires: goal.used < goal.limit
+    requires: not StartReceipt.any(r => r.id = request_id)
+    ensures:
+        let receipt = StartReceipt.created(
+            id: request_id, owner: goal.owner, goal: goal,
+            expected_version: expected_version, requester: requester,
+            canonical_intent: canonical_intent, execution_id: execution_id
+        )
+        Execution.created(id: execution_id, owner: goal.owner, goal: goal,
+                          phase: ready, start_receipt: receipt)
+    @guidance
+        -- Revalidate observed goal/version and derive requester from the actual
+        -- principal under existing product/acceptance locks. Persist the receipt,
+        -- typed host input, immutable observation and authoritative turn admission
+        -- in one transaction. No competing turn or synthetic message is admitted.
+        -- Start accepts execution, not a free model call: its initial request must
+        -- pass AdmitNewLogicalRequest. Goal creation and release never emit Start.
+}
+
+rule ReplayTypedStart {
+    when: StartReplayRequested(boundary, receipt, canonical_intent)
+    requires: boundary.caller_authorized
+    requires: boundary.owner = receipt.owner
+    requires: canonical_intent = receipt.canonical_intent
+    ensures: StartReceiptReturned(receipt)
+    @guidance
+        -- Authorization precedes receipt lookup. Changed input at the same
+        -- identity is a conflict, not a second admission. Return the same accepted
+        -- execution even if its work has finished; do not recreate or dispatch it.
+        -- Its execution must still pass Stop/lifecycle permission at dispatch.
+}
+
+rule AdmitNewLogicalRequest {
+    when: RequestPlanned(policy, boundary, execution, request_id, purpose, canonical_intent)
+    requires: policy.installed
+    requires: boundary.owner = execution.owner
+    requires: boundary.active_open_latest
+    requires: boundary.execution_authorized
+    requires: not boundary.stopped
+    requires: not boundary.queued_input
+    requires: not boundary.structured_wait
+    requires: execution.phase = ready
+    requires: execution.goal != null
+    requires: execution.goal.current
+    requires: execution.goal.state = underway
+    requires: execution.goal.limit != null
+    requires: execution.goal.used < execution.goal.limit
+    requires: not RequestIntent.any(r => r.id = request_id)
+    ensures:
+        RequestIntent.created(id: request_id, execution: execution,
+                              goal: execution.goal, purpose: purpose,
+                              canonical_intent: canonical_intent, phase: admitted)
+        execution.phase = requesting
+    @guidance
+        -- Persist the first logical identity, immutable binding, canonical intent,
+        -- admission and next durable request state atomically. No commit means
+        -- no charge and no dispatch. Commit followed by interruption restores the
+        -- same identity; a new process UUID is not a new accounting decision.
+        -- Initial/tool/no-tool/goal-bound-summary/new-successor calls all enter
+        -- here. Acceptance of queued input is not automatic follow-through: drain
+        -- it first, then re-evaluate its actual request/binding under this contract.
+}
+
+rule DispatchOrRetryAdmittedIntent {
+    when: DispatchRequested(policy, boundary, request)
+    requires: policy.installed
+    requires: boundary.owner = request.execution.owner
+    requires: boundary.active_open_latest
+    requires: boundary.execution_authorized
+    requires: not boundary.stopped
+    requires: not boundary.structured_wait
+    requires: request.phase = admitted
+    requires: request.execution.phase = requesting
+    requires: request.goal.current
+    requires: request.goal.state = underway
+    ensures: ProviderDispatchAuthorized(request)
+    @guidance
+        -- Consume existing execution/Stop dispatch permission at the provider
+        -- boundary, not a cached eligibility Boolean. Reuse canonical intent and
+        -- identity on provider/overload retry; this rule creates no admission row.
+        -- Already committed admission does not grant immunity to Stop or scope
+        -- revocation. Provider-side exactly-once delivery is not promised.
+}
+
+rule CheckpointPermittedResponse {
+    when: ResponseCheckpointCommitted(request)
+    requires: request.phase = admitted
+    ensures:
+        request.phase = checkpointed
+        request.execution.phase = deciding
+    @guidance
+        -- Persist the actual response, legitimate tool results and bound goal
+        -- report in their owning checkpoint before deciding capacity. A final
+        -- permitted request's report is not invalidated by its own debit. Errors
+        -- do not publish an uncommitted checkpoint or silently fall back to Idle.
+}
+
+rule RecoverCommittedCheckpoint {
+    when: CheckpointRecoveryRequested(request)
+    requires: request.phase = checkpointed
+    ensures: ResumeHostDecision(request.execution)
+}
+
+rule PreferAcceptedQueue {
+    when: HostDecisionRequested(policy, boundary, execution)
+    requires: policy.installed
+    requires: execution.phase = deciding
+    requires: boundary.queued_input
+    ensures: AcceptedInputDrainRequired(execution)
+    @guidance
+        -- Drain real accepted input with its existing ownership before deciding
+        -- automatic work. It cannot cause a second competing turn, bypass finite
+        -- admission, or relabel observed-NoGoal as a later captured goal. A race
+        -- is serialized/rechecked by the existing admission/checkpoint owner.
+}
+
+rule AdvanceUnderwayGoal {
+    when: HostDecisionRequested(policy, boundary, execution)
+    requires: policy.installed
+    requires: execution.phase = deciding
+    requires: boundary.owner = execution.owner
+    requires: boundary.active_open_latest
+    requires: boundary.execution_authorized
+    requires: not boundary.stopped
+    requires: not boundary.queued_input
+    requires: not boundary.structured_wait
+    requires: execution.goal != null
+    requires: execution.goal.current
+    requires: execution.goal.state = underway
+    requires: execution.goal.limit != null
+    requires: execution.goal.used < execution.goal.limit
+    ensures: execution.phase = ready
+    @guidance
+        -- Host no-tool-yield continuation remains in the existing execution and
+        -- binding, before ordinary Idle/terminal watch. The next request still
+        -- needs durable admission. Tool-bearing next requests use the same path.
+        -- Existing resource caps may refuse work; they are not increased here.
+}
+
+rule ExhaustStillUnderwayGoal {
+    when: HostDecisionRequested(policy, boundary, execution)
+    requires: policy.installed
+    requires: execution.phase in {ready, deciding}
+    requires: boundary.owner = execution.owner
+    requires: boundary.active_open_latest
+    requires: boundary.execution_authorized
+    requires: not boundary.stopped
+    requires: not boundary.queued_input
+    requires: not boundary.structured_wait
+    requires: execution.goal != null
+    requires: execution.goal.current
+    requires: execution.goal.state = underway
+    requires: execution.goal.limit != null
+    requires: execution.goal.used = execution.goal.limit
+    ensures:
+        execution.goal.state = exhausted
+        execution.phase = settled
+    @guidance
+        -- Commit host-derived Exhausted and truthful limit reason with settlement
+        -- before terminal watch capture. No grace request. Complete, Blocked or
+        -- other non-Underway report already committed by the last request wins;
+        -- that outcome cannot be overwritten by this rule.
+}
+
+rule SettleNonUnderwayOrSupersededBinding {
+    when: HostDecisionRequested(policy, boundary, execution)
+    requires: policy.installed
+    requires: execution.phase = deciding
+    requires: not boundary.queued_input
+    requires: execution.goal != null
+    requires: not execution.goal.current or execution.goal.state != underway
+    ensures: execution.phase = settled
+    @guidance
+        -- Preserve the goal outcome and existing stale-report fence. Never look
+        -- up a replacement to change this binding or mint another execution.
+}
+
+contract ExecutionBoundaryContract {
+    @invariant ImmutableGoalLimit
+        -- A finite limit is captured from explicitly installed policy for a new
+        -- immutable goal. It and the objective are immutable. Missing limit means
+        -- execution ineligible, never zero or unlimited. No historical backfill
+        -- invents eligibility or requests. New goal identity has its own limit and
+        -- empty request history; supersession does not erase the old history.
+    @invariant ImmutableObservation
+        -- goal=null is the admitted observed-NoGoal state and never becomes a
+        -- current-goal lookup. A captured goal reference stays fixed through
+        -- reports, Stop, replacement and recovery. Same-product summary handoff
+        -- carries that binding to its authorized successor without resetting use.
+    @invariant CanonicalStartNotChat
+        -- This is typed canonical host input and its accepted result, not ordinary
+        -- transcript text, a UserChat origin or an invented actor. Requester comes
+        -- from authenticated owner or verified existing Coordinator authority.
+        -- The input retains the exact owner/goal/version and execution identity;
+        -- it materializes through existing durable-turn ownership and recovery.
+        -- Its private goal projection does not serialize through shared message
+        -- content, display_data or persisted llm_text. Required input/context
+        -- load failures refuse execution. Concrete storage and wire types must
+        -- make these distinctions structural; this model does not name fields
+        -- on an existing API response.
+    @invariant DurableIdentity
+        -- id is the durable logical model-request identity shared by normal and
+        -- summary paths, not a goal-only transport counter. Transport retries,
+        -- overload retries and restored dispatch reuse this exact identity and
+        -- canonical intent; completed logical requests cannot be repurposed.
+
+    @invariant DeliberateNewGoal
+        -- Accepted creation of a distinct immutable goal uses its explicitly supplied
+        -- positive policy ceiling and starts with no request admissions. Create is
+        -- not Start. Supersession leaves prior requests/limits/history intact and
+        -- changes no existing execution binding. The new goal cannot borrow an old
+        -- logical request identity, its receipt or its execution permission.
+
+    @invariant IdentityConflictAndRefusal
+        -- Start replay requires the same authenticated requester and exact canonical
+        -- owner/goal/version/input; a changed input is a conflict. A request identity
+        -- already admitted with different execution/goal/purpose/intent is a conflict,
+        -- never a second charge or dispatch. Busy, stopped, inactive, stale or missing
+        -- eligibility refuses new Start without a queued synthetic input or a receipt
+        -- claiming acceptance. Unclassified storage/commit errors remain errors.
+
+    -- Further boundary obligations are deliberately prose, not fake Boolean state
+    -- copied from authority owners into a parallel runtime representation.
+    @invariant StopWaitAndLifecycleAuthority
+        -- Stop/revocation, inactive/Close and structured waits prevent follow-through.
+        -- They retain existing cancellation/suspension/settlement semantics; neither
+        -- a wait nor Stop fabricates goal Blocked, Complete or Exhausted. Release alone
+        -- does not Start, refill usage or revive an old fence. Existing permits are
+        -- revalidated at actual dispatch after any durable decision.
+
+    @invariant FailureAndIneligibleInputs
+        -- Missing finite eligibility, canonical Start input, expected goal binding,
+        -- admitted intent or required context is an explicit execution refusal/error,
+        -- never observed-NoGoal or unlimited work. Uninstalled policy adds no goal
+        -- request SQL/admission/automatic work. An observed-NoGoal ordinary execution
+        -- remains under the ordinary non-goal runtime and is not consumed by these rules.
+
+    @invariant SummaryAndAccountingScope
+        -- A goal-bound summary request consumes one admission; its retry/recovery uses
+        -- that same identity. Successful handoff transfers binding/accounting context
+        -- through existing same-product continuation without a terminal watch event
+        -- or usage reset. Each new successor model request consumes another admission.
+        -- A failed/interrupted handoff cannot create a fresh free initial request.
+}

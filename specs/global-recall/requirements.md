@@ -183,11 +183,16 @@ AND SHALL continue to reject same-instance Coordinator self-targeting
 
 THE SYSTEM SHALL additionally provide explicit subscription management only to the Global Coordinator as governed by REQ-GR-015
 
+WHEN goal execution and Coordinator goal-management capabilities are explicitly installed
+THE SYSTEM SHALL provide goal Create/State and typed Start management through the existing verified Coordinator principal under `../conversation-goals/requirements.md` REQ-GOAL-009 and REQ-GOAL-015 through REQ-GOAL-018
+AND SHALL require the ordinary target's settled admission, exact immutable goal/version, independent Stop fence and canonical durable input/receipt
+AND SHALL NOT route Start through cross-conversation message text, create a new autonomous management actor, extend resource authority, bypass a structured wait, or treat notification delivery as Start permission.
+
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE Coordinator's own persistent execution WorkScope MAY provide local file, patch, shell, and browser affordances governed by `../federation/requirements.md` REQ-FED-011 and REQ-FED-012
 
-THE SYSTEM SHALL NOT provide MCP, task approval, project, dedicated conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other dedicated lifecycle mutation tools to the Coordinator
+THE SYSTEM SHALL NOT provide MCP, task approval, project, dedicated conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other dedicated lifecycle mutation tools to the Coordinator beyond the explicitly installed goal-management capability governed above
 
 ---
 

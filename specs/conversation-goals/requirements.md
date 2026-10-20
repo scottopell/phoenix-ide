@@ -1,10 +1,10 @@
-# Durable Conversation Goal Storage
+# Durable Conversation Goals
 
 ## User story and scope
 
 As a Phoenix user, I need an ordinary conversation's immutable goal and attributed status history to remain inspectable across transcript changes, without an older execution affecting a replacement goal or a later status.
 
-This contract covers goal storage, mutation fencing, attribution consistency, immutable report bindings, settled-boundary application admission and bounded local watch facts. It does not grant execution, resource, deployment or merge authority. Automatic follow-through, changes to independent Stop/release semantics, ceilings, renewals, standalone nonboundary-report notifications and remote goal-change fanout are outside this contract. Structured waiting remains an execution fact, not a goal disposition.
+This contract covers goal storage, mutation fencing, attribution consistency, immutable execution bindings, typed Start admission, finite per-goal model-request accounting, host follow-through and bounded local watch facts. A goal does not itself grant execution, resource, deployment or merge authority. Execution requires separately installed host policy and existing admission. Independent Stop remains authoritative; structured waiting remains an execution fact, not a goal disposition. Numeric calibration, reopening terminal goals, standalone nonboundary-report notifications and remote goal-change fanout are outside this contract. Precise execution ordering is specified in [goal-execution.allium](goal-execution.allium).
 
 ## Requirements
 
@@ -84,7 +84,7 @@ THE SYSTEM SHALL NOT use an accepted Stop or release request as evidence of an a
 WHEN a control request is retried with identical command input
 THE SYSTEM SHALL retain its original result, and SHALL reject changed input at the same request identity.
 
-THE SYSTEM SHALL apply settled-boundary admission to a new owner goal command without clearing the independent Stop latch.
+THE SYSTEM SHALL apply settled-boundary admission to a new owner goal command without clearing the independent Stop latch. Create/State mutations SHALL NOT implicitly Start execution; typed Start has the distinct admission and receipt obligations of REQ-GOAL-016.
 
 ### REQ-GOAL-005 — Immutable execution observation and stale reports
 
@@ -107,7 +107,7 @@ THE SYSTEM SHALL NOT convert that observation into a later goal-bearing binding.
 WHEN an ordinary Runtime turn is accepted
 THE SYSTEM SHALL atomically capture its immutable observation with the accepted turn and workflow, before message materialization or any model request.
 
-THE SYSTEM SHALL bind an Underway goal by its exact fence and SHALL record an explicit no-goal observation at the observed owner version when no goal is Underway.
+THE SYSTEM SHALL bind an Underway goal by its exact fence and SHALL record an explicit no-goal observation at the observed owner version when no goal is Underway. Goal-bound model requests additionally require the installed execution policy, eligibility and per-goal capacity of REQ-GOAL-015–018; a binding alone SHALL NOT authorize a request.
 
 THE SYSTEM SHALL NOT mint an execution report binding for accepted steering alone or retrofit an absent binding from a current-goal lookup.
 
@@ -179,7 +179,7 @@ THE SYSTEM SHALL serialize those mutations with existing product-message admissi
 WHILE an admission or acceptance gate is occupied, or an owner has an active or accepted nonterminal turn, queued input, pending structured question or task approval, pending continuation reservation or opening, unfinished automatic continuation admission, unfinished creation delivery, or terminal settlement obligation
 THE SYSTEM SHALL refuse a new mutation as busy or unavailable without creating synthetic chat, queuing that mutation or admitting execution.
 
-THE SYSTEM SHALL permit retained terminal automatic-continuation records without treating them as pending work.
+THE SYSTEM SHALL permit retained terminal automatic-continuation records without treating them as pending work. Mutation admission SHALL remain distinct from typed Start and same-execution host follow-through; neither SHALL weaken the settled mutation boundary or retarget an existing execution after replacement.
 
 THE SYSTEM SHALL apply the same settled-boundary rule to owning-agent create/replace calls; execution does not grant an exemption.
 
@@ -289,3 +289,74 @@ THE SYSTEM SHALL preserve existing event identities, payloads, mandatory and sub
 THE SYSTEM SHALL classify pre-capture events as historical facts not captured, SHALL NOT backfill them from current goals, and SHALL leave existing goal, actor, history, binding and control data and already embedded migration identities unchanged.
 
 THE SYSTEM SHALL reuse the existing watch outbox and durable input admission without a second worker, scheduler or startup installation. Saved goal facts, unavailable usage and notification acceptance SHALL NOT grant authority to execute or automatically follow through.
+
+### REQ-GOAL-015 — Explicit installation and finite immutable-goal scope
+
+WHEN goal execution is explicitly installed
+THE SYSTEM SHALL require an explicitly supplied positive finite model-request ceiling, without a production numeric default, and SHALL associate one fixed ceiling with each newly created immutable goal identity admitted under that policy.
+
+THE SYSTEM SHALL give a deliberately created new goal its own new limit, retain prior goal usage/history, and SHALL NOT share a lifetime or commission allowance across goal identities. Replacing an objective SHALL create a new goal, not rewrite an existing goal's usage or reopen its terminal outcome.
+
+THE SYSTEM SHALL count each newly admitted goal-bound logical model request, including the initial request, requests with or without tools, goal-bound summary requests and new requests after a summary handoff. Usage SHALL be scoped to the immutable goal, not transcript, turn, provider, pause interval or transport attempt.
+
+THE SYSTEM SHALL preserve that usage across pause/resume, Stop/release, ordinary input, restart and same-product summary continuation. A transport retry, overload retry, exact replay or restored dispatch of the same intent SHALL retain one charge. A distinct logical request SHALL require a distinct admission, not reuse a completed request's charge.
+
+WHILE execution policy is uninstalled
+THE SYSTEM SHALL add no request-accounting or follow-through goal SQL, request admission, automatic dispatch or Start capability. Existing disabled behavior and schema-only inertness SHALL remain unchanged; watch capture installation alone SHALL NOT install execution.
+
+WHEN a goal predates finite execution eligibility
+THE SYSTEM SHALL refuse goal-bound execution with explicit unavailable/ineligible evidence, without fabricating zero usage, an unlimited ceiling, a historical request ledger or an invented configured limit. Ordinary observed-NoGoal execution SHALL remain ordinary and SHALL NOT adopt a later goal.
+
+### REQ-GOAL-016 — Genuine typed Start through canonical admission
+
+WHEN an authenticated owner or an independently verified existing Coordinator principal explicitly requests Start
+THE SYSTEM SHALL authorize the actual caller and ordinary target under existing management/execution scope at the application boundary before reading any retained receipt. For a new Start identity it SHALL validate the observed goal/version, open owner and latest active transcript, and SHALL serialize admission with existing product and message-acceptance gates.
+
+THE SYSTEM SHALL accept Start only at the genuine settled boundary with no competing active/accepted turn, queued input, structured question/task approval, Close, continuation/opening reservation or unresolved terminal obligation. Busy, stopped, inactive, stale, unavailable-policy, ineligible-goal and exhausted-goal outcomes SHALL be explicit refusals without queued synthetic work.
+
+THE SYSTEM SHALL persist a typed canonical host input containing the exact Start request identity, authenticated requester, ordinary owner, expected goal/version, admitted execution/workflow identity and immutable execution observation. Its accepted receipt and canonical input SHALL commit atomically with the owning durable-turn admission, and SHALL reach runtime materialization/recovery as that typed input, not a fabricated ordinary UserChat, assistant/tool message or model-supplied actor label.
+
+WHEN the same Start identity is retried with identical input after current caller authorization
+THE SYSTEM SHALL return its retained accepted result without creating a second turn, recapturing a goal, replenishing usage or charging another request. Changed input at the same identity SHALL be rejected. A retained acceptance SHALL NOT bypass a later Stop or lifecycle fence when dispatching.
+
+THE SYSTEM SHALL obtain Start's model context directly from its admitted typed goal/execution facts. Stored Start input/receipt SHALL remain distinct from shared transcript message content, display data and persisted `llm_text`; authenticated presentation SHALL expose its typed status without inventing a new wire shape in this contract. Shared transcript reads SHALL NOT acquire private goal facts through Start projection. Failure to decode or load required accepted input, binding, limit or context SHALL refuse execution, not substitute current-goal data or ordinary text.
+
+THE SYSTEM SHALL keep goal creation/replacement, Start and release as separate admissions. Create or State SHALL NOT implicitly Start; release SHALL clear only its existing Stop fence. A new goal SHALL NOT retarget, restart or grant another execution through an old binding. Existing Coordinator authority SHALL permit independently authorized target management, not mint resource/merge/deploy scope or answer structured waits without standing authorization.
+
+### REQ-GOAL-017 — Durable logical request identity and atomic accounting
+
+BEFORE the first dispatch of a newly planned goal-bound logical request
+THE SYSTEM SHALL durably establish its immutable logical identity, exact execution binding, purpose and canonical request intent, and SHALL atomically record its single per-goal admission with the next durable request state under current execution/control authority. The first normal request and summary request SHALL use this same identity/accounting contract; no process-local or goal-only random counter SHALL substitute for durable request identity.
+
+THE SYSTEM SHALL distinguish an admitted intent from its transport attempts and its completed checkpoint. Reusing an identity with different owner, goal, execution, purpose or canonical intent SHALL fail as an identity conflict. Request usage SHALL be derivable from normalized unique admission records, without an independently writable used counter or goal-wide reset operation. The exact table/key layout is not prescribed.
+
+WHEN failure occurs before admission commits
+THE SYSTEM SHALL retain neither a charge nor an admitted request state and SHALL NOT dispatch the provider.
+
+WHEN admission commits but dispatch or its response checkpoint is interrupted
+THE SYSTEM SHALL retain and recover that same admitted identity/charge and canonical intent. Recovery SHALL revalidate existing Stop/lifecycle/execution authority before any restored dispatch and SHALL NOT replan it as a free or second-charged request. This is the goal request intent's recovery obligation, not a provider-side exactly-once or general cross-version guarantee.
+
+WHEN an admitted request's response/tool/report checkpoint has committed
+THE SYSTEM SHALL recover that committed result and its next decision phase rather than repeat a completed logical request or erase its usage. Summary handoff SHALL preserve the existing goal's accounting; an interrupted admitted summary request reuses its identity, and a new successor request receives its own admission against the same goal.
+
+THE SYSTEM SHALL propagate unclassified storage, decode, constraint, context and commit failures through the owning admission/checkpoint protocol, without reporting successful admission, treating missing capacity evidence as NoGoal, silently falling back to ordinary execution or publishing uncommitted accounting/results.
+
+### REQ-GOAL-018 — Final-request ordering and host continuation before Idle
+
+WHEN a permitted goal-bound request returns
+THE SYSTEM SHALL allow its genuine response, legitimate tool results and bound goal report to finish their owning checkpoint before making a capacity or natural-yield decision. Consuming the last available admission SHALL NOT prematurely mark the goal Exhausted or invalidate that request's otherwise valid completion/report.
+
+WHEN a request finishes or an execution reaches a next-request/settle boundary
+THE SYSTEM SHALL resolve the durable host decision before publishing ordinary Idle/terminal completion and its watch occurrence. Already accepted user/steering input SHALL take priority over automatic follow-through and SHALL retain its existing queue ownership; this priority SHALL NOT permit an additional goal-bound request beyond capacity.
+
+WHILE the exact bound goal remains current and Underway, capacity remains, and existing active-owner/execution/Stop admission permits work
+THE SYSTEM SHALL continue through the same host execution pipeline after a model yield without tools, without synthetic chat, a new worker/scheduler or a competing turn. Tool-bearing follow-up requests SHALL pass through the same per-goal admission. Existing resource/tool-cycle caps SHALL remain independent constraints and SHALL NOT be increased by this contract.
+
+WHEN the goal remains Underway at the next request/settle decision and all its allowed requests have been admitted
+THE SYSTEM SHALL atomically record host-derived Exhausted and a truthful limit reason with the owning settlement decision, before terminal watch capture, and SHALL admit no extra request or grace completion call.
+
+THE SYSTEM SHALL preserve a committed Complete, Blocked or other non-Underway outcome instead of overwriting it with limit exhaustion. Stop, inactive/Close, revoked execution authority, pending structured waits and stale/superseded bindings SHALL prevent automatic follow-through; Stop SHALL retain its independent cancellation/control semantics rather than manufacture a goal-status transition.
+
+THE SYSTEM SHALL revalidate accepted queue priority and execution/control authority at the committing decision and at existing dispatch permission consumption. A queued-input or Stop race SHALL NOT overtake accepted input, double-admit work or dispatch through a revoked fence. Superseding a goal SHALL NOT alter an in-flight immutable binding or permit old reports to affect its replacement.
+
+THE SYSTEM SHALL keep host decisions, request admissions and checkpoint recovery within the existing authoritative runtime/durable-turn pipeline. Saved watch facts and notification delivery SHALL remain factual consumers, not execution triggers. Execution terminal/wait capture and summary suppression SHALL retain REQ-GOAL-011–014's causal owner and rollback boundaries.
