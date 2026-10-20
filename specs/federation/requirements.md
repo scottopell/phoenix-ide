@@ -63,6 +63,7 @@ The sending server SHALL derive conversation membership from its persisted runti
 Conversation-authored tool-call attribution SHALL survive admission, steering, persistence, retries, retrieval, transport, UI, and model rendering. Arbitrary Bash/Python API invocation and API-created opening objectives SHALL NOT be required to carry conversation authorship. Those calls authenticate the enrolled instance but retain API-channel input classification; they SHALL NOT invent a sending conversation. No UDS/peer-credential attestation subsystem is required.
 A Coordinator sender SHALL retain its actual stable Coordinator identity and exact transcript rather than fabricate ordinary ProductConversation membership.
 This attribution SHALL NOT be described as independently signed conversation authorship or proof of an uncompromised physical device.
+The public direct peer send operation SHALL accept no sender or source-instance claim and SHALL always construct API-channel provenance from the authenticated enrollment. A distinct server-to-server authored send operation SHALL accept only ordinary conversation or Coordinator attestation and SHALL bind the source instance solely to the authenticated enrollment. That operation SHALL trust the enrolled source server's membership and tool-call attribution; its peer credential SHALL NOT be represented as independent proof of conversation authorship or as a credential restricted to API-channel sends.
 
 ### REQ-FED-007: Peer coordinator messages
 
@@ -104,7 +105,7 @@ Dev launching SHALL supply a distinct data directory per worktree when the opera
 
 The Coordinator grounding panel SHALL show its working-directory path and browsable contents through server-backed file viewers without implying a Git project or ordinary work retirement controls.
 Connections SHALL offer agent-readable/writable notes for conventions and observations. Agent note edits SHALL NOT mutate destination, identity, credential association, enabled state, or trust. Notes SHALL contain no secrets and SHALL NOT confer authority.
-Coordinator files MAY retain local notes and scripts. Connection notes SHALL be one opaque text value read and written whole, with no automatic extraction or cross-peer synchronization. Files MAY repeat observations; they SHALL NOT become a second configuration authority. No general memory engine is required.
+Coordinator files MAY retain local notes and scripts. Connection notes SHALL be one opaque text value of at most 32 KiB of UTF-8 bytes, read and written whole, with no automatic extraction or cross-peer synchronization. Empty notes SHALL be valid; reimporting a connection SHALL preserve its notes, and deleting the connection SHALL delete its notes. Files MAY repeat observations; they SHALL NOT become a second configuration authority. No general memory engine is required.
 
 ### REQ-FED-013: Instance selection and typed references
 

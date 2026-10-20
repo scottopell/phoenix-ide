@@ -1,31 +1,31 @@
-# Remote tool matrix — design investigation
+# Remote tool and owner API matrix
 
-This is an implementation-planning inventory, not an implementation admission or a general remote-tool executor contract. The five-operation matrix remains under consideration in full.
+All five tools have explicit-instance HTTPS adapters. The owner-facing direct API resolves saved peer connections server-side and reuses those adapters.
 
-## Common transport seam
+## Owner operations
 
-Select one enrolled instance per call; authenticate with its caller-bound token; use bounded requests/results; return destination-qualified references. Execute destination-owned service operations, not caller-supplied executable code. No broadcast, cross-host SQL joins, merged search ranking, arbitrary tool-name dispatch, background delivery queue, or automatic compatibility adapter is implied.
+All operation requests are closed JSON objects and require `instance: string` (saved UUID or unambiguous saved name). Missing, null, blank, unknown, and ambiguous selectors fail; none invoke the local operation. The API does not share the tools' omission-means-local convention.
 
-## Concrete matrix
-
-| Operation | Local service anchor | Existing HTTP equivalence | Actual incremental concern |
+| Owner route (`POST`) | Request type and remaining fields | Response type | Existing adapter |
 |---|---|---|---|
-| `query_database(sql)` | `GlobalReadService::query_database` → `Database::coordinator_query` | No equivalent route found in inspected registration | Expose the same validated read-only operator query on the destination. Preserve authorizer/bounds, including current privileged visibility; do not fetch raw DB files. SQL remains target-schema-specific. No schema translation. |
-| `search_conversations(query)` | `GlobalReadService::search` | `/api/conversations/search` exists but uses palette search, not this tool's global message-hit policy | A thin destination adapter must use the existing tool service, preserving index-warming behavior and local Coordinator exclusion. Return source-instance-qualified citations, not rewrite formatted Markdown heuristically. No merged fleet index. |
-| `read_conversation(reference, cursor)` | `GlobalReadService::read_conversation` | General conversation APIs exist; bounded agent rendering is a distinct contract | Preserve stable-current versus exact transcript/message references, page bounds, and destination-local cursor. No durable remote snapshot session implied. |
-| `resolve_reference(reference)` | `GlobalReadService::resolve_reference` | `/api/global/resolve` already delegates to it | Closest to ordinary transport work. Qualify result IDs/links and keep WorkScope paths explicitly destination-host-local. Never resolve an unknown remote ID on the caller. |
-| `send_conversation_message(target, message, message_id)` | `SendConversationMessage` → `SendChatApplicationService` | Ordinary chat endpoints do not carry the tool's trusted sender contract | Genuine semantic seam: enrolled source-instance attribution, server-derived sender membership, narrow remote Coordinator exception, and existing idempotent acceptance. Reuse destination admission, not a federation-owned delivery queue. |
+| `/api/federation/query-database` | `OwnerQueryRequest`: `sql` | `RemoteQueryDatabaseResponse` | `query_remote_database` |
+| `/api/federation/search-conversations` | `OwnerSearchRequest`: `query` | `OwnerSearchResponse`: destination instance and qualified hits | `search_remote_conversations` |
+| `/api/federation/read-conversation` | `OwnerReadRequest`: typed `target`, optional `cursor` (zero by default) | `QualifiedConversationRead` | `read_remote_conversation` |
+| `/api/federation/resolve-reference` | `OwnerResolveRequest`: `reference` | `ResolveGlobalReferenceResponse` | `resolve_remote_reference` |
+| `/api/federation/send-conversation-message` | `OwnerSendRequest`: typed `target`, `message`, explicit UUID `message_id` | `RemoteSendMessageResponse` | `send_remote_conversation_message` |
 
-## Assessment
+Requests are bounded to 256 KiB. Existing HTTPS-only, verified trust, no-redirect, 30-second transport and bounded-response behavior is reused. No automatic retry, fallback, broadcast, merged index, schema translation, remote executable-code dispatch, or delivery queue is added. Transport errors expose static codes rather than raw peer diagnostics. Send retains destination receipt identity and rejection codes; owner calls derive only `RemoteApi` attribution. Request bodies cannot supply a conversation or Coordinator sender.
 
-The read operations are predominantly bounded adapters, not new distributed lifecycles. Their principal shared cost is instance-qualified reference production. The HTTP palette search is not interchangeable with message search merely because both are named search.
+## Authored send adapter
 
-Messaging is the highest-cost operation because it crosses trusted input admission. However that cost is already required by peer Coordinator communication; including four bounded read operations need not multiply it into a general RPC platform.
+The explicit-instance `send_conversation_message` tool uses `send_remote_authored_conversation_message` and the fixed peer-only `/api/federation/peer/send-authored-conversation-message` endpoint. Its closed request permits only ordinary conversation or Coordinator attestation with a complete source tool call, derived from persisted source membership and the tool context. Owner/direct API sends instead use the sender-free `/api/federation/peer/send-conversation-message` endpoint and always retain `RemoteApi` provenance. Both bind caller identity solely to peer enrollment; ordinary/API sends cannot message upward to the Coordinator.
 
-Tool credential authentication identifies the calling instance. Arbitrary Bash/Python API calls remain outside conversation authorship, including creation objectives. No local UDS/peer-credential system is planned.
+The authored endpoint trusts the enrolled source server. Both send endpoints accept the same directional bearer, so a holder can deliberately submit source-local attestations on the authored endpoint. This is not independent authorship proof or a credential-isolation boundary. OpenAPI labels the authored operation as server-to-server, not an owner/Python operation.
 
-An optional separate instance selector on existing tools is the approved semantic interface under REQ-FED-013; endpoint wire schemas remain undecided. Source instance must remain explicit in results. Saved names are ergonomic selectors, not identity. Current-schema SQL errors are honest failures; OpenAPI cannot adapt database schemas.
+## Connections and opaque notes
 
-## Boundaries still needing design
+- `GET /api/federation/peers`: `FederationPeerSummary[]` (`peer_instance_id`, `peer_display_name`, `base_url`, `created_at`). No bearer, verifier, or CA field.
+- `GET /api/federation/peers/:instance/notes`: `PeerNotesDocument` (`notes: string`).
+- `PUT /api/federation/peers/:instance/notes`: closed `PeerNotesDocument`, whole-value replacement, same response shape.
 
-Typed citation/reference result representation rather than parsing current formatted strings; destination endpoint shapes; transport error codes and size/deadline values; trusted Coordinator sender identity representation; destination retention of message retry identities. These must reuse owning contracts where available rather than silently add new guarantees.
+Each saved connection has owner-only opaque notes in one `TEXT NOT NULL DEFAULT ''` column on `federation_peer_connections`, with a 32 KiB UTF-8 byte limit in the schema and typed API boundary. Import/reimport leaves notes unchanged; connection deletion removes notes. No JSON interpretation, authority semantics, peer foreign key, history, or synchronization is added. Clients load notes lazily and save whole-text edits without interpreting the text as authority.
