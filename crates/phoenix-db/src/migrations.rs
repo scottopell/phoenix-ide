@@ -20614,7 +20614,14 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        run_pending_migrations(&pool).await.unwrap();
+        run_before_goal_storage_for_test(&pool).await.unwrap();
+        assert_pre_goal_storage_fixture(&pool).await;
+        let ledger_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 6")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger_name, "archive_partially_archived_chains");
 
         // Wire chain edges *after* migrations so 003 (the column) is in place.
         for (parent, child) in [
@@ -21424,6 +21431,45 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(indexes.len(), 3, "dependent wake indexes must survive");
     }
 
+    async fn assert_pre_goal_storage_fixture(pool: &SqlitePool) {
+        let late_ledger: Vec<(u32, String)> = sqlx::query_as(
+            "SELECT version, name FROM _migrations WHERE version >= 132 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(
+            late_ledger.is_empty(),
+            "unexpected late ledger: {late_ledger:?}"
+        );
+        let goal_schema: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'conversation_goal*' ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(
+            goal_schema.is_empty(),
+            "unexpected goal schema: {goal_schema:?}"
+        );
+    }
+
+    async fn assert_product_fixture_ledger(pool: &SqlitePool, versions: &[u32]) {
+        let actual: Vec<(u32, String)> = sqlx::query_as(
+            "SELECT version, name FROM _migrations WHERE version BETWEEN 70 AND 73 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let expected: Vec<(u32, String)> = MIGRATIONS
+            .iter()
+            .filter(|migration| versions.contains(&migration.version))
+            .map(|migration| (migration.version, migration.name.to_owned()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_pre_goal_storage_fixture(pool).await;
+    }
+
     async fn setup_schema_before_migration_070(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
         sqlx::raw_sql(
@@ -21477,11 +21523,18 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(pool)
         .await
         .unwrap();
-        run_pending_migrations(pool).await.unwrap();
+        run_before_goal_storage_for_test(pool).await.unwrap();
         sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71, 72, 73)")
             .execute(pool)
             .await
             .unwrap();
+        assert_product_fixture_ledger(pool, &[]).await;
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'product_conversations')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -21523,7 +21576,8 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 4);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
 
         for blank_id in ["   ", "\t", "\n", " \t\n "] {
             assert!(sqlx::query(
@@ -21629,7 +21683,8 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 4);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         let membership: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'orphan-worker'",
         )
@@ -21736,7 +21791,8 @@ with tempfile.TemporaryDirectory() as directory:
                 .await
                 .unwrap();
 
-            assert!(run_pending_migrations(&pool).await.is_err());
+            assert!(run_before_goal_storage_for_test(&pool).await.is_err());
+            assert_product_fixture_ledger(&pool, &[]).await;
             assert!(!sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(
                      SELECT 1 FROM pragma_table_info('conversations')
@@ -21753,7 +21809,8 @@ with tempfile.TemporaryDirectory() as directory:
     async fn migration_070_rejects_invalid_membership_and_coordinator_lifecycle() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
+        run_before_goal_storage_for_test(&pool).await.unwrap();
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
 
         assert!(sqlx::query(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -21836,7 +21893,8 @@ with tempfile.TemporaryDirectory() as directory:
     async fn migration_070_rejects_invalid_continuation_and_parent_topology() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
+        run_before_goal_storage_for_test(&pool).await.unwrap();
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES
                  ('ordinary-a', 'ordinary', 'open'),
@@ -22053,7 +22111,7 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -22080,7 +22138,9 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         let parent: String = sqlx::query_scalar(
             "SELECT parent_conversation_id FROM conversations WHERE id = 'recursive-subordinate'",
         )
@@ -22101,7 +22161,7 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -22130,7 +22190,9 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         let invalid_parents: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM conversations child
@@ -22155,7 +22217,7 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -22180,7 +22242,9 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(&pool)
             .await
             .unwrap();
-        assert!(run_pending_migrations(&pool).await.is_err());
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
+        assert!(run_before_goal_storage_for_test(&pool).await.is_err());
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
         assert!(!sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM _migrations WHERE version = 73)",
         )
