@@ -302,14 +302,15 @@ async fn conversation_goal_management_declaration_stays_absent_without_parent_co
             .await
             .unwrap()
             .unwrap();
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(!requests[0]
-            .tool_availability
-            .declarations()
-            .iter()
-            .any(|tool| tool.name == "goal_manage"));
-        drop(requests);
+        {
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(!requests[0]
+                .tool_availability
+                .declarations()
+                .iter()
+                .any(|tool| tool.name == "goal_manage"));
+        }
         assert_no_target_mutation(&fixture).await;
         assert!(tools.recorded_executions().is_empty());
     }

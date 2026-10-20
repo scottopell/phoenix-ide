@@ -1,5 +1,24 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Exactade qualification in progress — narrow completed Clippy correction
+
+Parent-owned run39377097203 at exacteade remains in progress per parent; no
+focused outcome or new floor is claimed. Completed Clippy job118477650972 has
+lib12/lib-test16 error summaries in its diagnostic tail. The prior twelve visible
+large-future and three Option-loop reports are absent from that tail, not blanket
+clearance of hidden diagnostics or execution of the future-size regression.
+One visible goal-owned root is `await_holding_lock` in the capability-absence
+fixture. Its source correction encloses the captured-request count/declaration
+assertions in a lexical block ending before the awaited no-target-mutation check.
+All assertions are preserved; no clone, async mutex, explicit-drop workaround or
+lint suppression is added. Neighboring request/wire assertion helpers are
+synchronous and do not hold their guards across await. The completed job log was
+read directly, without polling the running Rust lane. Shared federation/global/
+send-chat diagnostics remain unwaived. UI/specs succeeded per parent. Only
+formatting/whitespace/source checks ran locally; no compiler/tests/SQL/browser,
+push, dispatch, activation or schema changes. Eleven stashes remain intact;
+133 remains unqualified,134 unregistered/default-off,156floor onlye4d.
+
 ## Latest actual qualification — exact282 stopped on Option-loop warnings
 
 Parent-owned run **39375980176**, exact

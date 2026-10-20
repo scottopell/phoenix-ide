@@ -1,5 +1,20 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Exactade completed Clippy owned guard root — source correction only
+
+Parent39377097203 stillrunningRust per parent; no focused outcome/floor change.
+Completed118477650972 job read directly: diagnostic tail summaries12lib/16libtest;
+prior12visiblelargefuture+3Optionroots absent, not fullhiddeninventory clearance.
+Owned await_holding_lock management.rs305 now lexical block around exact captured
+request count/declaration assertions before awaited no-target-mutation. No tests
+removed, assertion weakening, clone, asyncmutex,drop workaround or lintallow.
+Other request/wire guard assertion helpers inspected: synchronous/no await.
+
+No runtime/feature breadth, push,CI,compiler/testsSQLbrowser/activation. Parent
+owns running result/artifact. UI/specs actualsuccess per parent; sharedfed/global/
+send_chatClippyunwaived;11stashes/132immutable/134unregistered/defaultoff and
+156floorONLYe4d/133unqualified unchanged until actualqualification evidence.
+
 ## Actual282 failure — three Option loops and shared future containment
 
 Parent39375980176 exact282 terminalFAIL/artifact12243672253, ZERO focused
