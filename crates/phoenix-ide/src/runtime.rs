@@ -293,6 +293,10 @@ impl ConversationMutexGates {
     async fn lock(&self, conversation_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         self.gate_for(conversation_id).await.lock_owned().await
     }
+
+    async fn try_lock(&self, conversation_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.gate_for(conversation_id).await.try_lock_owned().ok()
+    }
 }
 
 #[cfg(test)]
@@ -6569,6 +6573,22 @@ impl RuntimeManager {
     ) -> tokio::sync::OwnedMutexGuard<()> {
         self.product_message_admission
             .lock(product_conversation_id)
+            .await
+    }
+
+    pub(crate) async fn try_lock_message_acceptance(
+        &self,
+        conversation_id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.message_acceptance.try_lock(conversation_id).await
+    }
+
+    pub(crate) async fn try_lock_product_message_admission(
+        &self,
+        product_conversation_id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.product_message_admission
+            .try_lock(product_conversation_id)
             .await
     }
 

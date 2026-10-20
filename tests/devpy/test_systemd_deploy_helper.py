@@ -1382,14 +1382,18 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         registry_source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
         registry_match = re.search(r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)", registry_source, re.DOTALL)
         self.assertIsNotNone(registry_match)
-        historical_entries, removed = re.subn(
-            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
-            "",
-            registry_match.group(2),
-            count=1,
-            flags=re.DOTALL,
+        entries = registry_match.group(2)
+        qualified_target = max(helper.REQUIRED_MIGRATIONS)
+        suffix_boundaries = list(re.finditer(
+            rf"^    Migration\s*\{{\s*version:\s*{qualified_target + 1},",
+            entries,
+            flags=re.MULTILINE,
+        ))
+        self.assertEqual(
+            len(suffix_boundaries), 1,
+            "historical registry fixture requires exactly one successor boundary",
         )
-        self.assertEqual(1, removed, "synthetic qualified-128 fixture requires current migration 129")
+        historical_entries = entries[:suffix_boundaries[0].start()]
         historical_registry = self.transaction / "qualified-128-migrations.rs"
         historical_registry.write_text(
             registry_source[:registry_match.start(2)] + historical_entries + registry_source[registry_match.end(2):]
@@ -1425,6 +1429,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.write_manifest()
         manifest = self.manifest()
         self.registry = helper.candidate_registry(manifest)
+        self.assertEqual(self.registry[-1], (128, "product_creation_provisioning_stage"))
         self.database = Path(manifest.database_path)
         import sqlite3
         self.database.unlink(missing_ok=True)

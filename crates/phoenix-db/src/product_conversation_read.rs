@@ -1069,7 +1069,7 @@ impl Database {
         })
     }
 
-    async fn get_ordinary_product_conversation_on(
+    pub(crate) async fn get_ordinary_product_conversation_on(
         connection: &mut SqliteConnection,
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<ProductConversationAggregate> {

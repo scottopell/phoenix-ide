@@ -386,7 +386,7 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Err(prepared_semantics_changed(&input.prepared));
         }
-        if input.disposition == AcceptedDisposition::Runtime {
+        let active_owner = if input.disposition == AcceptedDisposition::Runtime {
             if let Some(owner) = sqlx::query_scalar::<_, i64>(
                 "SELECT turn_id FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1",
             )
@@ -399,18 +399,34 @@ impl WorkflowRepository {
                     owner: TurnAuthorityId(to_u64(owner, "turn_id")?),
                 }));
             }
-        } else if let Some(owner) =
-            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, input.conversation()).await?
-        {
-            if owner.conversation != *input.conversation() {
+            None
+        } else {
+            let owner =
+                load_active_runtime_turn_tx(&self.pool, &mut tx.tx, input.conversation()).await?;
+            if owner
+                .as_ref()
+                .is_some_and(|owner| owner.conversation != *input.conversation())
+            {
                 tx.rollback().await?;
                 return Err(DbError::Serialization(
                     "active runtime owner rehydrated under wrong conversation".to_string(),
                 ));
             }
-        }
+            owner
+        };
         let turn_id = next_direct_turn_id_tx(&mut tx).await?;
         let workflow_id = super::next_global_workflow_id_tx(&mut tx).await?;
+        let mut model =
+            phoenix_workflow::DurableTurnModel::from_turns(active_owner).map_err(conflict)?;
+        let step = model
+            .apply(TurnCommand::Accept {
+                turn_id,
+                conversation: input.conversation().clone(),
+                client_key: input.client_key.clone(),
+                prepared: input.prepared.clone(),
+                disposition: input.disposition,
+            })
+            .map_err(conflict)?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
         let prepared_payload =
@@ -447,6 +463,14 @@ impl WorkflowRepository {
         .await
         .map_err(map_constraint)?;
         insert_prepared_turn_attachments_tx(&mut tx.tx, turn_id, &prepared_payload).await?;
+        if input.disposition == AcceptedDisposition::Runtime {
+            let execution = phoenix_core::domain::conversation_goal::GoalExecution::parse(
+                to_i64(workflow_id.0, "workflow_id")?,
+                to_i64(turn_id.0, "turn_id")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx.tx, execution).await?;
+        }
         if cut == TransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(injected_cut(cut));
@@ -455,16 +479,7 @@ impl WorkflowRepository {
         if cut == TransactionCut::AfterCommit {
             return Err(injected_cut(cut));
         }
-        let mut model = phoenix_workflow::DurableTurnModel::default();
-        model
-            .apply(TurnCommand::Accept {
-                turn_id,
-                conversation: input.conversation().clone(),
-                client_key: input.client_key.clone(),
-                prepared: input.prepared.clone(),
-                disposition: input.disposition,
-            })
-            .map_err(conflict)
+        Ok(step)
     }
 
     pub async fn exact_turn_retired(
@@ -4213,6 +4228,8 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod goal_capture;
     use crate::migrations::run_pending_migrations;
     use crate::sqlite_telemetry::test_support::EventCapture;
     use crate::Database;
@@ -8476,6 +8493,142 @@ mod tests {
             panic!("expected exact replay")
         };
         assert_eq!(*prepared, payload);
+    }
+
+    #[tokio::test]
+    async fn steering_acceptance_returns_the_committed_step_and_exact_replay() {
+        let repo = repo().await;
+        let runtime = repo
+            .accept_authoritative_turn(&input("conv-a", "runtime-owner", 80))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: owner_id, ..
+        } = runtime.outcome
+        else {
+            panic!("expected runtime ownership");
+        };
+        let owner = repo
+            .load_authoritative_turn(owner_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let steering = input_with_disposition(
+            "conv-a",
+            "steering-created",
+            81,
+            AcceptedDisposition::Steering,
+        );
+        let created = repo.accept_authoritative_turn(&steering).await.unwrap();
+        let TurnOutcome::Created {
+            turn_id,
+            disposition: AcceptedDisposition::Steering,
+        } = created.outcome
+        else {
+            panic!("committed steering must return its created step");
+        };
+        assert!(repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            repo.load_authoritative_turn(owner_id).await.unwrap(),
+            Some(owner)
+        );
+        let replay = repo.accept_authoritative_turn(&steering).await.unwrap();
+        assert_eq!(
+            replay.outcome,
+            TurnOutcome::ExactReplay {
+                turn_id,
+                disposition: AcceptedDisposition::Steering,
+            }
+        );
+        assert!(replay.owed_effects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_acceptance_commit_cuts_reconcile_without_replacing_the_owner() {
+        for cut in [TransactionCut::BeforeCommit, TransactionCut::AfterCommit] {
+            let repo = repo().await;
+            let runtime = repo
+                .accept_authoritative_turn(&input("conv-a", "runtime-owner", 82))
+                .await
+                .unwrap();
+            let TurnOutcome::Created {
+                turn_id: owner_id, ..
+            } = runtime.outcome
+            else {
+                panic!("expected runtime ownership");
+            };
+            let owner = repo
+                .load_authoritative_turn(owner_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let steering =
+                input_with_disposition("conv-a", "steering-cut", 83, AcceptedDisposition::Steering);
+            assert!(repo
+                .accept_authoritative_turn_at_cut(&steering, cut)
+                .await
+                .is_err());
+            let before_retry: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM durable_turns WHERE conversation_id='conv-a' AND client_turn_key='steering-cut'",
+            ).fetch_one(&repo.pool).await.unwrap();
+            assert_eq!(before_retry, i64::from(cut == TransactionCut::AfterCommit));
+            let retry = repo.accept_authoritative_turn(&steering).await.unwrap();
+            match (cut, retry.outcome) {
+                (
+                    TransactionCut::BeforeCommit,
+                    TurnOutcome::Created {
+                        disposition: AcceptedDisposition::Steering,
+                        ..
+                    },
+                )
+                | (
+                    TransactionCut::AfterCommit,
+                    TurnOutcome::ExactReplay {
+                        disposition: AcceptedDisposition::Steering,
+                        ..
+                    },
+                ) => {}
+                other => panic!("unexpected cut reconciliation: {other:?}"),
+            }
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM durable_turns WHERE conversation_id='conv-a' AND client_turn_key='steering-cut'",
+            ).fetch_one(&repo.pool).await.unwrap();
+            assert_eq!(rows, 1);
+            assert_eq!(
+                repo.load_authoritative_turn(owner_id).await.unwrap(),
+                Some(owner)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_acceptance_requires_a_real_owner_before_any_workflow_write() {
+        let repo = repo().await;
+        let steering = input_with_disposition(
+            "conv-a",
+            "steering-without-owner",
+            84,
+            AcceptedDisposition::Steering,
+        );
+        assert!(matches!(
+            repo.accept_authoritative_turn(&steering).await,
+            Err(DbError::DirectTurnConflict(TurnConflict::CorruptAggregate(
+                "steering requires an active runtime owner"
+            )))
+        ));
+        let turns: i64 = sqlx::query_scalar("SELECT count(*) FROM durable_turns")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        let workflows: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!((turns, workflows), (0, 0));
     }
 
     #[tokio::test]
