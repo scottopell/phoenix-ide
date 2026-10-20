@@ -52,12 +52,24 @@ missing storage/expected child/corrupt capture refusing context construction.
 The pooled migration test now executes/caches an exact old-column INSERT before
 135 and reuses it on the retained connection after migration. Goal-change input
 without a captured marker reaches the explicit local-capture trigger; an
-old-source/new-outcome mismatch reaches named `goal_watch_packet_shape`, not an
-old enum CHECK. A proper new-column captured goal-change INSERT plus event-owned
-saved-goal child must commit on that same connection. The old-column statement
+old-source/new-outcome mismatch reaches SQLite's CHECK failure with the actual
+unnamed source/outcome equivalence expression, not an old enum CHECK. A proper
+new-column captured goal-change INSERT plus event-owned saved-goal child must
+commit on that same connection. The old-column statement
 does **not** accept the new packet shape. No CHECK, trigger or default is weakened;
 second-connection/schema-version/integrity and existing rollback assertions remain.
 All of this is source inspection and authored assertions, **not execution proof**.
+
+A subsequent exact-HEAD source review found two authored-test blockers in
+`61fe36ef`: the shared fixture enrolled before its setup mutations (creating two
+extra goal-change events), and the cache test expected a constraint name absent
+from migration 135. The bounded correction creates/blocks the goal before watch
+enrollment, then produces the genuine wait event; it preserves all admission,
+materialization, replay and privacy assertions. The cache test asserts SQLite
+CHECK code 275 and the actual source/outcome equivalence expression, preserving
+the preceding eligibility-trigger assertion and following valid captured
+transaction. No production source, migration SQL, CHECK/default or execution gate
+changes. Both corrections remain **authored and UNRUN**.
 
 | Contract | Implementation/verification boundary |
 |---|---|

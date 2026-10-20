@@ -427,9 +427,14 @@ async fn another_pooled_connection_reparses_the_new_schema() {
         .execute(&mut *retained)
         .await
         .unwrap_err();
+    let packet_shape_error = packet_shape_error.as_database_error().unwrap();
+    assert_eq!(packet_shape_error.code().as_deref(), Some("275"));
     assert!(packet_shape_error
-        .to_string()
-        .contains("goal_watch_packet_shape"));
+        .message()
+        .starts_with("CHECK constraint failed:"));
+    assert!(packet_shape_error
+        .message()
+        .contains("((source_occurrence_kind = 'goal_change') = (terminal_kind = 'goal_changed'))"));
     let mut tx = sqlx::Acquire::begin(&mut *retained).await.unwrap();
     sqlx::query("INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us,goal_capture_kind) VALUES ('cached-goal-change',?,'goal_change',?,1,?,'goal_changed',3,'captured')")
         .bind(watch).bind(source.product_conversation_id.as_str()).bind(&source.id)

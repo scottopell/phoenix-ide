@@ -39,10 +39,6 @@ pub(crate) async fn captured_notification(
         )
         .await
         .unwrap();
-    installed
-        .watch_product_conversation(&source.product_conversation_id)
-        .await
-        .unwrap();
     for (version, change) in [
         (
             0,
@@ -81,6 +77,10 @@ pub(crate) async fn captured_notification(
             .await
             .unwrap();
     }
+    installed
+        .watch_product_conversation(&source.product_conversation_id)
+        .await
+        .unwrap();
     installed
         .update_conversation_state(
             &source.id,
