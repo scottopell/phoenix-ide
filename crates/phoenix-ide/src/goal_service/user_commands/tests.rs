@@ -661,7 +661,9 @@ async fn conversation_goal_user_state_question_wait_stays_underway_and_cannot_be
 
 #[tokio::test]
 async fn conversation_goal_user_commands_retained_replay_checks_latest_target_and_close() {
-    use phoenix_core::domain::product_conversation::TranscriptConversationId;
+    use phoenix_core::domain::{
+        close::TranscriptConversationId, db_schema::MessageContent, sm_state::ConvState,
+    };
     let (service, owner) = fixture().await;
     let db = service.runtime.as_ref().unwrap().db();
     let id = Uuid::new_v4();
@@ -687,7 +689,6 @@ async fn conversation_goal_user_commands_retained_replay_checks_latest_target_an
         .await
         .unwrap()
         .unwrap();
-    use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
     db.add_message(
         "goal-command-handoff",
         "user-create",

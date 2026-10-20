@@ -96,6 +96,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn populated_v130_local_subscription_rows_survive_131_with_fresh_schema_parity() {
+        type Schema = (String, String, String, Option<String>);
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -174,7 +175,6 @@ mod tests {
         assert_eq!(history(db.pool()).await, before);
         let fresh = Database::open_in_memory().await.unwrap();
         let schema = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name";
-        type Schema = (String, String, String, Option<String>);
         assert_eq!(
             sqlx::query_as::<_, Schema>(schema)
                 .fetch_all(db.pool())

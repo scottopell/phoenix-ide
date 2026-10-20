@@ -92,7 +92,9 @@ impl Fixture {
 fn facts(replay: SubscriptionReplay) -> Vec<FederatedTerminalFact> {
     match replay {
         SubscriptionReplay::Facts { events } => events,
-        other => panic!("facts required: {other:?}"),
+        other @ (SubscriptionReplay::Gap { .. } | SubscriptionReplay::Ended { .. }) => {
+            panic!("facts required: {other:?}")
+        }
     }
 }
 
@@ -1172,12 +1174,12 @@ async fn close_to_history(f: &Fixture) {
                             scope: phoenix_core::work_scope::WorkScopeId::parse(scope).unwrap(),
                             inventory: phoenix_core::domain::close::CloseOwnedResourceInventory {
                                 worktree: None,
-                                work_scopes: Default::default(),
-                                bash_process_groups: Default::default(),
-                                tmux_servers: Default::default(),
-                                pty_sessions: Default::default(),
-                                browser_sessions: Default::default(),
-                                equivalent_live_resources: Default::default(),
+                                work_scopes: std::collections::BTreeSet::default(),
+                                bash_process_groups: std::collections::BTreeSet::default(),
+                                tmux_servers: std::collections::BTreeSet::default(),
+                                pty_sessions: std::collections::BTreeSet::default(),
+                                browser_sessions: std::collections::BTreeSet::default(),
+                                equivalent_live_resources: std::collections::BTreeSet::default(),
                             },
                         }
                     })

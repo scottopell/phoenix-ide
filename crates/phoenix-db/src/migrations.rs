@@ -15231,6 +15231,17 @@ with tempfile.TemporaryDirectory() as directory:
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn migration_130_upgrades_full_129_schema_preserving_history_and_fresh_parity() {
+        type ForeignKeyRow = (
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+        );
         let db = crate::Database::from_pool_for_tests(test_pool().await, String::new());
         db.run_migrations().await.unwrap();
         sqlx::raw_sql(
@@ -15372,17 +15383,6 @@ with tempfile.TemporaryDirectory() as directory:
                 f.on_update, f.on_delete, f.\"match\"
              FROM sqlite_schema s JOIN pragma_foreign_key_list(s.name) f
              WHERE s.type = 'table' ORDER BY s.name, f.id, f.seq";
-        type ForeignKeyRow = (
-            String,
-            i64,
-            i64,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            String,
-        );
         let foreign_keys_before: Vec<ForeignKeyRow> = sqlx::query_as(foreign_keys)
             .fetch_all(db.pool())
             .await
@@ -20495,29 +20495,23 @@ with tempfile.TemporaryDirectory() as directory:
         sqlx::raw_sql(MIGRATION_006).execute(&pool).await.unwrap();
 
         let archived_for = |id: &'static str| {
-            let pool = pool.clone();
-            async move {
-                sqlx::query("SELECT archived FROM conversations WHERE id = ?1")
-                    .bind(id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap()
-                    .get::<bool, _>("archived")
-            }
+            sqlx::query_scalar::<_, bool>("SELECT archived FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
         };
 
         // Chain A: every member ends archived.
-        assert!(archived_for("a-root").await);
-        assert!(archived_for("a-mid").await);
-        assert!(archived_for("a-leaf").await);
+        assert!(archived_for("a-root").await.unwrap());
+        assert!(archived_for("a-mid").await.unwrap());
+        assert!(archived_for("a-leaf").await.unwrap());
         // Chain B: untouched (already fully archived).
-        assert!(archived_for("b-root").await);
-        assert!(archived_for("b-leaf").await);
+        assert!(archived_for("b-root").await.unwrap());
+        assert!(archived_for("b-leaf").await.unwrap());
         // Chain C: untouched (none archived).
-        assert!(!archived_for("c-root").await);
-        assert!(!archived_for("c-leaf").await);
+        assert!(!archived_for("c-root").await.unwrap());
+        assert!(!archived_for("c-leaf").await.unwrap());
         // Standalone: untouched.
-        assert!(archived_for("solo-s").await);
+        assert!(archived_for("solo-s").await.unwrap());
     }
 
     /// Migration 007: top-level Explore conversations get `worktree_path`

@@ -23757,9 +23757,13 @@ mod tests {
                 InputOrigin::RemoteApi { instance_id }
                 | InputOrigin::RemoteConversation { instance_id, .. }
                 | InputOrigin::RemoteCoordinator { instance_id, .. } => {
-                    *instance_id = InstanceId::new()
+                    *instance_id = InstanceId::new();
                 }
-                _ => unreachable!(),
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated
+                | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
             }
             assert!(matches!(
                 insert_message_tx(&mut tx, &changed).await,

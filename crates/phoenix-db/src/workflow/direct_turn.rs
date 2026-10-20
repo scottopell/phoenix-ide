@@ -8192,7 +8192,12 @@ mod tests {
                         tool_use_id: "retry-call".into(),
                     }));
                 }
-                _ => {}
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated
+                | InputOrigin::RemoteApi { .. }
+                | InputOrigin::SubscriptionEvent { .. } => {}
             }
             let replay = repo
                 .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &retry)
@@ -8206,9 +8211,13 @@ mod tests {
                 InputOrigin::RemoteApi { instance_id }
                 | InputOrigin::RemoteConversation { instance_id, .. }
                 | InputOrigin::RemoteCoordinator { instance_id, .. } => {
-                    *instance_id = InstanceId::new()
+                    *instance_id = InstanceId::new();
                 }
-                _ => unreachable!(),
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated
+                | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
             }
             assert!(matches!(
                 repo.lookup_scoped_direct_turn_replay(

@@ -34,6 +34,22 @@ requires `metrics.outcome`, and the in-process provider test named a nonexistent
 fixture APIs are source-corrected after87; the partial exact4e result and wholly
 green exact2ec floor remain distinct, and neither qualifies the corrected source.
 
+Later exact3877baedcc1a72c2b3ac6327403f6a4361606f49 run **39361606004**
+completed FAILED. Rust artifact **12237862532** proves **zero focused tests
+executed**: the command fixture imported `TranscriptConversationId` from the
+wrong module. The actual type is `domain::close::TranscriptConversationId`;
+that fixture import and its statement-order imports are source-corrected.
+The prior87 metrics/transport compiler roots are absent in this run.
+Its Clippy job **118437207992** reported sixteen DB diagnostics: command refusal
+branch order; explicit federation/remote-origin variant matches and semicolons;
+six concrete BTreeSet defaults; two test aliases after statements; and one
+102-line migration fixture. The corrective source addresses all sixteen without
+new lint allowances or removed assertions; the last fixture uses a scalar-query
+future instead of a redundant async row wrapper. Migration edits are test-only:
+registered SQL, schema132 and the registry remain unchanged. The correction has
+had a staged-only read-only source review, not compiler/test qualification.
+Paused prepared-management tool work remains a separate uncommitted slice.
+
 The subsequent Stop-ordering and identity corrections remain source-only until
 an exact corrected-head run. No duplicate CI or local heavy execution was
 performed. Production stays Disabled, emitter None, route503; actual133 is
@@ -139,9 +155,10 @@ chat nor clears Stop. Four authored, unexecuted service tests cover attribution,
 held gates and historical retry, exact-input conflict, Stop preservation, actual
 history-insert rollback and auth/default-off boundaries. This is not public
 installation or State/AUQ/tools/UI/watch/automatic-continuation completion.
-Parent-owned39358832109 captured exact87 and is now terminal compile-red; these
-subsequent source changes are outside that captured head and are unqualified.
-No replacement or duplicate run has been dispatched by this writer.
+Parent-owned39358832109 captured exact87 and parent-owned39361606004 captured
+exact387; both are terminal compile-red with zero focused execution. Subsequent
+source corrections are unqualified. No replacement or duplicate run has been
+dispatched by this writer.
 
 The next shared `user_commands` source owner extends the same transaction and
 host gate path to explicit State commands: Blocked recovery to Underway retains

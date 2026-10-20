@@ -283,10 +283,10 @@ impl Database {
             .as_ref()
             .map_or(GoalVersion::INITIAL, |goal| goal.version);
         if observed != input.expected_version || host_gate_busy {
-            let reason = if observed != input.expected_version {
-                GoalUserRefusal::Version
-            } else {
+            let reason = if observed == input.expected_version {
                 GoalUserRefusal::Busy
+            } else {
+                GoalUserRefusal::Version
             };
             let receipt = reject_tx(&mut tx, input, reason, observed, at).await?;
             tx.commit().await?;

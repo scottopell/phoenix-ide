@@ -1,5 +1,34 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Latest actual exact387 failure and bounded source correction
+
+Parent run39361606004 captured exact3877baedcc1a72c2b3ac6327403f6a4361606f49
+and is terminal FAILED. Downloaded Rust artifact12237862532 shows ZERO focused
+tests executed: E0432 imported TranscriptConversationId from product_conversation,
+but the actual declaration is domain::close.rs. The fixture import is corrected,
+and its MessageContent/ConvState use is moved before statements. Prior87's
+metrics/Http compiler errors are absent in this run; that is not a test pass.
+
+The full actual Clippy job118437207992 log was downloaded and all sixteen DB
+diagnostics corrected in the same bounded validation slice: preserve refusal
+precedence while using equality; explicit Gap/Ended and InputOrigin variants;
+six concrete BTreeSet defaults; two alias moves before statements using
+clipboards; semicolons; and shorten the migration006 fixture via query_scalar.
+No lint allowance or test assertion was removed/added to waive the failures.
+In migrations.rs only migration130/006 test functions changed; the federation
+alias move is likewise test-only. No migration SQL/schema132 or registry changed. A frozen staged-only review found no actionable issue and checked
+all sixteen diagnostics, the real close type and scalar-query future lifetime.
+No local compiler/test/SQL/browser ran. Corrected source remains unqualified;
+2ec127/127 is still the only wholly passing focused floor,4e139/140 is partial,
+and both87/387 are compile-red with zero focused execution. Parent owns the
+single corrected-head qualification decision; writer dispatched no run.
+
+Prepared Global management tool work is paused and preserved separately from
+this correction commit: core pending_management.rs (untracked), its core module
+export and the service's shared-disposition alias. It has not entered runtime,
+tool schema or checkpoint integration and is not a claimed completed adapter.
+The full command/tool/UI/watch/automatic-continuation commission remains open.
+
 ## Resumed Stop-ordering correction — same writer, source-only
 
 Actual base is `4eae8cdb9bdb67d61c61c1c40285ac05428732aa`, same a52c58d8
