@@ -486,8 +486,14 @@ async fn stage_one(
         .send()
         .await
         .unwrap();
-    assert!(response.status().is_success());
-    let response: SubscriptionResponse = response.json().await.unwrap();
+    let status = response.status();
+    let body = response.bytes().await.unwrap();
+    assert!(
+        status.is_success(),
+        "subscription replay failed with {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let response: SubscriptionResponse = serde_json::from_slice(&body).unwrap();
     let SubscriptionResult::Replay {
         replay: SubscriptionReplay::Facts { events },
     } = response.result

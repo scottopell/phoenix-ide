@@ -5565,7 +5565,9 @@ def cmd_check(
         # only the parent leaves orphans whose pipes the harness can still
         # be blocked on, masking the original hang.
         from collections import deque
-        TAIL_LINES = 200
+        # Preserve final nextest panic bodies for large no-fail-fast suites while
+        # keeping every subprocess capture bounded.
+        TAIL_LINES = 4000
         t0 = time.monotonic()
         # Lane attribution for the reporter: steps always run on their lane's
         # thread, and lane threads are named after their lane.
