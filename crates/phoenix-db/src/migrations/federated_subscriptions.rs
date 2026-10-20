@@ -106,10 +106,10 @@ mod tests {
         let db = Database::from_pool_for_tests(pool, String::new());
         db.run_migrations().await.unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE IF NOT EXISTS _migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            "CREATE TABLE IF NOT EXISTS _migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))\
             )",
         )
         .execute(db.pool())

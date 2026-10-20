@@ -13,6 +13,14 @@ use phoenix_workflow::{
 };
 
 const NOW: i64 = RETENTION_US * 2;
+
+async fn open_migrated(path: &str) -> Database {
+    let db = Database::open(path).await.unwrap();
+    crate::migrations::run_pending_migrations(db.pool())
+        .await
+        .unwrap();
+    db
+}
 struct Fixture {
     db: Database,
     source: crate::Conversation,
@@ -902,7 +910,7 @@ async fn restart_preserves_staged_identity_and_admitted_cursor_after_lost_ack() 
         .join("subscriptions.sqlite")
         .to_string_lossy()
         .into_owned();
-    let db = Database::open(&path).await.unwrap();
+    let db = open_migrated(&path).await;
     let target = coordinator(&db).await;
     let remote = remote_fixture(&db).await;
     let replay = single_fact();
@@ -914,7 +922,7 @@ async fn restart_preserves_staged_identity_and_admitted_cursor_after_lost_ack() 
         .remove(0)
         .admission_id;
     db.pool.close().await;
-    let db = Database::open(&path).await.unwrap();
+    let db = open_migrated(&path).await;
     db.stage_remote_replay(&remote, &replay).await.unwrap();
     assert_eq!(
         db.pending_remote_notifications(&remote).await.unwrap()[0].admission_id,
@@ -923,7 +931,7 @@ async fn restart_preserves_staged_identity_and_admitted_cursor_after_lost_ack() 
     fixture_authorize(&db, &remote, &id).await;
     steer(&db, &target, &id).await.unwrap();
     db.pool.close().await;
-    let db = Database::open(&path).await.unwrap();
+    let db = open_migrated(&path).await;
     let resumed = db
         .remote_subscription_for_product(&remote.reference)
         .await
@@ -1550,7 +1558,7 @@ async fn unsubscribe_identity_is_durable_retryable_and_never_reenrolls() {
         .join("unsubscribe.sqlite")
         .to_string_lossy()
         .into_owned();
-    let db = Database::open(&path).await.unwrap();
+    let db = open_migrated(&path).await;
     let remote = remote_fixture(&db).await;
     db.stage_remote_replay(&remote, &single_fact())
         .await
@@ -1559,7 +1567,7 @@ async fn unsubscribe_identity_is_durable_retryable_and_never_reenrolls() {
         .await
         .unwrap();
     db.pool.close().await;
-    let db = Database::open(&path).await.unwrap();
+    let db = open_migrated(&path).await;
     let pending = db.next_remote_subscription_sync_batch(4).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert!(pending[0].pending_unsubscribe);
@@ -1630,7 +1638,7 @@ async fn authorization_refresh_replaces_an_expired_attempt_without_ending_or_adv
 
 #[tokio::test]
 async fn interrupted_authorization_rolls_back_navigation_and_retries_after_slug_rename() {
-    let db = Database::open(":memory:").await.unwrap();
+    let db = open_migrated(":memory:").await;
     let remote = remote_fixture(&db).await;
     db.stage_remote_replay(&remote, &single_fact())
         .await
@@ -1715,7 +1723,7 @@ async fn interrupted_authorization_rolls_back_navigation_and_retries_after_slug_
 
 #[tokio::test]
 async fn received_navigation_is_canonical_durable_and_batched_with_authorization() {
-    let db = Database::open(":memory:").await.unwrap();
+    let db = open_migrated(":memory:").await;
     let remote = remote_fixture(&db).await;
     db.stage_remote_replay(&remote, &single_fact())
         .await
@@ -1933,7 +1941,7 @@ async fn local_unsubscribe_fences_inflight_confirmation_after_stop_barrier() {
 
 #[tokio::test]
 async fn revocation_settlement_suppresses_authorizing_work_and_clears_unsubscribe_retry() {
-    let db = Database::open(":memory:").await.unwrap();
+    let db = open_migrated(":memory:").await;
     let remote = remote_fixture(&db).await;
     let mut events = facts(single_fact());
     let mut second = events[0].clone();

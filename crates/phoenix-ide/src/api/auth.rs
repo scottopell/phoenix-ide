@@ -458,8 +458,26 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // No password configured — pass through as the owner channel.
+    let reference_peer_token = (req.method() == axum::http::Method::GET
+        && req.uri().path() == "/openapi.json")
+        .then(|| bearer_token(&req).map(str::to_owned))
+        .flatten()
+        .filter(|token| PeerBearerCredential::parse(token.clone()).is_ok());
+
+    // With no password configured, local owner access remains open. An explicit
+    // peer credential on the dual-auth reference route must still authenticate.
     let Some(password) = &state.password else {
+        if let Some(token) = reference_peer_token.as_deref() {
+            if let Some(authenticated) = authenticate_peer_bearer(&state, token).await {
+                req.extensions_mut().insert(authenticated);
+                return next.run(req).await;
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Authentication required" })),
+            )
+                .into_response();
+        }
         req.extensions_mut().insert(OwnerAuthenticated);
         return next.run(req).await;
     };
@@ -480,35 +498,30 @@ pub async fn auth_middleware(
     // exact-shape peer token is checked against both channels without charging a
     // successful peer request to the owner's password-guess budget.
     let key = throttle_key(req.headers(), peer_from_extensions(&req));
-    if req.method() == axum::http::Method::GET && req.uri().path() == "/openapi.json" {
-        if let Some(token) = bearer_token(&req)
-            .map(str::to_owned)
-            .filter(|token| PeerBearerCredential::parse(token.clone()).is_ok())
-        {
-            let owner_locked = state.login_throttle.is_locked(&key);
-            if !owner_locked && owner_password_matches(&token, password.expose()) {
-                state.login_throttle.record_success(&key);
-                req.extensions_mut().insert(OwnerAuthenticated);
-                return next.run(req).await;
-            }
-            if let Some(authenticated) = authenticate_peer_bearer(&state, &token).await {
-                req.extensions_mut().insert(authenticated);
-                return next.run(req).await;
-            }
-            if owner_locked {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({ "error": "Too many authentication attempts; try again later" })),
-                )
-                    .into_response();
-            }
-            state.login_throttle.record_failure(&key);
+    if let Some(token) = reference_peer_token.as_deref() {
+        let owner_locked = state.login_throttle.is_locked(&key);
+        if !owner_locked && owner_password_matches(token, password.expose()) {
+            state.login_throttle.record_success(&key);
+            req.extensions_mut().insert(OwnerAuthenticated);
+            return next.run(req).await;
+        }
+        if let Some(authenticated) = authenticate_peer_bearer(&state, token).await {
+            req.extensions_mut().insert(authenticated);
+            return next.run(req).await;
+        }
+        if owner_locked {
             return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "Authentication required" })),
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "Too many authentication attempts; try again later" })),
             )
                 .into_response();
         }
+        state.login_throttle.record_failure(&key);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Authentication required" })),
+        )
+            .into_response();
     }
 
     // Bearer-password validation is throttled per peer IP, sharing the single
