@@ -32,6 +32,25 @@ fn runtime(
     )
 }
 
+async fn assemble(
+    storage: &DatabaseStorage,
+    conversation: &str,
+    messages: &[crate::db::Message],
+    excluded_message_id: Option<&str>,
+    cache: &std::sync::Mutex<Option<i64>>,
+) -> Result<Vec<LlmMessage>, String> {
+    assemble_cleared_messages(
+        storage,
+        conversation,
+        messages,
+        excluded_message_id,
+        &std::collections::HashSet::new(),
+        200_000,
+        cache,
+    )
+    .await
+}
+
 fn rendered_text(messages: &[LlmMessage]) -> String {
     messages
         .iter()
@@ -47,23 +66,20 @@ async fn saved_goal_capture_is_request_local_immutable_and_budgeted_before_freez
     let storage = DatabaseStorage::new(db.clone());
     let messages = db.get_messages(&message.conversation_id).await.unwrap();
     let cache = std::sync::Mutex::new(None);
-    let first = assemble_cleared_messages(
-        &storage,
-        &message.conversation_id,
-        &messages,
-        None,
-        &Default::default(),
-        200_000,
-        &cache,
-    )
-    .await
-    .unwrap();
+    let first = assemble(&storage, &message.conversation_id, &messages, None, &cache)
+        .await
+        .unwrap();
     let text = rendered_text(&first);
     assert!(text.contains(&diagnostic));
     for secret in [OBJECTIVE, REASON, GOAL_ID] {
         assert!(text.contains(secret));
     }
-    let no_capture = render_messages(&messages, &Default::default(), &Default::default()).unwrap();
+    let no_capture = render_messages(
+        &messages,
+        &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
     assert!(estimate_messages_tokens(&first) > estimate_messages_tokens(&no_capture));
     let budget = plan_continuation_history(first.clone(), 200_000, 0, None);
     assert_eq!(
@@ -71,17 +87,9 @@ async fn saved_goal_capture_is_request_local_immutable_and_budgeted_before_freez
         estimate_messages_tokens(&first)
     );
     db.delete_conversation(&source).await.unwrap();
-    let replay = assemble_cleared_messages(
-        &storage,
-        &message.conversation_id,
-        &messages,
-        None,
-        &Default::default(),
-        200_000,
-        &cache,
-    )
-    .await
-    .unwrap();
+    let replay = assemble(&storage, &message.conversation_id, &messages, None, &cache)
+        .await
+        .unwrap();
     assert_eq!(rendered_text(&replay), text);
     assert_private_absent(
         &serde_json::to_value(db.get_messages(&message.conversation_id).await.unwrap()).unwrap(),
@@ -100,25 +108,21 @@ async fn included_capture_failure_is_not_a_clear_watermark_fallback_and_omitted_
     let storage = DatabaseStorage::new(db);
     for cached in [None, Some(0)] {
         let cache = std::sync::Mutex::new(cached);
-        let error = assemble_cleared_messages(
+        let error = assemble(
             &storage,
             "missing-watermark-owner",
-            &[message.clone()],
+            std::slice::from_ref(&message),
             None,
-            &Default::default(),
-            200_000,
             &cache,
         )
         .await
         .unwrap_err();
         assert!(error.starts_with("failed to load subscription goal facts:"));
-        let excluded = assemble_cleared_messages(
+        let excluded = assemble(
             &storage,
             "missing-watermark-owner",
-            &[message.clone()],
+            std::slice::from_ref(&message),
             Some(&message.message_id),
-            &Default::default(),
-            200_000,
             &cache,
         )
         .await
@@ -130,18 +134,12 @@ async fn included_capture_failure_is_not_a_clear_watermark_fallback_and_omitted_
         };
         content.is_meta = true;
         wake.display_data = Some(serde_json::json!({"type":"wake_result","adopted":false}));
-        assert!(assemble_cleared_messages(
-            &storage,
-            "missing-watermark-owner",
-            &[wake],
-            None,
-            &Default::default(),
-            200_000,
-            &cache
-        )
-        .await
-        .unwrap()
-        .is_empty());
+        assert!(
+            assemble(&storage, "missing-watermark-owner", &[wake], None, &cache)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         for origin in [
             InputOrigin::UserApi,
             InputOrigin::RemoteApi {
@@ -150,13 +148,11 @@ async fn included_capture_failure_is_not_a_clear_watermark_fallback_and_omitted_
         ] {
             let mut ordinary = message.clone();
             ordinary.origin = origin;
-            let rendered = assemble_cleared_messages(
+            let rendered = assemble(
                 &storage,
                 "missing-watermark-owner",
                 &[ordinary],
                 None,
-                &Default::default(),
-                200_000,
                 &cache,
             )
             .await
@@ -180,7 +176,7 @@ async fn expected_captured_fact_missing_or_corrupt_fails_context_instead_of_no_g
         "CREATE VIEW coordinator_watch_goal_captures AS SELECT event_id,kind,owner_id,owner_version,goal_id,objective,'invalid' AS state,reason,usage_kind FROM retained_captures",
     ] {
         sqlx::query(sqlx::AssertSqlSafe(definition)).execute(db.pool()).await.unwrap();
-        let error = assemble_cleared_messages(&storage, &message.conversation_id, &[message.clone()], None, &Default::default(), 200_000, &std::sync::Mutex::new(Some(0))).await.unwrap_err();
+        let error = assemble(&storage, &message.conversation_id, std::slice::from_ref(&message), None, &std::sync::Mutex::new(Some(0))).await.unwrap_err();
         assert!(error.starts_with("failed to load subscription goal facts:"));
         sqlx::query("DROP VIEW coordinator_watch_goal_captures").execute(db.pool()).await.unwrap();
     }

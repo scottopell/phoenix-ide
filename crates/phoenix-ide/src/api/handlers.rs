@@ -13079,7 +13079,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 wire["messages"][0]["event_presentation"]["reason"],
                 "redacted"
             );
-            let private = enrich_messages(&state.db, &[message.clone()]).await;
+            let private = enrich_messages(&state.db, std::slice::from_ref(&message)).await;
             let private_wire = serde_json::to_value(&private).unwrap();
             let capture = private_wire[0]["event_presentation"]["goal_capture"].to_string();
             for secret in [OBJECTIVE, REASON, GOAL_ID] {

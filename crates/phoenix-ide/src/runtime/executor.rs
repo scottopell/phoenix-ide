@@ -1523,26 +1523,7 @@ async fn assemble_cleared_messages<S: StateStore>(
             .iter()
             .filter(|message| Some(message.message_id.as_str()) != excluded_message_id)
     };
-    let event_ids = included_messages()
-        .filter(|message| renders_user_message(message))
-        .filter_map(|message| match (&message.origin, &message.content) {
-            (
-                phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id },
-                MessageContent::User(_),
-            ) => Some(event_id.clone()),
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let captures = if event_ids.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        storage
-            .subscription_goal_captures(&event_ids)
-            .await
-            .map_err(|error| format!("failed to load subscription goal facts: {error}"))?
-    };
+    let captures = included_subscription_goal_captures(storage, included_messages()).await?;
     let prior_watermark = match storage.get_clear_watermark(conv_id).await {
         Ok(w) => {
             *watermark_cache.lock().unwrap() = Some(w);
@@ -1624,6 +1605,36 @@ async fn assemble_cleared_messages<S: StateStore>(
     };
 
     render_messages(included_messages(), &cleared, &captures)
+}
+
+async fn included_subscription_goal_captures<'a, S: StateStore>(
+    storage: &S,
+    messages: impl Iterator<Item = &'a crate::db::Message>,
+) -> Result<
+    std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+    String,
+> {
+    let event_ids = messages
+        .filter(|message| renders_user_message(message))
+        .filter_map(|message| match (&message.origin, &message.content) {
+            (
+                phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id },
+                MessageContent::User(_),
+            ) => Some(event_id.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let captures = if event_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        storage
+            .subscription_goal_captures(&event_ids)
+            .await
+            .map_err(|error| format!("failed to load subscription goal facts: {error}"))?
+    };
+    Ok(captures)
 }
 
 fn renders_user_message(message: &crate::db::Message) -> bool {

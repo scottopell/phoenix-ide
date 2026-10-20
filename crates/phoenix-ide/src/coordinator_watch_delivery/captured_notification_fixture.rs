@@ -24,9 +24,7 @@ pub(crate) fn assert_private_absent(value: &serde_json::Value) {
     }
 }
 
-pub(crate) async fn captured_notification(
-    db: &phoenix_db::Database,
-) -> (phoenix_db::Message, String, String) {
+async fn captured_wait_event(db: &phoenix_db::Database) -> (PendingWatchEvent, String) {
     let installed = db.clone().install_goal_controls_for_tests().await.unwrap();
     let source = installed
         .create_conversation(
@@ -103,7 +101,14 @@ pub(crate) async fn captured_notification(
         event.goal_capture,
         Some(phoenix_core::domain::watch_goal::WatchGoalCapture::CapturedSavedGoal { .. })
     ));
-    let diagnostic = notification(event);
+    (event.clone(), source.id)
+}
+
+pub(crate) async fn captured_notification(
+    db: &phoenix_db::Database,
+) -> (phoenix_db::Message, String, String) {
+    let (event, source_id) = captured_wait_event(db).await;
+    let diagnostic = notification(&event);
     let mut legacy = event.clone();
     legacy.goal_capture = None;
     assert_eq!(diagnostic, notification(&legacy));
@@ -190,5 +195,5 @@ pub(crate) async fn captured_notification(
     };
     assert_eq!(content.text, diagnostic);
     assert_eq!(content.llm_text(), diagnostic);
-    (message, source.id, diagnostic)
+    (message, source_id, diagnostic)
 }

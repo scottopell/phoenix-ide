@@ -106,6 +106,32 @@ only authorized direct owned-file rustfmt and Git whitespace inspection locally.
 No new CI, push, import, resources, service installation or activation follows
 without the parent's next independent review and guarded direction.
 
+### Second hosted diagnostic: bounded owned-Clippy correction
+
+Parent-reported completed jobs in diagnostic `39469829141` at exact `6b38fc71`
+show UI 11/12 checks passing (267.6 seconds), including the corrected dev.py tests;
+only the expected missing/stale generated-type tsc check fails. This is not a new
+qualified UI cut. Parent retains Rust monitoring and any codegen/artifact receipt;
+no export import or codegen-success claim follows from the UI/Clippy logs.
+
+Inspection of the retained Clippy job `118790820423` distinguishes owned roots
+from the unwaived shared failures. Owned corrections extract the included-event
+capture load from `assemble_cleared_messages` without moving it behind the
+watermark fallback, split captured-wait setup from the genuine send/materialize
+fixture, use `slice::from_ref` in private HTTP and executor assertions, and use a
+small executor-test assembly helper with the same explicit empty clearable set
+and 200,000 context window. Capture classification, filtering, propagation,
+legacy diagnostic content and all existing assertions are unchanged. No lint
+suppression or ambient installation policy is added.
+
+The 130-line federation test and federation-two-instance wildcard/underscore
+findings are shared paths, not new owned watch tests, and are deliberately left
+unchanged. Reported totals of 14 library and 32 test errors are **not** owned-root
+counts or waived failures. These corrections have only authorized direct
+owned-file rustfmt and whitespace inspection; no local compiler, tests, Clippy,
+SQL, CI, push, artifact import or installation has run. Qualification stays at
+the exact efcc UI12+209 floor pending actual Rust results and independent review.
+
 | Contract | Implementation/verification boundary |
 |---|---|
 | REQ-GOAL-011 | Existing terminal/wait outbox transactions must capture saved current goal or observed absence, distinct from legacy not-captured; usage explicitly unavailable. Storage and boundary tests owed. |
