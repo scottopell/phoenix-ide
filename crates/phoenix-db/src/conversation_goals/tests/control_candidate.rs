@@ -174,6 +174,127 @@ async fn conversation_goal_control_candidate_ordinary_owner_and_source_deletion_
     assert_eq!(receipts, 0);
 }
 
+async fn check_current_control(
+    db: &Database,
+    owner: &str,
+    workflow: i64,
+    turn: i64,
+) -> std::result::Result<(), crate::conversation_goals::control::ControlError> {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await?;
+    let result = crate::conversation_goals::control::require_current_control_tx(
+        &mut tx,
+        &p(owner),
+        GoalExecution::parse(workflow, turn).unwrap(),
+    )
+    .await;
+    tx.rollback().await?;
+    result
+}
+
+#[tokio::test]
+async fn conversation_goal_control_candidate_execution_recheck_preserves_storage_failure() {
+    let (_dir, db) = fixture().await;
+    assert!(matches!(
+        check_current_control(&db, "owner", 1, 1).await,
+        Err(crate::conversation_goals::control::ControlError::Storage(_))
+    ));
+}
+
+#[tokio::test]
+async fn conversation_goal_control_candidate_execution_recheck_never_recaptures_after_stop_release()
+{
+    use crate::conversation_goals::control::{ControlCommand, ControlError, ControlRequest};
+    let (_dir, db) = control_fixture().await;
+    let principal_id = uuid::Uuid::new_v4();
+    assert!(matches!(
+        check_current_control(&db, "owner", 1, 1).await,
+        Err(ControlError::AdmissionStopped)
+    ));
+    for (expected, command) in [
+        (0, ControlCommand::Release),
+        (1, ControlCommand::Stop),
+        (2, ControlCommand::Release),
+    ] {
+        db.apply_goal_control(
+            &ControlRequest {
+                owner: p("owner"),
+                principal_id,
+                request_id: uuid::Uuid::new_v4(),
+                command,
+                expected_control_version: expected,
+            },
+            at(),
+        )
+        .await
+        .unwrap();
+        if expected == 0 {
+            let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+            crate::conversation_goals::control::bind_control_at_admission_tx(
+                &mut tx,
+                &p("owner"),
+                GoalExecution::parse(1, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+            crate::conversation_goals::control::require_current_control_tx(
+                &mut tx,
+                &p("owner"),
+                GoalExecution::parse(1, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            assert!(check_current_control(&db, "owner", 1, 1).await.is_ok());
+            for (owner, workflow, turn) in [("other", 1, 1), ("owner", 4, 1), ("owner", 4, 4)] {
+                assert!(matches!(
+                    check_current_control(&db, owner, workflow, turn).await,
+                    Err(ControlError::AdmissionStopped)
+                ));
+            }
+        } else {
+            assert!(matches!(
+                check_current_control(&db, "owner", 1, 1).await,
+                Err(ControlError::AdmissionStopped)
+            ));
+        }
+    }
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    crate::conversation_goals::control::bind_control_at_admission_tx(
+        &mut tx,
+        &p("owner"),
+        GoalExecution::parse(4, 4).unwrap(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(check_current_control(&db, "owner", 4, 4).await.is_ok());
+    sqlx::query(
+        "INSERT INTO close_obligations (product_conversation_id,phase) VALUES ('owner','pending')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        check_current_control(&db, "owner", 4, 4).await,
+        Err(ControlError::AdmissionStopped)
+    ));
+    sqlx::query(
+        "UPDATE close_obligations SET phase='completed' WHERE product_conversation_id='owner'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(check_current_control(&db, "owner", 4, 4).await.is_ok());
+    sqlx::query("UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id='owner'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        check_current_control(&db, "owner", 4, 4).await,
+        Err(ControlError::AdmissionStopped)
+    ));
+}
+
 #[tokio::test]
 async fn conversation_goal_control_candidate_goal_or_no_goal_capture_shares_atomic_transaction() {
     use crate::conversation_goals::control::{bind_control_at_admission_tx, ControlError};
@@ -217,6 +338,13 @@ async fn conversation_goal_control_candidate_goal_or_no_goal_capture_shares_atom
         bind_control_at_admission_tx(&mut tx, &binding.owner, binding.execution)
             .await
             .unwrap();
+        crate::conversation_goals::control::require_current_control_tx(
+            &mut tx,
+            &binding.owner,
+            binding.execution,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         assert!(binding_is_current(&db, 1).await);
         let captured = db

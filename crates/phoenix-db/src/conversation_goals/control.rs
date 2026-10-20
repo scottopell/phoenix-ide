@@ -168,6 +168,42 @@ pub async fn bind_control_at_admission_tx(
     Ok(())
 }
 
+/// Recheck the exact admitted control inside the transaction that owns the next effect.
+///
+/// # Errors
+/// Rejects missing, stopped, stale or cross-execution control and unavailable owners.
+/// Storage failures are not relabeled as semantic refusal.
+pub async fn require_current_control_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner: &ProductConversationId,
+    execution: phoenix_core::domain::conversation_goal::GoalExecution,
+) -> Result<(), ControlError> {
+    let current: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversation_goal_control_bindings b
+         JOIN conversation_goal_controls ctl ON ctl.owner_id=b.owner_id
+             AND ctl.control_version=b.control_version AND ctl.stopped=b.admitted_stopped
+             AND ctl.principal_id=b.principal_id AND ctl.request_id=b.request_id
+         JOIN product_conversations p ON p.id=b.owner_id
+         JOIN durable_turns t ON t.turn_id=b.turn_id AND t.workflow_id=b.workflow_id
+         JOIN conversations c ON c.id=t.conversation_id AND c.product_conversation_id=b.owner_id
+         WHERE b.owner_id=? AND b.turn_id=? AND b.workflow_id=? AND b.admitted_stopped=0
+             AND p.kind='ordinary' AND p.ordinary_lifecycle='open'
+             AND t.disposition='Runtime' AND t.terminal_kind IS NULL
+             AND t.owns_conversation=1 AND t.canonical_message_id IS NULL
+             AND NOT EXISTS(SELECT 1 FROM close_obligations o
+                 WHERE o.product_conversation_id=p.id AND o.phase<>'completed'))",
+    )
+    .bind(owner.as_str())
+    .bind(execution.turn_id())
+    .bind(execution.workflow_id())
+    .fetch_one(&mut **tx)
+    .await?;
+    if !current {
+        return Err(ControlError::AdmissionStopped);
+    }
+    Ok(())
+}
+
 impl Database {
     /// Persist a control command after the application has authenticated an owner request.
     /// The reserved control schema is not installed by this operation.

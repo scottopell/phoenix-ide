@@ -176,3 +176,23 @@ owner/receipt foreign keys with NULL. An authored negative schema test asserts
 SQLx's NotNullViolation kind. Candidate controls and all source repairs remain
 unqualified until exact-head hosted execution. No registry/132 edit, runtime
 installation, production activation or local test/migration was performed.
+
+Corrected source64322 is under the sole new hosted run39348937685; no result is
+inferred while it is running. Separately authored transaction helper
+`require_current_control_tx` checks an execution's exact retained control version
+and request against the current open latch and live ordinary Runtime owner,
+without recapture or release. Two unexecuted regressions cover the actual DB
+request operation, Stop→release stale-binding refusal, fresh execution admission,
+cross-owner/workflow refusal, close gates and unclassified missing-schema errors;
+the atomic Goal/NoGoal capture test also exercises the helper. This later source
+is not in64322's CI and is not installed in report/model/continuation owners.
+
+The completed Clippy job118388364386 from64322/run39348937685 found an owned
+test compile blocker in the new Blocked-report setup: loaded execution binding
+was passed without the existing checked conversion to GoalReportBinding. It
+also found owned needless-by-value control HTTP error classification. Source
+correction05acd5b72 fixes both, without assertion/guard changes; it is outside
+the running64322 evidence and has not been re-dispatched. Twelve additional lib
+lint diagnostics on federation/shared paths remain unwaived. No new focused
+passing count is inferred before the Rust job/artifacts complete. The one new
+run allowance has been used; later source needs exact-head hosted qualification.

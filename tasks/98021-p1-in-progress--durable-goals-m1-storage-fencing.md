@@ -660,3 +660,51 @@ SQL/migration, browser/VM or production operation ran. Next is the one authorize
 meaningfully corrected exact-head hosted qualification, not duplicate old-head
 CI. Until actual results are read, later control service/HTTP and all repairs
 remain unqualified. Production emitter remains None and control route503.
+
+### Single corrected-head run and next control-recheck preparation
+
+Published reviewed source `64322db7480f1452d00357eaf20c209c16a54003`;
+sole new hosted CI **39348937685**, exact64322, is running. No duplicate dispatch.
+PR959 comment6280562707 records the source/run boundary. Prior e19 broad artifact
+contains only its last200 normal-output lines plus failure-name summary: the
+35 other broad failures cannot be classified from those names alone. Three
+SIGTERM cases and206 not-run tests are timeout fallout, not independent proven
+assertion defects. Nothing is blanket-waived as upstream.
+
+Prepared the next narrow source seam separately from64322:
+`require_current_control_tx` checks the exact persisted owner/workflow/turn,
+admitted control version and accepted request locator against current open
+control, plus ordinary/open owner, live Runtime ownership and close obligations
+in its caller's transaction. It never recaptures current control for an old
+execution, never releases Stop and preserves SQL failures as Storage, not semantic
+refusals. Two authored/unexecuted regressions use the actual DB control request
+operation to test Stop→release invalidating old executions, a new execution after
+release, missing/cross-owner/cross-workflow bindings, close gates, and missing
+schema as Storage; the Goal/NoGoal atomic-capture test also calls the verifier
+inside its admission transaction. This is helper preparation, NOT installation
+into report/model/continuation owners or a lifetime authority token.
+
+The running64322 qualification does not cover this later source seam.134 remains
+unregistered pending actual133. Accepted appropriate-command UserControl actor
+references and populated132 cyclic rebuild remain owed; default None/503 and all
+production prohibitions remain. The commissioned runtime/tools/UI/watch and
+auto-continuation work is not marked complete at this checkpoint.
+
+### Corrected-head hosted diagnostic, source correction not re-dispatched
+
+Completed Clippy job **118388364386** of64322/run39348937685 exposes an OWN
+compile blocker in the new refusal fixture: `GoalPendingReport::new` requires
+checked `GoalReportBinding`, not the loaded `GoalExecutionBinding`. Source review
+missed that conversion. It also exposes OWN `needless_pass_by_value` in HTTP
+`classify_error`. Both are source-fixed in **05acd5b72**: use the existing checked
+`try_into().unwrap()` fixture conversion and borrow the error in classification.
+No guard or test assertion was relaxed. The hosted head remains64322, not05acd;
+no execution qualification follows from either source correction.
+
+The same job has12 additional lib lint diagnostics on federation presentation,
+subscriptions/routes and shared send-chat code; no all-green Clippy or blanket
+upstream classification is claimed. The Rust job is still active at this entry;
+its actual focused execution/artifacts must be read before reporting counts.
+Only one corrected-head dispatch was authorized and used. No second run or retry
+was requested; later source is blocked on renewed exact-head hosted qualification,
+not an excuse for local builds or weakened checks. Production stays None/503.
