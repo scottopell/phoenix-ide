@@ -660,16 +660,17 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
             .origin,
         stored.submitted.origin
     );
+    let archived_target = ordinary(&receiver, "archived-ordinary").await;
     receiver
         .state
         .db
-        .set_legacy_conversation_archived(&coordinator_id)
+        .set_legacy_conversation_archived(&archived_target.id)
         .await
         .unwrap();
     let archived = request(
         peer.peer_instance_id,
         RemoteSendTarget::Transcript {
-            transcript_id: TranscriptConversationId::parse(coordinator_id).unwrap(),
+            transcript_id: TranscriptConversationId::parse(archived_target.id).unwrap(),
         },
     );
     let sender = RemoteSenderAttestation::from_conversation(
@@ -1096,8 +1097,13 @@ async fn shared_selectors_never_fall_back_on_unknown_tls_auth_or_unavailable_pee
         let tool = tools.iter().find(|tool| tool.name() == *name).unwrap();
         let local = tool.run(input.clone(), context(&caller, &source.id)).await;
         assert!(local.is_success(), "local {name}: {}", local.output());
+        let expected = if *name == "resolve_reference" {
+            "selector-target"
+        } else {
+            "localsentinelmarker"
+        };
         assert!(
-            local.output().contains("localsentinelmarker"),
+            local.output().to_ascii_lowercase().contains(expected),
             "local {name}: {}",
             local.output()
         );

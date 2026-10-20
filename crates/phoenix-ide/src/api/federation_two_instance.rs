@@ -164,7 +164,12 @@ impl TestInstance {
     }
 
     fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.origin)
+        let path = format!("/{}", path.trim_start_matches('/'));
+        self.origin
+            .navigation_url(&path)
+            .expect("test API path remains on the fixture origin")
+            .as_url()
+            .to_string()
     }
 
     async fn stop(self) {

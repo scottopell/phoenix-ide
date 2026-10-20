@@ -265,7 +265,7 @@ async fn call(
 #[tokio::test]
 async fn prefix_like_owner_password_and_owner_session_still_authorize_reference() {
     let mut state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-    let password = format!("phx_peer_{}", "o".repeat(43));
+    let password = "phx_peer_owner-password".to_string();
     state.password = Some(OwnerPassword::parse(password.clone()).unwrap());
     let app = crate::api::handlers::create_router(state);
     assert_eq!(
@@ -390,13 +390,16 @@ async fn auth_is_document_only_and_fetch_requires_explicit_saved_instance() {
             (StatusCode::NOT_FOUND, json!({"code":"peer_not_found"}))
         );
     }
-    for _ in 0..2 {
+    for endpoint in [
+        "https://peer-one.invalid:8443",
+        "https://peer-two.invalid:9443",
+    ] {
         state
             .db
             .save_federation_peer_connection(
                 InstanceId::new(),
                 "duplicate",
-                &"https://peer.invalid".parse().unwrap(),
+                &endpoint.parse().unwrap(),
                 &credential,
                 &PeerTlsTrust::PlatformRoots,
             )

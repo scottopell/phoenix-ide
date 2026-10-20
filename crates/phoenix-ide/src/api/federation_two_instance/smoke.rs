@@ -34,6 +34,14 @@ fn assert_authoritative_remote_hit(
     ordinary: &crate::db::Conversation,
     ordinary_message: &crate::db::Message,
 ) {
+    let stable_route = format!("/c/{}", ordinary.slug.as_deref().unwrap());
+    let stable_url = receiver
+        .origin
+        .navigation_url(&stable_route)
+        .unwrap()
+        .as_url()
+        .to_string();
+
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].source.instance_id, destination);
     assert!(matches!(
@@ -67,7 +75,7 @@ fn assert_authoritative_remote_hit(
     assert!(matches!(
         &hits[0].stable_navigation,
         Some(crate::api::global_read::QualifiedSearchNavigation::Peer { url })
-            if url == &format!("{}c/{}", receiver.origin, ordinary.product_conversation_id)
+            if url == &stable_url
     ));
 }
 
