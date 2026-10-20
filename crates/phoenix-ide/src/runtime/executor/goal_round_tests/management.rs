@@ -88,11 +88,10 @@ async fn provider_preparation(runtime: &mut TestRuntime) -> Event {
             .await
             .unwrap()
             .unwrap();
-    runtime.active_llm_generation = generation;
+    assert!(!runtime.llm_outcome_is_stale(generation));
     runtime
-        .process_outcome(EffectOutcome::Llm(outcome))
-        .await
-        .unwrap();
+        .process_generation_tagged_llm_outcome(generation, outcome)
+        .await;
     let event = runtime.event_rx.try_recv().unwrap();
     assert!(matches!(event, Event::GoalManagementPrepared { .. }));
     event
@@ -146,11 +145,10 @@ async fn conversation_goal_coordinator_provider_management_commits_only_at_its_c
             .await
             .unwrap()
             .unwrap();
-    runtime.active_llm_generation = generation;
+    assert!(!runtime.llm_outcome_is_stale(generation));
     runtime
-        .process_outcome(EffectOutcome::Llm(outcome))
-        .await
-        .unwrap();
+        .process_generation_tagged_llm_outcome(generation, outcome)
+        .await;
     assert!(matches!(runtime.state, ConvState::Idle));
     assert!(runtime.active_direct_turn.is_none());
     assert!(db
@@ -191,7 +189,7 @@ async fn conversation_goal_coordinator_provider_management_rejects_missing_or_st
                 .await
                 .unwrap()
                 .unwrap();
-        runtime.active_llm_generation = generation;
+        assert!(!runtime.llm_outcome_is_stale(generation));
         assert!(runtime
             .process_outcome(EffectOutcome::Llm(outcome))
             .await
@@ -215,7 +213,7 @@ async fn conversation_goal_coordinator_provider_management_rechecks_source_after
             turn_id: fixture.active.turn_id,
             expected_generation: fixture.active.generation,
         },
-        projection: Some(phoenix_db::workflow::DirectTurnConversationProjection {
+        projection: Some(phoenix_db::workflow::PersistedConversationProjection {
             state: ConvState::Idle,
             state_updated_at: chrono::Utc::now(),
         }),
@@ -362,11 +360,10 @@ async fn conversation_goal_coordinator_provider_management_rolls_back_replay_and
             .await
             .unwrap()
             .unwrap();
-    runtime.active_llm_generation = generation;
+    assert!(!runtime.llm_outcome_is_stale(generation));
     runtime
-        .process_outcome(EffectOutcome::Llm(outcome))
-        .await
-        .unwrap();
+        .process_generation_tagged_llm_outcome(generation, outcome)
+        .await;
     assert!(matches!(runtime.state, ConvState::Idle));
     assert_eq!(client.requests.lock().unwrap().len(), 2);
     assert!(tools.recorded_executions().is_empty());
@@ -474,11 +471,10 @@ async fn conversation_goal_coordinator_provider_state_commands_use_the_tagged_di
                 .await
                 .unwrap()
                 .unwrap();
-        runtime.active_llm_generation = generation;
+        assert!(!runtime.llm_outcome_is_stale(generation));
         runtime
-            .process_outcome(EffectOutcome::Llm(outcome))
-            .await
-            .unwrap();
+            .process_generation_tagged_llm_outcome(generation, outcome)
+            .await;
         assert!(matches!(runtime.state, ConvState::Idle));
         assert_eq!(client.requests.lock().unwrap().len(), 2);
         assert!(tools.recorded_executions().is_empty());

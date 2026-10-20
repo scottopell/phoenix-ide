@@ -2,10 +2,32 @@
 
 ## Latest source checkpoint — qualification remains parent-owned
 
-Exact `e6b717f4f05040f69c347cbbdc29c7591b07a56e` was normally pushed and
-independently captured by the parent for existing run **39373782924**. No result
-from that run is claimed here. The focused green floor remains **156/156 at
-exact `e4d0d615061a0d927cc5ad3d1a3d875c7c375754`**, not at `e6` or later source.
+Parent-owned run **39373782924**, exact
+`e6b717f4f05040f69c347cbbdc29c7591b07a56e`, is **terminal failed**, with artifact
+**12241829258**. Both broad Rust compilation and focused qualification stopped
+on six compile errors; **zero focused tests executed**. The focused green floor
+remains **156/156 at exact `e4d0d615061a0d927cc5ad3d1a3d875c7c375754`** only.
+The parent reports the UI and specs lanes fully successful after the timing
+barrier corrections; that does not qualify goal SQL or migration133.
+
+The follow-up source correction uses the actual
+`workflow::PersistedConversationProjection` and removes five writes to a
+nonexistent LLM-generation field. Every received outcome must match the actual
+runtime generation; four success paths go through
+`process_generation_tagged_llm_outcome`, including its task/metrics cleanup. The
+negative source-authority case asserts a current generation and directly checks
+the `process_outcome` error, because the tagged loop boundary logs and consumes
+that error instead of returning it. No fixture overwrites a request generation.
+
+The same run's Clippy job **118467336375** stopped at exactly two DB management
+roots: unnested admission or-patterns and a future-variant wildcard in canonical
+tool-call lookup. Their source correction nests the admission alternatives and
+exhaustively names all thirteen `ContentBlock` variants, preserving the guarded
+`goal_manage` lookup. IDE Clippy roots were not reached and are not declared
+clean. These fixes are source-only, not a new compilation or test result. The
+writer fetched the completed Rust/Clippy logs read-only; no CI was dispatched.
+The uncommitted UI presentation scaffold was withdrawn when these real failures
+arrived; no UI leaf, route, watch integration or autocontinuation is claimed.
 
 The later management coverage slice extracts the existing error reconciliation
 branch into a private function without changing its classification or admission

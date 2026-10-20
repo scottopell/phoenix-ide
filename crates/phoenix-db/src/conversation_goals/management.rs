@@ -268,7 +268,19 @@ pub(super) async fn verify_source_tx(
             {
                 Some(input)
             }
-            _ => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. } => None,
         })
         .ok_or(GoalDbError::Integrity(
             "management canonical tool call missing",
@@ -336,9 +348,11 @@ fn semantic_refusal(error: &GoalDbError) -> bool {
         GoalDbError::Domain(_)
             | GoalDbError::Busy
             | GoalDbError::TargetChanged
-            | GoalDbError::Admission(crate::DbError::ConversationNotFound(_))
-            | GoalDbError::Admission(crate::DbError::CloseAdmissionFenced(_))
-            | GoalDbError::Admission(crate::DbError::ProductConversationUnavailable(_))
+            | GoalDbError::Admission(
+                crate::DbError::ConversationNotFound(_)
+                    | crate::DbError::CloseAdmissionFenced(_)
+                    | crate::DbError::ProductConversationUnavailable(_)
+            )
     )
 }
 

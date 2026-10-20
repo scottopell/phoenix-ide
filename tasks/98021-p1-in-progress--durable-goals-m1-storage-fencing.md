@@ -1,5 +1,36 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual exacte6 CI failure — prioritized correction, no new feature activation
+
+Run39373782924 exacte6 is terminalFAIL, artifact12241829258. Rust broad/focused
+qualification both stopped on six compiler errors; zero focused tests executed.
+Clippy job118467336375 stopped on exactly two phoenix-db management errors,
+without reaching IDE lint roots. UI/specs lanes were fully successful per parent.
+Actual focused floor stays156/156 onlye4d/run39368026538/artifact12241064742.
+Migration133 still has no qualified actual execution;134 stays unregistered.
+
+The source correction replaces the nonexistent
+DirectTurnConversationProjection with actual PersistedConversationProjection.
+Five nonexistent active_llm_generation assignments are removed, not renamed:
+all sites assert the received generation is current; four successful paths
+invoke the actual production process_generation_tagged_llm_outcome boundary,
+which checks staleness and clears current task/metrics handles. The one negative
+source-authority test preserves its direct process_outcome error assertion after
+checking the genuine generation, because the production loop wrapper consumes
+and logs that error rather than returning a Result. No generation is overwritten.
+
+The two actual DB Clippy roots are corrected without lint suppressions: nested
+admission or-patterns and exhaustive ContentBlock canonical-call lookup. Completed
+Rust and Clippy logs were fetched read-only and inspected; no local compiler,
+test, SQL, browser, activation or new qualification was run. Prior static review
+missed these roots; source review remains below actual compiler evidence.
+
+The incomplete uncommitted UI leaf scaffold was deliberately withdrawn on this
+failure notification. This unit contains no UI/watch/autocontinuation changes,
+no schema132/migration/generated-byte changes, no134registration, no new push or
+CI dispatch. Source-only rustfmt and whitespace checks do not qualify the fixes.
+Parent reviews the coherent correction packet before any next push/qualification.
+
 ## Source continuation after exacte6 remote capture
 
 Parent captured exacte6b717f4f05040f69c347cbbdc29c7591b07a56e after its one
