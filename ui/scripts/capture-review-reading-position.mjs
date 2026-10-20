@@ -118,6 +118,9 @@ function compare(id, stage, before, after, geometry) {
   if (!after.sameNode || !after.originalNodeConnected) mismatch(id, stage, 'messages node replaced', before.sameNode, after.sameNode);
   const readerUrl = value => {
     const url = new URL(typeof value === 'string' ? value : `${value.pathname}${value.search}${value.hash}`, 'http://fixture.invalid');
+    if (typeof value !== 'string' && url.hash.startsWith('#/')) {
+      return `${url.pathname}${url.search}#${readerUrl(url.hash.slice(1))}`;
+    }
     if (stage !== 'exit') for (const key of ['viewer', 'presentation', 'target', 'file', 'root', 'line', 'endLine', 'handle', 'message', 'review', 'message_id', 'occurrence']) url.searchParams.delete(key);
     return `${url.pathname}${url.search}${url.hash}`;
   };
@@ -166,6 +169,21 @@ try {
         el.scrollTop = position === 'bottom' ? el.scrollHeight : (el.scrollHeight - el.clientHeight) * 0.52;
       }, position);
       await settle(page);
+      if (position === 'bottom') {
+        await page.evaluate(async () => {
+          const root = document.querySelector('#messages');
+          let stable = 0;
+          for (let frame = 0; frame < 120; frame++) {
+            root.scrollTop = root.scrollHeight;
+            await new Promise(requestAnimationFrame);
+            const tail = root.querySelector('[data-render-unit-key="review-tail-answer"]');
+            const atTail = root.scrollHeight - root.clientHeight - root.scrollTop <= 2;
+            stable = atTail && tail ? stable + 1 : 0;
+            if (stable >= 5) return;
+          }
+          throw new Error('Virtualized tail did not settle during setup');
+        });
+      }
       // Middle setup explicitly aligns a mounted Review header, then freezes the
       // baseline. This is header-adjacent reading, not arbitrary paragraph reading.
       if (position === 'middle') {

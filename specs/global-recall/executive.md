@@ -119,3 +119,9 @@ The implemented source at `97f39d517d4de299abd60023e040e5e486af3e05` passed [hos
 Independent frozen-source review plus cleanup/SVG/E2E review and subsequent exact-delta reviews found initial runtime-field, ownership-overlap and test-oracle defects; they were fixed and qualified. Reviews are bounded static evidence, not exhaustive proof. Lightweight isolated SQLite preservation/rollback checks and 15 focused UI regressions also passed. No generated TypeScript was hand-edited; hosted genuine codegen completed with a clean stale guard.
 
 Retained failed runs are linked in the delivery task and PR rather than treated as pending successes. Integration must reconcile the concurrent unmerged ADR-101 reservation against the actual main ledger while preserving both decisions; no forced renumbering is performed ahead of that integration. No merge/deploy admission has been granted by this delivery record.
+
+### Exact transcript citation rendering candidate
+
+The web Markdown URL transform recognizes UUID-shaped `@transcript:<id>` and `@transcript:<id>#message-<id>` destinations and promotes them to source-pinned app-local links. This implements the existing exact-member citation contract without changing resolver admission or broadening allowed URL schemes. Malformed destinations remain subject to the default sanitizer; image sources are not promoted.
+
+Focused Markdown/router tests cover the reported Proposal citation, exact source/message preservation, return-origin state and unsafe controls. Alias integration tests cover historical-member admission and explicit missing-target errors using mocked backend responses. These tests do not establish a deployed or installed-iPhone result; target hydration and physical navigation remain distinct acceptance surfaces.

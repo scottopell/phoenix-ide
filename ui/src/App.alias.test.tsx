@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProductConversationAliasRedirect } from './App';
 import { api, ApiResponseError } from './api';
 import { ViewJourneyLifecycle } from './hooks/conversationViewLifecycle';
+import { MarkdownRenderer } from './components/MarkdownRenderer';
+import { CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents } from './components/conversationMarkdownImages';
 
 function ReplaceRoute({ target }: { target: string }) {
   const navigate = useNavigate();
@@ -41,6 +43,7 @@ function Location() {
   const location = useLocation();
   const navigate = useNavigate();
   return <><div data-testid="location">{location.pathname}{location.search}{location.hash}</div>
+    <output data-testid="location-state">{JSON.stringify(location.state)}</output>
     <button type="button" onClick={() => navigate({ pathname: location.pathname, search: '?viewer=file', hash: '#message-m-1' })}>Open viewer</button>
     <button type="button" onClick={() => navigate(location.pathname, { state: { chapterSelection: 'pending' } })}>Select pending prompt</button></>;
 }
@@ -156,6 +159,55 @@ describe('ProductConversationAliasRedirect', () => {
     await act(async () => release({ coordinator_id: null }));
     await screen.findByTestId('product-page');
     expect(finish.mock.calls.filter(([outcome]) => outcome === 'failed')).toHaveLength(0);
+  });
+
+  it.each(['available', 'missing'] as const)('routes the reported Proposal Markdown citation through alias admission (%s target)', async availability => {
+    const transcript = 'aceb02b4-0735-491e-bd5c-854e844f1591';
+    const origin = '/global/coordinator?viewer=inspect#message-origin';
+    const destination = `/c/${transcript}?source_transcript=${transcript}#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2`;
+    const returnState = { conversationReturnOrigin: { kind: 'coordinator', href: origin } };
+    let resolveRoute!: (route: { coordinator_id: null }) => void;
+    vi.mocked(api.resolveCoordinatorRoute).mockReturnValueOnce(new Promise(resolve => { resolveRoute = resolve; }));
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async reference => {
+      if (availability === 'missing') throw new ApiResponseError('Transcript not found', 404);
+      return {
+        product_conversation_id: 'proposal-product', canonical_route: '/c/proposal-product', ordinary_lifecycle: 'open',
+        requested_transcript_row_id: reference, latest_transcript_row_id: 'successor', writable_transcript_row_id: 'successor',
+      } as never;
+    });
+    render(<MemoryRouter initialEntries={[origin]}>
+      <Location />
+      <Suspense fallback={null}><Routes>
+        <Route path="/global/:slug" element={
+          <MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+            {'[Proposal](@transcript:aceb02b4-0735-491e-bd5c-854e844f1591#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2)'}
+          </MarkdownRenderer>
+        } />
+        <Route path="/c/:slug" element={<RoutedAlias />} />
+      </Routes></Suspense>
+    </MemoryRouter>);
+    const citation = screen.getByRole('link', { name: 'Proposal' });
+    expect(citation).toHaveAttribute('href', destination);
+    expect(citation).not.toHaveAttribute('target');
+    fireEvent.click(citation);
+    expect(screen.getByTestId('location').textContent).toBe(destination);
+    expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual(returnState);
+    expect(api.resolveCoordinatorRoute).toHaveBeenCalledWith(transcript);
+    expect(api.getProductConversationSnapshot).not.toHaveBeenCalled();
+    await act(async () => resolveRoute({ coordinator_id: null }));
+    if (availability === 'available') {
+      expect(await screen.findByTestId('product-page')).toHaveTextContent('proposal-product');
+      expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+      for (const [reference] of vi.mocked(api.getProductConversationSnapshot).mock.calls) expect(reference).toBe(transcript);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    } else {
+      expect(await screen.findByRole('alert')).toHaveTextContent('Exact transcript unavailable or not a member of this conversation.');
+      expect(screen.queryByTestId('product-page')).not.toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: 'Proposal' })).not.toBeInTheDocument();
+    }
+    expect(embeddedSpy).not.toHaveBeenCalled();
+    expect(screen.getByTestId('location').textContent).toBe(destination);
+    expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual(returnState);
   });
 
   it('routes a historical Global member before ordinary snapshot lookup and retains its anchor', async () => {
