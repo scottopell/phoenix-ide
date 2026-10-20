@@ -5342,12 +5342,13 @@ def _rust_check_commands(
 ) -> tuple[list[str], list[str], list[str]]:
     if has_nextest:
         compile_cmd = ["cargo", "nextest", "run", *compile_p, "--no-run"]
+        final_failures = ["--failure-output", "final", "--final-status-level", "fail"]
         test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *test_p,
                     "-E", "not test(/export_bindings/)",
-                    "--test-threads", str(test_threads)]
+                    "--test-threads", str(test_threads), *final_failures]
         codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
                        "-E", "test(/export_bindings/)",
-                       "--test-threads", str(test_threads)]
+                       "--test-threads", str(test_threads), *final_failures]
     else:
         compile_cmd = ["cargo", "test", *compile_p, "--no-run"]
         test_cmd = ["cargo", "test", *test_p, "--",
