@@ -4,6 +4,8 @@ import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
+import { ConversationGoalDetails, ConversationGoalSummary } from '../components/ConversationGoals';
+import { useConversationGoals } from '../hooks/useConversationGoals';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -1465,6 +1467,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     ? { kind: 'idle', view: transcriptView }
     : desiredPositioning;
   const liveControlsEnabled = isOpen && !closeInProgress && snapshot?.latest_opening.status !== 'pending';
+  const goals = useConversationGoals(ordinarySnapshot?.product_conversation_id ?? null, liveControlsEnabled);
   const initialSnapshotReady = snapshot !== null;
   useLayoutEffect(() => {
     journey.expectTarget(!!hashTargetMessageId || readerSelection.kind !== 'latest' || awaitingRouteTopology, positioningTargetMessageId ?? null);
@@ -1550,6 +1553,10 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
         messages={messages}
         recallDisabled={!liveControlsEnabled}
       />}
+      {ordinarySnapshot && !liveTranscriptRowId ? <details>
+        <summary><ConversationGoalSummary model={goals} /></summary>
+        <ConversationGoalDetails key={ordinarySnapshot.product_conversation_id} model={goals} />
+      </details> : null}
       {ordinarySnapshot?.close && (ordinarySnapshot.close.outcome === 'archived_cleanup_attention' || closeIncomplete) && (
         <section className="product-conversation-page__close-status" role="alert" aria-label="Close status">
           <strong>{closeIncomplete
@@ -1655,7 +1662,10 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
             onStreamAttempt={journey.streamStarted}
             routePrefix={coordinator ? "/global" : "/c"}
             composerQuickAction={globalShell?.composerQuickAction}
-            stateBarExtension={globalShell?.stateBarExtension}
+            stateBarExtension={ordinarySnapshot ? {
+              summary: <ConversationGoalSummary model={goals} />,
+              details: <ConversationGoalDetails key={ordinarySnapshot.product_conversation_id} model={goals} />,
+            } : globalShell?.stateBarExtension}
             onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
         </div>

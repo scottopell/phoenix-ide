@@ -1,0 +1,64 @@
+.conversation-goals {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.conversation-goal-summary {
+  font-size: 0.85em;
+}
+
+.conversation-goal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.conversation-goal-fact {
+  overflow-wrap: anywhere;
+}
+
+.conversation-goal-fact strong {
+  white-space: pre-wrap;
+}
+
+.conversation-goal-source {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+.conversation-goals p {
+  margin: 0;
+}
+
+.conversation-goals fieldset {
+  display: grid;
+  gap: 0.75rem;
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.conversation-goals form,
+.conversation-goals label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.conversation-goals textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 3rem;
+  resize: vertical;
+}
+
+.conversation-goals ol {
+  display: grid;
+  gap: 0.75rem;
+  padding-left: 1.25rem;
+}
+
+.conversation-goals button {
+  justify-self: start;
+}

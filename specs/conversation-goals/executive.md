@@ -1,5 +1,84 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Ordinary-page factual UI — unqualified source cut
+
+The ordinary `ProductConversationPage` supplies goal summary/details through the
+existing embedded conversation `stateBarExtension`. Coordinator/Global extension
+selection remains unchanged. When no embedded live transcript exists, the same
+facts appear in a collapsed details element; History and Close render no editable
+command fields. Component CSS is colocated; `useConversationGoals` owns the
+page-lifetime read/command fencing separately from presentation exports. No new
+panel framework, chat message, watch worker or automatic-continuation integration
+is included.
+
+`goalApi.ts` validates the actual Rust wire encodings, including externally tagged
+`GoalState`, `GoalActor`, `GoalChange` and report observations, `recorded_at_us`,
+explicit command dispositions, and the control receipt's `principal_id` and
+`expected_control_version`. Integers beyond JavaScript's safe range, malformed
+payloads, wrong-owner facts and oversized/non-increasing history pages fail
+closed rather than being coerced. No generated SSE files are hand-edited.
+
+Current goal, control and first immutable-history page are read independently in
+parallel. They are **not** presented as one atomic combined snapshot and are not
+required to share a version. History pages advance from the last returned owner
+version. Refresh is explicit; there is no goal polling/watch loop. Uninstalled
+503 is shown as unavailable, not an empty goal or successful activation. Failed
+reads disable fresh commands. Reading or editing an objective grants no execution
+permission or consent.
+
+Create/replace, explicit Underway/Blocked/Complete/Exhausted state commands, and
+Stop require an explicit user action. State reasons are required where the
+existing command DTO requires them. Commands use factual goal/control CAS values;
+Stop uses zero only after a successful null control GET, matching the qualified
+absent-row mutation contract. No Release or implicit Stop release is offered.
+Successful/refused receipts cause factual refetch, not optimistic goal mutation.
+Objective text is sent unchanged and rendered without summarization.
+
+Each submitted command's UUID and payload remain fixed for unknown-outcome
+retries. Network errors, 5xx other than the route's definite pre-mutation 503,
+and invalid/mismatched success receipts block new commands and retain that exact
+retry. Accepted receipts correlate both user-control actors and the exact Create
+objective/identity or State disposition/reason in the mutation and resulting
+snapshot. Typed refusal receipts and definite auth/admission/uninstalled HTTP
+rejections remain distinct; uninstalled/admission JSON errors must match the
+actual route contract, not an arbitrary 503/409 body. A pre-mutation rejection of
+an exact retry cannot establish the original attempt's outcome: only a correlated
+receipt clears that retained unknown command. Refresh failure and owner
+switchback cannot discard it.
+Read-generation and owner-epoch fences prevent stale reads, mutation receipts or
+refetch completion from changing another owner's view, including switchback.
+Pending commands are retained per canonical owner within the mounted page; no
+durable browser-restart or remount recovery queue is claimed.
+
+Authored tests cover Rust wire variants and unsafe/foreign/history rejection,
+default 503 versus null absence, request/receipt correlation, no optimistic
+updates, exact unknown retry after failed refresh or a rejected retry, owner
+switchback/unmount fences, late control/history reads and mutation refetch,
+independent CAS values, explicit reasons, null-to-zero Stop, bounded history
+pagination and fail-closed page rejection, mounted ordinary extension controls,
+read-only History and preservation of the supplied coordinator extension. These
+tests have **not run**; no TypeScript typecheck, browser journey or user-visible
+runtime qualification is claimed for this source cut.
+
+The review boundary is this ordinary UI cut only. Source inspection and whitespace
+diff checks are not execution evidence. Parent independent review precedes any
+push and the parent-owned single hosted qualification. No local compiler, test,
+SQL, browser or Cargo metadata command is authorized for this cut. Typed watch
+and automatic follow-through remain unfinished, deferred work rather than hidden
+claims of completion.
+
+The latest qualified backend floor is **209/209 at exact
+`245da1764bf1085dc25d6dff29e3b8b79114de34`**, run `39431777571`, artifact
+`12268869127`, 145.406 seconds with captured full-workspace harnesses. All three
+control-read router tests and typed-admission unit passed there; capture took
+171.1 seconds, codegen reuse 1.0 seconds, and stale/budget/UI-specs/e2e passed.
+Broad completed with 5507 run, 5477 passed, 30 failed and 191 skipped in 908.274
+seconds. All 30 failures and shared Clippy findings remain unwaived; absence of
+owned roots in a retained Clippy tail is not a full-inventory-clear claim.
+Normal startup remains services-uninstalled and default OFF. No schema SQL,
+installer activation or production deployment is included. The dated sections
+below are older checkpoint evidence, not qualification of this UI cut.
+
 ## Private authenticated install seam — source cut
 
 The API has a crate-private `goal_control::private_install` seam that constructs
