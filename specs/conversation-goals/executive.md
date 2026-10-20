@@ -132,6 +132,40 @@ owned-file rustfmt and whitespace inspection; no local compiler, tests, Clippy,
 SQL, CI, push, artifact import or installation has run. Qualification stays at
 the exact efcc UI12+209 floor pending actual Rust results and independent review.
 
+### Verified hosted exports, not full qualification
+
+Parent-owned run `39469829141` at exact
+`6b38fc7123cf715a579f7bee9d4dafe4f4fd8234` is terminal failed, with successful
+binary capture/compile (251.4 seconds) and codegen (1.3 seconds). Retained artifact
+`12288991790` contains 188 authentic scratch TS files; `ready.json` identifies
+that exact clean HEAD, run and check-rust job. The sole writer checked those
+identity fields and scratch-file count, then copied only the five authorized
+exports byte-for-byte into `ui/src/generated/` and confirmed each with `cmp`:
+
+| Export | SHA-256 |
+|---|---|
+| WatchGoalCapture.ts | `f26397da99c1ddc939e98704084e0b28ac40835e7d1c104510fb51dd4fa2fe55` |
+| WatchGoalState.ts | `90d31806488c56355c833f2ae1ba390106ae94975cca8fbe0f110c7a796eaa96` |
+| WatchGoalUsage.ts | `d63eba9f9a61cf208f9f6b9e035592a9b04bb844ba0a83c88d681bf1a14c890a` |
+| EventOutcome.ts | `3a4e271b835de8d5dfb941ac21c8dd4033d97f9678a8301f9d3656f64667fca9` |
+| EventPresentationPayload.ts | `23219a8cab2cb3f99408cec685560aeed2e2e81477251720f0d527d842346f47` |
+
+Provenance: parent-retained
+`/Users/scottopell/.phoenix-ide/coordinator/evidence/goals-ci-39469829141/artifact/phoenix-ide/phoenix-ide/target/codegen-scratch/ui/src/generated`
+(server-local evidence handle, not a portable viewer path). No generated content
+was hand-edited and no local codegen/compiler executed. The scratch source types
+are unchanged by the reviewed owned-Clippy factoring at `248644c3`.
+
+Focused execution selected 213 tests: 209 passed, four migration-fixture
+assertions failed, 3407 skipped (264.669 seconds). The existing selector omitted
+most new goal-facts/migration/privacy/executor coverage; this is **not** a passing
+typed-watch qualification. Broad execution timed out at 1499.577 seconds with a
+partial 4981/5531 run, 4942 passed, 39 failed and 194 skipped. Shared broad/Clippy
+failures remain unwaived; imported authentic exports do not establish generated
+freshness or green UI/Rust at the correction HEAD. The only qualified floor
+remains exact efcc / `39451089782` UI12+209. Default OFF and uninstalled services
+remain unchanged; no push/CI/installation follows without parent direction.
+
 | Contract | Implementation/verification boundary |
 |---|---|
 | REQ-GOAL-011 | Existing terminal/wait outbox transactions must capture saved current goal or observed absence, distinct from legacy not-captured; usage explicitly unavailable. Storage and boundary tests owed. |
