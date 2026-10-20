@@ -2503,20 +2503,20 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
         facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).len(),
         1
     );
-    f.db.update_conversation_state(
-        &f.source.id,
-        &ConvState::ContextExhausted {
-            summary: "successful summary".into(),
-        },
-    )
-    .await
-    .unwrap();
     f.db.add_message(
         "successful-summary",
         &f.source.id,
         &crate::MessageContent::continuation("successful summary"),
         None,
         None,
+    )
+    .await
+    .unwrap();
+    f.db.update_conversation_state(
+        &f.source.id,
+        &ConvState::ContextExhausted {
+            summary: "successful summary".into(),
+        },
     )
     .await
     .unwrap();
