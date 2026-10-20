@@ -421,6 +421,59 @@ def workflow_order(group):
     }[group]
 
 
+class GoalQualificationCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def test_non_opt_in_keeps_existing_commands_and_cpu_profile(self):
+        for opt_in in (None, "", "false"):
+            env = {} if opt_in is None else {"PHOENIX_GOAL_REUSE_DIR": opt_in}
+            with self.subTest(opt_in=opt_in), mock.patch.dict(os.environ, env, clear=True):
+                self.assertIsNone(self.dev._goal_qualification_commands(
+                    True, ["-p", "phoenix-db"], ["-p", "phoenix-db"], [], 3,
+                    ["--profile", "cpu-attribution"]))
+        _, broad, _ = self.dev._rust_check_commands(
+            True, [], [], [], 3, ["--profile", "cpu-attribution"])
+        self.assertIn("cpu-attribution", broad)
+        self.assertIn("--workspace", broad)
+
+    def test_opt_in_replaces_compile_and_reuses_for_both_remaining_phases(self):
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PHOENIX_GOAL_REUSE_DIR": "/job/private"}, clear=True):
+            compile_cmd, broad_cmd, codegen_cmd = self.dev._goal_qualification_commands(
+                True, [], [], [], 3, [])
+        helper = [sys.executable, str(ROOT / "scripts/goal_qualification.py")]
+        self.assertEqual(compile_cmd, [*helper, "capture"])
+        self.assertEqual(broad_cmd, [*helper, "broad", "--test-threads", "3"])
+        self.assertEqual(codegen_cmd, [*helper, "codegen", "--test-threads", "3"])
+
+    def test_invalid_opt_in_scope_or_profile_fails_before_subprocess(self):
+        cases = [
+            (False, [], [], [], []),
+            (True, ["-p", "phoenix-db"], [], [], []),
+            (True, [], ["-p", "phoenix-db"], [], []),
+            (True, [], [], ["-p", "phoenix-db"], []),
+            (True, [], [], [], ["--config-file", "profile.toml", "--profile", "cpu-attribution"]),
+        ]
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PHOENIX_GOAL_REUSE_DIR": "/job/private"}, clear=True), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            for has_nextest, compile_p, test_p, codegen_p, profile in cases:
+                with self.subTest(case=(has_nextest, compile_p, test_p, codegen_p, profile)):
+                    with self.assertRaisesRegex(SystemExit, "full-workspace nextest/default profile"):
+                        self.dev._goal_qualification_commands(has_nextest, compile_p, test_p, codegen_p, 3, profile)
+        run.assert_not_called()
+
+    def test_opt_in_source_preserves_timeout_group_cache_and_codegen_scratch(self):
+        source = (ROOT / "dev.py").read_text()
+        self.assertIn('compile_rc = run_step("cargo test compile", compile_cmd, env_extra=reuse_env)', source)
+        self.assertIn('if compile_rc != 0 and goal_reuse_commands is not None:\n            return', source)
+        self.assertIn('reuse_env = compiler_cache_env if goal_reuse_commands is not None else None', source)
+        self.assertIn('env_extra={**(reuse_env or {}), "TS_RS_EXPORT_DIR": str(codegen_export_base)}', source)
+        self.assertIn('run_step("cargo test", test_cmd, env_extra=reuse_env, timeout=CARGO_TEST_TIMEOUT)', source)
+        self.assertIn('text=True, env=env, start_new_session=True, bufsize=1', source)
+        self.assertIn('def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT):', source)
+        self.assertEqual(self.dev.CHECK_TIMEOUT, 600)
+
+
 class CargoTestTimeoutTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()

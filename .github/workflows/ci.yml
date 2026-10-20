@@ -107,6 +107,8 @@ jobs:
       - name: ./dev.py check (rust,cargo-fmt)
         if: ${{ !cancelled() }}
         id: rust_check
+        env:
+          PHOENIX_GOAL_REUSE_DIR: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && format('{0}/goal-qualification-{1}-{2}-check-rust', runner.temp, github.run_id, github.run_attempt) || '' }}
         run: |
           mkdir -p ci-rust-logs
           set -o pipefail
@@ -118,23 +120,33 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
           RUST_TEST_THREADS: "2"
+          PHOENIX_GOAL_REUSE_DIR: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && format('{0}/goal-qualification-{1}-{2}-check-rust', runner.temp, github.run_id, github.run_attempt) || '' }}
         run: |
           mkdir -p ci-rust-logs
           set -o pipefail
-          timeout --signal=TERM --kill-after=10s 7m cargo nextest run --locked \
-            -p phoenix-core -p phoenix-db -p phoenix_ide \
-            -E 'test(/conversation_goal|goal_capture|goal_service|steering_accept|checkpoint_commit_survives|persist_fork_proposal_with_tool_round|persist_tool_round_|terminal_tool_round|sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reopen_and_retry/) or test(/::(migration_006_archives_partially_archived_chains|migration_070_preserves_orphan_subagent_behind_hidden_tombstone|migration_070_backfills_first_class_product_conversations_and_reanchors_close|migration_070_rejects_invalid_continuation_and_parent_topology|migration_070_rejects_invalid_membership_and_coordinator_lifecycle|migration_070_rejects_legacy_forks_and_cycles_transactionally|migration_073_rejects_unrecoverable_recursive_subordinate_cycle|migration_073_reparents_delimiter_bearing_legacy_ids|migration_073_reparents_preexisting_recursive_subordinate_parent)$/)' \
-            --test-threads 2 --no-fail-fast --failure-output immediate-final \
-            --status-level all --final-status-level all \
-            2>&1 | tee ci-rust-logs/goals.log
+          goal_filter='test(/conversation_goal|goal_capture|goal_service|steering_accept|checkpoint_commit_survives|persist_fork_proposal_with_tool_round|persist_tool_round_|terminal_tool_round|sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reopen_and_retry/) or test(/::(migration_006_archives_partially_archived_chains|migration_070_preserves_orphan_subagent_behind_hidden_tombstone|migration_070_backfills_first_class_product_conversations_and_reanchors_close|migration_070_rejects_invalid_continuation_and_parent_topology|migration_070_rejects_invalid_membership_and_coordinator_lifecycle|migration_070_rejects_legacy_forks_and_cycles_transactionally|migration_073_rejects_unrecoverable_recursive_subordinate_cycle|migration_073_reparents_delimiter_bearing_legacy_ids|migration_073_reparents_preexisting_recursive_subordinate_parent)$/)'
+          if [[ -n "$PHOENIX_GOAL_REUSE_DIR" && "$PHOENIX_GOAL_REUSE_DIR" != false ]]; then
+            timeout --signal=TERM --kill-after=10s 7m python3 scripts/goal_qualification.py focused \
+              --filter "$goal_filter" --test-threads 2
+          else
+            timeout --signal=TERM --kill-after=10s 7m cargo nextest run --locked \
+              -p phoenix-core -p phoenix-db -p phoenix_ide \
+              -E "$goal_filter" \
+              --test-threads 2 --no-fail-fast --failure-output immediate-final \
+              --status-level all --final-status-level all
+          fi 2>&1 | tee ci-rust-logs/goals.log
       - name: Retain Rust qualification evidence
         if: ${{ always() }}
+        env:
+          PHOENIX_GOAL_REUSE_DIR: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && format('{0}/goal-qualification-{1}-{2}-check-rust', runner.temp, github.run_id, github.run_attempt) || '' }}
         uses: actions/upload-artifact@v4
         with:
           name: rust-check-${{ github.sha }}
           path: |
             ci-rust-logs/*.log
             target/codegen-scratch/**/*.ts
+            ${{ env.PHOENIX_GOAL_REUSE_DIR != '' && format('{0}/*.json', env.PHOENIX_GOAL_REUSE_DIR) || '' }}
+            ${{ env.PHOENIX_GOAL_REUSE_DIR != '' && format('{0}/*.stderr.log', env.PHOENIX_GOAL_REUSE_DIR) || '' }}
           retention-days: 7
           if-no-files-found: warn
       - name: Check production feature on musl

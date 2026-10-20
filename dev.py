@@ -4206,6 +4206,7 @@ def _categorize_changed_paths(paths) -> set:
             "scripts/check_profile_command.py",
             "scripts/check_profile_report.py",
             "scripts/python_unittest_profile.py",
+            "scripts/goal_qualification.py",
         }:
             cats.add("SPECS")
         if p.startswith("ast-grep-rules/"):
@@ -5357,6 +5358,22 @@ def _rust_check_commands(
     return compile_cmd, test_cmd, codegen_cmd
 
 
+def _goal_qualification_commands(
+    has_nextest, compile_p, test_p, codegen_p, test_threads, nextest_profile_args,
+):
+    if os.environ.get("PHOENIX_GOAL_REUSE_DIR") in (None, "", "false"):
+        return None
+    if (os.environ.get("GITHUB_ACTIONS") != "true"
+            or not has_nextest or compile_p or test_p or codegen_p or nextest_profile_args):
+        raise SystemExit("goal qualification capture requires CI full-workspace nextest/default profile")
+    helper = [sys.executable, str(ROOT / "scripts" / "goal_qualification.py")]
+    return (
+        [*helper, "capture"],
+        [*helper, "broad", "--test-threads", str(test_threads)],
+        [*helper, "codegen", "--test-threads", str(test_threads)],
+    )
+
+
 def _clippy_check_env(root: Path = ROOT) -> dict[str, str]:
     return {
         "CARGO_INCREMENTAL": "0",
@@ -5765,15 +5782,18 @@ def cmd_check(
         # target dir, so its RUSTC_WORKSPACE_WRAPPER=clippy-driver fingerprint
         # churn can never invalidate this dir's build (and the two builds
         # don't contend on the shared target lock).
-        compile_rc = run_step("cargo test compile", compile_cmd)
+        reuse_env = compiler_cache_env if goal_reuse_commands is not None else None
+        compile_rc = run_step("cargo test compile", compile_cmd, env_extra=reuse_env)
+        if compile_rc != 0 and goal_reuse_commands is not None:
+            return
         if compile_rc == 0:
             # TS_RS_EXPORT_DIR is read at test runtime (not macro expansion),
             # so this run reuses the harnesses compiled above verbatim.
             rc = run_step("codegen", codegen_cmd,
-                          env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+                          env_extra={**(reuse_env or {}), "TS_RS_EXPORT_DIR": str(codegen_export_base)})
             if rc == 0:
                 codegen_stale_step()
-        run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
+        run_step("cargo test", test_cmd, env_extra=reuse_env, timeout=CARGO_TEST_TIMEOUT)
 
     def lane_clippy():
         """Clippy in a bounded, non-incremental target directory.
@@ -6407,6 +6427,11 @@ def cmd_check(
             has_nextest, compile_p, _pflags(), codegen_p, test_threads,
             nextest_profile_args,
         )
+        goal_reuse_commands = _goal_qualification_commands(
+            has_nextest, compile_p, _pflags(), codegen_p, test_threads, nextest_profile_args,
+        )
+        if goal_reuse_commands is not None:
+            compile_cmd, test_cmd, codegen_cmd = goal_reuse_commands
 
         # Scratch base for the ts-rs export. Every `#[ts(export_to)]` in the
         # workspace uses a `../../../ui/src/generated/` path relative to the
