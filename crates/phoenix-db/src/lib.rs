@@ -19,7 +19,10 @@ pub use coordinator_watches::{
     PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
     WatchSnapshot,
 };
-pub use federation_peers::{FederationPeerConnection, FederationPeerSelectionError};
+pub use federation_peers::{
+    FederationPeerConnection, FederationPeerNotes, FederationPeerSelectionError,
+    FederationPeerSummary, MAX_FEDERATION_PEER_NOTES_BYTES,
+};
 mod ddl;
 mod git_repository_reconciliation;
 mod message_attachments;

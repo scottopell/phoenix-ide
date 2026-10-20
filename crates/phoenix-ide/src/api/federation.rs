@@ -1,3 +1,4 @@
+pub(crate) mod peer_notes;
 pub(crate) mod subscriptions;
 use axum::{
     extract::{Path, State},
@@ -1738,7 +1739,12 @@ pub async fn issue_enrollment(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if request.caller_instance_id == local_id || request.caller_display_name.trim().is_empty() {
+    if request.caller_instance_id == local_id
+        || phoenix_core::domain::instance_identity::PeerDisplayName::parse(
+            &request.caller_display_name,
+        )
+        .is_err()
+    {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
@@ -1783,7 +1789,10 @@ pub async fn import_peer_connection(
     };
     if request.enrollment.caller_instance_id != local_id
         || request.enrollment.receiver_instance_id == local_id
-        || request.peer_display_name.trim().is_empty()
+        || phoenix_core::domain::instance_identity::PeerDisplayName::parse(
+            &request.peer_display_name,
+        )
+        .is_err()
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
@@ -1893,6 +1902,57 @@ mod tests {
             &transcript,
             "/c/readable-name"
         ));
+    }
+
+    #[tokio::test]
+    async fn enrollment_and_import_reject_uuid_display_names_but_accept_real_names() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let local = state.db.instance_id().await.unwrap();
+        let peer = InstanceId::new();
+        for (name, expected) in [
+            (peer.to_string(), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                InstanceId::new().to_string(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            ("dev-mbp-42".into(), StatusCode::CREATED),
+            (" 雪 laptop ".into(), StatusCode::CREATED),
+        ] {
+            let issued = issue_enrollment(
+                OwnerAuthenticated,
+                State(state.clone()),
+                Json(IssueEnrollmentRequest {
+                    caller_instance_id: peer,
+                    caller_display_name: name.clone(),
+                }),
+            )
+            .await;
+            assert_eq!(issued.status(), expected, "issue {name}");
+            let imported = import_peer_connection(
+                OwnerAuthenticated,
+                State(state.clone()),
+                Json(ImportPeerConnectionRequest {
+                    peer_display_name: name.clone(),
+                    base_url: "https://peer.example".into(),
+                    enrollment: EnrollmentTransferBundle {
+                        receiver_instance_id: peer,
+                        caller_instance_id: local,
+                        token: format!("phx_peer_{}", "a".repeat(43)),
+                        tls_trust: PeerTlsTrust::PlatformRoots,
+                    },
+                }),
+            )
+            .await;
+            assert_eq!(
+                imported.status(),
+                if expected == StatusCode::CREATED {
+                    StatusCode::OK
+                } else {
+                    expected
+                },
+                "import {name}"
+            );
+        }
     }
 
     #[tokio::test]

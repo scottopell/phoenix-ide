@@ -591,6 +591,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/federation/enrollments",
             post(super::federation::issue_enrollment),
         )
+        .merge(super::federation::peer_notes::router())
         .route(
             "/api/federation/peers/import",
             post(super::federation::import_peer_connection),

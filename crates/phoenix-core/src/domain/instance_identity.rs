@@ -69,6 +69,26 @@ impl<'de> serde::Deserialize<'de> for InstanceId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDisplayName(String);
+
+impl PeerDisplayName {
+    /// # Errors
+    /// Returns an error for an empty or UUID-shaped name.
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        let value = value.trim();
+        if value.is_empty() || uuid::Uuid::parse_str(value).is_ok() {
+            return Err("peer display name must be nonempty and must not be a UUID");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerBaseUrl(url::Url);
 
 #[derive(Debug, thiserror::Error)]

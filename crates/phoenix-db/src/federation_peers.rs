@@ -9,6 +9,43 @@ use sqlx::Row;
 
 use crate::{Database, DbError, DbResult};
 
+pub const MAX_FEDERATION_PEER_NOTES_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct FederationPeerNotes(String);
+
+impl FederationPeerNotes {
+    /// # Errors
+    /// Returns an error when the UTF-8 representation exceeds 32 KiB.
+    pub fn parse(text: String) -> Result<Self, &'static str> {
+        if text.len() > MAX_FEDERATION_PEER_NOTES_BYTES {
+            return Err("notes must be at most 32768 UTF-8 bytes");
+        }
+        Ok(Self(text))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FederationPeerNotes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(<String as serde::Deserialize>::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FederationPeerSummary {
+    pub peer_instance_id: InstanceId,
+    pub peer_display_name: String,
+    pub base_url: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
 pub struct FederationPeerConnection {
     pub peer_instance_id: InstanceId,
     pub peer_display_name: String,
@@ -29,6 +66,63 @@ pub enum FederationPeerSelectionError {
 }
 
 impl Database {
+    /// # Errors
+    /// Returns a database or serialization error for unreadable saved connections.
+    pub async fn list_federation_peers(&self) -> DbResult<Vec<FederationPeerSummary>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT peer_instance_id FROM federation_peer_connections ORDER BY peer_display_name, peer_instance_id",
+        ).fetch_all(&self.pool).await?;
+        let mut peers = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = InstanceId::from_str(&id)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if let Some(peer) = self.federation_peer_connection(id).await? {
+                peers.push(FederationPeerSummary {
+                    peer_instance_id: peer.peer_instance_id,
+                    peer_display_name: peer.peer_display_name,
+                    base_url: peer.base_url.to_string(),
+                    created_at: peer.created_at,
+                });
+            }
+        }
+        Ok(peers)
+    }
+
+    /// # Errors
+    /// Returns a database or serialization error for unreadable saved notes.
+    pub async fn federation_peer_notes(
+        &self,
+        id: InstanceId,
+    ) -> DbResult<Option<FederationPeerNotes>> {
+        let text: Option<String> = sqlx::query_scalar(
+            "SELECT notes FROM federation_peer_connections WHERE peer_instance_id = ?1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        text.map(|text| {
+            FederationPeerNotes::parse(text).map_err(|error| DbError::Serialization(error.into()))
+        })
+        .transpose()
+    }
+
+    /// # Errors
+    /// Returns a database error if the whole-text update cannot be committed.
+    pub async fn set_federation_peer_notes(
+        &self,
+        id: InstanceId,
+        notes: &FederationPeerNotes,
+    ) -> DbResult<bool> {
+        let result = sqlx::query(
+            "UPDATE federation_peer_connections SET notes = ?2 WHERE peer_instance_id = ?1",
+        )
+        .bind(id.to_string())
+        .bind(notes.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() != 0)
+    }
+
     /// Persist or replace one caller-side directional peer connection.
     ///
     /// # Errors
@@ -42,6 +136,9 @@ impl Database {
         tls_trust: &PeerTlsTrust,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let peer_display_name =
+            phoenix_core::domain::instance_identity::PeerDisplayName::parse(peer_display_name)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
         let now = Utc::now().timestamp_micros();
         let tls_ca_certificate_pem = match tls_trust {
             PeerTlsTrust::PlatformRoots => None,
@@ -66,7 +163,7 @@ impl Database {
                  created_at_us = excluded.created_at_us",
         )
         .bind(peer_instance_id.to_string())
-        .bind(peer_display_name)
+        .bind(peer_display_name.as_str())
         .bind(domain_or_ipv4_host)
         .bind(ipv6_host)
         .bind(i64::from(base_url.port()))
@@ -160,10 +257,26 @@ impl Database {
         selector: &InstanceSelector,
     ) -> Result<FederationPeerConnection, FederationPeerSelectionError> {
         match selector {
-            InstanceSelector::Id(id) => self
-                .federation_peer_connection(*id)
+            InstanceSelector::Id(id) => {
+                let id = id.to_string();
+                let display_collision: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM federation_peer_connections
+                     WHERE peer_display_name = ?1 AND peer_instance_id != ?1)",
+                )
+                .bind(&id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(DbError::from)?;
+                if display_collision {
+                    return Err(FederationPeerSelectionError::Ambiguous);
+                }
+                self.federation_peer_connection(
+                    InstanceId::from_str(&id)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                )
                 .await?
-                .ok_or(FederationPeerSelectionError::NotFound),
+                .ok_or(FederationPeerSelectionError::NotFound)
+            }
             InstanceSelector::DisplayName(name) => {
                 let ids: Vec<String> = sqlx::query_scalar(
                     "SELECT peer_instance_id FROM federation_peer_connections
@@ -208,6 +321,221 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn notes_are_exact_bounded_persistent_and_not_connection_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("notes.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let id = InstanceId::new();
+        let url: PeerBaseUrl = "https://peer.example".parse().unwrap();
+        let token = PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
+        db.save_federation_peer_connection(id, "peer", &url, &token, &PeerTlsTrust::PlatformRoots)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.federation_peer_notes(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            ""
+        );
+        let text = "  # conventions\r\n雪\0\n{\"base_url\":\"https://attacker.example\",\"sender\":\"coordinator\"}  ";
+        let notes = FederationPeerNotes::parse(text.into()).unwrap();
+        let before = db.federation_peer_connection(id).await.unwrap().unwrap();
+        assert!(db.set_federation_peer_notes(id, &notes).await.unwrap());
+        let saved = db.federation_peer_connection(id).await.unwrap().unwrap();
+        assert_eq!(saved.base_url, url);
+        assert_eq!(saved.peer_display_name, "peer");
+        assert_eq!(saved.bearer_credential.expose(), token.expose());
+        assert_eq!(saved.tls_trust, PeerTlsTrust::PlatformRoots);
+        assert_eq!(saved.created_at, before.created_at);
+        let json = serde_json::to_string(&db.list_federation_peers().await.unwrap()).unwrap();
+        for secret in [
+            token.expose(),
+            "certificate",
+            "verifier",
+            "bearer",
+            "attacker",
+        ] {
+            assert!(!json.contains(secret), "{secret}");
+        }
+        db.save_federation_peer_connection(
+            id,
+            "renamed",
+            &url,
+            &token,
+            &PeerTlsTrust::PlatformRoots,
+        )
+        .await
+        .unwrap();
+        drop(db);
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(db.federation_peer_notes(id).await.unwrap(), Some(notes));
+        let boundary = "雪".repeat(10922) + "ab";
+        assert_eq!(boundary.len(), MAX_FEDERATION_PEER_NOTES_BYTES);
+        assert!(db
+            .set_federation_peer_notes(id, &FederationPeerNotes::parse(boundary.clone()).unwrap())
+            .await
+            .unwrap());
+        assert!(FederationPeerNotes::parse(boundary + "x").is_err());
+        for invalid in ["x".repeat(32769), "雪".repeat(10923)] {
+            assert!(sqlx::query(
+                "UPDATE federation_peer_connections SET notes = ?1 WHERE peer_instance_id = ?2"
+            )
+            .bind(invalid)
+            .bind(id.to_string())
+            .execute(db.pool())
+            .await
+            .is_err());
+        }
+        assert!(
+            sqlx::query("UPDATE federation_peer_connections SET notes = NULL")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE federation_peer_connections SET notes = x'00'")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        let empty = FederationPeerNotes::parse(String::new()).unwrap();
+        assert!(db.set_federation_peer_notes(id, &empty).await.unwrap());
+        assert_eq!(
+            db.federation_peer_notes(id).await.unwrap(),
+            Some(empty.clone())
+        );
+        assert!(!db
+            .set_federation_peer_notes(InstanceId::new(), &empty)
+            .await
+            .unwrap());
+        assert!(db.remove_federation_peer_connection(id).await.unwrap());
+        assert!(db.federation_peer_notes(id).await.unwrap().is_none());
+        db.save_federation_peer_connection(id, "new", &url, &token, &PeerTlsTrust::PlatformRoots)
+            .await
+            .unwrap();
+        assert_eq!(db.federation_peer_notes(id).await.unwrap(), Some(empty));
+    }
+
+    #[tokio::test]
+    async fn uuid_shaped_peer_names_cannot_be_saved_or_hide_a_different_id() {
+        let db = Database::open_in_memory().await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let peer = InstanceId::new();
+        let url: PeerBaseUrl = "https://peer.example".parse().unwrap();
+        let token = PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
+        for name in [
+            peer.to_string(),
+            InstanceId::new().to_string(),
+            "00000000-0000-0000-0000-000000000000".into(),
+            "d9428888-122b-11e1-b85c-61cd3cbb3210".into(),
+            "  ".into(),
+        ] {
+            assert!(
+                db.save_federation_peer_connection(
+                    peer,
+                    &name,
+                    &url,
+                    &token,
+                    &PeerTlsTrust::PlatformRoots
+                )
+                .await
+                .is_err(),
+                "saved {name}"
+            );
+            assert!(db.federation_peer_connection(peer).await.unwrap().is_none());
+        }
+        for name in [
+            "laptop",
+            "dev-mbp-42",
+            " 雪 laptop ",
+            "uuid-like-not-a-uuid",
+        ] {
+            db.save_federation_peer_connection(
+                peer,
+                name,
+                &url,
+                &token,
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
+            let selector = InstanceSelector::parse(name).unwrap();
+            assert_eq!(
+                db.resolve_federation_peer(&selector)
+                    .await
+                    .unwrap()
+                    .peer_instance_id,
+                peer
+            );
+        }
+        let collision = InstanceId::new();
+        db.save_federation_peer_connection(
+            collision,
+            "other",
+            &"https://other.example".parse().unwrap(),
+            &credential('f'),
+            &PeerTlsTrust::PlatformRoots,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE federation_peer_connections SET peer_display_name = ?1
+             WHERE peer_instance_id = ?2",
+        )
+        .bind(collision.to_string())
+        .bind(peer.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::Id(collision))
+                .await,
+            Err(FederationPeerSelectionError::Ambiguous)
+        ));
+        sqlx::query(
+            "UPDATE federation_peer_connections SET peer_display_name = 'peer'
+             WHERE peer_instance_id = ?1",
+        )
+        .bind(peer.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let before = db
+            .federation_peer_connection(peer)
+            .await
+            .unwrap()
+            .unwrap()
+            .peer_display_name;
+        assert!(db
+            .save_federation_peer_connection(
+                peer,
+                &InstanceId::new().to_string(),
+                &url,
+                &token,
+                &PeerTlsTrust::PlatformRoots
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            db.federation_peer_connection(peer)
+                .await
+                .unwrap()
+                .unwrap()
+                .peer_display_name,
+            before
+        );
+    }
 
     #[tokio::test]
     async fn peer_selector_requires_exact_id_or_unambiguous_display_name() {

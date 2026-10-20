@@ -677,6 +677,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "durable_conversation_goal_storage",
         sql: include_str!("conversation_goals/schema.sql"),
     },
+    Migration {
+        version: 133,
+        name: "opaque_federation_peer_notes",
+        sql: "ALTER TABLE federation_peer_connections ADD COLUMN notes TEXT NOT NULL DEFAULT ''
+              CHECK (typeof(notes) = 'text' AND length(CAST(notes AS BLOB)) <= 32768);",
+    },
 ];
 
 async fn run_migration_130(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
@@ -14904,11 +14910,41 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
+    #[tokio::test]
+    async fn migration_133_adds_empty_notes_to_existing_connections() {
+        let pool = test_pool().await;
+        sqlx::raw_sql("CREATE TABLE federation_peer_connections (peer_instance_id TEXT PRIMARY KEY, bearer_credential TEXT NOT NULL);
+                       INSERT INTO federation_peer_connections VALUES ('existing', 'retained');")
+            .execute(&pool).await.unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 133)
+            .unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
+        let row: (String, String) = sqlx::query_as("SELECT notes, bearer_credential FROM federation_peer_connections WHERE peer_instance_id = 'existing'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row, (String::new(), "retained".into()));
+        sqlx::query("UPDATE federation_peer_connections SET notes = ?1")
+            .bind("雪".repeat(10922) + "ab")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("UPDATE federation_peer_connections SET notes = ?1")
+                .bind("雪".repeat(10923))
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (133, "opaque_federation_peer_notes"),
+            (132, "durable_conversation_goal_storage"),
             (131, "bounded_federated_terminal_subscriptions"),
             (130, "normalized_remote_input_origin"),
             (129, "single_conversation_name_and_route_projection"),
@@ -15256,7 +15292,7 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO _migrations (version, name) VALUES (130, 'fixture_skip_remote_origin'), (131, 'fixture_skip_subscriptions')",
+            "INSERT INTO _migrations (version, name) VALUES (130, 'fixture_skip_remote_origin'), (131, 'fixture_skip_subscriptions'), (132, 'durable_conversation_goal_storage'), (133, 'opaque_federation_peer_notes')",
         )
         .execute(db.pool())
         .await
