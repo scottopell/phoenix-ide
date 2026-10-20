@@ -135,6 +135,44 @@ The intervening runtime/provider/fork/terminal changes are also unqualified. The
 focused pass belongs only to `f6a5ea5570a3d4a086ef4a427b9c4f7745c70e08`, run
 `39331620726`, artifact `12226138977`; that run's aggregate result failed.
 No local compilation, tests, migration, deployment, or activation was performed
-for this source-only continuation. Migration 132 is unchanged. UserControl and
-stable-Stop DDL remain separately unassigned; they are not implicitly delivered
-by this emitter work.
+for this source-only continuation. Migration132 is unchanged. UserControl and
+stable-Stop have an explicit reservation134, with registration gated on actual
+federation133 integration. Unregistered control SQL, a real trusted service and
+an explicitly disabled HTTP adapter are authored separately; none installs the
+control schema or activates the emitter. Actor-cycle upgrade, runtime admission,
+continuation, tools/UI/watch and end-to-end feature delivery remain outstanding.
+
+### First executed private-runtime qualification (partial, not green)
+
+Exact head `e19c24639d915fb427b5ad509297fc37c62809b4` completed hosted run
+`39343463637` with a failed aggregate result. Rust artifact `12231755781` contains
+a focused result of **114 executed, 109 passed, 5 failed** in112.221s. Actual
+private-emitter processing/next Anthropic rendering, checkpoint rollback/manual
+retry, mixed report/proposal all-error refusal, separate sole proposal awaiting
+approval, default-off/forged-input rejection and parent guard tests passed on
+that head. The Stop journey failed; this is not complete journey qualification,
+public admission installation or a full-feature pass. Later control schema,
+service/API and source corrections are not included in that e19 evidence.
+
+The five owned failures were traced to: cancelled report results reaching the
+ordinary-success refusal as non-error cancellation content; a trusted-result
+fixture with the wrong serde enum shape; a reducer fixture treating generic
+Cancelled as Error; a cancelled-terminal fixture incorrectly expecting Retired
+rather than known-not-committed generation refusal; and an illegal settled-only
+state mutation used to set up a live-turn refusal. Source repairs keep the
+pending-report success guard, generation/probe and settled-admission policies
+intact. They remain unexecuted until a subsequent exact-head hosted run.
+
+The last wholly green focused floor remains f6's96/96; e19's109/5 is a separate,
+failed partial result, not an extension of that floor. Full normal checks also
+failed; no blanket base-failure exemption or production approval follows.
+
+Read-only source review of the five-root repair batch found no concrete new
+regression; it is not execution qualification. Before the next single hosted
+run, two newer control-candidate defects were corrected: a fixture's nonexistent
+`InstanceId::from_uuid` call now uses the actual `new` constructor, and the
+unregistered latch owner key is explicitly NOT NULL so SQLite cannot bypass its
+owner/receipt foreign keys with NULL. An authored negative schema test asserts
+SQLx's NotNullViolation kind. Candidate controls and all source repairs remain
+unqualified until exact-head hosted execution. No registry/132 edit, runtime
+installation, production activation or local test/migration was performed.

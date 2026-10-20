@@ -26,7 +26,7 @@ ON conversation_goal_control_requests(owner_id, result_control_version)
 WHERE outcome = 'accepted';
 
 CREATE TABLE conversation_goal_controls (
-    owner_id TEXT PRIMARY KEY REFERENCES product_conversations(id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL PRIMARY KEY REFERENCES product_conversations(id) ON DELETE CASCADE,
     control_version INTEGER NOT NULL CHECK (typeof(control_version) = 'integer' AND control_version > 0),
     stopped INTEGER NOT NULL CHECK (stopped IN (0,1)),
     principal_id BLOB NOT NULL,

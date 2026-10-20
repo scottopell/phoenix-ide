@@ -44,6 +44,25 @@ async fn binding_is_current(db: &Database, turn: i64) -> bool {
 }
 
 #[tokio::test]
+async fn conversation_goal_control_candidate_null_owner_cannot_bypass_receipt_foreign_key() {
+    let (_dir, db) = control_fixture().await;
+    let error = sqlx::query("INSERT INTO conversation_goal_controls (owner_id,control_version,stopped,principal_id,request_id) VALUES (NULL,1,0,?1,?2)")
+        .bind(vec![1_u8; 16])
+        .bind(vec![1_u8; 16])
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, sqlx::Error::Database(ref db_error) if matches!(db_error.kind(), sqlx::error::ErrorKind::NotNullViolation))
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_goal_controls")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn conversation_goal_control_candidate_missing_and_stopped_are_non_admitting() {
     let (_dir, db) = control_fixture().await;
     assert_eq!(control_version(&db).await, None);

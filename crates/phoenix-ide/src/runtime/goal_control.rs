@@ -191,9 +191,7 @@ mod tests {
             .extensions
             .insert(crate::api::auth::PeerAuthenticated {
                 enrollment_id: Uuid::new_v4(),
-                caller_instance_id: phoenix_core::domain::instance_identity::InstanceId::from_uuid(
-                    Uuid::new_v4(),
-                ),
+                caller_instance_id: phoenix_core::domain::instance_identity::InstanceId::new(),
                 caller_display_name: "peer is not the host owner".into(),
             });
         assert!(OwnerAuthenticated::from_request_parts(&mut parts, &())

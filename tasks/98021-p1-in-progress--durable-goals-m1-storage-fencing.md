@@ -570,7 +570,7 @@ parent review found the ProductConversationId constructor assertion was wrong;
 the corrected parse declaration is recorded in the follow-up. Listed references:
 `GoalExecution::turn_id()/workflow_id()` (private fields),
 `Database::conversation_goal_execution_binding(GoalExecution)`,
-`InstanceId::Display/from_uuid`, `Database::instance_id`, `ProductConversationId::parse`,
+`InstanceId::Display/new`, `Database::instance_id`, `ProductConversationId::parse`,
 `OwnerAuthenticated::from_request_parts`, `PeerAuthenticated`'s three fields,
 `ControlSnapshot`'s nonzero version, SQLx transaction/query APIs, and the existing
 Axum Router/Tower oneshot fixture convention. The candidate include path was
@@ -605,3 +605,58 @@ these concrete corrections supersede it. No auth behavior,134 registry slot,
 activation, or production migration changed. Currente19 run39343463637 progressed
 to its Focused goal qualification stage; no terminal result or timeout is inferred
 from its earlier long broad-check stage.
+
+### Actual e19 execution and five-root repair batch (review before next CI)
+
+Run39343463637 at exact `e19c24639d915fb427b5ad509297fc37c62809b4` is terminal
+FAILED; Rust artifact **12231755781** was downloaded and read. Focused execution
+completed114 tests: **109 passed, 5 failed, 112.221s**. The focused stage did not
+time out. Exact run/job metadata, not a hang assumption, establishes completion.
+The broad normal run also failed (parent read5169 passed/40 failed out of5209
+executed,191 skipped; the artifact tail warns206/5415 were not run after signal).
+The five owned names below appear in both broad and focused evidence. The other
+35 broad failures are not waived or blamed from counts alone.
+
+| Exact suffix under `runtime::executor::provider_tool_policy_tests::goal_round_tests` | Actual root and disposition |
+| --- | --- |
+| `conversation_goal_actual_report_prepared_before_stop_cannot_commit_success_after_stop` | **Runtime defect:** generic `ToolOutcome::Cancelled` has `is_error=false`; the uncommitted report therefore hit the unchanged ordinary-result guard (`goal report success requires pending round finalization`). Cancellation construction now emits an explicit paired `ECANCELLED` Error for a cancelled or skipped `goal_report`. Other tool cancellations keep their existing Cancelled variant. Both ToolAborted and late ToolComplete cancellation paths share this construction. Added a pure regression for current+skipped report refusal and preservation of ordinary cancellation semantics. The DB success guard is not weakened. |
+| `conversation_goal_mixed_legacy_trusted_payload_keeps_live_authority_and_never_leaks_durable_instructions` | **Fixture defect:** invented externally-tagged `TrustedInstructions` JSON omitted actual serde `type`. Build the canonical finalized `ToolResult` through its serializer, retaining exact old finalized-result round-trip and live-only trusted-overlay/no durable payload assertions. No compatibility shim or payload-drop policy change. |
+| `conversation_goal_reducer_cancel_carries_pending_intent_without_rendering_a_success` | **Fixture oracle defect:** a normal other-tool Cancelled outcome is not Error. Assert its exact Cancelled variant while still requiring the pending report to survive and finalization-only rendering to reject pending intent. |
+| `conversation_goal_terminal_retirement_after_cancel_is_not_fatal` | **Fixture classification defect:** Cancel is not a retired/deleted transcript. The exact probe correctly establishes known-not-committed and the command returns `StaleGeneration`. Renamed the test to `conversation_goal_terminal_checkpoint_after_cancel_is_known_not_committed_without_fatal_authority`; assert that precise refusal, nonfatal local authority, no report rows and unchanged goal. No probe/generation/retirement policy was changed. |
+| `conversation_goal_terminal_response_loss_reconstructs_exact_success_or_refusal_without_reapplying` | **Fixture setup defect:** GeneratedHost SetDisposition is settled-only and correctly returns Busy during this live turn. The refusal setup now commits a genuine prior Blocked report with its own assistant/call and paired result through `persist_goal_tool_round_and_state`. The later report is refused on its captured old fence. Prior result success is asserted, and existing exact retained error-row/probe/replay/goal-version assertions remain. No busy or authorization gate is bypassed. |
+
+Actual e19 passes include the provider/internal emitter -> atomic paired rows ->
+next rendered Anthropic request and final output journey, rollback/manual exact
+event retry, mixed report/proposal refusal, separate sole proposal approval wait,
+default-off/forged reports, and the helper-only parent guard. The failed Stop
+journey means this is **partial evidence**, not a green114 suite or full-feature
+acceptance. All later control candidate/service/API tests and these five-root
+source repairs are unexecuted. f6's96/96 remains the last wholly green focused
+floor, with its own failed aggregate; do not combine counts across heads.
+
+No further CI was dispatched before independent review of this five-root batch
+and inclusion of the control compile/fixture corrections. No local compiler,
+tests, SQL execution, browser/VM or production operation was run.
+
+### Five-root source review and control-candidate corrections
+
+Preserved actual d581baa HEAD, all four inherited dirty repair files and every
+stash before continuing in the same allocation. Read the five full assertion
+roots rather than rerunning the old red head. Read-only independent source
+review found no concrete regression in that batch; this is not test execution.
+The cancelled report is now an explicit paired error without weakening the
+unchanged report-success guard; ordinary other-tool cancellation stays Cancelled.
+
+Independent review also found two OWN newer control-slice defects before the
+single corrected-head CI: the peer fixture referenced nonexistent
+`InstanceId::from_uuid` (actual API is `new`), and SQLite's nullable TEXT PRIMARY
+KEY let a null owner evade both owner and receipt foreign keys. The unregistered
+candidate now requires NOT NULL and authors a negative insertion test requiring
+the actual SQLx NotNullViolation kind. Earlier declaration-audit text is corrected;
+that audit never proved compilation. Neither fix registers134 or changes132.
+
+Source-only rustfmt and git diff --check completed; no local compiler, tests,
+SQL/migration, browser/VM or production operation ran. Next is the one authorized
+meaningfully corrected exact-head hosted qualification, not duplicate old-head
+CI. Until actual results are read, later control service/HTTP and all repairs
+remain unqualified. Production emitter remains None and control route503.

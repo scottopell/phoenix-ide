@@ -485,7 +485,10 @@ async fn conversation_goal_reducer_cancel_carries_pending_intent_without_renderi
     assert!(
         matches!(&tool_results[0], ToolRoundResult::PendingGoalReport { report: carried, .. } if carried == &report)
     );
-    assert!(tool_results[1].finalized().unwrap().is_error());
+    assert!(matches!(
+        tool_results[1].finalized().unwrap().outcome,
+        ToolOutcome::Cancelled { .. }
+    ));
     assert!(finalized_round_results(&tool_results).is_err());
 }
 
@@ -496,7 +499,14 @@ async fn conversation_goal_mixed_legacy_trusted_payload_keeps_live_authority_and
     let catalog = crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(None).unwrap();
     let payload =
         phoenix_skills::invoke_trusted_coordinator_builtin("phoenix-api", &catalog).unwrap();
-    let legacy = serde_json::json!({"tool_use_id":"other","outcome":{"TrustedInstructions":{"output":payload}}});
+    let legacy = serde_json::to_value(ToolResult {
+        tool_use_id: "other".into(),
+        outcome: ToolOutcome::TrustedInstructions {
+            output: payload.to_string(),
+        },
+        duration_ms: None,
+    })
+    .unwrap();
     let entry: ToolRoundResult = serde_json::from_value(legacy.clone()).unwrap();
     assert_eq!(serde_json::to_value(&entry).unwrap(), legacy);
     let ContentBlock::ToolUse { name, input, .. } = &mut assistant.content[1] else {
@@ -583,31 +593,49 @@ fn db_assistant(assistant: &AssistantMessage) -> crate::db::Message {
 }
 
 async fn block_goal_before_report(db: &Database, report: &GoalPendingReport) {
-    use phoenix_core::domain::conversation_goal::GoalDisposition;
-    let mut mutation = report.mutation();
-    let actor = GoalActor::GeneratedHost {
-        action_id: text("block-before-report"),
+    let binding = db
+        .conversation_goal_execution_binding(report.execution())
+        .await
+        .unwrap()
+        .unwrap();
+    let prior = GoalPendingReport::new(
+        binding,
+        GoalReportCall {
+            transcript_id: text(CONVERSATION),
+            message_id: text("prior-blocking-assistant"),
+            tool_use_id: text("prior-blocking-report"),
+        },
+        GoalReportOutcome::Blocked(text("waiting on an external prerequisite")),
+    );
+    let assistant = db_assistant(&AssistantMessage::new(
+        "prior-blocking-assistant".into(),
+        vec![ContentBlock::ToolUse {
+            id: "prior-blocking-report".into(),
+            name: "goal_report".into(),
+            input: serde_json::to_value(prior.outcome()).unwrap(),
+        }],
+        None,
+        None,
+    ));
+    let results = [ToolRoundResult::PendingGoalReport {
+        report: prior,
+        duration_ms: 1,
+    }];
+    let state = ConvState::LlmRequesting { attempt: 1 };
+    let checkpoint = phoenix_db::conversation_goals::round::GoalRoundCheckpoint {
+        assistant: &assistant,
+        execution: report.execution(),
+        results: &results,
+        state: &state,
+        state_updated_at: Utc::now(),
     };
-    mutation.action_id = text("block-before-report");
-    mutation.attribution = GoalAttribution {
-        requested_by: actor.clone(),
-        applied_by: actor,
-    };
-    let GoalChange::Report { binding, .. } = &mutation.change else {
-        panic!("report binding")
-    };
-    let phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(fence) =
-        &binding.observation
-    else {
-        panic!("goal observation")
-    };
-    mutation.change = GoalChange::SetDisposition {
-        goal_id: fence.goal_id.clone(),
-        disposition: GoalDisposition::Blocked(text("waiting on an external prerequisite")),
-    };
-    db.apply_conversation_goal(&mutation, CONVERSATION, GoalTimestampUs::parse(11).unwrap())
+    let committed = db
+        .persist_goal_tool_round_and_state(&checkpoint)
         .await
         .unwrap();
+    assert!(
+        matches!(&committed.results[0].content, MessageContent::Tool(result) if !result.is_error)
+    );
 }
 
 async fn assert_report_after_settlement(
@@ -671,7 +699,15 @@ async fn conversation_goal_terminal_response_loss_reconstructs_exact_success_or_
         if refuse {
             block_goal_before_report(&db, &report).await;
         }
-        let assistant = db_assistant(&assistant);
+        let mut assistant = db_assistant(&assistant);
+        assistant.sequence_id = db
+            .get_messages(CONVERSATION)
+            .await
+            .unwrap()
+            .iter()
+            .map(|message| message.sequence_id)
+            .max()
+            .map_or(1, |sequence| sequence + 1);
         let results = [
             ToolRoundResult::PendingGoalReport {
                 report: report.clone(),
@@ -835,7 +871,8 @@ async fn conversation_goal_terminal_late_replay_failure_is_known_rollback() {
 }
 
 #[tokio::test]
-async fn conversation_goal_terminal_retirement_after_cancel_is_not_fatal() {
+async fn conversation_goal_terminal_checkpoint_after_cancel_is_known_not_committed_without_fatal_authority(
+) {
     let dir = tempfile::tempdir().unwrap();
     let (db, assistant, report, _) = goal_fixture().await;
     let settlement = ActiveDirectTurnSettlement {
@@ -868,13 +905,15 @@ async fn conversation_goal_terminal_retirement_after_cancel_is_not_fatal() {
     )
     .with_active_direct_turn(Some(active(&report)));
     let mut admitted = rt.admit_authoritative_effect().unwrap();
-    rt.persist_checkpoint_with_terminal_obligation(
-        pending_checkpoint(assistant, report.clone()),
-        &settlement,
-        &mut admitted,
-    )
-    .await
-    .unwrap();
+    let error = rt
+        .persist_checkpoint_with_terminal_obligation(
+            pending_checkpoint(assistant, report.clone()),
+            &settlement,
+            &mut admitted,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("StaleGeneration"), "{error}");
     assert_ne!(rt.local_terminal_authority, LocalTerminalAuthority::Fatal);
     assert!(db.get_messages(CONVERSATION).await.unwrap().is_empty());
     assert_eq!(

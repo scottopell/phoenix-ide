@@ -1386,6 +1386,7 @@ fn handle_core_cancellation(
         ) if *tool_use_id == aborted_id => {
             let all_results = build_cancellation_results(
                 completed_results,
+                assistant_message,
                 tool_use_id,
                 "Cancelled by user",
                 skipped_tools,
@@ -1428,6 +1429,7 @@ fn handle_core_cancellation(
         ) if *tool_use_id == completed_id => {
             let all_results = build_cancellation_results(
                 completed_results,
+                assistant_message,
                 tool_use_id,
                 "Cancelled by user",
                 skipped_tools,
@@ -1492,15 +1494,37 @@ fn handle_core_cancellation(
 /// cancelled current tool and skipped remaining tools.
 fn build_cancellation_results(
     completed_results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+    assistant_message: &AssistantMessage,
     cancelled_tool_id: &str,
     cancel_reason: &str,
     skipped_tools: &[ToolCall],
 ) -> Vec<phoenix_core::domain::conversation_goal::ToolRoundResult> {
+    use phoenix_core::domain::llm_types::ContentBlock;
     let mut all_results = completed_results.to_vec();
-    all_results.push(ToolResult::cancelled(cancelled_tool_id.to_string(), cancel_reason).into());
+    let cancelled_report = assistant_message.content.iter().any(|block| {
+        matches!(block,
+        ContentBlock::ToolUse { id, name, .. } if id == cancelled_tool_id && name == "goal_report")
+    });
+    let cancelled = if cancelled_report {
+        ToolResult::error(
+            cancelled_tool_id.to_owned(),
+            format!("ECANCELLED: goal report was not committed: {cancel_reason}"),
+        )
+    } else {
+        ToolResult::cancelled(cancelled_tool_id.to_owned(), cancel_reason)
+    };
+    all_results.push(cancelled.into());
     for tool in skipped_tools {
-        all_results
-            .push(ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation").into());
+        let skipped = if tool.name() == "goal_report" {
+            ToolResult::error(
+                tool.id.clone(),
+                "ECANCELLED: goal report was not executed because the previous tool was cancelled"
+                    .into(),
+            )
+        } else {
+            ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation")
+        };
+        all_results.push(skipped.into());
     }
     all_results
 }
@@ -6791,6 +6815,44 @@ mod tests {
             result.new_state,
             ConvState::LlmRequesting { attempt: 1 }
         ));
+    }
+
+    #[test]
+    fn conversation_goal_cancelled_and_skipped_reports_are_refusals_not_success_lookalikes() {
+        use phoenix_core::domain::{db_schema::ToolOutcome, llm_types::ContentBlock};
+        for current_name in ["goal_report", "think"] {
+            let assistant = AssistantMessage::new(
+                "cancelled-report-assistant".into(),
+                vec![
+                    ContentBlock::tool_use("current", current_name, serde_json::json!({})),
+                    ContentBlock::tool_use("skipped-report", "goal_report", serde_json::json!({})),
+                ],
+                None,
+                None,
+            );
+            let skipped = ToolCall::new(
+                "skipped-report",
+                ToolInput::from_name_and_value("goal_report", serde_json::json!({})),
+            );
+            let results = build_cancellation_results(
+                &[],
+                &assistant,
+                "current",
+                "Cancelled by user",
+                &[skipped],
+            );
+            assert_eq!(results.len(), 2);
+            let current = results[0].finalized().unwrap();
+            if current_name == "goal_report" {
+                assert!(matches!(current.outcome, ToolOutcome::Error { .. }));
+                assert!(current.is_error());
+            } else {
+                assert!(matches!(current.outcome, ToolOutcome::Cancelled { .. }));
+                assert!(!current.is_error());
+            }
+            assert!(results[1].finalized().unwrap().is_error());
+            assert!(CheckpointData::tool_round(assistant, results).is_ok());
+        }
     }
 
     #[test]
