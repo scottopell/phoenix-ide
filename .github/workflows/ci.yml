@@ -610,7 +610,7 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.ui == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -660,6 +660,14 @@ jobs:
           node scripts/capture-assistant-finalization-transcript.mjs
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs
+          node scripts/capture-review-reading-position.mjs
+          cd ..
+          stop_server
+          git restore --source=f576ef47f -- ui/src/pages/ProductConversationPage.tsx ui/src/contexts/ViewerSlotContext.tsx
+          start_server
+          (cd ui && BASELINE=1 REVIEW_READING_QA_OUT=qa-artifacts/review-reading-baseline node scripts/capture-review-reading-position.mjs)
+          stop_server
+          git restore --source=HEAD -- ui/src/pages/ProductConversationPage.tsx ui/src/contexts/ViewerSlotContext.tsx
       - uses: actions/upload-artifact@v4
         if: always()
         with:

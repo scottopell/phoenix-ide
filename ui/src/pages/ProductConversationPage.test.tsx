@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { StrictMode, useEffect, useLayoutEffect } from 'react';
+import { startTransition, StrictMode, Suspense, useEffect, useLayoutEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import { ViewJourneyLifecycle, defaultViewIdentity } from '../hooks/conversationViewLifecycle';
@@ -33,7 +33,8 @@ import {
 } from '../fixtures/productConversation/scenarios';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
-import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { ViewerSlotProvider, useReaderNavigationKey, useViewerSlot } from '../contexts/ViewerSlotContext';
+import type { Location } from 'react-router-dom';
 import { ChainProvider } from '../chain';
 import { ApiResponseError, type ChainView, type Message, type ProductConversationHistorySnapshotView as ProductConversationSnapshotView } from '../api';
 import type { CoordinatorConversationSnapshotView } from '../generated/CoordinatorConversationSnapshotView';
@@ -392,7 +393,15 @@ function ProductRouteSwitch() {
 function HistoryRouteControls() {
   const navigate = useNavigate();
   const location = useLocation();
-  return <><div data-testid="history-location">{location.pathname}{location.search}{location.hash}</div>
+  const viewer = useViewerSlot();
+  const readerNavigationKey = useReaderNavigationKey();
+  return <><div data-testid="reader-navigation-key">{readerNavigationKey}</div><div data-testid="history-location">{location.pathname}{location.search}{location.hash}</div>
+    <div data-testid="history-location-state">{JSON.stringify(location.state)}</div>
+    <button onClick={() => viewer.openMessage(1, 'fullscreen', 'm-1')}>open reader viewer</button>
+    <button onClick={() => viewer.setPresentation('pane')}>reader viewer pane</button>
+    <button onClick={() => viewer.close()}>close reader viewer</button>
+    <button onClick={() => navigate({ ...location }, { state: location.state })}>repeat reader navigation</button>
+    <button onClick={() => navigate({ ...location }, { replace: true, state: location.state })}>replace reader navigation</button>
     <button onClick={() => {
       const query = new URLSearchParams(location.search);
       if (query.has('source_transcript')) query.set('source_transcript', 'row-2');
@@ -428,7 +437,7 @@ function coordinatorSnapshot(snapshot: ProductConversationSnapshotView) {
 
 let conversationStore: ConversationStore;
 
-function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false, strict = false, journey?: ViewJourneyLifecycle) {
+function renderPage(initialEntry: string | Partial<Location> = '/product-conversations/pc-1', withRouteSwitch = false, strict = false, journey?: ViewJourneyLifecycle) {
   const content = (
     <ConversationContext.Provider value={conversationStore}>
     <ConversationReadinessProvider>
@@ -451,7 +460,7 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
     </ConversationReadinessProvider>
     </ConversationContext.Provider>
   );
-  return render(strict ? <StrictMode>{content}</StrictMode> : content);
+  return render(<Suspense fallback={<div data-testid="suspended-history" />}>{strict ? <StrictMode>{content}</StrictMode> : content}</Suspense>);
 }
 
 function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) {
@@ -505,7 +514,7 @@ beforeEach(() => {
   historyResizeObservers.length = 0;
   vi.clearAllMocks();
   localStorage.clear();
-  conversationNavStackSpy.mockClear();
+  conversationNavStackSpy.mockReset();
   embeddedConversationPageSpy.mockClear();
   viewerSpy.mockClear();
   chainQaColumnSpy.mockClear();
@@ -1074,6 +1083,104 @@ describe('ProductConversationPage', () => {
     expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(2);
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.slug).toBe('row-2');
     expect(screen.getByTestId('history-location')).toHaveTextContent('/global/row-1?source_transcript=row-1');
+  });
+
+  it.each([
+    ['open', false], ['close', false], ['presentation', false],
+    ['open', true], ['close', true], ['presentation', true],
+  ] as const)('does not replay a completed historical chapter jump on viewer %s (Global=%s)', async (mutation, global) => {
+    const { api } = await import('../api');
+    const snapshot = makeSnapshot({ before: null, has_older: false });
+    if (global) vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(snapshot));
+    else vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(snapshot);
+    const viewerSearch = mutation === 'open' ? '' : '&viewer=message&message=1&presentation=fullscreen';
+    renderPage(`${global ? '/global/row-1' : '/product-conversations/pc-1'}?source_transcript=row-1${viewerSearch}`);
+    await waitFor(() => expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    const jump = currentPositioning();
+    const readerKey = screen.getByTestId('reader-navigation-key').textContent;
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    expect(currentPositioning().kind).toBe('idle');
+
+    fireEvent.click(screen.getByRole('button', { name: mutation === 'open' ? 'open reader viewer' : mutation === 'close' ? 'close reader viewer' : 'reader viewer pane' }));
+    expect(currentPositioning().kind).toBe('idle');
+    expect(screen.getByTestId('reader-navigation-key').textContent).toBe(readerKey);
+    fireEvent.click(screen.getByRole('button', { name: 'repeat reader navigation' }));
+    expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } });
+    const repeated = currentPositioning();
+    if (jump.kind !== 'positioning' || repeated.kind !== 'positioning') throw new Error('expected jump commands');
+    expect(repeated.command.token).not.toBe(jump.command.token);
+  });
+
+  it('does not replay the committed jump after an interrupted navigation and old-viewer close', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({ before: null, has_older: false }));
+    renderPage('/product-conversations/pc-1?source_transcript=row-1&viewer=message&message=1&presentation=fullscreen#message-m-1');
+    await waitFor(() => expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    expect(currentPositioning().kind).toBe('idle');
+    const readerKey = screen.getByTestId('reader-navigation-key').textContent;
+    let suspendedAttempts = 0;
+    const suspended = new Promise<void>(() => {});
+    conversationNavStackSpy.mockImplementation(props => {
+      const input = props['transcriptPositioning'] as TranscriptPositioningInput;
+      if (input.kind === 'positioning' && input.command.kind === 'jump_to_message' && input.command.targetMessageId === 'm-3') {
+        suspendedAttempts += 1;
+        throw suspended;
+      }
+    });
+    await act(async () => {
+      startTransition(() => fireEvent.click(screen.getByRole('button', { name: 'jump latest message' })));
+    });
+    expect(suspendedAttempts).toBeGreaterThan(0);
+    expect(screen.queryByTestId('suspended-history')).not.toBeInTheDocument();
+    expect(screen.getByTestId('history-location')).toHaveTextContent('#message-m-1');
+    expect(screen.getByTestId('reader-navigation-key').textContent).toBe(readerKey);
+
+    fireEvent.click(screen.getByRole('button', { name: 'close reader viewer' }));
+
+    expect(screen.getByTestId('reader-navigation-key').textContent).toBe(readerKey);
+    expect(screen.getByTestId('history-location')).not.toHaveTextContent('viewer=');
+    expect(currentPositioning().kind).toBe('idle');
+    fireEvent.click(screen.getByRole('button', { name: 'repeat reader navigation' }));
+    expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { kind: 'jump_to_message', targetMessageId: 'm-1' } });
+  });
+
+  it('keeps an unfinished historical jump token through viewer open and close', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({ before: null, has_older: false }));
+    renderPage('/product-conversations/pc-1?source_transcript=row-1#message-m-1', false, true);
+    await waitFor(() => expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    const jump = currentPositioning();
+    for (const name of ['open reader viewer', 'close reader viewer']) {
+      fireEvent.click(screen.getByRole('button', { name }));
+      expect(currentPositioning()).toEqual(jump);
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    expect(currentPositioning().kind).toBe('idle');
+  });
+
+  it('retains hash and router state through viewer open, presentation change, and close', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({ before: null, has_older: false }));
+    const state = { chapterSelection: 'pending', readerContext: { id: 'retained' } };
+    renderPage({ pathname: '/product-conversations/pc-1', search: '?source_transcript=row-1&source_tool=send-1', hash: '#message-m-1', state });
+    await waitFor(() => expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    for (const name of ['open reader viewer', 'reader viewer pane', 'close reader viewer']) {
+      fireEvent.click(screen.getByRole('button', { name }));
+      expect(currentPositioning().kind).toBe('idle');
+      expect(screen.getByTestId('history-location')).toHaveTextContent('#message-m-1');
+      expect(screen.getByTestId('history-location')).toHaveTextContent('source_transcript=row-1&source_tool=send-1');
+      expect(screen.getByTestId('history-location-state').textContent).toBe(JSON.stringify(state));
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'replace reader navigation' }));
+    expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'jump latest message' }));
+    await waitFor(() => expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-3' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    fireEvent.click(screen.getByRole('button', { name: 'history back' }));
+    await waitFor(() => expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } }));
   });
 
   it('repositions an acknowledged message link when Back returns from a hashless entry', async () => {

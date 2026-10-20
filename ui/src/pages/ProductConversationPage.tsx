@@ -22,7 +22,7 @@ import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { HistoryScrollCommand, RestoreBasis } from '../conversation/historyExpansion';
 import { transcriptPositioningInputCommandKey, type TranscriptPositioningCompletion, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '../components/MessageContextMenu';
-import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useReaderNavigationKey, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { useConnection } from '../hooks/useConnection';
@@ -887,10 +887,16 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const location = useLocation();
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const scrollCommandTokenRef = useRef(0);
+  const readerNavigationKey = useReaderNavigationKey();
   const hashNavigationRef = useRef({ key: '', token: 0 });
-  if (hashNavigationRef.current.key !== location.key) {
-    hashNavigationRef.current = { key: location.key, token: ++scrollCommandTokenRef.current };
-  }
+  const hashNavigation = hashNavigationRef.current.key === readerNavigationKey ? hashNavigationRef.current : {
+    key: readerNavigationKey,
+    token: scrollCommandTokenRef.current + 1,
+  };
+  useLayoutEffect(() => {
+    hashNavigationRef.current = hashNavigation;
+    scrollCommandTokenRef.current = Math.max(scrollCommandTokenRef.current, hashNavigation.token);
+  }, [hashNavigation]);
   const [jumpCompletion, setJumpCompletion] = useState<TranscriptPositioningCompletion | null>(null);
   const desiredJumpRef = useRef<Extract<HistoryScrollCommand, { kind: 'jump_to_message' }> | null>(null);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
@@ -911,7 +917,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   useEffect(() => {
     setRestoreCommand(null);
     setOlderError(null);
-  }, [location.key]);
+  }, [readerNavigationKey]);
   const [openSnapshotGeneration, setOpenSnapshotGeneration] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
@@ -1443,21 +1449,21 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const positioningTargetMessageId = readerSelection.kind === 'unavailable' ? undefined : hashTargetLoaded ? resolvedHashTargetMessageId : transcriptTargetMessage?.message_id;
   const previousJump = desiredJumpRef.current;
   const completedJump = previousJump
-    && previousJump.token === hashNavigationRef.current.token
+    && previousJump.token === hashNavigation.token
     && previousJump.view.conversationId === transcriptView.conversationId
     && previousJump.targetMessageId === positioningTargetMessageId
     && jumpCompletion?.commandKey === transcriptPositioningInputCommandKey({ kind: 'positioning', command: previousJump });
   const desiredJump = positioningTargetMessageId
     ? completedJump ? previousJump : {
       kind: 'jump_to_message' as const,
-      token: hashNavigationRef.current.token,
+      token: hashNavigation.token,
       requestToken: 0,
       view: transcriptView,
       targetMessageId: positioningTargetMessageId,
     }
     : null;
-  desiredJumpRef.current = desiredJump;
-  const desiredPositioning: TranscriptPositioningInput = (restoreCommand?.navigationToken === hashNavigationRef.current.token ? restoreCommand.positioning : null)
+  useLayoutEffect(() => { desiredJumpRef.current = desiredJump; }, [desiredJump]);
+  const desiredPositioning: TranscriptPositioningInput = (restoreCommand?.navigationToken === hashNavigation.token ? restoreCommand.positioning : null)
     ?? (desiredJump ? { kind: 'positioning', command: desiredJump } : { kind: 'idle', view: transcriptView });
   const desiredPositioningKey = transcriptPositioningInputCommandKey(desiredPositioning);
   const transcriptPositioning: TranscriptPositioningInput = desiredPositioningKey !== null
@@ -1592,7 +1598,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           onViewTailSettled={journey.tailAnchorSettled}
           onViewAnchorProbe={journey.registerAnchorProbe}
           viewAnchorIntent={{
-            scope: `${hashNavigationRef.current.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
+            scope: `${hashNavigation.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
             ...(desiredJump ? { command: desiredJump } : { command: null, view: transcriptView }),
           }}
           historyBoundaries={snapshot.boundaries}

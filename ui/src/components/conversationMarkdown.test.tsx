@@ -46,6 +46,51 @@ describe('ConversationMarkdownAnchor', () => {
     expect(screen.getByTestId('location-state')).toHaveTextContent('/global/coordinator');
   });
 
+  it.each(['', '#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2'])('routes the literal transcript citation with exact pinning and return state (%s)', (fragment) => {
+    const transcript = 'aceb02b4-0735-491e-bd5c-854e844f1591';
+    const origin = '/global/coordinator?viewer=inspect#message-origin';
+    const destination = `/c/${transcript}?source_transcript=${transcript}${fragment}`;
+    render(<MemoryRouter initialEntries={[origin]}>
+      <ReactMarkdown components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+        {`[Proposal](@transcript:aceb02b4-0735-491e-bd5c-854e844f1591${fragment})`}
+      </ReactMarkdown>
+      <CurrentLocation />
+    </MemoryRouter>);
+    const link = screen.getByRole('link', { name: 'Proposal' });
+    expect(link).toHaveAttribute('href', destination);
+    expect(link).not.toHaveAttribute('target');
+    fireEvent.click(link);
+    expect(screen.getByTestId('location').textContent).toBe(destination);
+    expect(screen.getByTestId('location-state').textContent).toBe(JSON.stringify({
+      conversationReturnOrigin: { kind: 'coordinator', href: origin },
+    }));
+  });
+
+  it.each([
+    '@transcript:javascript:alert(1)',
+    '@transcript:../private',
+    '@transcript:not-a-uuid',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591/../private',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591%2fextra',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591?source_transcript=other',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591#message-invalid',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2/extra',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2#extra',
+    'javascript:alert(1)',
+    'data:text/html,unsafe',
+  ])('keeps unsafe or malformed transcript href sanitized: %s', (href) => {
+    render(<MemoryRouter><ReactMarkdown components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{`[unsafe](${href})`}</ReactMarkdown></MemoryRouter>);
+    expect(screen.getByText('unsafe', { selector: 'a' })).toHaveAttribute('href', '');
+  });
+
+  it.each([
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2',
+  ])('does not promote transcript references used as image sources: %s', (src) => {
+    render(<MemoryRouter><ReactMarkdown components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{`![Proposal](${src})`}</ReactMarkdown></MemoryRouter>);
+    expect(screen.getByRole('img', { name: 'Proposal' })).toHaveAttribute('src', '');
+  });
+
   it.each(['/c/source#message-id', 'https://example.com/source'])('adds inline affordance without replacing caller props for %s', (href) => {
     const onClick = vi.fn((event: React.MouseEvent<HTMLAnchorElement>) => event.preventDefault());
     render(

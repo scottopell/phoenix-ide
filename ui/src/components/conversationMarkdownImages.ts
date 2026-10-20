@@ -38,6 +38,8 @@ function conversationMarkdownUrlTransform(url: string, key: string): string | nu
   if (key === 'href') {
     const conversation = /^@conv:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(trimmed);
     if (conversation) return `/c/${conversation[1]}`;
+    const transcript = /^@transcript:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(#message-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/i.exec(trimmed);
+    if (transcript) return `/c/${transcript[1]}?source_transcript=${transcript[1]}${transcript[2] ?? ''}`;
   }
   return defaultUrlTransform(url);
 }
