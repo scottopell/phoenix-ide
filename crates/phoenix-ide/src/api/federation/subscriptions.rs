@@ -99,9 +99,8 @@ async fn apply(
     request: SubscriptionRequest,
     operation: &'static str,
 ) -> Response {
-    let destination = match state.db.instance_id().await {
-        Ok(id) => id,
-        Err(_) => return rejected(StatusCode::INTERNAL_SERVER_ERROR),
+    let Ok(destination) = state.db.instance_id().await else {
+        return rejected(StatusCode::INTERNAL_SERVER_ERROR);
     };
     if request.caller_instance_id != peer.caller_instance_id
         || request.reference.instance_id != destination

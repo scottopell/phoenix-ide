@@ -3052,6 +3052,44 @@ async fn resolve_conversation(
     })
 }
 
+fn map_message_reference_db_error(error: DbError) -> AppError {
+    match error {
+        DbError::MessageNotFound(_) => {
+            AppError::NotFound("message reference target not found".to_string())
+        }
+        other @ (DbError::Sqlx(_)
+        | DbError::ConversationNotFound(_)
+        | DbError::MessageConflict(_)
+        | DbError::TranscriptSnapshotChanged
+        | DbError::SlugExists(_)
+        | DbError::ConversationAlreadyExists(_)
+        | DbError::CoordinatorWorkScope(_)
+        | DbError::Serialization(_)
+        | DbError::SubAgentLifecycleConflict(_)
+        | DbError::ContinuationPrecondition(_)
+        | DbError::CloseFoundationConflict(_)
+        | DbError::CloseAdmissionFenced(_)
+        | DbError::ProductConversationUnavailable(_)
+        | DbError::SteeringQueueFull
+        | DbError::ProductCreationClaimLost
+        | DbError::CloseFoundationPrecondition(_)
+        | DbError::CloseFoundationStaleLatest { .. }
+        | DbError::CloseFoundationRepairRequired(_)
+        | DbError::CloseFoundationNotFound(_)
+        | DbError::ForkProposalConflict(_)
+        | DbError::DirectTurnConflict(_)
+        | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        | DbError::DormantGitRepositoryCatchupStaleOperation
+        | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+        | DbError::DormantGitRepositoryReadinessCatchupInProgress
+        | DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
+            AppError::Internal(other.to_string())
+        }
+    }
+}
+
 async fn resolve_message(
     service: &GlobalReadService,
     conv: Conversation,
@@ -3062,41 +3100,7 @@ async fn resolve_message(
         .db
         .get_message_by_id(message_id)
         .await
-        .map_err(|error| match error {
-            DbError::MessageNotFound(_) => {
-                AppError::NotFound("message reference target not found".to_string())
-            }
-            other @ (DbError::Sqlx(_)
-            | DbError::ConversationNotFound(_)
-            | DbError::MessageConflict(_)
-            | DbError::TranscriptSnapshotChanged
-            | DbError::SlugExists(_)
-            | DbError::ConversationAlreadyExists(_)
-            | DbError::CoordinatorWorkScope(_)
-            | DbError::Serialization(_)
-            | DbError::SubAgentLifecycleConflict(_)
-            | DbError::ContinuationPrecondition(_)
-            | DbError::CloseFoundationConflict(_)
-            | DbError::CloseAdmissionFenced(_)
-            | DbError::ProductConversationUnavailable(_)
-            | DbError::SteeringQueueFull
-            | DbError::ProductCreationClaimLost
-            | DbError::CloseFoundationPrecondition(_)
-            | DbError::CloseFoundationStaleLatest { .. }
-            | DbError::CloseFoundationRepairRequired(_)
-            | DbError::CloseFoundationNotFound(_)
-            | DbError::ForkProposalConflict(_)
-            | DbError::DirectTurnConflict(_)
-            | DbError::GitRepositoryWorkScopeProjectConflict { .. }
-            | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
-            | DbError::DormantGitRepositoryCatchupStaleOperation
-            | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
-            | DbError::DormantGitRepositoryReadinessCatchupInProgress
-            | DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
-            | DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
-                AppError::Internal(other.to_string())
-            }
-        })?;
+        .map_err(map_message_reference_db_error)?;
     if message.conversation_id != conv.id {
         return Err(AppError::NotFound(
             "message reference target not found".to_string(),

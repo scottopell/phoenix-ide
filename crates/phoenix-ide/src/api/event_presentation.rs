@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use phoenix_core::domain::db_schema::InputOrigin;
+use phoenix_core::domain::{db_schema::InputOrigin, federation_subscription::SubscriptionDelivery};
 use phoenix_db::{Database, Message, WatchEventPresentation, WatchEventProvenance, WatchOutcome};
 use serde::Serialize;
 use ts_rs::TS;
@@ -231,7 +231,6 @@ impl EventPresentations {
                     for (id, (notification, locator)) in events {
                         let navigation =
                             federated_navigation(db, &notification.reference, locator).await;
-                        use phoenix_core::domain::federation_subscription::SubscriptionDelivery;
                         let event = match notification.content {
                             SubscriptionDelivery::Fact { fact } => EventPresentation::FederatedFact(FederatedFactPresentation {
                                 event_id: id.clone(), instance_id: notification.reference.instance_id.to_string(),
@@ -293,13 +292,10 @@ async fn federated_navigation(
     reference: &phoenix_core::domain::federation_subscription::SubscriptionReference,
     locator: Option<(String, String)>,
 ) -> FederatedEventNavigation {
-    let peer = match db.federation_peer_connection(reference.instance_id).await {
-        Ok(Some(peer)) => peer,
-        _ => {
-            return FederatedEventNavigation::Unavailable {
-                reason: FederatedNavigationUnavailableReason::MissingConnection,
-            }
-        }
+    let Ok(Some(peer)) = db.federation_peer_connection(reference.instance_id).await else {
+        return FederatedEventNavigation::Unavailable {
+            reason: FederatedNavigationUnavailableReason::MissingConnection,
+        };
     };
     let Some((stable_path, source_path)) = locator else {
         return FederatedEventNavigation::Unavailable {

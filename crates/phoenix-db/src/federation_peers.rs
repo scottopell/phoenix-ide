@@ -323,6 +323,48 @@ impl Database {
 mod tests {
     use super::*;
 
+    async fn assert_peer_name_rejected(
+        db: &Database,
+        peer: InstanceId,
+        name: &str,
+        url: &PeerBaseUrl,
+        token: &PeerBearerCredential,
+    ) {
+        assert!(
+            db.save_federation_peer_connection(
+                peer,
+                name,
+                url,
+                token,
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .is_err(),
+            "saved {name}"
+        );
+        assert!(db.federation_peer_connection(peer).await.unwrap().is_none());
+    }
+
+    async fn save_peer_and_assert_resolves(
+        db: &Database,
+        peer: InstanceId,
+        name: &str,
+        url: &PeerBaseUrl,
+        token: &PeerBearerCredential,
+    ) {
+        db.save_federation_peer_connection(peer, name, url, token, &PeerTlsTrust::PlatformRoots)
+            .await
+            .unwrap();
+        let selector = InstanceSelector::parse(name).unwrap();
+        assert_eq!(
+            db.resolve_federation_peer(&selector)
+                .await
+                .unwrap()
+                .peer_instance_id,
+            peer
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn notes_are_exact_bounded_persistent_and_not_connection_authority() {
@@ -441,19 +483,7 @@ mod tests {
             "d9428888-122b-11e1-b85c-61cd3cbb3210".into(),
             "  ".into(),
         ] {
-            assert!(
-                db.save_federation_peer_connection(
-                    peer,
-                    &name,
-                    &url,
-                    &token,
-                    &PeerTlsTrust::PlatformRoots
-                )
-                .await
-                .is_err(),
-                "saved {name}"
-            );
-            assert!(db.federation_peer_connection(peer).await.unwrap().is_none());
+            assert_peer_name_rejected(&db, peer, &name, &url, &token).await;
         }
         for name in [
             "laptop",
@@ -461,23 +491,7 @@ mod tests {
             " 雪 laptop ",
             "uuid-like-not-a-uuid",
         ] {
-            db.save_federation_peer_connection(
-                peer,
-                name,
-                &url,
-                &token,
-                &PeerTlsTrust::PlatformRoots,
-            )
-            .await
-            .unwrap();
-            let selector = InstanceSelector::parse(name).unwrap();
-            assert_eq!(
-                db.resolve_federation_peer(&selector)
-                    .await
-                    .unwrap()
-                    .peer_instance_id,
-                peer
-            );
+            save_peer_and_assert_resolves(&db, peer, name, &url, &token).await;
         }
         let collision = InstanceId::new();
         db.save_federation_peer_connection(

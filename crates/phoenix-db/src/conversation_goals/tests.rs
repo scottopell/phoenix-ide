@@ -31,6 +31,33 @@ fn goal_count_sql(table: &str, owner_scoped: bool) -> &'static str {
     }
 }
 
+async fn prior_goal_storage_fixture() -> (tempfile::TempDir, std::path::PathBuf, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prior-goals.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    let db = Database::from_pool_for_tests(pool, path.to_string_lossy().into_owned());
+    db.run_migrations().await.unwrap();
+    crate::migrations::run_before_goal_storage_for_test(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO _migrations (version, name) VALUES (133, 'opaque_federation_peer_notes')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    (dir, path, db)
+}
+
 fn p(value: &str) -> ProductConversationId {
     ProductConversationId::parse(value).unwrap()
 }
@@ -255,10 +282,9 @@ async fn all_actor_writes_compete_on_observed_version() {
         db.mutate_conversation_goal(&global, at())
     );
     assert_ne!(a.is_ok(), b.is_ok());
-    let error = if a.is_err() {
-        a.unwrap_err()
-    } else {
-        b.unwrap_err()
+    let error = match (a, b) {
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
+        (Ok(_), Ok(_)) | (Err(_), Err(_)) => unreachable!("assertion above failed"),
     };
     assert!(matches!(error, GoalDbError::Domain(GoalError::Conflict)));
     assert_eq!(
@@ -281,7 +307,9 @@ async fn wrong_owner_role_and_fabricated_user_channel_roll_back_every_row() {
     for actor in [
         GoalActor::Coordinator(match agent(false) {
             GoalActor::OwningAgent(s) => s,
-            _ => unreachable!(),
+            GoalActor::UserApi { .. }
+            | GoalActor::Coordinator(_)
+            | GoalActor::GeneratedHost { .. } => unreachable!(),
         }),
         GoalActor::UserApi {
             transcript_id: t("root"),
@@ -289,7 +317,9 @@ async fn wrong_owner_role_and_fabricated_user_channel_roll_back_every_row() {
         },
         GoalActor::OwningAgent(match agent(true) {
             GoalActor::Coordinator(s) => s,
-            _ => unreachable!(),
+            GoalActor::UserApi { .. }
+            | GoalActor::OwningAgent(_)
+            | GoalActor::GeneratedHost { .. } => unreachable!(),
         }),
     ] {
         let mut request = create();
@@ -1079,29 +1109,7 @@ async fn real_migrations_goal_binding_successful_report_and_hard_delete_remove_a
 
 #[tokio::test]
 async fn prior_schema_upgrade_adds_empty_goal_storage_preserves_source_rows_and_is_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("prior-goals.db");
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .filename(&path)
-                .create_if_missing(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    let db = Database::from_pool_for_tests(pool, path.to_string_lossy().into_owned());
-    db.run_migrations().await.unwrap();
-    crate::migrations::run_before_goal_storage_for_test(db.pool())
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO _migrations (version, name) VALUES (133, 'opaque_federation_peer_notes')",
-    )
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let (_dir, path, db) = prior_goal_storage_fixture().await;
     let goal_tables_before: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'conversation_goal_%'",
     )

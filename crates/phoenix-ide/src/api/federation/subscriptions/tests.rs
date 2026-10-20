@@ -1,5 +1,8 @@
 use super::*;
-use phoenix_core::domain::close::TranscriptConversationId;
+use phoenix_core::domain::{
+    close::TranscriptConversationId,
+    federation_subscription::{FederatedTerminalFact, SubscriptionGap, TerminalFactOutcome},
+};
 
 fn request() -> SubscriptionRequest {
     SubscriptionRequest {
