@@ -132,7 +132,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rust-check-${{ github.sha }}
-          path: ci-rust-logs/*.log
+          path: |
+            ci-rust-logs/*.log
+            target/codegen-scratch/**/*.ts
           retention-days: 7
           if-no-files-found: warn
       - name: Check production feature on musl

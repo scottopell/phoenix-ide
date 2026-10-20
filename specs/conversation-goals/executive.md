@@ -40,15 +40,37 @@ executed**: the command fixture imported `TranscriptConversationId` from the
 wrong module. The actual type is `domain::close::TranscriptConversationId`;
 that fixture import and its statement-order imports are source-corrected.
 The prior87 metrics/transport compiler roots are absent in this run.
-Its Clippy job **118437207992** reported sixteen DB diagnostics: command refusal
-branch order; explicit federation/remote-origin variant matches and semicolons;
-six concrete BTreeSet defaults; two test aliases after statements; and one
-102-line migration fixture. The corrective source addresses all sixteen without
+Its Clippy job **118437207992** reported one library plus sixteen lib-test
+diagnostic reports, including shared DB roots: command refusal branch order;
+explicit federation/remote-origin variant matches and semicolons; six concrete
+BTreeSet defaults; two test aliases after statements; and one 102-line migration
+fixture. The corrective source addresses these roots without
 new lint allowances or removed assertions; the last fixture uses a scalar-query
 future instead of a redundant async row wrapper. Migration edits are test-only:
 registered SQL, schema132 and the registry remain unchanged. The correction has
 had a staged-only read-only source review, not compiler/test qualification.
 Paused prepared-management tool work remains a separate uncommitted slice.
+
+Run **39363163071** captured exactd4336ee6f0cab3ceed52bf1ccf9b66ef967d49a4;
+normal Rust was still running when its completed Clippy job **118433878610** was
+inspected. The prior DB blockers cleared far enough to expose IDE diagnostics.
+Owned Stop roots are source-corrected with let-else, retaining token cancellation
+and the same typed GoalControlRevoked outcome. A shorter local fence binding
+keeps the same constructor fence/subscriber/cancellation ownership while bringing
+the literal below the reported length limit, without a new lint allowance.
+Shared federation/send-chat/global-read/test diagnostics remain unwaived; this
+is not a passing Clippy or executed-test claim.
+
+The existing UI InputOrigin/EventPresentation generated contracts remain stale.
+The Rust lane already runs ts-rs exports into `target/codegen-scratch`, but its
+artifact retained only logs. A collection-only workflow correction adds those
+scratch TS outputs to the existing artifact—no command, job, run, compiler step,
+timeout, worker budget or generation behavior changes. The already-captured
+d433 run cannot acquire this new collection retroactively. Future retrieval must
+verify successful export and exact producer checkout, inspect the artifact's new
+multi-root layout, and copy complete producer bytes verbatim while preserving
+the hand-authored sse.ts barrel. No generated files have been hand-edited; until
+that output is captured and committed the UI blocker remains real.
 
 The subsequent Stop-ordering and identity corrections remain source-only until
 an exact corrected-head run. No duplicate CI or local heavy execution was

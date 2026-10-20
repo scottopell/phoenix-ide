@@ -9,15 +9,16 @@ but the actual declaration is domain::close.rs. The fixture import is corrected,
 and its MessageContent/ConvState use is moved before statements. Prior87's
 metrics/Http compiler errors are absent in this run; that is not a test pass.
 
-The full actual Clippy job118437207992 log was downloaded and all sixteen DB
-diagnostics corrected in the same bounded validation slice: preserve refusal
+The full actual Clippy job118437207992 log was downloaded. Its one library plus
+sixteen lib-test diagnostic reports include shared roots, corrected in the same
+bounded validation slice: preserve refusal
 precedence while using equality; explicit Gap/Ended and InputOrigin variants;
 six concrete BTreeSet defaults; two alias moves before statements using
 clipboards; semicolons; and shorten the migration006 fixture via query_scalar.
 No lint allowance or test assertion was removed/added to waive the failures.
 In migrations.rs only migration130/006 test functions changed; the federation
 alias move is likewise test-only. No migration SQL/schema132 or registry changed. A frozen staged-only review found no actionable issue and checked
-all sixteen diagnostics, the real close type and scalar-query future lifetime.
+each reported root, the real close type and scalar-query future lifetime.
 No local compiler/test/SQL/browser ran. Corrected source remains unqualified;
 2ec127/127 is still the only wholly passing focused floor,4e139/140 is partial,
 and both87/387 are compile-red with zero focused execution. Parent owns the
@@ -28,6 +29,33 @@ this correction commit: core pending_management.rs (untracked), its core module
 export and the service's shared-disposition alias. It has not entered runtime,
 tool schema or checkpoint integration and is not a claimed completed adapter.
 The full command/tool/UI/watch/automatic-continuation commission remains open.
+
+## d433 running qualification — owned IDE lint correction and producer evidence
+
+Parent-only run39363163071 captured d4336ee6f0cab3ceed52bf1ccf9b66ef967d49a4.
+While its normal Rust lane was still running, completed Clippy job118433878610
+was retrieved directly through the job-log API (gh run view refuses incomplete
+runs despite a completed job). Its prior DB blockers cleared far enough to show
+IDE diagnostics. Owned Stop branch now uses let-else but still cancels the same
+token and returns exactly GoalControlRevoked. The constructor binds the same
+fatal fence with a shorter local name so initialization fits the lint limit;
+all subscribers/cancellation handles retain the same owner. No lint allowance
+was added. Shared federation/send-chat/global-read/test failures are recorded,
+not waived or represented as green. Source fixes are not executed evidence.
+
+Existing UI InputOrigin/EventPresentation generated types are still stale.
+No generated file was hand-edited. Read-only source inspection established that
+the existing Rust lane exports fresh ts-rs bytes into target/codegen-scratch
+before broad tests, but its artifact kept only logs. The next bounded workflow
+change adds recursive scratch TS collection to that SAME existing upload step:
+no compiler command/job/run/timeout/worker-budget/resource activation changes.
+Already-captured d433 cannot be retrofitted. Future retrieval must verify exact
+producer checkout and successful complete export, inspect the new multi-root
+archive paths, then copy actual producer bytes verbatim while preserving the
+hand-authored sse.ts barrel. Until captured and committed, UI remains blocked.
+The pure internal Event enum is not TS-exported; do not conflate a future
+GoalManagementPrepared runtime event with the unrelated EventPresentation wire
+type or invent generated changes for an internal-only event.
 
 ## Resumed Stop-ordering correction — same writer, source-only
 

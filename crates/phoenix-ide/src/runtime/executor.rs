@@ -889,22 +889,19 @@ where
             error: "EUNAVAIL: tool is unavailable under the current conversation policy".into(),
         };
     }
-    let output = match goal_dispatch
+    let Ok(output) = goal_dispatch
         .run(
             tool_executor
                 .execute(checked.with_input_schema(request_schema), tool_ctx)
                 .instrument(span.clone()),
         )
         .await
-    {
-        Ok(output) => output,
-        Err(_) => {
-            cancel_token_check.cancel();
-            return ToolExecOutcome::Aborted {
-                tool_use_id,
-                reason: crate::state_machine::AbortReason::GoalControlRevoked,
-            };
-        }
+    else {
+        cancel_token_check.cancel();
+        return ToolExecOutcome::Aborted {
+            tool_use_id,
+            reason: crate::state_machine::AbortReason::GoalControlRevoked,
+        };
     };
 
     if cancel_token_check.is_cancelled() {
@@ -2333,7 +2330,7 @@ where
 
         let tool_executor = Arc::new(tool_executor);
         let clearable_names = Arc::new(tool_executor.clearable_tool_names());
-        let fatal_local_authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
 
         Self {
             context,
@@ -2394,10 +2391,8 @@ where
             steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
-            fatal_local_authority_rx: Some(fatal_local_authority_fence.subscribe()),
-            fatal_external_effect_cancellation: Some(
-                fatal_local_authority_fence.external_effect_cancellation(),
-            ),
+            fatal_local_authority_rx: Some(fence.subscribe()),
+            fatal_external_effect_cancellation: Some(fence.external_effect_cancellation()),
             #[cfg(test)]
             external_effect_dispatch_barrier: None,
             #[cfg(test)]
@@ -2411,7 +2406,7 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
-            fatal_local_authority_fence,
+            fatal_local_authority_fence: fence,
             svg_publication_lifetime: super::svg_artifacts::SvgPublicationLifetime::new(),
             handoff_completion_authority: None,
             handoff_completion_timestamp: None,
