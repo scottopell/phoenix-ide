@@ -2301,7 +2301,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                     helper.activate(mutated, ctl)
                 self.assertNotIn("stop", ctl.events)
 
-    def test_actual_registry134_named_sql_parses_only_as_ordinary_target(self):
+    def test_actual_registry135_named_sql_parses_only_as_ordinary_target(self):
         manifest = self.protected()
         actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
         artifact = helper.Artifact(str(actual_registry), digest(actual_registry))
@@ -2311,7 +2311,8 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
             registry=artifact,
         )
         ledger = helper.candidate_registry(ordinary)
-        self.assertEqual(ledger[-1], (134, "durable_conversation_goal_user_control"))
+        self.assertIn((134, "durable_conversation_goal_user_control"), ledger)
+        self.assertEqual(ledger[-1], (135, "local_watch_goal_capture"))
         protected = dataclasses.replace(manifest, registry=artifact)
         with mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", artifact.sha256):
             with self.assertRaisesRegex(helper.ActivationError, "exact qualified target128"):

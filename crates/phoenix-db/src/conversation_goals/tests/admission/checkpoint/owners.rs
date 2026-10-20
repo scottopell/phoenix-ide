@@ -1,3 +1,4 @@
+#[path = "owners/local_watch.rs"]
 mod local_watch;
 
 use chrono::{DateTime, Utc};

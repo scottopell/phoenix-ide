@@ -448,8 +448,10 @@ async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_
     }
     crate::coordinator_watches::record_terminal_event_tx(
         &mut tx,
-        32,
-        0,
+        crate::coordinator_watches::TerminalEventSource {
+            turn_id: 32,
+            generation: 0,
+        },
         &f.source.id,
         "Failed",
         None,

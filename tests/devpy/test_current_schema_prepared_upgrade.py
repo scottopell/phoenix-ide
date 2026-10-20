@@ -585,10 +585,11 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
 
         self.assertEqual(ledger, tuple(compiled_ledger()))
 
-    def test_actual_registry134_named_sql_parses_without_qualifying_protected_target(self) -> None:
+    def test_actual_registry135_named_sql_parses_without_qualifying_protected_target(self) -> None:
         actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
         ledger = helper.migration_registry(actual_registry, qualified_current_target=False)
-        self.assertEqual(ledger[-1], (134, "durable_conversation_goal_user_control"))
+        self.assertIn((134, "durable_conversation_goal_user_control"), ledger)
+        self.assertEqual(ledger[-1], (135, "local_watch_goal_capture"))
         self.assertEqual(ledger, tuple(compiled_ledger(through=None)))
         with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
             helper.migration_registry(actual_registry)

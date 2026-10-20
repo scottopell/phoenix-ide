@@ -300,10 +300,14 @@ impl Database {
     }
 }
 
+pub(crate) struct TerminalEventSource {
+    pub(crate) turn_id: u64,
+    pub(crate) generation: u64,
+}
+
 pub(crate) async fn record_terminal_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    turn_id: u64,
-    generation: u64,
+    source: TerminalEventSource,
     transcript_id: &str,
     terminal_kind: &str,
     reason: Option<&str>,
@@ -313,8 +317,8 @@ pub(crate) async fn record_terminal_event_tx(
     record_watch_event_tx(
         tx,
         "direct_turn",
-        &turn_id.to_string(),
-        generation,
+        &source.turn_id.to_string(),
+        source.generation,
         transcript_id,
         terminal_kind,
         reason,
@@ -703,8 +707,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn_id,
-            0,
+            TerminalEventSource {
+                turn_id,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("overload recovery exhausted"),
@@ -1128,8 +1134,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            historical,
-            0,
+            TerminalEventSource {
+                turn_id: historical,
+                generation: 0,
+            },
             &source.id,
             "Completed",
             None,
@@ -1153,8 +1161,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("model failed"),
@@ -1165,8 +1175,10 @@ mod tests {
         .unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("model failed"),
@@ -1208,8 +1220,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("context exhausted"),
@@ -1309,8 +1323,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("failed"),
@@ -1349,8 +1365,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Completed",
             None,
@@ -1361,8 +1379,10 @@ mod tests {
         .unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("context exhausted"),
@@ -1487,8 +1507,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("source failed"),
@@ -1545,8 +1567,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            later,
-            0,
+            TerminalEventSource {
+                turn_id: later,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("later failure"),
@@ -1602,8 +1626,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Cancelled",
             None,
@@ -1661,8 +1687,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &ordinary.id,
             "Completed",
             None,
@@ -1880,8 +1908,10 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Completed",
             None,

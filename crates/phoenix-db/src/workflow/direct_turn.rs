@@ -2690,8 +2690,10 @@ impl WorkflowRepository {
         }
         crate::coordinator_watches::record_terminal_event_tx(
             &mut tx.tx,
-            turn_id.0,
-            expected_generation,
+            crate::coordinator_watches::TerminalEventSource {
+                turn_id: turn_id.0,
+                generation: expected_generation,
+            },
             &turn.conversation.0,
             terminal_kind,
             reason,

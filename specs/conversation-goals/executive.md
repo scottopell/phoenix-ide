@@ -71,6 +71,41 @@ the preceding eligibility-trigger assertion and following valid captured
 transaction. No production source, migration SQL, CHECK/default or execution gate
 changes. Both corrections remain **authored and UNRUN**.
 
+### First hosted typed-watch diagnostic and corrective source packet
+
+Parent-owned diagnostic run `39468405487` at exact
+`dc18d89530139e985c87fbf2497551c7780371a6` terminated failed. Its retained artifact
+`12285344109` does not establish codegen/export success: capture failed after
+248.8 seconds, before usable test binaries, focused execution or authentic TS
+exports. No generated-file import is authorized by that artifact. The existing
+qualified floor remains only UI 12 checks and 209/209 focused assertions at exact
+`efcc5edf` / run `39451089782`; shared broad/Clippy blockers remain unwaived.
+
+Actual compiler E0583 and formatter resolution failure identify `owners.rs`'s
+new `local_watch` child: its parent is explicitly path-mounted, so the child
+needs `#[path = "owners/local_watch.rs"]`, matching the existing sibling's
+pattern. The correction audits the other newly introduced module declarations
+against their on-disk paths; no other new path override is needed by source
+inspection. This is not a compiler qualification claim.
+
+Actual dev.py registry-test failures had treated migration 134 as the tail.
+The bounded test changes retain an assertion for the unchanged 134 entry and
+assert the 135 `local_watch_goal_capture` tail in ordinary parsing. Protected
+qualified-target rejection and ceiling 128 are unchanged; no deployment-helper
+grammar, hash, activation policy or production service behavior changes.
+
+Actual new owned Clippy `too_many_arguments` identifies the terminal watch sink.
+The correction groups the existing turn ID and generation as
+`TerminalEventSource` at all 15 calls, reducing the boundary to seven arguments
+without changing any occurrence value, terminal fact, transaction or required
+installation policy. No ambient gate or lint suppression is added. Other reported
+UI lint/style/Vitest/AST/manual-SQL/spec/Allium/anchor/lock checks passed in that
+run; tsc's missing/stale generated exports remain expected diagnostic failures,
+not waivers or a qualified UI cut. Corrective source/tests are **UNRUN**, with
+only authorized direct owned-file rustfmt and Git whitespace inspection locally.
+No new CI, push, import, resources, service installation or activation follows
+without the parent's next independent review and guarded direction.
+
 | Contract | Implementation/verification boundary |
 |---|---|
 | REQ-GOAL-011 | Existing terminal/wait outbox transactions must capture saved current goal or observed absence, distinct from legacy not-captured; usage explicitly unavailable. Storage and boundary tests owed. |
