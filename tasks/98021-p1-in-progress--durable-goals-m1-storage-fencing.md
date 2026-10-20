@@ -525,3 +525,56 @@ parts, populated upgrade proof, host-authenticated service/API and actual atomic
 Goal/NoGoal+control admission capture remain required before registration or
 activation. Only tests include the SQL; production migration registry and132
 schema are untouched. Reservation134 is persisted, not prematurely executable.
+
+### Trusted Stop/release service and atomic capture source increment
+
+Added `conversation_goals/control.rs`: a real `BEGIN IMMEDIATE` command owner
+checks ordinary/open membership and close obligations **before** receipt lookup,
+then returns exact accepted/rejected receipts before later version checks or
+mutation. Changed command/expected version at the same owner/principal/request
+identity is conflict. New receipts and latch advancement use the same transaction;
+timestamps on retries remain the original committed timestamp. This is low-level
+persistence, not authentication or a claim that the reserved schema is installed.
+
+Added `runtime/goal_control.rs`: the application method requires the existing
+`OwnerAuthenticated` extractor marker and derives the correlation principal from
+`Database::instance_id()`, never request/model fields. Its private optional
+storage is `None` by default and is installed only inside tests. The DTO denies
+unknown fields. Guest and `PeerAuthenticated` markers cannot extract owner auth.
+No principal/session registry or model-provided actor was added.
+
+Added the real owner-only HTTP adapter at
+`POST /api/product-conversations/:reference/goal-control`, always backed by the
+default disabled service: authenticated normal requests receive503 without any
+control DB access; guest requests receive401 and forged principal fields are
+rejected by the actual JSON extractor. **The route is present, installation is
+not.** No runtime Stop cancellation, goal mutation, continuation, control-release
+or production activation can occur through this adapter in this source state.
+
+`bind_control_at_admission_tx` captures the accepted open version/request for an
+exact `GoalExecution` in a caller-owned transaction. A new DB test composes this
+actual helper with the actual132 `bind_goal_at_admission_tx` for both Goal and
+NoGoal: stopped control rejects and rolls back the goal observation; release
+allows both rows to commit. These unexecuted assertions target the real transaction composition,
+not installation in the public/runtime admission path. The candidate SQL also
+checks ordinary/open owner and close obligations for receipt/binding insertion.
+
+Additional unexecuted tests cover real accepted receipt retry after later changes,
+rejected receipt replay after later changes, same-ID changed input conflict,
+authorization re-check before old receipt replay when owner closes, guest/peer
+extractor refusal, forged input refusal, disabled default, and actual HTTP
+401/503/422 behavior. Concrete symbols were read before publication:
+`GoalExecution::turn_id()/workflow_id()` (private fields),
+`Database::conversation_goal_execution_binding(GoalExecution)`,
+`InstanceId::Display/from_uuid`, `Database::instance_id`, `ProductConversationId::new`,
+`OwnerAuthenticated::from_request_parts`, `PeerAuthenticated`'s three fields,
+`ControlSnapshot`'s nonzero version, SQLx transaction/query APIs, and the existing
+Axum Router/Tower oneshot fixture convention. The candidate include path was
+checked on disk. This is source grounding, not compile/test qualification.
+
+Accepted appropriate-command UserControl actor references and populated132 cyclic
+actor/history/binding rebuild remain the next implementation slice; the present
+Stop/release receipts do not pretend to be a completed actor migration or public
+admission installation. Registration134 still waits for actual133 import. Current
+hosted e19 run39343463637 remains the only active qualification; this increment
+is not in that older run, and no duplicate/new run was dispatched.

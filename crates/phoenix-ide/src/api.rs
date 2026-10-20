@@ -15,6 +15,7 @@ mod event_presentation;
 pub(crate) mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
+mod goal_control;
 pub(crate) mod handlers;
 mod installation_ownership;
 mod lifecycle_handlers;

@@ -16,6 +16,7 @@ pub mod deny_gate;
 pub(crate) mod direct_turn_worker;
 pub(crate) mod executor;
 pub(crate) mod fork_resolve;
+pub mod goal_control;
 pub mod pr_status_poll;
 mod recovery;
 mod svg_artifacts;
