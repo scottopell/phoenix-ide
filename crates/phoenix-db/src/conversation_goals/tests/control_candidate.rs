@@ -152,3 +152,56 @@ async fn conversation_goal_control_candidate_ordinary_owner_and_source_deletion_
     .unwrap();
     assert_eq!(receipts, 0);
 }
+
+#[tokio::test]
+async fn conversation_goal_control_candidate_goal_or_no_goal_capture_shares_atomic_transaction() {
+    use crate::conversation_goals::control::{bind_control_at_admission_tx, ControlError};
+    for with_goal in [false, true] {
+        let (_dir, db) = control_fixture().await;
+        accepted(&db, "stop", 0, 1).await.unwrap();
+        let observation = if with_goal {
+            let goal = db
+                .apply_conversation_goal(&create(), "root", at())
+                .await
+                .unwrap()
+                .snapshot;
+            GoalAdmissionObservation::Goal(goal.fence())
+        } else {
+            GoalAdmissionObservation::NoGoal {
+                observed_version: GoalVersion::INITIAL,
+            }
+        };
+        assert_eq!(control_version(&db).await, Some((1, 1)));
+        let binding = GoalExecutionBinding {
+            owner: ProductConversationId::new("owner").unwrap(),
+            execution: GoalExecution::parse(1, 1).unwrap(),
+            observation,
+        };
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        bind_goal_at_admission_tx(&mut tx, &binding).await.unwrap();
+        assert!(matches!(
+            bind_control_at_admission_tx(&mut tx, &binding.owner, binding.execution).await,
+            Err(ControlError::AdmissionStopped)
+        ));
+        tx.rollback().await.unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM conversation_goal_bindings WHERE turn_id=1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+        accepted(&db, "release", 1, 2).await.unwrap();
+        let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        bind_goal_at_admission_tx(&mut tx, &binding).await.unwrap();
+        bind_control_at_admission_tx(&mut tx, &binding.owner, binding.execution)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(binding_is_current(&db, 1).await);
+        let captured = db
+            .conversation_goal_execution_binding(binding.execution)
+            .await
+            .unwrap();
+        assert_eq!(captured, Some(binding));
+    }
+}

@@ -51,7 +51,9 @@ CREATE TABLE conversation_goal_control_bindings (
 
 CREATE TRIGGER conversation_goal_control_request_source
 BEFORE INSERT ON conversation_goal_control_requests
-WHEN NOT EXISTS (SELECT 1 FROM product_conversations WHERE id = NEW.owner_id AND kind = 'ordinary')
+WHEN NOT EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = NEW.owner_id
+    AND p.kind = 'ordinary' AND p.ordinary_lifecycle = 'open'
+    AND NOT EXISTS (SELECT 1 FROM close_obligations o WHERE o.product_conversation_id = p.id AND o.phase <> 'completed'))
  OR NEW.result_control_version <> COALESCE((SELECT control_version FROM conversation_goal_controls WHERE owner_id = NEW.owner_id), 0)
     + CASE NEW.outcome WHEN 'accepted' THEN 1 ELSE 0 END
  OR (NEW.outcome = 'rejected' AND NEW.result_stopped IS NOT
@@ -77,11 +79,13 @@ CREATE TRIGGER conversation_goal_control_binding_admission
 BEFORE INSERT ON conversation_goal_control_bindings
 WHEN NOT EXISTS (
     SELECT 1 FROM conversation_goal_controls ctl
+    JOIN product_conversations p ON p.id = ctl.owner_id AND p.kind = 'ordinary' AND p.ordinary_lifecycle = 'open'
     JOIN durable_turns t ON t.turn_id = NEW.turn_id AND t.workflow_id = NEW.workflow_id
     JOIN conversations c ON c.id = t.conversation_id
     WHERE ctl.owner_id = NEW.owner_id AND c.product_conversation_id = NEW.owner_id
       AND ctl.control_version = NEW.control_version AND ctl.stopped = 0
       AND ctl.principal_id = NEW.principal_id AND ctl.request_id = NEW.request_id
+      AND NOT EXISTS (SELECT 1 FROM close_obligations o WHERE o.product_conversation_id = p.id AND o.phase <> 'completed')
       AND t.disposition = 'Runtime' AND t.terminal_kind IS NULL
       AND t.owns_conversation = 1 AND t.canonical_message_id IS NULL)
 BEGIN SELECT RAISE(ABORT, 'control binding must match open admission'); END;
