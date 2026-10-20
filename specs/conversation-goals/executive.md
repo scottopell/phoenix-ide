@@ -161,8 +161,20 @@ The parent verified actual PR902 source at
 `83478ea102d5a5e346c32ca4862aeebba1242a27` with schema133
 `opaque_federation_peer_notes`, and exact byte parity of its schema132 with the
 accepted goal schema. That evidence supersedes earlier absence statements;
-the narrow non-destructive133 source integration is separate pending work.
-Schema134 remains unregistered through that integration and qualification gate.
+the narrow non-destructive133 source integration is a separate source-only cut.
+Its registry entry and SQL are byte-identical to that retained remote source:
+only the bounded opaque text `notes` column is added. No federation handler,
+transport, tool, UI, or credential behavior is imported. The existing populated
+connection preservation/UTF-8 byte-boundary test is copied from the same source.
+A new fresh-schema regression covers default empty notes,32768-byte acceptance,
+oversize/null/blob rejection, ledger133, idempotence, and absent134 registration.
+The schema130 full-upgrade fixture stamps132/133 only to defer those unrelated
+steps while inspecting130. It then removes those temporary stamps and executes
+the real132/133 migrations before comparing the complete upgraded schema with a
+fresh database; the132 stamp is not treated as proof of schema application.
+Schema132 SQL remains unchanged. Formatting, diff checks and binary-safe remote
+registry/SQL comparison passed; no migration SQL or tests were executed locally.
+Schema134 remains unregistered through source review and hosted qualification.
 
 The production service/emitter is absent, public tool registration and UI remain
 unfinished, and watches/autocontinuation are not claimed. Schema132 is untouched;
