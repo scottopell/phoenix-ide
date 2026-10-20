@@ -485,26 +485,10 @@ async fn classification_fanout_consumes_cancellation_once_and_drops_nonterminal_
 }
 
 async fn coordinator(db: &Database) -> String {
-    let c = db
-        .create_conversation(
-            "federation-coordinator",
-            "coordinator",
-            "/tmp",
-            true,
-            None,
-            None,
-        )
+    db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
         .await
-        .unwrap();
-    sqlx::query("UPDATE product_conversations SET kind = 'coordinator', ordinary_lifecycle = NULL WHERE id = ?1").bind(c.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
-    sqlx::query(
-        "UPDATE conversations SET runtime_role = 'coordinator', coordinator_head = 1 WHERE id = ?1",
-    )
-    .bind(&c.id)
-    .execute(db.pool())
-    .await
-    .unwrap();
-    c.id
+        .unwrap()
+        .id
 }
 async fn remote_fixture(db: &Database) -> RemoteSubscription {
     let reference = SubscriptionReference {
@@ -832,6 +816,12 @@ async fn continuation_candidate(f: &Fixture) {
         )
         .await
         .unwrap();
+    f.db.set_auto_continue_on_context_exhaustion(
+        &f.source.product_conversation_id,
+        phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO automatic_continuation_admissions(predecessor_conversation_id,product_conversation_id,summary_message_id,operation_id,first_message_id,admitted_at_unix_micros,updated_at_unix_micros) VALUES (?1,?2,?3,'federation-continuation','federation-successor-first',1,1)").bind(&f.source.id).bind(f.source.product_conversation_id.as_str()).bind(summary.message_id).execute(f.db.pool()).await.unwrap();
 }
 
@@ -2515,8 +2505,47 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
     );
     f.db.update_conversation_state(
         &f.source.id,
+        &ConvState::ContextExhausted {
+            summary: "successful summary".into(),
+        },
+    )
+    .await
+    .unwrap();
+    f.db.add_message(
+        "successful-summary",
+        &f.source.id,
+        &crate::MessageContent::continuation("successful summary"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (outcome, _) =
+        f.db.continue_conversation_with_intent(
+            &f.source.id,
+            crate::NewContinuationDispatchIntent::generated_predecessor_context(
+                ClientTurnKey::new("summary-successor-opening").unwrap(),
+                "successful summary".into(),
+            ),
+        )
+        .await
+        .unwrap();
+    let crate::ContinueOutcome::Created(successor) = outcome else {
+        panic!("successor required")
+    };
+    f.db.add_message(
+        "summary-successor-opening",
+        &successor.id,
+        &crate::MessageContent::continuation("successful summary"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    f.db.update_conversation_state(
+        &f.source.id,
         &ConvState::HandedOff {
-            successor_conv_id: "summary-successor".into(),
+            successor_conv_id: successor.id,
         },
     )
     .await

@@ -23631,12 +23631,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_messages
         );
+        let mut expected_newest_first = expected_messages.clone();
+        expected_newest_first.reverse();
         assert_eq!(
             product_page
                 .iter()
                 .map(|(_, message)| (message.message_id.clone(), message.origin.clone()))
                 .collect::<Vec<_>>(),
-            expected_messages
+            expected_newest_first
         );
     }
 

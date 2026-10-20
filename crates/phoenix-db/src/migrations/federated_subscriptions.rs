@@ -131,17 +131,9 @@ mod tests {
             .await
             .unwrap();
         let target = db
-            .create_conversation(
-                "historical-coordinator",
-                "coordinator",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
-        sqlx::query("UPDATE product_conversations SET kind = 'coordinator', ordinary_lifecycle = NULL WHERE id = ?1").bind(target.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
         sqlx::query(
             "INSERT INTO coordinator_roots(product_conversation_id,name) VALUES (?1,'historical')",
         )
