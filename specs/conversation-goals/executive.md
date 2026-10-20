@@ -62,19 +62,45 @@ The parent reported terminal failure of the UI lane `118690151347` in hosted run
 `39440857025` at exact `5f1203f858bb4c410574453b6c5efc0b5e8f9065`, retaining
 `evidence/goals-ci-39440857025/ui-specs.log` in the parent harness. TypeScript and
 ESLint failed; Vitest reported 3808 passed, 2 failed and 2 skipped across 182
-files (181 passed). The two failed cases were the 403/503 unknown-retry tests,
-which asserted the new owner's enabled Create control before its facts settled.
+files (181 passed). The two failed cases were the 403/503 unknown-retry tests.
+The initial readiness-only diagnosis was incomplete: the keyed details component
+also resets the new owner's objective to blank, correctly disabling Create.
 Stylelint, ast-grep, manual-SQL audit, spec shape, Allium, dev.py and package-lock
 checks passed in that lane. Static review missed these three owned roots; it did
-not qualify UI execution. Rust was still active when the parent relayed this
-result and remains parent-monitored, not classified here.
+not qualify UI execution.
 
-The bounded correction separates unavailable/error discriminants in `Facts`,
-replaces a type-only unused disposition schema with the equivalent explicit
-request DTO union, and waits for the new owner's enabled control in the two retry
-cases without weakening UUID/payload retention assertions. This corrective
-source has **not run**; no corrected TypeScript, ESLint, Vitest, browser journey
-or user-visible runtime qualification is claimed.
+The first correction, `75c78339a8960866830aa0e2c07a839bdcf11a97`, separated
+unavailable/error discriminants in `Facts`, replaced the type-only unused
+disposition schema with the equivalent explicit request DTO union, and added a
+readiness wait in the retry tests. Parent-reported hosted run `39447059443`, UI
+lane `118711877469`, passed TypeScript, ESLint and stylelint but failed Vitest:
+3807 passed, 3 failed and 2 skipped across 182 files (180 passed). Both retry
+cases still failed because the new owner's objective was empty. The third
+failure was the finalization fixture's structural render count (8 versus 6).
+The parent retains `evidence/goals-ci-39447059443/ui-specs.log`; the existing
+run's Rust monitoring remains parent-owned.
+
+The second bounded correction changes fixtures, not production behavior. The
+retry cases verify the new owner's empty objective, enter an unsent objective,
+wait for enabled Create and assert that no additional command was sent before
+switching back. The original owner's exact UUID/payload and blocking assertions
+remain intact; owner keys and blank-objective rejection are unchanged.
+
+Source inspection found that the finalization fixture mocked the main `api` but
+not `goalApi`, and its `open()` waited only for transcript text. The real
+`useConversationGoals.refresh` starts independent reads and later sets facts on
+the product owner after `Promise.all`, allowing initial network completion to
+cross the token-churn baseline. The fixture now supplies deterministic null/empty
+goal reads and renders the real extension summary, then waits for `GOAL none`
+(the committed ready state) before returning from `open()`. The structural,
+embedded and history render-count assertions are unchanged, with additional
+assertions that token/heartbeat churn starts no new goal reads or commands.
+This is a source-grounded isolation correction, not an executed proof that the
+count failure is resolved; no token-driven production re-render defect is
+established by the contaminated baseline.
+
+This second corrective source has **not run**. No corrected Vitest, browser
+journey or user-visible runtime qualification is claimed.
 
 The review boundary is this ordinary UI correction only. Source inspection and
 whitespace diff checks are not execution evidence. Parent independent review
@@ -83,7 +109,17 @@ remains parent-owned. No local compiler, test, SQL, browser or Cargo metadata
 command is authorized for this cut. Typed watch and automatic follow-through
 remain unfinished, deferred work rather than hidden claims of completion.
 
-The latest qualified backend floor is **209/209 at exact
+The latest parent-reported backend-only floor is **209/209 at exact
+`5f1203f858bb4c410574453b6c5efc0b5e8f9065`**, run `39440857025`, artifact
+`12275977275`, 257.256 seconds with 3384 skipped. Capture took 505.4 seconds,
+codegen reuse 1.2 seconds and freshness passed. Broad hit its 1500-second timeout:
+5184 of 5507 run, 5151 passed, 33 failed and 191 skipped in 1499.614 seconds.
+This is a partial run, not a completed comparison to the earlier shared 30.
+Clippy reported 13 library and 17 test findings; no owned root in the visible
+tail is not a full-inventory-clear claim. These failures remain unwaived and
+backend-only qualification does not qualify UI.
+
+The earlier backend floor was **209/209 at exact
 `245da1764bf1085dc25d6dff29e3b8b79114de34`**, run `39431777571`, artifact
 `12268869127`, 145.406 seconds with captured full-workspace harnesses. All three
 control-read router tests and typed-admission unit passed there; capture took

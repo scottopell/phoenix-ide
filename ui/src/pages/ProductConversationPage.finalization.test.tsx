@@ -3,6 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { forwardRef, memo, Profiler, StrictMode, useEffect, useImperativeHandle } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
+import { goalApi } from '../goalApi';
+import type { StateBarConversationExtension } from '../components/StateBar';
 import type { EmbeddedConversationProjection } from './ConversationPage';
 import type { PendingUserMessage } from '../hooks/useMessageQueue';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -75,15 +77,16 @@ vi.mock('../components/VirtualTranscript', async () => {
   };
 });
 vi.mock('./ConversationPage', () => ({
-  EmbeddedConversationPage: ({ onProjectionChange }: {
+  EmbeddedConversationPage: ({ onProjectionChange, stateBarExtension }: {
     onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
+    stateBarExtension?: StateBarConversationExtension | undefined;
   }) => {
     probe.embeddedRenders++;
     useEffect(() => {
       // Deliberately retain the passive projection even after the atom acknowledges a send.
       if (probe.projection) onProjectionChange?.(probe.projection);
     }, [onProjectionChange]);
-    return <div>composer owner</div>;
+    return <div><span>composer owner</span>{stateBarExtension?.summary}</div>;
   },
 }));
 vi.mock('../hooks/useConnection', () => ({ useConnection: vi.fn() }));
@@ -108,6 +111,14 @@ vi.mock('../api', async () => {
   return { ...actual, api: { ...actual.api,
     getProductConversationHistorySnapshot: vi.fn(),
     reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
+  } };
+});
+
+vi.mock('../goalApi', async importOriginal => {
+  const actual = await importOriginal<typeof import('../goalApi')>();
+  return { ...actual, goalApi: {
+    current: vi.fn().mockResolvedValue(null), control: vi.fn().mockResolvedValue(null),
+    history: vi.fn().mockResolvedValue([]), command: vi.fn(),
   } };
 });
 
@@ -153,6 +164,11 @@ async function open(expected = 'Live question') {
     </MemoryRouter>
   </ConversationContext.Provider></StrictMode>);
   await screen.findByText(expected);
+  await screen.findByText('GOAL none');
+  expect(goalApi.current).toHaveBeenCalledWith('pc-product-alpha');
+  expect(goalApi.control).toHaveBeenCalledWith('pc-product-alpha');
+  expect(goalApi.history).toHaveBeenCalledWith('pc-product-alpha', 0);
+  expect(goalApi.command).not.toHaveBeenCalled();
   return view;
 }
 async function startStream(requestId = 'ordinary-final', text = 'RESPONSE_MARKER') {
@@ -166,6 +182,10 @@ function responseRows(commit: typeof commits[number], requestId = 'ordinary-fina
 
 beforeEach(() => {
   store = new ConversationStore();
+  vi.mocked(goalApi.current).mockClear();
+  vi.mocked(goalApi.control).mockClear();
+  vi.mocked(goalApi.history).mockClear();
+  vi.mocked(goalApi.command).mockClear();
   probe.structuralRenders = 0;
   probe.embeddedRenders = 0;
   probe.historyRenders = 0;
@@ -268,6 +288,7 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     await open();
     await startStream();
     const baseline = { structural: probe.structuralRenders, embedded: probe.embeddedRenders, history: probe.historyRenders };
+    const goalReads = [vi.mocked(goalApi.current).mock.calls.length, vi.mocked(goalApi.control).mock.calls.length, vi.mocked(goalApi.history).mock.calls.length];
     for (let index = 0; index < 5; index++) act(() => {
       token('ordinary-final', ` token-${index}`);
       store.dispatch(latestRow, { type: 'sse_event_observed' });
@@ -276,6 +297,8 @@ describe('ProductConversationPage atom-owned ordinary finalization', () => {
     expect(probe.structuralRenders).toBe(baseline.structural);
     expect(probe.embeddedRenders).toBe(baseline.embedded);
     expect(probe.historyRenders).toBe(baseline.history);
+    expect([vi.mocked(goalApi.current).mock.calls.length, vi.mocked(goalApi.control).mock.calls.length, vi.mocked(goalApi.history).mock.calls.length]).toEqual(goalReads);
+    expect(goalApi.command).not.toHaveBeenCalled();
     expect(commits.length).toBeGreaterThan(0);
   });
 
