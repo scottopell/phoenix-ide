@@ -27,14 +27,78 @@ fn generated_reference_has_exact_supported_paths_and_resolvable_derived_schemas(
             Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
         }
     }
+
+    fn assert_operation(
+        reference: &Value,
+        path: &str,
+        method: &str,
+        access: Access,
+        success_status: &str,
+        request_schema: Option<&str>,
+        response_schema: &str,
+    ) {
+        let operation = &reference["paths"][path][method];
+        assert_eq!(operation["security"], access.security(), "{path}");
+        let mut statuses = operation["responses"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        statuses.sort_unstable();
+        let mut expected_statuses = vec![success_status, "default"];
+        expected_statuses.sort_unstable();
+        assert_eq!(statuses, expected_statuses, "{path}");
+        assert_eq!(
+            operation["responses"][success_status]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{response_schema}"),
+            "{path}"
+        );
+        if let Some(request_schema) = request_schema {
+            assert_eq!(operation["requestBody"]["required"], true, "{path}");
+            assert_eq!(
+                operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{request_schema}"),
+                "{path}"
+            );
+        } else {
+            assert!(operation.get("requestBody").is_none(), "{path}");
+        }
+    }
+
+    fn assert_required_properties(schemas: &Value, name: &str, expected: &[&str]) {
+        let schema = &schemas[name];
+        let mut properties = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        properties.sort_unstable();
+        let mut required = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect::<Vec<_>>();
+        required.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(properties, expected, "{name} properties");
+        assert_eq!(required, expected, "{name} required");
+    }
     let id = InstanceId::new();
     let reference = serde_json::to_value(generate(id)).unwrap();
     assert_eq!(reference["info"]["title"], "Federation API reference");
     assert_eq!(reference["x-phoenix-instance-id"], json!(id));
     let mut expected = vec![
         "/openapi.json".to_string(),
+        "/api/federation/enrollments".into(),
+        "/api/federation/enrollments/{caller_instance_id}/revoke".into(),
         "/api/federation/openapi".into(),
+        "/api/federation/peer/identity".into(),
         "/api/federation/peers".into(),
+        "/api/federation/peers/import".into(),
         "/api/federation/peers/{instance}/notes".into(),
         "/api/federation/peer/send-authored-conversation-message".into(),
     ];
@@ -81,7 +145,98 @@ fn generated_reference_has_exact_supported_paths_and_resolvable_derived_schemas(
             .collect::<Vec<_>>(),
         expected
     );
+    assert_operation(
+        &reference,
+        "/api/federation/enrollments",
+        "post",
+        Access::Owner,
+        "201",
+        Some("IssueEnrollmentRequest"),
+        "EnrollmentTransferBundle",
+    );
+    assert_operation(
+        &reference,
+        "/api/federation/peers/import",
+        "post",
+        Access::Owner,
+        "200",
+        Some("ImportPeerConnectionRequest"),
+        "ImportPeerConnectionResponse",
+    );
+    assert_operation(
+        &reference,
+        "/api/federation/enrollments/{caller_instance_id}/revoke",
+        "post",
+        Access::Owner,
+        "200",
+        None,
+        "RevokeEnrollmentResponse",
+    );
+    assert_eq!(
+        reference["paths"]["/api/federation/enrollments/{caller_instance_id}/revoke"]["parameters"],
+        json!([{
+            "name":"caller_instance_id",
+            "in":"path",
+            "required":true,
+            "schema":{"type":"string","format":"uuid"},
+            "description":"Caller instance UUID"
+        }])
+    );
+    assert_operation(
+        &reference,
+        "/api/federation/peer/identity",
+        "get",
+        Access::Peer,
+        "200",
+        None,
+        "PeerIdentityResponse",
+    );
     let schemas = &reference["components"]["schemas"];
+    assert_required_properties(
+        schemas,
+        "IssueEnrollmentRequest",
+        &[
+            "caller_instance_id",
+            "caller_display_name",
+            "receiver_display_name",
+            "receiver_base_url",
+        ],
+    );
+    assert_required_properties(
+        schemas,
+        "EnrollmentTransferBundle",
+        &[
+            "receiver_instance_id",
+            "receiver_display_name",
+            "receiver_base_url",
+            "caller_instance_id",
+            "token",
+            "tls_trust",
+        ],
+    );
+    assert_required_properties(schemas, "ImportPeerConnectionRequest", &["enrollment"]);
+    assert_required_properties(
+        schemas,
+        "ImportPeerConnectionResponse",
+        &["peer_instance_id"],
+    );
+    assert_required_properties(schemas, "RevokeEnrollmentResponse", &["revoked"]);
+    assert_required_properties(
+        schemas,
+        "PeerIdentityResponse",
+        &["receiver_instance_id", "caller_instance_id"],
+    );
+    for field in ["receiver_display_name", "receiver_base_url"] {
+        assert_eq!(
+            schemas["EnrollmentTransferBundle"]["properties"][field]["type"],
+            "string"
+        );
+    }
+    assert_eq!(schemas["PeerCaCertificatePem"]["type"], "string");
+    let tls_trust = schemas["PeerTlsTrust"].to_string();
+    for expected in ["platform_roots", "private_ca", "PeerCaCertificatePem"] {
+        assert!(tls_trust.contains(expected), "missing {expected}");
+    }
     for name in [
         "OwnerQueryRequest",
         "OwnerSearchRequest",

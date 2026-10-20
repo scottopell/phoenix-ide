@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    append_bounded_response_chunk, owner, peer_notes, remote_query_client, FederationClientError,
+    append_bounded_response_chunk, owner, peer_notes, remote_query_client,
+    EnrollmentTransferBundle, FederationClientError, ImportPeerConnectionRequest,
+    ImportPeerConnectionResponse, IssueEnrollmentRequest, PeerIdentityResponse,
     RemoteAuthoredSendMessageRequest, RemoteQueryDatabaseRequest, RemoteQueryDatabaseResponse,
     RemoteReadConversationRequest, RemoteReadConversationResponse, RemoteReadErrorResponse,
     RemoteResolveErrorResponse, RemoteResolveReferenceRequest, RemoteResolveReferenceResponse,
     RemoteSearchErrorResponse, RemoteSearchRequest, RemoteSearchResponse, RemoteSendMessageRequest,
-    RemoteSendMessageResponse,
+    RemoteSendMessageResponse, RevokeEnrollmentResponse,
 };
 use crate::api::{
     auth::{OwnerAuthenticated, PeerAuthenticated},
@@ -192,17 +194,47 @@ impl ReferenceBuilder {
         description: &str,
         request: Option<Value>,
     ) {
+        self.operation_with_status::<ResponseBody, ErrorBody>(
+            path,
+            method,
+            access,
+            description,
+            request,
+            StatusCode::OK,
+        );
+    }
+
+    fn operation_with_status<ResponseBody: JsonSchema, ErrorBody: JsonSchema>(
+        &mut self,
+        path: &str,
+        method: &str,
+        access: Access,
+        description: &str,
+        request: Option<Value>,
+        success_status: StatusCode,
+    ) {
         let response = self.schema::<ResponseBody>();
         let error = self.schema::<ErrorBody>();
         let authentication_error = self.schema::<MessageErrorBody>();
         let plain_error = self.schema::<String>();
+        let success_description = if success_status == StatusCode::CREATED {
+            "Created"
+        } else {
+            "Success"
+        };
+        let mut responses = serde_json::Map::new();
+        responses.insert(
+            success_status.as_str().into(),
+            json!({"description":success_description, "content":{"application/json":{"schema":response}}}),
+        );
+        responses.insert(
+            "default".into(),
+            json!({"description":"Rejected, unavailable, invalid input, or authentication failure. Error details never grant authority.", "content":{"application/json":{"schema":{"anyOf":[error, authentication_error]}}, "text/plain":{"schema":plain_error}}}),
+        );
         let mut operation = json!({
             "summary": description,
             "security": access.security(),
-            "responses": {
-                "200": {"description":"Success", "content":{"application/json":{"schema":response}}},
-                "default": {"description":"Rejected, unavailable, invalid input, or authentication failure. Error details never grant authority.", "content":{"application/json":{"schema":{"anyOf":[error, authentication_error]}}, "text/plain":{"schema":plain_error}}}
-            }
+            "responses": responses,
         });
         if let Some(schema) = request {
             operation["requestBody"] =
@@ -210,14 +242,37 @@ impl ReferenceBuilder {
         }
         self.paths.entry(path.into()).or_insert_with(|| json!({}))[method] = operation;
     }
+
     fn post<Request: JsonSchema, ResponseBody: JsonSchema, ErrorBody: JsonSchema>(
         &mut self,
         path: &str,
         access: Access,
         description: &str,
     ) {
+        self.post_with_status::<Request, ResponseBody, ErrorBody>(
+            path,
+            access,
+            description,
+            StatusCode::OK,
+        );
+    }
+
+    fn post_with_status<Request: JsonSchema, ResponseBody: JsonSchema, ErrorBody: JsonSchema>(
+        &mut self,
+        path: &str,
+        access: Access,
+        description: &str,
+        success_status: StatusCode,
+    ) {
         let request = self.schema::<Request>();
-        self.operation::<ResponseBody, ErrorBody>(path, "post", access, description, Some(request));
+        self.operation_with_status::<ResponseBody, ErrorBody>(
+            path,
+            "post",
+            access,
+            description,
+            Some(request),
+            success_status,
+        );
     }
 }
 
@@ -253,6 +308,35 @@ pub(crate) fn generate(instance_id: InstanceId) -> FederationApiReference {
     };
     b.operation::<FederationApiReference, MessageErrorBody>("/openapi.json", "get", Reference, "Federation API reference only; owner auth or active directional peer bearer. Not the complete Phoenix API.", None);
     b.post::<FetchOpenApiRequest, DestinationApiReference, OwnerErrorBody>("/api/federation/openapi", Owner, "Fetch the explicit saved destination's reference over verified HTTPS; no redirects or local fallback; 512 KiB maximum.");
+    b.post_with_status::<IssueEnrollmentRequest, EnrollmentTransferBundle, MessageErrorBody>(
+        "/api/federation/enrollments",
+        Owner,
+        "Issue or replace a directional enrollment and return its transfer bundle.",
+        StatusCode::CREATED,
+    );
+    b.post::<ImportPeerConnectionRequest, ImportPeerConnectionResponse, MessageErrorBody>(
+        "/api/federation/peers/import",
+        Owner,
+        "Verify the enrollment destination over authenticated HTTPS before saving the peer connection.",
+    );
+    let revoke_enrollment = "/api/federation/enrollments/{caller_instance_id}/revoke";
+    b.operation::<RevokeEnrollmentResponse, MessageErrorBody>(
+        revoke_enrollment,
+        "post",
+        Owner,
+        "Revoke the active directional enrollment for the caller instance.",
+        None,
+    );
+    let caller_instance_id_parameter = b.schema::<InstanceId>();
+    b.paths
+        .get_mut(revoke_enrollment)
+        .expect("revoke enrollment path")["parameters"] = json!([{
+        "name":"caller_instance_id",
+        "in":"path",
+        "required":true,
+        "schema":caller_instance_id_parameter,
+        "description":"Caller instance UUID"
+    }]);
     b.post::<OwnerQueryRequest, RemoteQueryDatabaseResponse, OwnerErrorBody>(
         "/api/federation/query-database",
         Owner,
@@ -270,6 +354,13 @@ pub(crate) fn generate(instance_id: InstanceId) -> FederationApiReference {
         "Resolve a destination reference with instance-qualified navigation.",
     );
     b.post::<OwnerSendRequest, RemoteSendMessageResponse, OwnerErrorBody>("/api/federation/send-conversation-message", Owner, "Send with idempotent message_id; owner attribution is RemoteApi, not caller-supplied Coordinator authority.");
+    b.operation::<PeerIdentityResponse, MessageErrorBody>(
+        "/api/federation/peer/identity",
+        "get",
+        Peer,
+        "Return the receiver and authenticated caller instance identities.",
+        None,
+    );
     b.post::<RemoteQueryDatabaseRequest, RemoteQueryDatabaseResponse, MessageErrorBody>(
         "/api/federation/peer/query-database",
         Peer,

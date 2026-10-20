@@ -399,7 +399,9 @@ impl PeerBearerCredential {
 
 const MAX_PEER_CA_CERTIFICATE_PEM_BYTES: usize = 32 * 1024;
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(
+    Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeerTlsTrust {
     PlatformRoots,
@@ -408,7 +410,7 @@ pub enum PeerTlsTrust {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, schemars::JsonSchema)]
 pub struct PeerCaCertificatePem(String);
 
 impl PeerCaCertificatePem {

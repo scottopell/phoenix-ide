@@ -13,48 +13,104 @@ use base64::Engine;
 use futures::StreamExt as _;
 use phoenix_core::domain::{
     conversation_reference::ConversationReferenceTarget,
-    instance_identity::{FederationCredentialVerifier, InstanceId, PeerTlsTrust},
+    instance_identity::{
+        FederationCredentialVerifier, InstanceId, PeerBaseUrl, PeerDisplayName, PeerTlsTrust,
+    },
 };
+
+use super::auth::{OwnerAuthenticated, PeerAuthenticated};
+use super::AppState;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
-use super::auth::{OwnerAuthenticated, PeerAuthenticated};
-use super::AppState;
+fn deserialize_peer_display_name<'de, D>(deserializer: D) -> Result<PeerDisplayName, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    PeerDisplayName::parse(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_peer_display_name<S>(value: &PeerDisplayName, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.as_str())
+}
+
+fn deserialize_peer_base_url<'de, D>(deserializer: D) -> Result<PeerBaseUrl, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+fn serialize_peer_base_url<S>(value: &PeerBaseUrl, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_str(value)
+}
 
 static QUERY_ADMISSION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
 const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
+const MAX_PEER_IDENTITY_RESPONSE_BYTES: usize = 4 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct IssueEnrollmentRequest {
     pub caller_instance_id: InstanceId,
     pub caller_display_name: String,
+    #[serde(deserialize_with = "deserialize_peer_display_name")]
+    #[schemars(with = "String")]
+    pub receiver_display_name: PeerDisplayName,
+    #[serde(deserialize_with = "deserialize_peer_base_url")]
+    #[schemars(with = "String")]
+    pub receiver_base_url: PeerBaseUrl,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct EnrollmentTransferBundle {
     pub receiver_instance_id: InstanceId,
+    #[serde(
+        deserialize_with = "deserialize_peer_display_name",
+        serialize_with = "serialize_peer_display_name"
+    )]
+    #[schemars(with = "String")]
+    pub receiver_display_name: PeerDisplayName,
+    #[serde(
+        deserialize_with = "deserialize_peer_base_url",
+        serialize_with = "serialize_peer_base_url"
+    )]
+    #[schemars(with = "String")]
+    pub receiver_base_url: PeerBaseUrl,
     pub caller_instance_id: InstanceId,
     pub token: String,
     pub tls_trust: PeerTlsTrust,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct RevokeEnrollmentResponse {
     pub revoked: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ImportPeerConnectionRequest {
-    pub peer_display_name: String,
-    pub base_url: String,
     pub enrollment: EnrollmentTransferBundle,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct ImportPeerConnectionResponse {
     pub peer_instance_id: InstanceId,
+}
+
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PeerIdentityResponse {
+    pub receiver_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
 }
 
 pub(crate) const MAX_REMOTE_MESSAGE_BYTES: usize = 32 * 1024;
@@ -1899,6 +1955,59 @@ where
     })
 }
 
+async fn verify_enrollment_destination(
+    receiver_base_url: &PeerBaseUrl,
+    tls_trust: &PeerTlsTrust,
+    bearer_credential: &phoenix_core::domain::instance_identity::PeerBearerCredential,
+    expected_receiver_instance_id: InstanceId,
+    expected_caller_instance_id: InstanceId,
+) -> Result<(), FederationClientError> {
+    let endpoint = receiver_base_url
+        .navigation_url("/api/federation/peer/identity")
+        .expect("fixed federation identity route remains on the peer origin");
+    let response = remote_query_client(tls_trust)?
+        .get(endpoint.as_url().clone())
+        .bearer_auth(bearer_credential.expose())
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_PEER_IDENTITY_RESPONSE_BYTES)?;
+    }
+    if !status.is_success() {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    }
+    let identity: PeerIdentityResponse = serde_json::from_slice(&bytes)?;
+    if identity.receiver_instance_id != expected_receiver_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if identity.caller_instance_id != expected_caller_instance_id {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    Ok(())
+}
+
+pub async fn peer_identity(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+) -> Response {
+    match state.db.instance_id().await {
+        Ok(receiver_instance_id) => Json(PeerIdentityResponse {
+            receiver_instance_id,
+            caller_instance_id: authenticated.caller_instance_id,
+        })
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read peer identity");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn issue_enrollment(
     _owner: OwnerAuthenticated,
     State(state): State<AppState>,
@@ -1911,12 +2020,10 @@ pub async fn issue_enrollment(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if request.caller_instance_id == local_id
-        || phoenix_core::domain::instance_identity::PeerDisplayName::parse(
-            &request.caller_display_name,
-        )
-        .is_err()
-    {
+    let Ok(caller_display_name) = PeerDisplayName::parse(&request.caller_display_name) else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
+    if request.caller_instance_id == local_id {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
@@ -1926,7 +2033,7 @@ pub async fn issue_enrollment(
         .db
         .replace_federation_enrollment(
             request.caller_instance_id,
-            request.caller_display_name.trim(),
+            caller_display_name.as_str(),
             &verifier,
         )
         .await
@@ -1939,6 +2046,8 @@ pub async fn issue_enrollment(
         StatusCode::CREATED,
         Json(EnrollmentTransferBundle {
             receiver_instance_id: local_id,
+            receiver_display_name: request.receiver_display_name,
+            receiver_base_url: request.receiver_base_url,
             caller_instance_id: request.caller_instance_id,
             token,
             tls_trust: state.federation_tls_trust.clone(),
@@ -1959,38 +2068,54 @@ pub async fn import_peer_connection(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if request.enrollment.caller_instance_id != local_id
-        || request.enrollment.receiver_instance_id == local_id
-        || phoenix_core::domain::instance_identity::PeerDisplayName::parse(
-            &request.peer_display_name,
-        )
-        .is_err()
-    {
+    let EnrollmentTransferBundle {
+        receiver_instance_id,
+        receiver_display_name,
+        receiver_base_url,
+        caller_instance_id,
+        token,
+        tls_trust,
+    } = request.enrollment;
+    if caller_instance_id != local_id || receiver_instance_id == local_id {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let Ok(base_url) = request.base_url.parse() else {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-    };
     let Ok(bearer_credential) =
-        phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
-            request.enrollment.token,
-        )
+        phoenix_core::domain::instance_identity::PeerBearerCredential::parse(token)
     else {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
+    match verify_enrollment_destination(
+        &receiver_base_url,
+        &tls_trust,
+        &bearer_credential,
+        receiver_instance_id,
+        local_id,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(FederationClientError::DestinationMismatch | FederationClientError::CallerMismatch) => {
+            tracing::warn!("federation peer identity did not match the enrollment bundle");
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(_) => {
+            tracing::warn!("federation peer identity verification failed closed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    }
     match state
         .db
         .save_federation_peer_connection(
-            request.enrollment.receiver_instance_id,
-            request.peer_display_name.trim(),
-            &base_url,
+            receiver_instance_id,
+            receiver_display_name.as_str(),
+            &receiver_base_url,
             &bearer_credential,
-            &request.enrollment.tls_trust,
+            &tls_trust,
         )
         .await
     {
         Ok(()) => Json(ImportPeerConnectionResponse {
-            peer_instance_id: request.enrollment.receiver_instance_id,
+            peer_instance_id: receiver_instance_id,
         })
         .into_response(),
         Err(error) => {
@@ -2125,9 +2250,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrollment_and_import_reject_uuid_display_names_but_accept_real_names() {
+    async fn enrollment_rejects_uuid_caller_names_but_accepts_real_names() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-        let local = state.db.instance_id().await.unwrap();
         let peer = InstanceId::new();
         for (name, expected) in [
             (peer.to_string(), StatusCode::UNPROCESSABLE_ENTITY),
@@ -2144,34 +2268,12 @@ mod tests {
                 Json(IssueEnrollmentRequest {
                     caller_instance_id: peer,
                     caller_display_name: name.clone(),
+                    receiver_display_name: PeerDisplayName::parse("receiver").unwrap(),
+                    receiver_base_url: "https://receiver.example".parse().unwrap(),
                 }),
             )
             .await;
             assert_eq!(issued.status(), expected, "issue {name}");
-            let imported = import_peer_connection(
-                OwnerAuthenticated,
-                State(state.clone()),
-                Json(ImportPeerConnectionRequest {
-                    peer_display_name: name.clone(),
-                    base_url: "https://peer.example".into(),
-                    enrollment: EnrollmentTransferBundle {
-                        receiver_instance_id: peer,
-                        caller_instance_id: local,
-                        token: format!("phx_peer_{}", "a".repeat(43)),
-                        tls_trust: PeerTlsTrust::PlatformRoots,
-                    },
-                }),
-            )
-            .await;
-            assert_eq!(
-                imported.status(),
-                if expected == StatusCode::CREATED {
-                    StatusCode::OK
-                } else {
-                    expected
-                },
-                "import {name}"
-            );
         }
     }
 
@@ -2182,10 +2284,10 @@ mod tests {
             OwnerAuthenticated,
             State(state),
             Json(ImportPeerConnectionRequest {
-                peer_display_name: "peer".to_string(),
-                base_url: "https://peer.example".to_string(),
                 enrollment: EnrollmentTransferBundle {
                     receiver_instance_id: InstanceId::new(),
+                    receiver_display_name: PeerDisplayName::parse("peer").unwrap(),
+                    receiver_base_url: "https://peer.example".parse().unwrap(),
                     caller_instance_id: InstanceId::new(),
                     token: format!("phx_peer_{}", "a".repeat(43)),
                     tls_trust: PeerTlsTrust::PlatformRoots,
@@ -2195,6 +2297,257 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    struct EnrollmentReceiver {
+        _certificates: tempfile::TempDir,
+        instance_id: InstanceId,
+        origin: PeerBaseUrl,
+        trust: PeerTlsTrust,
+        shutdown: tokio_util::sync::CancellationToken,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl EnrollmentReceiver {
+        async fn stop(self) {
+            self.shutdown.cancel();
+            self.server.await.unwrap();
+        }
+    }
+
+    async fn start_enrollment_receiver(
+        caller_instance_id: InstanceId,
+        token: &str,
+    ) -> EnrollmentReceiver {
+        let certificates = tempfile::tempdir().unwrap();
+        let mut tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+            dir: certificates.path().to_path_buf(),
+            hosts: vec!["localhost".to_string()],
+        })
+        .unwrap();
+        tls.server.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let certificate_pem = phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+            std::fs::read_to_string(tls.ca_cert_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let trust = PeerTlsTrust::PrivateCa { certificate_pem };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let instance_id = state.db.instance_id().await.unwrap();
+        state
+            .db
+            .replace_federation_enrollment(
+                caller_instance_id,
+                "caller",
+                &FederationCredentialVerifier::from_bearer(token.as_bytes()),
+            )
+            .await
+            .unwrap();
+        let app = crate::api::handlers::create_router(state);
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls.server));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            let accepted = tokio::select! {
+                () = server_shutdown.cancelled() => None,
+                accepted = listener.accept() => Some(accepted.unwrap()),
+            };
+            let Some((stream, _)) = accepted else {
+                return;
+            };
+            let Ok(stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let service = hyper_util::service::TowerToHyperService::new(app);
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+        });
+
+        EnrollmentReceiver {
+            _certificates: certificates,
+            instance_id,
+            origin,
+            trust,
+            shutdown,
+            server,
+        }
+    }
+
+    fn enrollment_bundle(
+        receiver_instance_id: InstanceId,
+        receiver_base_url: PeerBaseUrl,
+        caller_instance_id: InstanceId,
+        token: String,
+        tls_trust: PeerTlsTrust,
+    ) -> EnrollmentTransferBundle {
+        EnrollmentTransferBundle {
+            receiver_instance_id,
+            receiver_display_name: PeerDisplayName::parse("receiver").unwrap(),
+            receiver_base_url,
+            caller_instance_id,
+            token,
+            tls_trust,
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_import_verifies_authenticated_destination_before_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let token = format!("phx_peer_{}", "a".repeat(43));
+        let receiver = start_enrollment_receiver(caller_instance_id, &token).await;
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    receiver.instance_id,
+                    receiver.origin.clone(),
+                    caller_instance_id,
+                    token.clone(),
+                    receiver.trust.clone(),
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = caller_state
+            .db
+            .federation_peer_connection(receiver.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.peer_display_name, "receiver");
+        assert_eq!(saved.base_url, receiver.origin);
+        assert_eq!(saved.bearer_credential.expose(), token.as_str());
+        receiver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_import_rejects_wrong_destination_without_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let token = format!("phx_peer_{}", "b".repeat(43));
+        let receiver = start_enrollment_receiver(caller_instance_id, &token).await;
+        let claimed_receiver = InstanceId::new();
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    claimed_receiver,
+                    receiver.origin.clone(),
+                    caller_instance_id,
+                    token,
+                    receiver.trust.clone(),
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(caller_state
+            .db
+            .federation_peer_connection(claimed_receiver)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(caller_state
+            .db
+            .federation_peer_connection(receiver.instance_id)
+            .await
+            .unwrap()
+            .is_none());
+        receiver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_import_rejects_offline_destination_without_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let receiver_instance_id = InstanceId::new();
+        let offline = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let receiver_base_url =
+            format!("https://localhost:{}", offline.local_addr().unwrap().port())
+                .parse()
+                .unwrap();
+        drop(offline);
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    receiver_instance_id,
+                    receiver_base_url,
+                    caller_instance_id,
+                    format!("phx_peer_{}", "c".repeat(43)),
+                    PeerTlsTrust::PlatformRoots,
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(caller_state
+            .db
+            .federation_peer_connection(receiver_instance_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_import_rejects_untrusted_tls_without_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let token = format!("phx_peer_{}", "d".repeat(43));
+        let receiver = start_enrollment_receiver(caller_instance_id, &token).await;
+        let unrelated_certificates = tempfile::tempdir().unwrap();
+        let unrelated = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+            dir: unrelated_certificates.path().to_path_buf(),
+            hosts: vec!["localhost".to_string()],
+        })
+        .unwrap();
+        let certificate_pem = phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+            std::fs::read_to_string(unrelated.ca_cert_path.unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    receiver.instance_id,
+                    receiver.origin.clone(),
+                    caller_instance_id,
+                    token,
+                    PeerTlsTrust::PrivateCa { certificate_pem },
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(caller_state
+            .db
+            .federation_peer_connection(receiver.instance_id)
+            .await
+            .unwrap()
+            .is_none());
+        receiver.stop().await;
     }
 
     #[tokio::test]

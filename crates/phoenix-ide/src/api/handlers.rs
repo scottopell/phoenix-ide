@@ -668,6 +668,10 @@ pub fn create_router(state: AppState) -> Router {
     // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
     let peer_router = Router::new()
         .route(
+            "/api/federation/peer/identity",
+            get(super::federation::peer_identity),
+        )
+        .route(
             "/api/federation/peer/subscriptions/create",
             post(super::federation::subscriptions::create).layer(DefaultBodyLimit::max(
                 super::federation::subscriptions::REQUEST_BYTES,
@@ -19424,17 +19428,21 @@ mod lifecycle_handler_tests {
             .unwrap(),
         );
         let local = state.db.instance_id().await.unwrap();
+        let receiver = InstanceId::new();
+        let offline = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let offline_port = offline.local_addr().unwrap().port();
+        drop(offline);
         let body = serde_json::json!({
-            "peer_display_name": "peer",
-            "base_url": "https://peer.example",
             "enrollment": {
-                "receiver_instance_id": InstanceId::new(),
+                "receiver_instance_id": receiver,
+                "receiver_display_name": "peer",
+                "receiver_base_url": format!("https://localhost:{offline_port}"),
                 "caller_instance_id": local,
                 "token": format!("phx_peer_{}", "a".repeat(43)),
                 "tls_trust": { "kind": "platform_roots" },
             }
         });
-        let app = create_router(state);
+        let app = create_router(state.clone());
 
         let unauthorized = app
             .clone()
@@ -19462,7 +19470,13 @@ mod lifecycle_handler_tests {
             )
             .await
             .unwrap();
-        assert_eq!(imported.status(), StatusCode::OK);
+        assert_eq!(imported.status(), StatusCode::BAD_GATEWAY);
+        assert!(state
+            .db
+            .federation_peer_connection(receiver)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -19500,10 +19514,10 @@ mod lifecycle_handler_tests {
                 base64::engine::general_purpose::STANDARD.encode(certificate.der())
             );
             let body = serde_json::json!({
-                "peer_display_name": "peer",
-                "base_url": "https://peer.example",
                 "enrollment": {
                     "receiver_instance_id": peer,
+                    "receiver_display_name": "peer",
+                    "receiver_base_url": "https://peer.example",
                     "caller_instance_id": local,
                     "token": format!("phx_peer_{}", "a".repeat(43)),
                     "tls_trust": {
@@ -19767,7 +19781,9 @@ mod lifecycle_handler_tests {
         let caller = phoenix_core::domain::instance_identity::InstanceId::new();
         let request_body = serde_json::json!({
             "caller_instance_id": caller,
-            "caller_display_name": "peer"
+            "caller_display_name": "peer",
+            "receiver_display_name": "receiver",
+            "receiver_base_url": "https://receiver.example"
         })
         .to_string();
 
@@ -19787,6 +19803,11 @@ mod lifecycle_handler_tests {
         let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
         let first_bundle: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
         let first_token = first_bundle["token"].as_str().unwrap();
+        assert_eq!(first_bundle["receiver_display_name"], "receiver");
+        assert_eq!(
+            first_bundle["receiver_base_url"],
+            "https://receiver.example/"
+        );
 
         let forbidden = create_router(state.clone())
             .oneshot(
