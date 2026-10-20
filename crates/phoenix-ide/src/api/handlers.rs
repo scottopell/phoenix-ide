@@ -3,6 +3,8 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+mod exact_reads;
+
 use super::assets::{
     get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
     PUBLIC_ROOT_ASSETS,
@@ -132,6 +134,7 @@ pub fn create_router(state: AppState) -> Router {
     let router = router
         // Static assets (embedded or filesystem fallback)
         .merge(crate::api::product_conversations::automatic_continuation_routes())
+        .merge(exact_reads::routes())
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
         .route("/preview/*filepath", get(serve_preview_file))

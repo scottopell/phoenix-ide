@@ -222,7 +222,7 @@ describe('conversation message history clients', () => {
     vi.unstubAllGlobals();
   });
 
-  it('GETs latest messages with limit query', async () => {
+  it('reads latest messages with limit query', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -238,7 +238,8 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesLatest('conv/id', 25);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv%2Fid/messages/latest?limit=25',
+      '/api/conversation-reads/messages/latest?limit=25',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv/id' }) }),
     );
   });
 
@@ -275,7 +276,7 @@ describe('conversation message history clients', () => {
     });
   });
 
-  it('GETs messages before a sequence using before_message_sequence', async () => {
+  it('reads messages before a sequence using before_message_sequence', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -288,11 +289,12 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesBefore('conv-1', 77, 10);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages?before_message_sequence=77&limit=10',
+      '/api/conversation-reads/messages?before_message_sequence=77&limit=10',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
-  it('GETs messages after a sequence using after_message_sequence', async () => {
+  it('reads messages after a sequence using after_message_sequence', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -305,11 +307,12 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesAfter('conv-1', 88, 11);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages?after_message_sequence=88&limit=11',
+      '/api/conversation-reads/messages?after_message_sequence=88&limit=11',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
-  it('GETs an exact range with explicit start/end_message_sequence params', async () => {
+  it('reads an exact range with explicit start/end_message_sequence params', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -322,11 +325,12 @@ describe('conversation message history clients', () => {
     await api.getConversationMessageRange('conv-1', 5, 12);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages/range?start_message_sequence=5&end_message_sequence=12',
+      '/api/conversation-reads/messages/range?start_message_sequence=5&end_message_sequence=12',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
-  it('GETs messages around a pivot sequence with before/after query params', async () => {
+  it('reads messages around a pivot sequence with before/after query params', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -339,7 +343,8 @@ describe('conversation message history clients', () => {
     await api.getConversationMessagesAround('conv-1', 17, 4, 6);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/conversations/conv-1/messages/around/17?before=4&after=6',
+      '/api/conversation-reads/messages/around/17?before=4&after=6',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'conv-1' }) }),
     );
   });
 
@@ -477,7 +482,7 @@ describe('conversation message history clients', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation/req%2F1', { method: 'DELETE' });
   });
 
-  it('GETs a product conversation snapshot with message_limit and before params', async () => {
+  it('reads a product conversation snapshot with message_limit and before params', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -487,7 +492,8 @@ describe('conversation message history clients', () => {
 
     await api.getProductConversationSnapshot('pc-1', { message_limit: 100, before: 'cursor-1' });
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/pc-1?message_limit=100&before=cursor-1');
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversation-reads/snapshot?message_limit=100&before=cursor-1',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ reference: 'pc-1' }) }));
   });
 
   it('preserves snapshot HTTP status for stale-cursor recovery', async () => {
