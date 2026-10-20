@@ -82,12 +82,10 @@ mod tests {
             .create_conversation("control-service-root", "control", "/tmp", true, None, None)
             .await
             .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../../phoenix-db/src/conversation_goals/control_candidate.sql"
-        ))
-        .execute(db.pool())
-        .await
-        .unwrap();
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('conversation_goal_controls','conversation_goal_control_requests','conversation_goal_user_requests')",
+        ).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(tables, 3);
         (
             GoalControlService { storage: Some(db) },
             conversation.product_conversation_id,

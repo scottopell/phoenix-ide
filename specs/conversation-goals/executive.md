@@ -1,5 +1,35 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Independent ca49 review corrections — exact FK timing and migrated fixture inventory
+
+Review found two pre-execution blockers in the134 registration cut. The actor
+probe used nonexistent columns and misclassified its receipt FK as deferred.
+It now inserts a valid UserControl actor shape using `control_principal_id`,
+`control_request_id`, `control_command` and `control_result_version`, leaving all
+source fields NULL. The missing receipt must fail **at INSERT**, classified as a
+foreign-key violation, followed by explicit transaction rollback. A separate
+syntactically valid accepted state receipt for existing goal/version1 points to
+missing next history/version2: INSERT must succeed once and **COMMIT** must fail
+with a foreign-key violation. The probe receipt must then be absent. This tests
+the actual immediate actor-to-receipt and deferred receipt-to-history contracts;
+no SQL/schema semantics are changed. Health checks, retained-row equality and
+subsequent changed-intent rejection remain present.
+
+The runtime control-service fixture opens a fully migrated database. It now
+verifies all three registered control/request tables instead of applying duplicate
+candidate DDL. A repository-wide Rust include/caller inventory leaves candidate
+SQL only at: the registered migration concat; the minimal hand-built substrate
+in `tests/control_candidate.rs`; the explicitly pre134, installed-control branch
+of `admitted_fixture_with_control_at`; and `user_control_upgrade`'s candidate-only
+rebuild tests over that genuine pre134 fixture. Those older substrates still
+require their explicit DDL; they are not silently migrated or skipped.
+
+These are source-review corrections, not execution evidence. Only standalone
+formatting/whitespace and bounded source/API checks ran; no compiler/tests/SQL,
+browser, push or CI.185/185 remains qualified **only at d4c**. Activation/public
+installation remain off; schema132 and executable134 SQL are unchanged, and all
+11 stashes are preserved.
+
 ## Qualification floor and next source cut — migration134 registered, activation still off
 
 Parent run **39386564244**, exact

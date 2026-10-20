@@ -231,14 +231,40 @@ async fn conversation_goal_registered_134_real_runner_failure_rolls_back_cycle_s
 async fn assert_unreceipted_actor_rejected(db: &Database, command: &GoalUserCommand) {
     let unreceipted_request = uuid::Uuid::new_v4();
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
-    sqlx::query(
-        "INSERT INTO conversation_goal_actors(owner_id,actor_id,kind,transcript_id,principal_id,request_id) VALUES(?,9000,'user_control','full-root',?,?)",
+    let error = sqlx::query(
+        "INSERT INTO conversation_goal_actors(owner_id,actor_id,kind,control_principal_id,control_request_id,control_command,control_result_version) VALUES(?,9000,'user_control',?,?,'state',2)",
     ).bind(command.owner.as_str()).bind(command.principal_id.as_bytes().as_slice())
-        .bind(unreceipted_request.as_bytes().as_slice()).execute(&mut *tx).await.unwrap();
+        .bind(unreceipted_request.as_bytes().as_slice()).execute(&mut *tx).await.unwrap_err();
     assert!(
-        tx.commit().await.is_err(),
-        "deferred actor->receipt FK must reject missing receipt"
+        error
+            .as_database_error()
+            .is_some_and(|error| error.is_foreign_key_violation()),
+        "immediate actor->receipt FK must reject valid actor shape: {error}"
     );
+    tx.rollback().await.unwrap();
+    assert_healthy(db).await;
+}
+
+async fn assert_receipt_without_next_history_rejected(db: &Database, command: &GoalUserCommand) {
+    let request_id = uuid::Uuid::new_v4();
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let inserted = sqlx::query(
+        "INSERT INTO conversation_goal_user_requests(owner_id,principal_id,request_id,command,expected_version,goal_id,outcome,result_version,recorded_at_us) SELECT owner_id,?,?,'state',1,goal_id,'accepted',2,101 FROM conversation_goal_history WHERE owner_id=? AND version=1",
+    ).bind(command.principal_id.as_bytes().as_slice()).bind(request_id.as_bytes().as_slice())
+        .bind(command.owner.as_str()).execute(&mut *tx).await.unwrap();
+    assert_eq!(inserted.rows_affected(), 1);
+    let error = tx.commit().await.unwrap_err();
+    assert!(
+        error
+            .as_database_error()
+            .is_some_and(|error| error.is_foreign_key_violation()),
+        "deferred receipt->history FK must reject missing next version at commit: {error}"
+    );
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM conversation_goal_user_requests WHERE owner_id=? AND principal_id=? AND request_id=?",
+    ).bind(command.owner.as_str()).bind(command.principal_id.as_bytes().as_slice())
+        .bind(request_id.as_bytes().as_slice()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(receipts, 0);
     assert_healthy(db).await;
 }
 
@@ -267,6 +293,8 @@ async fn conversation_goal_registered_134_receipts_replay_exactly_and_reject_cha
     assert_eq!(replay, first);
     assert_eq!(retained(&db).await, before);
     assert_unreceipted_actor_rejected(&db, &command).await;
+    assert_eq!(retained(&db).await, before);
+    assert_receipt_without_next_history_rejected(&db, &command).await;
     assert_eq!(retained(&db).await, before);
     let changed = GoalUserCommand {
         change: GoalUserChange::Create {

@@ -1,5 +1,23 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## ca49 independent review corrections before134 qualification
+
+Two P1sourceblockers corrected: valid UserControl actor uses actualcontrol_*columns
+and NULLsourcefields, missingreceipt rejects immediatelyatINSERT with classified
+FKerror +explicitrollback; separate validacceptedstatereceipt expected1/result2
+for existinggoal mustINSERTonce then rejectmissinghistory2 atCOMMIT/FKerror,
+leavingnoprobereceipt. Actor->receipt isIMMEDIATE, receipt->history isDEFERRED;
+no false deferredactorreceipt claim. Retainedrow/health/changedintent checks kept.
+
+runtime/goal_control testfixture fullymigrates: removedduplicatecandidateDDL and
+assert3registeredtables. WholeRustcandidateinclude/callerinventory leavesDDL only
+migrationconcat, handbuiltminimalcontroltests, explicitpre134Installedfixturebranch,
+and genuinepre134candidateuserrebuildtests. Minimalfixtures stillrequireDDL.
+
+No schemaSQL changes/activation/publicinstaller, compiler/testsSQLbrowser/push/CI/
+resources. Onlystandaloneformat/diff/sourceAPIchecks;185floorONLYd4c remains,
+134registeredsourceNOTqualified, shared30broad/Clippyblockersunwaived11stashesintact.
+
 ## Actuald4c focused185/185 and next source-only134 registration cut
 
 Parent39386564244 exactd4c terminalFAILoverall but actualfocused185/185PASS169.521s
