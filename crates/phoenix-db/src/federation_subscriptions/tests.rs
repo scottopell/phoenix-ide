@@ -2467,7 +2467,7 @@ async fn recovered_steering_installs_terminal_projection_before_atomic_fanout() 
 }
 
 #[tokio::test]
-async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_uncommitted_summary() {
+async fn real_summary_failure_survives_when_successful_handoff_suppresses_candidate() {
     use phoenix_core::domain::{
         db_schema::ErrorKind,
         sm_state::{ContinuationSummaryRequest, ConvState, RecoverableContinuationFailure},
@@ -2499,10 +2499,8 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
     )
     .await
     .unwrap();
-    assert_eq!(
-        facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).len(),
-        1
-    );
+    let failure = facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await);
+    assert_eq!(failure.len(), 1);
     continuation_candidate(&f).await;
     let (outcome, intent) =
         f.db.continue_conversation_with_intent(
@@ -2540,8 +2538,11 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
             .fetch_one(f.db.pool())
             .await
             .unwrap(),
-        0
+        1
     );
+    let remaining = facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].event_id, failure[0].event_id);
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM federation_terminal_occurrences WHERE occurrence_kind = 'continuation_summary'").fetch_one(f.db.pool()).await.unwrap(),1);
 }
 
