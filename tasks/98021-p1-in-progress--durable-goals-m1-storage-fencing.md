@@ -469,3 +469,59 @@ admission binding; exact fenced continuation admission; tools, UI and watch
 projections; then actual end-to-end acceptance. Private emitter default `None`
 and automatic activation OFF remain until those prerequisites are implemented
 and qualified. No speculative lifetime/retry/permission framework is requested.
+
+### Explicit reservation receipt — 134 (registration still gated)
+
+Goals integrator explicitly reserves **134** for additive UserControl request
+attribution, stable ordinary-owner Stop/control and admission-control bindings.
+Checked receipts: [PR959 comment6279958168](https://github.com/scottopell/phoenix-ide/pull/959#issuecomment-6279958168)
+and [PR902 comment6279958338](https://github.com/scottopell/phoenix-ide/pull/902#issuecomment-6279958338).
+Federation133 remains exclusively reserved (task blob
+`27d2b558f7afc1901e168b21e56b7b69dfe93dbf`); this is not a release of133.
+No executable134 registry entry or placeholder133 may be added until actual133
+is integrated. Any competing claim must be reconciled before registration.
+
+The accepted narrow132 prerequisite cut is
+`ed25a228e092b41d5c112e1c7585aab406944ca3`, focused70/70 at run39320605328,
+artifact12221238348, not whole-PR/release approval. Parent verified132 SQL and
+registry byte-identical through f6. Importing later17b+ runtime work is not a
+prerequisite for federation133; f6's independent96/96 does not change this cut.
+
+Parent bounded review of exact e19..2766 accepted the terminal helper and the
+three-relation schema direction, with these mandatory clarifications: authenticate
+and authorize before any receipt lookup; exact replay is only before version
+checks/mutation, never before auth. UserControl actors reference only immutable
+**accepted** receipts for an appropriate command, bound to exact owner/principal/
+request, never a rejected receipt. Principal identity is correlation, not a
+capability. Scalar command arguments are preferred over extra subtype tables
+when CHECK constraints suffice. These constraints govern the unregistered134
+candidate and its tests; source review does not install/activate anything.
+
+### Unregistered 134 control-relation candidate and schema tests
+
+Authored `conversation_goals/control_candidate.sql` with the three bounded
+relations for the Stop/release slice: immutable accepted/rejected request rows,
+ordinary-owner current control, immutable exact-turn open-control bindings.
+Accepted receipt insertion advances the current latch/version in the same SQLite
+statement; composite FKs tie current state and bindings to the exact accepted
+receipt, resulting version and stopped value. Rejected receipts cannot supply
+that accepted reference. Missing state remains non-admitting in this candidate;
+no production backfill or upgrade policy is applied. No generic permission,
+principal/session registry, JSON command envelope, or fourth control table.
+
+Four new `conversation_goal_control_candidate_*` schema tests are authored in
+`tests/control_candidate.rs`, using the existing132 populated owner substrate.
+They exercise stopped/missing admission refusal, release/Stop/release old-binding
+invalidation, retained rejected receipts and request-ID conflict, transaction
+rollback of receipt+latch, ordinary-owner restriction, source deletion without
+pinning and owner-delete cascades. They are **not executed**, not hosted in the
+still-running e19 qualification, and not an authentication/service/retry API or
+full migration proof. The test helper inserts receipts directly on purpose:
+production auth-before-lookup remains an uninstalled application boundary.
+
+This candidate does not yet rebuild the132 actor/history/binding constraint
+cycle or implement accepted goal-control commands beyond Stop/release. Those
+parts, populated upgrade proof, host-authenticated service/API and actual atomic
+Goal/NoGoal+control admission capture remain required before registration or
+activation. Only tests include the SQL; production migration registry and132
+schema are untouched. Reservation134 is persisted, not prematurely executable.
