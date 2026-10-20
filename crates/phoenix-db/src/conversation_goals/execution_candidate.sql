@@ -57,12 +57,21 @@ CREATE TABLE conversation_goal_request_checkpoints (
 CREATE TRIGGER conversation_goal_requests_append
 BEFORE INSERT ON conversation_goal_requests
 WHEN EXISTS (SELECT 1 FROM conversation_goal_requests WHERE request_id = NEW.request_id OR rowid = NEW.rowid)
+ OR EXISTS (
+    SELECT 1 FROM conversation_goal_requests r
+    WHERE (r.goal_id = NEW.goal_id AND r.ordinal = NEW.ordinal)
+       OR (NEW.cause = 'initial' AND r.cause = 'initial'
+           AND r.goal_id = NEW.goal_id AND r.historical_turn_id = NEW.historical_turn_id)
+       OR (NEW.cause = 'after_checkpoint' AND r.cause = 'after_checkpoint'
+           AND r.predecessor_request_id = NEW.predecessor_request_id)
+       OR (NEW.cause = 'summary' AND r.cause = 'summary'
+           AND r.goal_id = NEW.goal_id AND r.summary_operation = NEW.summary_operation))
  OR NOT EXISTS (SELECT 1 FROM conversation_goal_limits l WHERE l.goal_id = NEW.goal_id AND NEW.ordinal <= l.request_limit)
  OR COALESCE((SELECT MAX(ordinal) FROM conversation_goal_requests WHERE goal_id = NEW.goal_id), 0) = 9223372036854775807
  OR NEW.ordinal - 1 <> COALESCE((SELECT MAX(ordinal) FROM conversation_goal_requests WHERE goal_id = NEW.goal_id), 0)
  OR NOT EXISTS (
     SELECT 1 FROM conversation_goal_history h
-    WHERE h.owner_id = NEW.owner_id AND h.goal_id = NEW.goal_id AND h.state_kind = 'underway'
+    WHERE h.owner_id = NEW.owner_id AND h.goal_id = NEW.goal_id AND h.state = 'underway'
       AND NOT EXISTS (SELECT 1 FROM conversation_goal_history later WHERE later.owner_id = h.owner_id AND later.version > h.version))
  OR NOT EXISTS (
     SELECT 1 FROM durable_turns t JOIN conversation_goal_bindings b ON b.turn_id = t.turn_id

@@ -91,7 +91,10 @@ async fn report_and_paired_result_remain_uncommitted_until_the_outer_owner_commi
         &pending,
         7,
         at(),
-        GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -140,7 +143,10 @@ async fn committed_success_response_loss_reuses_the_original_result_after_replac
         &pending,
         7,
         at(),
-        GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -173,7 +179,10 @@ async fn committed_success_response_loss_reuses_the_original_result_after_replac
         &pending,
         99,
         at(),
-        GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -248,7 +257,10 @@ async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on
         &first,
         1,
         at(),
-        GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -268,7 +280,10 @@ async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on
         &pending,
         2,
         at(),
-        GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -305,7 +320,10 @@ async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on
         &pending,
         5,
         at(),
-        GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -355,7 +373,11 @@ async fn existing_result_is_not_replay_authority_for_changed_genuine_tool_argume
             &altered,
             1,
             at(),
-            GoalControlInstallation::Disabled,
+            crate::conversation_goals::execution::GoalWritePolicies {
+                control: GoalControlInstallation::Disabled,
+                execution:
+                    crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+            },
         )
         .await,
         Err(GoalDbError::Integrity("pending report changed arguments"))
@@ -391,7 +413,11 @@ async fn report_cannot_borrow_another_round_or_execution_even_in_the_same_transc
                 &pending,
                 1,
                 at(),
-                GoalControlInstallation::Disabled
+                crate::conversation_goals::execution::GoalWritePolicies {
+                    control: GoalControlInstallation::Disabled,
+                    execution:
+                        crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+                }
             )
             .await,
             Err(GoalDbError::Integrity("pending report owning round"))
@@ -421,7 +447,10 @@ async fn retained_success_must_match_exact_accepted_history_not_just_the_success
         &pending,
         1,
         at(),
-        GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -443,7 +472,11 @@ async fn retained_success_must_match_exact_accepted_history_not_just_the_success
             &pending,
             9,
             at(),
-            GoalControlInstallation::Disabled,
+            crate::conversation_goals::execution::GoalWritePolicies {
+                control: GoalControlInstallation::Disabled,
+                execution:
+                    crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+            },
         )
         .await,
         Err(GoalDbError::Integrity(
@@ -475,7 +508,11 @@ async fn unknown_constraint_failure_aborts_the_outer_round_instead_of_becoming_t
             &pending,
             1,
             at(),
-            GoalControlInstallation::Disabled,
+            crate::conversation_goals::execution::GoalWritePolicies {
+                control: GoalControlInstallation::Disabled,
+                execution:
+                    crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+            },
         )
         .await,
         Err(GoalDbError::Sqlx(_))

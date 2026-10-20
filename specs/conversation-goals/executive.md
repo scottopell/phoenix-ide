@@ -31,6 +31,21 @@ remain implementation work; full broad checks and Clippy remain unwaived. The
 qualified floor is still `fab412e9` / hosted `39482419906`, UI12 + 233/233.
 
 
+### Independent review corrections to the first milestone
+
+Parent source review of `cb4deef72` found three defects: the new append trigger
+used nonexistent `history.state_kind` instead of `history.state`; 15 cfg-test
+callers still supplied the old control-only argument; and fresh-ID `INSERT OR
+REPLACE` could steal a causal slot with recursive triggers OFF. The candidate
+now rejects every occupied causal slot and goal/ordinal before insertion, not
+only request ID/rowid. A new **UNRUN** regression attempts fresh-ID/next-ordinal
+replacement of uncheckpointed initial, summary and after-checkpoint rows on
+connections explicitly configured with recursive triggers OFF, then checks exact
+retained identities and contiguous ordinals. Existing control policy values are
+preserved at each corrected test caller, with execution explicitly Disabled.
+These source corrections do not change qualification, install services or join
+the ledger to runtime checkpoints. Historical SQL 132–135 remains untouched.
+
 ADR-185 refines the locked installation boundary: the existing owner-propagated
 GoalControlInstallation policy defaults Disabled; schema 135 does not install
 a consumer. New local events distinguish disabled capture from legacy absence,

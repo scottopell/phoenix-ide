@@ -507,7 +507,11 @@ async fn outer_round_rollback_removes_genuine_source_result_and_goal_change_toge
             &report,
             Some("full-root"),
             at(),
-            crate::conversation_goals::control::GoalControlInstallation::Disabled
+            crate::conversation_goals::execution::GoalWritePolicies {
+                control: crate::conversation_goals::control::GoalControlInstallation::Disabled,
+                execution:
+                    crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+            }
         )
         .await,
         Err(GoalDbError::Integrity("source message missing"))
@@ -520,7 +524,10 @@ async fn outer_round_rollback_removes_genuine_source_result_and_goal_change_toge
         &report,
         Some("full-root"),
         at(),
-        crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: crate::conversation_goals::control::GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
@@ -556,7 +563,10 @@ async fn committed_outer_round_and_exact_report_retry_share_one_history_change()
         &report,
         Some("full-root"),
         at(),
-        crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: crate::conversation_goals::control::GoalControlInstallation::Disabled,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();

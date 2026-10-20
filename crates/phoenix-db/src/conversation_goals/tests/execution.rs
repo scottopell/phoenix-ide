@@ -457,3 +457,98 @@ async fn conversation_goal_execution_restored_claim_keeps_initial_slot_and_histo
     tx.commit().await.unwrap();
     assert_eq!(request_count(&db).await, 1);
 }
+
+#[tokio::test]
+async fn conversation_goal_execution_replace_cannot_steal_any_causal_slot_with_recursive_triggers_off(
+) {
+    let (_dir, db) = execution_fixture(8).await;
+    let snapshot = open_goal(&db).await;
+    let initial = intent(&snapshot, "initial", GoalRequestCause::Initial);
+    append(&db, &initial).await.unwrap();
+
+    let mut connection = db.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA recursive_triggers=OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA recursive_triggers")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        0
+    );
+    let steal_initial = "INSERT OR REPLACE INTO conversation_goal_requests
+        (request_id,goal_id,ordinal,owner_id,observed_version,historical_workflow_id,historical_turn_id,generation,cause,live_turn_id)
+        VALUES ('fresh-initial','goal-1',2,'owner',1,1,1,0,'initial',1)";
+    assert!(sqlx::query(steal_initial)
+        .execute(&mut *connection)
+        .await
+        .is_err());
+    drop(connection);
+    assert_eq!(append(&db, &initial).await.unwrap().ordinal, 1);
+    assert_eq!(request_count(&db).await, 1);
+
+    let summary = intent(
+        &snapshot,
+        "summary",
+        GoalRequestCause::Summary {
+            operation: t("handoff"),
+        },
+    );
+    assert_eq!(append(&db, &summary).await.unwrap().ordinal, 2);
+    let mut connection = db.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA recursive_triggers=OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let steal_summary = "INSERT OR REPLACE INTO conversation_goal_requests
+        (request_id,goal_id,ordinal,owner_id,observed_version,historical_workflow_id,historical_turn_id,generation,cause,summary_operation,live_turn_id)
+        VALUES ('fresh-summary','goal-1',3,'owner',1,1,1,0,'summary','handoff',1)";
+    assert!(sqlx::query(steal_summary)
+        .execute(&mut *connection)
+        .await
+        .is_err());
+    drop(connection);
+    assert_eq!(append(&db, &summary).await.unwrap().ordinal, 2);
+    assert_eq!(request_count(&db).await, 2);
+
+    checkpoint(&db, &initial, "response-initial").await;
+    let next = intent(
+        &snapshot,
+        "next",
+        GoalRequestCause::AfterCheckpoint {
+            predecessor: initial.id.clone(),
+        },
+    );
+    assert_eq!(append(&db, &next).await.unwrap().ordinal, 3);
+    let mut connection = db.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA recursive_triggers=OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let steal_checkpoint_slot = "INSERT OR REPLACE INTO conversation_goal_requests
+        (request_id,goal_id,ordinal,owner_id,observed_version,historical_workflow_id,historical_turn_id,generation,cause,predecessor_request_id,live_turn_id)
+        VALUES ('fresh-next','goal-1',4,'owner',1,1,1,0,'after_checkpoint','initial',1)";
+    assert!(sqlx::query(steal_checkpoint_slot)
+        .execute(&mut *connection)
+        .await
+        .is_err());
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT request_id, ordinal FROM conversation_goal_requests ORDER BY ordinal",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("initial".to_string(), 1),
+            ("summary".to_string(), 2),
+            ("next".to_string(), 3)
+        ]
+    );
+    drop(connection);
+    assert_eq!(append(&db, &next).await.unwrap().ordinal, 3);
+    assert_eq!(request_count(&db).await, 3);
+}

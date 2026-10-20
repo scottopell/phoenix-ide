@@ -354,7 +354,10 @@ async fn conversation_goal_user_candidate_actor_requires_the_accepted_actual_goa
         &mutation,
         None,
         GoalTimestampUs::parse(10).unwrap(),
-        GoalControlInstallation::Installed,
+        crate::conversation_goals::execution::GoalWritePolicies {
+            control: GoalControlInstallation::Installed,
+            execution: crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
+        },
     )
     .await
     .unwrap();
