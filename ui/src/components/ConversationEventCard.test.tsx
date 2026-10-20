@@ -154,6 +154,7 @@ describe('instance-qualified subscription events', () => {
     container.querySelector('details')!.open = true;
     expect(screen.getByRole('link', { name: 'Remote conversation · 11111111' })).toHaveAttribute('href', federatedFact.navigation.stable_url);
     expect(screen.getByRole('link', { name: 'Exact destination transcript' })).toHaveAttribute('href', federatedFact.navigation.source_url);
+    expect(screen.getByText('If this remote destination is unreachable, verify its saved URL in Settings → Connections.')).toBeVisible();
     expect(container.querySelector('a[href="/c/product-1"]')).toBeNull();
     expect(screen.getByText('Turn finished')).toBeVisible();
     expect(container.querySelector('details')!.textContent).toContain('task completion is not inferred');
@@ -165,7 +166,9 @@ describe('instance-qualified subscription events', () => {
     expect(screen.getByText('Intermediate facts unavailable. Current state: Nonterminal.')).toBeVisible();
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
     expect(container.querySelector('time')).toBeNull();
-    expect(screen.getByText('Remote navigation unavailable: missing connection')).toBeVisible();
+    const guidance = screen.getByText('Remote navigation unavailable: no connection is configured. Open Settings → Connections to add one.');
+    expect(guidance).toBeVisible();
+    expect(guidance.closest('details')).toBeNull();
   });
   it('distinguishes a gap terminal snapshot from an intermediate terminal fact', () => {
     const terminalGap = { ...federatedGap, current: { kind: 'terminal', outcome: 'failed' } } as const;

@@ -89,10 +89,16 @@ export function ConversationEventCard({ presentation, eventId, originalText, act
         <span className={failure ? 'conversation-event-outcome failure' : 'conversation-event-outcome'}>{fragment('event-outcome', fragments.outcome)}</span>
         {occurredAt !== null && <time dateTime={new Date(occurredAt / 1000).toISOString()} aria-label={fragments.time}>{fragment('event-time', fragments.time)}</time>}
       </div>
+      {remote?.navigation.status === 'unavailable' && remote.navigation.reason === 'missing_connection'
+        && <p className="conversation-event-navigation-guidance">Remote navigation unavailable: no connection is configured. Open Settings → Connections to add one.</p>}
       <details ref={details}>
         <summary>Event details</summary>
-        {remoteNavigation && <a href={remoteNavigation.source_url}>Exact destination transcript</a>}
-        {remote?.navigation.status === 'unavailable' && <p>Remote navigation unavailable: {remote.navigation.reason.replaceAll('_', ' ')}</p>}
+        {remoteNavigation && <>
+          <a href={remoteNavigation.source_url}>Exact destination transcript</a>
+          <p className="conversation-event-navigation-guidance">If this remote destination is unreachable, verify its saved URL in Settings → Connections.</p>
+        </>}
+        {remote?.navigation.status === 'unavailable' && remote.navigation.reason !== 'missing_connection'
+          && <p>Remote navigation unavailable: {remote.navigation.reason.replaceAll('_', ' ')}</p>}
         {fragments.reason && <p className="conversation-event-reason">{fragment('event-reason', fragments.reason)}</p>}
         <pre className="conversation-event-provenance">{fragment('event-provenance', fragments.provenance)}</pre>
         <CopyButton text={fragments.provenance} title="Copy event provenance" />

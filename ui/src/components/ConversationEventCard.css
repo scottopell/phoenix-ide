@@ -49,6 +49,11 @@
   outline-offset: 2px;
 }
 
+.conversation-event-navigation-guidance {
+  margin: 0.35rem 0;
+  overflow-wrap: anywhere;
+}
+
 .conversation-event-provenance, .conversation-event-reason {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
