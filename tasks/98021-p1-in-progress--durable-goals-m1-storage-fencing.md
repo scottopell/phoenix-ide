@@ -1,5 +1,60 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual737 failure corrected with runtime exact-retry seam — source only
+
+Parent run39374941681 exact737 is terminalFAIL/artifact12242414430 with ZERO
+focused execution. Earlier6provider compiler and2DBlint roots were absent; actual
+new compiler root recovery.rs408 expectedToolContent/foundToolResult is corrected
+using actual ToolResult::persisted_tool_content(), matching production round result
+construction. Prior8b static review missed it; compiler evidence supersedes review.
+
+ActualClippy118470954462 newly reached owned IDE roots:3reports for local imports
+after statements, wildcard PendingGoalReport|Finalized, and106/100line report
+checkpoint helper. Source moves imports to module scope, enumerates those variants,
+and extracts existing assistant sequence reconciliation into a small helper shared
+before management/report branching, coherently fixing the on-path retry mismatch.
+No lint suppression. Full completed Rust+Clippy logs inspected read-only, no rerun.
+Shared federation/global_read/send_chat roots remain unwaived, not silently fixed
+or declared green. UI/specs actualsuccess per parent;156floorONLYe4d remains.
+
+This coherent local unit includes the runtime owner/replay retry and changed
+assistant regressions described below; no further UI scaffold or feature breadth.
+Only standalone formatting/whitespace/source review,0compiler/testsSQL/browser,
+no push/newCI/activation/134registration;133stillunqualified.11stashesintact.
+
+## Runtime checkpoint exact-retry seam — source only after737 capture
+
+Parent captured exact737 in ONE existing run39374941681 and owns its results
+and artifacts; its actual terminal failure is recorded above. No new run is
+dispatched here. The bounded source correction extracts the existing
+retained-assistant sequence-only reconciliation into a shared helper called before
+management/report branching in persist_pending_goal_round.
+Management previously returned before that reconciliation; a normal runtime retry
+reserves a new sequence, but DB message_payload_matches includes sequence_id,
+turning identical checkpoint intent into an unclassifiable failure. DB/service
+retry fixtures reuse the original sequence and cannot detect this runtime seam.
+Other assistant payload/owner/proposal/replay validation is unchanged.
+
+Two authored runtime regression functions cover twelve accepted/refused ×
+ordinary/Fork × absent/Anthropic/Responses cases, plus two changed-assistant
+negative cases. They exercise real apply_transition_result checkpoint owners
+with genuine pending management and application-gated DB checkpoints: initial
+persisted/public message equality, signed/encrypted typed replay, exact repeated
+publication despite new sequence reservations, unchanged complete durable
+snapshots, restored current durable source state/timestamp and watch observer,
+retained refusal after admission returns, retained success despite held target
+product+transcript gates, pending replay consumption, and no provider/tool dispatch.
+Changed assistant content remains rejected and unpublished/fatal, not normalized
+away by the sequence reconciliation. No provider exchange, proposal-tool execution,
+file creation, browser/watch UI, restart recovery or automatic continuation is
+claimed by these direct runtime effect tests.
+
+Only standalone rustfmt and Git whitespace/source checks are performed; no
+compiler/tests/SQL/browser/local heavy. No next push, CI, activation, generated
+byte edits, schema132 changes or134registration. Eleven stashes remain intact.
+Actual156floorONLYe4d and133unqualified remain until parent-owned execution
+provides a new actual result. Broader UI/watch/autocontinuation remains unfinished.
+
 ## Actual exacte6 CI failure — prioritized correction, no new feature activation
 
 Run39373782924 exacte6 is terminalFAIL, artifact12241829258. Rust broad/focused

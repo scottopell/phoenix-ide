@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, sync::Weak};
 
-use phoenix_core::domain::conversation_goal::{GoalPendingManagement, ToolRoundResult};
+use phoenix_core::domain::conversation_goal::{
+    GoalAgentSource, GoalPendingManagement, GoalText, ToolRoundResult,
+};
 use phoenix_db::conversation_goals::{
     management::{GoalManagementRoundKind, GoalManagementTarget},
     round::{CommittedGoalRound, GoalRoundCheckpoint},
@@ -73,7 +75,6 @@ impl GoalManagementService {
             .goal_management_execution(transcript, turn_id, turn.generation)
             .await
             .map_err(|error| error.to_string())?;
-        use phoenix_core::domain::conversation_goal::{GoalAgentSource, GoalText};
         let source = GoalAgentSource {
             product_conversation_id: owner,
             execution,
@@ -115,7 +116,9 @@ impl GoalManagementService {
                         let owner = management.request().owner().clone();
                         Some((owner.as_str().to_owned(), owner))
                     }
-                    _ => None,
+                    ToolRoundResult::Finalized(_) | ToolRoundResult::PendingGoalReport { .. } => {
+                        None
+                    }
                 })
                 .collect();
             for owner in owners.into_values() {

@@ -1,5 +1,64 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest actual qualification — exact737 failed before focused execution
+
+Parent-owned run **39374941681**, exact
+`7372d588c9f2d08099df2cd297022d6ed8a6335a`, is **terminal failed**, artifact
+**12242414430**, with **zero focused tests executed**. The six earlier provider
+fixture compiler roots and two DB Clippy roots are absent from this run. The new
+compile stop is the recovery fixture passing a `ToolResult` to
+`MessageContent::Tool`, whose payload is `ToolContent`. The source correction
+uses the actual `ToolResult::persisted_tool_content()` constructor, not an
+invented conversion or a changed expected type. The earlier bounded static
+review missed this error; actual compiler evidence supersedes it.
+
+Completed Clippy job **118470954462** reached goal-owned IDE diagnostics: three
+reports for imports after statements, a wildcard over `ToolRoundResult`, and
+`persist_pending_goal_round` length106/100. Source corrections move imports to
+module scope, explicitly enumerate finalized/report alternatives, and extract
+the existing sequence reconciliation into its small shared helper before the
+management/report split. No new lint suppressions are added. The full completed
+Rust/Clippy logs were read, not rerun. Shared federation/global-read/send-chat
+Clippy failures remain unwaived; neither IDE Clippy nor the new packet is claimed
+green. Parent reports UI/specs lanes fully successful. The only actual focused
+green floor remains156/156 at exacte4d; migration133 remains unqualified and134
+unregistered. No new CI, push, activation, SQL or local compile/test was performed.
+
+## Runtime exact-retry source correction — not executed
+
+After parent capture of exact737 for run **39374941681**, source tracing found
+management checkpoints branching before the retained assistant sequence
+reconciliation already used by report checkpoints. Runtime checkpoint effects
+reserve a fresh sequence range on each attempt, while exact retained-message
+comparison includes `sequence_id`; DB/service fixtures retaining the original
+sequence do not exercise that seam. The source fix extracts the existing
+sequence-only reconciliation into a helper called before the management/report
+split. All other
+assistant payload, owner, result, proposal and private-replay comparisons remain
+at their existing transaction owners. This fixes an existing exact-retry contract;
+it does not add automatic restart replay or another recovery/compatibility tier.
+
+Two additional source-only runtime regression functions cover twelve
+ordinary/Fork effect-owner × absent/Anthropic/Responses replay × accepted/refused
+cases, and two changed-assistant negative cases. They invoke the real
+`apply_transition_result` orchestration with `PersistCheckpoint` or
+`PersistForkProposal`, genuine application-gated pending management and real DB
+owners. They assert initial saved message/publication equality and private bytes,
+new sequence reservation on retry with exact retained rows and publications,
+unchanged proposal/history/turn/state/replay snapshots, current durable source
+state/timestamp and watcher installation, stable success/refusal with both target
+gates held, consumed pending replay, and no new LLM/tool dispatch. Changed
+assistant content must still fail closed without publishing or changing durable
+state. Completed awaited orchestration is the synchronization boundary; channel
+lag/closure is an assertion failure, not silently treated as no publication.
+
+This is runtime checkpoint/effect coverage, **not** execution of `propose_task`,
+a provider-dispatch E2E or browser/watch UI. No task file is created. The source
+fix and tests have not been compiled or executed. Parent owns all run39374941681
+results/artifacts; its actual terminal failure is recorded above. Schema132, migration
+registration, generated types and activation remain unchanged, and broader
+UI/watch/autocontinuation delivery remains incomplete.
+
 ## Latest source checkpoint — qualification remains parent-owned
 
 Parent-owned run **39373782924**, exact

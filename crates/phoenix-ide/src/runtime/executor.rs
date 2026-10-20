@@ -9492,6 +9492,20 @@ where
         }
     }
 
+    async fn restore_goal_assistant_sequence(
+        &self,
+        assistant: &mut crate::db::Message,
+    ) -> Result<(), String> {
+        if self.storage.message_exists(&assistant.message_id).await? {
+            assistant.sequence_id = self
+                .storage
+                .get_message_by_id(&assistant.message_id)
+                .await?
+                .sequence_id;
+        }
+        Ok(())
+    }
+
     async fn persist_pending_goal_round(
         &mut self,
         mut assistant: crate::db::Message,
@@ -9502,6 +9516,7 @@ where
     ) -> Result<Option<Event>, String> {
         use phoenix_core::domain::conversation_goal::ToolRoundResult;
         use phoenix_db::conversation_goals::round::GoalRoundCheckpoint;
+        self.restore_goal_assistant_sequence(&mut assistant).await?;
         if results
             .iter()
             .any(|entry| matches!(entry, ToolRoundResult::PendingGoalManagement { .. }))
@@ -9528,13 +9543,6 @@ where
             .ok_or("pending goal round has no active direct turn")?;
         if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
             return Err("pending goal report execution differs from active direct turn".into());
-        }
-        if self.storage.message_exists(&assistant.message_id).await? {
-            assistant.sequence_id = self
-                .storage
-                .get_message_by_id(&assistant.message_id)
-                .await?
-                .sequence_id;
         }
         let mut trusted = Vec::new();
         for entry in &results {

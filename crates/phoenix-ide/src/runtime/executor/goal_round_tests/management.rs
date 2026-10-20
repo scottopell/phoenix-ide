@@ -8,6 +8,9 @@ use phoenix_core::domain::conversation_goal::{
 };
 use phoenix_core::domain::provider_replay::{AnthropicPrivateBlock, ContentIndex};
 
+#[path = "management_retry.rs"]
+mod retry;
+
 fn create(fixture: &Fixture) -> GoalManagementRequest {
     GoalManagementRequest::Create {
         owner: fixture.target.clone(),

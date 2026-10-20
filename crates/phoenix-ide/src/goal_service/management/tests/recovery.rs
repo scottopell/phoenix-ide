@@ -405,7 +405,7 @@ async fn fork_rollback(provider: Provider, failure: Failure) {
     assert!(!management.is_error);
     assert_eq!(
         accepted.results[1].content,
-        MessageContent::Tool(results[1].finalized().unwrap().clone())
+        MessageContent::Tool(results[1].finalized().unwrap().persisted_tool_content())
     );
     assert_eq!(
         db.list_fork_proposals_for_origin(&fixture.source)
