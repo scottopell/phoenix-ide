@@ -98,6 +98,13 @@ Goal/history, canonical assistant/results, state, replay changes, and optional
 terminal ownership commit together; exact retained results bypass target gates.
 No ordinary owning-agent authority is widened to cross-owner management.
 
+Source review corrected the reducer fixture to the actual `ToolCall::new` plus
+`ToolInput::from_name_and_value` API. Fresh Close fences and history-only targets
+are canonical management refusals through the two typed admission errors; source
+authority, SQL/serialization and integrity failures are not reclassified. Added
+source regressions cover free-gate Close/history targets in both Runtime and
+terminal checkpoints, exact retained refusal replay, and unchanged target history.
+
 New source regressions cover serialization, canonical prepared-event rejection,
 real Coordinator materialization, gate refusal, rollback, historical retry, and
 terminal checkpoint ownership. They have not been compiled or executed locally.

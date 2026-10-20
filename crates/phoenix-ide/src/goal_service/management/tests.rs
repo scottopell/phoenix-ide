@@ -599,3 +599,141 @@ async fn conversation_goal_management_terminal_refusal_replays_without_new_live_
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn conversation_goal_management_fresh_closed_target_commits_a_refusal_and_replays() {
+    for history in [false, true] {
+        for terminal in [false, true] {
+            closed_target_refusal(history, terminal).await;
+        }
+    }
+}
+
+async fn closed_target_refusal(history: bool, terminal: bool) {
+    use crate::runtime::traits::{
+        terminal_obligation, ActiveDirectTurnSettlement, ActiveDirectTurnTerminal,
+    };
+    let fixture = fixture(true).await;
+    let (assistant, results) = round(&fixture).await;
+    let db = fixture.runtime.db();
+    close_target(&fixture, history).await;
+    assert_target_gates_are_free(&fixture).await;
+    let state = if terminal {
+        ConvState::Idle
+    } else {
+        ConvState::LlmRequesting { attempt: 1 }
+    };
+    let checkpoint = round_checkpoint(&assistant, &results, &state);
+    let settlement = ActiveDirectTurnSettlement {
+        turn: fixture.active.clone(),
+        conversation_id: fixture.source.clone(),
+        terminal: ActiveDirectTurnTerminal::Cancelled,
+        state: state.clone(),
+        state_updated_at: checkpoint.state_updated_at,
+        execution_occurrence_message_id: None,
+    };
+    let obligation = terminal_obligation(&settlement, None);
+    let kind = if terminal {
+        GoalManagementRoundKind::Terminal(&obligation)
+    } else {
+        GoalManagementRoundKind::Runtime
+    };
+    let first = established(fixture.service.checkpoint(&checkpoint, kind, None).await);
+    let MessageContent::Tool(output) = &first.results[0].content else {
+        panic!("refused result")
+    };
+    assert!(output.is_error);
+    assert!(output.content.contains("Goal management refused"));
+    assert!(!first.replayed);
+    assert!(db
+        .conversation_goal(&fixture.target)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .conversation_goal_history(&fixture.target, GoalVersion::INITIAL)
+        .await
+        .unwrap()
+        .is_empty());
+    let source = db.get_conversation(&fixture.source).await.unwrap();
+    assert_eq!(source.state, state);
+    assert_eq!(source.state_updated_at, checkpoint.state_updated_at);
+    assert_eq!(db.get_messages(&fixture.source).await.unwrap().len(), 3);
+    let ownership: (Option<String>, i64) =
+        sqlx::query_as("SELECT terminal_kind,owns_conversation FROM durable_turns WHERE turn_id=?")
+            .bind(i64::try_from(fixture.active.turn_id.0).unwrap())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        ownership,
+        if terminal {
+            (Some("Cancelled".into()), 0)
+        } else {
+            (None, 1)
+        }
+    );
+    let _product = fixture
+        .runtime
+        .lock_product_message_admission(fixture.target.as_str())
+        .await;
+    let _transcript = fixture
+        .runtime
+        .lock_message_acceptance("management-target")
+        .await;
+    let replayed = established(fixture.service.checkpoint(&checkpoint, kind, None).await);
+    assert!(replayed.replayed);
+    assert_eq!(
+        serde_json::to_value(first.results).unwrap(),
+        serde_json::to_value(replayed.results).unwrap()
+    );
+    assert_eq!(db.get_messages(&fixture.source).await.unwrap().len(), 3);
+    assert!(db
+        .conversation_goal(&fixture.target)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .conversation_goal_history(&fixture.target, GoalVersion::INITIAL)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+async fn close_target(fixture: &Fixture, history: bool) {
+    use phoenix_core::domain::close::TranscriptConversationId;
+    let db = fixture.runtime.db();
+    if history {
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id=?")
+            .bind(fixture.target.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+    } else {
+        db.begin_direct_close_foundation(
+            &fixture.target,
+            &TranscriptConversationId::parse("management-target").unwrap(),
+            "management-close",
+        )
+        .await
+        .unwrap();
+    }
+}
+
+async fn assert_target_gates_are_free(fixture: &Fixture) {
+    // The gates are free: the refusal must come from transactional lifecycle admission.
+    drop(
+        fixture
+            .runtime
+            .try_lock_product_message_admission(fixture.target.as_str())
+            .await
+            .unwrap(),
+    );
+    drop(
+        fixture
+            .runtime
+            .try_lock_message_acceptance("management-target")
+            .await
+            .unwrap(),
+    );
+}

@@ -4729,7 +4729,10 @@ mod tests {
             None,
         );
         let state = ConvState::ToolExecuting {
-            current_tool: ToolCall::from_raw("manage", "goal_manage", input),
+            current_tool: ToolCall::new(
+                "manage",
+                ToolInput::from_name_and_value("goal_manage", input),
+            ),
             remaining_tools: vec![],
             completed_results: vec![],
             pending_sub_agents: vec![],

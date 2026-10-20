@@ -337,6 +337,8 @@ fn semantic_refusal(error: &GoalDbError) -> bool {
             | GoalDbError::Busy
             | GoalDbError::TargetChanged
             | GoalDbError::Admission(crate::DbError::ConversationNotFound(_))
+            | GoalDbError::Admission(crate::DbError::CloseAdmissionFenced(_))
+            | GoalDbError::Admission(crate::DbError::ProductConversationUnavailable(_))
     )
 }
 
@@ -388,4 +390,22 @@ pub(super) async fn retained_result_tx(
         ));
     }
     Ok(refused)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_goal_management_refuses_only_typed_target_admission_failures() {
+        let owner = ProductConversationId::parse("target").unwrap();
+        assert!(semantic_refusal(&GoalDbError::Admission(
+            crate::DbError::ProductConversationUnavailable(owner)
+        )));
+        assert!(!semantic_refusal(&GoalDbError::BindingConflict));
+        assert!(!semantic_refusal(&GoalDbError::Integrity("source differs")));
+        assert!(!semantic_refusal(&GoalDbError::Admission(
+            crate::DbError::Serialization("invalid state".into())
+        )));
+    }
 }
