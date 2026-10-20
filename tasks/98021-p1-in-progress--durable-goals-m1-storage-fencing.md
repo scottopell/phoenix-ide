@@ -1,5 +1,20 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual07 compile failure — standalone production AssistantMessage import
+
+Parent39382847878 exact07 terminalFAIL/artifact12245899259, ZERO focusedexecuted.
+TwoE0425 at executor723/739: AssistantMessage missingproductionmodulescope despite
+nestedtest imports. Addactual crate::state_machine::state::AssistantMessage to
+existing production state import; lib reexport resolves core sm_state1269decl.
+No semantic/testfixture change. Staticreviewmissedimport; actualcompilerwins.
+
+Read completedClippy118495802967 andUI118495803149 logs; Rust/Clippy/E2E/dev.pyunit
+all hit same2productionroots. UIindividualtsc/timingpass is NOTfullUI/specssuccess.
+Othernewhelper types inspected against module/local/FQ paths; no typecheckclaim.
+Onlystandalonerustfmt/whitespace/sourcechecks;0compiler/testsSQLbrowser/push/CI/
+featurebreadth/activation/resourcechange.11stashes132immutable134unregistered/
+defaultoff,156floorONLYe4d/ade178partial/133notfullyqualified unchanged.
+
 ## Independent72e P2 correction — missing-turn replay fail-closed
 
 Parent exactade..72e review found installed Coordinator management missingactive

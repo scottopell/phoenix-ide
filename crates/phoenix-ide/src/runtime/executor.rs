@@ -26,7 +26,7 @@ use super::{
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
-    SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
+    AssistantMessage, SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
 };
 use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,

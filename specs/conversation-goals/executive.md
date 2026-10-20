@@ -1,5 +1,29 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest actual qualification — exact07 production import failure
+
+Parent run **39382847878**, exact
+`07cfc5987641f2423a82e568fde04c22d3474ef3`, is **terminal failed**, artifact
+**12245899259**, with **zero focused tests executed**. Two production E0425
+errors at the cancellation/canonical-management helper signatures reference
+`AssistantMessage` without a module-scope import. Existing nested test imports
+do not supply production scope. The standalone source correction adds that type
+to the existing `crate::state_machine::state` import; the re-export resolves to
+`phoenix_core::domain::sm_state::AssistantMessage`. No helper behavior or fixture
+assertion changes. Prior static review missed this import; compiler evidence wins.
+
+The completed Clippy118495802967 and UI/specs118495803149 job logs were inspected.
+Rust, Clippy, E2E and the UI lane's dev.py unit check encountered the same two
+production compile errors. Individual UI TypeScript/timing checks passing does
+**not** make UI/specs fully successful at this HEAD. No hidden lint inventory is
+claimed cleared. Newly added helper signatures and body type paths were checked
+against module imports, local imports and fully qualified declarations; this is
+bounded source review, not compiler/typecheck evidence. Only standalone rustfmt
+and Git whitespace checks ran locally, with no compiler/tests/SQL/browser,
+push, new CI, feature expansion or activation. Eleven stashes, immutable132,
+unregistered/default-off134 and the156onlye4d full floor are unchanged;133 is not
+fully qualified and ade178/184 remains partial evidence.
+
 ## Independent72e review correction — missing active authority fails before replay take
 
 Review of exact72e found an owned fail-closed gap: the installed-service path
