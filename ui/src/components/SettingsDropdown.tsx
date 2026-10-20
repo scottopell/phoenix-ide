@@ -5,6 +5,7 @@ import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
 import { FederationConnections } from './FederationConnections';
+import { OPEN_FEDERATION_CONNECTIONS_EVENT } from './settingsEvents';
 import {
   getBrowserNotificationPermission,
   useNotificationSettings,
@@ -59,13 +60,32 @@ export function SettingsDropdown({
   compact = false,
 }: Props) {
   const [open, setOpen] = useState(false);
+  const [connectionsOpen, setConnectionsOpen] = useState(false);
   useRegisterFocusScope(open ? 'settings-dialog' : null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const connectionsTriggerRef = useRef<HTMLButtonElement | null>(null);
   const titleId = useId();
   const navigate = useNavigate();
   const [menuPos, setMenuPos] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
+
+  useEffect(() => {
+    const openConnections = () => {
+      setOpen(true);
+      setConnectionsOpen(true);
+    };
+    window.addEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openConnections);
+    return () => window.removeEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openConnections);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (open && connectionsOpen) connectionsTriggerRef.current?.focus();
+  }, [open, connectionsOpen]);
+
+  useEffect(() => {
+    if (!open) setConnectionsOpen(false);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -186,7 +206,7 @@ export function SettingsDropdown({
               </button>
             </section>
           ) : null}
-          <FederationConnections />
+          <FederationConnections open={connectionsOpen} onOpenChange={setConnectionsOpen} triggerRef={connectionsTriggerRef} />
           <NotificationsSection />
           <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
           <section className="settings-section">

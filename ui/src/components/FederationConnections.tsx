@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type Ref } from 'react';
 import * as v from 'valibot';
 import './FederationConnections.css';
 
@@ -9,12 +9,18 @@ const PeerSchema = v.object({
   created_at: v.string(),
 });
 type Peer = v.InferOutput<typeof PeerSchema>;
+const ImportPeerResponseSchema = v.object({ peer_instance_id: v.string() });
 const NotesSchema = v.object({ notes: v.string() });
 const NOTES_BYTES = 32 * 1024;
 
 async function responseJson(response: Response): Promise<unknown> {
   if (!response.ok) throw new Error(`Request failed (${response.status})`);
   return response.json();
+}
+
+async function fetchPeers(signal?: AbortSignal): Promise<Peer[]> {
+  const response = await fetch('/api/federation/peers', signal ? { signal } : undefined);
+  return v.parse(v.array(PeerSchema), await responseJson(response));
 }
 
 function NotesEditor({ peer }: { peer: Peer }) {
@@ -65,19 +71,94 @@ function NotesEditor({ peer }: { peer: Peer }) {
   </div>;
 }
 
+function EnrollmentImportForm({ onImported }: { onImported: (peerInstanceId: string) => Promise<void> }) {
+  const [bundle, setBundle] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+  const inputId = useId();
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy || !bundle.trim()) return;
+    let enrollment: unknown;
+    try {
+      enrollment = JSON.parse(bundle) as unknown;
+    } catch {
+      setError('Could not import connection. Check the enrollment bundle and retry.');
+      setStatus(null);
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    let accepted = false;
+    try {
+      const response = await fetch('/api/federation/peers/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enrollment }),
+      });
+      if (!response.ok) throw new Error('Import rejected');
+      accepted = true;
+      setBundle('');
+      const imported = v.parse(ImportPeerResponseSchema, await response.json());
+      await onImported(imported.peer_instance_id);
+      setStatus('Connection imported and selected.');
+    } catch {
+      setError(accepted
+        ? 'Connection was imported, but Connections could not be refreshed. Reopen Settings to retry.'
+        : 'Could not import connection. Check the enrollment bundle and destination, then retry.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <form className="federation-import" onSubmit={(event) => { void submit(event); }}>
+    <label htmlFor={inputId}>Receiver-issued enrollment bundle</label>
+    <div className="settings-section__hint">Treat this one-time JSON bundle as a secret. Paste the complete bundle; its name and URL are authoritative.</div>
+    <textarea
+      id={inputId}
+      value={bundle}
+      onChange={(event) => { setBundle(event.target.value); setError(null); setStatus(null); }}
+      disabled={busy}
+      spellCheck={false}
+      autoComplete="off"
+    />
+    <button type="submit" className="settings-inline-btn" disabled={busy || !bundle.trim()}>{busy ? 'Importing…' : 'Import connection'}</button>
+    {error && <div role="alert" className="settings-section__error">{error}</div>}
+    {status && <div role="status" className="settings-section__success">{status}</div>}
+  </form>;
+}
+
 function ConnectionsList() {
   const [peers, setPeers] = useState<Peer[] | null>(null);
   const [error, setError] = useState(false);
   const [selected, setSelected] = useState('');
+  const requestGeneration = useRef(0);
+  const loadPeers = useCallback(async (signal?: AbortSignal, selectAfterLoad?: string) => {
+    const generation = ++requestGeneration.current;
+    try {
+      const nextPeers = await fetchPeers(signal);
+      if (signal?.aborted || generation !== requestGeneration.current) return;
+      setPeers(nextPeers);
+      setError(false);
+      if (selectAfterLoad) setSelected(selectAfterLoad);
+    } catch (loadError) {
+      if (signal?.aborted || generation !== requestGeneration.current) return;
+      setError(true);
+      throw loadError;
+    }
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
-    fetch('/api/federation/peers', { signal: controller.signal }).then(responseJson).then((json) => {
-      setPeers(v.parse(v.array(PeerSchema), json));
-    }).catch(() => { if (!controller.signal.aborted) setError(true); });
+    void loadPeers(controller.signal).catch(() => undefined);
     return () => controller.abort();
-  }, []);
+  }, [loadPeers]);
   const peer = peers?.find((item) => item.peer_instance_id === selected);
-  return <>
+  return <div className="federation-connections__content">
+    <EnrollmentImportForm onImported={(peerInstanceId) => loadPeers(undefined, peerInstanceId)} />
     {error ? <div role="alert">Could not load connections. Reopen to retry.</div> : peers === null ? <div>Loading…</div> : peers.length === 0 ? <div>No saved peer connections.</div> : <>
       <label>Connection <select value={selected} onChange={(event) => setSelected(event.target.value)}>
         <option value="">Select a peer…</option>
@@ -85,13 +166,25 @@ function ConnectionsList() {
       </select></label>
       {peer && <NotesEditor key={peer.peer_instance_id} peer={peer} />}
     </>}
-  </>;
+  </div>;
 }
 
-export function FederationConnections() {
-  const [open, setOpen] = useState(false);
+interface FederationConnectionsProps {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  triggerRef?: Ref<HTMLButtonElement>;
+}
+
+export function FederationConnections({ open, onOpenChange, triggerRef }: FederationConnectionsProps = {}) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const expanded = open ?? internalOpen;
+  const contentId = useId();
+  function setExpanded(next: boolean) {
+    if (open === undefined) setInternalOpen(next);
+    onOpenChange?.(next);
+  }
   return <section className="settings-section federation-connections">
-    <button type="button" className="settings-inline-btn" aria-expanded={open} onClick={() => setOpen(!open)}>Connections {open ? '▾' : '▸'}</button>
-    {open && <ConnectionsList />}
+    <button ref={triggerRef} type="button" className="settings-inline-btn" aria-expanded={expanded} aria-controls={contentId} onClick={() => setExpanded(!expanded)}>Connections {expanded ? '▾' : '▸'}</button>
+    {expanded && <div id={contentId}><ConnectionsList /></div>}
   </section>;
 }

@@ -4,6 +4,7 @@ import type { EventPresentation } from '../generated/EventPresentation';
 import type { ConversationHighlight } from './MessageComponents';
 import { CopyButton } from './CopyButton';
 import { coordinatorConversationLinkState } from './conversationReturnOrigin';
+import { openFederationConnections } from './settingsEvents';
 import './ConversationEventCard.css';
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -89,14 +90,17 @@ export function ConversationEventCard({ presentation, eventId, originalText, act
         <span className={failure ? 'conversation-event-outcome failure' : 'conversation-event-outcome'}>{fragment('event-outcome', fragments.outcome)}</span>
         {occurredAt !== null && <time dateTime={new Date(occurredAt / 1000).toISOString()} aria-label={fragments.time}>{fragment('event-time', fragments.time)}</time>}
       </div>
+      {remoteNavigation && <p className="conversation-event-navigation-guidance">
+        If this configured remote destination is unreachable, verify its saved URL in{' '}
+        <button type="button" className="conversation-event-navigation-action" onClick={openFederationConnections}>Settings → Connections</button> before retrying.
+      </p>}
       {remote?.navigation.status === 'unavailable' && remote.navigation.reason === 'missing_connection'
-        && <p className="conversation-event-navigation-guidance">Remote navigation unavailable: no connection is configured. Open Settings → Connections to add one.</p>}
+        && <p className="conversation-event-navigation-guidance">Remote navigation unavailable: no connection is configured.{' '}
+          <button type="button" className="conversation-event-navigation-action" onClick={openFederationConnections}>Open Settings → Connections</button> to add one.
+        </p>}
       <details ref={details}>
         <summary>Event details</summary>
-        {remoteNavigation && <>
-          <a href={remoteNavigation.source_url}>Exact destination transcript</a>
-          <p className="conversation-event-navigation-guidance">If this remote destination is unreachable, verify its saved URL in Settings → Connections.</p>
-        </>}
+        {remoteNavigation && <a href={remoteNavigation.source_url}>Exact destination transcript</a>}
         {remote?.navigation.status === 'unavailable' && remote.navigation.reason !== 'missing_connection'
           && <p>Remote navigation unavailable: {remote.navigation.reason.replaceAll('_', ' ')}</p>}
         {fragments.reason && <p className="conversation-event-reason">{fragment('event-reason', fragments.reason)}</p>}

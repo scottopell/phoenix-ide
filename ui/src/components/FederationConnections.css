@@ -3,9 +3,32 @@
 }
 
 .federation-connections select,
+.federation-import textarea,
 .federation-notes textarea {
   width: 100%;
   box-sizing: border-box;
+}
+
+.federation-connections__content,
+.federation-import {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.federation-import {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.federation-import textarea {
+  min-height: 120px;
+  resize: vertical;
+  font: inherit;
+}
+
+.federation-import .settings-inline-btn {
+  justify-self: start;
 }
 
 .federation-notes {

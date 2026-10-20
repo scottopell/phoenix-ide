@@ -10,6 +10,7 @@ import { EventPresentationSchema, SseMessageDataSchema } from '../sseSchemas';
 import { ConversationEventCard, eventCardFragments } from './ConversationEventCard';
 import { buildConversationSearchProjection } from './viewer-find/searchProjections';
 import { copyToClipboard } from '../utils/clipboard';
+import { OPEN_FEDERATION_CONNECTIONS_EVENT } from './settingsEvents';
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValue(true) }));
 const available = {
@@ -149,26 +150,36 @@ const federatedGap = {
 } satisfies EventPresentation;
 
 describe('instance-qualified subscription events', () => {
-  it('uses destination HTTPS for colliding local IDs, preserving exact historical navigation', () => {
+  it('uses destination HTTPS for colliding local IDs and shows connectivity guidance before details are opened', () => {
     const { container } = mount(federatedFact);
-    container.querySelector('details')!.open = true;
+    const details = container.querySelector('details')!;
+    expect(details).not.toHaveAttribute('open');
+    const guidance = screen.getByText(/If this configured remote destination is unreachable/);
+    expect(guidance).toBeVisible();
+    expect(guidance.closest('details')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Settings → Connections' })).toBeVisible();
     expect(screen.getByRole('link', { name: 'Remote conversation · 11111111' })).toHaveAttribute('href', federatedFact.navigation.stable_url);
+    details.open = true;
     expect(screen.getByRole('link', { name: 'Exact destination transcript' })).toHaveAttribute('href', federatedFact.navigation.source_url);
-    expect(screen.getByText('If this remote destination is unreachable, verify its saved URL in Settings → Connections.')).toBeVisible();
     expect(container.querySelector('a[href="/c/product-1"]')).toBeNull();
     expect(screen.getByText('Turn finished')).toBeVisible();
     expect(container.querySelector('details')!.textContent).toContain('task completion is not inferred');
     expect(eventCardFragments(federatedFact, '').provenance).toContain(federatedFact.instance_id);
   });
-  it('shows an explicit gap and current nonterminal state without inventing a completion or local link', () => {
+  it('opens Settings Connections from an accessible missing-connection action without inventing a local link', () => {
+    const openSettings = vi.fn();
+    window.addEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openSettings);
     const { container } = mount(federatedGap, 'event-provenance');
     expect(screen.getByText('Retention gap')).toBeVisible();
     expect(screen.getByText('Intermediate facts unavailable. Current state: Nonterminal.')).toBeVisible();
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
     expect(container.querySelector('time')).toBeNull();
-    const guidance = screen.getByText('Remote navigation unavailable: no connection is configured. Open Settings → Connections to add one.');
-    expect(guidance).toBeVisible();
-    expect(guidance.closest('details')).toBeNull();
+    const action = screen.getByRole('button', { name: 'Open Settings → Connections' });
+    expect(action).toBeVisible();
+    expect(action.closest('details')).toBeNull();
+    fireEvent.click(action);
+    expect(openSettings).toHaveBeenCalledOnce();
+    window.removeEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openSettings);
   });
   it('distinguishes a gap terminal snapshot from an intermediate terminal fact', () => {
     const terminalGap = { ...federatedGap, current: { kind: 'terminal', outcome: 'failed' } } as const;

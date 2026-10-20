@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
@@ -33,11 +33,37 @@ vi.mock('../hooks/useFocusScope', () => ({
 }));
 
 import { SettingsDropdown } from './SettingsDropdown';
+import { OPEN_FEDERATION_CONNECTIONS_EVENT } from './settingsEvents';
 
-describe('SettingsDropdown version footer', () => {
+describe('SettingsDropdown', () => {
   beforeEach(() => {
-    apiMock.getVersion.mockReset();
+    apiMock.getVersion.mockReset().mockReturnValue(new Promise(() => {}));
     apiMock.getLlmLanguageSetting.mockReset().mockReturnValue(new Promise(() => {}));
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('opens Settings and expands and focuses Connections for the shared action event', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify([]))));
+    render(
+      <MemoryRouter>
+        <SettingsDropdown
+          theme="dark"
+          onToggleTheme={vi.fn()}
+          codexPreflight={null}
+          onPreflightInvalidated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent(window, new Event(OPEN_FEDERATION_CONNECTIONS_EVENT));
+
+    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeVisible();
+    const connections = screen.getByRole('button', { name: /Connections/ });
+    expect(connections).toHaveAttribute('aria-expanded', 'true');
+    expect(connections).toHaveFocus();
+    expect(screen.getByRole('textbox', { name: 'Receiver-issued enrollment bundle' })).toBeVisible();
+    expect(await screen.findByText('No saved peer connections.')).toBeVisible();
   });
 
   it('shows an abbreviated dirty SHA while exposing the full identity', async () => {

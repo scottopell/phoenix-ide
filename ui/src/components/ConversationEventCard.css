@@ -54,6 +54,21 @@
   overflow-wrap: anywhere;
 }
 
+.conversation-event-navigation-action {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-blue);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.conversation-event-navigation-action:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
 .conversation-event-provenance, .conversation-event-reason {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
