@@ -4,6 +4,7 @@ import { api, type CodexLoginPreflight, type LlmLanguageSetting, type Notificati
 import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
+import { FederationConnections } from './FederationConnections';
 import {
   getBrowserNotificationPermission,
   useNotificationSettings,
@@ -185,6 +186,7 @@ export function SettingsDropdown({
               </button>
             </section>
           ) : null}
+          <FederationConnections />
           <NotificationsSection />
           <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
           <section className="settings-section">

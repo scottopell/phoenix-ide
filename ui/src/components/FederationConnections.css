@@ -1,0 +1,28 @@
+.federation-connections {
+  overflow-wrap: anywhere;
+}
+
+.federation-connections select,
+.federation-notes textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.federation-notes {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.federation-notes textarea {
+  min-height: 120px;
+  resize: vertical;
+  font: inherit;
+}
+
+.federation-notes__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
