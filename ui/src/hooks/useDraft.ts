@@ -1,5 +1,6 @@
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { DraftContext } from '../conversation/DraftContext';
+import type { ComposerDraftRecovery } from '../conversation/DraftStore';
 import { useConversationSnapshot } from '../conversation/useConversationAtom';
 
 const DEBOUNCE_MS = 300;
@@ -67,6 +68,16 @@ export function useDraftValue(slug: string): string {
     [store, slug],
   );
   return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+export function useDraftRecovery(slug: string): ComposerDraftRecovery {
+  const store = useDraftStore();
+  const subscribe = useCallback((listener: () => void) => store.subscribe(slug, listener), [store, slug]);
+  const getSnapshot = useCallback(() => store.getRejected(slug), [store, slug]);
+  const rejected = useSyncExternalStore(subscribe, getSnapshot);
+  const getRecovery = useCallback(() => store.recovery(slug), [store, slug]);
+  const actions = useSyncExternalStore(subscribe, getRecovery);
+  return useMemo(() => ({ ...actions, rejected }), [actions, rejected]);
 }
 
 export interface DraftActions {

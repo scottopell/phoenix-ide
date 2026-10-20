@@ -1,3 +1,5 @@
+import { bashLaunchOutcomes } from './testFixtures/bashLaunchOutcomes';
+import { BashResponseSchema } from './sseSchemas';
 /**
  * SSE wire-format validation tests (task 02674).
  *
@@ -941,4 +943,16 @@ describe('chain Q&A SSE schemas', () => {
     });
     expect(result.success).toBe(false);
   });
+});
+
+it.each(bashLaunchOutcomes)('validates no-handle launch outcome $status / $launch_error', (response) => {
+  expect(v.parse(BashResponseSchema, response)).toEqual(response);
+  expect(response).not.toHaveProperty('handle');
+  expect(response).not.toHaveProperty('pid');
+  const missingCaptureFact: Record<string, unknown> = { ...response };
+  delete missingCaptureFact['output_complete'];
+  expect(v.safeParse(BashResponseSchema, missingCaptureFact).success).toBe(false);
+  for (const descendants of ['verified', 'absent', 'running', 'Unverified', '', null]) {
+    expect(v.safeParse(BashResponseSchema, { ...response, descendants }).success).toBe(false);
+  }
 });

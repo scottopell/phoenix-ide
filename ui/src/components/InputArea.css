@@ -238,3 +238,41 @@
     animation: none;
   }
 }
+
+.input-unsent-message {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.input-unsent-message summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.input-unsent-message pre {
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.input-unsent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+@media (hover: none), (width <= 768px) {
+  .input-unsent-message > summary,
+  .input-unsent-actions > button {
+    min-height: 44px;
+  }
+
+  .input-unsent-actions > button {
+    min-width: 44px;
+  }
+}

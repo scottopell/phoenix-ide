@@ -1,3 +1,4 @@
+import { bashLaunchOutcomes } from '../testFixtures/bashLaunchOutcomes';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
@@ -4225,4 +4226,26 @@ describe('tool result ownership across repeated provider IDs', () => {
     render(transcript(messages));
     assertArtifacts();
   });
+});
+
+it.each(bashLaunchOutcomes)('renders full no-handle outcome $status / $launch_error', (response) => {
+  const { container } = render(<MemoryRouter><ToolUseBlock
+    block={{ type: 'tool_use', id: 'launch', name: 'bash', input: { cmd: response.cmd } }}
+    result={{
+      event_presentation: null, message_id: 'launch-result', sequence_id: 2,
+      conversation_id: 'c1', message_type: 'tool', created_at: '',
+      content: { tool_use_id: 'launch', result: JSON.stringify(response), is_error: response.status === 'outcome_unknown' },
+    }}
+    onOpenFile={undefined}
+  /></MemoryRouter>);
+  expect(container.querySelector('.bash-response')).not.toBeNull();
+  expect(container.querySelector('.bash-status')).toHaveTextContent('no handle');
+  expect(container).toHaveTextContent('No controllable handle; descendants unverified. Output capture incomplete.');
+  expect(container).toHaveTextContent('retained-tail');
+  expect(container.querySelector('.bash-handle')).toBeNull();
+  if (response.status === 'outcome_unknown') {
+    expect(container).toHaveTextContent('Do not automatically retry.');
+    expect(container.querySelector('.bash-exit-code')).toBeNull();
+    expect(container.querySelector('.bash-signal-number')).toBeNull();
+  }
 });

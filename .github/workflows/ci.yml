@@ -688,6 +688,7 @@ jobs:
           node scripts/capture-streaming-table.mjs
           node scripts/capture-assistant-finalization-transcript.mjs
           node scripts/capture-subagent-task-details.mjs
+          node scripts/capture-composer-rejection.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

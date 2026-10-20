@@ -1623,6 +1623,9 @@ function bashStatusText(status: string, finalCause: string | null): string {
     case 'still_running': return 'still running';
     case 'kill_pending_kernel': return 'kill pending (kernel)';
     case 'tombstoned': return finalCause ? `tombstoned · ${finalCause}` : 'tombstoned';
+    case 'unregistered_exited': return 'exited · no handle';
+    case 'unregistered_killed': return 'signaled · no handle';
+    case 'outcome_unknown': return 'outcome unknown · no handle';
     case 'exited': return 'exited';
     case 'killed': return 'killed';
     default: return status;
@@ -1793,7 +1796,7 @@ function CoordinatorEnvironment({ displayData }: { displayData: Record<string, u
 
 function BashResponseView({ response }: { response: Record<string, unknown> }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
-  if (typeof response['error'] === 'string') {
+  if (typeof response['error'] === 'string' && response['status'] !== 'outcome_unknown') {
     return <BashErrorView response={response} />;
   }
   const status = String(response['status'] ?? '');
@@ -1812,8 +1815,8 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
     ? (response['lines'] as Array<{ offset?: number; bytes?: string }>)
     : [];
 
-  const isExited = status === 'exited';
-  const isKilled = status === 'killed';
+  const isExited = status === 'exited' || status === 'unregistered_exited';
+  const isKilled = status === 'killed' || status === 'unregistered_killed';
   const isTombstone = status === 'tombstoned';
   const partial = typeof response['partial'] === 'string' ? response['partial'] : null;
   const lineTexts = lines.map((l) => l.bytes ?? '');
@@ -1836,8 +1839,11 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
         {waitedMs !== null && <span className="bash-duration">waited {formatBashMillis(waitedMs)}</span>}
         {durationMs !== null && <span className="bash-duration">ran {formatBashMillis(durationMs)}</span>}
       </div>
+      {typeof response['launch_error'] === 'string' && (
+        <div className="bash-error-message">No controllable handle; descendants unverified.{response['output_complete'] === false ? ' Output capture incomplete.' : ''}</div>
+      )}
       <BashOutputView lines={lineTexts} partial={partial} truncatedBefore={truncatedBefore} />
-      {status === 'waiter_panicked' && typeof response['error_message'] === 'string' && (
+      {(status === 'waiter_panicked' || status === 'outcome_unknown') && typeof response['error_message'] === 'string' && (
         <div className="bash-error-message">{response['error_message']}</div>
       )}
     </div>
