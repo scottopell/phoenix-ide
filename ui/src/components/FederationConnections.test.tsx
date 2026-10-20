@@ -36,7 +36,7 @@ describe('FederationConnections', () => {
     fireEvent.change(editor, { target: { value: text } });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled());
+    await waitFor(() => expect(screen.getByText(/UTF-8 bytes ✓/)).toBeInTheDocument());
     const firstSave = fetchMock.mock.calls[2];
     if (!firstSave) throw new Error('Expected first save request');
     expect(JSON.parse(firstSave[1].body)).toEqual({ notes: text });
@@ -61,6 +61,21 @@ describe('FederationConnections', () => {
     expect(editor).toHaveValue('retained edit');
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('replaces the notes loading state with a bounded error', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((path: string) => Promise.resolve(
+      new Response(path.endsWith('/notes') ? 'secret-notes-diagnostic' : JSON.stringify([peer]), {
+        status: path.endsWith('/notes') ? 500 : 200,
+      }),
+    )));
+    render(<FederationConnections />);
+    fireEvent.click(screen.getByRole('button', { name: /Connections/ }));
+    const select = await screen.findByRole('combobox', { name: 'Connection' });
+    fireEvent.change(select, { target: { value: peer.peer_instance_id } });
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load notes');
+    expect(screen.queryByText('Loading notes…')).not.toBeInTheDocument();
+    expect(screen.queryByText('secret-notes-diagnostic')).not.toBeInTheDocument();
   });
 
   it('shows load errors without rendering remote response text', async () => {

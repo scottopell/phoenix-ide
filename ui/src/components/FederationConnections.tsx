@@ -53,15 +53,15 @@ function NotesEditor({ peer }: { peer: Peer }) {
     <div>{peer.base_url}</div>
     <code>{peer.peer_instance_id}</code>
     <div className="settings-section__hint">Notes are observations, not authority. Do not store secrets.</div>
-    {text === null ? <div>Loading notes…</div> : <>
+    {text === null && error === null ? <div>Loading notes…</div> : text !== null ? <>
       <textarea aria-label={`Notes for ${peer.peer_display_name}`} value={text} onChange={(event) => setText(event.target.value)} disabled={busy} />
       <div className="federation-notes__actions">
         <span>{bytes} / {NOTES_BYTES} UTF-8 bytes {text === saved ? '✓' : '· unsaved'}</span>
         <button type="button" className="settings-inline-btn" disabled={busy || bytes > NOTES_BYTES || text === saved} onClick={() => { void save(); }}>{busy ? 'Saving…' : 'Save'}</button>
       </div>
-      {bytes > NOTES_BYTES && <div role="alert">Notes exceed the 32 KiB limit.</div>}
-    </>}
-    {error && <div role="alert">{error}</div>}
+      {bytes > NOTES_BYTES && <div role="alert" className="settings-section__error">Notes exceed the 32 KiB limit.</div>}
+    </> : null}
+    {error && <div role="alert" className="settings-section__error">{error}</div>}
   </div>;
 }
 
