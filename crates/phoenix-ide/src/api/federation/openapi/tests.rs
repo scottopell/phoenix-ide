@@ -238,6 +238,14 @@ fn generated_reference_has_exact_supported_paths_and_resolvable_derived_schemas(
         assert!(tls_trust.contains(expected), "missing {expected}");
     }
     for name in [
+        "IssueEnrollmentRequest",
+        "EnrollmentTransferBundle",
+        "ImportPeerConnectionRequest",
+        "PeerIdentityResponse",
+    ] {
+        assert_eq!(schemas[name]["additionalProperties"], false, "{name}");
+    }
+    for name in [
         "OwnerQueryRequest",
         "OwnerSearchRequest",
         "OwnerReadRequest",

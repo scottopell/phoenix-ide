@@ -19480,6 +19480,64 @@ mod lifecycle_handler_tests {
     }
 
     #[tokio::test]
+    async fn peer_import_rejects_legacy_top_level_destination_fields_before_side_effects() {
+        use phoenix_core::domain::instance_identity::InstanceId;
+
+        let mut state = hard_delete_cascade_tests::make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
+        let local = state.db.instance_id().await.unwrap();
+        let receiver = InstanceId::new();
+        let destination_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        destination_listener.set_nonblocking(true).unwrap();
+        let destination_port = destination_listener.local_addr().unwrap().port();
+        let body = serde_json::json!({
+            "enrollment": {
+                "receiver_instance_id": receiver,
+                "receiver_display_name": "peer",
+                "receiver_base_url": format!("https://localhost:{destination_port}"),
+                "caller_instance_id": local,
+                "token": format!("phx_peer_{}", "a".repeat(43)),
+                "tls_trust": { "kind": "platform_roots" },
+            },
+            "peer_display_name": "legacy-peer",
+            "base_url": "https://conflicting.example",
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_router(state.clone()).oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peers/import")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer owner-password")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("unknown fields must be rejected before contacting the destination")
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(matches!(
+            destination_listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(state
+            .db
+            .federation_peer_connection(receiver)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn peer_import_rejects_non_der_basic_constraints_without_persisting() {
         use base64::Engine as _;
         use phoenix_core::domain::instance_identity::InstanceId;

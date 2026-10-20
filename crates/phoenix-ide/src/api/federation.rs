@@ -61,6 +61,7 @@ const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
 const MAX_PEER_IDENTITY_RESPONSE_BYTES: usize = 4 * 1024;
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IssueEnrollmentRequest {
     pub caller_instance_id: InstanceId,
     pub caller_display_name: String,
@@ -73,6 +74,7 @@ pub struct IssueEnrollmentRequest {
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EnrollmentTransferBundle {
     pub receiver_instance_id: InstanceId,
     #[serde(
@@ -98,6 +100,7 @@ pub struct RevokeEnrollmentResponse {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImportPeerConnectionRequest {
     pub enrollment: EnrollmentTransferBundle,
 }
@@ -108,6 +111,7 @@ pub struct ImportPeerConnectionResponse {
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PeerIdentityResponse {
     pub receiver_instance_id: InstanceId,
     pub caller_instance_id: InstanceId,
