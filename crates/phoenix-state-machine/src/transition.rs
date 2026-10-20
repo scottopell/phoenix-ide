@@ -2400,6 +2400,64 @@ pub fn transition_parent(
                 pending_sub_agents,
                 assistant_message,
             }),
+            ParentEvent::Parent(ParentOnlyEvent::GoalManagementPrepared {
+                management,
+                duration_ms,
+            }),
+        ) if context.is_coordinator
+            && current_tool.name() == "goal_manage"
+            && management.source().tool_use_id.as_str() == current_tool.id
+            && management.source().message_id.as_str() == assistant_message.message_id
+            && management.source().transcript_id.as_str() == context.conversation_id =>
+        {
+            let core = finish_tool_round_step(
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+                phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement {
+                    management,
+                    duration_ms,
+                },
+            );
+            Ok(ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
+        (
+            ParentState::Core(
+                core @ CoreState::CancellingTool {
+                    tool_use_id,
+                    assistant_message,
+                    ..
+                },
+            ),
+            ParentEvent::Parent(ParentOnlyEvent::GoalManagementPrepared { management, .. }),
+        ) if context.is_coordinator
+            && management.source().tool_use_id.as_str() == tool_use_id
+            && management.source().message_id.as_str() == assistant_message.message_id
+            && management.source().transcript_id.as_str() == context.conversation_id =>
+        {
+            handle_core_cancellation(
+                core,
+                CoreEvent::ToolAborted {
+                    tool_use_id: tool_use_id.clone(),
+                },
+            )
+            .map(|core| ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
+        (
+            ParentState::Core(CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            }),
             ParentEvent::Parent(ParentOnlyEvent::GoalReportPrepared {
                 report,
                 duration_ms,
@@ -4644,6 +4702,87 @@ mod tests {
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    fn management_fixture() -> (
+        ConvState,
+        phoenix_core::domain::conversation_goal::GoalPendingManagement,
+    ) {
+        use phoenix_core::domain::{
+            conversation_goal::*, llm_types::ContentBlock,
+            product_conversation::ProductConversationId,
+        };
+        let request = GoalManagementRequest::Create {
+            owner: ProductConversationId::parse("target").unwrap(),
+            expected_version: GoalVersion::INITIAL,
+            objective: GoalText::parse("objective").unwrap(),
+        };
+        let input = serde_json::to_value(&request).unwrap();
+        let assistant = AssistantMessage::new(
+            "canonical-management".into(),
+            vec![ContentBlock::tool_use(
+                "manage",
+                "goal_manage",
+                input.clone(),
+            )],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::from_raw("manage", "goal_manage", input),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: assistant,
+        };
+        let intent = GoalPendingManagement::new(
+            GoalAgentSource {
+                product_conversation_id: ProductConversationId::parse("coordinator").unwrap(),
+                transcript_id: GoalText::parse("test-conv").unwrap(),
+                execution: GoalExecution::parse(1, 2).unwrap(),
+                message_id: GoalText::parse("canonical-management").unwrap(),
+                tool_use_id: GoalText::parse("manage").unwrap(),
+            },
+            0,
+            request,
+        );
+        (state, intent)
+    }
+
+    #[test]
+    fn conversation_goal_management_preparation_requires_coordinator_and_exact_canonical_call() {
+        let (state, management) = management_fixture();
+        let event = Event::GoalManagementPrepared {
+            management,
+            duration_ms: 3,
+        };
+        assert!(transition(&state, &test_context(), event.clone()).is_err());
+        let mut context = test_context();
+        context.is_coordinator = true;
+        let prepared = transition(&state, &context, event.clone()).unwrap();
+        assert!(prepared.effects.iter().any(|effect| matches!(effect,
+            Effect::PersistCheckpoint { data: CheckpointData::ToolRound { tool_results, .. } }
+            if matches!(tool_results.as_slice(), [phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement { .. }])
+        )));
+        for field in ["tool", "message", "transcript"] {
+            let mut wrong = state.clone();
+            let ConvState::ToolExecuting {
+                current_tool,
+                assistant_message,
+                ..
+            } = &mut wrong
+            else {
+                panic!("tool")
+            };
+            match field {
+                "tool" => current_tool.id = "wrong".into(),
+                "message" => assistant_message.message_id = "wrong".into(),
+                _ => context.conversation_id = "wrong".into(),
+            }
+            assert!(transition(&wrong, &context, event.clone()).is_err());
+            context.conversation_id = "test-conv".into();
+        }
+        assert!(phoenix_core::domain::sm_event::SubAgentEvent::try_from(event).is_err());
     }
 
     #[test]

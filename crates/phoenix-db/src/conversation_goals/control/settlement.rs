@@ -111,6 +111,11 @@ impl Database {
             ));
         }
         let replayed = match &input {
+            ToolRoundWrite::Management { .. } => {
+                return Err(DbError::Serialization(
+                    "Coordinator management has no ordinary revoked-control owner".into(),
+                ))
+            }
             ToolRoundWrite::Finalized(results) => {
                 retained_pair_tx(&mut tx.tx, assistant, results).await?
             }

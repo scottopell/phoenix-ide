@@ -2609,7 +2609,7 @@ impl MessageStore for DatabaseStorage {
     }
 }
 
-pub(super) fn terminal_obligation(
+pub(crate) fn terminal_obligation(
     settlement: &ActiveDirectTurnSettlement,
     response_message_id: Option<String>,
 ) -> phoenix_db::workflow::DirectTurnTerminalObligationInput {

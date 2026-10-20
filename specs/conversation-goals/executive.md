@@ -49,7 +49,8 @@ new lint allowances or removed assertions; the last fixture uses a scalar-query
 future instead of a redundant async row wrapper. Migration edits are test-only:
 registered SQL, schema132 and the registry remain unchanged. The correction has
 had a staged-only read-only source review, not compiler/test qualification.
-Paused prepared-management tool work remains a separate uncommitted slice.
+Prepared-management checkpoint work is a separate source-only slice; see the
+internal Coordinator checkpoint boundary below.
 
 Run **39363163071** captured exactd4336ee6f0cab3ceed52bf1ccf9b66ef967d49a4;
 normal Rust was still running when its completed Clippy job **118433878610** was
@@ -76,6 +77,33 @@ The subsequent Stop-ordering and identity corrections remain source-only until
 an exact corrected-head run. No duplicate CI or local heavy execution was
 performed. Production stays Disabled, emitter None, route503; actual133 is
 absent and134 remains unregistered.
+
+### Internal Coordinator checkpoint boundary
+
+The parent captured run **39368026538** at exact
+`e4d0d615061a0d927cc5ad3d1a3d875c7c375754`. Its completed Clippy job
+**118449313750** reports the owned `Runtime::new` constructor at101/100 lines;
+two temporary bindings are inlined in later source without changing channel or
+catalog ownership or adding an allowance. The lib-test diagnostic tail names
+shared federation fixtures, not additional owned goal-test diagnostics. The run's
+Rust result and generated artifact qualification remain parent-owned; no passing
+claim is made here.
+
+Internal `goal_manage` preparation now requires the parent Coordinator, its
+canonical current assistant/tool-use, and a live generation-fenced materialized
+Runtime turn. A pending intent carries no success output. Its checkpoint owner
+acquires each ordinary target's product-message and transcript-acceptance gates
+with try-only admission, then rechecks latest/settled target state transactionally.
+Goal/history, canonical assistant/results, state, replay changes, and optional
+terminal ownership commit together; exact retained results bypass target gates.
+No ordinary owning-agent authority is widened to cross-owner management.
+
+New source regressions cover serialization, canonical prepared-event rejection,
+real Coordinator materialization, gate refusal, rollback, historical retry, and
+terminal checkpoint ownership. They have not been compiled or executed locally.
+The production service/emitter is absent, public tool registration and UI remain
+unfinished, and watches/autocontinuation are not claimed. Schema132 is untouched;
+134 remains unregistered and activation remains off.
 
 ### Earlier64322 compile diagnostic
 

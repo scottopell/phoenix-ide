@@ -10140,6 +10140,7 @@ impl Database {
         if matches!(
             &input,
             conversation_goals::round::ToolRoundWrite::Pending { .. }
+                | conversation_goals::round::ToolRoundWrite::Management { .. }
         ) {
             if let Some(update) = update {
                 provider_replay::validate_goal_round_replay(assistant, update)?;
@@ -10348,6 +10349,7 @@ impl Database {
         if matches!(
             &input,
             conversation_goals::round::ToolRoundWrite::Pending { .. }
+                | conversation_goals::round::ToolRoundWrite::Management { .. }
         ) {
             if let Some(update) = update {
                 provider_replay::validate_goal_round_replay(assistant, update)?;
@@ -12296,6 +12298,12 @@ impl Database {
             };
             let mut completed_results: Vec<ToolResult> = completed_results.into_iter().map(|entry| match entry {
                 phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) => result,
+                phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement { management, duration_ms } => {
+                    tracing::debug!(conversation_id = %conv_id, tool_use_id = %management.source().tool_use_id.as_str(), "goal management interrupted before checkpoint commit");
+                    let mut result = ToolResult::error(management.source().tool_use_id.as_str().into(), "Goal management interrupted before checkpoint commit; no goal change was applied.".into());
+                    result.duration_ms = Some(duration_ms);
+                    result
+                }
                 phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { report, duration_ms } => {
                     tracing::debug!(conversation_id = %conv_id, tool_use_id = %report.call().tool_use_id.as_str(), "goal report interrupted before checkpoint commit");
                     let mut result = ToolResult::error(report.call().tool_use_id.as_str().into(), "Goal report interrupted before checkpoint commit; no goal change was applied.".into());

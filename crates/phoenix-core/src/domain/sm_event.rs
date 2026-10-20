@@ -527,6 +527,10 @@ use std::collections::HashMap;
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
 pub enum Event {
+    GoalManagementPrepared {
+        management: crate::domain::conversation_goal::GoalPendingManagement,
+        duration_ms: u64,
+    },
     GoalReportPrepared {
         report: crate::domain::conversation_goal::GoalPendingReport,
         duration_ms: u64,
@@ -810,6 +814,7 @@ impl Event {
             Event::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             Event::RetryTimeout { .. } => "RetryTimeout",
             Event::GoalReportPrepared { .. } => "GoalReportPrepared",
+            Event::GoalManagementPrepared { .. } => "GoalManagementPrepared",
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolAborted { .. } => "ToolAborted",
             Event::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
@@ -957,6 +962,10 @@ pub enum CoreEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum ParentOnlyEvent {
+    GoalManagementPrepared {
+        management: crate::domain::conversation_goal::GoalPendingManagement,
+        duration_ms: u64,
+    },
     GoalReportPrepared {
         report: crate::domain::conversation_goal::GoalPendingReport,
         duration_ms: u64,
@@ -1235,6 +1244,15 @@ impl TryFrom<Event> for ParentEvent {
             Event::UserQuestionDismissed { request_id } => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::UserQuestionDismissed { request_id },
             )),
+            Event::GoalManagementPrepared {
+                management,
+                duration_ms,
+            } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::GoalManagementPrepared {
+                    management,
+                    duration_ms,
+                },
+            )),
             Event::GoalReportPrepared {
                 report,
                 duration_ms,
@@ -1454,6 +1472,7 @@ impl TryFrom<Event> for SubAgentEvent {
             // against firing for sub-agents.
             Event::TaskApprovalDecided { .. }
             | Event::GoalReportPrepared { .. }
+            | Event::GoalManagementPrepared { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed { .. }
@@ -1512,6 +1531,7 @@ impl ParentEvent {
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::UserQuestionDismissed { .. } => "UserQuestionDismissed",
                 ParentOnlyEvent::GoalReportPrepared { .. } => "GoalReportPrepared",
+                ParentOnlyEvent::GoalManagementPrepared { .. } => "GoalManagementPrepared",
                 ParentOnlyEvent::DismissError => "DismissError",
                 ParentOnlyEvent::CredentialBecameAvailable { .. } => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",

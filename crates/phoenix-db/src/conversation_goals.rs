@@ -16,6 +16,7 @@ type GoalTx<'a> = Transaction<'a, Sqlite>;
 mod admission;
 pub(crate) mod checkpoint;
 pub mod control;
+pub mod management;
 pub mod round;
 pub mod user_commands;
 

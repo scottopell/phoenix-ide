@@ -718,13 +718,14 @@ impl GoalReportEmitter {
     }
 }
 
-fn contains_pending_goal_report(
+fn contains_pending_goal_result(
     results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
 ) -> bool {
     results.iter().any(|result| {
         matches!(
             result,
             phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { .. }
+                | phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement { .. }
         )
     })
 }
@@ -740,7 +741,10 @@ fn finalized_round_results(
             }
             phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport {
                 ..
-            } => Err("pending goal report cannot be rendered before checkpoint commit".into()),
+            }
+            | phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement {
+                ..
+            } => Err("pending goal result cannot be rendered before checkpoint commit".into()),
         })
         .collect()
 }
@@ -2034,6 +2038,7 @@ where
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     goal_report_emitter: Option<GoalReportEmitter>,
+    goal_management: Option<Arc<crate::goal_service::management::GoalManagementService>>,
     #[cfg(test)]
     goal_dispatch_barrier: Option<Arc<GoalDispatchTestBarrier>>,
     pending_sub_agent_acceptance: Option<String>,
@@ -2372,10 +2377,8 @@ where
         let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
-        let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
-        let clearable_names = Arc::new(tool_executor.clearable_tool_names());
         let fence = crate::runtime::FatalLocalAuthorityFence::new();
 
         Self {
@@ -2388,15 +2391,16 @@ where
             creation_settlement_disposition: CreationSettlementDisposition::Continue,
             storage,
             llm_client: Arc::new(llm_client),
+            clearable_names: Arc::new(tool_executor.clearable_tool_names()),
             tool_executor,
             previous_transcripts: None,
-            clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             pending_trusted_tool_results: Vec::new(),
             prepared_revoked_goal_tool_round: None,
             pending_provider_replay_update: None,
             goal_report_emitter: None,
+            goal_management: None,
             #[cfg(test)]
             goal_dispatch_barrier: None,
             pending_sub_agent_acceptance: None,
@@ -2410,7 +2414,7 @@ where
             event_rx,
             event_tx,
             broadcast_tx,
-            acknowledged_event_rx,
+            acknowledged_event_rx: mpsc::channel(1).1,
             tool_cancel_token: None,
             llm_task_handle: None,
             active_llm_attempt: None,
@@ -8854,6 +8858,57 @@ where
         self.create_tool_llm_metrics_sink(admitted)
     }
 
+    async fn prepare_goal_management(&self, tool: &ToolCall) -> Result<Event, String> {
+        use phoenix_core::domain::conversation_goal::GoalManagementRequest;
+        if !self.context.is_coordinator || self.context.is_sub_agent {
+            return Err("goal management requires the parent Coordinator".into());
+        }
+        let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = &self.state
+        else {
+            return Err("goal management has no owning assistant round".into());
+        };
+        if current_tool.id != tool.id || current_tool.input != tool.input {
+            return Err("goal management differs from executing call".into());
+        }
+        let request = match serde_json::from_value::<GoalManagementRequest>(tool.input.to_value()) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Event::ToolComplete {
+                    tool_use_id: tool.id.clone(),
+                    result: ToolResult::error(
+                        tool.id.clone(),
+                        format!("Invalid goal management: {error}"),
+                    ),
+                })
+            }
+        };
+        let service = self
+            .goal_management
+            .as_ref()
+            .ok_or("goal management is not installed")?;
+        let turn = self
+            .active_direct_turn
+            .as_deref()
+            .ok_or("goal management has no active direct turn")?;
+        let management = service
+            .prepare(
+                &self.context.conversation_id,
+                turn,
+                &assistant_message.message_id,
+                &tool.id,
+                request,
+            )
+            .await?;
+        Ok(Event::GoalManagementPrepared {
+            management,
+            duration_ms: 0,
+        })
+    }
+
     fn parent_goal_report_emitter(&self) -> Option<&GoalReportEmitter> {
         if self.context.is_sub_agent || self.context.is_coordinator {
             None
@@ -8987,6 +9042,22 @@ where
                     .prepare_goal_report(&tool, emitter.binding.clone(), admitted)
                     .map(Some);
             }
+        }
+
+        if tool.name() == "goal_manage" {
+            if self.context.is_coordinator
+                && !self.context.is_sub_agent
+                && self.goal_management.is_some()
+            {
+                return self.prepare_goal_management(&tool).await.map(Some);
+            }
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id: tool.id.clone(),
+                result: ToolResult::error(
+                    tool.id.clone(),
+                    "EUNAVAIL: Coordinator goal management is not installed".into(),
+                ),
+            }));
         }
 
         if tool.name() == "spawn_agents" {
@@ -9271,6 +9342,132 @@ where
         Ok(Some(committed.results))
     }
 
+    async fn persist_pending_management_round(
+        &mut self,
+        assistant: crate::db::Message,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+        proposal: Option<&crate::db::ForkProposal>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
+        use phoenix_db::conversation_goals::{
+            management::GoalManagementRoundKind, round::GoalRoundCheckpoint,
+        };
+        if !self.context.is_coordinator || self.context.is_sub_agent {
+            return Err("management checkpoint is not the parent Coordinator".into());
+        }
+        let service = self
+            .goal_management
+            .as_ref()
+            .ok_or("management checkpoint owner is not installed")?
+            .clone();
+        let execution = results
+            .iter()
+            .find_map(|result| match result {
+                ToolRoundResult::PendingGoalManagement { management, .. } => {
+                    Some(management.source().execution)
+                }
+                _ => None,
+            })
+            .ok_or("management checkpoint has no intent")?;
+        let active = self
+            .active_direct_turn
+            .as_deref()
+            .ok_or("management checkpoint has no active direct turn")?;
+        if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
+            return Err("management checkpoint differs from active direct turn".into());
+        }
+        if let Some(settlement) = settlement {
+            if &settlement.turn != active {
+                return Err("management terminal authority differs".into());
+            }
+        }
+        let checkpoint = GoalRoundCheckpoint {
+            assistant: &assistant,
+            execution,
+            results: &results,
+            state: &self.state,
+            state_updated_at: self.state_updated_at,
+        };
+        let obligation = settlement
+            .map(|settlement| crate::runtime::traits::terminal_obligation(settlement, None));
+        let kind = if let Some(obligation) = &obligation {
+            GoalManagementRoundKind::Terminal(obligation)
+        } else if let Some(proposal) = proposal {
+            GoalManagementRoundKind::Fork(proposal)
+        } else {
+            GoalManagementRoundKind::Runtime
+        };
+        let committed = match service
+            .checkpoint(
+                &checkpoint,
+                kind,
+                self.pending_provider_replay_update.as_ref(),
+            )
+            .await
+        {
+            TerminalMutationEstablishment::Established { value, .. } => value,
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+            TerminalMutationEstablishment::Retired => {
+                return Err("management checkpoint retired".into())
+            }
+        };
+        self.pending_provider_replay_update = None;
+        self.install_live_state(committed.state, committed.state_updated_at, false)?;
+        if settlement.is_some() {
+            self.active_direct_turn = None;
+            self.pending_direct_turn_terminal = None;
+            self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+            self.direct_turn_cancellation_initiated = false;
+            self.settle_turn_span();
+        }
+        self.publish_management_round(assistant, &results, committed.results, settlement, admitted);
+        Ok(None)
+    }
+
+    fn publish_management_round(
+        &mut self,
+        assistant: crate::db::Message,
+        results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+        messages: Vec<crate::db::Message>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) {
+        let finalized = results
+            .iter()
+            .filter_map(|entry| entry.finalized().cloned())
+            .collect::<Vec<_>>();
+        merge_trusted_tool_results(
+            &mut self.pending_trusted_tool_results,
+            trusted_tool_results(&assistant.message_id, &finalized),
+        );
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(assistant);
+        for result in messages {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(result);
+        }
+        if settlement.is_some() {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .state_change(
+                    self.state.clone(),
+                    self.state.presentation_mode().into(),
+                    self.state_updated_at,
+                );
+        }
+    }
+
     async fn persist_pending_goal_round(
         &mut self,
         mut assistant: crate::db::Message,
@@ -9281,10 +9478,23 @@ where
     ) -> Result<Option<Event>, String> {
         use phoenix_core::domain::conversation_goal::ToolRoundResult;
         use phoenix_db::conversation_goals::round::GoalRoundCheckpoint;
+        if results
+            .iter()
+            .any(|entry| matches!(entry, ToolRoundResult::PendingGoalManagement { .. }))
+        {
+            return self
+                .persist_pending_management_round(
+                    assistant, results, proposal, settlement, admitted,
+                )
+                .await;
+        }
         let execution = results
             .iter()
             .find_map(|entry| match entry {
                 ToolRoundResult::PendingGoalReport { report, .. } => Some(report.execution()),
+                ToolRoundResult::PendingGoalManagement { management, .. } => {
+                    Some(management.source().execution)
+                }
                 ToolRoundResult::Finalized(_) => None,
             })
             .ok_or("pending goal round has no report")?;
@@ -9309,7 +9519,8 @@ where
                     &assistant.message_id,
                     std::slice::from_ref(result),
                 )),
-                ToolRoundResult::PendingGoalReport { .. } => {}
+                ToolRoundResult::PendingGoalReport { .. }
+                | ToolRoundResult::PendingGoalManagement { .. } => {}
             }
         }
         let state = self.state.clone();
@@ -9384,7 +9595,7 @@ where
             .filter_map(|result| result.finalized().cloned())
             .collect();
         let trusted_results = trusted_tool_results(&agent_msg.message_id, &finalized);
-        let results = if contains_pending_goal_report(&tool_results) {
+        let results = if contains_pending_goal_result(&tool_results) {
             let execution = tool_results.iter().find_map(|entry| {
                 if let phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { report, .. } = entry {
                     Some(report.execution())
@@ -9556,7 +9767,7 @@ where
                 .persist_prepared_revoked_goal_tool_round(admitted)
                 .await;
         }
-        if contains_pending_goal_report(&tool_results) {
+        if contains_pending_goal_result(&tool_results) {
             return self
                 .persist_pending_goal_round(
                     agent_msg,
@@ -9646,7 +9857,7 @@ where
                     created_at: assistant_message.created_at,
                 };
 
-                if contains_pending_goal_report(&tool_results) {
+                if contains_pending_goal_result(&tool_results) {
                     return self
                         .persist_pending_goal_round(agent_msg, tool_results, None, None, admitted)
                         .await;
@@ -9803,7 +10014,7 @@ where
             resolved_at: None,
         };
 
-        if contains_pending_goal_report(&tool_results) {
+        if contains_pending_goal_result(&tool_results) {
             return self
                 .persist_pending_goal_round(
                     agent_msg,

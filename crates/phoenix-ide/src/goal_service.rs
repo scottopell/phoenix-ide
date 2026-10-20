@@ -67,6 +67,7 @@ pub(crate) async fn apply(
     }
 }
 
+pub(crate) mod management;
 #[allow(dead_code, reason = "authenticated command adapter is not installed")]
 pub(crate) mod user_commands;
 

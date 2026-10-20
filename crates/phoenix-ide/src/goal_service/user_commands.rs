@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use phoenix_core::domain::{
-    conversation_goal::{GoalDisposition, GoalId, GoalText, GoalTimestampUs, GoalVersion},
+    conversation_goal::{
+        GoalCommandDisposition as UserGoalDisposition, GoalId, GoalText, GoalTimestampUs,
+        GoalVersion,
+    },
     product_conversation::ProductConversationId,
 };
 use phoenix_db::conversation_goals::{
@@ -28,20 +31,6 @@ pub(crate) struct GoalStateRequest {
     pub expected_version: GoalVersion,
     pub goal_id: GoalId,
     pub disposition: UserGoalDisposition,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(
-    tag = "state",
-    content = "reason",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub(crate) enum UserGoalDisposition {
-    Underway,
-    Blocked(GoalText),
-    Complete(GoalText),
-    Exhausted(GoalText),
 }
 
 #[derive(Default)]
@@ -88,12 +77,7 @@ impl GoalCommandService {
         owner: ProductConversationId,
         request: GoalStateRequest,
     ) -> Result<GoalUserReceipt, GoalCommandServiceError> {
-        let disposition = match request.disposition {
-            UserGoalDisposition::Underway => GoalDisposition::Underway,
-            UserGoalDisposition::Blocked(reason) => GoalDisposition::Blocked(reason),
-            UserGoalDisposition::Complete(reason) => GoalDisposition::Complete(reason),
-            UserGoalDisposition::Exhausted(reason) => GoalDisposition::Exhausted(reason),
-        };
+        let disposition = request.disposition.into();
         self.apply(
             authenticated,
             owner,

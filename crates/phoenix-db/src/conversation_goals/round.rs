@@ -38,6 +38,11 @@ pub struct CommittedGoalTerminalRound {
 
 pub(crate) enum ToolRoundWrite<'a> {
     Finalized(&'a [Message]),
+    Management {
+        execution: GoalExecution,
+        results: &'a [ToolRoundResult],
+        targets: &'a [super::management::GoalManagementTarget],
+    },
     Pending {
         execution: GoalExecution,
         results: &'a [ToolRoundResult],
@@ -63,6 +68,24 @@ pub(crate) async fn write_round_tx(
             persist_finalized_round_tx(tx, assistant, results).await?;
             Ok((results.to_vec(), false))
         }
+        ToolRoundWrite::Management {
+            execution,
+            results,
+            targets,
+        } => finalize_round_with_management_tx(
+            tx,
+            &GoalRoundCheckpoint {
+                assistant,
+                execution,
+                results,
+                state,
+                state_updated_at,
+            },
+            control_installation,
+            Some(targets),
+        )
+        .await
+        .map_err(db_error),
         ToolRoundWrite::Pending { execution, results } => finalize_round_tx(
             tx,
             &GoalRoundCheckpoint {
@@ -189,7 +212,7 @@ async fn retained_message_tx(tx: &mut GoalTx<'_>, id: &str) -> Result<Option<Mes
         .bind(id).try_map(crate::parse_message_row).fetch_optional(&mut **tx).await?)
 }
 
-fn validate_round_shape(checkpoint: &GoalRoundCheckpoint<'_>) -> Result<()> {
+pub(super) fn validate_round_shape(checkpoint: &GoalRoundCheckpoint<'_>) -> Result<()> {
     let assistant = checkpoint.assistant;
     let MessageContent::Agent(blocks) = &assistant.content else {
         return Err(GoalDbError::Integrity("goal round assistant"));
@@ -231,8 +254,8 @@ fn validate_round_shape(checkpoint: &GoalRoundCheckpoint<'_>) -> Result<()> {
     }
     for result in checkpoint.results {
         if let ToolRoundResult::Finalized(result) = result {
-            if !result.is_error() && blocks.iter().any(|block| matches!(
-                block, ContentBlock::ToolUse { id, name, .. } if id == &result.tool_use_id && name == "goal_report"
+            if result.is_success() && blocks.iter().any(|block| matches!(
+                block, ContentBlock::ToolUse { id, name, .. } if id == &result.tool_use_id && matches!(name.as_str(), "goal_report" | "goal_manage")
             )) {
                 return Err(GoalDbError::Integrity("goal report result was finalized before commit"));
             }
@@ -271,6 +294,20 @@ pub(crate) async fn retained_round_tx(
         let actual = actual.ok_or(GoalDbError::Integrity("retained round missing result"))?;
         let finalized = match intent {
             ToolRoundResult::Finalized(result) => result.clone(),
+            ToolRoundResult::PendingGoalManagement {
+                management,
+                duration_ms,
+            } => {
+                super::management::retained_result_tx(
+                    tx,
+                    assistant,
+                    checkpoint.execution,
+                    management,
+                    &actual,
+                    *duration_ms,
+                )
+                .await?
+            }
             ToolRoundResult::PendingGoalReport { report, .. } => {
                 super::checkpoint::verify_source_tx(tx, assistant, checkpoint.execution, report)
                     .await?;
@@ -295,6 +332,15 @@ pub(crate) async fn finalize_round_tx(
     checkpoint: &GoalRoundCheckpoint<'_>,
     control_installation: super::control::GoalControlInstallation,
 ) -> Result<(Vec<Message>, bool)> {
+    finalize_round_with_management_tx(tx, checkpoint, control_installation, None).await
+}
+
+async fn finalize_round_with_management_tx(
+    tx: &mut GoalTx<'_>,
+    checkpoint: &GoalRoundCheckpoint<'_>,
+    control_installation: super::control::GoalControlInstallation,
+    targets: Option<&[super::management::GoalManagementTarget]>,
+) -> Result<(Vec<Message>, bool)> {
     validate_round_shape(checkpoint)?;
     let assistant = checkpoint.assistant;
     let mut retained = Vec::with_capacity(checkpoint.results.len());
@@ -316,6 +362,35 @@ pub(crate) async fn finalize_round_tx(
     for (ordinal, result) in checkpoint.results.iter().enumerate() {
         let resolved = match result {
             ToolRoundResult::Finalized(result) => result.clone(),
+            ToolRoundResult::PendingGoalManagement {
+                management,
+                duration_ms,
+            } => {
+                if let Some(actual) = &retained[ordinal] {
+                    super::management::retained_result_tx(
+                        tx,
+                        assistant,
+                        checkpoint.execution,
+                        management,
+                        actual,
+                        *duration_ms,
+                    )
+                    .await?
+                } else {
+                    let targets = targets.ok_or(GoalDbError::Integrity(
+                        "management round missing application admission",
+                    ))?;
+                    super::management::finalize_tx(
+                        tx,
+                        checkpoint,
+                        management,
+                        *duration_ms,
+                        targets,
+                        control_installation,
+                    )
+                    .await?
+                }
+            }
             ToolRoundResult::PendingGoalReport {
                 report,
                 duration_ms,

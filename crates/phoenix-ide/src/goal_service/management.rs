@@ -1,0 +1,161 @@
+use std::{collections::BTreeMap, sync::Weak};
+
+use phoenix_core::domain::conversation_goal::{GoalPendingManagement, ToolRoundResult};
+use phoenix_db::conversation_goals::{
+    management::{GoalManagementRoundKind, GoalManagementTarget},
+    round::{CommittedGoalRound, GoalRoundCheckpoint},
+};
+
+use crate::runtime::{traits::TerminalMutationEstablishment, RuntimeManager};
+
+/// Internal checkpoint owner; no public tool registration installs this service.
+#[allow(
+    dead_code,
+    reason = "Coordinator management activation is not installed"
+)]
+pub(crate) struct GoalManagementService {
+    runtime: Weak<RuntimeManager>,
+}
+
+impl GoalManagementService {
+    #[allow(
+        dead_code,
+        reason = "Coordinator management activation is not installed"
+    )]
+    pub(crate) fn new(runtime: Weak<RuntimeManager>) -> Self {
+        Self { runtime }
+    }
+
+    pub(crate) async fn prepare(
+        &self,
+        transcript: &str,
+        turn: &crate::runtime::traits::ActiveDirectTurn,
+        message: &str,
+        tool_use: &str,
+        request: phoenix_core::domain::conversation_goal::GoalManagementRequest,
+    ) -> Result<GoalPendingManagement, String> {
+        let runtime = self.runtime.upgrade().ok_or("management runtime closed")?;
+        let turn_id = i64::try_from(turn.turn_id.0).map_err(|error| error.to_string())?;
+        let (owner, execution) = runtime
+            .db()
+            .goal_management_execution(transcript, turn_id, turn.generation)
+            .await
+            .map_err(|error| error.to_string())?;
+        use phoenix_core::domain::conversation_goal::{GoalAgentSource, GoalText};
+        let source = GoalAgentSource {
+            product_conversation_id: owner,
+            execution,
+            transcript_id: GoalText::parse(transcript).map_err(|error| error.to_string())?,
+            message_id: GoalText::parse(message).map_err(|error| error.to_string())?,
+            tool_use_id: GoalText::parse(tool_use).map_err(|error| error.to_string())?,
+        };
+        Ok(GoalPendingManagement::new(source, turn.generation, request))
+    }
+
+    pub(crate) async fn checkpoint(
+        &self,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+        kind: GoalManagementRoundKind<'_>,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<CommittedGoalRound> {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return TerminalMutationEstablishment::KnownNotCommitted(
+                "management runtime closed".into(),
+            );
+        };
+        let retained = match runtime
+            .db()
+            .retained_goal_management_round(checkpoint)
+            .await
+        {
+            Ok(retained) => retained,
+            Err(error) => return TerminalMutationEstablishment::Unclassifiable(error.to_string()),
+        };
+        let mut targets = Vec::new();
+        let mut product_guards = Vec::new();
+        let mut transcript_guards = Vec::new();
+        if retained.is_none() {
+            let owners: BTreeMap<_, _> = checkpoint
+                .results
+                .iter()
+                .filter_map(|result| match result {
+                    ToolRoundResult::PendingGoalManagement { management, .. } => {
+                        let owner = management.request().owner().clone();
+                        Some((owner.as_str().to_owned(), owner))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for owner in owners.into_values() {
+                let Some(product) = runtime
+                    .try_lock_product_message_admission(owner.as_str())
+                    .await
+                else {
+                    targets.push(GoalManagementTarget::Refused { owner });
+                    continue;
+                };
+                let latest = match runtime.db().get_ordinary_product_conversation(&owner).await {
+                    Ok(latest) => latest,
+                    Err(phoenix_db::DbError::ConversationNotFound(_)) => {
+                        targets.push(GoalManagementTarget::Refused { owner });
+                        continue;
+                    }
+                    Err(error) => {
+                        return TerminalMutationEstablishment::KnownNotCommitted(error.to_string())
+                    }
+                };
+                let Some(transcript) = runtime
+                    .try_lock_message_acceptance(&latest.latest_transcript_row_id)
+                    .await
+                else {
+                    targets.push(GoalManagementTarget::Refused { owner });
+                    continue;
+                };
+                targets.push(GoalManagementTarget::Admitted {
+                    owner,
+                    transcript: latest.latest_transcript_row_id,
+                });
+                product_guards.push(product);
+                transcript_guards.push(transcript);
+            }
+        }
+        let result = runtime
+            .db()
+            .persist_goal_management_round(checkpoint, &targets, kind, replay)
+            .await;
+        drop(transcript_guards);
+        drop(product_guards);
+        match result {
+            Ok(value) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+                value,
+            },
+            Err(error) => match runtime
+                .db()
+                .retained_goal_management_round(checkpoint)
+                .await
+            {
+                Ok(None) => TerminalMutationEstablishment::KnownNotCommitted(error.to_string()),
+                Ok(Some(_)) => match runtime
+                    .db()
+                    .persist_goal_management_round(checkpoint, &[], kind, replay)
+                    .await
+                {
+                    Ok(value) => TerminalMutationEstablishment::Established {
+                        transcript_generation: None,
+                        value,
+                    },
+                    Err(replay_error) => TerminalMutationEstablishment::Unclassifiable(format!(
+                        "management commit {error}; exact replay {replay_error}"
+                    )),
+                },
+                Err(probe) => TerminalMutationEstablishment::Unclassifiable(format!(
+                    "management commit {error}; exact probe {probe}"
+                )),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -207,7 +207,10 @@ impl Database {
         use crate::conversation_goals::round::{
             db_error, selected_state_tx, write_round_tx, CommittedGoalRound, ToolRoundWrite,
         };
-        if matches!(&input, ToolRoundWrite::Pending { .. }) {
+        if matches!(
+            &input,
+            ToolRoundWrite::Pending { .. } | ToolRoundWrite::Management { .. }
+        ) {
             validate_goal_round_replay(assistant, update)?;
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;

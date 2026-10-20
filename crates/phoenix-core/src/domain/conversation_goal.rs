@@ -4,6 +4,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::product_conversation::ProductConversationId;
 
+mod pending_management;
+pub use pending_management::{
+    GoalCommandDisposition, GoalManagementRequest, GoalPendingManagement,
+};
 mod pending_report;
 pub use pending_report::{GoalPendingReport, GoalReportBinding, GoalReportCall, GoalReportOutcome};
 mod tool_round_result;
