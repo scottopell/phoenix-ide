@@ -80,7 +80,51 @@ const OWNERS: [Owner; 9] = [
 ];
 
 async fn admitted_fixture() -> (Database, Message, GoalPendingReport) {
+    admitted_fixture_with_control(
+        crate::conversation_goals::control::GoalControlInstallation::Disabled,
+    )
+    .await
+}
+
+async fn control_command(
+    db: &Database,
+    owner: &phoenix_core::domain::product_conversation::ProductConversationId,
+    command: crate::conversation_goals::control::ControlCommand,
+    expected_control_version: u64,
+) {
+    db.apply_goal_control(
+        &crate::conversation_goals::control::ControlRequest {
+            owner: owner.clone(),
+            principal_id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4(),
+            command,
+            expected_control_version,
+        },
+        super::super::at(),
+    )
+    .await
+    .unwrap();
+}
+
+#[allow(clippy::too_many_lines)]
+async fn admitted_fixture_with_control(
+    installation: crate::conversation_goals::control::GoalControlInstallation,
+) -> (Database, Message, GoalPendingReport) {
     let (db, command) = fixture().await;
+    let db = match installation {
+        crate::conversation_goals::control::GoalControlInstallation::Disabled => db,
+        crate::conversation_goals::control::GoalControlInstallation::Installed => {
+            let db = db.install_goal_controls_for_tests().await.unwrap();
+            control_command(
+                &db,
+                &command.owner,
+                crate::conversation_goals::control::ControlCommand::Release,
+                0,
+            )
+            .await;
+            db
+        }
+    };
     db.apply_conversation_goal(&command, "full-root", super::super::at())
         .await
         .unwrap();
@@ -131,6 +175,55 @@ async fn admitted_fixture() -> (Database, Message, GoalPendingReport) {
         i64::try_from(turn_id.0).unwrap(),
     )
     .unwrap();
+    if installation == crate::conversation_goals::control::GoalControlInstallation::Installed {
+        use crate::workflow::{
+            ClaimAuthoritativeTurnInput, LocalAuthorityResult, MaterializeAuthoritativeTurnInput,
+            MaterializeAuthoritativeTurnOutcome,
+        };
+        let repo = db.workflow_repository();
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id: workflow,
+                process_incarnation: phoenix_workflow::ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: phoenix_workflow::LeaseExpiry(100),
+            })
+            .await
+            .unwrap();
+        let LocalAuthorityResult::DurableFactEstablished(
+            MaterializeAuthoritativeTurnOutcome::Materialized(materialized),
+        ) = repo
+            .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+                turn_id,
+                authority: claim.authority.unwrap(),
+                prepared: payload,
+                sequence_id: 2,
+                created_at: Timestamp(3),
+                accepted_state: ConvState::LlmRequesting { attempt: 1 },
+                state_updated_at: Utc::now(),
+                now: Timestamp(3),
+            })
+            .await
+        else {
+            panic!("materialized accepted Runtime turn")
+        };
+        let canonical: Option<String> =
+            sqlx::query_scalar("SELECT canonical_message_id FROM durable_turns WHERE turn_id=?")
+                .bind(execution.turn_id())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            canonical.as_deref(),
+            Some(materialized.message.message_id.as_str())
+        );
+        assert_eq!(
+            materialized.message.message_id,
+            "full-root:goal-owner-input"
+        );
+        assert_eq!(materialized.generation, 0);
+    }
     assert_eq!(execution, GoalExecution::parse(1, 1).unwrap());
     let binding = db
         .conversation_goal_execution_binding(execution)
@@ -149,7 +242,13 @@ async fn admitted_fixture() -> (Database, Message, GoalPendingReport) {
     let assistant = Message {
         message_id: "owner-assistant".into(),
         conversation_id: "full-root".into(),
-        sequence_id: 2,
+        sequence_id: if installation
+            == crate::conversation_goals::control::GoalControlInstallation::Installed
+        {
+            3
+        } else {
+            2
+        },
         message_type: MessageType::Agent,
         content: MessageContent::Agent(vec![ContentBlock::ToolUse {
             id: "report-call".into(),
@@ -281,7 +380,14 @@ fn selected_state(owner: Owner) -> ConvState {
 }
 
 async fn assert_no_round(db: &Database, report: &GoalPendingReport) {
-    assert_eq!(db.get_messages("full-root").await.unwrap().len(), 1);
+    let expected = if db.goal_control_installation()
+        == crate::conversation_goals::control::GoalControlInstallation::Installed
+    {
+        2
+    } else {
+        1
+    };
+    assert_eq!(db.get_messages("full-root").await.unwrap().len(), expected);
     assert_eq!(
         db.conversation_goal(&report.mutation().owner)
             .await
@@ -432,6 +538,89 @@ async fn all_actual_goal_round_owners_commit_and_exactly_replay_without_rewindin
             2
         );
         assert_eq!(db.get_messages("full-root").await.unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn conversation_goal_installed_control_fences_every_actual_report_round_owner() {
+    use crate::conversation_goals::control::{ControlCommand, GoalControlInstallation};
+    for owner in OWNERS {
+        for stopped in [false, true] {
+            let (db, assistant, report) =
+                admitted_fixture_with_control(GoalControlInstallation::Installed).await;
+            if stopped {
+                control_command(&db, &report.mutation().owner, ControlCommand::Stop, 1).await;
+            }
+            let results = [ToolRoundResult::PendingGoalReport {
+                report: report.clone(),
+                duration_ms: 7,
+            }];
+            let state = selected_state(owner);
+            let checkpoint = GoalRoundCheckpoint {
+                assistant: &assistant,
+                execution: report.execution(),
+                results: &results,
+                state: &state,
+                state_updated_at: Utc::now(),
+            };
+            let (messages, replayed) = persist(owner, &db, &checkpoint).await.unwrap();
+            assert!(!replayed, "{owner:?}");
+            let MessageContent::Tool(result) = &messages[0].content else {
+                panic!("paired report")
+            };
+            assert_eq!(result.is_error, stopped, "{owner:?}");
+            let goal = db
+                .conversation_goal(&report.mutation().owner)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(goal.version.get(), if stopped { 1 } else { 2 }, "{owner:?}");
+            assert_eq!(
+                matches!(goal.state, GoalState::Complete(_)),
+                !stopped,
+                "{owner:?}"
+            );
+            if stopped {
+                control_command(&db, &report.mutation().owner, ControlCommand::Release, 2).await;
+            } else {
+                control_command(&db, &report.mutation().owner, ControlCommand::Stop, 1).await;
+            }
+            let (retained, replayed) = persist(owner, &db, &checkpoint).await.unwrap();
+            assert!(replayed, "{owner:?}");
+            assert_eq!(
+                serde_json::to_value(&retained).unwrap(),
+                serde_json::to_value(&messages).unwrap(),
+                "{owner:?}"
+            );
+            assert_owner_replay_state(owner, &db).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn conversation_goal_installed_missing_control_schema_rolls_back_every_report_owner() {
+    use crate::conversation_goals::control::GoalControlInstallation;
+    for owner in OWNERS {
+        let (db, assistant, report) =
+            admitted_fixture_with_control(GoalControlInstallation::Installed).await;
+        sqlx::query("DROP TABLE conversation_goal_control_bindings")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let results = [ToolRoundResult::PendingGoalReport {
+            report: report.clone(),
+            duration_ms: 7,
+        }];
+        let state = selected_state(owner);
+        let checkpoint = GoalRoundCheckpoint {
+            assistant: &assistant,
+            execution: report.execution(),
+            results: &results,
+            state: &state,
+            state_updated_at: Utc::now(),
+        };
+        assert!(persist(owner, &db, &checkpoint).await.is_err(), "{owner:?}");
+        assert_no_round(&db, &report).await;
     }
 }
 

@@ -7906,6 +7906,12 @@ where
         &mut self,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        self.storage
+            .require_goal_control_for_dispatch(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+            )
+            .await?;
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
         // only fires for parent conversations. The counter is reset at
@@ -8391,6 +8397,12 @@ where
             cache_key: PromptCacheKey::stable(&conv_id),
         };
 
+        self.storage
+            .require_goal_control_for_dispatch(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+            )
+            .await?;
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
         let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
@@ -8801,6 +8813,12 @@ where
         tool: ToolCall,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        self.storage
+            .require_goal_control_for_dispatch(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+            )
+            .await?;
         let request_policy = self
             .storage
             .load_tool_admission_policy(&self.context.conversation_id)

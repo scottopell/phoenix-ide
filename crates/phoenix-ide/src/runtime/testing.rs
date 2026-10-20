@@ -1281,6 +1281,15 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn require_goal_control_for_dispatch(
+        &self,
+        _conv_id: &str,
+        _active: Option<&super::traits::ActiveDirectTurn>,
+    ) -> Result<(), String> {
+        tracing::debug!("in-memory test storage has no installed durable goal control");
+        Ok(())
+    }
+
     async fn persist_goal_tool_round_and_state(
         &self,
         _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,

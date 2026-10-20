@@ -5,6 +5,9 @@ use phoenix_core::domain::conversation_goal::{
 
 use super::*;
 
+#[path = "goal_capture/control.rs"]
+mod control;
+
 async fn fixture() -> (Database, WorkflowRepository, GoalMutation) {
     let db = Database::open_in_memory().await.unwrap();
     let conversation = db

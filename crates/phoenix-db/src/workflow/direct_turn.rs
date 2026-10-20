@@ -475,6 +475,13 @@ impl WorkflowRepository {
             )
             .map_err(|error| DbError::Serialization(error.to_string()))?;
             crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx.tx, execution).await?;
+            crate::conversation_goals::control::capture_runtime_control_tx(
+                &mut tx.tx,
+                execution,
+                self.goal_control_installation,
+            )
+            .await
+            .map_err(crate::conversation_goals::control::db_error)?;
         }
         if cut == TransactionCut::BeforeCommit {
             tx.rollback().await?;

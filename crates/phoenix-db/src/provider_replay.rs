@@ -218,6 +218,7 @@ impl Database {
             input,
             state,
             state_updated_at,
+            self.goal_control_installation,
         )
         .await?;
         let (state, state_updated_at) =

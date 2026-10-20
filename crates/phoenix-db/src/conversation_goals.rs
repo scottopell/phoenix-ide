@@ -28,6 +28,8 @@ pub enum GoalDbError {
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
+    Control(#[from] control::ControlError),
+    #[error(transparent)]
     Domain(#[from] GoalError),
     #[error("goal action identity was already used for another mutation")]
     RetryConflict,
@@ -300,9 +302,15 @@ async fn apply_goal_tx(
     mutation: &GoalMutation,
     expected_transcript: Option<&str>,
     at: GoalTimestampUs,
+    control_installation: control::GoalControlInstallation,
 ) -> Result<GoalHistoryEntry> {
     if let Some(previous) = retry_tx(tx, mutation).await? {
         return Ok(previous);
+    }
+    if let (control::GoalControlInstallation::Installed, GoalChange::Report { binding, .. }) =
+        (control_installation, &mutation.change)
+    {
+        control::require_current_control_tx(tx, &binding.owner, binding.execution).await?;
     }
     if let Some(transcript) = expected_transcript {
         match &mutation.change {
@@ -450,7 +458,14 @@ impl Database {
         at: GoalTimestampUs,
     ) -> Result<GoalHistoryEntry> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let accepted = apply_goal_tx(&mut tx, mutation, expected_transcript, at).await?;
+        let accepted = apply_goal_tx(
+            &mut tx,
+            mutation,
+            expected_transcript,
+            at,
+            self.goal_control_installation,
+        )
+        .await?;
         tx.commit().await?;
         Ok(accepted)
     }

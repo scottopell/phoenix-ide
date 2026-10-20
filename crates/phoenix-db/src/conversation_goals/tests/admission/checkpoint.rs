@@ -1,3 +1,4 @@
+use crate::conversation_goals::control::GoalControlInstallation;
 use phoenix_core::domain::conversation_goal::{
     GoalChange, GoalDisposition, GoalExecution, GoalMutation, GoalPendingReport, GoalReportCall,
     GoalReportOutcome, GoalVersion,
@@ -90,6 +91,7 @@ async fn report_and_paired_result_remain_uncommitted_until_the_outer_owner_commi
         &pending,
         7,
         at(),
+        GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -138,6 +140,7 @@ async fn committed_success_response_loss_reuses_the_original_result_after_replac
         &pending,
         7,
         at(),
+        GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -170,6 +173,7 @@ async fn committed_success_response_loss_reuses_the_original_result_after_replac
         &pending,
         99,
         at(),
+        GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -244,6 +248,7 @@ async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on
         &first,
         1,
         at(),
+        GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -263,6 +268,7 @@ async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on
         &pending,
         2,
         at(),
+        GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -299,6 +305,7 @@ async fn semantic_refusal_preserves_other_results_and_its_committed_rejection_on
         &pending,
         5,
         at(),
+        GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -347,7 +354,8 @@ async fn existing_result_is_not_replay_authority_for_changed_genuine_tool_argume
             GoalExecution::parse(1, 1).unwrap(),
             &altered,
             1,
-            at()
+            at(),
+            GoalControlInstallation::Disabled,
         )
         .await,
         Err(GoalDbError::Integrity("pending report changed arguments"))
@@ -376,7 +384,16 @@ async fn report_cannot_borrow_another_round_or_execution_even_in_the_same_transc
         (&assistant, GoalExecution::parse(1, 2).unwrap()),
     ] {
         assert!(matches!(
-            finalize_report_tx(&mut tx, source, execution, &pending, 1, at()).await,
+            finalize_report_tx(
+                &mut tx,
+                source,
+                execution,
+                &pending,
+                1,
+                at(),
+                GoalControlInstallation::Disabled
+            )
+            .await,
             Err(GoalDbError::Integrity("pending report owning round"))
         ));
     }
@@ -404,6 +421,7 @@ async fn retained_success_must_match_exact_accepted_history_not_just_the_success
         &pending,
         1,
         at(),
+        GoalControlInstallation::Disabled,
     )
     .await
     .unwrap();
@@ -424,7 +442,8 @@ async fn retained_success_must_match_exact_accepted_history_not_just_the_success
             GoalExecution::parse(1, 1).unwrap(),
             &pending,
             9,
-            at()
+            at(),
+            GoalControlInstallation::Disabled,
         )
         .await,
         Err(GoalDbError::Integrity(
@@ -455,7 +474,8 @@ async fn unknown_constraint_failure_aborts_the_outer_round_instead_of_becoming_t
             GoalExecution::parse(1, 1).unwrap(),
             &pending,
             1,
-            at()
+            at(),
+            GoalControlInstallation::Disabled,
         )
         .await,
         Err(GoalDbError::Sqlx(_))

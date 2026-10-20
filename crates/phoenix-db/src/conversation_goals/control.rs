@@ -9,6 +9,13 @@ use uuid::Uuid;
 
 use crate::Database;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GoalControlInstallation {
+    #[default]
+    Disabled,
+    Installed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlCommand {
@@ -150,6 +157,38 @@ async fn receipt_tx(
         .as_ref().map(|row| decode(row, input)).transpose()
 }
 
+pub(crate) async fn capture_runtime_control_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    execution: phoenix_core::domain::conversation_goal::GoalExecution,
+    installation: GoalControlInstallation,
+) -> Result<(), ControlError> {
+    if installation == GoalControlInstallation::Disabled {
+        return Ok(());
+    }
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT p.id FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
+         JOIN product_conversations p ON p.id=c.product_conversation_id
+         WHERE t.turn_id=? AND t.workflow_id=? AND p.kind='ordinary'",
+    )
+    .bind(execution.turn_id())
+    .bind(execution.workflow_id())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(owner) = owner {
+        let owner = ProductConversationId::parse(owner)
+            .map_err(|_| ControlError::Integrity("admitted owner identity"))?;
+        bind_control_at_admission_tx(tx, &owner, execution).await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn db_error(error: ControlError) -> crate::DbError {
+    match error {
+        ControlError::Storage(error) => crate::DbError::Sqlx(error),
+        other => crate::DbError::Serialization(other.to_string()),
+    }
+}
+
 /// Capture control in the same transaction that captures the turn's Goal/NoGoal observation.
 ///
 /// # Errors
@@ -189,7 +228,7 @@ pub async fn require_current_control_tx(
          WHERE b.owner_id=? AND b.turn_id=? AND b.workflow_id=? AND b.admitted_stopped=0
              AND p.kind='ordinary' AND p.ordinary_lifecycle='open'
              AND t.disposition='Runtime' AND t.terminal_kind IS NULL
-             AND t.owns_conversation=1 AND t.canonical_message_id IS NULL
+             AND t.owns_conversation=1
              AND NOT EXISTS(SELECT 1 FROM close_obligations o
                  WHERE o.product_conversation_id=p.id AND o.phase<>'completed'))",
     )
@@ -205,6 +244,76 @@ pub async fn require_current_control_tx(
 }
 
 impl Database {
+    #[must_use]
+    pub fn goal_control_installation(&self) -> GoalControlInstallation {
+        self.goal_control_installation
+    }
+
+    /// Install the unregistered candidate in an isolated test database.
+    ///
+    /// # Errors
+    /// Returns the actual schema-installation failure without enabling the controls.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn install_goal_controls_for_tests(mut self) -> Result<Self, ControlError> {
+        sqlx::raw_sql(include_str!("control_candidate.sql"))
+            .execute(self.pool())
+            .await?;
+        self.goal_control_installation = GoalControlInstallation::Installed;
+        Ok(self)
+    }
+
+    /// Check the exact active turn immediately before a model dispatch.
+    ///
+    /// # Errors
+    /// Refuses missing/stale authority and stopped control; storage errors remain distinct.
+    /// This does not cancel a request already dispatched or hold a permit across network work.
+    pub async fn require_goal_control_for_dispatch(
+        &self,
+        transcript: &str,
+        active_turn: Option<(i64, u64)>,
+    ) -> Result<(), ControlError> {
+        if self.goal_control_installation == GoalControlInstallation::Disabled {
+            return Ok(());
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let owner: Option<(String, String)> = sqlx::query_as(
+            "SELECT p.id,p.kind FROM conversations c JOIN product_conversations p
+             ON p.id=c.product_conversation_id WHERE c.id=?",
+        )
+        .bind(transcript)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (owner, kind) = owner.ok_or(ControlError::OwnerUnavailable)?;
+        if kind != "ordinary" {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let (turn, generation) = active_turn.ok_or(ControlError::AdmissionStopped)?;
+        let generation = i64::try_from(generation).map_err(|_| ControlError::AdmissionStopped)?;
+        let workflow: Option<i64> = sqlx::query_scalar(
+            "SELECT t.workflow_id FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
+             WHERE t.turn_id=? AND t.conversation_id=? AND t.generation=?
+             AND t.disposition='Runtime' AND t.owns_conversation=1 AND t.terminal_kind IS NULL
+             AND t.canonical_message_id IS NOT NULL AND c.parent_conversation_id IS NULL
+             AND c.continued_in_conv_id IS NULL",
+        )
+        .bind(turn)
+        .bind(transcript)
+        .bind(generation)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let execution = phoenix_core::domain::conversation_goal::GoalExecution::parse(
+            workflow.ok_or(ControlError::AdmissionStopped)?,
+            turn,
+        )
+        .map_err(|_| ControlError::Integrity("active execution identity"))?;
+        let owner = ProductConversationId::parse(owner)
+            .map_err(|_| ControlError::Integrity("active owner identity"))?;
+        require_current_control_tx(&mut tx, &owner, execution).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Persist a control command after the application has authenticated an owner request.
     /// The reserved control schema is not installed by this operation.
     ///

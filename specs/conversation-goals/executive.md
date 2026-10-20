@@ -16,7 +16,7 @@ error classification. Source audit also corrected the minimal schema fixture's
 settled-admission setup and switched its Goal/NoGoal capture to the actual
 `capture_goal_at_new_turn_tx` production helper. None of those later repairs or
 the transactional control-recheck increment has exact-head execution evidence.
-No second run was dispatched under the one-run allowance.
+The parent subsequently commissioned/dispatched corrected-head run39349884955 at exact2ec; it does not cover later source. No duplicate run was dispatched.
 
 E2E, geometry, task validation and worker-budget jobs passed separately. Clippy
 and UI/specs failed; their remaining federation/shared paths are unchanged from
@@ -24,6 +24,33 @@ ed25 by source diff, not waived as green.134 stays unregistered pending actual13
 132 is unchanged. Private emitter stays None and the public control route stays
 503. UserControl actor-cycle upgrade and installed runtime/tools/UI/watch/automatic
 continuation remain commissioned and incomplete.
+
+## Installed-path source, not execution-qualified
+
+Parent-owned run39349884955 has captured exact2ec. The subsequent source increment
+threads a typed default-disabled installation through Database clones and its real
+WorkflowRepository projection. Only the explicit isolated test-support candidate
+installer can enable it; schema presence is not activation. Actual new Runtime
+acceptance captures control atomically with Goal/NoGoal, and all report transaction
+owners recheck control before fresh mutation. Retained success/refusal stays
+historical evidence after Stop/release. Missing schema is a storage failure.
+
+Mandatory MessageStore forwarding now reaches actual model and tool dispatch,
+independently of an emitter or Goal-vs-NoGoal. It checks the active materialized
+turn/generation and retained control, including a late check after model request
+preparation. **This is not strict Stop/send linearization or in-flight
+cancellation**: a check→dispatch gap remains and blocks production activation.
+Production constructors stay Disabled, emitter None and control route503.
+
+Eight authored/unexecuted tests exercise real acceptance, commit cuts, genuine
+claim/materialization, nine report-owner shapes and runtime provider/tool effects.
+Read-only review caught/fixed the admission-vs-effect canonical-message predicate
+and canonical-ID expectation before publishing. Parent2ec Clippy's two owned
+fixture lints are source-fixed here; that is not test qualification. UserControl
+requires a goal-command-specific receipt, never a Stop/release receipt masquerading
+as goal creation; actor-cycle upgrade/service source remains owed.134 is still
+unregistered pending actual133. Runtime cancellation/linearization, actor/service,
+public tools/UI/watch and automatic continuation remain unfinished.
 
 ## Historical foundation qualification
 

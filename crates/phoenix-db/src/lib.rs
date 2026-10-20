@@ -1577,6 +1577,7 @@ impl SteeringCapacityTestControl {
 
 pub struct Database {
     pool: SqlitePool,
+    goal_control_installation: conversation_goals::control::GoalControlInstallation,
     sqlite_workload_collector: SqliteWorkloadCollector,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
@@ -1601,6 +1602,7 @@ impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            goal_control_installation: self.goal_control_installation,
             sqlite_workload_collector: self.sqlite_workload_collector.clone(),
             path: self.path.clone(),
             dormant_git_repository_catchup_authority_state: self
@@ -1749,6 +1751,7 @@ impl Database {
         workflow::WorkflowRepository::with_sqlite_workload_collector(
             self.pool.clone(),
             self.sqlite_workload_collector.clone(),
+            self.goal_control_installation,
         )
     }
 
@@ -1830,6 +1833,8 @@ impl Database {
     ) -> Self {
         Self {
             pool,
+            goal_control_installation:
+                conversation_goals::control::GoalControlInstallation::Disabled,
             sqlite_workload_collector,
             path,
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
@@ -10150,6 +10155,7 @@ impl Database {
             input,
             state,
             state_updated_at,
+            self.goal_control_installation,
         )
         .await?;
         if replayed {
@@ -10280,6 +10286,7 @@ impl Database {
             input,
             state,
             state_updated_at,
+            self.goal_control_installation,
         )
         .await?;
         let (state, state_updated_at) = conversation_goals::round::selected_state_tx(
@@ -10364,6 +10371,7 @@ impl Database {
             input,
             &obligation.projection.state,
             obligation.projection.state_updated_at,
+            self.goal_control_installation,
         )
         .await?;
         if !replayed {

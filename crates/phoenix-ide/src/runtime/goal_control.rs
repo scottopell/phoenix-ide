@@ -183,7 +183,7 @@ mod tests {
     async fn conversation_goal_control_service_auth_extractor_rejects_guest_before_receipt_access()
     {
         let (service, owner) = fixture().await;
-        let (mut parts, _) = Request::new(()).into_parts();
+        let (mut parts, ()) = Request::new(()).into_parts();
         assert!(OwnerAuthenticated::from_request_parts(&mut parts, &())
             .await
             .is_err());

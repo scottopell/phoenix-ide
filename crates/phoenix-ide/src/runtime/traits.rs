@@ -402,6 +402,12 @@ pub trait MessageStore: Send + Sync {
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment;
 
+    async fn require_goal_control_for_dispatch(
+        &self,
+        conv_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<(), String>;
+
     async fn persist_goal_tool_round_and_state(
         &self,
         checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
@@ -813,6 +819,16 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn require_goal_control_for_dispatch(
+        &self,
+        conv_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<(), String> {
+        (**self)
+            .require_goal_control_for_dispatch(conv_id, active)
+            .await
+    }
+
     async fn persist_goal_tool_round_and_state(
         &self,
         checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
@@ -1654,6 +1670,24 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn require_goal_control_for_dispatch(
+        &self,
+        conv_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<(), String> {
+        let active = active
+            .map(|turn| {
+                i64::try_from(turn.turn_id.0)
+                    .map(|id| (id, turn.generation))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        self.db
+            .require_goal_control_for_dispatch(conv_id, active)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn persist_goal_tool_round_and_state(
         &self,
         checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,

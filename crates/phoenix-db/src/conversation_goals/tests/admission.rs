@@ -492,15 +492,28 @@ async fn outer_round_rollback_removes_genuine_source_result_and_goal_change_toge
     let source = retain_report_source_for_round(&db).await;
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     assert!(matches!(
-        apply_goal_tx(&mut tx, &report, Some("full-root"), at()).await,
+        apply_goal_tx(
+            &mut tx,
+            &report,
+            Some("full-root"),
+            at(),
+            crate::conversation_goals::control::GoalControlInstallation::Disabled
+        )
+        .await,
         Err(GoalDbError::Integrity("source message missing"))
     ));
     tx.rollback().await.unwrap();
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     insert_complete_report_round(&mut tx, &source).await;
-    let applied = apply_goal_tx(&mut tx, &report, Some("full-root"), at())
-        .await
-        .unwrap();
+    let applied = apply_goal_tx(
+        &mut tx,
+        &report,
+        Some("full-root"),
+        at(),
+        crate::conversation_goals::control::GoalControlInstallation::Disabled,
+    )
+    .await
+    .unwrap();
     assert!(matches!(applied.snapshot.state, GoalState::Blocked(_)));
     tx.rollback().await.unwrap();
     assert_eq!(
@@ -528,9 +541,15 @@ async fn committed_outer_round_and_exact_report_retry_share_one_history_change()
     let source = retain_report_source_for_round(&db).await;
     let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     insert_complete_report_round(&mut tx, &source).await;
-    let accepted = apply_goal_tx(&mut tx, &report, Some("full-root"), at())
-        .await
-        .unwrap();
+    let accepted = apply_goal_tx(
+        &mut tx,
+        &report,
+        Some("full-root"),
+        at(),
+        crate::conversation_goals::control::GoalControlInstallation::Disabled,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let retried = db
         .apply_conversation_goal(&report, "full-root", GoalTimestampUs::parse(20).unwrap())

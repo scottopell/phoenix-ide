@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "goal_round_tests/control_dispatch.rs"]
+mod control_dispatch;
 use phoenix_core::domain::provider_replay::ProviderReplaySettlement;
 use phoenix_core::domain::{
     conversation_goal::{
@@ -502,7 +505,7 @@ async fn conversation_goal_mixed_legacy_trusted_payload_keeps_live_authority_and
     let legacy = serde_json::to_value(ToolResult {
         tool_use_id: "other".into(),
         outcome: ToolOutcome::TrustedInstructions {
-            output: payload.to_string(),
+            output: payload.clone(),
         },
         duration_ms: None,
     })

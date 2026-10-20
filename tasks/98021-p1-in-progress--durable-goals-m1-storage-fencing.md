@@ -745,3 +745,54 @@ run. Parent retains integration; commissioned runtime/tools/UI/watch/continuatio
 is incomplete, not closed at the foundation checkpoint. No local compiler/test,
 SQL/browser/VM, merge, deployment, live migration or activation occurred. All
 stashes and132 source/registration are preserved.
+
+### Installed-path source increment after parent-owned2ec qualification snapshot
+
+Parent commissioned corrected qualification and dispatched sole current2ec run
+**39349884955**; verified indexed exact2ec before changing the published source.
+No duplicate workflow or local execution was started. This supersedes the prior
+administrative one-run blocker;64322 remains failed with zero test execution.
+
+New source installs actual effect-path fences under an immutable per-Database
+`GoalControlInstallation`, default Disabled in all ordinary constructors and
+preserved by clone and WorkflowRepository projection. Only an explicit isolated
+cfg(test/test-support) candidate installer enables it; table presence never does.
+Actual new Runtime acceptance now captures control alongside Goal/NoGoal before
+the same transaction's cuts; exact replay never recaptures. Actual report mutation
+checks the exact retained control inside its owning transaction, propagated by
+ordinary/provider-replay/fork/terminal owners. Stop refusal becomes paired error;
+missing/malformed schema stays infrastructure failure and rolls back the owner.
+Retained success/refusal remains readable after later Stop/release without replaying
+a mutation. No132/registry/134 change is involved.
+
+MessageStore now requires the model/tool dispatch check: Arc forwards it,
+DatabaseStorage preserves the real installed gate, and InMemoryStorage explicitly
+has no installed durable control. Actual executor model dispatch checks both at
+entry and after request construction, before its provider tasks; actual tool
+entry checks too. Installed dispatch requires an exact live materialized Runtime
+turn/generation/current ordinary transcript and its admitted control. Goal and
+NoGoal both traverse it, independent of emitter presence. **These are pre-dispatch
+checks, not a lifetime permit or strict Stop-vs-send linearization.** Stop can
+still commit in the check→dispatch gap, and already-dispatched operations need
+cancellation integration. This is an explicit activation blocker; production
+installation/emitter remain disabled and public route503.
+
+Eight new authored/unexecuted test functions exercise real acceptance rollback,
+Goal/NoGoal, before/after commit cuts, default-disabled despite schema, missing
+schema, all nine report transaction-owner shapes with success/Stop/retry, and
+real RuntimeExecutor provider/tool dispatch after genuine claim/materialization
+(Goal/NoGoal; missing turn/schema and stale generation). Source review found/fixed
+two fixture issues before publishing: effect verification must not require
+canonical_message_id NULL (admission still does), and canonical input IDs are
+namespace-qualified by the actual materializer. Review is not compiler/test
+qualification. Parent2ec Clippy also exposes two owned fixture lints, source-fixed
+here: String clone and explicit unit-pattern destructuring. Other inherited
+Clippy/UI failures remain separately owned; Rust job is still running at entry.
+
+UserControl actor preparation identified the real prerequisite: an accepted
+goal-command-specific receipt/service, not an accepted Stop/release receipt or
+fake chat source. Immutable132 has actors plus history↔binding cycle and no
+snapshot table. Candidate rebuild/source work is still owed; actual133 remains
+absent,134 reserved/unregistered. Runtime Stop cancellation/linearization,
+UserControl mutation service, tools/UI/watch/automatic continuation remain
+commissioned and are not closed by this increment. Parent retains integration.

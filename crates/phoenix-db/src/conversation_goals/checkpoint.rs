@@ -104,6 +104,7 @@ fn semantic_refusal(error: &GoalDbError) -> bool {
         ) | GoalDbError::BindingConflict
             | GoalDbError::Busy
             | GoalDbError::TargetChanged
+            | GoalDbError::Control(super::control::ControlError::AdmissionStopped)
     )
 }
 
@@ -202,6 +203,7 @@ pub(crate) async fn finalize_report_tx(
     report: &GoalPendingReport,
     duration_ms: u64,
     at: GoalTimestampUs,
+    control_installation: super::control::GoalControlInstallation,
 ) -> Result<ToolResult> {
     verify_source_tx(tx, assistant, execution, report).await?;
     let result_message_id =
@@ -216,6 +218,7 @@ pub(crate) async fn finalize_report_tx(
         &mutation,
         Some(report.call().transcript_id.as_str()),
         at,
+        control_installation,
     )
     .await;
     let mut result = match outcome {
@@ -250,6 +253,7 @@ mod tests {
             GoalDbError::BindingConflict,
             GoalDbError::Busy,
             GoalDbError::TargetChanged,
+            GoalDbError::Control(super::super::control::ControlError::AdmissionStopped),
         ] {
             assert!(semantic_refusal(&error));
         }
@@ -259,6 +263,9 @@ mod tests {
             GoalDbError::Domain(GoalError::Blank),
             GoalDbError::Domain(GoalError::Range),
             GoalDbError::Sqlx(sqlx::Error::RowNotFound),
+            GoalDbError::Control(super::super::control::ControlError::Storage(
+                sqlx::Error::RowNotFound,
+            )),
         ] {
             assert!(!semantic_refusal(&error));
         }
