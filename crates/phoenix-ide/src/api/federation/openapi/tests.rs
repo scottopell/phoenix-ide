@@ -8,6 +8,25 @@ use tower::ServiceExt as _;
 #[test]
 #[allow(clippy::too_many_lines)]
 fn generated_reference_has_exact_supported_paths_and_resolvable_derived_schemas() {
+    fn resolve_refs(value: &Value, document: &Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(reference) = object.get("$ref") {
+                    let path = reference.as_str().unwrap().strip_prefix('#').unwrap();
+                    assert!(document.pointer(path).is_some(), "unresolved {path}");
+                }
+                for value in object.values() {
+                    resolve_refs(value, document);
+                }
+            }
+            Value::Array(array) => {
+                for value in array {
+                    resolve_refs(value, document);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
     let id = InstanceId::new();
     let reference = serde_json::to_value(generate(id)).unwrap();
     assert_eq!(reference["info"]["title"], "Federation API reference");
@@ -180,25 +199,6 @@ fn generated_reference_has_exact_supported_paths_and_resolvable_derived_schemas(
         "verifier",
     ] {
         assert!(!summary.contains_key(secret));
-    }
-    fn resolve_refs(value: &Value, document: &Value) {
-        match value {
-            Value::Object(object) => {
-                if let Some(reference) = object.get("$ref") {
-                    let path = reference.as_str().unwrap().strip_prefix('#').unwrap();
-                    assert!(document.pointer(path).is_some(), "unresolved {path}");
-                }
-                for value in object.values() {
-                    resolve_refs(value, document);
-                }
-            }
-            Value::Array(array) => {
-                for value in array {
-                    resolve_refs(value, document);
-                }
-            }
-            _ => {}
-        }
     }
     resolve_refs(&reference, &reference);
     assert!(serde_json::to_vec(&reference).unwrap().len() < DOCUMENT_BYTES);

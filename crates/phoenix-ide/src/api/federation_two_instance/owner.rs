@@ -25,7 +25,7 @@ async fn post(caller: &TestInstance, operation: &str, request: &Value) -> reqwes
         .unwrap()
 }
 
-fn requests(instance: impl ToString) -> Vec<(&'static str, Value)> {
+fn requests(instance: &impl ToString) -> Vec<(&'static str, Value)> {
     let instance = instance.to_string();
     vec![
         (
@@ -111,7 +111,7 @@ async fn owner_five_facades_use_remote_identities_and_remote_api_only_attributio
         .set_federation_peer_notes(peer.peer_instance_id, &notes)
         .await
         .unwrap();
-    for (operation, request) in requests(peer.peer_instance_id) {
+    for (operation, request) in requests(&peer.peer_instance_id) {
         let response = post(&caller, operation, &request).await;
         assert_eq!(response.status(), reqwest::StatusCode::OK, "{operation}");
         let bytes = response.bytes().await.unwrap();
@@ -230,7 +230,7 @@ async fn owner_five_facades_use_remote_identities_and_remote_api_only_attributio
         reqwest::StatusCode::UNPROCESSABLE_ENTITY
     );
     let inbound_credential = caller.enroll(peer.peer_instance_id).await;
-    for (operation, request) in requests(peer.peer_instance_id) {
+    for (operation, request) in requests(&peer.peer_instance_id) {
         let response = caller
             .client
             .post(caller.endpoint(&format!("api/federation/{operation}")))
@@ -264,7 +264,7 @@ async fn owner_all_five_fail_closed_on_broken_tls_auth_and_unavailable_peer() {
         )
         .await
         .unwrap();
-    for (operation, request) in requests(peer.peer_instance_id) {
+    for (operation, request) in requests(&peer.peer_instance_id) {
         let response = post(&caller, operation, &request).await;
         assert_eq!(
             response.status(),
@@ -294,7 +294,7 @@ async fn owner_all_five_fail_closed_on_broken_tls_auth_and_unavailable_peer() {
         .revoke_federation_enrollment(caller.state.db.instance_id().await.unwrap())
         .await
         .unwrap();
-    for (operation, request) in requests(peer.peer_instance_id) {
+    for (operation, request) in requests(&peer.peer_instance_id) {
         let response = post(&caller, operation, &request).await;
         assert_eq!(
             response.status(),
@@ -307,7 +307,7 @@ async fn owner_all_five_fail_closed_on_broken_tls_auth_and_unavailable_peer() {
         );
     }
     receiver.stop().await;
-    for (operation, request) in requests(peer.peer_instance_id) {
+    for (operation, request) in requests(&peer.peer_instance_id) {
         let response = post(&caller, operation, &request).await;
         assert_eq!(
             response.status(),

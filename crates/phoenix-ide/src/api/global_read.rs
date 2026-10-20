@@ -4249,7 +4249,7 @@ mod tests {
             .create_conversation("all-hidden", "all-hidden", "/tmp", true, None, None)
             .await
             .unwrap();
-        for index in 0..READ_MESSAGE_BATCH * 2 + 1 {
+        for index in 0..=READ_MESSAGE_BATCH * 2 {
             db.add_message(
                 &format!("all-hidden-{index}"),
                 &conv.id,

@@ -35,8 +35,20 @@ fn acceptance(response: &RemoteSendMessageResponse) -> &RemoteMessageAcceptance 
     match &response.receipt {
         RemoteSendReceipt::Accepted { acceptance }
         | RemoteSendReceipt::Duplicate { acceptance } => acceptance,
-        receipt => panic!("expected acceptance-only receipt, got {receipt:?}"),
+        receipt @ RemoteSendReceipt::Rejected { .. } => {
+            panic!("expected acceptance-only receipt, got {receipt:?}")
+        }
     }
+}
+
+async fn coordinator_id(instance: &TestInstance) -> String {
+    instance
+        .state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 fn send_tool(caller: &TestInstance) -> Arc<dyn crate::tools::Tool> {
@@ -732,7 +744,11 @@ pub(super) async fn materialize_received(
         MaterializeAuthoritativeTurnOutcome::Materialized(row)
         | MaterializeAuthoritativeTurnOutcome::ExactReplay(row)
         | MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(row) => *row.message,
-        other => panic!("expected authoritative message projection: {other:?}"),
+        other @ (MaterializeAuthoritativeTurnOutcome::NotCommitted
+        | MaterializeAuthoritativeTurnOutcome::StaleAuthority
+        | MaterializeAuthoritativeTurnOutcome::CommandRejected(_)) => {
+            panic!("expected authoritative message projection: {other:?}")
+        }
     }
 }
 
@@ -741,21 +757,9 @@ async fn https_coordinator_retry_after_continuation_returns_original_acceptance(
     let caller = TestInstance::start().await;
     let receiver = TestInstance::start().await;
     let peer = caller.connect_to(&receiver).await;
-    let source_id = caller
-        .state
-        .db
-        .coordinator_conversation_id()
-        .await
-        .unwrap()
-        .unwrap();
+    let source_id = coordinator_id(&caller).await;
     let source = caller.state.db.get_conversation(&source_id).await.unwrap();
-    let original = receiver
-        .state
-        .db
-        .coordinator_conversation_id()
-        .await
-        .unwrap()
-        .unwrap();
+    let original = coordinator_id(&receiver).await;
     let send = request(peer.peer_instance_id, RemoteSendTarget::Coordinator {});
     let sender = RemoteSenderAttestation::from_conversation(
         source,

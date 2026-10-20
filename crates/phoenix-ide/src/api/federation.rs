@@ -2233,6 +2233,68 @@ mod tests {
         server.await.unwrap();
     }
 
+    fn spawn_redirect_assertion_server(
+        source: tokio::net::TcpListener,
+        target: Option<tokio::net::TcpListener>,
+        acceptor: tokio_rustls::TlsAcceptor,
+        status: &'static str,
+        redirect_port: u16,
+        send_message: bool,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+            let (stream, _) = source.accept().await.unwrap();
+            let stream = acceptor.accept(stream).await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = Vec::new();
+            stream.read_until(b'\n', &mut request).await.unwrap();
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_until(b'\n', &mut request).await.unwrap();
+            }
+            let request = String::from_utf8(request).unwrap();
+            let operation = if send_message {
+                "send-conversation-message"
+            } else {
+                "query-database"
+            };
+            assert!(request.starts_with(&format!("POST /api/federation/peer/{operation} ")));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nLocation: https://localhost:{redirect_port}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            drop(stream);
+
+            tokio::select! {
+                accepted = async {
+                    match target {
+                        Some(target) => target.accept().await,
+                        None => source.accept().await,
+                    }
+                } => {
+                    accepted.unwrap();
+                    true
+                }
+                result = done_rx => {
+                    result.unwrap();
+                    false
+                }
+            }
+        });
+        (done_tx, server)
+    }
+
     #[tokio::test]
     async fn authenticated_remote_query_and_send_do_not_follow_307_or_308() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -2273,54 +2335,14 @@ mod tests {
                 listener.local_addr().unwrap().port()
             });
             let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(loaded.server));
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            let server = tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-                let (stream, _) = source.accept().await.unwrap();
-                let stream = acceptor.accept(stream).await.unwrap();
-                let mut stream = tokio::io::BufReader::new(stream);
-                let mut request = Vec::new();
-                stream.read_until(b'\n', &mut request).await.unwrap();
-                while !request.ends_with(b"\r\n\r\n") {
-                    stream.read_until(b'\n', &mut request).await.unwrap();
-                }
-                let request = String::from_utf8(request).unwrap();
-                let operation = if send_message {
-                    "send-conversation-message"
-                } else {
-                    "query-database"
-                };
-                assert!(request.starts_with(&format!("POST /api/federation/peer/{operation} ")));
-                assert!(request
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer "));
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\nLocation: https://localhost:{redirect_port}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                drop(stream);
-
-                tokio::select! {
-                    accepted = async {
-                        match target {
-                            Some(target) => target.accept().await,
-                            None => source.accept().await,
-                        }
-                    } => {
-                        accepted.unwrap();
-                        true
-                    }
-                    result = done_rx => {
-                        result.unwrap();
-                        false
-                    }
-                }
-            });
+            let (done_tx, server) = spawn_redirect_assertion_server(
+                source,
+                target,
+                acceptor,
+                status,
+                redirect_port,
+                send_message,
+            );
             state
                 .db
                 .save_federation_peer_connection(
