@@ -41,7 +41,7 @@ impl IntoResponse for PeerNotesError {
     }
 }
 
-fn database_error(error: phoenix_db::DbError) -> PeerNotesError {
+fn database_error(error: &phoenix_db::DbError) -> PeerNotesError {
     tracing::error!(%error, "federation peer-notes database operation failed");
     PeerNotesError(StatusCode::INTERNAL_SERVER_ERROR, "database_unavailable")
 }
@@ -60,7 +60,7 @@ async fn peer(state: &AppState, instance: String) -> ApiResult<FederationPeerCon
             FederationPeerSelectionError::Ambiguous => {
                 PeerNotesError(StatusCode::CONFLICT, "ambiguous_instance")
             }
-            FederationPeerSelectionError::Database(error) => database_error(error),
+            FederationPeerSelectionError::Database(error) => database_error(&error),
         })
 }
 
@@ -79,7 +79,7 @@ async fn list_peers(
         .list_federation_peers()
         .await
         .map(Json)
-        .map_err(database_error)
+        .map_err(|error| database_error(&error))
 }
 
 async fn get_notes(
@@ -92,7 +92,7 @@ async fn get_notes(
         .db
         .federation_peer_notes(peer.peer_instance_id)
         .await
-        .map_err(database_error)?
+        .map_err(|error| database_error(&error))?
         .ok_or(PeerNotesError(StatusCode::NOT_FOUND, "peer_not_found"))?;
     Ok(Json(PeerNotesDocument { notes }))
 }
@@ -110,7 +110,7 @@ async fn put_notes(
         .db
         .set_federation_peer_notes(peer.peer_instance_id, &request.notes)
         .await
-        .map_err(database_error)?
+        .map_err(|error| database_error(&error))?
     {
         return Err(PeerNotesError(StatusCode::NOT_FOUND, "peer_not_found"));
     }
