@@ -599,7 +599,7 @@ async fn block_goal_before_report(db: &Database, report: &GoalPendingReport) {
         .unwrap()
         .unwrap();
     let prior = GoalPendingReport::new(
-        binding,
+        binding.try_into().unwrap(),
         GoalReportCall {
             transcript_id: text(CONVERSATION),
             message_id: text("prior-blocking-assistant"),

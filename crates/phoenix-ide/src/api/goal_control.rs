@@ -19,7 +19,7 @@ pub(super) async fn apply(
     let receipt = GoalControlService::default()
         .apply(authenticated, owner, request)
         .await
-        .map_err(classify_error)?;
+        .map_err(|error| classify_error(&error))?;
     let status = match &receipt.result {
         ControlOutcome::Accepted { .. } => StatusCode::OK,
         ControlOutcome::RejectedVersion { .. } => StatusCode::CONFLICT,
@@ -31,7 +31,7 @@ fn api_error(status: StatusCode, message: &str) -> ApiError {
     (status, Json(serde_json::json!({"error": message})))
 }
 
-fn classify_error(error: GoalControlServiceError) -> ApiError {
+fn classify_error(error: &GoalControlServiceError) -> ApiError {
     match error {
         GoalControlServiceError::Disabled => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
