@@ -26,6 +26,38 @@ impl GoalManagementService {
         Self { runtime }
     }
 
+    pub(crate) fn definition() -> phoenix_core::domain::llm_types::ToolDefinition {
+        phoenix_core::domain::llm_types::ToolDefinition {
+            name: "goal_manage".into(),
+            description: "Manage an ordinary conversation's goal through a version-checked Coordinator checkpoint. No work is started.".into(),
+            defer_loading: false,
+            input_schema: serde_json::json!({
+                "type":"object",
+                "oneOf":[
+                    {"type":"object","properties":{
+                        "op":{"type":"string","enum":["create"]},
+                        "owner":{"type":"string","minLength":1},
+                        "expected_version":{"type":"integer","minimum":0},
+                        "objective":{"type":"string","minLength":1}
+                    },"required":["op","owner","expected_version","objective"],"additionalProperties":false},
+                    {"type":"object","properties":{
+                        "op":{"type":"string","enum":["state"]},
+                        "owner":{"type":"string","minLength":1},
+                        "expected_version":{"type":"integer","minimum":1},
+                        "goal_id":{"type":"string","minLength":1},
+                        "disposition":{"type":"object","oneOf":[
+                            {"type":"object","properties":{"state":{"type":"string","enum":["underway"]}},"required":["state"],"additionalProperties":false},
+                            {"type":"object","properties":{
+                                "state":{"type":"string","enum":["blocked","complete","exhausted"]},
+                                "reason":{"type":"string","minLength":1}
+                            },"required":["state","reason"],"additionalProperties":false}
+                        ]}
+                    },"required":["op","owner","expected_version","goal_id","disposition"],"additionalProperties":false}
+                ]
+            }),
+        }
+    }
+
     pub(crate) async fn prepare(
         &self,
         transcript: &str,
@@ -156,6 +188,9 @@ impl GoalManagementService {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests;

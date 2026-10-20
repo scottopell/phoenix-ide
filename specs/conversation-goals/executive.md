@@ -122,6 +122,22 @@ terminal checkpoints, exact retained refusal replay, and unchanged target histor
 New source regressions cover serialization, canonical prepared-event rejection,
 real Coordinator materialization, gate refusal, rollback, historical retry, and
 terminal checkpoint ownership. They have not been compiled or executed locally.
+A later source-only provider journey exposes the internal declaration only when
+the parent Coordinator has an explicitly installed management owner. The default
+remains `None`. Its declaration uses the actual tagged `GoalCommandDisposition`
+object contract, not string status names. The provider fixture materializes the
+real source turn, emits a canonical tool call with signed Anthropic replay, and
+drives the queued preparation event through checkpoint and following provider
+request. Source tests cover Create and tagged state commands, replay rollback and
+retry, missing/stale/ordinary authority, forged arguments/call identity, host
+generation change, source retirement after preparation, and unavailable
+capability advertisement. No generic tool executor applies management mutations.
+The fixture is shared with service tests rather than introducing a second fake
+source model. A bounded source review corrected helper/signature/schema errors;
+the corrected follow-up found no further concrete source failures, not a passing
+compiler or runtime qualification. Captured run39371603386 is at exact`9a3` and
+does not contain this later journey work; its monitoring remains parent-owned.
+
 The production service/emitter is absent, public tool registration and UI remain
 unfinished, and watches/autocontinuation are not claimed. Schema132 is untouched;
 134 remains unregistered and activation remains off.

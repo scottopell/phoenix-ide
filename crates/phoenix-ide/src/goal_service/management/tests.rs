@@ -1,5 +1,4 @@
 use super::*;
-use crate::runtime::traits::ActiveDirectTurn;
 use chrono::Utc;
 use phoenix_core::domain::{
     conversation_goal::*,
@@ -7,130 +6,9 @@ use phoenix_core::domain::{
     llm_types::ContentBlock,
     sm_state::ConvState,
 };
-use phoenix_db::workflow::{
-    AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, LocalAuthorityResult,
-    MaterializeAuthoritativeTurnInput, MaterializeAuthoritativeTurnOutcome,
-};
-use phoenix_db::{Database, Message};
-use phoenix_workflow::{
-    AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedDirectTurnDelivery,
-    PreparedDirectTurnPayload, PreparedTurn, SubmittedDirectTurnExpansionPolicy,
-    SubmittedDirectTurnIdentity, Timestamp, TurnOutcome,
-};
-use std::sync::Arc;
+use phoenix_db::Message;
 
-struct Fixture {
-    _home: tempfile::TempDir,
-    source: String,
-    runtime: Arc<RuntimeManager>,
-    service: GoalManagementService,
-    target: phoenix_core::domain::product_conversation::ProductConversationId,
-    active: ActiveDirectTurn,
-}
-
-async fn fixture(coordinator: bool) -> Fixture {
-    let db = Database::open_in_memory().await.unwrap();
-    let target = db
-        .create_conversation("management-target", "target", "/tmp", true, None, None)
-        .await
-        .unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let source = if coordinator {
-        db.initialize_coordinator_work_scope(home.path().to_str().unwrap())
-            .await
-            .unwrap();
-        db.get_or_create_coordinator(
-            Some("test-model"),
-            phoenix_core::llm_language::LlmLanguage::default(),
-        )
-        .await
-        .unwrap()
-        .id
-    } else {
-        db.create_conversation("management-source", "ordinary", "/tmp", true, None, None)
-            .await
-            .unwrap()
-            .id
-    };
-    let db = db.install_goal_controls_for_tests().await.unwrap();
-    let prepared = PreparedDirectTurnPayload::from_parts(
-        SubmittedDirectTurnIdentity {
-            origin: InputOrigin::UnknownHistorical,
-            text: "manage goal".into(),
-            images: vec![],
-            files: vec![],
-            message_id: "management-input".into(),
-            user_agent: None,
-            skill_invocation: None,
-            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
-        },
-        PreparedDirectTurnDelivery {
-            text: "manage goal".into(),
-            llm_text: None,
-            images: vec![],
-            files: vec![],
-            user_agent: None,
-            skill_invocation: None,
-        },
-    );
-    let repo = db.workflow_repository();
-    let accepted = repo
-        .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-            client_key: ClientTurnKey::new("management-turn").unwrap(),
-            prepared: PreparedTurn::from_exact_payload(
-                &ConversationAuthority(source.clone()),
-                prepared.to_exact_bytes().unwrap(),
-            ),
-            disposition: AcceptedDisposition::Runtime,
-            accepted_at: Timestamp(1),
-        })
-        .await
-        .unwrap();
-    let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
-        panic!("accepted")
-    };
-    let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
-    let claim = repo
-        .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
-            turn_id,
-            workflow_id,
-            process_incarnation: phoenix_workflow::ProcessIncarnation(1),
-            now: Timestamp(2),
-            lease_until: phoenix_workflow::LeaseExpiry(100),
-        })
-        .await
-        .unwrap();
-    let LocalAuthorityResult::DurableFactEstablished(
-        MaterializeAuthoritativeTurnOutcome::Materialized(materialized),
-    ) = repo
-        .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
-            turn_id,
-            authority: claim.authority.unwrap(),
-            prepared,
-            sequence_id: 1,
-            created_at: Timestamp(3),
-            accepted_state: ConvState::LlmRequesting { attempt: 1 },
-            state_updated_at: chrono::Utc::now(),
-            now: Timestamp(3),
-        })
-        .await
-    else {
-        panic!("materialized")
-    };
-    let active = crate::runtime::traits::ActiveDirectTurn {
-        turn_id,
-        generation: materialized.generation,
-    };
-    let runtime = crate::goal_service::tests::test_runtime_manager(db);
-    Fixture {
-        _home: home,
-        source,
-        service: GoalManagementService::new(Arc::downgrade(&runtime)),
-        runtime,
-        target: target.product_conversation_id,
-        active,
-    }
-}
+use super::testing::{fixture, Fixture};
 
 fn request(fixture: &Fixture) -> GoalManagementRequest {
     GoalManagementRequest::Create {

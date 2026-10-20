@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "goal_round_tests/control_dispatch.rs"]
 mod control_dispatch;
+#[path = "goal_round_tests/management.rs"]
+mod management;
 use phoenix_core::domain::provider_replay::ProviderReplaySettlement;
 use phoenix_core::domain::{
     conversation_goal::{

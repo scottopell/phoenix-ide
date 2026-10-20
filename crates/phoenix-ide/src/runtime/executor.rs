@@ -8348,6 +8348,19 @@ where
             }
             available_tools.push(emitter.definition());
         }
+        if self.context.is_coordinator
+            && !self.context.is_sub_agent
+            && self.goal_management.is_some()
+        {
+            if available_tools
+                .iter()
+                .any(|definition| definition.name == "goal_manage")
+            {
+                return Err("goal management declaration has two owners".into());
+            }
+            available_tools
+                .push(crate::goal_service::management::GoalManagementService::definition());
+        }
         if let Some(tool) = available_tools
             .iter_mut()
             .find(|tool| tool.name == "spawn_agents")
@@ -8871,7 +8884,10 @@ where
         else {
             return Err("goal management has no owning assistant round".into());
         };
-        if current_tool.id != tool.id || current_tool.input != tool.input {
+        if current_tool.id != tool.id
+            || current_tool.name() != "goal_manage"
+            || current_tool.input != tool.input
+        {
             return Err("goal management differs from executing call".into());
         }
         let request = match serde_json::from_value::<GoalManagementRequest>(tool.input.to_value()) {
@@ -9377,6 +9393,12 @@ where
             .ok_or("management checkpoint has no active direct turn")?;
         if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
             return Err("management checkpoint differs from active direct turn".into());
+        }
+        if results.iter().any(|result| matches!(result,
+            ToolRoundResult::PendingGoalManagement { management, .. }
+                if management.source().execution != execution || management.generation() != active.generation
+        )) {
+            return Err("management checkpoint generation differs from active direct turn".into());
         }
         if let Some(settlement) = settlement {
             if &settlement.turn != active {
