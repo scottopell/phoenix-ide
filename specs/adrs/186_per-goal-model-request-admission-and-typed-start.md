@@ -81,7 +81,14 @@ owning turn admission commit together. Runtime materialization/recovery must
 consume this typed case; existing chat payload code does not implement it merely
 because a service can set `InputOrigin` or request a model call.
 
-Identical authorized replay returns the same acceptance; changed input conflicts.
+Replay first derives and authorizes the actual caller for the target, before
+receipt lookup. It then compares the verified requester with the stored requester
+and every typed command field: request identity, owner, immutable goal, expected
+goal/version and Start command. Same-target authorization or an opaque string's
+equality is not an exact requester/input check. A changed requester or field at
+the same identity conflicts. An exact historical replay returns the same receipt
+without fresh settled, Stop, current-goal or current-version admission; returning
+a receipt is not provider dispatch or permission to recreate accepted work.
 A receipt cannot revive a revoked execution or refill the goal. Initial request
 accounting follows admission, using the same durable request mechanism as later
 requests. Stored Start input is not a transcript UserChat, assistant/tool message,
@@ -135,9 +142,15 @@ has capacity, same-execution follow-through requests another admitted logical
 call even after a no-tool yield. If blocked/suspended/complete/exhausted,
 observed-NoGoal, stopped, inactive/closed, stale or superseded, it does not grant
 automatic work. Structured waits remain execution suspension, not automatic
-goal-status coupling. Dispatch still consumes existing live permission after
-any committed decision, so Stop or accepted-input races cannot exploit a cached
-Boolean decision.
+goal-status coupling. Dispatch still consumes existing live Stop/execution
+permission after any committed decision. Independently, accepted queue presence
+must be checked at the actual serialized dispatch admission: the Stop permit is
+not a queue predicate. If input arrives after request admission while its phase
+is requesting, defer/refuse the send/retry and drain accepted input through
+existing queue/checkpoint ownership. Retain the same immutable admitted intent
+and charge, without refund/refill, replan, Idle, new turn or synthetic Start.
+After draining, recheck eligibility for that same intent under current authority;
+no cached Boolean decision can justify overtaking accepted input.
 
 ### Delivery sequence and non-goals
 

@@ -7,9 +7,10 @@
 -- Boundary vocabulary (logical events, not claims about existing wire/types):
 -- StartRequested(policy: ExecutionPolicy, boundary: Boundary, goal: Goal,
 --   request_id: String, expected_version: Integer, requester: VerifiedPrincipal,
---   canonical_intent: String, execution_id: String): new typed Start admission.
+--   canonical_intent: StartPayload, execution_id: String): new typed Start admission.
 -- StartReplayRequested(boundary: Boundary, receipt: StartReceipt,
---   canonical_intent: String): authorized exact accepted-input replay.
+--   requester: VerifiedPrincipal, canonical_intent: StartPayload): authorized
+--   exact accepted-input replay; compare typed fields, not string encodings.
 -- RequestPlanned(policy: ExecutionPolicy, boundary: Boundary,
 --   execution: Execution, request_id: String, purpose: RequestPurpose,
 --   canonical_intent: String): first logical request admission, not transport.
@@ -20,9 +21,9 @@
 -- CheckpointRecoveryRequested(request: RequestIntent): restore that checkpoint.
 -- HostDecisionRequested(policy: ExecutionPolicy, boundary: Boundary,
 --   execution: Execution): serialized next-request/settle decision.
--- StartReceiptReturned, ProviderDispatchAuthorized, ResumeHostDecision and
--- AcceptedInputDrainRequired are boundary outcomes consumed by the existing
--- admission/runtime/dispatch owners. They are not new workers or permits.
+-- StartReceiptReturned, ProviderDispatchAuthorized, ResumeHostDecision,
+-- AcceptedInputDrainRequired and AdmittedDispatchDeferred are boundary outcomes
+-- consumed by existing admission/runtime/dispatch owners, not new workers or permits.
 
 -- Installation and numeric calibration are distinct. There is no config default.
 external entity ExecutionPolicy {
@@ -35,6 +36,7 @@ external entity Owner {
 }
 
 external entity VerifiedPrincipal {
+    id: String
     kind: authenticated_owner | existing_coordinator
     authorized_target: Owner
 }
@@ -78,13 +80,23 @@ entity Execution {
 
 }
 
+-- Logical typed command value; equality below compares every command field.
+-- It prescribes no serialization, API payload, database key or new framework.
+external entity StartPayload {
+    request_id: String
+    owner: Owner
+    goal: Goal
+    expected_version: Integer
+    command: start
+}
+
 entity StartReceipt {
     id: String
     owner: Owner
     goal: Goal
     expected_version: Integer
     requester: VerifiedPrincipal
-    canonical_intent: String
+    canonical_intent: StartPayload
     execution_id: String
 
 }
@@ -125,6 +137,11 @@ rule AcceptTypedStart {
                          requester, canonical_intent, execution_id)
     requires: requester.authorized_target = goal.owner
     requires: expected_version = goal.version
+    requires: canonical_intent.request_id = request_id
+    requires: canonical_intent.owner = goal.owner
+    requires: canonical_intent.goal = goal
+    requires: canonical_intent.expected_version = expected_version
+    requires: canonical_intent.command = start
     requires: policy.installed
     requires: boundary.caller_authorized
     requires: boundary.owner = goal.owner
@@ -156,16 +173,27 @@ rule AcceptTypedStart {
 }
 
 rule ReplayTypedStart {
-    when: StartReplayRequested(boundary, receipt, canonical_intent)
+    when: StartReplayRequested(boundary, receipt, requester, canonical_intent)
     requires: boundary.caller_authorized
     requires: boundary.owner = receipt.owner
-    requires: canonical_intent = receipt.canonical_intent
+    requires: requester = receipt.requester
+    requires: requester.authorized_target = receipt.owner
+    requires: canonical_intent.request_id = receipt.id
+    requires: canonical_intent.owner = receipt.owner
+    requires: canonical_intent.goal = receipt.goal
+    requires: canonical_intent.expected_version = receipt.expected_version
+    requires: canonical_intent.command = receipt.canonical_intent.command
     ensures: StartReceiptReturned(receipt)
     @guidance
-        -- Authorization precedes receipt lookup. Changed input at the same
-        -- identity is a conflict, not a second admission. Return the same accepted
-        -- execution even if its work has finished; do not recreate or dispatch it.
-        -- Its execution must still pass Stop/lifecycle permission at dispatch.
+        -- Derive and authorize the actual verified requester before receipt
+        -- lookup, then compare requester identity and every typed command field.
+        -- Same target authorization alone is not requester equality. No free
+        -- canonical string or unspecified serialization substitutes for equality.
+        -- Changed input at the same identity is a conflict, not a new admission.
+        -- Return the historical receipt without fresh settled/Stop/current-goal
+        -- version revalidation, even after the execution finishes. This outcome
+        -- does not recreate or dispatch work. Actual dispatch separately checks
+        -- queue/lifecycle/Stop/execution authority at its existing owning boundary.
 }
 
 rule AdmitNewLogicalRequest {
@@ -199,6 +227,28 @@ rule AdmitNewLogicalRequest {
         -- it first, then re-evaluate its actual request/binding under this contract.
 }
 
+rule DeferAdmittedDispatchForAcceptedQueue {
+    when: DispatchRequested(policy, boundary, request)
+    requires: policy.installed
+    requires: boundary.owner = request.execution.owner
+    requires: boundary.queued_input
+    requires: request.phase = admitted
+    requires: request.execution.phase = requesting
+    ensures:
+        request.phase = admitted
+        request.execution.phase = requesting
+        AdmittedDispatchDeferred(request)
+        AcceptedInputDrainRequired(request.execution)
+    @guidance
+        -- Use existing serialized queue/checkpoint ownership to defer/refuse
+        -- the provider send when accepted input arrives after admission. Retain
+        -- the same immutable intent, identity and charge: no refund, refill,
+        -- replan, competing turn, Idle transition or fresh Start. Drain accepted
+        -- input before rechecking dispatch; this rule grants no provider send.
+        -- Existing Stop permission is not a queue predicate. Queue observation
+        -- and send admission must be revalidated under the actual owning gate.
+}
+
 rule DispatchOrRetryAdmittedIntent {
     when: DispatchRequested(policy, boundary, request)
     requires: policy.installed
@@ -206,6 +256,7 @@ rule DispatchOrRetryAdmittedIntent {
     requires: boundary.active_open_latest
     requires: boundary.execution_authorized
     requires: not boundary.stopped
+    requires: not boundary.queued_input
     requires: not boundary.structured_wait
     requires: request.phase = admitted
     requires: request.execution.phase = requesting
@@ -214,8 +265,10 @@ rule DispatchOrRetryAdmittedIntent {
     ensures: ProviderDispatchAuthorized(request)
     @guidance
         -- Consume existing execution/Stop dispatch permission at the provider
-        -- boundary, not a cached eligibility Boolean. Reuse canonical intent and
-        -- identity on provider/overload retry; this rule creates no admission row.
+        -- boundary, not a cached eligibility Boolean. Independently recheck the
+        -- accepted queue at serialized dispatch admission; do not infer queue
+        -- protection from the Stop permit. Reuse canonical intent and identity
+        -- on provider/overload retry; this rule creates no admission row.
         -- Already committed admission does not grant immunity to Stop or scope
         -- revocation. Provider-side exactly-once delivery is not promised.
 }

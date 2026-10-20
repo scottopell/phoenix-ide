@@ -316,8 +316,10 @@ THE SYSTEM SHALL accept Start only at the genuine settled boundary with no compe
 
 THE SYSTEM SHALL persist a typed canonical host input containing the exact Start request identity, authenticated requester, ordinary owner, expected goal/version, admitted execution/workflow identity and immutable execution observation. Its accepted receipt and canonical input SHALL commit atomically with the owning durable-turn admission, and SHALL reach runtime materialization/recovery as that typed input, not a fabricated ordinary UserChat, assistant/tool message or model-supplied actor label.
 
-WHEN the same Start identity is retried with identical input after current caller authorization
-THE SYSTEM SHALL return its retained accepted result without creating a second turn, recapturing a goal, replenishing usage or charging another request. Changed input at the same identity SHALL be rejected. A retained acceptance SHALL NOT bypass a later Stop or lifecycle fence when dispatching.
+WHEN the same Start identity is retried after current caller/target authorization
+THE SYSTEM SHALL compare the actual verified requester identity with the receipt's requester and compare the exact typed Start payload fields: request identity, ordinary owner, immutable goal, expected goal/version and Start command. Authorization for the same target or equality of an unspecified string encoding SHALL NOT substitute for those comparisons. Changed requester or input at the same identity SHALL be rejected.
+
+THE SYSTEM SHALL return an identical retained accepted result without creating a second turn, recapturing a goal, replenishing usage or charging another request. Returning this historical receipt SHALL NOT require fresh settled-boundary, Stop, current-goal or current-version admission and SHALL NOT itself dispatch work. Actual execution dispatch SHALL still satisfy its independent current queue, Stop, lifecycle and execution-authority checks.
 
 THE SYSTEM SHALL obtain Start's model context directly from its admitted typed goal/execution facts. Stored Start input/receipt SHALL remain distinct from shared transcript message content, display data and persisted `llm_text`; authenticated presentation SHALL expose its typed status without inventing a new wire shape in this contract. Shared transcript reads SHALL NOT acquire private goal facts through Start projection. Failure to decode or load required accepted input, binding, limit or context SHALL refuse execution, not substitute current-goal data or ordinary text.
 
@@ -358,5 +360,8 @@ THE SYSTEM SHALL atomically record host-derived Exhausted and a truthful limit r
 THE SYSTEM SHALL preserve a committed Complete, Blocked or other non-Underway outcome instead of overwriting it with limit exhaustion. Stop, inactive/Close, revoked execution authority, pending structured waits and stale/superseded bindings SHALL prevent automatic follow-through; Stop SHALL retain its independent cancellation/control semantics rather than manufacture a goal-status transition.
 
 THE SYSTEM SHALL revalidate accepted queue priority and execution/control authority at the committing decision and at existing dispatch permission consumption. A queued-input or Stop race SHALL NOT overtake accepted input, double-admit work or dispatch through a revoked fence. Superseding a goal SHALL NOT alter an in-flight immutable binding or permit old reports to affect its replacement.
+
+WHEN accepted queued input arrives after a request has been admitted but before its provider dispatch or retry
+THE SYSTEM SHALL defer or refuse that send under the existing queue/checkpoint ownership, drain accepted input first, and recheck dispatch eligibility without changing that request's immutable identity, canonical intent or existing charge. This deferral SHALL NOT refund or refill capacity, replan the intent, create a competing turn, publish Idle, or synthesize Start. Stop dispatch permission alone SHALL NOT be treated as queue protection.
 
 THE SYSTEM SHALL keep host decisions, request admissions and checkpoint recovery within the existing authoritative runtime/durable-turn pipeline. Saved watch facts and notification delivery SHALL remain factual consumers, not execution triggers. Execution terminal/wait capture and summary suppression SHALL retain REQ-GOAL-011–014's causal owner and rollback boundaries.
