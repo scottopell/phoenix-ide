@@ -145,22 +145,81 @@ async fn exact_read_transcript_and_ordinary_history_preserve_opaque_references()
 #[tokio::test]
 async fn exact_read_product_ids_follow_the_nonblank_text_schema_contract() {
     let state = make_test_state().await;
-    state
-        .db
-        .create_conversation("template", "template", "/tmp", true, None, None)
-        .await
-        .unwrap();
     for (index, reference) in REFERENCES.iter().enumerate() {
         let product_id =
             phoenix_core::domain::product_conversation::ProductConversationId::parse(*reference)
                 .unwrap();
-        sqlx::query("INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES (?1, 'ordinary', 'open')")
-            .bind(product_id.as_str()).execute(state.db.pool()).await.unwrap();
+        assert_eq!(product_id.as_str(), *reference);
         let transcript_id = format!("product-transcript-{index}");
-        sqlx::query("INSERT INTO conversations (id, product_conversation_id, slug, title, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role)
-            SELECT ?1, ?2, ?1, title, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role FROM conversations WHERE id = 'template'")
-            .bind(&transcript_id).bind(product_id.as_str()).execute(state.db.pool()).await.unwrap();
+        let conversation = state
+            .db
+            .create_conversation(&transcript_id, &transcript_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope_id = conversation.attached_work_scope_id.as_ref().unwrap();
+        let mut tx = state.db.pool().begin().await.unwrap();
+        // Membership updates are forbidden; stage the whole empty constructor row for reinsertion.
+        sqlx::query("CREATE TEMP TABLE exact_read_product_fixture AS SELECT * FROM conversations WHERE id = ?1")
+            .bind(&transcript_id).execute(&mut *tx).await.unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(&transcript_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM product_conversation_work_scopes WHERE work_scope_id = ?1")
+            .bind(scope_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE product_conversations SET id = ?1 WHERE id = ?2")
+            .bind(product_id.as_str())
+            .bind(conversation.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE exact_read_product_fixture SET product_conversation_id = ?1")
+            .bind(product_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversations SELECT * FROM exact_read_product_fixture")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE exact_read_product_fixture")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let stored = state.db.get_conversation(&transcript_id).await.unwrap();
+        assert_eq!(stored.product_conversation_id, product_id);
+        assert_eq!(
+            stored.attached_work_scope_id,
+            conversation.attached_work_scope_id
+        );
+        assert_eq!(stored.cwd, conversation.cwd);
+        let owner: String = sqlx::query_scalar(
+            "SELECT product_conversation_id FROM product_conversation_work_scopes WHERE work_scope_id = ?1",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(owner, *reference);
     }
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(state.db.pool())
+        .await
+        .unwrap();
+    assert!(violations.is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap(),
+        1
+    );
     let router = create_router(state);
     for (index, reference) in REFERENCES.iter().enumerate() {
         for suffix in ["", "?boundary_representation=original_messages"] {
