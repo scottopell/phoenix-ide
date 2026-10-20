@@ -417,6 +417,65 @@ async fn exact_read_blank_and_missing_references_do_not_fall_back_to_latest() {
 }
 
 #[tokio::test]
+async fn transcript_direct_get_serves_public_shell_without_exempting_exact_reads() {
+    // The handler also returns an HTML diagnostic when no built UI is available.
+    let shell = super::super::serve_spa().await.into_response();
+    let shell_status = shell.status();
+    let shell_content_type = shell.headers()[axum::http::header::CONTENT_TYPE].clone();
+    assert_eq!(shell_content_type, "text/html; charset=utf-8");
+    let shell_body = to_bytes(shell.into_body(), 1024 * 1024).await.unwrap();
+    assert!(!shell_body.is_empty());
+
+    let mut state = make_test_state().await;
+    for password_required in [false, true] {
+        state.password = password_required.then(|| {
+            phoenix_core::domain::instance_identity::OwnerPassword::parse("secret".to_owned())
+                .unwrap()
+        });
+        let router = create_router(state.clone());
+        for uri in [
+            "/transcript?source_transcript=.",
+            "/transcript?source_transcript=a%2Fb%3Fc%23d",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                shell_status,
+                "{uri}, password={password_required}"
+            );
+            assert_eq!(
+                response.headers()[axum::http::header::CONTENT_TYPE],
+                shell_content_type,
+                "{uri}, password={password_required}"
+            );
+            assert_eq!(
+                to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                shell_body,
+                "{uri}, password={password_required}"
+            );
+        }
+        if password_required {
+            for uri in TRANSCRIPT_READS.iter().copied().chain([
+                "/api/product-conversation-reads/snapshot",
+                "/api/global/coordinator/reads/route",
+                "/api/global/coordinator/reads/history",
+            ]) {
+                let response = router
+                    .clone()
+                    .oneshot(request(uri, r#"{"reference":"."}"#))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn exact_read_aliases_remain_owner_authenticated() {
     let mut state = make_test_state().await;
     state
