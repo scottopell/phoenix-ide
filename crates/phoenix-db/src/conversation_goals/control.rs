@@ -84,6 +84,8 @@ pub struct ControlRequest {
 pub enum ControlError {
     #[error(transparent)]
     Storage(#[from] sqlx::Error),
+    #[error(transparent)]
+    Admission(#[from] crate::DbError),
     #[error("ordinary owner is unavailable for control")]
     OwnerUnavailable,
     #[error("control request identity already has different input")]
@@ -252,6 +254,29 @@ pub async fn require_current_control_tx(
 }
 
 impl Database {
+    /// Read existing control facts with canonical owner resolution on the same read snapshot.
+    ///
+    /// # Errors
+    /// Rejects unavailable/nonordinary owners and malformed persisted controls.
+    pub async fn ordinary_goal_control(
+        &self,
+        owner: &ProductConversationId,
+    ) -> Result<Option<ControlSnapshot>, ControlError> {
+        let mut tx = self.pool().begin().await?;
+        Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT control_version,stopped FROM conversation_goal_controls WHERE owner_id=?",
+        )
+        .bind(owner.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let current = row.map_or(Ok(None), |(version, stopped)| {
+            snapshot(version, Some(stopped))
+        })?;
+        tx.commit().await?;
+        Ok(current)
+    }
+
     #[must_use]
     pub fn goal_control_installation(&self) -> GoalControlInstallation {
         self.goal_control_installation

@@ -23,6 +23,23 @@ services from the host instance identity, not caller-supplied actor data.
 | POST `/api/product-conversations/:reference/goal` | Existing `GoalCommandService::create`, including host identity, exact request replay, settled/latest/Close fencing and Stop preservation |
 | POST `/api/product-conversations/:reference/goal/state` | Existing `GoalCommandService::state`; explicit user disposition, never completion inferred from execution state |
 | POST `/api/product-conversations/:reference/goal-control` | Existing `GoalControlService::apply` and its unchanged typed receipt/status mapping |
+| GET `/api/product-conversations/:reference/goal-control` | Source-only prerequisite for truthful Stop UI: existing `ControlSnapshot` (`version`, `stopped`), or null only when no control row exists |
+
+The factual control GET is an unqualified backend prerequisite cut, separate
+from UI wiring. It uses `OwnerAuthenticated`, default-uninstalled 503 behavior,
+and canonical ordinary owner resolution plus control lookup on one read
+transaction. It creates no control row, epoch, receipt, chat or consent. The
+existing snapshot type contains **only** nonzero `version` and `stopped`;
+disarmed/consent fields are not fabricated. A null read means actual absence,
+not consent or authorization. The existing mutation implementation explicitly
+uses expected CAS version zero for absent control storage; an authored router
+regression reads null without writes, submits Stop at zero, observes version
+one/stopped, releases at one, and verifies version two plus replay/stale CAS.
+Two further authored tests cover real auth/peer/alias/coordinator rejection and
+genuine continuation/live-Close factual reads with unchanged write fences.
+The default-OFF test also includes control GET. These new tests have not run.
+Completed-History retirement remains outside executed coverage. Normal startup
+remains uninstalled, and no UI/watch/autocontinuation is included in this cut.
 
 Factual reads resolve the canonical ordinary ProductConversation via the existing
 `get_ordinary_product_conversation_on` and read facts on **the same SQLite read
@@ -51,21 +68,19 @@ parent ID, preserving inherited ProductConversation identity and transcript-alia
 rejection without an invented subagent constructor. No UI, watch/outbox delivery or normal-startup installation is added.
 
 The latest hosted focused receipt is **205/205 at exact
-`022ec5fd02e423614ed305f3bc97e01f30a6b36d`** with captured full-workspace harnesses
-(run `39421627851`, artifact `12265740941`, 181.846 seconds, 3384 skipped).
-Capture took 187.6 seconds, codegen reuse 1.9 seconds, and the codegen-stale
-check passed. Command-budget, UI/specs, and e2e passed. This supersedes the
-198-test focused floor at `21364` without implying isolated-three-package build
-equivalence or transferring qualification to later edits.
+`d398e4fe95041ffd1571ca063d8ba22aff70058f`** with captured full-workspace harnesses
+(run `39425602545`, artifact `12267966788`, 248.454 seconds, 3384 skipped).
+Capture took 206.3 seconds, codegen reuse 1.1 seconds, and the codegen-stale
+check passed. Command-budget, UI/specs, and e2e passed. The two owned router
+Clippy roots were absent from the retained tail; that is not a full-inventory
+Clippy-clear claim. This supersedes the 205-test floor at `022ec` without
+implying isolated-three-package build equivalence or qualifying later edits.
 
-Overall CI remained red. Broad execution completed: 5503 ran, 5473 passed,
-30 failed, and 191 skipped in 1207.529 seconds. All 30 failures remain unwaived.
-Clippy remained red, including two owned findings: the API error mapper's
-future-variant wildcard and a manually constructed empty string in the live-Close
-test. A bounded follow-up explicitly enumerates the remaining error variants
-and uses `String::new()`; those lint fixes have not yet been typechecked or
-executed. Shared Clippy findings are not waived. Production activation remains
-OFF. The dated paragraphs below retain earlier
+Overall CI remained red. Broad execution hit the 1500-second budget: 5257/5503
+ran, 5224 passed, 33 failed, and 191 skipped in 1499.624 seconds. These are
+partial results, not a completed comparison with the prior 30-failure run.
+Shared broad failures and Clippy findings remain unwaived. Production activation
+remains OFF. The dated paragraphs below retain earlier
 checkpoint history, not newer qualification claims.
 
 ## Latest actual134 qualification — exact778 SQL-safe-string compile failure

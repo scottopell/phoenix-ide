@@ -157,6 +157,11 @@ async fn conversation_goal_private_install_default_off_auth_first_and_all_or_not
         (Method::GET, goal.clone(), None),
         (Method::GET, format!("{goal}/history?after=0"), None),
         (
+            Method::GET,
+            format!("/api/product-conversations/{owner}/goal-control"),
+            None,
+        ),
+        (
             Method::POST,
             goal.clone(),
             Some(create_body(Uuid::new_v4(), 0)),
@@ -652,5 +657,199 @@ async fn conversation_goal_private_install_history_is_bounded_typed_ordered_and_
             StatusCode::BAD_REQUEST
         );
     }
+    assert_eq!(counts(&state.db).await, before);
+}
+
+#[tokio::test]
+async fn conversation_goal_control_factual_read_requires_real_owner_and_canonical_ordinary_identity(
+) {
+    let (state, owner) = fixture(true).await;
+    let subordinate = state
+        .db
+        .create_conversation(
+            "goal-http-agent",
+            "goal-worker",
+            "/tmp",
+            false,
+            Some("goal-http-root"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(subordinate.product_conversation_id, owner);
+    let coordinator = state
+        .db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    let router = authenticated_router(&state, true);
+    let peer_only = private_install::<()>(state.runtime.clone())
+        .unwrap()
+        .layer(Extension(crate::api::auth::PeerAuthenticated {
+            enrollment_id: Uuid::new_v4(),
+            caller_instance_id: phoenix_core::domain::instance_identity::InstanceId::new(),
+            caller_display_name: "peer".into(),
+        }));
+    let before = counts(&state.db).await;
+    let control_path = format!("/api/product-conversations/{owner}/goal-control");
+    assert_eq!(
+        response(&router, request(Method::GET, &control_path, None, false))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(&peer_only, request(Method::GET, &control_path, None, false))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let mut spoof = request(Method::GET, &control_path, None, false);
+    spoof
+        .headers_mut()
+        .insert("x-owner-authenticated", "true".parse().unwrap());
+    assert_eq!(response(&router, spoof).await.0, StatusCode::UNAUTHORIZED);
+    for reference in [
+        "goal-http-root".to_owned(),
+        "goal-http-agent".to_owned(),
+        "foreign-owner".to_owned(),
+        coordinator.product_conversation_id.to_string(),
+    ] {
+        let path = format!("/api/product-conversations/{reference}/goal-control");
+        assert_eq!(
+            response(&router, request(Method::GET, &path, None, true))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(counts(&state.db).await, before);
+}
+
+#[tokio::test]
+async fn conversation_goal_control_factual_read_absent_zero_cas_stop_release_and_replay() {
+    let (state, owner) = fixture(true).await;
+    let router = authenticated_router(&state, true);
+    let path = format!("/api/product-conversations/{owner}/goal-control");
+    let before = counts(&state.db).await;
+    assert_eq!(
+        response(&router, request(Method::GET, &path, None, true)).await,
+        (StatusCode::OK, Value::Null)
+    );
+    assert_eq!(counts(&state.db).await, before);
+    let stop = json!({"request_id":Uuid::new_v4(), "command":"stop", "expected_control_version":0});
+    let stopped = response(&router, request(Method::POST, &path, Some(&stop), true)).await;
+    assert_eq!(stopped.0, StatusCode::OK);
+    assert_eq!(stopped.1["result"]["outcome"], "accepted");
+    assert_eq!(
+        stopped.1["result"]["snapshot"],
+        json!({"version":1,"stopped":true})
+    );
+    let before = counts(&state.db).await;
+    assert_eq!(
+        response(&router, request(Method::GET, &path, None, true)).await,
+        (StatusCode::OK, stopped.1["result"]["snapshot"].clone())
+    );
+    assert_eq!(counts(&state.db).await, before);
+    assert_eq!(
+        response(&router, request(Method::POST, &path, Some(&stop), true)).await,
+        stopped
+    );
+    let release =
+        json!({"request_id":Uuid::new_v4(), "command":"release", "expected_control_version":1});
+    let released = response(&router, request(Method::POST, &path, Some(&release), true)).await;
+    assert_eq!(released.0, StatusCode::OK);
+    assert_eq!(
+        released.1["result"]["snapshot"],
+        json!({"version":2,"stopped":false})
+    );
+    assert_eq!(
+        response(&router, request(Method::POST, &path, Some(&release), true)).await,
+        released
+    );
+    let stale =
+        json!({"request_id":Uuid::new_v4(), "command":"stop", "expected_control_version":1});
+    let conflict = response(&router, request(Method::POST, &path, Some(&stale), true)).await;
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+    assert_eq!(conflict.1["result"]["outcome"], "rejected_version");
+    assert_eq!(
+        conflict.1["result"]["observed"],
+        json!({"version":2,"stopped":false})
+    );
+    let before = counts(&state.db).await;
+    assert_eq!(
+        response(&router, request(Method::GET, &path, None, true)).await,
+        (StatusCode::OK, released.1["result"]["snapshot"].clone())
+    );
+    assert_eq!(counts(&state.db).await, before);
+}
+
+#[tokio::test]
+async fn conversation_goal_control_factual_read_survives_continuation_and_live_close_without_materialization(
+) {
+    let (state, owner) = fixture(true).await;
+    let router = authenticated_router(&state, true);
+    let path = format!("/api/product-conversations/{owner}/goal-control");
+    let stop = json!({"request_id":Uuid::new_v4(), "command":"stop", "expected_control_version":0});
+    let stopped = response(&router, request(Method::POST, &path, Some(&stop), true)).await;
+    assert_eq!(stopped.0, StatusCode::OK);
+    state
+        .db
+        .add_message(
+            "goal-control-read-handoff",
+            "goal-http-root",
+            &phoenix_core::domain::db_schema::MessageContent::continuation("control facts persist"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .update_conversation_state(
+            "goal-http-root",
+            &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+                summary: "control facts persist".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let phoenix_db::ContinueOutcome::Created(successor) = state
+        .db
+        .continue_conversation("goal-http-root")
+        .await
+        .unwrap()
+    else {
+        panic!("expected real continuation")
+    };
+    assert_eq!(successor.product_conversation_id, owner);
+    let before = counts(&state.db).await;
+    assert_eq!(
+        response(&router, request(Method::GET, &path, None, true)).await,
+        (StatusCode::OK, stopped.1["result"]["snapshot"].clone())
+    );
+    assert_eq!(counts(&state.db).await, before);
+    state
+        .db
+        .begin_direct_close_foundation(
+            &owner,
+            &TranscriptConversationId::parse(successor.id).unwrap(),
+            "goal-control-read-close",
+        )
+        .await
+        .unwrap();
+    let before = counts(&state.db).await;
+    assert_eq!(
+        response(&router, request(Method::GET, &path, None, true)).await,
+        (StatusCode::OK, stopped.1["result"]["snapshot"].clone())
+    );
+    let release =
+        json!({"request_id":Uuid::new_v4(), "command":"release", "expected_control_version":1});
+    assert_eq!(
+        response(&router, request(Method::POST, &path, Some(&release), true))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(counts(&state.db).await, before);
 }

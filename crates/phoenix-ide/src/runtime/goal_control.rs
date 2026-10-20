@@ -46,6 +46,21 @@ impl GoalControlService {
         Ok(Self { storage: Some(db) })
     }
 
+    pub(crate) async fn current(
+        &self,
+        _authenticated: OwnerAuthenticated,
+        owner: ProductConversationId,
+    ) -> Result<
+        Option<phoenix_db::conversation_goals::control::ControlSnapshot>,
+        GoalControlServiceError,
+    > {
+        let db = self
+            .storage
+            .as_ref()
+            .ok_or(GoalControlServiceError::Disabled)?;
+        Ok(db.ordinary_goal_control(&owner).await?)
+    }
+
     /// Apply an owner-authenticated control request using the server's stable owner principal.
     /// The default service is disabled and no public route installs it.
     ///

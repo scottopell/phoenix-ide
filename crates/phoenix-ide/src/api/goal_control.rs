@@ -8,7 +8,9 @@ use axum::{
 };
 use phoenix_core::domain::conversation_goal::{GoalHistoryEntry, GoalVersion};
 use phoenix_core::domain::product_conversation::ProductConversationId;
-use phoenix_db::conversation_goals::control::{ControlError, ControlOutcome, ControlReceipt};
+use phoenix_db::conversation_goals::control::{
+    ControlError, ControlOutcome, ControlReceipt, ControlSnapshot,
+};
 use phoenix_db::conversation_goals::{
     user_commands::{GoalUserReceipt, GoalUserResult},
     GoalDbError,
@@ -49,7 +51,7 @@ pub(super) fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         )
         .route(
             "/api/product-conversations/:reference/goal-control",
-            post(apply),
+            get(current_control).post(apply),
         )
 }
 
@@ -191,6 +193,21 @@ fn command_error(error: &GoalCommandServiceError) -> ApiError {
     }
 }
 
+async fn current_control(
+    authenticated: OwnerAuthenticated,
+    Path(reference): Path<String>,
+    services: InstalledServices,
+) -> Result<Json<Option<ControlSnapshot>>, ApiError> {
+    let services = installed(services)?;
+    let owner = canonical_owner(reference)?;
+    services
+        .controls
+        .current(authenticated, owner)
+        .await
+        .map(Json)
+        .map_err(|error| classify_error(&error))
+}
+
 async fn apply(
     authenticated: OwnerAuthenticated,
     Path(owner): Path<String>,
@@ -221,9 +238,10 @@ fn classify_error(error: &GoalControlServiceError) -> ApiError {
             StatusCode::SERVICE_UNAVAILABLE,
             "goal control is not installed",
         ),
-        GoalControlServiceError::Control(ControlError::OwnerUnavailable) => {
-            api_error(StatusCode::NOT_FOUND, "ordinary owner unavailable")
-        }
+        GoalControlServiceError::Control(
+            ControlError::OwnerUnavailable
+            | ControlError::Admission(phoenix_db::DbError::ConversationNotFound(_)),
+        ) => api_error(StatusCode::NOT_FOUND, "ordinary owner unavailable"),
         GoalControlServiceError::Control(ControlError::RequestConflict) => {
             api_error(StatusCode::CONFLICT, "request identity has different input")
         }
@@ -233,7 +251,9 @@ fn classify_error(error: &GoalControlServiceError) -> ApiError {
         GoalControlServiceError::Control(ControlError::AdmissionStopped) => {
             api_error(StatusCode::CONFLICT, "control is stopped or uninitialized")
         }
-        GoalControlServiceError::Control(ControlError::Storage(_) | ControlError::Integrity(_))
+        GoalControlServiceError::Control(
+            ControlError::Storage(_) | ControlError::Integrity(_) | ControlError::Admission(_),
+        )
         | GoalControlServiceError::Storage(_)
         | GoalControlServiceError::HostIdentity(_)
         | GoalControlServiceError::Clock => {
