@@ -233,12 +233,6 @@ pub(super) struct SubscriptionSyncReceipt {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn generate(instance_id: InstanceId) -> FederationApiReference {
-    let settings =
-        SchemaSettings::draft07().with(|s| s.definitions_path = "#/components/schemas/".into());
-    let mut b = ReferenceBuilder {
-        generator: settings.into_generator(),
-        paths: BTreeMap::new(),
-    };
     use super::subscriptions::{
         NotificationQuery, OwnerSubscriptionRequest, RemoteUnsubscribeReceipt, RemoteWatchReceipt,
         SubscriptionRequest, SubscriptionResponse,
@@ -250,6 +244,13 @@ pub(crate) fn generate(instance_id: InstanceId) -> FederationApiReference {
     use peer_notes::PeerNotesDocument;
     use phoenix_db::federation_subscriptions::{RemoteNotification, RemoteSubscription};
     use Access::{Owner, Peer, Reference};
+
+    let settings =
+        SchemaSettings::draft07().with(|s| s.definitions_path = "#/components/schemas/".into());
+    let mut b = ReferenceBuilder {
+        generator: settings.into_generator(),
+        paths: BTreeMap::new(),
+    };
     b.operation::<FederationApiReference, MessageErrorBody>("/openapi.json", "get", Reference, "Federation API reference only; owner auth or active directional peer bearer. Not the complete Phoenix API.", None);
     b.post::<FetchOpenApiRequest, DestinationApiReference, OwnerErrorBody>("/api/federation/openapi", Owner, "Fetch the explicit saved destination's reference over verified HTTPS; no redirects or local fallback; 512 KiB maximum.");
     b.post::<OwnerQueryRequest, RemoteQueryDatabaseResponse, OwnerErrorBody>(

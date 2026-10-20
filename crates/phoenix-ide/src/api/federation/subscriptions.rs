@@ -15,7 +15,10 @@ use axum::{
 use chrono::Utc;
 use futures::StreamExt;
 use phoenix_core::domain::{
-    federation_subscription::*,
+    federation_subscription::{
+        SubscriptionAuthorization, SubscriptionCursor, SubscriptionDelivery, SubscriptionReference,
+        SubscriptionReplay, SubscriptionSnapshot, SubscriptionState, REPLAY_BATCH,
+    },
     instance_identity::{InstanceId, InstanceSelector},
     product_conversation::ProductConversationId,
 };
@@ -904,14 +907,16 @@ pub async fn owner_unsubscribe(
         instance_id: peer.peer_instance_id,
         product_conversation_id: request.product_conversation_id.clone(),
     };
-    let remote = match state
+    let Ok(Some(remote)) = state
         .db
         .remote_subscription_by_id(peer.peer_instance_id, request.subscription_id)
         .await
-    {
-        Ok(Some(remote)) if remote.reference == reference => remote,
-        _ => return rejected(StatusCode::NOT_FOUND),
+    else {
+        return rejected(StatusCode::NOT_FOUND);
     };
+    if remote.reference != reference {
+        return rejected(StatusCode::NOT_FOUND);
+    }
     match unsubscribe_remote(&state.db, &peer, &remote).await {
         Ok(receipt) => Json(receipt).into_response(),
         Err(error) => {

@@ -287,39 +287,9 @@ impl SendChatApplicationService {
                     .runtime
                     .lock_product_message_admission(product_conversation_id.as_str())
                     .await;
-                let conversation_id = if let Some(owner) = self
-                    .db
-                    .product_conversation_client_message_owner(
-                        &product_conversation_id,
-                        &req.message_id,
-                    )
-                    .await
-                    .map_err(map_conversation_load_error)?
-                {
-                    owner
-                } else {
-                    let current = self
-                        .db
-                        .coordinator_conversation_id()
-                        .await
-                        .map_err(map_conversation_load_error)?
-                        .ok_or_else(|| {
-                            SendChatServiceError::NotFound("Coordinator unavailable".into())
-                        })?;
-                    let conversation = self
-                        .db
-                        .get_conversation(&current)
-                        .await
-                        .map_err(map_conversation_load_error)?;
-                    if conversation.product_conversation_id != product_conversation_id
-                        || conversation.runtime_role != crate::work_scope::RuntimeRole::Coordinator
-                    {
-                        return Err(SendChatServiceError::NotFound(
-                            "Coordinator identity changed".into(),
-                        ));
-                    }
-                    current
-                };
+                let conversation_id = self
+                    .stable_coordinator_transcript_id(product_conversation_id, &req.message_id)
+                    .await?;
                 let admission_guard = self.runtime.lock_message_acceptance(&conversation_id).await;
                 req.conversation_id = conversation_id.clone();
                 self.send_with_admission_guard(req, Some(admission_guard), &mut replay)
@@ -384,6 +354,42 @@ impl SendChatApplicationService {
                     .map(|outcome| (conversation_id, outcome, replay));
             }
         }
+    }
+
+    async fn stable_coordinator_transcript_id(
+        &self,
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+        message_id: &str,
+    ) -> Result<String, SendChatServiceError> {
+        let conversation_id = if let Some(owner) = self
+            .db
+            .product_conversation_client_message_owner(&product_conversation_id, message_id)
+            .await
+            .map_err(map_conversation_load_error)?
+        {
+            owner
+        } else {
+            let current = self
+                .db
+                .coordinator_conversation_id()
+                .await
+                .map_err(map_conversation_load_error)?
+                .ok_or_else(|| SendChatServiceError::NotFound("Coordinator unavailable".into()))?;
+            let conversation = self
+                .db
+                .get_conversation(&current)
+                .await
+                .map_err(map_conversation_load_error)?;
+            if conversation.product_conversation_id != product_conversation_id
+                || conversation.runtime_role != crate::work_scope::RuntimeRole::Coordinator
+            {
+                return Err(SendChatServiceError::NotFound(
+                    "Coordinator identity changed".into(),
+                ));
+            }
+            current
+        };
+        Ok(conversation_id)
     }
 
     pub(crate) async fn send(

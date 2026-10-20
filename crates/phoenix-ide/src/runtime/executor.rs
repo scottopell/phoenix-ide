@@ -65,7 +65,7 @@ enum AuthoritativeEffect {
         origin: phoenix_core::domain::db_schema::InputOrigin,
     },
     PersistAuthoritativeUserMessage {
-        payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        payload: Box<phoenix_core::domain::sm_event::PreparedDirectTurnPayload>,
         authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
         idempotent: bool,
     },
@@ -230,7 +230,7 @@ impl ClassifiedEffect {
                 idempotent,
             } => Self::Authoritative(Box::new(
                 AuthoritativeEffect::PersistAuthoritativeUserMessage {
-                    payload: *payload,
+                    payload,
                     authority,
                     idempotent,
                 },
@@ -6225,7 +6225,7 @@ where
                     .storage
                     .preflight_authoritative_user_message(
                         &authority,
-                        &payload,
+                        payload.as_ref(),
                         phoenix_workflow::Timestamp(now),
                     )
                     .await?
@@ -6246,7 +6246,7 @@ where
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
                     authority,
-                    payload,
+                    payload: *payload,
                     sequence_id: reserved_seqs[0],
                     created_at: phoenix_workflow::Timestamp(now),
                     accepted_state: self

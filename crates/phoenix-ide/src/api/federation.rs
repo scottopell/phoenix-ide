@@ -435,13 +435,13 @@ async fn receive_remote_message(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let receipt = if request.destination_instance_id != destination {
+    let receipt = if request.destination_instance_id == destination {
+        admit_remote_message(&state, &request, origin).await
+    } else {
         RemoteSendReceipt::Rejected {
             code: RemoteSendRejectionCode::DestinationMismatch,
             message: "destination instance identity mismatch".into(),
         }
-    } else {
-        admit_remote_message(&state, &request, origin).await
     };
     Json(RemoteSendMessageResponse {
         destination_instance_id: destination,
@@ -601,6 +601,22 @@ async fn admit_remote_message(
             message: bounded_send_diagnostic(&message),
         };
     }
+    let disposition =
+        if replay == SendChatReplay::Steering || outcome == SendChatOutcome::QueuedAsSteering {
+            RemoteSendDisposition::Queued
+        } else {
+            RemoteSendDisposition::Delivered
+        };
+    remote_acceptance_receipt(state, request, id, disposition, replay).await
+}
+
+async fn remote_acceptance_receipt(
+    state: &AppState,
+    request: &RemoteSendMessageRequest,
+    id: String,
+    disposition: RemoteSendDisposition,
+    replay: crate::send_chat_service::SendChatReplay,
+) -> RemoteSendReceipt {
     let conversation = match state.db.get_conversation(&id).await {
         Ok(conversation) => conversation,
         Err(error) => {
@@ -610,12 +626,6 @@ async fn admit_remote_message(
             }
         }
     };
-    let disposition =
-        if replay == SendChatReplay::Steering || outcome == SendChatOutcome::QueuedAsSteering {
-            RemoteSendDisposition::Queued
-        } else {
-            RemoteSendDisposition::Delivered
-        };
     let stable_path = if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
         "/global".to_string()
     } else {
@@ -658,7 +668,7 @@ async fn admit_remote_message(
         },
         disposition,
     };
-    if replay == SendChatReplay::New {
+    if replay == crate::send_chat_service::SendChatReplay::New {
         RemoteSendReceipt::Accepted { acceptance }
     } else {
         RemoteSendReceipt::Duplicate { acceptance }

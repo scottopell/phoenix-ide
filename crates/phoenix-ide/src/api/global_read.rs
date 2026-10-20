@@ -3066,7 +3066,36 @@ async fn resolve_message(
             DbError::MessageNotFound(_) => {
                 AppError::NotFound("message reference target not found".to_string())
             }
-            other => AppError::Internal(other.to_string()),
+            other @ (DbError::Sqlx(_)
+            | DbError::ConversationNotFound(_)
+            | DbError::MessageConflict(_)
+            | DbError::TranscriptSnapshotChanged
+            | DbError::SlugExists(_)
+            | DbError::ConversationAlreadyExists(_)
+            | DbError::CoordinatorWorkScope(_)
+            | DbError::Serialization(_)
+            | DbError::SubAgentLifecycleConflict(_)
+            | DbError::ContinuationPrecondition(_)
+            | DbError::CloseFoundationConflict(_)
+            | DbError::CloseAdmissionFenced(_)
+            | DbError::ProductConversationUnavailable(_)
+            | DbError::SteeringQueueFull
+            | DbError::ProductCreationClaimLost
+            | DbError::CloseFoundationPrecondition(_)
+            | DbError::CloseFoundationStaleLatest { .. }
+            | DbError::CloseFoundationRepairRequired(_)
+            | DbError::CloseFoundationNotFound(_)
+            | DbError::ForkProposalConflict(_)
+            | DbError::DirectTurnConflict(_)
+            | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+            | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+            | DbError::DormantGitRepositoryCatchupStaleOperation
+            | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+            | DbError::DormantGitRepositoryReadinessCatchupInProgress
+            | DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+            | DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
+                AppError::Internal(other.to_string())
+            }
         })?;
     if message.conversation_id != conv.id {
         return Err(AppError::NotFound(
@@ -3106,9 +3135,9 @@ async fn resolve_message(
                 .ok_or_else(|| AppError::Internal("remote sender reference missing".to_string()))?;
             vec![sender.exact, sender.stable]
         }
-        phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. } => Vec::new(),
         phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
         | phoenix_core::domain::db_schema::InputOrigin::UserApi
+        | phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. }
         | phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
         | phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { .. } => Vec::new(),
     };
@@ -4160,16 +4189,16 @@ mod tests {
         split_fragment, ConversationReadTarget, CoordinatorWorkScopeTargetError,
         GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService, QualifiedSearchHit,
         ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
-        WorkScopeUnavailableReason,
+        WorkScopeUnavailableReason, READ_MESSAGE_BATCH,
     };
     use std::sync::Arc;
+
+    use phoenix_core::domain::db_schema::MessageContent;
 
     use crate::db::MessageRetriever;
 
     #[tokio::test]
     async fn remote_page_cursor_does_not_skip_a_visible_row_that_did_not_fit() {
-        use phoenix_core::domain::db_schema::MessageContent;
-
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let conv = db
             .create_conversation("page-fit", "page-fit", "/tmp", true, None, None)
