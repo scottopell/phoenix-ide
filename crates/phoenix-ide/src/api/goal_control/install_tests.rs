@@ -214,13 +214,12 @@ async fn conversation_goal_private_install_rejects_guest_peer_spoof_and_noncanon
     let (state, owner) = fixture(true).await;
     let subordinate = state
         .db
-        .create_subagent(
+        .create_conversation(
             "goal-http-agent",
-            "goal-http-root",
-            "goal worker",
+            "goal-worker",
             "/tmp",
-            None,
-            None,
+            false,
+            Some("goal-http-root"),
             None,
         )
         .await

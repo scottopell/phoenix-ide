@@ -175,7 +175,8 @@ fn command_error(error: &GoalCommandServiceError) -> ApiError {
             _,
         ))
         | GoalCommandServiceError::Goal(GoalDbError::Admission(
-            phoenix_db::DbError::CloseAdmissionFenced(_),
+            phoenix_db::DbError::CloseAdmissionFenced(_)
+            | phoenix_db::DbError::ProductConversationUnavailable(_),
         )) => api_error(
             StatusCode::CONFLICT,
             "goal command admission changed or is fenced",
@@ -260,6 +261,28 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[test]
+    fn conversation_goal_command_http_maps_history_and_close_admission_to_conflict() {
+        for error in [
+            GoalCommandServiceError::Storage(phoenix_db::DbError::ProductConversationUnavailable(
+                "history-owner".into(),
+            )),
+            GoalCommandServiceError::Goal(GoalDbError::Admission(
+                phoenix_db::DbError::ProductConversationUnavailable("history-owner".into()),
+            )),
+            GoalCommandServiceError::Storage(phoenix_db::DbError::CloseAdmissionFenced(
+                "closing-owner".into(),
+            )),
+            GoalCommandServiceError::Goal(GoalDbError::Admission(
+                phoenix_db::DbError::CloseAdmissionFenced("closing-owner".into()),
+            )),
+        ] {
+            let (status, Json(body)) = command_error(&error);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"], "goal command admission changed or is fenced");
+        }
     }
 
     #[tokio::test]

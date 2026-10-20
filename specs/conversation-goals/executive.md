@@ -42,7 +42,12 @@ history pagination with no read-side rows/chat. They are **not executed or
 qualified** in this source cut. Completed-History read eligibility is source-only:
 the canonical read path admits its lifecycle, but the new tests do not execute
 full Close retirement. No fake Close phase/ledger fixture substitutes for that
-coverage. No UI, watch/outbox delivery or normal-startup installation is added.
+coverage. A separate authored mapper unit regression covers both direct-storage
+and nested goal-admission `ProductConversationUnavailable`/`CloseAdmissionFenced`
+errors as HTTP 409; it is not a completed-History lifecycle journey. The child
+fixture uses the existing test-support `create_conversation` API with its actual
+parent ID, preserving inherited ProductConversation identity and transcript-alias
+rejection without an invented subagent constructor. No UI, watch/outbox delivery or normal-startup installation is added.
 
 The latest hosted focused receipt is **198/198 at exact
 `21364ad088eaee872e1d84a7bc8360eedad2c0f0`** with captured full-workspace harnesses
