@@ -1483,7 +1483,12 @@ async fn revocation_during_saved_peer_create_ends_the_persisted_retry_identity()
                     async move {
                         if request.uri().path() == "/api/federation/peer/subscriptions/create" {
                             entered.notify_one();
-                            release.notified().await;
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                release.notified(),
+                            )
+                            .await
+                            .expect("test release signal");
                         }
                         next.run(request).await
                     }
