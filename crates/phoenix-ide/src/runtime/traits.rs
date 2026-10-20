@@ -63,6 +63,7 @@ pub enum AuthoritativeUserMessageMaterialization {
 pub enum ActiveDirectTurnTerminal {
     Completed,
     Cancelled,
+    GoalControlRevoked,
     Failed { reason: String },
 }
 
@@ -70,7 +71,7 @@ impl ActiveDirectTurnTerminal {
     pub(crate) const fn variant_name(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
-            Self::Cancelled => "cancelled",
+            Self::Cancelled | Self::GoalControlRevoked => "cancelled",
             Self::Failed { .. } => "failed",
         }
     }
@@ -434,6 +435,20 @@ pub trait MessageStore: Send + Sync {
     ) -> TerminalMutationEstablishment<
         phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
     >;
+
+    async fn persist_revoked_goal_tool_round(
+        &self,
+        _conv_id: &str,
+        _assistant: &Message,
+        _tool_results: &[Message],
+        _settlement: &ActiveDirectTurnSettlement,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment {
+        tracing::debug!("storage cannot commit an atomic revoked-goal tool settlement");
+        TerminalMutationEstablishment::KnownNotCommitted(
+            "storage does not support atomic revoked-goal tool settlement".into(),
+        )
+    }
 
     async fn persist_sub_agent_results_with_terminal_obligation(
         &self,
@@ -1183,6 +1198,19 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
             .await
     }
 
+    async fn persist_revoked_goal_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        results: &[Message],
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment {
+        (**self)
+            .persist_revoked_goal_tool_round(conv_id, assistant, results, settlement, update)
+            .await
+    }
+
     async fn persist_sub_agent_results_with_terminal_obligation(
         &self,
         evidence: &TerminalSubAgentEvidence,
@@ -1654,10 +1682,12 @@ fn direct_turn_terminal_command(
             turn_id: turn.turn_id,
             expected_generation: turn.generation,
         },
-        ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
-            turn_id: turn.turn_id,
-            expected_generation: turn.generation,
-        },
+        ActiveDirectTurnTerminal::Cancelled | ActiveDirectTurnTerminal::GoalControlRevoked => {
+            phoenix_workflow::TurnCommand::Cancel {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+            }
+        }
         ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnCommand::Fail {
             turn_id: turn.turn_id,
             expected_generation: turn.generation,
@@ -1874,7 +1904,9 @@ impl MessageStore for DatabaseStorage {
     ) -> TerminalEvidenceEstablishment {
         let terminal = match &settlement.terminal {
             ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
-            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+            ActiveDirectTurnTerminal::Cancelled | ActiveDirectTurnTerminal::GoalControlRevoked => {
+                phoenix_workflow::TurnTerminal::Cancelled
+            }
             ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
                 reason: reason.clone(),
             },
@@ -2392,6 +2424,47 @@ impl MessageStore for DatabaseStorage {
         }
     }
 
+    async fn persist_revoked_goal_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        results: &[Message],
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment {
+        if settlement.terminal != ActiveDirectTurnTerminal::GoalControlRevoked {
+            return TerminalMutationEstablishment::KnownNotCommitted(
+                "atomic revoked-goal settlement requires control revocation".into(),
+            );
+        }
+        let obligation = terminal_obligation(settlement, None);
+        match self
+            .db
+            .persist_revoked_goal_tool_round(conv_id, assistant, results, &obligation, update)
+            .await
+        {
+            Ok(()) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+                value: (),
+            },
+            Err(error) => {
+                let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::Messages(
+                    std::iter::once(assistant.clone())
+                        .chain(results.iter().cloned())
+                        .collect(),
+                );
+                classify_terminal_mutation(
+                    &self.db,
+                    &evidence,
+                    &obligation,
+                    error.to_string(),
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
     async fn persist_sub_agent_results_with_terminal_obligation(
         &self,
         evidence: &TerminalSubAgentEvidence,
@@ -2455,7 +2528,9 @@ pub(super) fn terminal_obligation(
 ) -> phoenix_db::workflow::DirectTurnTerminalObligationInput {
     let terminal = match &settlement.terminal {
         ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
-        ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+        ActiveDirectTurnTerminal::Cancelled | ActiveDirectTurnTerminal::GoalControlRevoked => {
+            phoenix_workflow::TurnTerminal::Cancelled
+        }
         ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
             reason: reason.clone(),
         },

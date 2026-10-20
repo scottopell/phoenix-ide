@@ -52,6 +52,43 @@ use continuation::{
     plan_with_handoff, project_recent_references, CompactionPolicy, ContinuationHistory,
 };
 
+fn terminal_tool_messages(
+    agent_msg: &crate::db::Message,
+    tool_results: Vec<ToolResult>,
+    sequences: impl Iterator<Item = i64>,
+) -> Vec<crate::db::Message> {
+    tool_results
+        .into_iter()
+        .zip(sequences)
+        .map(|(result, sequence_id)| {
+            let content = tool_result_message_content(&result);
+            crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
+                conversation_id: agent_msg.conversation_id.clone(),
+                sequence_id,
+                message_type: content.message_type(),
+                content,
+                display_data: merge_duration_into_display_data(
+                    result.display_data(),
+                    result.duration_ms,
+                ),
+                usage_data: None,
+                created_at: Utc::now(),
+            }
+        })
+        .collect()
+}
+
+struct PreparedRevokedGoalToolRound {
+    _reservation: crate::runtime::ReservedBroadcastRange,
+    assistant: crate::db::Message,
+    results: Vec<crate::db::Message>,
+    settlement: crate::runtime::traits::ActiveDirectTurnSettlement,
+    provider_replay: Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    trusted_results: Vec<PendingTrustedToolResult>,
+}
+
 enum AuthoritativeEffect {
     BroadcastAssistantMessage {
         message: crate::state_machine::AssistantMessage,
@@ -1983,6 +2020,7 @@ where
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
     pending_trusted_tool_results: Vec<PendingTrustedToolResult>,
+    prepared_revoked_goal_tool_round: Option<Box<PreparedRevokedGoalToolRound>>,
     /// Accepted provider-private replay mutation waiting for the reducer's
     /// authoritative persistence effect. Consumed by `PersistState`.
     pending_provider_replay_update:
@@ -2348,6 +2386,7 @@ where
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             pending_trusted_tool_results: Vec::new(),
+            prepared_revoked_goal_tool_round: None,
             pending_provider_replay_update: None,
             goal_report_emitter: None,
             #[cfg(test)]
@@ -3356,7 +3395,11 @@ where
     /// are logged and discarded — state unchanged.
     #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
-        let cancelled_llm = matches!(&outcome, EffectOutcome::Llm(LlmOutcome::Cancelled));
+        let cancelled_llm = matches!(
+            &outcome,
+            EffectOutcome::Llm(LlmOutcome::Cancelled | LlmOutcome::GoalControlRevoked)
+        );
+        let revoked_llm = matches!(&outcome, EffectOutcome::Llm(LlmOutcome::GoalControlRevoked));
         let revoked_tool = matches!((&outcome, &self.state), (
             EffectOutcome::Tool(ToolExecOutcome::Aborted {
                 tool_use_id,
@@ -3442,6 +3485,14 @@ where
             self.direct_turn_cancellation_initiated = true;
         }
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
+        if (revoked_tool || revoked_llm)
+            && self.active_direct_turn.is_some()
+            && matches!(result.new_state, ConvState::Idle)
+        {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::GoalControlRevoked,
+            ));
+        }
 
         let generated_events = self.apply_transition_result(result).await?;
         for event in generated_events.into_iter().rev() {
@@ -4231,6 +4282,8 @@ where
                     persist_state_effect_satisfied = true;
                     continue;
                 }
+                let is_terminal_checkpoint = terminal_direct_turn_transition
+                    && matches!(&effect, Effect::PersistCheckpoint { .. });
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let is_sub_agent_result_persist =
                     matches!(effect, Effect::PersistSubAgentResults { .. });
@@ -4561,6 +4614,13 @@ where
                 };
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
+                }
+                if is_terminal_checkpoint
+                    && self.active_direct_turn.is_none()
+                    && self.pending_direct_turn_terminal.is_none()
+                {
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
                 }
                 if approval_commits_state {
                     committed_state = Some((self.state.clone(), self.state_updated_at));
@@ -8536,7 +8596,7 @@ where
             let llm_outcome = match result {
                 Err(_) => {
                     let _ = attempt_capture.finalize_cancelled();
-                    LlmOutcome::Cancelled
+                    LlmOutcome::GoalControlRevoked
                 }
                 Ok(Ok(response)) => {
                     // Extract tool calls from content and convert to typed ToolCall
@@ -9303,12 +9363,85 @@ where
         Ok(None)
     }
 
+    async fn persist_prepared_revoked_goal_tool_round(
+        &mut self,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        let command = self
+            .prepared_revoked_goal_tool_round
+            .as_ref()
+            .ok_or("revoked-goal checkpoint has no prepared command")?;
+        if self.state != command.settlement.state {
+            return Err("revoked-goal checkpoint target differs from the retained command".into());
+        }
+        let establishment = self
+            .storage
+            .persist_revoked_goal_tool_round(
+                &command.assistant.conversation_id,
+                &command.assistant,
+                &command.results,
+                &command.settlement,
+                command.provider_replay.as_ref(),
+            )
+            .await;
+        let publish = match establishment {
+            TerminalMutationEstablishment::Established { .. } => true,
+            TerminalMutationEstablishment::Retired => false,
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+        };
+        let command = self
+            .prepared_revoked_goal_tool_round
+            .take()
+            .expect("prepared command retained through settlement");
+        self.state_updated_at = command.settlement.state_updated_at;
+        self.pending_provider_replay_update = None;
+        self.active_direct_turn = None;
+        self.pending_direct_turn_terminal = None;
+        self.direct_turn_cancellation_initiated = false;
+        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        self.settle_turn_span();
+        if publish {
+            merge_trusted_tool_results(
+                &mut self.pending_trusted_tool_results,
+                command.trusted_results,
+            );
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(command.assistant);
+            for message in command.results {
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(message);
+            }
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .state_change(
+                    self.state.clone(),
+                    self.state.presentation_mode().to_string(),
+                    self.state_updated_at,
+                );
+        }
+        Ok(None)
+    }
+
     async fn persist_checkpoint_with_terminal_obligation(
         &mut self,
         data: CheckpointData,
         settlement: &ActiveDirectTurnSettlement,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        if self.prepared_revoked_goal_tool_round.is_some() {
+            return self
+                .persist_prepared_revoked_goal_tool_round(admitted)
+                .await;
+        }
         let CheckpointData::ToolRound {
             assistant_message,
             tool_results,
@@ -9346,34 +9479,30 @@ where
         }
         let tool_results = finalized_round_results(&tool_results)?;
         let new_trusted_results = trusted_tool_results(&agent_msg.message_id, &tool_results);
-        let tool_msgs: Vec<crate::db::Message> = tool_results
-            .into_iter()
-            .zip(reserved_seqs.into_iter().skip(1))
-            .map(|(result, sequence_id)| {
-                let content = tool_result_message_content(&result);
-                crate::db::Message {
-                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                    message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
-                    conversation_id: conv_id.clone(),
-                    sequence_id,
-                    message_type: content.message_type(),
-                    content,
-                    display_data: merge_duration_into_display_data(
-                        result.display_data(),
-                        result.duration_ms,
-                    ),
-                    usage_data: None,
-                    created_at: Utc::now(),
-                }
-            })
-            .collect();
-        match self
+        let tool_msgs =
+            terminal_tool_messages(&agent_msg, tool_results, reserved_seqs.into_iter().skip(1));
+        let atomic_revocation = settlement.terminal
+            == crate::runtime::traits::ActiveDirectTurnTerminal::GoalControlRevoked;
+        if atomic_revocation {
+            self.prepared_revoked_goal_tool_round = Some(Box::new(PreparedRevokedGoalToolRound {
+                _reservation: _reserved_broadcast_range,
+                assistant: agent_msg,
+                results: tool_msgs,
+                settlement: settlement.clone(),
+                provider_replay: self.pending_provider_replay_update.take(),
+                trusted_results: new_trusted_results,
+            }));
+            return self
+                .persist_prepared_revoked_goal_tool_round(admitted)
+                .await;
+        }
+        let establishment = self
             .storage
             .persist_tool_round_with_terminal_obligation(
                 &conv_id, &agent_msg, &tool_msgs, settlement,
             )
-            .await
-        {
+            .await;
+        match establishment {
             TerminalMutationEstablishment::Established { .. } => {
                 self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
             }

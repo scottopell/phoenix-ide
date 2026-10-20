@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::Database;
 
 pub mod dispatch;
+mod settlement;
 use dispatch::GoalDispatchPermit;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

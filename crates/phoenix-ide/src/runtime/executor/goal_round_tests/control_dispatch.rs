@@ -254,7 +254,7 @@ async fn conversation_goal_stop_after_model_admission_before_first_poll_prevents
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(matches!(outcome, LlmOutcome::Cancelled));
+        assert!(matches!(outcome, LlmOutcome::GoalControlRevoked));
         rt.process_generation_tagged_llm_outcome(generation, outcome)
             .await;
         assert!(matches!(rt.state, ConvState::Idle));
@@ -364,7 +364,7 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_provider_future() {
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(matches!(outcome, LlmOutcome::Cancelled));
+        assert!(matches!(outcome, LlmOutcome::GoalControlRevoked));
         rt.process_generation_tagged_llm_outcome(generation, outcome)
             .await;
         assert!(matches!(rt.state, ConvState::Idle));
@@ -461,16 +461,61 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
                 serde_json::to_value(db.get_messages(CONVERSATION).await.unwrap()).unwrap(),
                 before_messages
             );
+            let ownership: (Option<String>, i64) = sqlx::query_as(
+                "SELECT terminal_kind,owns_conversation FROM durable_turns WHERE turn_id=?",
+            )
+            .bind(turn_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(ownership, (None, 1));
+            let obligations: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM direct_turn_terminal_obligations WHERE turn_id=?",
+            )
+            .bind(turn_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(obligations, 0);
             assert!(
                 rt.terminal_transition_retry.is_some(),
                 "the sole revoked outcome must survive a failed write"
             );
+            let prepared = rt.prepared_revoked_goal_tool_round.as_ref().unwrap();
+            let expected_messages: Vec<_> = std::iter::once(prepared.assistant.clone())
+                .chain(prepared.results.iter().cloned())
+                .collect();
+            let expected_state_time = prepared.settlement.state_updated_at;
             sqlx::query("DROP TRIGGER fail_revoked_tool_settlement")
                 .execute(db.pool())
                 .await
                 .unwrap();
             rt.retry_terminal_transition().await;
             assert!(rt.terminal_transition_retry.is_none());
+            assert!(rt.prepared_revoked_goal_tool_round.is_none());
+            let actual_messages: Vec<_> = db
+                .get_messages(CONVERSATION)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|actual| {
+                    expected_messages
+                        .iter()
+                        .any(|expected| actual.message_id == expected.message_id)
+                })
+                .collect();
+            assert_eq!(
+                serde_json::to_value(actual_messages).unwrap(),
+                serde_json::to_value(expected_messages).unwrap()
+            );
+            assert_eq!(rt.state_updated_at, expected_state_time);
+            assert_eq!(
+                db.get_conversation(CONVERSATION)
+                    .await
+                    .unwrap()
+                    .state_updated_at,
+                expected_state_time
+            );
         } else {
             rt.process_outcome(EffectOutcome::Tool(outcome))
                 .await
@@ -488,6 +533,32 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_tool_future_and_cont
                 .await
                 .unwrap();
         assert_eq!(terminal.as_deref(), Some("Cancelled"));
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        let messages = db.get_messages(CONVERSATION).await.unwrap();
+        let results: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::Tool(result) if result.tool_use_id == "inflight-tool" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert_eq!(results[0].content, "Cancelled by user");
+        let calls = messages
+            .iter()
+            .filter(|message| {
+                matches!(&message.content,
+                    MessageContent::Agent(blocks) if blocks.iter().any(|block| matches!(block,
+                        ContentBlock::ToolUse { id, .. } if id == "inflight-tool"
+                    ))
+                )
+            })
+            .count();
+        assert_eq!(calls, 1);
         tokio::time::timeout(Duration::from_secs(5), pending.dropped.notified())
             .await
             .unwrap();

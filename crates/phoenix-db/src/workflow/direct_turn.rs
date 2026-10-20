@@ -2553,7 +2553,7 @@ impl WorkflowRepository {
         Ok(())
     }
 
-    async fn terminalize_authoritative_turn_in_tx(
+    pub(crate) async fn terminalize_authoritative_turn_in_tx(
         &self,
         tx: &mut super::WorkflowTx<'_>,
         input: &TerminalizeAuthoritativeTurnInput,

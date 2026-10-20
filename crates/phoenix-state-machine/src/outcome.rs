@@ -89,6 +89,8 @@ pub enum LlmOutcome {
     /// Provider rejected the assembled prompt. This does not retry the same
     /// request automatically, but persists a user-resumable conversation error.
     PromptRejected { message: String },
+    /// The admitted owner-control epoch was revoked during this provider request.
+    GoalControlRevoked,
     /// Request was cancelled (abort signal received).
     #[allow(dead_code)]
     Cancelled,

@@ -116,10 +116,23 @@ async fn conversation_goal_user_candidate_restores_populated_132_cycle_without_s
             .await
             .unwrap();
         if remove_source_messages {
-            sqlx::query("DELETE FROM messages WHERE conversation_id='full-root'")
-                .execute(db.pool())
-                .await
-                .unwrap();
+            let deleted = sqlx::query(
+                "DELETE FROM messages WHERE conversation_id='full-root' AND message_id=?",
+            )
+            .bind(report.call().message_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(deleted.rows_affected(), 1);
+            let canonical_retained: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM durable_turns t JOIN messages m
+                 ON m.message_id=t.canonical_message_id AND m.conversation_id=t.conversation_id
+                 WHERE t.conversation_id='full-root')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert!(canonical_retained);
         }
         upgrade(&db).await;
         assert_eq!(retained(&db).await, before);

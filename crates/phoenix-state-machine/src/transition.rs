@@ -4111,6 +4111,13 @@ pub fn handle_outcome(
     context: &ConvContext,
     outcome: EffectOutcome,
 ) -> Result<TransitionResult, InvalidOutcome> {
+    if matches!(&outcome, EffectOutcome::Llm(LlmOutcome::GoalControlRevoked))
+        && !matches!(state, ConvState::LlmRequesting { .. })
+    {
+        return Err(InvalidOutcome {
+            reason: "goal-control revocation has no current provider request".into(),
+        });
+    }
     let event = match outcome {
         EffectOutcome::Llm(llm) => llm_outcome_to_event(llm, state),
         EffectOutcome::Tool(ToolExecOutcome::Aborted {
@@ -4322,6 +4329,10 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::GoalControlRevoked => Event::UserCancel {
+            reason: None,
+            cause: CancelCause::UserRequested,
+        },
         LlmOutcome::Cancelled => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -4633,6 +4644,46 @@ mod tests {
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    #[test]
+    fn conversation_goal_provider_revocation_cancels_only_the_current_request() {
+        let requesting = ConvState::LlmRequesting { attempt: 1 };
+        let cancelled = handle_outcome(
+            &requesting,
+            &test_context(),
+            EffectOutcome::Llm(LlmOutcome::GoalControlRevoked),
+        )
+        .unwrap();
+        assert!(matches!(cancelled.new_state, ConvState::Idle));
+        assert!(cancelled
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(!cancelled
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm | Effect::ScheduleRetry { .. })));
+        assert!(handle_outcome(
+            &ConvState::Idle,
+            &test_context(),
+            EffectOutcome::Llm(LlmOutcome::GoalControlRevoked)
+        )
+        .is_err());
+
+        let generic = handle_outcome(
+            &requesting,
+            &test_context(),
+            EffectOutcome::Llm(LlmOutcome::Cancelled),
+        )
+        .unwrap();
+        assert!(matches!(
+            generic.new_state,
+            ConvState::Error {
+                error_kind: ErrorKind::Cancelled,
+                ..
+            }
+        ));
     }
 
     #[test]
