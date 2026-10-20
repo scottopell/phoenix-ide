@@ -10,7 +10,7 @@ use crate::send_chat_service::{
     MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
 };
 
-fn notification(event: &PendingWatchEvent) -> Result<String, serde_json::Error> {
+fn notification(event: &PendingWatchEvent) -> String {
     let label = match &event.route {
         WatchEventRoute::Subscription => "Watched conversation event",
         WatchEventRoute::MandatoryCloseFailure { .. } => "Mandatory Close cleanup failure",
@@ -29,13 +29,6 @@ fn notification(event: &PendingWatchEvent) -> Result<String, serde_json::Error> 
     if let Some(reason) = event.outcome.reason() {
         text.push_str(" Reason: ");
         text.push_str(reason);
-    }
-    if let Some(capture) = &event.goal_capture {
-        let _ = write!(
-            text,
-            " Saved goal facts (event transaction; no execution authority): {}.",
-            serde_json::to_string(capture)?
-        );
     }
     if let WatchEventRoute::MandatoryCloseFailure {
         run_ordinal,
@@ -94,7 +87,7 @@ fn notification(event: &PendingWatchEvent) -> Result<String, serde_json::Error> 
         }
         text.push_str("\nRead-only investigation is allowed. Delivery acceptance is not cleanup success or repair approval.");
     }
-    Ok(text)
+    text
 }
 
 pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
@@ -121,13 +114,7 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
     };
     let service = SendChatApplicationService::new(db.clone(), runtime.clone());
     for event in events {
-        let text = match notification(&event) {
-            Ok(text) => text,
-            Err(error) => {
-                tracing::warn!(event_id=%event.event_id, %error, "watch fact rendering failed; retrying");
-                continue;
-            }
-        };
+        let text = notification(&event);
         let request = SendChatRequest {
             conversation_id: target.clone(),
             origin: InputOrigin::SubscriptionEvent {
@@ -159,6 +146,9 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod captured_notification_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -312,7 +302,7 @@ mod tests {
                 origin: InputOrigin::SubscriptionEvent {
                     event_id: event.event_id.clone(),
                 },
-                text: notification(&event).unwrap(),
+                text: notification(&event),
                 message_id: event.event_id.clone(),
                 images: vec![],
                 files: vec![],
@@ -379,8 +369,7 @@ mod tests {
             CloseFailureStop::ConversationAndProcessesStopped {
                 confirmed_at_unix_us: 10,
             },
-        ))
-        .unwrap();
+        ));
         for fact in [
             "Mandatory Close cleanup failure",
             "Cleanup run ordinal: 2",
@@ -409,7 +398,7 @@ mod tests {
             unreachable!();
         };
         *subject = MandatoryCloseFailureSubject::Attempt;
-        let text = notification(&event).unwrap();
+        let text = notification(&event);
         assert!(text.contains("Close attempt interruption with no captured resource"));
         assert!(!text.contains("Failed resource"));
     }
@@ -475,7 +464,7 @@ mod tests {
                 .into()
             })
             .collect();
-        let text = notification(&event).unwrap();
+        let text = notification(&event);
         let lines = text
             .lines()
             .filter(|line| line.starts_with("- Scope:"))
@@ -511,7 +500,7 @@ mod tests {
             event.route = WatchEventRoute::Subscription;
             event.outcome = outcome;
             event.source_occurrence_kind = kind.into();
-            let text = notification(&event).unwrap();
+            let text = notification(&event);
             assert!(text.starts_with("Watched conversation event."));
             assert!(text.contains(&format!("Outcome: {}.", event.outcome.label())));
             assert_eq!(event.outcome.reason(), reason);
@@ -525,7 +514,7 @@ mod tests {
 
     #[test]
     fn uncertain_shutdown_never_claims_confirmed_stop() {
-        let text = notification(&failure(CloseFailureStop::ShutdownUncertain)).unwrap();
+        let text = notification(&failure(CloseFailureStop::ShutdownUncertain));
         assert!(text.contains("Shutdown uncertain. Close incomplete."));
         assert!(!text.contains("Conversation and processes stopped"));
         assert!(!text.contains("confirmed at"));

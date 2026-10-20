@@ -337,10 +337,8 @@ async fn another_pooled_connection_reparses_the_new_schema() {
         .connect_with(options)
         .await
         .unwrap();
-    Database::from_pool_for_tests(pool.clone(), "migration-135-file".into())
-        .run_migrations()
-        .await
-        .unwrap();
+    let db = Database::from_pool_for_tests(pool.clone(), "migration-135-file".into());
+    db.run_migrations().await.unwrap();
     let index = super::super::MIGRATIONS
         .iter()
         .position(|m| m.version == 135)
@@ -348,9 +346,36 @@ async fn another_pooled_connection_reparses_the_new_schema() {
     super::super::run_migration_list(&pool, &super::super::MIGRATIONS[..index])
         .await
         .unwrap();
+    let source = db
+        .create_conversation("cache135", "cache135", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    db.watch_product_conversation(&source.product_conversation_id)
+        .await
+        .unwrap();
+    let watch: i64 = sqlx::query_scalar(
+        "SELECT id FROM coordinator_watches WHERE source_product_conversation_id=?",
+    )
+    .bind(source.product_conversation_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    const CACHED_INSERT: &str = "INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us) VALUES (?,?,?,?,?,?,?,?)";
     let mut retained = pool.acquire().await.unwrap();
     let before: i64 = sqlx::query_scalar("PRAGMA schema_version")
         .fetch_one(&mut *retained)
+        .await
+        .unwrap();
+    sqlx::query(CACHED_INSERT)
+        .bind("cached-before")
+        .bind(watch)
+        .bind("creation")
+        .bind("cached-before")
+        .bind(0_i64)
+        .bind(&source.id)
+        .bind("completed")
+        .bind(1_i64)
+        .execute(&mut *retained)
         .await
         .unwrap();
     sqlx::query("SELECT event_id,terminal_kind FROM coordinator_watch_events")
@@ -363,6 +388,57 @@ async fn another_pooled_connection_reparses_the_new_schema() {
         .await
         .unwrap();
     assert!(after > before);
+    sqlx::query(CACHED_INSERT)
+        .bind("cached-after")
+        .bind(watch)
+        .bind("creation")
+        .bind("cached-after")
+        .bind(0_i64)
+        .bind(&source.id)
+        .bind("completed")
+        .bind(2_i64)
+        .execute(&mut *retained)
+        .await
+        .unwrap();
+    let old_shape_error = sqlx::query(CACHED_INSERT)
+        .bind("cached-goal-change")
+        .bind(watch)
+        .bind("goal_change")
+        .bind(source.product_conversation_id.as_str())
+        .bind(1_i64)
+        .bind(&source.id)
+        .bind("goal_changed")
+        .bind(3_i64)
+        .execute(&mut *retained)
+        .await
+        .unwrap_err();
+    assert!(old_shape_error
+        .to_string()
+        .contains("goal capture requires eligible local subscription"));
+    let packet_shape_error = sqlx::query(CACHED_INSERT)
+        .bind("cached-wrong-packet")
+        .bind(watch)
+        .bind("creation")
+        .bind("cached-wrong-packet")
+        .bind(0_i64)
+        .bind(&source.id)
+        .bind("goal_changed")
+        .bind(3_i64)
+        .execute(&mut *retained)
+        .await
+        .unwrap_err();
+    assert!(packet_shape_error
+        .to_string()
+        .contains("goal_watch_packet_shape"));
+    let mut tx = sqlx::Acquire::begin(&mut *retained).await.unwrap();
+    sqlx::query("INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us,goal_capture_kind) VALUES ('cached-goal-change',?,'goal_change',?,1,?,'goal_changed',3,'captured')")
+        .bind(watch).bind(source.product_conversation_id.as_str()).bind(&source.id)
+        .execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO coordinator_watch_goal_captures(event_id,kind,owner_id,owner_version,goal_id,objective,state,usage_kind) VALUES ('cached-goal-change','saved_goal',?,1,'cached-goal','cached goal objective','underway','unavailable_not_captured')")
+        .bind(source.product_conversation_id.as_str()).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_,String>("SELECT terminal_kind FROM coordinator_watch_events WHERE event_id='cached-goal-change'")
+        .fetch_one(&mut *retained).await.unwrap(), "goal_changed");
     sqlx::query(
         "SELECT event_id,goal_capture_kind,goal_capture_event_id FROM coordinator_watch_events",
     )

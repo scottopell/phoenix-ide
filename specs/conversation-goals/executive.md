@@ -19,6 +19,46 @@ obligations at their admitted write owners. Report checkpoints do not append
 standalone events. Stop, mandatory Close and federation semantics are unchanged.
 This source is **not compiled or executed** and has not passed independent review.
 
+### Privacy correction after independent source review
+
+The first local freeze (`f71ced1c`) appended captured facts to the normal
+notification text, which shared reads serialize independently of redacted typed
+presentation. That source privacy defect is corrected in the follow-up candidate:
+notification text is the pre-capture diagnostic; no saved objective/reason/goal ID
+is added to message content, display data or persisted `llm_text`. Existing typed
+authenticated presentation remains the private UI consumer. No existing shared
+diagnostic evidence is removed or rewritten.
+
+`StateStore::subscription_goal_captures` loads only requested local subscription
+identities from immutable event-owned storage. Actual normal and continuation
+prompt assembly selects included user-message event IDs (excluding the protected
+handoff and unadopted wake results), renders facts into request-local user context,
+and budgets/freezes that rendered result. There is no system/trusted-envelope
+injection or live-goal lookup. Capture errors propagate independently of the
+existing clear-watermark fallback: normal dispatch returns an error, continuation
+returns its typed failure, and neither dispatches a provider task. Legacy/disabled
+classification stays event-owned; missing/corrupt expected capture is an error.
+
+Authored **UNRUN** regressions use a real captured blocked-goal wait event, the
+legacy notification renderer, actual send-service admission, canonical repository
+materialization of that accepted payload, and exact service replay. HTTP shared
+initial/history reads, SSE shared init/pending/live replay, and persisted payloads
+must contain none of the three unique private facts, while authenticated typed
+presentation and actual normal/continuation LLM requests retain them. Other
+assertions cover token estimates before budgeting, source deletion/replay,
+freeze before provider spawn, excluded/remote/wake inputs avoiding lookup, and
+missing storage/expected child/corrupt capture refusing context construction.
+
+The pooled migration test now executes/caches an exact old-column INSERT before
+135 and reuses it on the retained connection after migration. Goal-change input
+without a captured marker reaches the explicit local-capture trigger; an
+old-source/new-outcome mismatch reaches named `goal_watch_packet_shape`, not an
+old enum CHECK. A proper new-column captured goal-change INSERT plus event-owned
+saved-goal child must commit on that same connection. The old-column statement
+does **not** accept the new packet shape. No CHECK, trigger or default is weakened;
+second-connection/schema-version/integrity and existing rollback assertions remain.
+All of this is source inspection and authored assertions, **not execution proof**.
+
 | Contract | Implementation/verification boundary |
 |---|---|
 | REQ-GOAL-011 | Existing terminal/wait outbox transactions must capture saved current goal or observed absence, distinct from legacy not-captured; usage explicitly unavailable. Storage and boundary tests owed. |

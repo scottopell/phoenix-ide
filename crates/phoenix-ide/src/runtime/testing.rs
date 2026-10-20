@@ -2132,6 +2132,16 @@ impl MessageStore for InMemoryStorage {
 
 #[async_trait]
 impl StateStore for InMemoryStorage {
+    async fn subscription_goal_captures(
+        &self,
+        _event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    > {
+        Ok(std::collections::HashMap::new())
+    }
+
     async fn update_state(
         &self,
         conv_id: &str,

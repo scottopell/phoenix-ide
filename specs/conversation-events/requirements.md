@@ -32,4 +32,6 @@ THE SYSTEM SHALL keep goal facts separate from the event's execution, wait or go
 
 THE SYSTEM SHALL preserve these distinctions through the read paths and shared-read redaction of REQ-CEVT-004, with inspectable saved evidence under REQ-CEVT-003. A missing or invalid event projection SHALL use the existing unavailable-details fallback rather than reconstruct facts from live goal storage. Mandatory Close and federation terminal-fact routes, source provenance, message acceptance, navigation and ordering SHALL remain unchanged.
 
+Saved goal facts SHALL NOT be appended to persisted diagnostic content, `llm_text`, or display data exposed by shared transcript reads. Executor consumption SHALL project immutable local-event facts into request-local user-message context before token budgeting and request freeze, without changing persisted message content or injecting system instructions. Capture-load failures SHALL fail context construction rather than fabricate captured absence or fall back to live goal storage. Existing clear and inclusion boundaries SHALL determine which event identities are looked up and rendered.
+
 Related contracts: [Conversation UI](../conversation-ui/requirements.md), [Conversation retrieval](../conversation-retrieval/requirements.md).

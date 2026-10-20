@@ -13054,6 +13054,42 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn captured_notification_shared_http_initial_and_history_keep_only_legacy_diagnostic() {
+        use crate::coordinator_watch_delivery::captured_notification_fixture::{
+            assert_private_absent, captured_notification, GOAL_ID, OBJECTIVE, REASON,
+        };
+        let state = make_test_state().await;
+        let (message, source, diagnostic) = captured_notification(&state.db).await;
+        let token = state
+            .db
+            .create_share_token(&message.conversation_id)
+            .await
+            .unwrap();
+        for source_removed in [false, true] {
+            if source_removed {
+                state.db.delete_conversation(&source).await.unwrap();
+            }
+            let Json(shared) = get_shared_conversation(State(state.clone()), Path(token.clone()))
+                .await
+                .unwrap();
+            let wire = serde_json::to_value(&shared).unwrap();
+            assert_private_absent(&wire);
+            assert_eq!(wire["messages"][0]["content"]["text"], diagnostic);
+            assert_eq!(
+                wire["messages"][0]["event_presentation"]["reason"],
+                "redacted"
+            );
+            let private = enrich_messages(&state.db, &[message.clone()]).await;
+            let private_wire = serde_json::to_value(&private).unwrap();
+            let capture = private_wire[0]["event_presentation"]["goal_capture"].to_string();
+            for secret in [OBJECTIVE, REASON, GOAL_ID] {
+                assert!(capture.contains(secret));
+            }
+            assert_eq!(wire["messages"][0]["content"], private_wire[0]["content"]);
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_oauth_callback_rejects_unmatched_state_and_error_redirects() {
         use axum::extract::Query;
 

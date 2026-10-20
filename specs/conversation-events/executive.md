@@ -57,3 +57,23 @@ Hosted run `38733795185` at a1fbb6e completed full codegen and full cargo tests 
 Bounded repairs enumerate existing enum variants (future variants require an explicit choice), borrow the wire serializer input, format the affected Rust/CSS, and regenerate SseWireEvent from the verified existing ts-rs test binary. The genuine export ran exactly one named test with 1 pass/1937 filtered; its only generated change is the two-line documentation comment describing explicit projection instead of implicit From. No generated code was hand-edited and no local compiler was launched. Rustfmt checks passed. A focused stylelint run exposed missing inter-rule blank lines after the first formatting edit; those were corrected, with final confirmation left to the next hosted run rather than silently rerunning a consumed admission.
 
 The full-codegen execution gate therefore has hosted evidence, but generated-file freshness and final green Rust/Clippy/UI lanes remain pending the repair head. The 88 rendered assertions remain scoped to the previously qualified presentation behavior; repairs do not constitute a new full browser or physical-phone campaign.
+
+### Local captured-fact privacy correction (source-only)
+
+Independent review of the local typed-watch freeze found that saved goal JSON in
+normal diagnostic text bypassed shared presentation redaction. The follow-up
+source restores the legacy notification text unchanged. Saved facts remain in
+authenticated typed presentation and are loaded separately by actual executor
+prompt assembly into ephemeral user-message context before budgeting/freeze.
+Nothing adds them to serialized message content, display data or `llm_text`.
+
+Authored **UNRUN** regressions admit a genuine captured blocked-goal notification
+through the send service, materialize the accepted payload through its canonical
+repository boundary, and replay the same delivery. Shared HTTP initial/history
+and SSE initial/pending/live/replay wires must contain no unique saved objective,
+reason or goal ID anywhere; original diagnostics remain unchanged. Authenticated
+presentation and actual normal/continuation LLM request assertions retain the
+facts. Missing/corrupt expected capture refuses context construction, separately
+from existing clear-watermark fallback. Source deletion and replay use immutable
+event facts, not live goals. These are source assertions, not runtime qualification;
+generated exports and all parent-owned hosted capture/qualification gates remain.

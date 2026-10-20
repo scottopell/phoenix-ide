@@ -785,6 +785,77 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
+    async fn captured_notification_shared_init_replay_pending_and_live_never_serialize_goal_facts()
+    {
+        use crate::coordinator_watch_delivery::captured_notification_fixture::{
+            assert_private_absent, captured_notification, GOAL_ID, OBJECTIVE, REASON,
+        };
+        let db = phoenix_db::Database::open_in_memory().await.unwrap();
+        let (message, source, diagnostic) = captured_notification(&db).await;
+        let live_event = SseEvent::Message {
+            message: message.clone(),
+            opening: None,
+        };
+        let messages = vec![message.clone()];
+        let init = SseEvent::Init {
+            sequence_id: 1,
+            conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
+            transcript: crate::runtime::InitTranscript::Complete(messages),
+            opening: None,
+            steering_messages: Vec::new(),
+            agent_working: false,
+            presentation_mode: "idle".into(),
+            last_sequence_id: 1,
+            stream_incarnation: "test-stream".into(),
+            context_window_size: 0,
+            project_name: None,
+            pending_anchor_sequence_id: 0,
+            pending_events: vec![live_event.clone()],
+            pending_truncated: false,
+        };
+        for source_removed in [false, true] {
+            if source_removed {
+                db.delete_conversation(&source).await.unwrap();
+            }
+            for event in [live_event.clone(), init.clone()] {
+                let private =
+                    prepare_sse_delivery(&db, event.clone(), SseStreamAudience::Authenticated)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let private =
+                    project_sse_wire(&db, SseStreamAudience::Authenticated, private).await;
+                let private = serde_json::to_value(private).unwrap();
+                for secret in [OBJECTIVE, REASON, GOAL_ID] {
+                    assert!(private.to_string().contains(secret));
+                }
+                let shared = prepare_sse_delivery(&db, event, SseStreamAudience::SharedTranscript)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let shared =
+                    project_sse_wire(&db, SseStreamAudience::SharedTranscript, shared).await;
+                let wire = serde_json::to_value(shared).unwrap();
+                assert_private_absent(&wire);
+                let rows = if wire.get("message").is_some() {
+                    vec![&wire["message"]]
+                } else {
+                    vec![&wire["messages"][0], &wire["pending_events"][0]["message"]]
+                };
+                for row in rows {
+                    assert_eq!(row["content"]["text"], diagnostic);
+                    assert_eq!(row["event_presentation"]["reason"], "redacted");
+                    assert_eq!(
+                        row["content"],
+                        serde_json::to_value(&message.content).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn event_projection_matches_rest_init_pending_live_and_aggregate_and_redacts_share() {
         let (db, messages) = super::super::event_presentation::tests::fixture(1).await;
         let message = messages[0].clone();

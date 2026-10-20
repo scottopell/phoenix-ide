@@ -86,6 +86,69 @@ async fn creation(
 }
 
 #[tokio::test]
+async fn executor_batch_lookup_preserves_event_time_disabled_legacy_and_observed_absence() {
+    let (db, transcript, owner) = fixture().await;
+    creation(
+        &db,
+        &transcript,
+        "batch-disabled",
+        GoalControlInstallation::Disabled,
+    )
+    .await
+    .unwrap();
+    creation(
+        &db,
+        &transcript,
+        "batch-no-goal",
+        GoalControlInstallation::Installed,
+    )
+    .await
+    .unwrap();
+    let watch: i64 = sqlx::query_scalar(
+        "SELECT id FROM coordinator_watches WHERE source_product_conversation_id=?",
+    )
+    .bind(owner.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us) VALUES ('batch-legacy',?,'creation','historical',0,?,'completed',1)")
+        .bind(watch).bind(&transcript).execute(db.pool()).await.unwrap();
+    let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+    let ids = pending
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let before = db.coordinator_watch_goal_captures(&ids).await.unwrap();
+    assert_eq!(before.len(), 3);
+    assert_eq!(before["batch-legacy"], WatchGoalCapture::LegacyNotCaptured);
+    assert!(before
+        .values()
+        .any(|capture| matches!(capture, WatchGoalCapture::NotCapturedDisabled)));
+    assert!(before.values().any(|capture| matches!(
+        capture,
+        WatchGoalCapture::CapturedNoGoal {
+            owner_version: 0,
+            ..
+        }
+    )));
+    create_goal(&db, &transcript, &owner).await;
+    assert_eq!(
+        db.coordinator_watch_goal_captures(&ids).await.unwrap(),
+        before
+    );
+    db.delete_conversation(&transcript).await.unwrap();
+    assert_eq!(
+        db.coordinator_watch_goal_captures(&ids).await.unwrap(),
+        before
+    );
+    assert!(db
+        .coordinator_watch_goal_captures(&["missing-historical-event".into()])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn disabled_real_boundaries_do_not_touch_unavailable_goal_storage() {
     let (db, transcript, _) = fixture().await;
     assert_eq!(

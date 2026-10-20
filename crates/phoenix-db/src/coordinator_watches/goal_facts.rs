@@ -4,6 +4,44 @@ use sqlx::{Row, Sqlite, Transaction};
 use crate::conversation_goals::control::GoalControlInstallation;
 use crate::{DbError, DbResult};
 
+impl crate::Database {
+    /// Load immutable local-event facts for request-local executor rendering.
+    ///
+    /// # Errors
+    /// Returns an error if storage fails or a retained capture is incomplete.
+    pub async fn coordinator_watch_goal_captures(
+        &self,
+        event_ids: &[String],
+    ) -> DbResult<std::collections::HashMap<String, WatchGoalCapture>> {
+        let mut captures = std::collections::HashMap::new();
+        for chunk in event_ids.chunks(400) {
+            let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+                "SELECT e.event_id, e.route_kind, e.goal_capture_kind,
+                    gc.kind AS capture_kind, gc.owner_id AS capture_owner_id,
+                    gc.owner_version AS capture_owner_version, gc.goal_id AS capture_goal_id,
+                    gc.objective AS capture_objective, gc.state AS capture_state,
+                    gc.reason AS capture_reason, gc.usage_kind AS capture_usage_kind
+                 FROM coordinator_watch_events e
+                 LEFT JOIN coordinator_watch_goal_captures gc ON gc.event_id=e.event_id
+                 WHERE e.route_kind='subscription' AND e.event_id IN (",
+            );
+            let mut ids = query.separated(",");
+            for id in chunk {
+                ids.push_bind(id);
+            }
+            ids.push_unseparated(")");
+            for row in query.build().fetch_all(self.pool()).await? {
+                let id: String = row.try_get("event_id")?;
+                let capture = decode(&row)?.ok_or_else(|| {
+                    DbError::Serialization("local watch event has no capture classification".into())
+                })?;
+                captures.insert(id, capture);
+            }
+        }
+        Ok(captures)
+    }
+}
+
 pub(super) fn marker(installation: GoalControlInstallation) -> &'static str {
     match installation {
         GoalControlInstallation::Disabled => "disabled",

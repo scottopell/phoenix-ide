@@ -48,6 +48,8 @@ use tracing::Instrument;
 mod continuation;
 #[cfg(test)]
 mod provider_tool_policy_tests;
+#[cfg(test)]
+mod watch_goal_context_tests;
 use continuation::{
     plan_with_handoff, project_recent_references, CompactionPolicy, ContinuationHistory,
 };
@@ -1515,11 +1517,31 @@ async fn assemble_cleared_messages<S: StateStore>(
     clearable_names: &std::collections::HashSet<String>,
     context_window: usize,
     watermark_cache: &std::sync::Mutex<Option<i64>>,
-) -> Vec<LlmMessage> {
+) -> Result<Vec<LlmMessage>, String> {
     let included_messages = || {
         db_messages
             .iter()
             .filter(|message| Some(message.message_id.as_str()) != excluded_message_id)
+    };
+    let event_ids = included_messages()
+        .filter(|message| renders_user_message(message))
+        .filter_map(|message| match (&message.origin, &message.content) {
+            (
+                phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id },
+                MessageContent::User(_),
+            ) => Some(event_id.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let captures = if event_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        storage
+            .subscription_goal_captures(&event_ids)
+            .await
+            .map_err(|error| format!("failed to load subscription goal facts: {error}"))?
     };
     let prior_watermark = match storage.get_clear_watermark(conv_id).await {
         Ok(w) => {
@@ -1535,13 +1557,17 @@ async fn assemble_cleared_messages<S: StateStore>(
                 );
                 let cleared =
                     clearable_sequence_ids_through_watermark(db_messages, clearable_names, w);
-                render_messages(included_messages(), &cleared)
+                render_messages(included_messages(), &cleared, &captures)
             } else {
                 tracing::warn!(
                     conv_id = %conv_id, error = %e,
                     "failed to read clear watermark with none cached; sending uncleared history",
                 );
-                render_messages(included_messages(), &std::collections::HashSet::new())
+                render_messages(
+                    included_messages(),
+                    &std::collections::HashSet::new(),
+                    &captures,
+                )
             };
         }
     };
@@ -1597,7 +1623,28 @@ async fn assemble_cleared_messages<S: StateStore>(
         }
     };
 
-    render_messages(included_messages(), &cleared)
+    render_messages(included_messages(), &cleared, &captures)
+}
+
+fn renders_user_message(message: &crate::db::Message) -> bool {
+    match &message.content {
+        MessageContent::User(user_content) => {
+            !(user_content.is_meta
+                && message
+                    .display_data
+                    .as_ref()
+                    .and_then(|data| data.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("wake_result")
+                && !message
+                    .display_data
+                    .as_ref()
+                    .and_then(|data| data.get("adopted"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false))
+        }
+        _ => false,
+    }
 }
 
 /// Fold persisted messages into the provider-agnostic LLM message list.
@@ -1612,7 +1659,11 @@ async fn assemble_cleared_messages<S: StateStore>(
 fn render_messages<'a>(
     db_messages: impl IntoIterator<Item = &'a crate::db::Message>,
     cleared_sequence_ids: &std::collections::HashSet<i64>,
-) -> Vec<LlmMessage> {
+    captures: &std::collections::HashMap<
+        String,
+        phoenix_core::domain::watch_goal::WatchGoalCapture,
+    >,
+) -> Result<Vec<LlmMessage>, String> {
     use crate::db::{MessageContent, ToolContent};
     use phoenix_llm::ImageSource;
 
@@ -1620,20 +1671,7 @@ fn render_messages<'a>(
     for msg in db_messages {
         match &msg.content {
             MessageContent::User(user_content) => {
-                if user_content.is_meta
-                    && msg
-                        .display_data
-                        .as_ref()
-                        .and_then(|data| data.get("type"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("wake_result")
-                    && !msg
-                        .display_data
-                        .as_ref()
-                        .and_then(|data| data.get("adopted"))
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                {
+                if !renders_user_message(msg) {
                     continue;
                 }
                 // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
@@ -1658,7 +1696,14 @@ fn render_messages<'a>(
                         user_content.llm_text()
                     ),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => {
-                        format!("[Conversation event {event_id}]\n{}", user_content.llm_text())
+                        let mut text = format!("[Conversation event {event_id}]\n{}", user_content.llm_text());
+                        if let Some(capture) = captures.get(event_id) {
+                            let facts = serde_json::to_string(capture)
+                                .map_err(|error| format!("failed to render subscription goal facts: {error}"))?;
+                            text.push_str("\nSaved goal facts (event transaction; no execution authority): ");
+                            text.push_str(&facts);
+                        }
+                        text
                     }
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => {
                         format!("[System-generated input]\n{}", user_content.llm_text())
@@ -1777,7 +1822,7 @@ fn render_messages<'a>(
             MessageContent::System(_) | MessageContent::Error(_) => {}
         }
     }
-    messages
+    Ok(messages)
 }
 
 /// Render a human-readable summary of sub-agent outcomes for the LLM.
@@ -8264,7 +8309,7 @@ where
                 .saturating_sub(trusted_token_reserve),
             &self.clear_watermark_cache,
         )
-        .await;
+        .await?;
 
         overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
 
@@ -10597,7 +10642,7 @@ where
         let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
         let system_prompt = policy.system_prompt();
-        let frozen_messages = assemble_cleared_messages(
+        let frozen_messages = match assemble_cleared_messages(
             &self.storage,
             &conv_id,
             projection,
@@ -10609,7 +10654,17 @@ where
             context_window,
             &self.clear_watermark_cache,
         )
-        .await;
+        .await
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                return Ok(Some(Event::ContinuationFailed {
+                    operation_id,
+                    error,
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                }));
+            }
+        };
 
         let protected_handoff = history.handoff.is_some();
         let rendered_count = frozen_messages.len() + usize::from(protected_handoff);
@@ -14152,7 +14207,12 @@ mod dispatch_context_budget_tests {
         };
         let mut api = message("recipient", 2, "user request");
         api.origin = InputOrigin::UserApi;
-        let rendered = render_messages(&[internal, api], &std::collections::HashSet::new());
+        let rendered = render_messages(
+            &[internal, api],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(rendered.len(), 2);
         assert_eq!(rendered[0].role, phoenix_llm::MessageRole::User);
         assert!(
@@ -14191,7 +14251,7 @@ mod dispatch_context_budget_tests {
             skill.content = MessageContent::Skill(SkillContent {
                 name: "inspect".into(), body: "body".into(), trigger: "/inspect".into(), files: vec![],
             });
-            let rendered = render_messages(&[user, skill], &std::collections::HashSet::new());
+            let rendered = render_messages(&[user, skill], &std::collections::HashSet::new(), &std::collections::HashMap::new()).unwrap();
             assert_eq!(rendered.len(), 2);
             for rendered in rendered {
                 assert_eq!(rendered.role, phoenix_llm::MessageRole::User);
@@ -22156,7 +22216,12 @@ mod steer_drain_detector_tests {
                 msgs[0].content.message_type()
             );
         };
-        let rendered = render_messages(&msgs, &std::collections::HashSet::new());
+        let rendered = render_messages(
+            &msgs,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(rendered.len(), 1, "the summary must reach LLM history");
         assert_eq!(
             rendered[0].role,
@@ -23388,7 +23453,12 @@ mod steer_drain_detector_tests {
         .await
         .expect("checkpoint tool round");
         let messages = storage.get_all_messages("conv-replay-owner");
-        let rendered = render_messages(&messages, &std::collections::HashSet::new());
+        let rendered = render_messages(
+            &messages,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let projected = rendered;
         assert_eq!(
             projected
@@ -27105,7 +27175,8 @@ mod stale_tool_result_clearing_tests {
                 20_000,
                 &cache,
             )
-            .await;
+            .await
+            .unwrap();
             assert_eq!(messages.len(), 2);
             assert_eq!(
                 messages[0].content[0].render_text(),
@@ -27133,8 +27204,9 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             is_rendered_cleared(&messages, "old-tool"),
             "old round rendered as placeholder"
@@ -27161,8 +27233,9 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             !is_rendered_cleared(&messages, "old-tool"),
             "read failure with empty cache → nothing cleared this turn",
@@ -27186,15 +27259,17 @@ mod stale_tool_result_clearing_tests {
         let cache = std::sync::Mutex::new(None);
 
         // Turn 1: a real sweep advances and caches the watermark; `old` is cleared.
-        let first =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let first = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(is_rendered_cleared(&first, "old-tool"));
 
         // Turn 2: the watermark read fails, but the cache holds the advanced
         // value, so the previously-cleared result stays cleared.
         storage.set_fail_watermark_read(true);
-        let second =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let second = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             is_rendered_cleared(&second, "old-tool"),
             "read failure must preserve the cached cleared set, not un-clear it",
@@ -27217,8 +27292,9 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             !is_rendered_cleared(&messages, "old-tool"),
             "write failure → prior (empty) cleared set rendered, not the failed advance",
@@ -27241,7 +27317,7 @@ mod stale_tool_result_clearing_tests {
 
         let db = storage.get_messages(conv).await.unwrap();
         let cleared: HashSet<i64> = std::iter::once(cleared_seq).collect();
-        let msgs = render_messages(&db, &cleared);
+        let msgs = render_messages(&db, &cleared, &std::collections::HashMap::new()).unwrap();
 
         let find = |id: &str| -> (String, usize) {
             for m in &msgs {

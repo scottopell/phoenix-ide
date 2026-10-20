@@ -529,6 +529,14 @@ pub struct PersistedStateSnapshot {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    async fn subscription_goal_captures(
+        &self,
+        event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    >;
+
     async fn record_execution_cancel(&self, _conversation_id: &str) -> Result<(), String> {
         Ok(())
     }
@@ -1270,6 +1278,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
+    async fn subscription_goal_captures(
+        &self,
+        event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    > {
+        (**self).subscription_goal_captures(event_ids).await
+    }
+
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         (**self).record_execution_cancel(conversation_id).await
     }
@@ -2720,6 +2738,19 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn subscription_goal_captures(
+        &self,
+        event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    > {
+        self.db
+            .coordinator_watch_goal_captures(event_ids)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1) ON CONFLICT DO NOTHING")
             .bind(conversation_id).execute(self.db.pool()).await.map_err(|error| error.to_string())?;
