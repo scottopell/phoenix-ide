@@ -10,10 +10,10 @@ The five tools are `query_database`, `search_conversations`, `read_conversation`
 
 | Requirement | Current status | Remaining verification or implementation |
 |---|---|---|
-| REQ-FED-001–005 | Identity, query-focused directional enrollment, TLS trust, revocation, and credential denial implemented | Exact deployed two-host acceptance |
+| REQ-FED-001–005 | Receiver-issued bundles own destination identity/name/URL/trust; import authenticates and verifies both instances over bounded pinned TLS before enabling; query-focused enrollment, revocation, and credential denial are exact-head qualified | Deployed two-host enrollment acceptance |
 | REQ-FED-006–007 | Direct/owner send derives RemoteApi only; explicit remote tool uses distinct source-server-authored send with persisted membership and exact tool-call provenance; exact-head source qualification is green | Deployed two-host acceptance |
-| REQ-FED-008 | Typed search/read/resolve/send identities, peer navigation, Rust-backed TypeScript bindings, owner facades, web/native presentation, and Python are exact-head qualified | Deployed two-host acceptance |
-| REQ-FED-009–010 | Five owner-authenticated saved-peer operation facades, Python methods, generated federation-only OpenAPI, and destination-bound saved-peer reference fetch are exact-head qualified | Deployed peer fetch acceptance |
+| REQ-FED-008 | Typed identities, qualified peer navigation, visible missing/unreachable connection recovery guidance, Rust-backed TypeScript bindings, owner facades, web/native presentation, and Python are exact-head qualified | Deployed two-host acceptance |
+| REQ-FED-009–010 | Five owner facades, Python methods, complete federation lifecycle/peer OpenAPI, and destination-bound saved-peer reference fetch are exact-head qualified | Deployed peer fetch acceptance |
 | REQ-FED-011–012 | Peer-notes migration 133, typed 32 KiB UTF-8 bounds, owner GET/PUT, and the Settings Connections editor are exact-head qualified | Coordinator WorkScope remains goals-owned; deployed notes acceptance remains |
 | REQ-FED-013 | Five tool adapters accept optional instance selection; owner operation and OpenAPI-fetch facades require explicit saved-peer selection; exact-head qualification is green | Deployed two-host acceptance |
 | REQ-FED-015 | Normalized finite replay/authorization, retention/gaps, End-on-Close, durable Coordinator admission, unsubscribe/revocation, presentation, generated bindings, and isolated fixtures are exact-head qualified | Final independent review and deployed two-host acceptance |

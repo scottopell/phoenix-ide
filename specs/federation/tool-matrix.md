@@ -2,6 +2,10 @@
 
 All five tools have explicit-instance HTTPS adapters. The owner-facing direct API resolves saved peer connections server-side and reuses those adapters.
 
+## Directional enrollment setup
+
+The receiver-issued transfer bundle owns the destination instance ID, display name, canonical HTTPS base URL, caller instance ID, directional bearer, and TLS trust. Import accepts that single bundle rather than a second destination representation. Before a connection row is saved or enabled, the importer performs a bounded, no-redirect request using the bundle's pinned TLS trust and bearer, then requires the peer to attest both the destination and authenticated caller instance IDs. Offline, untrusted, unauthorized, or mismatched destinations fail without persisting the connection.
+
 ## Owner operations
 
 All operation requests are closed JSON objects and require `instance: string` (saved UUID or unambiguous saved name). Missing, null, blank, unknown, and ambiguous selectors fail; none invoke the local operation. The API does not share the tools' omission-means-local convention.
