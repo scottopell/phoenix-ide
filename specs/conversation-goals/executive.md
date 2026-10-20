@@ -1,5 +1,33 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest source checkpoint — qualification remains parent-owned
+
+Exact `e6b717f4f05040f69c347cbbdc29c7591b07a56e` was normally pushed and
+independently captured by the parent for existing run **39373782924**. No result
+from that run is claimed here. The focused green floor remains **156/156 at
+exact `e4d0d615061a0d927cc5ad3d1a3d875c7c375754`**, not at `e6` or later source.
+
+The later management coverage slice extracts the existing error reconciliation
+branch into a private function without changing its classification or admission
+policy. Three source-only regression functions cover: all Runtime/Fork/terminal
+owners with Anthropic/Responses replay and accepted/refused outcomes; a missing
+retained result pair; and actual Fork proposal/state/provider-row write failures.
+Tests commit through the real application gates and DB transaction owners, then
+invoke the same private reconciliation branch with a lost-response diagnostic.
+This models lost acknowledgement at that branch; it is not fault injection into
+the transport/commit call, automatic restart recovery, or a runtime Fork journey.
+The Fork fixture pairs its proposal call/result with the canonical management
+call; it does not execute the proposal tool or create a task on disk.
+
+Assertions include full history/message/proposal/private-replay/state/turn
+snapshots, exact output reuse, successful terminal ownership release and replay
+cleanup, unchanged nonterminal source ownership, stable refusal after target eligibility
+returns, historical success after target retirement with both target gates held,
+and changed proposal rejection. Source formatting and whitespace checks are not
+compiler, test, SQL or migration qualification. UI/watch/automatic continuation
+remain commissioned and incomplete. Schema132 is immutable,134 unregistered,
+production installation disabled, emitter absent and public control route503.
+
 ## Current qualification boundary
 
 Parent-owned run **39349884955**, exact **`2ec904a6720140469eb840b0607302c64dc9da24`**,

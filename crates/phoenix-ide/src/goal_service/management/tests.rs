@@ -10,6 +10,8 @@ use phoenix_db::Message;
 
 use super::testing::{fixture, Fixture};
 
+mod recovery;
+
 fn request(fixture: &Fixture) -> GoalManagementRequest {
     GoalManagementRequest::Create {
         owner: fixture.target.clone(),

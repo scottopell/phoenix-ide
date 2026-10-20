@@ -162,29 +162,36 @@ impl GoalManagementService {
                 transcript_generation: None,
                 value,
             },
-            Err(error) => match runtime
-                .db()
-                .retained_goal_management_round(checkpoint)
+            Err(error) => {
+                Self::reconcile_checkpoint(runtime.db(), checkpoint, kind, replay, &error).await
+            }
+        }
+    }
+
+    async fn reconcile_checkpoint(
+        db: &phoenix_db::Database,
+        checkpoint: &GoalRoundCheckpoint<'_>,
+        kind: GoalManagementRoundKind<'_>,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        error: &phoenix_db::DbError,
+    ) -> TerminalMutationEstablishment<CommittedGoalRound> {
+        match db.retained_goal_management_round(checkpoint).await {
+            Ok(None) => TerminalMutationEstablishment::KnownNotCommitted(error.to_string()),
+            Ok(Some(_)) => match db
+                .persist_goal_management_round(checkpoint, &[], kind, replay)
                 .await
             {
-                Ok(None) => TerminalMutationEstablishment::KnownNotCommitted(error.to_string()),
-                Ok(Some(_)) => match runtime
-                    .db()
-                    .persist_goal_management_round(checkpoint, &[], kind, replay)
-                    .await
-                {
-                    Ok(value) => TerminalMutationEstablishment::Established {
-                        transcript_generation: None,
-                        value,
-                    },
-                    Err(replay_error) => TerminalMutationEstablishment::Unclassifiable(format!(
-                        "management commit {error}; exact replay {replay_error}"
-                    )),
+                Ok(value) => TerminalMutationEstablishment::Established {
+                    transcript_generation: None,
+                    value,
                 },
-                Err(probe) => TerminalMutationEstablishment::Unclassifiable(format!(
-                    "management commit {error}; exact probe {probe}"
+                Err(replay_error) => TerminalMutationEstablishment::Unclassifiable(format!(
+                    "management commit {error}; exact replay {replay_error}"
                 )),
             },
+            Err(probe) => TerminalMutationEstablishment::Unclassifiable(format!(
+                "management commit {error}; exact probe {probe}"
+            )),
         }
     }
 }

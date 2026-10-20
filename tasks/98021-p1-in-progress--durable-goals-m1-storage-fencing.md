@@ -1,5 +1,33 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Source continuation after exacte6 remote capture
+
+Parent captured exacte6b717f4f05040f69c347cbbdc29c7591b07a56e after its one
+normal push and owns existing qualification39373782924. This writer runs no
+qualification/monitor/retry or local compiler/tests/SQL/browser. Actual focused
+floor remains156/156 only at exacte4d/run39368026538/artifact12241064742;
+exact9a3 failed before focused execution and59 source-corrected its four imports.
+Eleven stashes, immutable132 and unregistered134 are preserved.
+
+Next source-only unit covers Coordinator management Fork and ambiguous-response
+reconciliation: private extraction of the unchanged existing error branch;
+three regression functions comprising twelve owner/provider/outcome cases,
+two partial-pair cases, and six real Fork write-failure cases. Fixtures use actual
+Coordinator turn materialization, application gates and normal transaction
+owners; signed Anthropic and encrypted Responses replay are asserted byte-data
+exactly through their typed reads. Real proposal/state/replay write failures
+must roll back goal history, complete paired messages, state, replay, proposal
+and turn ownership. Recovery reuses exact success/refusal after target changes,
+refuses partial pairs and changed proposal bodies, and cannot silently reapply
+management. This is direct post-error-branch coverage with actual database
+commits, not a transport fault, automatic restart or full Runtime Fork journey.
+No proposal tool, task creation or activation is performed.
+
+Only standalone formatting, source review and Git whitespace checks are allowed
+locally; these tests are authored, not executed. Broader UI/watch/autocontinuation
+and remaining provider/runtime integration remain commissioned, not completed
+by this local commit. No next push or new CI is made as part of this unit.
+
 ## Latest actual exact387 failure and bounded source correction
 
 Parent run39361606004 captured exact3877baedcc1a72c2b3ac6327403f6a4361606f49
