@@ -19,13 +19,29 @@ mod goal_round_tests;
 const CONVERSATION: &str = "provider-tool-withdrawal";
 const MCP_TOOL: &str = "mcp__slack__read_thread";
 
+#[derive(Default)]
+struct PendingExternalCall {
+    entered: tokio::sync::Notify,
+    dropped: tokio::sync::Notify,
+    cancel: Mutex<Option<CancellationToken>>,
+}
+
+struct PendingExternalDrop(Arc<PendingExternalCall>);
+
+impl Drop for PendingExternalDrop {
+    fn drop(&mut self) {
+        self.0.dropped.notify_one();
+    }
+}
+
 struct RenderingAnthropicClient {
     requests: Mutex<Vec<LlmRequest>>,
     wires: Mutex<Vec<serde_json::Value>>,
     responses: Mutex<std::collections::VecDeque<LlmResponse>>,
+    pending: Mutex<Option<Arc<PendingExternalCall>>>,
 }
 
-struct DeferredMcpCatalog(MockToolExecutor, bool);
+struct DeferredMcpCatalog(MockToolExecutor, bool, Option<Arc<PendingExternalCall>>);
 
 impl DeferredMcpCatalog {
     fn new(available: bool) -> Self {
@@ -36,11 +52,12 @@ impl DeferredMcpCatalog {
                 MockToolExecutor::new()
             },
             false,
+            None,
         )
     }
 
     fn with_proposals() -> Self {
-        Self(MockToolExecutor::new(), true)
+        Self(MockToolExecutor::new(), true, None)
     }
 
     fn recorded_executions(&self) -> Vec<(String, serde_json::Value)> {
@@ -55,6 +72,13 @@ impl ToolExecutor for DeferredMcpCatalog {
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
     ) -> Option<ToolOutput> {
+        if let Some(pending) = &self.2 {
+            *pending.cancel.lock().unwrap() = Some(ctx.cancel.clone());
+            let _output = self.0.execute(call, ctx).await;
+            let _drop = PendingExternalDrop(pending.clone());
+            pending.entered.notify_one();
+            return std::future::pending().await;
+        }
         self.0.execute(call, ctx).await
     }
 
@@ -96,6 +120,7 @@ impl RenderingAnthropicClient {
             requests: Mutex::new(vec![]),
             wires: Mutex::new(vec![]),
             responses: Mutex::new(std::collections::VecDeque::new()),
+            pending: Mutex::new(None),
         }
     }
 }
@@ -118,6 +143,20 @@ impl LlmClient for RenderingAnthropicClient {
         let wire = phoenix_llm::render_anthropic_request_for_test(&spec, request)?;
         self.requests.lock().unwrap().push(request.clone());
         self.wires.lock().unwrap().push(wire);
+        let pending = self.pending.lock().unwrap().clone();
+        if let Some(pending) = pending {
+            if let Some(telemetry) = &request.telemetry {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    "anthropic",
+                    "test-model",
+                    phoenix_core::domain::llm_types::LlmTransport::Http,
+                );
+            }
+            let _drop = PendingExternalDrop(pending.clone());
+            pending.entered.notify_one();
+            return std::future::pending().await;
+        }
         if let Some(response) = self.responses.lock().unwrap().pop_front() {
             return Ok(response);
         }

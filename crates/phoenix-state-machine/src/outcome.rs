@@ -119,6 +119,7 @@ pub enum ToolExecOutcome {
 pub enum AbortReason {
     /// User explicitly cancelled
     CancellationRequested,
+    GoalControlRevoked,
 }
 
 // ============================================================================

@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 use crate::Database;
 
+pub mod dispatch;
+use dispatch::GoalDispatchPermit;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GoalControlInstallation {
     #[default]
@@ -185,7 +188,11 @@ pub(crate) async fn capture_runtime_control_tx(
 pub(crate) fn db_error(error: ControlError) -> crate::DbError {
     match error {
         ControlError::Storage(error) => crate::DbError::Sqlx(error),
-        other => crate::DbError::Serialization(other.to_string()),
+        other @ (ControlError::OwnerUnavailable
+        | ControlError::RequestConflict
+        | ControlError::VersionRange
+        | ControlError::AdmissionStopped
+        | ControlError::Integrity(_)) => crate::DbError::Serialization(other.to_string()),
     }
 }
 
@@ -262,32 +269,32 @@ impl Database {
         Ok(self)
     }
 
-    /// Check the exact active turn immediately before a model dispatch.
+    /// Admit an exact active execution to the shared dispatch-versus-control owner gate.
     ///
     /// # Errors
     /// Refuses missing/stale authority and stopped control; storage errors remain distinct.
-    /// This does not cancel a request already dispatched or hold a permit across network work.
-    pub async fn require_goal_control_for_dispatch(
+    pub async fn admit_goal_control_dispatch(
         &self,
         transcript: &str,
         active_turn: Option<(i64, u64)>,
-    ) -> Result<(), ControlError> {
+    ) -> Result<GoalDispatchPermit, ControlError> {
         if self.goal_control_installation == GoalControlInstallation::Disabled {
-            return Ok(());
+            return Ok(GoalDispatchPermit::disabled());
         }
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let owner: Option<(String, String)> = sqlx::query_as(
             "SELECT p.id,p.kind FROM conversations c JOIN product_conversations p
              ON p.id=c.product_conversation_id WHERE c.id=?",
         )
         .bind(transcript)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(self.pool())
         .await?;
         let (owner, kind) = owner.ok_or(ControlError::OwnerUnavailable)?;
         if kind != "ordinary" {
-            tx.commit().await?;
-            return Ok(());
+            return Ok(GoalDispatchPermit::disabled());
         }
+        let gate = self.goal_control_runtime.owner(&owner)?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let epoch = gate.lock().await;
         let (turn, generation) = active_turn.ok_or(ControlError::AdmissionStopped)?;
         let generation = i64::try_from(generation).map_err(|_| ControlError::AdmissionStopped)?;
         let workflow: Option<i64> = sqlx::query_scalar(
@@ -311,7 +318,7 @@ impl Database {
             .map_err(|_| ControlError::Integrity("active owner identity"))?;
         require_current_control_tx(&mut tx, &owner, execution).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(GoalDispatchPermit::admitted(gate.clone(), &epoch))
     }
 
     /// Persist a control command after the application has authenticated an owner request.
@@ -324,7 +331,9 @@ impl Database {
         input: &ControlRequest,
         at: GoalTimestampUs,
     ) -> Result<ControlReceipt, ControlError> {
+        let gate = self.goal_control_runtime.owner(input.owner.as_str())?;
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let mut epoch = gate.lock().await;
         let authorized_owner: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM product_conversations p WHERE p.id=? AND p.kind='ordinary' AND p.ordinary_lifecycle='open' AND NOT EXISTS(SELECT 1 FROM close_obligations o WHERE o.product_conversation_id=p.id AND o.phase!='completed'))")
             .bind(input.owner.as_str()).fetch_one(&mut *tx).await?;
         if !authorized_owner {
@@ -360,7 +369,9 @@ impl Database {
         let receipt = receipt_tx(&mut tx, input)
             .await?
             .ok_or(ControlError::Integrity("missing committed control receipt"))?;
+        let revocation = accepted.then(|| epoch.commit_revocation());
         tx.commit().await?;
+        drop(revocation);
         Ok(receipt)
     }
 }

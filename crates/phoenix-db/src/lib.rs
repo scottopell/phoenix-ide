@@ -1578,6 +1578,7 @@ impl SteeringCapacityTestControl {
 pub struct Database {
     pool: SqlitePool,
     goal_control_installation: conversation_goals::control::GoalControlInstallation,
+    goal_control_runtime: std::sync::Arc<conversation_goals::control::dispatch::GoalControlRuntime>,
     sqlite_workload_collector: SqliteWorkloadCollector,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
@@ -1603,6 +1604,7 @@ impl Clone for Database {
         Self {
             pool: self.pool.clone(),
             goal_control_installation: self.goal_control_installation,
+            goal_control_runtime: self.goal_control_runtime.clone(),
             sqlite_workload_collector: self.sqlite_workload_collector.clone(),
             path: self.path.clone(),
             dormant_git_repository_catchup_authority_state: self
@@ -1835,6 +1837,7 @@ impl Database {
             pool,
             goal_control_installation:
                 conversation_goals::control::GoalControlInstallation::Disabled,
+            goal_control_runtime: std::sync::Arc::default(),
             sqlite_workload_collector,
             path,
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(

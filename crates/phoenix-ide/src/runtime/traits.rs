@@ -402,11 +402,11 @@ pub trait MessageStore: Send + Sync {
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment;
 
-    async fn require_goal_control_for_dispatch(
+    async fn admit_goal_control_dispatch(
         &self,
         conv_id: &str,
         active: Option<&ActiveDirectTurn>,
-    ) -> Result<(), String>;
+    ) -> Result<phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit, String>;
 
     async fn persist_goal_tool_round_and_state(
         &self,
@@ -819,14 +819,12 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
-    async fn require_goal_control_for_dispatch(
+    async fn admit_goal_control_dispatch(
         &self,
         conv_id: &str,
         active: Option<&ActiveDirectTurn>,
-    ) -> Result<(), String> {
-        (**self)
-            .require_goal_control_for_dispatch(conv_id, active)
-            .await
+    ) -> Result<phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit, String> {
+        (**self).admit_goal_control_dispatch(conv_id, active).await
     }
 
     async fn persist_goal_tool_round_and_state(
@@ -1670,11 +1668,11 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
-    async fn require_goal_control_for_dispatch(
+    async fn admit_goal_control_dispatch(
         &self,
         conv_id: &str,
         active: Option<&ActiveDirectTurn>,
-    ) -> Result<(), String> {
+    ) -> Result<phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit, String> {
         let active = active
             .map(|turn| {
                 i64::try_from(turn.turn_id.0)
@@ -1683,7 +1681,7 @@ impl MessageStore for DatabaseStorage {
             })
             .transpose()?;
         self.db
-            .require_goal_control_for_dispatch(conv_id, active)
+            .admit_goal_control_dispatch(conv_id, active)
             .await
             .map_err(|error| error.to_string())
     }

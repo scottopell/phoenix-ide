@@ -4113,6 +4113,36 @@ pub fn handle_outcome(
 ) -> Result<TransitionResult, InvalidOutcome> {
     let event = match outcome {
         EffectOutcome::Llm(llm) => llm_outcome_to_event(llm, state),
+        EffectOutcome::Tool(ToolExecOutcome::Aborted {
+            tool_use_id,
+            reason: super::outcome::AbortReason::GoalControlRevoked,
+        }) if matches!(state, ConvState::ToolExecuting { current_tool, .. }
+            if current_tool.id == tool_use_id) =>
+        {
+            return transition(
+                state,
+                context,
+                Event::UserCancel {
+                    reason: None,
+                    cause: CancelCause::UserRequested,
+                },
+            )
+            .and_then(|cancelling| {
+                let mut settled = transition(
+                    &cancelling.new_state,
+                    context,
+                    Event::ToolAborted { tool_use_id },
+                )?;
+                let mut effects = cancelling.effects;
+                effects.retain(|effect| !matches!(effect, Effect::PersistState));
+                effects.append(&mut settled.effects);
+                settled.effects = effects;
+                Ok(settled)
+            })
+            .map_err(|error| InvalidOutcome {
+                reason: error.to_string(),
+            });
+        }
         EffectOutcome::Tool(tool) => tool_outcome_to_event(tool),
         EffectOutcome::SubAgent { agent_id, outcome } => {
             Event::SubAgentResult { agent_id, outcome }

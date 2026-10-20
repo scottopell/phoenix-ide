@@ -638,6 +638,21 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct GoalDispatchTestBarrier {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl GoalDispatchTestBarrier {
+    async fn pause(&self) {
+        self.reached.notify_one();
+        self.resume.notified().await;
+    }
+}
+
 struct GoalReportEmitter {
     binding: phoenix_core::domain::conversation_goal::GoalReportBinding,
 }
@@ -831,6 +846,7 @@ async fn execute_tool_to_outcome<S, T>(
     checked: crate::runtime::deny_gate::CheckedToolCall,
     tool_ctx: ToolContext,
     cancel_token_check: &CancellationToken,
+    goal_dispatch: phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit,
     conv_id: String,
     root_conv_id: String,
     tool_name: String,
@@ -873,10 +889,23 @@ where
             error: "EUNAVAIL: tool is unavailable under the current conversation policy".into(),
         };
     }
-    let output = tool_executor
-        .execute(checked.with_input_schema(request_schema), tool_ctx)
-        .instrument(span.clone())
-        .await;
+    let output = match goal_dispatch
+        .run(
+            tool_executor
+                .execute(checked.with_input_schema(request_schema), tool_ctx)
+                .instrument(span.clone()),
+        )
+        .await
+    {
+        Ok(output) => output,
+        Err(_) => {
+            cancel_token_check.cancel();
+            return ToolExecOutcome::Aborted {
+                tool_use_id,
+                reason: crate::state_machine::AbortReason::GoalControlRevoked,
+            };
+        }
+    };
 
     if cancel_token_check.is_cancelled() {
         span.record("outcome", "aborted");
@@ -1962,6 +1991,8 @@ where
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     goal_report_emitter: Option<GoalReportEmitter>,
+    #[cfg(test)]
+    goal_dispatch_barrier: Option<Arc<GoalDispatchTestBarrier>>,
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
     pending_sub_agent_activation: Option<PendingSubAgentActivation>,
@@ -2322,6 +2353,8 @@ where
             pending_trusted_tool_results: Vec::new(),
             pending_provider_replay_update: None,
             goal_report_emitter: None,
+            #[cfg(test)]
+            goal_dispatch_barrier: None,
             pending_sub_agent_acceptance: None,
             pending_sub_agent_terminal: None,
             pending_sub_agent_activation: None,
@@ -3328,6 +3361,14 @@ where
     /// are logged and discarded — state unchanged.
     #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        let cancelled_llm = matches!(&outcome, EffectOutcome::Llm(LlmOutcome::Cancelled));
+        let revoked_tool = matches!((&outcome, &self.state), (
+            EffectOutcome::Tool(ToolExecOutcome::Aborted {
+                tool_use_id,
+                reason: crate::state_machine::AbortReason::GoalControlRevoked,
+            }),
+            ConvState::ToolExecuting { current_tool, .. },
+        ) if current_tool.id == *tool_use_id);
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
         // is the live timer firing. Its task has run to completion, leaving the
@@ -3402,6 +3443,9 @@ where
             self.pending_trusted_tool_results.clear();
         }
 
+        if revoked_tool || cancelled_llm {
+            self.direct_turn_cancellation_initiated = true;
+        }
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
 
         let generated_events = self.apply_transition_result(result).await?;
@@ -7906,8 +7950,9 @@ where
         &mut self,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        self.storage
-            .require_goal_control_for_dispatch(
+        let goal_dispatch = self
+            .storage
+            .admit_goal_control_dispatch(
                 &self.context.conversation_id,
                 self.active_direct_turn.as_deref(),
             )
@@ -8397,12 +8442,6 @@ where
             cache_key: PromptCacheKey::stable(&conv_id),
         };
 
-        self.storage
-            .require_goal_control_for_dispatch(
-                &self.context.conversation_id,
-                self.active_direct_turn.as_deref(),
-            )
-            .await?;
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
         let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
@@ -8453,6 +8492,8 @@ where
         let forwarder_abort = forwarder_handle.abort_handle();
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
         let mut request_admission = admitted.reborrow();
+        #[cfg(test)]
+        let goal_dispatch_barrier = self.goal_dispatch_barrier.clone();
         let task_attempt_capture = attempt_capture.clone();
         let request_task = async move {
             let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
@@ -8476,8 +8517,13 @@ where
             // transcript, tool-registry, or prompt construction happens here.
             let attempt_capture = task_attempt_capture;
 
+            #[cfg(test)]
+            if let Some(barrier) = goal_dispatch_barrier {
+                barrier.pause().await;
+            }
+
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
-            let provider = llm_client.complete_streaming(&request, &chunk_tx);
+            let provider = goal_dispatch.run(llm_client.complete_streaming(&request, &chunk_tx));
             let result = if let Some(deadline) = overload_deadline {
                 let started_at = std::time::Instant::now();
                 let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
@@ -8485,15 +8531,19 @@ where
                     result
                 } else {
                     let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
-                    Err(phoenix_llm::LlmError::server_overloaded(
+                    Ok(Err(phoenix_llm::LlmError::server_overloaded(
                         "Server overload retry deadline elapsed",
-                    ))
+                    )))
                 }
             } else {
                 provider.await
             };
             let llm_outcome = match result {
-                Ok(response) => {
+                Err(_) => {
+                    let _ = attempt_capture.finalize_cancelled();
+                    LlmOutcome::Cancelled
+                }
+                Ok(Ok(response)) => {
                     // Extract tool calls from content and convert to typed ToolCall
                     let tool_calls: Vec<ToolCall> = response
                         .tool_uses()
@@ -8529,7 +8579,7 @@ where
                         request_id: request_id.clone(),
                     }
                 }
-                Err(e) => llm_error_to_outcome(e, &request_id, &model_id),
+                Ok(Err(e)) => llm_error_to_outcome(e, &request_id, &model_id),
             };
 
             let finalized_metrics = attempt_capture.finalized();
@@ -8813,8 +8863,9 @@ where
         tool: ToolCall,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        self.storage
-            .require_goal_control_for_dispatch(
+        let goal_dispatch = self
+            .storage
+            .admit_goal_control_dispatch(
                 &self.context.conversation_id,
                 self.active_direct_turn.as_deref(),
             )
@@ -8823,6 +8874,10 @@ where
             .storage
             .load_tool_admission_policy(&self.context.conversation_id)
             .await?;
+        #[cfg(test)]
+        if let Some(barrier) = &self.goal_dispatch_barrier {
+            barrier.pause().await;
+        }
         let request_definition = request_policy.declarations().iter().find(|definition| {
             definition.name == tool.name() && request_policy.is_callable(tool.name())
         });
@@ -8897,6 +8952,9 @@ where
                 }));
             }
             self.spawn_catalog = Some(catalog);
+            goal_dispatch
+                .require_delegation_support()
+                .map_err(|error| error.to_string())?;
             return self.handle_spawn_agents_tool(tool).await;
         }
 
@@ -9065,6 +9123,7 @@ where
                 checked,
                 tool_ctx,
                 &cancel_token_check,
+                goal_dispatch,
                 conv_id,
                 root_conv_id,
                 tool_name,

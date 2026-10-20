@@ -2009,8 +2009,82 @@ fn test_spawn_agents_complete_accumulates_ids() {
 
 use super::outcome::{AbortReason, EffectOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 
+#[test]
+fn conversation_goal_control_revocation_settles_only_the_exact_tool_in_one_transition() {
+    let state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            "current",
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
+                "echo current",
+            )),
+        ),
+        remaining_tools: vec![ToolCall::new(
+            "skipped",
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
+                "echo skipped",
+            )),
+        )],
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: assistant_message_for_tools(&["current", "skipped"]),
+    };
+    for (tool_use_id, reason) in [
+        ("current", AbortReason::CancellationRequested),
+        ("other", AbortReason::GoalControlRevoked),
+    ] {
+        assert!(handle_outcome(
+            &state,
+            &test_context(),
+            EffectOutcome::Tool(ToolExecOutcome::Aborted {
+                tool_use_id: tool_use_id.into(),
+                reason,
+            })
+        )
+        .is_err());
+    }
+    let result = handle_outcome(
+        &state,
+        &test_context(),
+        EffectOutcome::Tool(ToolExecOutcome::Aborted {
+            tool_use_id: "current".into(),
+            reason: AbortReason::GoalControlRevoked,
+        }),
+    )
+    .unwrap();
+    assert!(matches!(result.new_state, ConvState::Idle));
+    assert!(
+        matches!(result.effects.first(), Some(Effect::AbortTool { tool_use_id }) if tool_use_id == "current")
+    );
+    let checkpoint_index = result
+        .effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::PersistCheckpoint { .. }))
+        .unwrap();
+    let state_index = result
+        .effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::PersistState))
+        .unwrap();
+    assert!(checkpoint_index < state_index);
+    assert_eq!(
+        result
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::PersistState))
+            .count(),
+        1
+    );
+    assert!(!result
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::RequestLlm | Effect::ExecuteTool { .. })));
+}
+
 fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
-    Just(AbortReason::CancellationRequested)
+    prop_oneof![
+        Just(AbortReason::CancellationRequested),
+        Just(AbortReason::GoalControlRevoked),
+    ]
 }
 
 fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
