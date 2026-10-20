@@ -1,5 +1,59 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Qualification floor and next source cut — migration134 registered, activation still off
+
+Parent run **39386564244**, exact
+`d4c306dc9d315f719ea7a1eda0deb13722c65c6b`, is terminal failed overall but establishes
+**185/185 focused PASS** in169.521s with3393skipped, artifact **12249700355**.
+This is the new full focused floor **only at d4c**, not at later source commits.
+The final canonical cancellation payload, later `Cancelled`/owns0 and provider/tool
+count assertions executed and passed; actual133 migration tests are included.
+Compile190.9s, codegen133.2s and generated-stale guard passed. Broad Rust completed
+5492run/5462passed/30failed/191skipped in1180.095s. UI/specs and E2E passed; shared
+Clippy and the30 broad failures remain blockers, not waived by focused success.
+
+Following that prerequisite, the next source-only slice registers134 as
+`durable_conversation_goal_user_control`: its SQL is exactly the existing control
+candidate followed by the existing user-control rebuild. The only candidate-file
+change is its obsolete unregistered comment; executable SQL and132 remain unchanged.
+The ordinary migration runner supplies the atomic transaction and ledger write;
+no new migration engine or compatibility/recovery tier is introduced.
+
+Registration is **schema only**, not runtime installation. `Database` still starts
+with `GoalControlInstallation::Disabled`, goal/report/management services and
+command/control services retain their disabled defaults, and public control stays
+unavailable. No production installer, authenticated read route, UI mount, goal
+watch emitter or automatic-continuation policy is added. Those remain separate
+commissioned work and are not delivered by this cut. The test-only control helper
+now verifies migrated table presence and flips only the isolated test instance;
+fresh management/user-command fixtures no longer run candidate DDL a second time.
+
+Existing candidate rebuild/FK/immutability/cycle tests remain intact but are fed
+real pre134 databases, with control-candidate installation explicit only where
+those older candidate tests require it. A test-only runner bound ends at133; it
+uses the existing real migration list, not fabricated version stamps. Four new
+registered-runner regression functions cover fresh/real133 schema parity and
+inert defaults; populated report-history/binding cycles with ordinary, Anthropic
+and Responses checkpoint owners plus exact retained checkpoint replay; injected
+mid-cycle delete failure rolling back schema/data/source/ledger then successful
+retry; and exact user-command receipt replay with changed-intent rejection.
+Assertions include foreign keys enabled, FK/integrity checks, empty staging,
+unchanged history/actors/objectives/bindings, messages/state/turn ownership and
+typed replay side rows, supported hard-delete cleanup, idempotent migration and
+no manufactured control/user requests. Provider-side fixtures use the existing
+owner replay builders; this is not a new signature/provider-dispatch E2E claim.
+
+The older131 upgrade explicitly covers132through134 with all three exact ledger
+names. The remote130 fixture defers134 as well, removes all three later stamps,
+actually applies132+133+134 and still checks133 against the fresh schema. The133
+notes test queries133 explicitly rather than misidentifying it as latest; ledger
+ordering/capability tests include134. No prior regression is removed.
+
+Only standalone formatting, whitespace, source/API review and immutable-file
+comparison are performed locally. No compiler/tests, SQL execution, browser,
+new CI, push, merge, deploy or resource expansion. These134 tests are **authored,
+not executed**;185/185 remains evidence only for d4c. Eleven stashes are preserved.
+
 ## Latest actual qualification — exact239184/185, cancellation expectation corrected
 
 Parent run **39383636793**, exact

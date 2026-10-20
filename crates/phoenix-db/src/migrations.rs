@@ -683,6 +683,15 @@ const MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE federation_peer_connections ADD COLUMN notes TEXT NOT NULL DEFAULT ''
               CHECK (typeof(notes) = 'text' AND length(CAST(notes AS BLOB)) <= 32768);",
     },
+    Migration {
+        version: 134,
+        name: "durable_conversation_goal_user_control",
+        sql: concat!(
+            include_str!("conversation_goals/control_candidate.sql"),
+            "\n",
+            include_str!("conversation_goals/user_control_candidate.sql"),
+        ),
+    },
 ];
 
 async fn run_migration_130(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
@@ -12085,6 +12094,15 @@ pub(crate) async fn run_before_goal_storage_for_test(pool: &SqlitePool) -> DbRes
     run_migration_list(pool, &MIGRATIONS[..goal_index]).await
 }
 
+#[cfg(test)]
+pub(crate) async fn run_before_goal_user_control_for_test(pool: &SqlitePool) -> DbResult<u32> {
+    let index = MIGRATIONS
+        .iter()
+        .position(|migration| migration.version == 134)
+        .expect("goal user-control migration is registered");
+    run_migration_list(pool, &MIGRATIONS[..index]).await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbResult<u32> {
     // Ensure the tracking table exists
@@ -14938,7 +14956,7 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
     #[tokio::test]
-    async fn migration_133_fresh_schema_enforces_notes_and_keeps_control_candidate_unregistered() {
+    async fn migration_133_fresh_schema_enforces_notes_without_enabling_goal_controls() {
         let db = crate::Database::open_in_memory().await.unwrap();
         let id = "33333333-3333-4333-8333-333333333333";
         sqlx::query(
@@ -14980,13 +14998,18 @@ with tempfile.TemporaryDirectory() as directory:
                 "UPDATE federation_peer_connections SET notes={invalid} WHERE peer_instance_id='{id}'"
             ))).execute(db.pool()).await.is_err());
         }
-        let latest: (i64, String) =
-            sqlx::query_as("SELECT version,name FROM _migrations ORDER BY version DESC LIMIT 1")
+        let notes_ledger: (i64, String) =
+            sqlx::query_as("SELECT version,name FROM _migrations WHERE version=133")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(latest, (133, "opaque_federation_peer_notes".into()));
-        assert!(!MIGRATIONS.iter().any(|migration| migration.version == 134));
+        assert_eq!(notes_ledger, (133, "opaque_federation_peer_notes".into()));
+        assert_eq!(
+            db.goal_control_installation(),
+            crate::conversation_goals::control::GoalControlInstallation::Disabled
+        );
+        assert!(MIGRATIONS.iter().any(|migration| migration.version == 134
+            && migration.name == "durable_conversation_goal_user_control"));
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
     }
 
@@ -14995,6 +15018,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (134, "durable_conversation_goal_user_control"),
             (133, "opaque_federation_peer_notes"),
             (132, "durable_conversation_goal_storage"),
             (131, "bounded_federated_terminal_subscriptions"),
@@ -15343,7 +15367,7 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO _migrations (version, name) VALUES (130, 'fixture_skip_remote_origin'), (131, 'fixture_skip_subscriptions'), (132, 'durable_conversation_goal_storage'), (133, 'opaque_federation_peer_notes')",
+            "INSERT INTO _migrations (version, name) VALUES (130, 'fixture_skip_remote_origin'), (131, 'fixture_skip_subscriptions'), (132, 'durable_conversation_goal_storage'), (133, 'opaque_federation_peer_notes'), (134, 'durable_conversation_goal_user_control')",
         )
         .execute(db.pool())
         .await
@@ -15517,11 +15541,20 @@ with tempfile.TemporaryDirectory() as directory:
             !goal_table_before,
             "fixture stamps only defer later migrations"
         );
-        sqlx::query("DELETE FROM _migrations WHERE version IN (132,133)")
+        sqlx::query("DELETE FROM _migrations WHERE version IN (132,133,134)")
             .execute(db.pool())
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 3);
+        let user_control_ledger: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version=134")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            user_control_ledger,
+            "durable_conversation_goal_user_control"
+        );
         let goal_ledger: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version=132")
                 .fetch_one(db.pool())

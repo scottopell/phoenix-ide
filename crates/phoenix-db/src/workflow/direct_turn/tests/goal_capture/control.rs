@@ -139,12 +139,10 @@ async fn conversation_goal_installed_capture_shares_real_acceptance_crash_cuts()
 #[tokio::test]
 async fn conversation_goal_schema_presence_does_not_enable_default_admission() {
     let (db, repo, _) = fixture().await;
-    sqlx::raw_sql(include_str!(
-        "../../../../conversation_goals/control_candidate.sql"
-    ))
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('conversation_goal_controls','conversation_goal_user_requests')",
+    ).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(tables, 2);
     assert_eq!(
         db.goal_control_installation(),
         GoalControlInstallation::Disabled

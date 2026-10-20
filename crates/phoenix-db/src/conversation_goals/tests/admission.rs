@@ -3,15 +3,25 @@ use super::*;
 #[path = "admission/checkpoint.rs"]
 mod checkpoint;
 
+async fn fixture_before_user_control() -> (Database, GoalMutation) {
+    let (db, owner) = full_substrate_before_user_control().await;
+    let command = fixture_command(owner);
+    (db, command)
+}
+
 async fn fixture() -> (Database, GoalMutation) {
     let (db, owner) = full_substrate().await;
+    (db, fixture_command(owner))
+}
+
+fn fixture_command(owner: ProductConversationId) -> GoalMutation {
     let mut command = create();
     command.owner = owner;
     command.attribution.requested_by = GoalActor::UserApi {
         transcript_id: t("full-root"),
         message_id: t("full-input"),
     };
-    (db, command)
+    command
 }
 
 async fn live_turn(db: &Database) {

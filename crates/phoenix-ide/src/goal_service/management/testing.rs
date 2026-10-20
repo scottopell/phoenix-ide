@@ -54,7 +54,6 @@ pub(crate) async fn fixture(coordinator: bool) -> Fixture {
             .id
     };
     let db = db.install_goal_controls_for_tests().await.unwrap();
-    install_user_commands(&db).await;
     if !coordinator {
         release_ordinary_source_control(&db, &source).await;
     }
@@ -116,17 +115,6 @@ pub(crate) async fn fixture(coordinator: bool) -> Fixture {
         target: target.product_conversation_id,
         active,
     }
-}
-
-async fn install_user_commands(db: &Database) {
-    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../../../phoenix-db/src/conversation_goals/user_control_candidate.sql"
-    ))
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
 }
 
 async fn release_ordinary_source_control(db: &Database, source: &str) {

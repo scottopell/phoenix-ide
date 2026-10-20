@@ -1,5 +1,45 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actuald4c focused185/185 and next source-only134 registration cut
+
+Parent39386564244 exactd4c terminalFAILoverall but actualfocused185/185PASS169.521s
+3393skip/artifact12249700355. NEWGREENFLOOR ONLYexactd4c, not later source. Final
+canonicalcancel/alllaterCancelled-owns0/provider/tool assertionsEXECUTEDPASS,
+actual133migrationtestsPASS. Compile190.9/codegen133.2/stalePASS. BroadCOMPLETE
+5492run5462pass30fail191skip1180.095s; UI/specs+E2EPASS; sharedClippyred+30broad
+remainblockers/unwaived. No newCI needed merely to record this actual evidence.
+
+Followingqualified133prerequisite, boundedcut registers134 named
+`durable_conversation_goal_user_control` using existingcontrolSQL + existinguserSQL
+in same existing migrationtransaction. ExecutablecandidateSQL unchanged (only
+obsoletecontrolcomment corrected);132schemaimmutable. No newcompatibility tier,
+runnerframework or runtime policy. DEFAULTactivationOFF/publicinstallerabsent.
+Schema registration is NOT service installation, public503 unchanged. Stableowner
+read/authenticatedcommandinstallation seam next, then existingUIextension/watch
+transaction/realgoalautocontdistinctcontextcontinuation; NOTimplementedinthiscut.
+
+Current-schema tests stopmanualcandidateDDL; test-onlycontrolhelper verifies
+registeredtable then enablesonlyisolatedtestinstance. Existingcandidate FK/cycle/
+constraint/rebuild/replay tests retained on explicitrealpre134databases. Genuine
+pre134test runner boundedexistingMIGRATIONS<=133; onlyoldcandidate tests manually
+installcontrolSQL beforeusercandidate testing. Fournewregisteredrunner tests:
+fresh+real133schema/defaultdisabled/idempotence parity; populatedreportcycle over
+Normal/Anthropic/Responsesowners exactcheckpointreplay+source/turn/history/
+actor/binding/replay preservation +deletecleanup; realrunner injectedcycledelete
+failure rollsbackschema/data/ledger thenretry; exactUserControlreceiptreplay and
+changedintentrefusal. FKenabled/FKcheck/integrity/stagingcleanup included. These
+are authoredNOTexecuted; no newproviderdispatch/signatureE2Eclaim.
+
+Older131fixture explicitly132through134count3+3exactledgers, samepreservation/
+idempotencechecks. Remote130fixture defers/removesALL132/133/134stamps, applies3,
+verifies134ledger and prior133freshschema parity.133notestestqueries133direct,
+capabilitytail includes134. No regressions removed. BothIDEcommand/management
+fixtures use registeredtables instead of redundantcandidateSQL.
+
+Onlystandalonerustfmt/Gitwhitespace/sourceAPIreview/immutablecomparison;0compiler/
+testsSQLbrowser/CI/push/merge/deploy/resources.11stashesintact.134REGISTEREDsource
+butNOTqualifiedoractivated;185onlyd4cfloor. Returncoherentpacket forparentreview.
+
 ## Actual239 sole focused failure — exact typed non-error cancellation contract
 
 Parent39383636793 exact239 terminalFAIL/artifact12247587393. Focused185executed

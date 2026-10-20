@@ -25,7 +25,7 @@ use phoenix_workflow::{
     TurnAuthorityId, TurnCommand, TurnOutcome, TurnTerminal,
 };
 
-use super::super::{fixture, t};
+use super::super::{fixture, fixture_before_user_control, t};
 
 #[path = "owners/user_control_upgrade.rs"]
 mod user_control_upgrade;
@@ -109,11 +109,30 @@ async fn control_command(
     .unwrap();
 }
 
-#[allow(clippy::too_many_lines)]
 async fn admitted_fixture_with_control(
     installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> (Database, Message, GoalPendingReport) {
-    let (db, command) = fixture().await;
+    admitted_fixture_with_control_at(installation, false).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn admitted_fixture_with_control_at(
+    installation: crate::conversation_goals::control::GoalControlInstallation,
+    before_user_control: bool,
+) -> (Database, Message, GoalPendingReport) {
+    let (db, command) = if before_user_control {
+        fixture_before_user_control().await
+    } else {
+        fixture().await
+    };
+    if before_user_control
+        && installation == crate::conversation_goals::control::GoalControlInstallation::Installed
+    {
+        sqlx::raw_sql(include_str!("../../../control_candidate.sql"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
     let db = match installation {
         crate::conversation_goals::control::GoalControlInstallation::Disabled => db,
         crate::conversation_goals::control::GoalControlInstallation::Installed => {

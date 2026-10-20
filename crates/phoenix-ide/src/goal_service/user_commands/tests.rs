@@ -15,14 +15,6 @@ async fn fixture() -> (GoalCommandService, ProductConversationId) {
         .await
         .unwrap();
     let db = db.install_goal_controls_for_tests().await.unwrap();
-    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../../../phoenix-db/src/conversation_goals/user_control_candidate.sql"
-    ))
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
     (
         GoalCommandService {
             runtime: Some(crate::goal_service::tests::test_runtime_manager(db)),

@@ -1,4 +1,4 @@
--- Unregistered candidate for reserved migration 134; not included by production migrations.
+-- Migration134 control tables; schema presence does not install runtime controls.
 CREATE TABLE conversation_goal_control_requests (
     owner_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     principal_id BLOB NOT NULL CHECK (typeof(principal_id) = 'blob' AND length(principal_id) = 16),

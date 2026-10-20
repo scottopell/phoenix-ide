@@ -7,6 +7,8 @@ use phoenix_core::domain::conversation_goal::{
 
 const CANDIDATE: &str = include_str!("../../../../user_control_candidate.sql");
 
+mod registered;
+
 type ActorRow = (
     i64,
     String,
@@ -57,8 +59,18 @@ async fn schema(db: &Database) -> Vec<(String, String)> {
 }
 
 async fn populated() -> (Database, GoalPendingReport) {
-    let (db, assistant, report) =
-        admitted_fixture_with_control(GoalControlInstallation::Installed).await;
+    populated_at(GoalControlInstallation::Installed).await
+}
+
+async fn populated_at(installation: GoalControlInstallation) -> (Database, GoalPendingReport) {
+    populated_for(installation, Owner::Normal).await
+}
+
+async fn populated_for(
+    installation: GoalControlInstallation,
+    owner: Owner,
+) -> (Database, GoalPendingReport) {
+    let (db, assistant, report) = admitted_fixture_with_control_at(installation, true).await;
     let results = [ToolRoundResult::PendingGoalReport {
         report: report.clone(),
         duration_ms: 1,
@@ -71,7 +83,7 @@ async fn populated() -> (Database, GoalPendingReport) {
         state: &state,
         state_updated_at: Utc::now(),
     };
-    let (messages, replayed) = persist(Owner::Normal, &db, &checkpoint).await.unwrap();
+    let (messages, replayed) = persist(owner, &db, &checkpoint).await.unwrap();
     assert!(!replayed);
     let MessageContent::Tool(result) = &messages[0].content else {
         panic!("canonical tool result")

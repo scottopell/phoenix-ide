@@ -257,14 +257,14 @@ impl Database {
         self.goal_control_installation
     }
 
-    /// Install the unregistered candidate in an isolated test database.
+    /// Enable controls in an isolated test database with migrated control tables.
     ///
     /// # Errors
-    /// Returns the actual schema-installation failure without enabling the controls.
+    /// Returns a missing-schema error without enabling the controls.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn install_goal_controls_for_tests(mut self) -> Result<Self, ControlError> {
-        sqlx::raw_sql(include_str!("control_candidate.sql"))
-            .execute(self.pool())
+        sqlx::query("SELECT owner_id FROM conversation_goal_controls LIMIT 0")
+            .fetch_all(self.pool())
             .await?;
         self.goal_control_installation = GoalControlInstallation::Installed;
         Ok(self)
