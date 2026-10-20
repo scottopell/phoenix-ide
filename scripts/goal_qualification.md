@@ -84,13 +84,35 @@ the actual installed nextest version; unsupported output fails closed.
 
 ## Verification status
 
-The source implementation includes command-shape and failure-path unit tests
-using mocked subprocesses and temporary fixture files. These tests must be run
-in an authorized qualification; authoring or static inspection is not execution
-proof. The prior nine historical migration regressions passed at `39f8f3f`, but
-that focused run was interrupted by its outer timeout. The earlier complete
-189-test receipt at `239afa` remains scoped to that commit and its earlier
-harness. Neither receipt qualifies this implementation. The first hosted
-qualification must retain the real Cargo/nextest JSON and actual version receipt and demonstrate that codegen,
-broad, and focused consumers used the same captured harnesses; the minimal
-mocked fixtures are not nextest runtime-compatibility proof.
+Hosted [run 39409786797](https://github.com/scottopell/phoenix-ide/actions/runs/39409786797)
+qualified **198/198 focused tests in 231.127 seconds** at exact commit
+`41fe2041f368aab45ec319c1029e44b71412857e`, using the captured full-workspace
+harnesses. Capture took 213.1 seconds; codegen reused those harnesses in 1.2
+seconds and the codegen-stale check passed. Broad and focused phases consumed
+the same capture without another Cargo compilation.
+
+Artifact `12260208322` retains real `cargo.json`, `binaries.json`, `ready.json`,
+and full stderr logs under
+`_temp/goal-qualification-39409786797-1-check-rust/`. The receipt binds exact
+HEAD/run/attempt/job, 42 executable binary identities, full-workspace/default
+profile, cargo-nextest 0.9.148, Cargo 1.95.0, and rustc 1.95.0. This is a receipt
+for that commit and harness/toolchain identity, not arbitrary nextest-version
+compatibility or isolated-three-package build-graph equivalence.
+
+**Overall CI remained red.** Broad execution hit its 1500-second budget:
+5432/5496 tests ran, with 5399 passed, 33 failed, and 191 skipped in 1499.590
+seconds. Those are partial results, not a completed broad-suite comparison or
+pass. Clippy remained red. The command-budget and UI lanes also exposed three
+new authored-test mistakes: missing `sys` import, an incorrect expectation of
+an explicit `--workspace` flag in the unchanged broad command, and an attempt
+to access the function-local `CHECK_TIMEOUT` as a module attribute. Test-only
+corrections now target the actual command and local timeout/default binding;
+they have not yet been executed or qualified. No helper or production behavior
+change is part of those corrections.
+
+The earlier 189-test receipt at `239afa` remains separate and scoped to its
+older isolated-three-package harness; the nine historical regressions also
+passed in the interrupted `39f8f3f` run. Neither receipt is silently transferred
+to another commit. Mocked command-shape/failure fixtures remain distinct from
+hosted metadata and OS-level process-cleanup evidence. This qualification does
+not enable goal storage or authorize production activation.

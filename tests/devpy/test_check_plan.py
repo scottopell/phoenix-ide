@@ -1,6 +1,8 @@
+import ast
 import io
 import importlib.util
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -434,8 +436,10 @@ class GoalQualificationCommandTests(unittest.TestCase):
                     ["--profile", "cpu-attribution"]))
         _, broad, _ = self.dev._rust_check_commands(
             True, [], [], [], 3, ["--profile", "cpu-attribution"])
-        self.assertIn("cpu-attribution", broad)
-        self.assertIn("--workspace", broad)
+        self.assertEqual(broad, [
+            "cargo", "nextest", "--profile", "cpu-attribution", "run",
+            "-E", "not test(/export_bindings/)", "--test-threads", "3",
+        ])
 
     def test_opt_in_replaces_compile_and_reuses_for_both_remaining_phases(self):
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PHOENIX_GOAL_REUSE_DIR": "/job/private"}, clear=True):
@@ -471,7 +475,18 @@ class GoalQualificationCommandTests(unittest.TestCase):
         self.assertIn('run_step("cargo test", test_cmd, env_extra=reuse_env, timeout=CARGO_TEST_TIMEOUT)', source)
         self.assertIn('text=True, env=env, start_new_session=True, bufsize=1', source)
         self.assertIn('def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT):', source)
-        self.assertEqual(self.dev.CHECK_TIMEOUT, 600)
+        check = next(node for node in ast.parse(source).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "cmd_check")
+        timeout = next(node.value for node in check.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "CHECK_TIMEOUT"
+                               for target in node.targets))
+        self.assertEqual(ast.literal_eval(timeout), 600)
+        run_step = next(node for node in check.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "run_step")
+        self.assertEqual(run_step.args.kwonlyargs[0].arg, "timeout")
+        self.assertEqual(ast.dump(run_step.args.kw_defaults[0]),
+                         ast.dump(ast.Name(id="CHECK_TIMEOUT", ctx=ast.Load())))
 
 
 class CargoTestTimeoutTests(unittest.TestCase):
