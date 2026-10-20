@@ -1,9 +1,46 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest actual qualification — exact282 stopped on Option-loop warnings
+
+Parent-owned run **39375980176**, exact
+`2820a2b7d76e1f76038a23f6f6766ec88023cb1d`, is **terminal failed**, artifact
+**12243672253**, with **zero focused tests executed**. The prior `ToolContent`
+E0308 is absent. Three management provider fixtures iterate over the actual
+`Option<Event>` from `execute_effect`; source changes use `if let Some(event)`
+and preserve the zero-or-one `process_event` behavior without suppressions.
+Parent reports UI/specs lanes fully successful. Migration133 is still unqualified;
+134 remains unregistered/default-off. The actual focused floor is156/156 onlye4d.
+
+Clippy job **118474205637** was read in full, but its 1883-line GitHub job log
+contains only the check runner's diagnostic tail. It exposes **twelve** repeated
+large-future reports at18544bytes and the three Option-loop warnings, followed
+by a **summary** of70 lib-test errors. It is not a complete70-diagnostic inventory.
+No omitted roots are declared cleared, waived or unrelated from that summary.
+Shared federation/global-read/send-chat blockers remain unwaived.
+
+The source correction heap-pins only the management checkpoint branch at the
+shared `persist_pending_goal_round` dispatch and immediately awaits it. The
+branch no longer contributes its entire nested service future inline to every
+ordinary effect frame. No task is spawned or detached, references do not become
+static, and admission ownership, mutable borrows, guard scopes and error handling
+stay with the same awaited caller. Dropping that caller drops the boxed future;
+there is no independent work owner. This is a source-level containment rationale,
+**not** an executed measurement or cancellation-race result. No per-test boxing,
+new lint allows, stack increase, worker increase or resource expansion is added.
+
+One authored regression measures `size_of_val` on the actual unpolled shared
+effect future against16KiB, then drops it and checks no durable/provider/tool work
+occurred. This checks a future-frame budget and unpolled-drop behavior when run;
+it does not exercise cancellation during SQL or prove threshold success now.
+Existing checkpoint owner/replay tests remain the behavior checks. Only source
+formatting and whitespace checks were performed locally; no compiler, tests,
+SQL, browser, activation, push or new CI. The packet includes the prior9f
+free-versus-held gate coverage refinement and awaits independent exact-HEAD review.
+
 ## Post282 source coverage refinement — free and held target gates
 
 Parent captured exact282 for run **39375980176** and owns its monitoring and
-artifact. No result is claimed here. The runtime exact-retry matrix now checks
+artifact; its later actual failure is recorded above. The runtime exact-retry matrix now checks
 each of its twelve cases twice: first after proving both target gates available
 and releasing both, then with both held. This specifically closes the earlier
 retained-refusal limitation: retry must not turn a saved refusal into a new

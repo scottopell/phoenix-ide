@@ -83,7 +83,7 @@ fn provider_runtime(
 
 async fn provider_preparation(runtime: &mut TestRuntime) -> Event {
     let events = runtime.execute_effect(Effect::RequestLlm).await.unwrap();
-    for event in events {
+    if let Some(event) = events {
         runtime.process_event(event).await.unwrap();
     }
     let (generation, outcome) =
@@ -184,7 +184,7 @@ async fn conversation_goal_coordinator_provider_management_rejects_missing_or_st
             _ => {}
         }
         let events = runtime.execute_effect(Effect::RequestLlm).await.unwrap();
-        for event in events {
+        if let Some(event) = events {
             runtime.process_event(event).await.unwrap();
         }
         let (generation, outcome) =
@@ -295,7 +295,7 @@ async fn conversation_goal_management_declaration_stays_absent_without_parent_co
             true,
         )]);
         let events = runtime.execute_effect(Effect::RequestLlm).await.unwrap();
-        for event in events {
+        if let Some(event) = events {
             runtime.process_event(event).await.unwrap();
         }
         let _ = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())

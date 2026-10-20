@@ -9521,11 +9521,10 @@ where
             .iter()
             .any(|entry| matches!(entry, ToolRoundResult::PendingGoalManagement { .. }))
         {
-            return self
-                .persist_pending_management_round(
-                    assistant, results, proposal, settlement, admitted,
-                )
-                .await;
+            return Box::pin(self.persist_pending_management_round(
+                assistant, results, proposal, settlement, admitted,
+            ))
+            .await;
         }
         let execution = results
             .iter()

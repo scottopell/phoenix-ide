@@ -335,6 +335,24 @@ async fn assert_committed(fixture: &Fixture, shape: Shape, refused: bool, messag
 }
 
 #[tokio::test]
+async fn conversation_goal_management_checkpoint_future_does_not_inline_into_unrelated_effect_frames(
+) {
+    let fixture = fixture(true).await;
+    let (mut runtime, client, tools) = provider_runtime(&fixture, &create(&fixture));
+    let before = snapshot(&fixture).await;
+    let future = runtime.execute_effect(Effect::RequestLlm);
+    let size = std::mem::size_of_val(&future);
+    drop(future);
+    assert!(
+        size <= 16 * 1024,
+        "shared effect future exceeds 16 KiB: {size}"
+    );
+    assert_eq!(snapshot(&fixture).await, before);
+    assert!(client.requests.lock().unwrap().is_empty());
+    assert!(tools.recorded_executions().is_empty());
+}
+
+#[tokio::test]
 async fn conversation_goal_runtime_management_sequence_reconciliation_still_rejects_changed_assistant_payload(
 ) {
     for shape in [Shape::Ordinary, Shape::Fork] {

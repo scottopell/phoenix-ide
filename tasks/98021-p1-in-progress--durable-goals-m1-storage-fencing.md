@@ -1,5 +1,34 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual282 failure — three Option loops and shared future containment
+
+Parent39375980176 exact282 terminalFAIL/artifact12243672253, ZERO focused
+executed; priorToolContentE0308absent. Three provider fixture sites receive
+Option<Event>, not Vec: use ifletSome preserving zero-or-one process_event.
+No warnings/Clippy suppressions. UI/specs actualFULLPASS per parent.
+
+Read completedClippy118474205637 GitHub1883linejoblog; it contains dev.py tail,
+NOT full70diagnostics. Actual exposed inventory12x18544byte large_future and
+3Optionloops, then compilerSUMMARY70libtesterrors. Parent corrected earlier
+fullinventory wording; no extra70body exists in that retained artifact. Omitted
+roots and shared federation/global_read/send_chat remain unwaived/unknown, not
+claimed clear. No extra export, resource or new evidence-capture framework.
+
+Sharedowner correction Box::pin(self.persist_pending_management_round(...)).await
+only at management/report branch split. Same inlineawait borrows, authority,
+guards, token lifetime, cancellation/drop owner and Err propagation; no spawn,
+detach,staticwidening,caller scatterbox or resource increase. This removes the
+nested management service future from the shared inline frame by construction,
+not an executed byte-size/threshold/cancellation-race result. One authored test
+measures actual unpolled execute_effect frame <=16KiB, drops it and asserts no
+SQL/domain/provider/tool changes. It does NOT test midSQL cancellation; existing
+checkpoint owner/replay tests remain the behavioral qualification target.
+
+Includes prior9f free/held target-gate retry refinement for review. Onlystandalone
+rustfmt/diff/sourcechecks;0compiler/testsSQLbrowser/newCI/push/activation.11stashes,
+132immutable,134unregistered/defaultoff,156floorONLYe4d,133unqualified unchanged.
+Stop feature breadth until coherent source packet review and actual qualification.
+
 ## After282 capture — narrow retained-refusal coverage refinement
 
 Parent owns run39375980176 exact282; no monitoring/dispatch/result claim by this
