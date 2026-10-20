@@ -1,5 +1,28 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Latest actual134 qualification — exact778 SQL-safe-string compile failure
+
+Parent run **39394922634**, exact
+`778604eac663dec4710f50a0b45a1430ecb5a368`, is **terminal failed**, artifact
+**12251990910**, with **zero focused tests executed**. Module resolution and
+formatting passed the earlier stop; SQLx0.9 then rejected the registered fixture's
+`query_scalar(&format!(...))` because `&String` is not `SqlSafeStr`. Source replaces
+that three-name dynamic query with three literal SQL strings paired with their
+table labels, preserving all count-zero assertions. The actual SQLx declaration
+implements the contract for `&'static str`; no `AssertSqlSafe`, unchecked escape,
+assertion removal or production query/schema change is introduced. No additional
+formatted SQL query remains in the registration upgrade test module. Prior source
+review missed this API constraint; actual compiler evidence takes precedence.
+
+Completed Clippy118535304638 was inspected. Its retained diagnostic tail exposes
+shared federation/global-read/send-chat roots with12lib/15lib-test summaries and
+no new goal-owned root in that tail; it is not full-inventory clearance. UI/specs
+and E2E fully passed per parent, including the named-registry regressions. The
+next correction is source-only: standalone rustfmt and whitespace/API inspection,
+no compiler/tests/SQL/browser, new CI, push, activation or resource changes.
+185/185 remains qualified **only at d4c**;134 is registered but unqualified,
+activation remains off, schema132 unchanged and11stashes preserved.
+
 ## Latest actual134 qualification — exact91 module resolution and registry grammar failures
 
 Parent run **39393190783**, exact

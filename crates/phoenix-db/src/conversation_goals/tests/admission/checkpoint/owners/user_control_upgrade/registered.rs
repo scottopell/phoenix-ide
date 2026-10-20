@@ -71,12 +71,21 @@ async fn conversation_goal_registered_134_fresh_and_real_133_upgrade_have_same_s
     );
     assert_eq!(schema(&prior).await, schema(&fresh).await);
     assert_registered(&prior).await;
-    for table in [
-        "conversation_goal_controls",
-        "conversation_goal_control_requests",
-        "conversation_goal_user_requests",
+    for (table, query) in [
+        (
+            "conversation_goal_controls",
+            "SELECT count(*) FROM conversation_goal_controls",
+        ),
+        (
+            "conversation_goal_control_requests",
+            "SELECT count(*) FROM conversation_goal_control_requests",
+        ),
+        (
+            "conversation_goal_user_requests",
+            "SELECT count(*) FROM conversation_goal_user_requests",
+        ),
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        let count: i64 = sqlx::query_scalar(query)
             .fetch_one(prior.pool())
             .await
             .unwrap();

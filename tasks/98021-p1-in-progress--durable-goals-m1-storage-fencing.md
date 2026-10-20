@@ -1,5 +1,20 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Actual778 SQL-safe-string compile stop — static three-query correction
+
+Parent39394922634 exact778 terminalFAIL/artifact12251990910/ZEROFOCUSED.
+Modulepath/fmtroot cleared, SQLx0.9E0277 query_scalar(&format!(...)) &String not
+SqlSafeStr. ReplaceONLY3known-tablecounts with3literalSQLstrings+tablelabels,
+allcountzeroassertions preserved. ActualSqlSafeStrimpl &'staticstr inspected;
+noAssertSqlSafe/uncheckedwaiver/productionquerychange. No remainingformatSQLquery
+in user_control_upgrade/registered. StaticreviewmissedAPI;compilerwins.
+
+CompletedClippy118535304638 read: visible sharedfed/global/send_chat12lib15libtest
+tailredunwaived, nonewownedgoalrootvisible≠fullinventoryclear. UI/specs+E2EFULLPASS
+perparent(namedregistryregressionsPASS). Onlystandaloneformat/whitespace/sourceAPI;
+0compiler/testsSQLbrowser/CI/push/activation/resources.185floorONLYd4c134source
+NOTqualified/defaultOFF132immutable11stashes unchanged.
+
 ## Actual91 zero-execution module and registry-expression correction
 
 Parent39393190783 exact91 terminalFAIL/artifact12251126226/ZEROFOCUSED. E0583+
