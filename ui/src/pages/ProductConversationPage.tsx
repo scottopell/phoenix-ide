@@ -889,10 +889,12 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const scrollCommandTokenRef = useRef(0);
   const readerNavigationKey = useReaderNavigationKey();
   const hashNavigationRef = useRef({ key: '', token: 0 });
-  const hashNavigation = hashNavigationRef.current.key === readerNavigationKey ? hashNavigationRef.current : {
+  const committedHashNavigation = hashNavigationRef.current;
+  const nextScrollCommandToken = scrollCommandTokenRef.current + 1;
+  const hashNavigation = useMemo(() => committedHashNavigation.key === readerNavigationKey ? committedHashNavigation : {
     key: readerNavigationKey,
-    token: scrollCommandTokenRef.current + 1,
-  };
+    token: nextScrollCommandToken,
+  }, [committedHashNavigation, readerNavigationKey, nextScrollCommandToken]);
   useLayoutEffect(() => {
     hashNavigationRef.current = hashNavigation;
     scrollCommandTokenRef.current = Math.max(scrollCommandTokenRef.current, hashNavigation.token);
@@ -1394,11 +1396,11 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const latestWorkScopeKey = isOpen
     ? currentLatestProjection?.conversation?.work_scope_key
     : undefined;
-  const transcriptView = {
+  const transcriptView = useMemo(() => ({
     conversationId: snapshot?.product_conversation_id ?? '',
     generation: historyGeneration,
     transcriptGeneration: historyGeneration,
-  };
+  }), [snapshot?.product_conversation_id, historyGeneration]);
   const routeReaderSelectionRef = useRef<{ pathname: string; productConversationId: string | undefined; transcriptPin: string | null; awaitingTopology: boolean } | null>(null);
   if (snapshot && (routeReaderSelectionRef.current?.pathname !== location.pathname
     || routeReaderSelectionRef.current.productConversationId !== productConversationId || routeReaderSelectionRef.current.awaitingTopology)) {
@@ -1453,7 +1455,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
     && previousJump.view.conversationId === transcriptView.conversationId
     && previousJump.targetMessageId === positioningTargetMessageId
     && jumpCompletion?.commandKey === transcriptPositioningInputCommandKey({ kind: 'positioning', command: previousJump });
-  const desiredJump = positioningTargetMessageId
+  const desiredJump = useMemo(() => positioningTargetMessageId
     ? completedJump ? previousJump : {
       kind: 'jump_to_message' as const,
       token: hashNavigation.token,
@@ -1461,7 +1463,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       view: transcriptView,
       targetMessageId: positioningTargetMessageId,
     }
-    : null;
+    : null, [positioningTargetMessageId, completedJump, previousJump, hashNavigation.token, transcriptView]);
   useLayoutEffect(() => { desiredJumpRef.current = desiredJump; }, [desiredJump]);
   const desiredPositioning: TranscriptPositioningInput = (restoreCommand?.navigationToken === hashNavigation.token ? restoreCommand.positioning : null)
     ?? (desiredJump ? { kind: 'positioning', command: desiredJump } : { kind: 'idle', view: transcriptView });

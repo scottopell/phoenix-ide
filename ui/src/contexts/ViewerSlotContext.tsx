@@ -255,10 +255,10 @@ export function ViewerSlotProvider({
     && replacement.pathname === location.pathname
     && replacement.search === location.search
     && replacement.hash === location.hash;
-  const readerNavigation = committedNavigation.locationKey === location.key ? committedNavigation : {
+  const readerNavigation = useMemo(() => committedNavigation.locationKey === location.key ? committedNavigation : {
     locationKey: location.key,
     readerKey: viewerOnly ? committedNavigation.readerKey : location.key,
-  };
+  }, [committedNavigation, location.key, viewerOnly]);
   useLayoutEffect(() => {
     readerNavigationRef.current = readerNavigation;
     if (viewerOnly && viewerReplacementRef.current === replacement) viewerReplacementRef.current = null;

@@ -29,9 +29,9 @@ Each requirement maps to where its behavior lives in the implementation.
 | Requirement | Implementation |
 |-------------|----------------|
 | **REQ-VS-001:** User Opens Prose Viewer | `ViewerSlotProvider.openProse` + URL search params; `ui/src/contexts/ViewerSlotContext.tsx` |
-| **REQ-VS-002:** Unified URL Slot Contract | One `ViewerSlotProvider` derives all viewer kinds from the URL; `FileExplorerProvider` is a thin adapter projecting prose state |
+| **REQ-VS-002:** Unified URL Slot Contract | One `ViewerSlotProvider` derives all viewer kinds from the URL; `FileExplorerProvider` is a thin adapter projecting prose state. Reader navigation isolation is specified in `requirements.md`; candidate browser qualification remains pending |
 | **REQ-VS-003:** User Opens Diff Viewer | `?viewer=diff&presentation=fullscreen` for primary View Diff, `?viewer=diff&presentation=pane` where split-pane is intentionally used; `ConversationDiffViewer` fetches the payload on mount from `GET /api/conversations/:id/diff` |
-| **REQ-VS-004:** User Closes Active Viewer | `ViewerSlotProvider.close` clears the `viewer`/`presentation`/`file`/`root` params via `setSearchParams` |
+| **REQ-VS-004:** User Closes Active Viewer | `ViewerSlotProvider.close` clears viewer-owned params; hash/state and reader identity preservation are candidate qualification obligations below |
 | **REQ-VS-005:** URL Hydrates Prose | `deriveSlot` reads `?viewer=prose&file=&root=` (and legacy `?file=&root=`) on every render |
 | **REQ-VS-006:** URL Hydrates Non-Prose Viewers | Diff and message identity plus presentation hydrate from the URL; browser and inspector retain their existing shapes; server-backed viewers re-fetch or resolve payloads on mount |
 | **REQ-VS-007:** Single-Slot Mutex | Structural: one `viewer` param at a time. The discriminated union enforces it; no coordinating effects |
@@ -46,6 +46,14 @@ Each requirement maps to where its behavior lives in the implementation.
 | **REQ-VS-016:** Focused Content Review | `ViewerSlotProvider.setPresentation`, `ViewerPresentationControl`, `useFocusedReviewExit`, `MetaViewer`, `MessageViewer` provide URL-restorable takeover and protected feedback resolution |
 
 The slot is realized as a single `ViewerSlotProvider` (mounted in `DesktopLayout`, which wraps every conversation route) that derives its state from the URL, with no coordinating effects -- the discriminated union enforces the mutex. The diff payload is a viewer-mounted fetch keyed on the conversation id, since the diff endpoint is conversation-keyed rather than comparator-addressable.
+
+## Reader Navigation Isolation — Candidate
+
+[REQ-VS-002 and REQ-VS-004](requirements.md) distinguish viewer-only URL replacement from reader navigation. The candidate preserves hash, router state, and reader navigation identity across viewer changes; actual push, replace, and history traversal retain their reader commands. Uncommitted concurrent renders must not become mutation authority.
+
+Qualification must audit the shared prose, diff, browser, inspector, and message viewer paths: supported close controls, Escape dismissal, and presentation changes where available, while retaining find/annotation/pending-feedback guards. Outside-click close is unsupported and is not an acceptance claim. Raw legacy `ConversationPage` narrow-layout remount behavior is not qualified by this candidate.
+
+Browser acceptance remains pending. Source changes and focused regression coverage are not a shipped-behavior or rendered reader-position claim.
 
 ## Validation
 

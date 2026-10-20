@@ -149,7 +149,7 @@ try {
       url.search = ''; url.hash = '';
       for (const [key, value] of Object.entries({ story: fixture.story, mode: 'preview', fixtureTheme: 'dark', fixtureBrowserHistory: '1', fixtureEntry: fixture.entry })) url.searchParams.set(key, value);
       await page.goto(url.href);
-      await page.locator(`[data-product-conversation-fixture-ready="${fixture.ready}"]`).waitFor();
+      await page.locator(`main[data-product-conversation-fixture-ready="${fixture.ready}"]`).waitFor();
       await page.locator('#messages').waitFor();
       await page.waitForFunction(entry => document.documentElement.dataset.sourceFixtureLocation === entry, fixture.entry);
       await settle(page);

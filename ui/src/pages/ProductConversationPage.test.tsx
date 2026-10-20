@@ -1129,7 +1129,9 @@ describe('ProductConversationPage', () => {
       }
     });
     await act(async () => {
-      startTransition(() => fireEvent.click(screen.getByRole('button', { name: 'jump latest message' })));
+      startTransition(() => {
+        fireEvent.click(screen.getByRole('button', { name: 'jump latest message' }));
+      });
     });
     expect(suspendedAttempts).toBeGreaterThan(0);
     expect(screen.queryByTestId('suspended-history')).not.toBeInTheDocument();
