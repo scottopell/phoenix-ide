@@ -140,25 +140,31 @@ async fn binding_tx(tx: &mut GoalTx<'_>, turn_id: i64) -> Result<Option<GoalExec
 }
 
 async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
-    let row = sqlx::query("SELECT * FROM conversation_goal_actors WHERE actor_id=?")
+    let row = sqlx::query("SELECT actor_id,owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id FROM conversation_goal_actors WHERE actor_id=?")
         .bind(actor_id)
         .fetch_one(&mut **tx)
         .await?;
     let kind: String = row.try_get("kind")?;
     match kind.as_str() {
-        "user_control" => Ok(GoalActor::UserControl {
-            principal_id: uuid::Uuid::from_slice(
-                &row.try_get::<Vec<u8>, _>("control_principal_id")?,
-            )
-            .map_err(|_| GoalDbError::Integrity("goal control principal identity"))?,
-            request_id: uuid::Uuid::from_slice(&row.try_get::<Vec<u8>, _>("control_request_id")?)
+        "user_control" => {
+            let control = sqlx::query("SELECT control_principal_id,control_request_id,control_command FROM conversation_goal_actors WHERE actor_id=?")
+                .bind(actor_id).fetch_one(&mut **tx).await?;
+            Ok(GoalActor::UserControl {
+                principal_id: uuid::Uuid::from_slice(
+                    &control.try_get::<Vec<u8>, _>("control_principal_id")?,
+                )
+                .map_err(|_| GoalDbError::Integrity("goal control principal identity"))?,
+                request_id: uuid::Uuid::from_slice(
+                    &control.try_get::<Vec<u8>, _>("control_request_id")?,
+                )
                 .map_err(|_| GoalDbError::Integrity("goal control request identity"))?,
-            command: match row.try_get::<String, _>("control_command")?.as_str() {
-                "create" => GoalUserCommandKind::Create,
-                "state" => GoalUserCommandKind::State,
-                _ => return Err(GoalDbError::Integrity("goal control command kind")),
-            },
-        }),
+                command: match control.try_get::<String, _>("control_command")?.as_str() {
+                    "create" => GoalUserCommandKind::Create,
+                    "state" => GoalUserCommandKind::State,
+                    _ => return Err(GoalDbError::Integrity("goal control command kind")),
+                },
+            })
+        }
         "user_api" => Ok(GoalActor::UserApi {
             transcript_id: text(row.try_get("transcript_id")?)?,
             message_id: text(row.try_get("message_id")?)?,

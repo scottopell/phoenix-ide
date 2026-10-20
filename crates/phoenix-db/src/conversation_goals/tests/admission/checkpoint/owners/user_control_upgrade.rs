@@ -350,6 +350,45 @@ async fn conversation_goal_user_candidate_actor_requires_the_accepted_actual_goa
     assert_eq!(current.version.get(), 3);
     assert_eq!(current.goal_id.as_str(), "control-created");
     assert_eq!(current.objective.as_str(), "canonical request objective");
+    let retained_before_replacements = retained(&db).await;
+    let receipt_before: (String, i64, String, String, i64, i64) = sqlx::query_as("SELECT command,expected_version,goal_id,outcome,result_version,recorded_at_us FROM conversation_goal_user_requests WHERE owner_id=?1 AND principal_id=?2 AND request_id=?3")
+        .bind(owner.as_str()).bind(vec![1_u8;16]).bind(vec![3_u8;16]).fetch_one(db.pool()).await.unwrap();
+    sqlx::query("PRAGMA recursive_triggers=OFF")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(sqlx::query("INSERT OR REPLACE INTO conversation_goal_ids (goal_id,objective,owner_id) VALUES ('control-created','forged accepted input',?1)")
+        .bind(owner.as_str()).execute(db.pool()).await.is_err());
+    let mut rowid_replacement = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("PRAGMA defer_foreign_keys=ON")
+        .execute(&mut *rowid_replacement)
+        .await
+        .unwrap();
+    let identity_rowid: i64 = sqlx::query_scalar(
+        "SELECT rowid FROM conversation_goal_ids WHERE goal_id='control-created'",
+    )
+    .fetch_one(&mut *rowid_replacement)
+    .await
+    .unwrap();
+    let refused = sqlx::query("INSERT OR REPLACE INTO conversation_goal_ids (rowid,goal_id,objective,owner_id) VALUES (?1,'temporary-rowid-replacement','temporary objective',?2)")
+        .bind(identity_rowid).bind(owner.as_str()).execute(&mut *rowid_replacement).await.unwrap_err();
+    assert!(refused
+        .as_database_error()
+        .unwrap()
+        .message()
+        .contains("goal identity cannot be replaced"));
+    rowid_replacement.commit().await.unwrap();
+    assert_eq!(retained(&db).await, retained_before_replacements);
+    let receipt_after: (String, i64, String, String, i64, i64) = sqlx::query_as("SELECT command,expected_version,goal_id,outcome,result_version,recorded_at_us FROM conversation_goal_user_requests WHERE owner_id=?1 AND principal_id=?2 AND request_id=?3")
+        .bind(owner.as_str()).bind(vec![1_u8;16]).bind(vec![3_u8;16]).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(receipt_after, receipt_before);
+    assert_eq!(
+        db.conversation_goal(&owner).await.unwrap().unwrap(),
+        current
+    );
+    let accepted_input: String = sqlx::query_scalar("SELECT i.objective FROM conversation_goal_user_requests r JOIN conversation_goal_ids i ON i.owner_id=r.owner_id AND i.goal_id=r.goal_id WHERE r.outcome='accepted'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(accepted_input, "canonical request objective");
     assert_ne!(before.goal_id, current.goal_id);
     let history = db
         .conversation_goal_history(&owner, GoalVersion::INITIAL)

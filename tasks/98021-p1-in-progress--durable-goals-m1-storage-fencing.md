@@ -1,5 +1,39 @@
 # Durable conversation goals M1 amendment — immutable objectives and fenced supersession
 
+## Resumed Stop-ordering correction — same writer, source-only
+
+Actual base is `4eae8cdb9bdb67d61c61c1c40285ac05428732aa`, same a52c58d8
+worktree/writer. All retained dirty work and eleven stashes were preserved.
+Existing run39354314956 is now terminal red; downloaded Rust artifact12237890605
+reports 140 focused tests:139 passed,1 failed,3434 skipped (126.507s). The owned
+legacy-upgrade decoder failed because cached SELECT-star metadata remained ten
+columns while the rebuilt actor table returned sixteen, panicking the SQLx
+worker. The corrected reader fixes its legacy projection and queries extension
+columns only for UserControl. Broad Rust/clippy/UI-specs remain red, not waived.
+The sole wholly passing focused floor remains exact2ec904a6720140469eb840b0607302c64dc9da24,
+run39349884955/artifact12234391373,127/127 including all five earlier runtime roots.
+
+Preserved Stop work now holds an exact per-owner dispatch permit across every
+provider/tool future poll, ordered against control commit. Stop revokes old
+permits irreversibly; Release cannot revive them. Goal/NoGoal barrier tests
+cover before-first-poll, actual inflight cancellation, and SQLite writer/gate
+ordering. Tool cancellation composes pure UserCancel and ToolAborted transitions
+without an intermediate state write; real checkpoint-failure regressions retain
+the sole outcome through existing terminal retry, preserve state/messages until
+commit, and settle provider/tool durable turns as Cancelled. Generic aborts and
+wrong tool IDs remain rejected. The candidate134 identity INSERT guard covers
+both goal-ID and explicit-rowid REPLACE, with recursive triggers off and foreign
+keys deferred, preserving accepted canonical Create input, receipt and history.
+
+Read-only adversarial review found the rowid and lost-settlement defects above;
+a follow-up of the corrected frozen source found no actionable finding. This is
+not execution qualification. Only standalone source formatting and whitespace
+checks ran locally: no compiler/test/SQL/browser/VM or resource expansion.
+Registered132 and the registry are unchanged.134 remains unregistered until
+actual federation133 integrates; production stays Disabled/emitterNone/route503.
+The full authenticated commands/tools/UI/watch/automatic-continuation feature
+remains commissioned and unfinished; this checkpoint does not close the task.
+
 ## Qualified bounded foundation checkpoint — actual hosted execution
 
 Exact **ed25a228e092b41d5c112e1c7585aab406944ca3**, CI39320605328/Rust118293499801 focused **70 executed,70 passed,3397 skipped/filtered (39.155s)**; full individual statuses artifact12221238348. Includes registered fresh/upgrade/idempotence/deletion coverage, service/admission/capture and genuine continuation/Steering replay+commit-cut tests. This is not whole PR qualification or report activation. Whole Rust independently red:5213/5377executed,5175pass,38fail,191skip;164notrun afterSIGTERM. Outside-focused failure ownership/root causes require assertions, not names.
@@ -863,7 +897,7 @@ and cancellation, goal tools/UI/watch/automatic continuation remain commissioned
 
 Parent run **39349884955**, exact **2ec904a6720140469eb840b0607302c64dc9da24**,
 is terminal FAILED overall. Downloaded/read Rust job **118391408991**, artifact
-**12234006411**. Focused execution **127 tests:127 passed,3391 filtered/skipped,
+**12234391373**. Focused execution **127 tests:127 passed,3391 filtered/skipped,
 119.396s**. All five e19 assertion roots are individually PASS, including actual
 prepared-report Stop, mixed trusted payload, ordinary-tool cancellation, stale
 terminal retirement, and terminal response-loss receipt reconstruction. This is
@@ -896,3 +930,60 @@ authenticated service proof. Next remains the real owner-authenticated goal
 command service and subsequent tools/UI/watch/automatic continuation, with
 strict Stop/send ownership/cancellation still an activation gate.134 remains
 unregistered pending actual133; immutable132 and all stashes remain preserved.
+
+### Additive identity immutability and real dispatch-vs-Stop source repair
+
+Parent independent4e review found accepted command input could be changed via
+`INSERT OR REPLACE` on132's goal identity with recursive triggers off. Added a
+BEFORE INSERT existing-goal-id refusal **only to unregistered UserControl candidate**;
+132 source/registration are unchanged. Positive accepted Create regression now
+explicitly disables recursive triggers, attempts objective replacement and checks
+unchanged current goal plus canonical accepted input. This is authored, not run.
+
+Replaced the detached dispatch predicate with an owned, single-use
+`GoalDispatchPermit` passed through mandatory MessageStore forwarding to the actual
+provider future and `ToolExecutor::execute`. Database clones share a per-owner
+runtime gate. Exact active execution/control is admitted from SQLite under that
+gate; the permit registers the epoch and holds the same mutex for each external
+future poll, never across Pending/network awaits. New accepted Stop/release holds
+the owner gate through transaction commit and revokes its epoch before releasing
+it. Old receiver channels stay revoked after Release. The commit revocation Drop
+guard also invalidates local permits on commit error/cancellation/uncertain reply;
+this is conservative local effect denial, not a durable receipt-success claim.
+
+Read-only review caught a real DB/owner lock inversion when a running tool retained
+a transaction between polls. Both dispatch admission and control mutation now
+acquire their owning BEGIN IMMEDIATE **before** the owner mutex; they still hold
+the owner gate through protected commit/revocation. A deterministic authored test
+holds a real single-connection transaction inside an admitted future, manually
+polls actual Stop to Pending, resumes the operation and proves both can drain.
+It does not weaken the gate or sleep/retry around the cycle.
+
+Four other authored regressions cover Goal and NoGoal: model admission barrier
+before provider first poll and tool-policy barrier before external tool poll,
+Stop→Release then zero actual external invocations; genuine in-flight provider/
+tool cancellation with dropped-future observation and tool cancellation token.
+Tests use real accepted/claimed/materialized turns; tool responses pass through
+the actual reducer into ToolExecuting, then a typed GoalControlRevoked cause
+bridges only the exact current tool through UserCancel and existing ToolAborted
+reduction to runtime+persisted Idle. Generic ToolAborted acceptance is unchanged.
+The provider returns its actual generation-tagged Cancelled outcome rather than
+dropping the unit task sender into a fabricated NetworkError. Started cancellation
+uses the existing first-terminal-wins metric finalizer and asserts a persisted
+Cancelled attempt; refusal before first poll asserts no attempt row.
+
+Several source-only review rounds caught/corrected actual task-output type and
+outcome-channel fixture mistakes, typed cancellation settlement, metrics omission,
+lock inversion and redundant-must-use lint. Final read-only review found no new
+concrete blocker; this is not compiler/lint/test qualification. Existing4e CI
+39354314956 remains the sole active run and does not include these dirty repairs.
+No extra dispatch, local compiler/test/SQL/browser/VM, merge or activation occurred.
+
+Installed spawn_agents is explicitly refused with a capability-gap log: no fake
+claim that a parent permit transfers into child activation/lifetimes. Default
+Disabled behavior is unchanged. Cancellation drops the actual external future;
+it cannot undo effects already completed by an external service, and tool-owned
+process/authority teardown (including SVG's fatal close path) still needs its
+specific qualification. All production installation stays off, emitterNone,
+route503,134unregistered pending actual133. Owner command service/tool/UI/watch/
+automatic continuation remain commissioned, not closed by this repair batch.

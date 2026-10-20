@@ -3,7 +3,7 @@
 ## Current qualification boundary
 
 Parent-owned run **39349884955**, exact **`2ec904a6720140469eb840b0607302c64dc9da24`**,
-is terminal FAILED overall. Downloaded Rust job118391408991 artifact12234006411
+is terminal FAILED overall. Downloaded Rust job118391408991 artifact12234391373
 proves focused execution: **127 tests,127 passed,3391 filtered/skipped,119.396s**.
 All five e19 failure roots individually pass, including the actual prepared-report
 Stop race and terminal-response-loss reconstruction. This is the new wholly green
@@ -16,9 +16,20 @@ termination. Those35 assertions are not blanket-classified as upstream. Clippy
 and UI/specs also failed; E2E, geometry, tasks and worker-budget lanes passed.
 Two owned fixture Clippy lints are source-fixed in369, outside tested2ec.
 
-Actual-path369 and subsequent actor/candidate work remain execution-unqualified.
-No duplicate CI or local heavy execution was performed. Production stays Disabled,
-emitter None, route503; actual133 is absent and134 remains unregistered.
+The later exact4e run **39354314956** is terminal FAILED. Its Rust artifact
+**12237890605** reports **140 focused tests:139 passed,1 failed,3434 skipped**
+(126.507s). The owned failure is the warmed legacy actor decoder during the
+candidate rebuild: SQLx cached `SELECT *` metadata retained ten columns after the
+actor table gained six, panicking the worker and surfacing RowNotFound. Source
+now uses an explicit legacy projection and a control-variant-only field query.
+This partial result does **not** supersede the wholly passing exact2ec floor.
+Broad Rust, clippy and UI/specs are red; shared failures are not waived. One
+owned non-exhaustive control-error match is source-corrected here.
+
+The subsequent Stop-ordering and identity corrections remain source-only until
+an exact corrected-head run. No duplicate CI or local heavy execution was
+performed. Production stays Disabled, emitter None, route503; actual133 is
+absent and134 remains unregistered.
 
 ### Earlier64322 compile diagnostic
 
@@ -57,13 +68,22 @@ historical evidence after Stop/release. Missing schema is a storage failure.
 
 Mandatory MessageStore forwarding now reaches actual model and tool dispatch,
 independently of an emitter or Goal-vs-NoGoal. It checks the active materialized
-turn/generation and retained control, including a late check after model request
-preparation. **This is not strict Stop/send linearization or in-flight
-cancellation**: a check→dispatch gap remains and blocks production activation.
-Production constructors stay Disabled, emitter None and control route503.
+turn/generation and retained control. Source now carries a shared per-owner
+permit through final external polling: control commits and each future poll use
+the same owner gate; Stop revokes exact permits irreversibly, and Release cannot
+revive an old operation. Deterministic Goal/NoGoal barriers cover pre-first-poll,
+inflight provider/tool cancellation, and SQLite writer contention. Revoked-tool
+settlement composes cancellation and completion in one pure reducer result, so
+a failed terminal write retains the existing retryable settlement rather than
+losing the sole outcome at an intermediate state write. Actual provider and
+tool settlement assert the durable Cancelled result; tool tests also inject a
+real terminal checkpoint failure and retry. These new regressions have not
+been executed. Production constructors stay Disabled, emitter None and control
+route503; source inspection does not qualify production activation.
 
-Eight authored/unexecuted tests exercise real acceptance, commit cuts, genuine
-claim/materialization, nine report-owner shapes and runtime provider/tool effects.
+Coverage targets real acceptance, commit cuts, genuine claim/materialization,
+nine report-owner shapes and runtime provider/tool effects. The newer dispatch
+barriers and changed settlement cases remain execution-unqualified.
 Read-only review caught/fixed the admission-vs-effect canonical-message predicate
 and canonical-ID expectation before publishing. Parent2ec Clippy's two owned
 fixture lints are source-fixed here; that is not test qualification. UserControl
@@ -71,8 +91,8 @@ requires a goal-command-specific receipt, never a Stop/release receipt masquerad
 as goal creation. Later candidate source supplies the typed actor and cyclic
 rebuild groundwork described below; authenticated command service and complete
 upgrade qualification remain owed.134 is still unregistered pending actual133.
-Runtime cancellation/linearization, service, public tools/UI/watch and automatic
-continuation remain unfinished.
+Runtime cancellation/linearization qualification, service, public tools/UI/watch
+and automatic continuation remain unfinished.
 
 ## UserControl candidate source, not installed
 
@@ -94,13 +114,17 @@ for direct requested/applied roles. An AFTER INSERT guard plus retained history
 FKs rejects value/row-ID replacement. Candidate receipt INSERT-conflict guards
 also prevent SQLite REPLACE from rewriting retry evidence, rewinding control or
 recapturing an old binding while preserving normal one-step control UPSERT.
+The candidate-only identity INSERT guard also refuses goal-ID or explicit-rowid
+REPLACE, even with recursive triggers disabled and foreign keys deferred. Its
+regression retains canonical accepted Create input, full history and the exact
+receipt across failed replacement attempts. Registered132 remains unchanged.
 
-Four unexecuted UserControl tests exercise genuine populated132 report/binding
-cycles, retained equality/source removal/owner deletion, mid-rebuild rollback,
-receipt immutability and positive typed Create insert/read/serde with adversarial
-source/command/reference checks. A fifth authored regression covers control
-REPLACE. This is isolated storage composition, not public authentication or
-actual133→134 qualification. Accepted State application, complete legacy upgrade
+Exact4e executed four UserControl tests: mid-rebuild rollback, receipt
+immutability and positive typed Create attribution passed; populated132 retained
+history/source-removal decoding failed at the cached projection boundary above.
+The corrected decoder and expanded identity-REPLACE regression remain
+execution-unqualified. This is isolated storage composition, not public
+authentication or actual133→134 qualification. Accepted State application, complete legacy upgrade
 matrix and authenticated owner command service remain owed. Legacy132 actor
 REPLACE behavior outside the new receipt-backed history is captured as a TODO.
 Read-only reviews corrected concrete API/SQLx-static-SQL/fixture issues before

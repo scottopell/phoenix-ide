@@ -1,3 +1,9 @@
+CREATE TRIGGER conversation_goal_ids_no_reinsert
+BEFORE INSERT ON conversation_goal_ids
+WHEN EXISTS (SELECT 1 FROM conversation_goal_ids
+             WHERE goal_id = NEW.goal_id OR rowid = NEW.rowid)
+BEGIN SELECT RAISE(ABORT, 'goal identity cannot be replaced'); END;
+
 CREATE TABLE conversation_goal_user_requests (
     owner_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     principal_id BLOB NOT NULL CHECK (typeof(principal_id) = 'blob' AND length(principal_id) = 16),
