@@ -107,6 +107,39 @@ prior-floor/shared Clippy failures remain unwaived and are not silently rewritte
 as part of this new execution-accounting fix. The qualified floor and Disabled
 execution installation remain unchanged.
 
+### Partial-cut terminal diagnostic 39541824537
+
+Hosted [39541824537](https://github.com/scottopell/phoenix-ide/actions/runs/39541824537)
+finished on exact `7a61bbf33543e82e6c3befd51f9d834f48038e08`. Compilation
+(284.7s), codegen (1.2s) and freshness passed. Artifact `12321007533` retains the
+expanded focused run: **259 executed, 249 passed, 10 failed, 3387 skipped** in
+296.434s. New request ledger, typed Start model and migration-136 regressions
+passed. This is real partial evidence, **not 259/259 or a replacement whole-gate
+floor**. UI/spec, existing E2E and geometry lanes passed; existing E2E is not
+message-free goal Start/follow-through proof.
+
+The ten focused failures are fixture/version assumptions. Four historical
+pre-134 report fixtures called the current aggregate getter against an actual
+133 schema. A test-only explicit historical Message projection now verifies the
+persisted payload/fingerprint, accepted execution and absence of future columns,
+applies the pure Message-materialization transition and seeds its old-schema
+canonical message/state atomically. Current fixtures retain the current
+claim/materialization path. No production fallback, invented origin, migration
+edit or compatibility promise is introduced; source attribution, report-round
+commit/replay and rollback assertions remain intact.
+
+Current full-runner assertions now compare the real 136 schema/ledger: 133 to
+136 applies three migrations; 131 to 136 applies five, including the baseline
+helper used by that upgrade test. Explicit 134 tests still stop at 134. Migration
+135 preservation/cache tests now stop exactly at the registered 135 prefix,
+rather than applying 136 and falsely requiring a byte-identical 134 schema.
+These bounded fixture corrections are **UNRUN** locally beyond rustfmt/Git.
+
+Broad tests timed out at 1499.576s: **4706/5559 executed, 4660 passed, 46 failed,
+194 skipped**. Broad/Clippy remain unwaived; the unchanged shared failures are not
+reclassified as passes. Qualified floor remains `fab412e9` / `39482419906`, UI12 +
+233/233. Execution stays Disabled and services remain uninstalled.
+
 ### Independent review corrections to canonical Start storage
 
 Source review of `0d42672a7` found missing nonterminal command arms, cross-root

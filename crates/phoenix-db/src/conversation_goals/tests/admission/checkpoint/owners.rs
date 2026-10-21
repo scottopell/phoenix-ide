@@ -30,6 +30,8 @@ use phoenix_workflow::{
 
 use super::super::{fixture, fixture_before_user_control, t};
 
+#[path = "owners/historical_message.rs"]
+mod historical_message;
 #[path = "owners/user_control_upgrade.rs"]
 mod user_control_upgrade;
 use crate::{
@@ -205,6 +207,10 @@ async fn admitted_fixture_with_control_at(
             ClaimAuthoritativeTurnInput, LocalAuthorityResult, MaterializeAuthoritativeTurnInput,
             MaterializeAuthoritativeTurnOutcome,
         };
+        if before_user_control {
+            historical_message::seed_materialized_message(&db, execution, &payload).await;
+            return (db, command, execution);
+        }
         let repo = db.workflow_repository();
         let claim = repo
             .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {

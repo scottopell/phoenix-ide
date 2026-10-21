@@ -3,6 +3,15 @@ use crate::Database;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Row;
 
+async fn run_through_capture(pool: &sqlx::SqlitePool) -> DbResult<u32> {
+    let end = super::super::MIGRATIONS
+        .iter()
+        .position(|migration| migration.version == 135)
+        .unwrap()
+        + 1;
+    super::super::run_migration_list(pool, &super::super::MIGRATIONS[..end]).await
+}
+
 async fn fixture() -> (Database, String) {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -161,9 +170,7 @@ async fn populated_forward_upgrade_preserves_outbox_roots_delivery_references_an
     assert_eq!(identities.len(), 5);
     let before: Vec<(String,String,String,String,Option<String>)> = sqlx::query_as("SELECT event_id,source_occurrence_kind,terminal_kind,delivery_state,accepted_transcript_id FROM coordinator_watch_events ORDER BY event_id")
         .fetch_all(db.pool()).await.unwrap();
-    super::super::run_pending_migrations(db.pool())
-        .await
-        .unwrap();
+    run_through_capture(db.pool()).await.unwrap();
     let after_schema = schema(db.pool()).await;
     assert_eq!(retained_rows(db.pool()).await, before_rows);
     for (kind, name, sql, root) in before_schema {
@@ -280,9 +287,7 @@ async fn forced_after_schema_and_ddl_failure_restores_everything_and_can_retry()
             .unwrap(),
         0
     );
-    super::super::run_pending_migrations(db.pool())
-        .await
-        .unwrap();
+    run_through_capture(db.pool()).await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
             .fetch_one(db.pool())
@@ -382,7 +387,7 @@ async fn another_pooled_connection_reparses_the_new_schema() {
         .fetch_all(&mut *retained)
         .await
         .unwrap();
-    super::super::run_pending_migrations(&pool).await.unwrap();
+    run_through_capture(&pool).await.unwrap();
     let after: i64 = sqlx::query_scalar("PRAGMA schema_version")
         .fetch_one(&mut *retained)
         .await
