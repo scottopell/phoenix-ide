@@ -31,6 +31,39 @@ remain implementation work; full broad checks and Clippy remain unwaived. The
 qualified floor is still `fab412e9` / hosted `39482419906`, UI12 + 233/233.
 
 
+### Typed canonical Start and forward materialization storage (unqualified)
+
+The next source milestone adds a typed owner/actual-Coordinator requester and
+message-free Start input/retained receipt domain. The pure durable-turn model
+now distinguishes message bytes from a Start receipt reference, checks the full
+four-row materialization truth table, and offers an explicit Start-materialize
+command. Start cannot become steering or materialize a canonical message;
+materialized Start cannot rearm. Existing Message fingerprint bytes are unchanged.
+
+Forward 136 now owns its retained-connection schema handler: exactly one match
+per old payload/origin NOT NULL clause, checked schema-version increments,
+statement-cache clearing on success/error, atomic rollback and guard restoration.
+No parent table is dropped or rebuilt. New SQL stores normalized immutable Start
+identity/requester/observed goal/execution evidence under the target root, with
+only live-turn SET NULL detachment. It adds explicit input kind/materialization,
+backfills actual preexisting messages and replaces the discovery index plus the
+two binding-admission predicates without modifying historical SQL files.
+Discovery, rearm, message CAS, commit probes and control dispatch now consult the
+explicit materialization fact. Row/discovery decoding constructs Start from its
+receipt reference without loading chat payload or inventing an InputOrigin.
+
+**This is a partial canonical/storage milestone, not an enabled Start journey.**
+No owner/Coordinator Start service or actual atomic acceptance/materialization
+checkpoint is exposed yet. The worker remains a message-only fail-closed sink;
+its Start adoption branch, authenticated historical replay, Coordinator source
+round commit, runtime request ledger/checkpoints and queue/Stop grant remain
+implementation work. No caller installs the execution policy. Authored core,
+pure-model and migration regressions (including raw-storage Start roundtrip,
+parent/child rootpages, exact message bytes, cache reuse, rollback, four states,
+immutable input and receipt detach) are **UNRUN**. No runtime E2E or compile pass
+is claimed. Existing hosted strategy must qualify this partial cut before it is
+used as a new floor; `fab412e9` / `39482419906` remains the qualified floor.
+
 ### Independent review corrections to the first milestone
 
 Parent source review of `cb4deef72` found three defects: the new append trigger

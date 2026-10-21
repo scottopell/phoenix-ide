@@ -18741,8 +18741,10 @@ mod chat_authority_tests {
                     .await
                     .unwrap()
                     .expect("accepted direct turn");
-                let payload =
-                    PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+                let payload = PreparedDirectTurnPayload::from_exact_bytes(
+                    turn.prepared.message_payload().unwrap(),
+                )
+                .unwrap();
                 assert_eq!(payload.message_id(), "literal-message");
                 assert_eq!(payload.delivery.text, text);
                 assert!(payload.delivery.llm_text.is_none());
@@ -18894,8 +18896,10 @@ mod chat_authority_tests {
                 .await
                 .unwrap()
                 .expect("exact manual opening accepted");
-            let payload =
-                PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+            let payload = PreparedDirectTurnPayload::from_exact_bytes(
+                turn.prepared.message_payload().unwrap(),
+            )
+            .unwrap();
             assert_eq!(payload.submitted.message_id, intent.message_id.as_str());
             assert_eq!(payload.submitted.text, text);
             assert_eq!(payload.delivery.text, text);

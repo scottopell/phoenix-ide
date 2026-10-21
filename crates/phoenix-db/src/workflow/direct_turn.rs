@@ -14,10 +14,10 @@ use phoenix_core::domain::sm_event::{
 use phoenix_workflow::{
     direct_turn_profile, AcceptedDisposition, AttemptId, AttemptStatus, AuthorityOutcome,
     CanonicalMessageId, ClaimOutcome, ClientTurnKey, ConversationAuthority, DeliveryId,
-    DurableTurn, EffectId, EffectRole, EffectStatus, ExecutionCapability, Generation, LeaseExpiry,
-    Materialization, PreparedTurn, ProcessIncarnation, ReceiptId, Timestamp, TurnAuthorityId,
-    TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
-    WorkflowId, WorkflowStatus,
+    DurableTurn, EffectId, EffectRole, EffectStatus, ExecutionCapability, Generation,
+    GoalStartReceiptId, LeaseExpiry, Materialization, PreparedTurn, ProcessIncarnation, ReceiptId,
+    Timestamp, TurnAuthorityId, TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep,
+    TurnTerminal, Version, WorkflowId, WorkflowStatus,
 };
 use sqlx::{Connection, Row};
 
@@ -367,15 +367,19 @@ impl WorkflowRepository {
             return Err(error);
         }
 
-        let submitted_message_id =
-            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-                .map_err(|_| {
-                    conflict(TurnConflict::CorruptAggregate(
-                        "prepared payload decode failed",
-                    ))
-                })?
-                .message_id()
-                .to_string();
+        let submitted_message_id = PreparedDirectTurnPayload::from_exact_bytes(
+            input
+                .prepared
+                .message_payload()
+                .map_err(DbError::DirectTurnConflict)?,
+        )
+        .map_err(|_| {
+            conflict(TurnConflict::CorruptAggregate(
+                "prepared payload decode failed",
+            ))
+        })?
+        .message_id()
+        .to_string();
         let legacy_message_exists = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(
                  SELECT 1 FROM messages
@@ -434,9 +438,13 @@ impl WorkflowRepository {
             .map_err(conflict)?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
-        let prepared_payload =
-            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-                .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let prepared_payload = PreparedDirectTurnPayload::from_exact_bytes(
+            input
+                .prepared
+                .message_payload()
+                .map_err(DbError::DirectTurnConflict)?,
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
             "INSERT INTO durable_turns (
                 turn_id, conversation_id, client_turn_key, prepared_fingerprint,
@@ -560,7 +568,10 @@ impl WorkflowRepository {
         PreparedTurn::rehydrate(
             &turn.conversation,
             turn.prepared.fingerprint().to_string(),
-            turn.prepared.payload().to_vec(),
+            turn.prepared
+                .message_payload()
+                .map_err(DbError::DirectTurnConflict)?
+                .to_vec(),
         )
         .map_err(DbError::DirectTurnConflict)?;
         if !stored.submitted_identity_matches(submitted) {
@@ -783,7 +794,7 @@ impl WorkflowRepository {
              SET generation = ?2, terminal_kind = NULL, terminal_reason = NULL,
                  owns_conversation = 1
              WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NOT NULL
-               AND disposition = 'Runtime' AND canonical_message_id IS NULL
+               AND disposition = 'Runtime' AND materialized = 0
                AND NOT EXISTS (
                    SELECT 1 FROM durable_turns owner
                    WHERE owner.conversation_id = durable_turns.conversation_id
@@ -1251,7 +1262,8 @@ impl WorkflowRepository {
         let rows = sqlx::query(
             "SELECT durable_turns.turn_id, durable_turns.workflow_id,
                     durable_turns.conversation_id, durable_turns.prepared_fingerprint,
-                    durable_turns.prepared_payload
+                    durable_turns.prepared_payload, durable_turns.input_kind,
+                    durable_turns.materialized, durable_turns.goal_start_id, durable_turns.canonical_message_id
              FROM durable_turns
              JOIN conversations ON conversations.id = durable_turns.conversation_id
              JOIN product_conversations product
@@ -1273,7 +1285,7 @@ impl WorkflowRepository {
                  OR (product.kind <> 'ordinary' AND conversations.archived = 0)
                )
                AND terminal_kind IS NULL
-               AND canonical_message_id IS NULL
+               AND materialized = 0
                AND workflow_id IS NOT NULL
                AND (durable_turns.turn_id > ?1 OR (durable_turns.turn_id = ?1 AND durable_turns.workflow_id > ?2))
              ORDER BY durable_turns.turn_id, durable_turns.workflow_id
@@ -1740,9 +1752,9 @@ impl WorkflowRepository {
         )
         .await?;
         let updated = sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1
                  WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NULL
-                   AND canonical_message_id IS NULL AND workflow_id = ?4",
+                   AND input_kind = 'message' AND materialized = 0 AND workflow_id = ?4",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(&message.message_id)
@@ -2871,7 +2883,7 @@ async fn load_exact_rearmed_turn_tx(
                AND (
                    (w.status = 'Active' AND t.terminal_kind IS NULL
                     AND e.status IN ('Eligible', 'Executing'))
-                   OR t.canonical_message_id IS NOT NULL
+                   OR t.materialized = 1
                    OR e.status = 'Completed'
                )
          )",
@@ -3381,6 +3393,13 @@ async fn load_prepared_turn_from_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> DbResult<PreparedTurn> {
     let conversation = ConversationAuthority(row.get("conversation_id"));
+    if let Some(start) = prepared_goal_start(
+        &conversation,
+        &row.try_get::<String, _>("prepared_fingerprint")?,
+        &row_materialization(row)?,
+    )? {
+        return Ok(start);
+    }
     let payload = load_prepared_payload_pool(
         pool,
         TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
@@ -4104,13 +4123,51 @@ fn row_to_turn_stub(
             .map_err(|e| DbError::Serialization(e.to_string()))?,
         to_u64(row.get("generation"), "generation")?,
         lifecycle,
-        row.get::<Option<String>, _>("canonical_message_id").map_or(
-            Materialization::Unmaterialized,
-            |message_id| Materialization::Materialized {
-                message_id: CanonicalMessageId(message_id),
-            },
-        ),
+        row_materialization(&row)?,
     ))
+}
+
+fn row_materialization(row: &sqlx::sqlite::SqliteRow) -> DbResult<Materialization> {
+    let kind: String = row.try_get("input_kind")?;
+    let materialized: i64 = row.try_get("materialized")?;
+    let message: Option<String> = row.try_get("canonical_message_id")?;
+    let start: Option<i64> = row.try_get("goal_start_id")?;
+    match (kind.as_str(), materialized, message, start) {
+        ("message", 0, None, None) => Ok(Materialization::Unmaterialized),
+        ("message", 1, Some(message), None) => Ok(Materialization::Materialized {
+            message_id: CanonicalMessageId(message),
+        }),
+        ("goal_start", value @ (0 | 1), None, Some(start)) => {
+            let receipt = GoalStartReceiptId::new(to_u64(start, "goal_start_id")?)
+                .ok_or_else(|| conflict(TurnConflict::CorruptAggregate("invalid Start receipt")))?;
+            Ok(if value == 0 {
+                Materialization::UnmaterializedGoalStart { receipt }
+            } else {
+                Materialization::MaterializedGoalStart { receipt }
+            })
+        }
+        _ => Err(conflict(TurnConflict::CorruptAggregate(
+            "canonical input materialization truth table",
+        ))),
+    }
+}
+
+fn prepared_goal_start(
+    conversation: &ConversationAuthority,
+    fingerprint: &str,
+    materialization: &Materialization,
+) -> DbResult<Option<PreparedTurn>> {
+    match materialization {
+        Materialization::UnmaterializedGoalStart { receipt }
+        | Materialization::MaterializedGoalStart { receipt } => {
+            let prepared = PreparedTurn::from_goal_start(conversation, *receipt);
+            if prepared.fingerprint() != fingerprint {
+                return Err(prepared_semantics_changed(&prepared));
+            }
+            Ok(Some(prepared))
+        }
+        Materialization::Unmaterialized | Materialization::Materialized { .. } => Ok(None),
+    }
 }
 
 async fn row_to_turn_tx(
@@ -4120,12 +4177,19 @@ async fn row_to_turn_tx(
     let fingerprint: String = row.get("prepared_fingerprint");
     let (id, conversation, client_key, generation, lifecycle, materialization) =
         row_to_turn_stub(row)?;
-    let prepared = load_prepared_payload_tx(tx, id).await?;
+    let prepared = match prepared_goal_start(&conversation, &fingerprint, &materialization)? {
+        Some(start) => start,
+        None => rehydrate_prepared_from_parts(
+            fingerprint,
+            &conversation,
+            &load_prepared_payload_tx(tx, id).await?,
+        )?,
+    };
     Ok(DurableTurn {
         id,
         conversation: conversation.clone(),
         client_key,
-        prepared: rehydrate_prepared_from_parts(fingerprint, &conversation, &prepared)?,
+        prepared,
         generation,
         lifecycle,
         materialization,
@@ -4143,16 +4207,20 @@ async fn row_to_turn_pool(
             .bind(to_i64(id.0, "turn_id")?)
             .fetch_one(pool)
             .await?;
-    let prepared = load_prepared_payload_pool(pool, id).await?;
+    let fingerprint: String = fingerprint_row.try_get("prepared_fingerprint")?;
+    let prepared = match prepared_goal_start(&conversation, &fingerprint, &materialization)? {
+        Some(start) => start,
+        None => rehydrate_prepared_from_parts(
+            fingerprint,
+            &conversation,
+            &load_prepared_payload_pool(pool, id).await?,
+        )?,
+    };
     Ok(DurableTurn {
         id,
         conversation: conversation.clone(),
         client_key,
-        prepared: rehydrate_prepared_from_parts(
-            fingerprint_row.get("prepared_fingerprint"),
-            &conversation,
-            &prepared,
-        )?,
+        prepared,
         generation,
         lifecycle,
         materialization,
@@ -7270,7 +7338,7 @@ mod tests {
         .await
         .unwrap();
         assert!(sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2 WHERE turn_id = ?1",
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1 WHERE turn_id = ?1",
         )
         .bind(i64::try_from(turn_id.0).unwrap())
         .bind(canonical_message_id("conv-b", "foreign-message"))
@@ -8067,7 +8135,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.prepared.payload(), historical);
+        assert_eq!(loaded.prepared.message_payload().unwrap(), historical);
         assert_eq!(loaded.prepared.fingerprint(), original_fingerprint);
         let mut retry = payload.submitted.clone();
         if let InputOrigin::InternalConversation { source_call, .. } = &mut retry.origin {
@@ -8710,7 +8778,8 @@ mod tests {
         let input = input("conv-replay", "client", 31);
         repo.accept_authoritative_turn(&input).await.unwrap();
         let mut changed_delivery =
-            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload()).unwrap();
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap();
         changed_delivery.delivery.llm_text = Some("changed expansion".to_string());
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
@@ -8730,9 +8799,10 @@ mod tests {
         let repo = repo().await;
         let input = input("conv-replay", "legacy-client", 31);
         repo.accept_authoritative_turn(&input).await.unwrap();
-        let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-            .unwrap()
-            .submitted;
+        let mut submitted =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap()
+                .submitted;
         assert_eq!(submitted.origin, InputOrigin::UnknownHistorical);
         submitted.origin = InputOrigin::UserApi;
         let replay = repo
@@ -8755,9 +8825,10 @@ mod tests {
         let repo = repo().await;
         let input = input("conv-replay", "conflict", 32);
         repo.accept_authoritative_turn(&input).await.unwrap();
-        let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-            .unwrap()
-            .submitted;
+        let mut submitted =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap()
+                .submitted;
         submitted.text.push_str(" changed");
         let err = repo
             .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
@@ -8776,12 +8847,16 @@ mod tests {
         let input_b = input("conv-b-scope", "same-key", 34);
         repo.accept_authoritative_turn(&input_a).await.unwrap();
         repo.accept_authoritative_turn(&input_b).await.unwrap();
-        let submitted_a = PreparedDirectTurnPayload::from_exact_bytes(input_a.prepared.payload())
-            .unwrap()
-            .submitted;
-        let submitted_b = PreparedDirectTurnPayload::from_exact_bytes(input_b.prepared.payload())
-            .unwrap()
-            .submitted;
+        let submitted_a = PreparedDirectTurnPayload::from_exact_bytes(
+            input_a.prepared.message_payload().unwrap(),
+        )
+        .unwrap()
+        .submitted;
+        let submitted_b = PreparedDirectTurnPayload::from_exact_bytes(
+            input_b.prepared.message_payload().unwrap(),
+        )
+        .unwrap()
+        .submitted;
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
                 input_a.conversation(),
@@ -8825,9 +8900,10 @@ mod tests {
             .execute(&repo.pool)
             .await
             .unwrap();
-        let submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-            .unwrap()
-            .submitted;
+        let submitted =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap()
+                .submitted;
         let err = repo
             .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
             .await

@@ -26,18 +26,27 @@ pub enum LoadedActiveDirectTurn {
         active: ActiveDirectTurn,
         canonical_message_id: String,
     },
+    GoalStart {
+        active: ActiveDirectTurn,
+        receipt: phoenix_workflow::GoalStartReceiptId,
+        materialized: bool,
+    },
 }
 
 impl LoadedActiveDirectTurn {
     pub const fn active(&self) -> &ActiveDirectTurn {
         match self {
-            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+            Self::Unmaterialized { active }
+            | Self::Materialized { active, .. }
+            | Self::GoalStart { active, .. } => active,
         }
     }
 
     pub fn into_active(self) -> ActiveDirectTurn {
         match self {
-            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+            Self::Unmaterialized { active }
+            | Self::Materialized { active, .. }
+            | Self::GoalStart { active, .. } => active,
         }
     }
 }
@@ -2301,6 +2310,20 @@ impl MessageStore for DatabaseStorage {
                 match turn.materialization {
                     phoenix_workflow::Materialization::Unmaterialized => {
                         LoadedActiveDirectTurn::Unmaterialized { active }
+                    }
+                    phoenix_workflow::Materialization::UnmaterializedGoalStart { receipt } => {
+                        LoadedActiveDirectTurn::GoalStart {
+                            active,
+                            receipt,
+                            materialized: false,
+                        }
+                    }
+                    phoenix_workflow::Materialization::MaterializedGoalStart { receipt } => {
+                        LoadedActiveDirectTurn::GoalStart {
+                            active,
+                            receipt,
+                            materialized: true,
+                        }
                     }
                     phoenix_workflow::Materialization::Materialized { message_id } => {
                         LoadedActiveDirectTurn::Materialized {

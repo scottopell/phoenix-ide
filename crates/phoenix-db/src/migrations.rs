@@ -12,6 +12,7 @@ use phoenix_core::work_scope::WorkScopeId;
 use super::{DbError, DbResult, ProjectSeedId};
 
 mod federated_subscriptions;
+mod goal_execution;
 mod local_goal_watch;
 mod retire_commission_review;
 mod settle_historical_continuation;
@@ -697,9 +698,15 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 136,
         name: "per_goal_execution_requests",
-        sql: include_str!("conversation_goals/execution_candidate.sql"),
+        sql: MIGRATION_136,
     },
 ];
+
+const MIGRATION_136: &str = concat!(
+    include_str!("conversation_goals/execution_candidate.sql"),
+    "\n",
+    include_str!("conversation_goals/start_candidate.sql"),
+);
 
 const MIGRATION_134: &str = concat!(
     include_str!("conversation_goals/control_candidate.sql"),
@@ -12185,6 +12192,11 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 136 {
+            goal_execution::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
         if migration.version == 135 {
             local_goal_watch::run(pool, migration).await?;
             applied += 1;

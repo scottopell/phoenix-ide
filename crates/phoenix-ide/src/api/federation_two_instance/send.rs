@@ -78,7 +78,7 @@ async fn stored_payload(receiver: &TestInstance, id: &str) -> PreparedDirectTurn
         .await
         .unwrap()
         .unwrap();
-    PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap()
+    PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.message_payload().unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -567,7 +567,10 @@ pub(super) async fn materialize_received(
         .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
             turn_id: turn.id,
             authority: claim.authority.unwrap(),
-            prepared: PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap(),
+            prepared: PreparedDirectTurnPayload::from_exact_bytes(
+                turn.prepared.message_payload().unwrap(),
+            )
+            .unwrap(),
             sequence_id: instance
                 .state
                 .db

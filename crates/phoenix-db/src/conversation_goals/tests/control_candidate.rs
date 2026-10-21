@@ -23,6 +23,8 @@ fn conversation_goal_control_db_error_preserves_typed_admission() {
 
 async fn control_fixture() -> (tempfile::TempDir, Database) {
     let (dir, db) = fixture().await;
+    sqlx::query("ALTER TABLE durable_turns ADD COLUMN materialized INTEGER GENERATED ALWAYS AS (canonical_message_id IS NOT NULL) VIRTUAL")
+        .execute(db.pool()).await.unwrap();
     sqlx::raw_sql("ALTER TABLE product_conversations ADD COLUMN ordinary_lifecycle TEXT NOT NULL DEFAULT 'open' CHECK (ordinary_lifecycle IN ('open','history')); CREATE TABLE close_obligations (product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE, phase TEXT NOT NULL);")
         .execute(db.pool()).await.unwrap();
     sqlx::raw_sql(include_str!("../control_candidate.sql"))

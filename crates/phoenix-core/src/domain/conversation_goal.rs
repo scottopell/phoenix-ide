@@ -9,6 +9,9 @@ pub use execution::{
     GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalRequestLimit, GoalRequestPurpose,
 };
 
+mod start;
+pub use start::{GoalStartInput, GoalStartReceipt, GoalStartRequester};
+
 mod pending_management;
 pub use pending_management::{
     GoalCommandDisposition, GoalManagementRequest, GoalPendingManagement,

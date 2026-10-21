@@ -155,7 +155,9 @@ pub(crate) async fn captured_notification(
         .await
         .unwrap()
         .unwrap();
-    let prepared = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+    let prepared =
+        PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.message_payload().unwrap())
+            .unwrap();
     assert_private_absent(&serde_json::to_value(&prepared).unwrap());
     let now = chrono::Utc::now();
     let now_seconds = u64::try_from(now.timestamp()).unwrap();

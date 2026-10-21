@@ -8045,7 +8045,8 @@ impl Database {
                      AND owner.owns_conversation = 1
                      AND owner.terminal_kind IS NULL
                      AND (
-                         owner.canonical_message_id IS NULL
+                         owner.input_kind = 'goal_start'
+                         OR owner.materialized = 0
                          OR canonical.sequence_id > occurrence_source.sequence_id
                      )
                )",
@@ -11969,7 +11970,7 @@ impl Database {
                AND t.disposition = 'Runtime'
                AND t.owns_conversation = 1
                AND t.terminal_kind IS NULL
-               AND t.canonical_message_id IS NOT NULL
+               AND t.materialized = 1
              ORDER BY c.created_at, c.id",
         )
         .fetch_all(&self.pool)
@@ -11992,7 +11993,7 @@ impl Database {
                  AND t.disposition = 'Runtime'
                  AND t.owns_conversation = 1
                  AND t.terminal_kind IS NULL
-                 AND t.canonical_message_id IS NOT NULL
+                 AND t.materialized = 1
              )",
         )
         .bind(conversation_id)
@@ -12117,7 +12118,7 @@ impl Database {
                            SELECT 1 FROM durable_turns t
                            WHERE t.conversation_id = conversations.id
                              AND t.owns_conversation = 1
-                             AND t.canonical_message_id IS NOT NULL
+                             AND t.materialized = 1
                              AND t.terminal_kind IS NULL
                        )
                        OR EXISTS (

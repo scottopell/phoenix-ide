@@ -54,11 +54,32 @@ pub struct TurnAuthorityId(pub u64);
 )]
 pub struct CanonicalMessageId(pub String);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalStartReceiptId(u64);
+
+impl GoalStartReceiptId {
+    #[must_use]
+    pub fn new(value: u64) -> Option<Self> {
+        (value > 0 && i64::try_from(value).is_ok()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedTurnInput {
+    Message(Vec<u8>),
+    GoalStart(GoalStartReceiptId),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTurn {
     target: ConversationAuthority,
     fingerprint: String,
-    payload: Vec<u8>,
+    input: PreparedTurnInput,
 }
 
 impl PreparedTurn {
@@ -68,7 +89,18 @@ impl PreparedTurn {
         Self {
             target: target.clone(),
             fingerprint,
-            payload,
+            input: PreparedTurnInput::Message(payload),
+        }
+    }
+
+    #[must_use]
+    pub fn from_goal_start(target: &ConversationAuthority, receipt: GoalStartReceiptId) -> Self {
+        let fingerprint =
+            prepared_fingerprint(target, format!("goal-start:{}", receipt.get()).as_bytes());
+        Self {
+            target: target.clone(),
+            fingerprint,
+            input: PreparedTurnInput::GoalStart(receipt),
         }
     }
 
@@ -90,7 +122,7 @@ impl PreparedTurn {
         Ok(Self {
             target: target.clone(),
             fingerprint,
-            payload,
+            input: PreparedTurnInput::Message(payload),
         })
     }
 
@@ -105,8 +137,19 @@ impl PreparedTurn {
     }
 
     #[must_use]
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
+    pub fn input(&self) -> &PreparedTurnInput {
+        &self.input
+    }
+
+    /// # Errors
+    /// Refuses to reinterpret a message-free Start as chat bytes.
+    pub fn message_payload(&self) -> Result<&[u8], TurnConflict> {
+        match &self.input {
+            PreparedTurnInput::Message(payload) => Ok(payload),
+            PreparedTurnInput::GoalStart(_) => Err(TurnConflict::CorruptAggregate(
+                "Start has no message payload",
+            )),
+        }
     }
 }
 
@@ -155,6 +198,8 @@ pub enum TurnLifecycle {
 pub enum Materialization {
     Unmaterialized,
     Materialized { message_id: CanonicalMessageId },
+    UnmaterializedGoalStart { receipt: GoalStartReceiptId },
+    MaterializedGoalStart { receipt: GoalStartReceiptId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +251,11 @@ pub enum TurnCommand {
         expected_generation: u64,
         message_id: CanonicalMessageId,
     },
+    MaterializeGoalStart {
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        receipt: GoalStartReceiptId,
+    },
     Complete {
         turn_id: TurnAuthorityId,
         expected_generation: u64,
@@ -240,6 +290,12 @@ pub enum TurnOutcome {
     },
     MaterializationReplay {
         message_id: CanonicalMessageId,
+    },
+    GoalStartMaterialized {
+        receipt: GoalStartReceiptId,
+    },
+    GoalStartMaterializationReplay {
+        receipt: GoalStartReceiptId,
     },
     Terminal {
         generation: u64,
@@ -372,6 +428,11 @@ impl DurableTurnModel {
                 expected_generation,
                 message_id,
             } => self.materialize(turn_id, expected_generation, message_id),
+            TurnCommand::MaterializeGoalStart {
+                turn_id,
+                expected_generation,
+                receipt,
+            } => self.materialize_goal_start(turn_id, expected_generation, receipt),
             TurnCommand::Complete {
                 turn_id,
                 expected_generation,
@@ -450,6 +511,17 @@ impl DurableTurnModel {
                 "duplicate turn authority id",
             ));
         }
+        let materialization = match prepared.input() {
+            PreparedTurnInput::Message(_) => Materialization::Unmaterialized,
+            PreparedTurnInput::GoalStart(receipt)
+                if disposition == AcceptedDisposition::Runtime =>
+            {
+                Materialization::UnmaterializedGoalStart { receipt: *receipt }
+            }
+            PreparedTurnInput::GoalStart(_) => {
+                return Err(TurnConflict::CorruptAggregate("Start cannot be steering"))
+            }
+        };
         let turn = DurableTurn {
             id: turn_id,
             conversation: conversation.clone(),
@@ -457,7 +529,7 @@ impl DurableTurnModel {
             prepared,
             generation: 0,
             lifecycle: TurnLifecycle::Accepted { disposition },
-            materialization: Materialization::Unmaterialized,
+            materialization,
         };
         self.by_scoped_key.insert(scoped_key, turn_id);
         if disposition == AcceptedDisposition::Runtime {
@@ -525,6 +597,10 @@ impl DurableTurnModel {
                     owed_effects: Vec::new(),
                 })
             }
+            Materialization::UnmaterializedGoalStart { .. }
+            | Materialization::MaterializedGoalStart { .. } => Err(TurnConflict::CorruptAggregate(
+                "Start cannot materialize a message",
+            )),
             Materialization::Materialized {
                 message_id: canonical,
             } if canonical == &message_id => Ok(TurnStep {
@@ -539,6 +615,51 @@ impl DurableTurnModel {
                 canonical: canonical.clone(),
             }),
         }
+    }
+
+    fn materialize_goal_start(
+        &mut self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        receipt: GoalStartReceiptId,
+    ) -> Result<TurnStep, TurnConflict> {
+        let turn = self
+            .turns
+            .get_mut(&turn_id)
+            .ok_or(TurnConflict::UnknownTurn)?;
+        match (&turn.materialization, turn.prepared.input()) {
+            (
+                Materialization::MaterializedGoalStart { receipt: previous },
+                PreparedTurnInput::GoalStart(input),
+            ) if *previous == receipt && *input == receipt => {
+                return Ok(TurnStep {
+                    outcome: TurnOutcome::GoalStartMaterializationReplay { receipt },
+                    owed_effects: Vec::new(),
+                })
+            }
+            (
+                Materialization::UnmaterializedGoalStart { receipt: previous },
+                PreparedTurnInput::GoalStart(input),
+            ) if *previous == receipt && *input == receipt => {}
+            _ => {
+                return Err(TurnConflict::CorruptAggregate(
+                    "Start receipt or materialization kind changed",
+                ))
+            }
+        }
+        if turn.generation != expected_generation {
+            return Err(TurnConflict::StaleGeneration {
+                actual: turn.generation,
+            });
+        }
+        if !turn.is_live() {
+            return Err(TurnConflict::AlreadyTerminal);
+        }
+        turn.materialization = Materialization::MaterializedGoalStart { receipt };
+        Ok(TurnStep {
+            outcome: TurnOutcome::GoalStartMaterialized { receipt },
+            owed_effects: Vec::new(),
+        })
     }
 
     fn rearm(
@@ -557,7 +678,10 @@ impl DurableTurnModel {
                     disposition: AcceptedDisposition::Runtime
                 }
             )
-            && matches!(turn.materialization, Materialization::Unmaterialized)
+            && matches!(
+                turn.materialization,
+                Materialization::Unmaterialized | Materialization::UnmaterializedGoalStart { .. }
+            )
         {
             return if self.live_owner.get(&turn.conversation) == Some(&turn_id) {
                 Ok(TurnStep {
@@ -589,7 +713,10 @@ impl DurableTurnModel {
         if disposition != AcceptedDisposition::Runtime {
             return Err(TurnConflict::RearmRequiresRuntime);
         }
-        if !matches!(turn.materialization, Materialization::Unmaterialized) {
+        if !matches!(
+            turn.materialization,
+            Materialization::Unmaterialized | Materialization::UnmaterializedGoalStart { .. }
+        ) {
             return Err(TurnConflict::RearmRequiresUnmaterialized);
         }
         if let Some(owner) = self.live_owner.get(&turn.conversation).copied() {
@@ -689,6 +816,32 @@ impl DurableTurnModel {
             }
         }
         for turn in self.turns.values() {
+            let valid_input = match (turn.prepared.input(), &turn.materialization) {
+                (
+                    PreparedTurnInput::Message(_),
+                    Materialization::Unmaterialized | Materialization::Materialized { .. },
+                ) => true,
+                (
+                    PreparedTurnInput::GoalStart(input),
+                    Materialization::UnmaterializedGoalStart { receipt }
+                    | Materialization::MaterializedGoalStart { receipt },
+                ) => {
+                    input == receipt
+                        && matches!(
+                            turn.lifecycle,
+                            TurnLifecycle::Accepted {
+                                disposition: AcceptedDisposition::Runtime
+                            } | TurnLifecycle::Terminal {
+                                disposition: AcceptedDisposition::Runtime,
+                                ..
+                            }
+                        )
+                }
+                _ => false,
+            };
+            if !valid_input {
+                violations.insert("prepared input and materialization kind disagree");
+            }
             let scoped_key = (turn.conversation.clone(), turn.client_key.clone());
             if self.by_scoped_key.get(&scoped_key) != Some(&turn.id) {
                 violations.insert("scoped replay index disagrees with authoritative turn");
@@ -710,6 +863,99 @@ impl DurableTurnModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn message_free_start_materializes_once_without_canonical_message() {
+        let conversation = ConversationAuthority("goal-owner".to_string());
+        let receipt = GoalStartReceiptId::new(7).unwrap();
+        let prepared = PreparedTurn::from_goal_start(&conversation, receipt);
+        assert!(prepared.message_payload().is_err());
+        let mut model = DurableTurnModel::default();
+        model
+            .apply(TurnCommand::Accept {
+                turn_id: TurnAuthorityId(1),
+                conversation: conversation.clone(),
+                client_key: ClientTurnKey("start-key".to_string()),
+                prepared,
+                disposition: AcceptedDisposition::Runtime,
+            })
+            .unwrap();
+        assert_eq!(
+            model.turn(&TurnAuthorityId(1)).unwrap().materialization,
+            Materialization::UnmaterializedGoalStart { receipt }
+        );
+        assert!(model
+            .apply(TurnCommand::Materialize {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+                message_id: CanonicalMessageId("fake".to_string())
+            })
+            .is_err());
+        assert_eq!(
+            model
+                .apply(TurnCommand::MaterializeGoalStart {
+                    turn_id: TurnAuthorityId(1),
+                    expected_generation: 0,
+                    receipt
+                })
+                .unwrap()
+                .outcome,
+            TurnOutcome::GoalStartMaterialized { receipt }
+        );
+        assert_eq!(
+            model
+                .apply(TurnCommand::MaterializeGoalStart {
+                    turn_id: TurnAuthorityId(1),
+                    expected_generation: 0,
+                    receipt
+                })
+                .unwrap()
+                .outcome,
+            TurnOutcome::GoalStartMaterializationReplay { receipt }
+        );
+        model
+            .apply(TurnCommand::Cancel {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+            })
+            .unwrap();
+        assert!(model
+            .apply(TurnCommand::Rearm {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 1
+            })
+            .is_err());
+        assert!(model.invariant_violations().is_empty());
+    }
+
+    #[test]
+    fn start_cannot_be_steering_or_rehydrate_with_a_message_materialization() {
+        let conversation = ConversationAuthority("goal-owner".to_string());
+        let receipt = GoalStartReceiptId::new(8).unwrap();
+        let prepared = PreparedTurn::from_goal_start(&conversation, receipt);
+        let mut model = DurableTurnModel::default();
+        assert!(model
+            .apply(TurnCommand::Accept {
+                turn_id: TurnAuthorityId(1),
+                conversation: conversation.clone(),
+                client_key: ClientTurnKey("start-key".to_string()),
+                prepared: prepared.clone(),
+                disposition: AcceptedDisposition::Steering
+            })
+            .is_err());
+        let corrupt = DurableTurn {
+            id: TurnAuthorityId(1),
+            conversation,
+            client_key: ClientTurnKey("start-key".to_string()),
+            prepared,
+            generation: 0,
+            lifecycle: TurnLifecycle::Accepted {
+                disposition: AcceptedDisposition::Runtime,
+            },
+            materialization: Materialization::Unmaterialized,
+        };
+        assert!(DurableTurnModel::from_turns([corrupt]).is_err());
+    }
+
     use proptest::prelude::*;
 
     fn prepared(seed: u8) -> PreparedTurn {
@@ -737,7 +983,7 @@ mod tests {
             )
             .fingerprint()
         );
-        assert_eq!(prepared.payload(), b"abc");
+        assert_eq!(prepared.message_payload().unwrap(), b"abc");
         assert!(PreparedTurn::rehydrate(
             &ConversationAuthority("conv-a".into()),
             prepared.fingerprint().to_string(),

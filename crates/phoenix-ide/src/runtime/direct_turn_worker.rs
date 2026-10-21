@@ -398,9 +398,14 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         let Some(authority) = claim.authority else {
             return Ok(());
         };
-        let prepared = match PreparedDirectTurnPayload::from_exact_bytes(
-            candidate.prepared.payload(),
-        ) {
+        let prepared = match candidate
+            .prepared
+            .message_payload()
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                PreparedDirectTurnPayload::from_exact_bytes(bytes)
+                    .map_err(|error| error.to_string())
+            }) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let terminal = phoenix_workflow::TurnCommand::Fail {

@@ -328,7 +328,7 @@ impl Database {
             "SELECT t.workflow_id FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
              WHERE t.turn_id=? AND t.conversation_id=? AND t.generation=?
              AND t.disposition='Runtime' AND t.owns_conversation=1 AND t.terminal_kind IS NULL
-             AND t.canonical_message_id IS NOT NULL AND c.parent_conversation_id IS NULL
+             AND t.materialized=1 AND c.parent_conversation_id IS NULL
              AND c.continued_in_conv_id IS NULL",
         )
         .bind(turn)

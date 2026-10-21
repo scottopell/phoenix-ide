@@ -753,6 +753,10 @@ impl SendChatApplicationService {
                                     SendChatOutcome::Delivered
                                 }
                             }
+                            Materialization::UnmaterializedGoalStart { .. }
+                            | Materialization::MaterializedGoalStart { .. } => {
+                                return Err(SendChatServiceError::IdempotencyConflict)
+                            }
                             Materialization::Materialized { .. } => {
                                 SendChatOutcome::AlreadyPersisted
                             }
@@ -975,6 +979,10 @@ async fn lookup_durable_replay(
                 } else {
                     Ok(DurableReplayOutcome::ExactUnmaterializedLive)
                 }
+            }
+            Materialization::UnmaterializedGoalStart { .. }
+            | Materialization::MaterializedGoalStart { .. } => {
+                Err(SendChatServiceError::IdempotencyConflict)
             }
             Materialization::Materialized { .. } => Ok(DurableReplayOutcome::ExactMaterialized),
         },
