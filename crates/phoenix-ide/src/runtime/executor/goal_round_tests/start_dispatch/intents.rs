@@ -20,10 +20,20 @@ async fn checkpoint_latest(
     )
     .unwrap();
     let mut tx = db.pool().begin().await.unwrap();
+    let claim_generation: i64 = sqlx::query_scalar(
+        "SELECT generation FROM durable_turns WHERE turn_id=? AND workflow_id=?
+         AND disposition='Runtime' AND terminal_kind IS NULL AND owns_conversation=1",
+    )
+    .bind(receipt.execution().turn_id())
+    .bind(receipt.execution().workflow_id())
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
     phoenix_db::conversation_goals::execution::checkpoint_request_tx(
         &mut tx,
         db.goal_execution_installation(),
         &intent,
+        claim_generation,
         &text("test-owned-response-checkpoint"),
     )
     .await
