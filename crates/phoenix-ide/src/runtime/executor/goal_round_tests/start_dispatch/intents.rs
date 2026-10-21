@@ -98,8 +98,6 @@ async fn conversation_goal_real_normal_successor_requires_durable_checkpoint_and
             deadline_at: now + chrono::Duration::seconds(60),
             logical_request_id: initial.clone(),
             model_id: rt.context.model_id.clone(),
-            settings: rt.context.settings.clone(),
-            throttle_resets_at: None,
         },
     };
     db.update_conversation_state(CONVERSATION, &rt.state)
