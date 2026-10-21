@@ -292,6 +292,19 @@ same focused step retains seven minutes, two test threads, existing admission,
 and full artifact evidence. This extends future selection; it does not claim
 execution or passing coverage for tests skipped by the preceding run.
 
+The subsequent partial Start diagnostic selects `migrations::goal_execution::`
+and the two exact pure-model tests
+`direct_turn::tests::message_free_start_materializes_once_without_canonical_message`
+and `direct_turn::tests::start_cannot_be_steering_or_rehydrate_with_a_message_materialization`.
+The actual pure test names do not contain `goal_start`, so a `goal_start` substring
+alone would silently skip them. Expanded selector SHA-256 is
+`736e43fadd8dd8feb198934d99a089b718c609ca4ad755b93d01f9e2c8e901d0`;
+stripping only these additions recovers `c48b9059...f6f5d5a`, then stripping the
+prior watch additions recovers `2783437b...13204a` byte-for-byte. The existing
+seven-minute/two-thread lane, caches, runners and qualification policy are
+unchanged. This is selection provenance only; no new execution result or floor
+is claimed.
+
 These source/selector/test corrections are **UNRUN**. Only direct rustfmt on the
 two owned Rust test files, source/hash/byte comparisons and whitespace inspection
 ran locally. No Cargo/compiler/tests/SQL/CI/push or service installation ran;

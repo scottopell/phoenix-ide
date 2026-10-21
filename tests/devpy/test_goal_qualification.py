@@ -245,6 +245,14 @@ class GoalQualificationTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         expression = next(line for line in workflow.splitlines() if "goal_filter='test(/conversation_goal" in line).split("'")[1]
         self.assertEqual(self.helper.digest(expression.encode()),
+                         "736e43fadd8dd8feb198934d99a089b718c609ca4ad755b93d01f9e2c8e901d0")
+        expression = expression.replace(
+            "migrations::goal_execution::|direct_turn::tests::("
+            "message_free_start_materializes_once_without_canonical_message|"
+            "start_cannot_be_steering_or_rehydrate_with_a_message_materialization)|",
+            "",
+        )
+        self.assertEqual(self.helper.digest(expression.encode()),
                          "c48b9059938ada212c42e489a65914b3600d1bdcdb31734a152ed587bb6f5d5a")
         expression = expression.replace(
             "coordinator_watches::goal_facts::|migrations::local_goal_watch::|"
