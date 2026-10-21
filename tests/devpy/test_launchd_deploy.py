@@ -5185,8 +5185,8 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
         self.active.unlink()
         self.assertTrue(self.dev._markerless_status_is_resolved(status))
         self.assertIsNone(self.dev._markerless_operation_refusal())
-        claimed = self.dev._claim_launchd_deploy("replacement")
-        self.assertEqual(claimed.transaction_id, "replacement")
+        self.dev._claim_launchd_deploy("replacement")
+        self.assertEqual(self.active.read_text().strip(), "replacement")
         self.dev._release_launchd_deploy_claim("replacement")
 
         for malformed in (
