@@ -36,6 +36,11 @@ impl GoalManagementTarget {
 #[derive(Clone, Copy)]
 pub enum GoalManagementRoundKind<'a> {
     Runtime,
+    AdmittedRequest {
+        admitted: &'a crate::workflow::AdmittedGoalRequest,
+        source: &'a phoenix_core::domain::sm_state::ConvState,
+        source_updated_at: chrono::DateTime<chrono::Utc>,
+    },
     Fork(&'a crate::ForkProposal),
     Terminal(&'a crate::workflow::DirectTurnTerminalObligationInput),
 }
@@ -60,6 +65,36 @@ impl Database {
             targets,
         };
         match kind {
+            GoalManagementRoundKind::AdmittedRequest {
+                admitted,
+                source,
+                source_updated_at,
+            } => {
+                use super::request_checkpoint::{
+                    GoalRequestCheckpoint, GoalRequestCheckpointOutcome, GoalRequestEvidence,
+                };
+                match self
+                    .commit_goal_request_checkpoint(&GoalRequestCheckpoint {
+                        admitted,
+                        source,
+                        source_updated_at,
+                        assistant: checkpoint.assistant,
+                        evidence: GoalRequestEvidence::Round {
+                            results: checkpoint.results,
+                            management_targets: targets,
+                        },
+                        state: checkpoint.state,
+                        state_updated_at: checkpoint.state_updated_at,
+                        provider_replay: replay,
+                    })
+                    .await?
+                {
+                    GoalRequestCheckpointOutcome::Committed(committed) => Ok(committed),
+                    GoalRequestCheckpointOutcome::Refused => Err(crate::DbError::Serialization(
+                        "admitted Coordinator request checkpoint refused".into(),
+                    )),
+                }
+            }
             GoalManagementRoundKind::Runtime => {
                 if let Some(replay) = replay {
                     return self
@@ -198,6 +233,80 @@ impl Database {
         Ok(retained)
     }
 
+    /// Resolve a canonical Coordinator's adopted Start from its actual dispatch receipt.
+    ///
+    /// # Errors
+    /// Refuses mismatched, checkpointed, stale, non-Coordinator or revoked requests.
+    pub async fn goal_management_admitted_execution(
+        &self,
+        transcript: &str,
+        message: &str,
+        admitted: &crate::workflow::AdmittedGoalRequest,
+        source_slot: (
+            &phoenix_core::domain::sm_state::ConvState,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    ) -> Result<(ProductConversationId, GoalExecution)> {
+        let request = admitted.intent();
+        if message != request.id.as_str() {
+            return Err(GoalDbError::BindingConflict);
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let retained = super::execution::retained_request_tx(
+            &mut tx,
+            self.goal_execution_installation,
+            request,
+        )
+        .await
+        .map_err(|error| GoalDbError::Projection(error.to_string()))?
+        .ok_or(GoalDbError::BindingConflict)?;
+        if retained.checkpoint.is_some() {
+            return Err(GoalDbError::BindingConflict);
+        }
+        super::execution::require_live_request_tx(&mut tx, request, transcript)
+            .await
+            .map_err(|error| GoalDbError::Projection(error.to_string()))?;
+        let row = sqlx::query("SELECT c.product_conversation_id,c.state,c.state_updated_at FROM conversations c
+            JOIN product_conversations p ON p.id=c.product_conversation_id
+            JOIN durable_turns t ON t.conversation_id=c.id
+            JOIN workflows w ON w.workflow_id=t.workflow_id
+            JOIN conversation_goal_start_materializations a ON a.start_id=t.goal_start_id
+              AND a.workflow_id=t.workflow_id AND a.turn_id=t.turn_id
+            WHERE c.id=? AND c.coordinator_head=1 AND c.runtime_role='coordinator' AND p.kind='coordinator'
+              AND t.turn_id=? AND t.workflow_id=? AND t.generation=? AND w.generation=t.generation
+              AND w.status='Active' AND t.input_kind='goal_start' AND t.materialized=1
+              AND t.disposition='Runtime' AND t.owns_conversation=1 AND t.terminal_kind IS NULL
+              AND NOT EXISTS(SELECT 1 FROM direct_turn_terminal_obligations o WHERE o.turn_id=t.turn_id)")
+            .bind(transcript).bind(request.execution.turn_id()).bind(request.execution.workflow_id())
+            .bind(admitted.claim_generation()).fetch_optional(&mut *tx).await?
+            .ok_or(GoalDbError::BindingConflict)?;
+        let state: phoenix_core::domain::sm_state::ConvState =
+            serde_json::from_str(&row.get::<String, _>("state"))
+                .map_err(|error| GoalDbError::Projection(error.to_string()))?;
+        let exact_source_slot = &state == source_slot.0
+            && row.get::<String, _>("state_updated_at") == source_slot.1.to_rfc3339();
+        let source_is_owned = exact_source_slot
+            && match &state {
+                phoenix_core::domain::sm_state::ConvState::LlmRequesting { .. }
+                | phoenix_core::domain::sm_state::ConvState::ServerOverloadRetrying { .. } => {
+                    source_slot.1 == admitted.state_updated_at()
+                }
+                phoenix_core::domain::sm_state::ConvState::ToolExecuting {
+                    assistant_message,
+                    ..
+                } => assistant_message.message_id == message,
+                _ => false,
+            };
+        if !source_is_owned {
+            return Err(GoalDbError::BindingConflict);
+        }
+        let owner = super::product(row.get("product_conversation_id"))?;
+        if owner != request.goal.owner {
+            return Err(GoalDbError::BindingConflict);
+        }
+        Ok((owner, request.execution))
+    }
+
     /// Resolve only the canonical Coordinator's live, generation-fenced Runtime turn.
     ///
     /// # Errors
@@ -241,7 +350,32 @@ pub(super) async fn verify_source_tx(
     }
     let generation =
         i64::try_from(intent.generation()).map_err(|_| GoalDbError::BindingConflict)?;
-    let found: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages m
+    let input_kind: String = sqlx::query_scalar(
+        "SELECT input_kind FROM durable_turns WHERE turn_id=? AND workflow_id=?",
+    )
+    .bind(execution.turn_id())
+    .bind(execution.workflow_id())
+    .fetch_one(&mut **tx)
+    .await?;
+    let found: bool = if input_kind == "goal_start" {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages m
+            JOIN conversations c ON c.id=m.conversation_id
+            JOIN product_conversations p ON p.id=c.product_conversation_id
+            JOIN durable_turns t ON t.conversation_id=c.id
+            JOIN conversation_goal_start_materializations a ON a.start_id=t.goal_start_id
+              AND a.workflow_id=t.workflow_id AND a.turn_id=t.turn_id
+            JOIN conversation_goal_requests r ON r.request_id=m.message_id
+              AND r.workflow_id=t.workflow_id AND r.turn_id=t.turn_id AND r.owner_id=c.product_conversation_id
+            WHERE m.message_id=? AND m.conversation_id=? AND m.message_type='agent'
+              AND c.product_conversation_id=? AND c.runtime_role='coordinator' AND p.kind='coordinator'
+              AND t.input_kind='goal_start' AND t.materialized=1 AND t.turn_id=? AND t.workflow_id=?
+              AND r.generation<=? AND (?=0 OR (c.coordinator_head=1 AND t.generation=?
+                AND t.disposition='Runtime' AND t.owns_conversation=1 AND t.terminal_kind IS NULL)))")
+            .bind(source.message_id.as_str()).bind(source.transcript_id.as_str())
+            .bind(source.product_conversation_id.as_str()).bind(execution.turn_id()).bind(execution.workflow_id())
+            .bind(generation).bind(i64::from(live)).bind(generation).fetch_one(&mut **tx).await?
+    } else {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages m
         JOIN conversations c ON c.id=m.conversation_id
         JOIN product_conversations p ON p.id=c.product_conversation_id
         JOIN durable_turns t ON t.conversation_id=c.id
@@ -253,7 +387,8 @@ pub(super) async fn verify_source_tx(
         .bind(source.message_id.as_str()).bind(source.transcript_id.as_str())
         .bind(source.product_conversation_id.as_str()).bind(execution.turn_id())
         .bind(execution.workflow_id()).bind(i64::from(live)).bind(generation)
-        .fetch_one(&mut **tx).await?;
+        .fetch_one(&mut **tx).await?
+    };
     if !found {
         return Err(GoalDbError::BindingConflict);
     }

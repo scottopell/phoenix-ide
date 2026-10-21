@@ -10,6 +10,8 @@ use phoenix_db::conversation_goals::{
 use phoenix_db::workflow::ClaimAuthoritativeTurnInput;
 use phoenix_workflow::{LeaseExpiry, ProcessIncarnation, WorkflowId};
 
+#[path = "start_dispatch/checkpoints.rs"]
+mod checkpoints;
 #[path = "start_dispatch/intents.rs"]
 mod intents;
 

@@ -1,3 +1,4 @@
+mod checkpoint;
 mod recovery;
 
 use super::*;

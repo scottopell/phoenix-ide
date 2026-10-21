@@ -19,6 +19,27 @@ pub struct AdmittedGoalRequest {
 }
 
 impl AdmittedGoalRequest {
+    /// Report binding for this exact retained request's immutable execution/goal.
+    ///
+    /// # Errors
+    /// Invalid retained goal version or owner identity.
+    pub fn report_binding(
+        &self,
+    ) -> Result<
+        phoenix_core::domain::conversation_goal::GoalReportBinding,
+        phoenix_core::domain::conversation_goal::GoalError,
+    > {
+        use phoenix_core::domain::conversation_goal::{
+            GoalAdmissionObservation, GoalExecutionBinding,
+        };
+        GoalExecutionBinding {
+            owner: self.intent.goal.owner.clone(),
+            execution: self.intent.execution,
+            observation: GoalAdmissionObservation::Goal(self.intent.goal.clone()),
+        }
+        .try_into()
+    }
+
     #[must_use]
     pub fn intent(&self) -> &GoalRequestIntent {
         &self.intent
@@ -42,6 +63,11 @@ pub struct GoalStartRequestContext {
 }
 
 impl GoalStartRequestContext {
+    #[must_use]
+    pub fn into_admitted(self) -> AdmittedGoalRequest {
+        self.admitted
+    }
+
     #[must_use]
     pub fn admitted(&self) -> &AdmittedGoalRequest {
         &self.admitted

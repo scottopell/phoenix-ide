@@ -75,6 +75,56 @@ impl GoalManagementService {
             .goal_management_execution(transcript, turn_id, turn.generation)
             .await
             .map_err(|error| error.to_string())?;
+        Self::pending_management(
+            (owner, execution, turn.generation),
+            transcript,
+            message,
+            tool_use,
+            request,
+        )
+    }
+
+    pub(crate) async fn prepare_admitted_request(
+        &self,
+        transcript: &str,
+        admitted: &phoenix_db::workflow::AdmittedGoalRequest,
+        source_slot: (
+            &phoenix_core::domain::sm_state::ConvState,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        message: &str,
+        tool_use: &str,
+        request: phoenix_core::domain::conversation_goal::GoalManagementRequest,
+    ) -> Result<GoalPendingManagement, String> {
+        let runtime = self.runtime.upgrade().ok_or("management runtime closed")?;
+        let (owner, execution) = runtime
+            .db()
+            .goal_management_admitted_execution(transcript, message, admitted, source_slot)
+            .await
+            .map_err(|error| error.to_string())?;
+        let generation =
+            u64::try_from(admitted.claim_generation()).map_err(|error| error.to_string())?;
+        Self::pending_management(
+            (owner, execution, generation),
+            transcript,
+            message,
+            tool_use,
+            request,
+        )
+    }
+
+    fn pending_management(
+        authority: (
+            phoenix_core::domain::product_conversation::ProductConversationId,
+            phoenix_core::domain::conversation_goal::GoalExecution,
+            u64,
+        ),
+        transcript: &str,
+        message: &str,
+        tool_use: &str,
+        request: phoenix_core::domain::conversation_goal::GoalManagementRequest,
+    ) -> Result<GoalPendingManagement, String> {
+        let (owner, execution, generation) = authority;
         let source = GoalAgentSource {
             product_conversation_id: owner,
             execution,
@@ -82,7 +132,7 @@ impl GoalManagementService {
             message_id: GoalText::parse(message).map_err(|error| error.to_string())?,
             tool_use_id: GoalText::parse(tool_use).map_err(|error| error.to_string())?,
         };
-        Ok(GoalPendingManagement::new(source, turn.generation, request))
+        Ok(GoalPendingManagement::new(source, generation, request))
     }
 
     pub(crate) async fn checkpoint(

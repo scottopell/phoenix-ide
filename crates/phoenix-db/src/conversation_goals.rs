@@ -18,6 +18,7 @@ pub(crate) mod checkpoint;
 pub mod control;
 pub mod execution;
 pub mod management;
+pub mod request_checkpoint;
 pub mod round;
 pub mod start;
 pub mod user_commands;

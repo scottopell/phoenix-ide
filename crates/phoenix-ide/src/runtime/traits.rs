@@ -138,6 +138,26 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn goal_request_completion_is_current(
+        &self,
+        _admitted: &phoenix_db::workflow::AdmittedGoalRequest,
+        _transcript: &str,
+        _state: &ConvState,
+        _stamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        Err("storage does not own admitted Goal response validation".into())
+    }
+
+    async fn commit_goal_request_checkpoint(
+        &self,
+        _command: &phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+    ) -> Result<
+        phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpointOutcome,
+        String,
+    > {
+        Err("storage does not own admitted Goal request checkpoints".into())
+    }
+
     async fn admit_goal_start_request_context(
         &self,
         conversation_id: &str,
@@ -905,6 +925,28 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn goal_request_completion_is_current(
+        &self,
+        admitted: &phoenix_db::workflow::AdmittedGoalRequest,
+        transcript: &str,
+        state: &ConvState,
+        stamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        (**self)
+            .goal_request_completion_is_current(admitted, transcript, state, stamp)
+            .await
+    }
+
+    async fn commit_goal_request_checkpoint(
+        &self,
+        command: &phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+    ) -> Result<
+        phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpointOutcome,
+        String,
+    > {
+        (**self).commit_goal_request_checkpoint(command).await
+    }
+
     async fn admit_goal_start_request_context(
         &self,
         conversation_id: &str,
@@ -1812,6 +1854,32 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn goal_request_completion_is_current(
+        &self,
+        admitted: &phoenix_db::workflow::AdmittedGoalRequest,
+        transcript: &str,
+        state: &ConvState,
+        stamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        self.db
+            .goal_request_completion_is_current(admitted, transcript, state, stamp)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn commit_goal_request_checkpoint(
+        &self,
+        command: &phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+    ) -> Result<
+        phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpointOutcome,
+        String,
+    > {
+        self.db
+            .commit_goal_request_checkpoint(command)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn admit_goal_start_request_context(
         &self,
         conversation_id: &str,

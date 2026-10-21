@@ -520,6 +520,75 @@ pub(super) async fn apply_replay_tx(
     Ok(())
 }
 
+pub(crate) async fn update_is_retained_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+) -> DbResult<bool> {
+    use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
+    match update {
+        ProviderReplayUpdate::Anthropic(expected) => {
+            let json: Option<String> = sqlx::query_scalar(
+                "SELECT payload FROM active_provider_replay_state WHERE conversation_id=?",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let Some(json) = json else {
+                return Ok(false);
+            };
+            let payload: AnthropicReplayPayload = serde_json::from_str(&json)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let expected = serde_json::to_value(expected)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            for set in payload.response_sets {
+                if serde_json::to_value(set)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?
+                    == expected
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ProviderReplayUpdate::Responses(expected) => {
+            let row: Option<(String,String,String)> = sqlx::query_as(
+                "SELECT model,owner_message_id,public_content FROM active_responses_replay_sets WHERE conversation_id=? AND response_id=?",
+            ).bind(conversation_id).bind(&expected.response_id).fetch_optional(&mut **tx).await?;
+            let Some((model, owner, public)) = row else {
+                return Ok(false);
+            };
+            let public: Vec<phoenix_core::domain::llm_types::ContentBlock> =
+                serde_json::from_str(&public)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT payload FROM active_responses_replay_items WHERE conversation_id=? AND response_id=? ORDER BY ordinal",
+            ).bind(conversation_id).bind(&expected.response_id).fetch_all(&mut **tx).await?;
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| serde_json::from_str(row))
+                .collect::<Result<_, _>>()
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            Ok(model == expected.model
+                && owner == expected.owner_message_id
+                && public == expected.public_content
+                && items == expected.output_items)
+        }
+        ProviderReplayUpdate::Clear => {
+            let retained: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                SELECT 1 FROM active_provider_replay_state WHERE conversation_id=?
+                UNION ALL SELECT 1 FROM active_responses_replay_sets WHERE conversation_id=?)",
+            )
+            .bind(conversation_id)
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            Ok(!retained)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,6 +46,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod continuation;
+mod goal_request_checkpoint;
+use goal_request_checkpoint::{
+    GoalRequestCompletion, GoalResponseMessage, PendingGoalRequestCheckpoint,
+};
 #[cfg(test)]
 mod provider_tool_policy_tests;
 #[cfg(test)]
@@ -2210,6 +2214,10 @@ where
     /// never leaks into the pure `EffectOutcome` type.
     llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
     llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
+    goal_request_completion_tx: mpsc::Sender<GoalRequestCompletion>,
+    goal_request_completion_rx: mpsc::Receiver<GoalRequestCompletion>,
+    active_goal_request_dispatch: Option<goal_request_checkpoint::GoalRequestDispatchSlot>,
+    pending_goal_request_checkpoint: Option<PendingGoalRequestCheckpoint>,
     terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
     /// Generation/epoch tag for the in-flight tool task, mirroring
@@ -2472,6 +2480,7 @@ where
         // them here, where the select loop discards superseded outcomes before
         // routing live ones into `process_outcome`.
         let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
+        let (goal_request_completion_tx, goal_request_completion_rx) = mpsc::channel(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
 
@@ -2522,6 +2531,10 @@ where
             llm_request_generation: 0,
             llm_outcome_tx,
             llm_outcome_rx,
+            goal_request_completion_tx,
+            goal_request_completion_rx,
+            active_goal_request_dispatch: None,
+            pending_goal_request_checkpoint: None,
             terminal_transition_retry: None,
             terminal_settlement_attempt: TerminalSettlementAttempt::Initial,
             tool_request_generation: 0,
@@ -3190,6 +3203,11 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
+                Some(completion) = self.goal_request_completion_rx.recv() => {
+                    if let Err(error) = self.process_goal_request_completion(completion).await {
+                        tracing::warn!(%error, "admitted Goal response refused");
+                    }
+                }
                 Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
                     self.process_generation_tagged_llm_outcome(generation, llm_outcome)
                         .await;
@@ -3504,6 +3522,22 @@ where
     /// are logged and discarded — state unchanged.
     #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        if let EffectOutcome::Llm(LlmOutcome::Response { request_id, .. }) = &outcome {
+            if matches!(
+                self.storage
+                    .load_active_direct_turn(&self.context.conversation_id)
+                    .await?,
+                Some(crate::runtime::traits::LoadedActiveDirectTurn::GoalStart { .. })
+            ) && !self
+                .pending_goal_request_checkpoint
+                .as_ref()
+                .is_some_and(|pending| pending.admitted.intent().id.as_str() == request_id)
+            {
+                return Err(
+                    "Start response has no matching actual-dispatch checkpoint receipt".into(),
+                );
+            }
+        }
         let cancelled_llm = matches!(
             &outcome,
             EffectOutcome::Llm(LlmOutcome::Cancelled | LlmOutcome::GoalControlRevoked)
@@ -3658,6 +3692,19 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        if matches!(event, Event::ContinuationResponse { .. })
+            && matches!(
+                self.storage
+                    .load_active_direct_turn(&self.context.conversation_id)
+                    .await?,
+                Some(crate::runtime::traits::LoadedActiveDirectTurn::GoalStart { .. })
+            )
+        {
+            self.enter_fatal_local_authority_loss(
+                "Start Summary completion has no canonical request checkpoint owner".into(),
+            );
+            return Err("Start Summary completion is held until its canonical request checkpoint owner is integrated".into());
+        }
         if self.fatal_local_authority_fence.is_closed()
             && self.handoff_completion_authority.is_none()
             && !matches!(event, Event::Shutdown)
@@ -4095,6 +4142,14 @@ where
                 self.pending_sub_agent_terminal = Some(sub_agent_terminal_cause(outcome));
             }
         }
+        let goal_checkpoint_transition = self.is_goal_checkpoint_transition(&result);
+        if goal_checkpoint_transition {
+            self.pending_direct_turn_terminal = None;
+            if let Some(pending) = self.pending_goal_request_checkpoint.as_mut() {
+                pending.source = self.state.clone();
+                pending.source_updated_at = self.state_updated_at;
+            }
+        }
         let terminal_direct_turn_transition = !self.context.is_sub_agent
             && self.active_direct_turn.is_some()
             && self.pending_direct_turn_terminal.is_some();
@@ -4193,6 +4248,8 @@ where
                 )
             });
             let publish = state_changed
+                && self.pending_goal_request_checkpoint.is_none()
+                && !goal_checkpoint_transition
                 && !will_drain_from_idle
                 && !will_commit_steering_drain
                 && !will_settle_creation
@@ -4388,6 +4445,16 @@ where
                 ) || (checkpoint_satisfies_persist_state
                     && !has_specialized_state_work);
                 let is_state_persist = satisfies_persist_state || checkpoint_commits_state;
+                if goal_checkpoint_transition && matches!(effect, Effect::PersistState) {
+                    if self.pending_goal_request_checkpoint.is_some() {
+                        return Err(
+                            "Goal state persistence preceded its canonical checkpoint".into()
+                        );
+                    }
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
+                    continue;
+                }
                 if redundant_approval_state_persist {
                     continue;
                 }
@@ -4793,13 +4860,15 @@ where
         // the await inside `run_effects_with_inline_drain`, which would cause a
         // concurrent `POST /chat` to route a `UserMessage` before the drain has
         // advanced the state back to `LlmRequesting` (FM-7).
-        if terminal_direct_turn_transition {
-            let _admitted = terminal_unit_admission
-                .as_deref_mut()
-                .expect("terminal direct-turn transition is admitted");
-            self.publish_live_state_admitted();
-        } else {
-            self.publish_live_state()?;
+        if !goal_checkpoint_transition && self.pending_goal_request_checkpoint.is_none() {
+            if terminal_direct_turn_transition {
+                let _admitted = terminal_unit_admission
+                    .as_deref_mut()
+                    .expect("terminal direct-turn transition is admitted");
+                self.publish_live_state_admitted();
+            } else {
+                self.publish_live_state()?;
+            }
         }
         Ok(generated_events)
     }
@@ -5010,7 +5079,7 @@ where
             let _ = activation.sender.send(());
         }
 
-        if broadcast {
+        if broadcast && self.pending_goal_request_checkpoint.is_none() {
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
@@ -6383,6 +6452,7 @@ where
 
     fn abort_active_llm_task(&mut self) {
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
+        self.active_goal_request_dispatch = None;
         if let Some(handle) = self.llm_task_handle.take() {
             handle.abort();
         }
@@ -6693,6 +6763,24 @@ where
                 idempotent,
                 origin,
             } => {
+                if self
+                    .pending_goal_request_checkpoint
+                    .as_ref()
+                    .is_some_and(|pending| pending.admitted.intent().id.as_str() == message_id)
+                {
+                    return self
+                        .persist_goal_response_message(
+                            GoalResponseMessage {
+                                content,
+                                display_data,
+                                usage_data,
+                                message_id,
+                                origin,
+                            },
+                            admitted,
+                        )
+                        .await;
+                }
                 // Idempotent recovery paths skip an already-persisted identity;
                 // ordinary message effects avoid the extra existence query.
                 if (idempotent
@@ -7727,6 +7815,11 @@ where
             }
 
             AuthoritativeEffect::BroadcastAssistantMessage { message } => {
+                if self.pending_goal_request_checkpoint.is_some() {
+                    tracing::debug!(message_id = %message.message_id,
+                        "holding admitted Goal assistant preview until checkpoint commit");
+                    return Ok(None);
+                }
                 #[cfg(test)]
                 if let Some(barrier) = self.semantic_publication_barrier.take() {
                     barrier.wait().await;
@@ -7808,6 +7901,9 @@ where
                 Ok(None)
             }
             ControlEffect::NotifyStateChange => {
+                if self.pending_goal_request_checkpoint.is_some() {
+                    return Ok(None);
+                }
                 let state = self.state.clone();
                 let state_name = state.variant_name();
                 let presentation_mode = state.presentation_mode().to_string();
@@ -8199,6 +8295,12 @@ where
         &mut self,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        if self.pending_goal_request_checkpoint.is_some() {
+            self.enter_fatal_local_authority_loss(
+                "next LLM dispatch attempted before admitted Goal checkpoint commit".into(),
+            );
+            return Err("admitted Goal response is not checkpointed".into());
+        }
         let goal_request_context = self
             .storage
             .admit_goal_start_request_context(
@@ -8544,7 +8646,16 @@ where
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // provider context are request authority, not task-local inputs.
         let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
-        if let Some(emitter) = self.parent_goal_report_emitter() {
+        let request_goal_report = goal_request_context
+            .as_ref()
+            .map(|context| context.admitted().report_binding())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .map(|binding| GoalReportEmitter { binding });
+        if let Some(emitter) = request_goal_report
+            .as_ref()
+            .or_else(|| self.parent_goal_report_emitter())
+        {
             if available_tools
                 .iter()
                 .any(|definition| definition.name == "goal_report")
@@ -8730,6 +8841,10 @@ where
             cache_key: PromptCacheKey::stable(&conv_id),
         };
 
+        let publish_response_progress = goal_request_context.is_none();
+        if !publish_response_progress {
+            tracing::debug!(%request_id, "holding admitted Goal response tokens until checkpoint commit");
+        }
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
         let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
@@ -8752,18 +8867,23 @@ where
                             first_text_seen = true;
                             let observed_at = Utc::now();
                             *first_byte_at_for_fwd.lock().await = Some(observed_at);
-                            let request_id_for_first = request_id_for_fwd.clone();
-                            let _ =
-                                broadcast_tx_for_tokens.send_seq(|seq| SseEvent::LlmFirstByte {
-                                    sequence_id: seq,
-                                    request_id: request_id_for_first,
+                            if publish_response_progress {
+                                let request_id_for_first = request_id_for_fwd.clone();
+                                let _ = broadcast_tx_for_tokens.send_seq(|seq| {
+                                    SseEvent::LlmFirstByte {
+                                        sequence_id: seq,
+                                        request_id: request_id_for_first,
+                                    }
                                 });
+                            }
                         }
-                        let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
-                            sequence_id: seq,
-                            text,
-                            request_id: request_id_for_fwd.clone(),
-                        });
+                        if publish_response_progress {
+                            let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
+                                sequence_id: seq,
+                                text,
+                                request_id: request_id_for_fwd.clone(),
+                            });
+                        }
                     }
                     Some(phoenix_llm::TokenChunk::RateLimitSnapshot(snapshot)) => {
                         let _ =
@@ -8967,11 +9087,33 @@ where
         // wedge the conversation, while the generation lets the select loop
         // drop a stale outcome from an intentionally-aborted request. See
         // `forward_llm_outcome`.
-        tokio::spawn(forward_llm_outcome(
-            llm_rx,
-            dispatch_generation,
-            llm_outcome_tx,
-        ));
+        if let Some(context) = goal_request_context {
+            let completion_tx = self.goal_request_completion_tx.clone();
+            self.active_goal_request_dispatch =
+                Some(goal_request_checkpoint::GoalRequestDispatchSlot::spawned(
+                    dispatch_generation,
+                    context.admitted(),
+                    self.state.clone(),
+                ));
+            tokio::spawn(async move {
+                let outcome = llm_rx.await.unwrap_or_else(|_| LlmOutcome::NetworkError {
+                    message: "admitted Goal request task dropped its outcome".into(),
+                });
+                let _ = completion_tx
+                    .send(GoalRequestCompletion {
+                        generation: dispatch_generation,
+                        admitted: context.into_admitted(),
+                        outcome,
+                    })
+                    .await;
+            });
+        } else {
+            tokio::spawn(forward_llm_outcome(
+                llm_rx,
+                dispatch_generation,
+                llm_outcome_tx,
+            ));
+        }
 
         Ok(None)
     }
@@ -9005,6 +9147,9 @@ where
     /// per-result `duration_ms` (`schema.rs:649`) takes over the
     /// display.
     fn broadcast_tool_start_timestamp(&self, tool_use_id: &str) {
+        if self.pending_goal_request_checkpoint.is_some() {
+            return;
+        }
         let assistant_message_id = match &self.state {
             ConvState::ToolExecuting {
                 assistant_message, ..
@@ -9082,6 +9227,9 @@ where
     async fn take_state_progress_replay(
         &mut self,
     ) -> Result<Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>, String> {
+        if self.pending_goal_request_checkpoint.is_some() {
+            return Ok(None);
+        }
         if self.pending_provider_replay_update.is_some()
             && Box::pin(self.management_checkpoint_owns_replay()).await?
         {
@@ -9136,14 +9284,9 @@ where
                     management.source().tool_use_id.as_str(),
                     management.request(),
                 )?;
-                let turn = self
-                    .active_direct_turn
-                    .as_deref()
-                    .ok_or("goal management has no active direct turn")?;
-                let verified = service
-                    .prepare(
-                        &self.context.conversation_id,
-                        turn,
+                let verified = self
+                    .prepare_management_request(
+                        service,
                         &assistant.message_id,
                         management.source().tool_use_id.as_str(),
                         management.request().clone(),
@@ -9165,18 +9308,7 @@ where
                 continue;
             };
             require_canonical_management_call(assistant, &call.id, &request)?;
-            let turn = self
-                .active_direct_turn
-                .as_deref()
-                .ok_or("goal management has no active direct turn")?;
-            service
-                .prepare(
-                    &self.context.conversation_id,
-                    turn,
-                    &assistant.message_id,
-                    &call.id,
-                    request,
-                )
+            self.prepare_management_request(service, &assistant.message_id, &call.id, request)
                 .await?;
             return Ok(true);
         }
@@ -9219,18 +9351,8 @@ where
             .goal_management
             .as_ref()
             .ok_or("goal management is not installed")?;
-        let turn = self
-            .active_direct_turn
-            .as_deref()
-            .ok_or("goal management has no active direct turn")?;
-        let management = service
-            .prepare(
-                &self.context.conversation_id,
-                turn,
-                &assistant_message.message_id,
-                &tool.id,
-                request,
-            )
+        let management = self
+            .prepare_management_request(service, &assistant_message.message_id, &tool.id, request)
             .await?;
         Ok(Event::GoalManagementPrepared {
             management,
@@ -9356,7 +9478,17 @@ where
             }));
         }
         if tool.name() == "goal_report" {
-            if let Some(emitter) = self.parent_goal_report_emitter() {
+            let request_goal_report = self
+                .pending_goal_request_checkpoint
+                .as_ref()
+                .map(|pending| pending.admitted.report_binding())
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .map(|binding| GoalReportEmitter { binding });
+            if let Some(emitter) = request_goal_report
+                .as_ref()
+                .or_else(|| self.parent_goal_report_emitter())
+            {
                 if request_schema != emitter.definition().input_schema {
                     return Ok(Some(Event::ToolComplete {
                         tool_use_id: tool.id.clone(),
@@ -9731,6 +9863,16 @@ where
             GoalManagementRoundKind::Terminal(obligation)
         } else if let Some(proposal) = proposal {
             GoalManagementRoundKind::Fork(proposal)
+        } else if let Some(pending) = &self.pending_goal_request_checkpoint {
+            if pending.generation != self.llm_request_generation {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err("management checkpoint lost actual dispatch generation".into());
+            }
+            GoalManagementRoundKind::AdmittedRequest {
+                admitted: &pending.admitted,
+                source: &pending.source,
+                source_updated_at: pending.source_updated_at,
+            }
         } else {
             GoalManagementRoundKind::Runtime
         };
@@ -9753,7 +9895,11 @@ where
             }
         };
         self.pending_provider_replay_update = None;
+        let goal_request_committed = self.pending_goal_request_checkpoint.take().is_some();
         self.install_live_state(committed.state, committed.state_updated_at, false)?;
+        if goal_request_committed {
+            self.publish_live_state_admitted();
+        }
         if settlement.is_some() {
             self.active_direct_turn = None;
             self.pending_direct_turn_terminal = None;
@@ -10199,6 +10345,17 @@ where
                     created_at: assistant_message.created_at,
                 };
 
+                if self
+                    .pending_goal_request_checkpoint
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.admitted.intent().id.as_str() == agent_msg.message_id
+                    })
+                {
+                    return self
+                        .persist_admitted_goal_tool_round(agent_msg, tool_results, admitted)
+                        .await;
+                }
                 if contains_pending_goal_result(&tool_results) {
                     return self
                         .persist_pending_goal_round(agent_msg, tool_results, None, None, admitted)
