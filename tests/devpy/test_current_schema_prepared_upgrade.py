@@ -3657,6 +3657,42 @@ sys.exit({7 if failure else 0})
         self.assertTrue(Path(manifest.active_path).exists())
         self.assertEqual(helper.database_ledger(database)[-1][0], 129)
 
+        observation = helper._capacity_observation_path(reservation)
+        self.assertIn(
+            "restore_capacity_cleanup_authorized_at",
+            json.loads(observation.read_text()),
+        )
+        self.assertFalse(reservation.restore_path.exists())
+
+        launchctl.reset_mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        with mock.patch.object(
+            helper, "__file__", manifest.current_schema_upgrade.controller_helper_path
+        ), mock.patch.object(helper, "assert_database_exclusive"), mock.patch.object(
+            helper.subprocess, "run", return_value=absence
+        ), mock.patch.object(
+            helper, "service_absence_confirmed", return_value=True
+        ), mock.patch.object(
+            helper, "Launchctl", return_value=launchctl
+        ), mock.patch.object(
+            helper, "require_loaded_plist"
+        ), mock.patch.object(
+            helper, "wait_for_identity"
+        ), mock.patch.object(
+            helper,
+            "_reservation_still_sufficient",
+            side_effect=AssertionError("released capacity must not be re-required"),
+        ), mock.patch.object(
+            helper,
+            "invoke_current_schema_candidate",
+            side_effect=AssertionError("migration must not rerun"),
+        ):
+            self.assertEqual(
+                helper.finalize_paired(manifest, current_schema=True), "committed"
+            )
+        self.assertFalse(Path(manifest.active_path).exists())
+
     def test_source128_pin_matches_immutable_candidate_merge(self) -> None:
         self.assertEqual(helper.PREPARED_SOURCE128_COMMIT, "d5513ee5d9453f66575a0d9161491fb49bcb0b67")
 

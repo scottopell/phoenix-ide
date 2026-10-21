@@ -11503,6 +11503,39 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     return None
 
 
+_EXACT_SOURCE128_PRECONDITION_STATUS_KEYS = {
+    "transaction_id", "state", "source_kind", "prepared_mode",
+    "source_commit", "release_commit", "release_tag", "expected_version",
+    "expected_git_sha", "created_at", "updated_at", "failure",
+    "finalization_pending", "rollback_failure",
+}
+
+
+def _exact_source128_precondition_failed_status(
+    status: dict[str, object], owner: str
+) -> bool:
+    return (
+        set(status) == _EXACT_SOURCE128_PRECONDITION_STATUS_KEYS
+        and status.get("transaction_id") == owner
+        and status.get("state") == "precondition_failed"
+        and status.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
+        and status.get("prepared_mode") == "current_schema"
+        and status.get("source_commit") == PREPARED_SOURCE128_COMMIT
+        and status.get("release_commit") is None
+        and status.get("release_tag") is None
+        and status.get("expected_version") == PREPARED_SOURCE128_VERSION
+        and status.get("expected_git_sha") == PREPARED_SOURCE128_COMMIT
+        and isinstance(status.get("created_at"), str)
+        and isinstance(status.get("updated_at"), str)
+        and isinstance(status.get("failure"), str)
+        and status.get("failure", "").endswith(
+            "preparation failed before handoff"
+        )
+        and status.get("finalization_pending") is False
+        and status.get("rollback_failure") is None
+    )
+
+
 def _markerless_status_is_resolved(status: dict[str, object]) -> bool:
     owner = status.get("transaction_id")
     exact_source128_evidence = False
@@ -11525,7 +11558,7 @@ def _markerless_status_is_resolved(status: dict[str, object]) -> bool:
                 return _exact_source128_published_completion(transaction)
             exact_source128_evidence = True
     if _status_claims_exact_source128(status) and not exact_source128_evidence:
-        return False
+        return _exact_source128_precondition_failed_status(status, owner)
     transaction_id = status.get("transaction_id")
     state = status.get("state")
     source_kind = status.get("source_kind")

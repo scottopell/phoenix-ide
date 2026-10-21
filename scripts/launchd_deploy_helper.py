@@ -2866,7 +2866,9 @@ def activate(manifest: Manifest) -> str:
                     prepared_candidate[1], Path(manifest.target_plist)
                 )
                 assert capacity_reservation is not None
-                release_capacity_reservation(manifest, capacity_reservation)
+                release_source128_capacity_reservation(
+                    manifest, capacity_reservation
+                )
                 write_status(manifest, "committed")
                 if not release_durable_terminal_claim(manifest, required_state="committed"):
                     raise ActivationError("source128 activation claim release was unconfirmed")
@@ -3080,6 +3082,33 @@ def abandon_capacity_reservation(
     ):
         raise ActivationError("capacity reservation does not belong to this transaction")
     _remove_capacity_files(*_owned_capacity_cleanup_paths(manifest, reservation))
+
+
+def _source128_capacity_cleanup_authorized(
+    manifest: Manifest, reservation: DatabaseCapacityReservation
+) -> bool:
+    evidence = _repair_json(_capacity_observation_path(reservation))
+    if evidence.get("transaction_id") != manifest.transaction_id:
+        raise ActivationError("source128 restore capacity evidence does not match")
+    value = evidence.get("restore_capacity_cleanup_authorized_at")
+    return isinstance(value, str) and bool(value)
+
+
+def release_source128_capacity_reservation(
+    manifest: Manifest, reservation: DatabaseCapacityReservation
+) -> None:
+    evidence_path = _capacity_observation_path(reservation)
+    evidence = _repair_json(evidence_path)
+    if evidence.get("transaction_id") != manifest.transaction_id:
+        raise ActivationError("source128 restore capacity evidence does not match")
+    if not _source128_capacity_cleanup_authorized(manifest, reservation):
+        evidence["restore_capacity_cleanup_authorized_at"] = utc_now()
+        atomic_write(
+            evidence_path,
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode(),
+            0o600,
+        )
+    release_capacity_reservation(manifest, reservation)
 
 
 def release_capacity_reservation(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
@@ -4025,7 +4054,11 @@ def finalize_source128(manifest: Manifest, private: Path) -> str:
             _restore_capacity_path(manifest, database),
             evidence["reserved_capacity_bytes"],
         )
-        _reservation_still_sufficient(manifest, reservation)
+        if not (
+            ledger == target
+            and _source128_capacity_cleanup_authorized(manifest, reservation)
+        ):
+            _reservation_still_sufficient(manifest, reservation)
         if ledger == source:
             run_current_schema_migration(manifest, reservation)
         else:
@@ -4058,8 +4091,13 @@ def finalize_source128(manifest: Manifest, private: Path) -> str:
         atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
         publication = prepare_plist_publication(private, Path(manifest.target_plist))
         publish_source128_plist(publication, Path(manifest.target_plist))
-        release_capacity_reservation(
-            manifest, DatabaseCapacityReservation(Path(current.backup_path), _restore_capacity_path(manifest, database), 0)
+        release_source128_capacity_reservation(
+            manifest,
+            DatabaseCapacityReservation(
+                Path(current.backup_path),
+                _restore_capacity_path(manifest, database),
+                0,
+            ),
         )
         write_status(manifest, "committed")
         if not release_durable_terminal_claim(manifest, required_state="committed"):

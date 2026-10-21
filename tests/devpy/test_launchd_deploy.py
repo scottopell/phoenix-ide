@@ -5163,6 +5163,42 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
                 self.assertIn("may run only the exact retained candidate migration", output.getvalue())
                 self.assertIn("no snapshot restore", output.getvalue())
 
+    def test_exact_source128_precondition_failure_allows_next_claim(self):
+        now = "2026-10-21T04:00:00+00:00"
+        status = {
+            "transaction_id": "protected",
+            "state": "precondition_failed",
+            "source_kind": "prepared_artifact",
+            "prepared_mode": "current_schema",
+            "source_commit": self.dev.PREPARED_SOURCE128_COMMIT,
+            "release_commit": None,
+            "release_tag": None,
+            "expected_version": self.dev.PREPARED_SOURCE128_VERSION,
+            "expected_git_sha": self.dev.PREPARED_SOURCE128_COMMIT,
+            "created_at": now,
+            "updated_at": now,
+            "failure": "RuntimeError: preparation failed before handoff",
+            "finalization_pending": False,
+            "rollback_failure": None,
+        }
+        self.status.write_text(json.dumps(status))
+        self.assertTrue(self.dev._markerless_status_is_resolved(status))
+        self.assertIsNone(self.dev._markerless_operation_refusal())
+        claimed = self.dev._claim_launchd_deploy("replacement")
+        self.assertEqual(claimed.transaction_id, "replacement")
+        self.dev._release_launchd_deploy_claim("replacement")
+
+        for malformed in (
+            status | {"unexpected": True},
+            {key: value for key, value in status.items() if key != "failure"},
+            status | {"expected_git_sha": "a" * 40},
+            status | {"failure": "migration failed after handoff"},
+        ):
+            with self.subTest(malformed=malformed):
+                self.status.write_text(json.dumps(malformed))
+                self.assertFalse(self.dev._markerless_status_is_resolved(malformed))
+                self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
     def test_exact_source128_claim_release_checkpoint_requires_explicit_strict_finalization(self):
         _payload, status = self.write_exact_source128_completion()
         self.assertTrue(self.dev._exact_source128_published_completion(self.staging))
