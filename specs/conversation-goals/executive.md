@@ -22,6 +22,26 @@ not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
 execution is claimed.
 
 
+## Exact b23 adoption diagnostic: compile blocked, not qualified
+
+Hosted [39562054668](https://github.com/scottopell/phoenix-ide/actions/runs/39562054668)
+on exact `b23baf18a75d8a323f2cf02362d801ebbb2fb5c3` failed compilation before
+focused tests or codegen (74.8s); artifact `12328840369` retains the diagnostic.
+Formatting passed (3.8s). The UI/spec lane passed 11/12 steps (122.4s), with the
+two actual-registry dev.py tests still expecting 136 as the tail. The seed/E2E
+build failure had the same compiler roots, not independent runtime evidence.
+No new generated exports or focused-test passes exist for this run.
+
+The bounded source correction covers the missing Start-effect arm in the mutable
+idempotency rewrite and replaces both runtime-formatted retained Start queries
+with literal-only `concat!` expansion plus bound values. It adds no SQL-safety
+waiver. The actual current-registry tests retain exact 136 membership and require
+the named 137 tail. Current Rust 131→current and 133→current upgrade counts and
+ledger/schema comparison now include 137; deliberate historical 136-prefix tests
+remain unchanged. Protected target-128 policy and parser grammar are untouched.
+These corrections are unqualified source; no local compiler, SQL, tests or
+codegen were run. The worker/producer hold and exact 66abc partial floor remain.
+
 ## Adoption review corrections: later source, unqualified
 
 The bounded review correction uses the actual ordinary retry **target** and

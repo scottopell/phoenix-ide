@@ -2320,7 +2320,8 @@ fn creation_provisioned_transition(
             | Effect::PersistAuthoritativeUserMessage { idempotent, .. } => {
                 *idempotent = true;
             }
-            Effect::PersistState
+            Effect::PersistAuthoritativeGoalStart { .. }
+            | Effect::PersistState
             | Effect::RequestLlm
             | Effect::CompleteCreation { .. }
             | Effect::MaterializeCreation { .. }

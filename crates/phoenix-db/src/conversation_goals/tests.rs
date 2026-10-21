@@ -1105,7 +1105,7 @@ async fn real_migrations_goal_binding_successful_report_and_hard_delete_remove_a
     }
 }
 
-async fn assert_current_136_schema_and_goal_ledger(reopened: &Database, baseline: &Database) {
+async fn assert_current_137_schema_and_goal_ledger(reopened: &Database, baseline: &Database) {
     let ledger: Vec<(i64, String)> =
         sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=132 ORDER BY version")
             .fetch_all(reopened.pool())
@@ -1119,6 +1119,7 @@ async fn assert_current_136_schema_and_goal_ledger(reopened: &Database, baseline
             (134, "durable_conversation_goal_user_control".into()),
             (135, "local_watch_goal_capture".into()),
             (136, "per_goal_execution_requests".into()),
+            (137, "goal_start_materialization_witness".into()),
         ]
     );
     let schema =
@@ -1161,13 +1162,13 @@ async fn reopened_current_from_prior_131(path: &std::path::Path) -> Database {
         crate::migrations::run_pending_migrations(reopened.pool())
             .await
             .unwrap(),
-        5
+        6
     );
     reopened
 }
 
 #[tokio::test]
-async fn prior_schema_131_upgrade_applies_132_through_136_preserves_source_rows_and_is_idempotent()
+async fn prior_schema_131_upgrade_applies_132_through_137_preserves_source_rows_and_is_idempotent()
 {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prior-goals.db");
@@ -1194,7 +1195,7 @@ async fn prior_schema_131_upgrade_applies_132_through_136_preserves_source_rows_
         crate::migrations::run_pending_migrations(reopened.pool())
             .await
             .unwrap(),
-        5
+        6
     );
     let after: (String,String,String,String) = sqlx::query_as("SELECT c.id,c.product_conversation_id,m.message_id,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.id='upgrade-root'")
         .fetch_one(reopened.pool()).await.unwrap();
@@ -1206,7 +1207,7 @@ async fn prior_schema_131_upgrade_applies_132_through_136_preserves_source_rows_
         0
     );
     let baseline = reopened_current_from_prior_131(&dir.path().join("baseline-goals.db")).await;
-    assert_current_136_schema_and_goal_ledger(&reopened, &baseline).await;
+    assert_current_137_schema_and_goal_ledger(&reopened, &baseline).await;
     let notes: (String, i64, String) = sqlx::query_as(
         "SELECT type,\"notnull\",dflt_value FROM pragma_table_info('federation_peer_connections') WHERE name='notes'",
     ).fetch_one(reopened.pool()).await.unwrap();

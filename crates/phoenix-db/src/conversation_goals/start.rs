@@ -131,16 +131,23 @@ impl crate::Database {
     }
 }
 
-const START_SELECT: &str = "SELECT s.*,h.version,h.state,h.reason,g.objective FROM conversation_goal_starts s
- LEFT JOIN conversation_goal_history h ON h.owner_id=s.owner_id AND h.goal_id=s.goal_id AND h.version=s.observed_version
- LEFT JOIN conversation_goal_ids g ON g.owner_id=s.owner_id AND g.goal_id=s.goal_id";
+macro_rules! start_select {
+    ($predicate:literal) => {
+        concat!(
+            "SELECT s.*,h.version,h.state,h.reason,g.objective FROM conversation_goal_starts s
+             LEFT JOIN conversation_goal_history h ON h.owner_id=s.owner_id AND h.goal_id=s.goal_id AND h.version=s.observed_version
+             LEFT JOIN conversation_goal_ids g ON g.owner_id=s.owner_id AND g.goal_id=s.goal_id ",
+            $predicate
+        )
+    };
+}
 
 pub(crate) async fn retained_start_for_execution_tx(
     tx: &mut GoalTx<'_>,
     execution: GoalExecution,
 ) -> Result<Option<GoalStartReceipt>> {
-    let row = sqlx::query(&format!(
-        "{START_SELECT} WHERE s.historical_workflow_id=? AND s.historical_turn_id=?"
+    let row = sqlx::query(start_select!(
+        "WHERE s.historical_workflow_id=? AND s.historical_turn_id=?"
     ))
     .bind(execution.workflow_id())
     .bind(execution.turn_id())
@@ -153,13 +160,11 @@ pub(crate) async fn retained_start_tx(
     tx: &mut GoalTx<'_>,
     input: &GoalStartInput,
 ) -> Result<Option<GoalStartReceipt>> {
-    let Some(row) = sqlx::query(&format!(
-        "{START_SELECT} WHERE s.owner_id=? AND s.request_id=?"
-    ))
-    .bind(input.goal().owner.as_str())
-    .bind(input.request_id.to_string())
-    .fetch_optional(&mut **tx)
-    .await?
+    let Some(row) = sqlx::query(start_select!("WHERE s.owner_id=? AND s.request_id=?"))
+        .bind(input.goal().owner.as_str())
+        .bind(input.request_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?
     else {
         return Ok(None);
     };
