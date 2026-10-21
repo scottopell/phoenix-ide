@@ -6,6 +6,8 @@ use phoenix_core::domain::conversation_goal::{
     GoalRequestPurpose, GoalSnapshot,
 };
 
+use std::fmt::Write as _;
+
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
@@ -213,10 +215,10 @@ fn select_intent(
         &cause,
     ))
     .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let digest = Sha256::digest(identity)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(identity) {
+        write!(&mut digest, "{byte:02x}").expect("writing to String cannot fail");
+    }
     GoalRequestIntent::new(
         GoalRequestId::parse(format!("goal-request:{digest}"))
             .map_err(|error| DbError::Serialization(error.to_string()))?,
