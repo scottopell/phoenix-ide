@@ -48,7 +48,7 @@ WHEN EXISTS (SELECT 1 FROM conversation_goal_start_materializations
       AND wt.event_payload=CAST(json_object('Delivered',json_object('GoalStartMaterialized',json_object('receipt',s.start_id))) AS BLOB)
       AND cv.state=json_object('type','llm_requesting','attempt',1)
       AND cv.state_updated_at=NEW.state_updated_at
-      AND w.kind='direct_turn' AND w.profile_id='direct_turn' AND w.profile_version=1
+      AND w.profile_kind='direct_turn' AND w.profile_version=1
       AND w.status='Active' AND w.version=wt.to_version AND w.generation=wt.generation
       AND w.snapshot_codec_family='direct_turn.snapshot' AND w.snapshot_codec_version=1
       AND w.snapshot_payload=CAST(json_object('turn_id',t.turn_id) AS BLOB)

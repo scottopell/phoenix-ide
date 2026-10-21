@@ -311,14 +311,13 @@ impl WorkflowRepository {
         tx: &mut crate::workflow::WorkflowTx<'_>,
         input: &GoalStartAdoptionInput,
     ) -> DbResult<sqlx::sqlite::SqliteRow> {
-        let head = sqlx::query("SELECT kind,profile_id,profile_version,status,version,generation,snapshot_codec_family,snapshot_codec_version,snapshot_payload FROM workflows WHERE workflow_id=?")
+        let head = sqlx::query("SELECT profile_kind,profile_version,status,version,generation,snapshot_codec_family,snapshot_codec_version,snapshot_payload FROM workflows WHERE workflow_id=?")
             .bind(input.receipt.execution().workflow_id()).fetch_one(&mut *tx.tx).await?;
         let snapshot = serde_json::to_vec(&direct_turn_profile::DirectTurnSnapshot {
             turn_id: to_u64(input.receipt.execution().turn_id(), "turn_id")?,
         })
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-        if head.get::<String, _>("kind") != direct_turn_profile::PROFILE_ID
-            || head.get::<String, _>("profile_id") != direct_turn_profile::PROFILE_ID
+        if head.get::<String, _>("profile_kind") != direct_turn_profile::PROFILE_ID
             || head.get::<i64, _>("profile_version")
                 != i64::from(direct_turn_profile::PROTOCOL_VERSION)
             || head.get::<String, _>("snapshot_codec_family")

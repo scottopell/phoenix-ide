@@ -139,7 +139,6 @@ async fn conversation_goal_start_committed_probe_does_not_adopt_divergent_workfl
         "UPDATE workflows SET snapshot_codec_version=snapshot_codec_version+1 WHERE workflow_id=?",
         "UPDATE workflows SET status='Cancelling' WHERE workflow_id=?",
         "UPDATE workflows SET version=version-1 WHERE workflow_id=?",
-        "UPDATE workflows SET version=version+1 WHERE workflow_id=?",
     ] {
         let (db, input) = materialized().await;
         sqlx::query(mutation)
@@ -148,15 +147,30 @@ async fn conversation_goal_start_committed_probe_does_not_adopt_divergent_workfl
             .await
             .unwrap();
         assert!(
-            !matches!(
-                db.workflow_repository()
-                    .classify_goal_start_materialization(&input)
-                    .await,
-                Ok(GoalStartAdoptionOutcome::ClassifiedCommitted { .. })
-            ),
+            db.workflow_repository()
+                .classify_goal_start_materialization(&input)
+                .await
+                .is_err(),
             "{mutation}"
         );
     }
+}
+
+#[tokio::test]
+async fn conversation_goal_start_committed_probe_classifies_valid_advanced_head_elsewhere() {
+    let (db, input) = materialized().await;
+    sqlx::query("UPDATE workflows SET version=version+1 WHERE workflow_id=?")
+        .bind(input.receipt.execution().workflow_id())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.workflow_repository()
+            .classify_goal_start_materialization(&input)
+            .await
+            .unwrap(),
+        GoalStartAdoptionOutcome::CommittedElsewhere
+    );
 }
 
 async fn partial_receipt(db: &Database, input: &GoalStartAdoptionInput) {
