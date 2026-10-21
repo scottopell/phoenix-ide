@@ -3961,17 +3961,18 @@ def finalize_source128(manifest: Manifest, private: Path) -> str:
     current = manifest.current_schema_upgrade
     assert isinstance(current, PreparedSource128Upgrade)
     launchctl = Launchctl(manifest)
-    proof = _snapshot_proof(manifest)
-    if set(proof) not in (
-        SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS,
-        SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS | SOURCE128_MIGRATED_KEYS,
-        SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS | SOURCE128_MIGRATED_KEYS | SOURCE128_START_KEYS,
-    ):
-        raise ActivationError("source128 finalization requires exact retained rehearsal proof")
-    state, pid = launchctl.inspect()
-    was_running = state in {"running", "active"} and pid is not None
-    if was_running:
-        try:
+    was_running = False
+    try:
+        proof = _snapshot_proof(manifest)
+        if set(proof) not in (
+            SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS,
+            SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS | SOURCE128_MIGRATED_KEYS,
+            SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS | SOURCE128_MIGRATED_KEYS | SOURCE128_START_KEYS,
+        ):
+            raise ActivationError("source128 finalization requires exact retained rehearsal proof")
+        state, pid = launchctl.inspect()
+        was_running = state in {"running", "active"} and pid is not None
+        if was_running:
             if "candidate_start_attempted_at" not in proof:
                 raise ActivationError("running source128 candidate lacks durable start-attempt proof")
             require_loaded_plist(manifest, launchctl, private)
@@ -3981,11 +3982,11 @@ def finalize_source128(manifest: Manifest, private: Path) -> str:
             quarantine_source128_target(manifest)
             require_launchd_absence(manifest.label, manifest.uid)
             quarantine_source128_target(manifest)
-        except Exception as exc:
-            settle_source128_failure(manifest, launchctl, str(exc))
-            raise
-    elif state != "not_loaded" or pid is not None:
-        raise ActivationError("source128 finalization requires a stopped candidate")
+        elif state != "not_loaded" or pid is not None:
+            raise ActivationError("source128 finalization requires a stopped candidate")
+    except Exception as exc:
+        settle_source128_failure(manifest, launchctl, str(exc))
+        raise
     try:
         require_launchd_absence(manifest.label, manifest.uid)
         assert_database_exclusive(manifest)
@@ -4003,17 +4004,29 @@ def finalize_source128(manifest: Manifest, private: Path) -> str:
         elif "candidate_start_attempted_at" in proof and proof.get("migrated_ledger") != [list(row) for row in target]:
             raise ActivationError("source128 start proof does not bind target ledger")
     except Exception as exc:
-        if was_running:
-            settle_source128_failure(manifest, launchctl, str(exc))
+        settle_source128_failure(manifest, launchctl, str(exc))
         raise
     try:
+        evidence = _repair_json(
+            _capacity_observation_path(
+                DatabaseCapacityReservation(
+                    Path(current.backup_path),
+                    _restore_capacity_path(manifest, database),
+                    0,
+                )
+            )
+        )
+        if (evidence.get("transaction_id") != manifest.transaction_id
+                or type(evidence.get("reserved_capacity_bytes")) is not int
+                or evidence["reserved_capacity_bytes"] <= 0):
+            raise ActivationError("source128 restore capacity evidence does not match")
+        reservation = DatabaseCapacityReservation(
+            Path(current.backup_path),
+            _restore_capacity_path(manifest, database),
+            evidence["reserved_capacity_bytes"],
+        )
+        _reservation_still_sufficient(manifest, reservation)
         if ledger == source:
-            evidence = _repair_json(_capacity_observation_path(DatabaseCapacityReservation(Path(current.backup_path), _restore_capacity_path(manifest, database), 0)))
-            if evidence.get("transaction_id") != manifest.transaction_id or type(evidence.get("reserved_capacity_bytes")) is not int or evidence["reserved_capacity_bytes"] <= 0:
-                raise ActivationError("source128 restore capacity evidence does not match")
-            capacity = evidence["reserved_capacity_bytes"]
-            reservation = DatabaseCapacityReservation(Path(current.backup_path), _restore_capacity_path(manifest, database), capacity)
-            _reservation_still_sufficient(manifest, reservation)
             run_current_schema_migration(manifest, reservation)
         else:
             validate_current_schema_database(database, registry, source_kind=manifest.source_kind, manifest=manifest, migrated=True)

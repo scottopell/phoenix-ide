@@ -3362,6 +3362,67 @@ sys.exit({7 if failure else 0})
         self.assertEqual(proof["migrated_logical_digest"], helper.database_logical_digest(database))
         self.assertEqual(proof["migrated_ledger"], [list(row) for row in compiled_ledger(None)])
 
+    def test_finalize_target129_rechecks_capacity_before_start(self) -> None:
+        _database, manifest, _reservation = self.source128_finalization_fixture(
+            migrated=True
+        )
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        with mock.patch.object(
+            helper, "__file__", manifest.current_schema_upgrade.controller_helper_path
+        ), mock.patch.object(helper, "assert_database_exclusive"), mock.patch.object(
+            helper.subprocess, "run", return_value=absence
+        ), mock.patch.object(
+            helper, "service_absence_confirmed", return_value=True
+        ), mock.patch.object(
+            helper, "Launchctl", return_value=launchctl
+        ), mock.patch.object(
+            helper,
+            "_reservation_still_sufficient",
+            side_effect=helper.ActivationError("capacity proof no longer holds"),
+        ):
+            with self.assertRaisesRegex(
+                helper.ActivationError, "capacity proof no longer holds"
+            ):
+                helper.finalize_paired(manifest, current_schema=True)
+        launchctl.start.assert_not_called()
+        launchctl.stop.assert_called_once()
+        self.assertEqual(
+            helper.read_status(manifest)["state"],
+            "activation_failed_database_committed",
+        )
+        self.assertTrue(Path(manifest.active_path).exists())
+
+    def test_finalize_invalid_proof_tears_down_loaded_job(self) -> None:
+        _database, manifest, _reservation = self.source128_finalization_fixture(
+            migrated=True
+        )
+        proof_path = Path(manifest.current_schema_upgrade.proof_path)
+        proof = json.loads(proof_path.read_text())
+        proof["unexpected"] = True
+        proof_path.write_text(json.dumps(proof))
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("loaded", None)
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        with mock.patch.object(
+            helper, "__file__", manifest.current_schema_upgrade.controller_helper_path
+        ), mock.patch.object(
+            helper.subprocess, "run", return_value=absence
+        ), mock.patch.object(
+            helper, "service_absence_confirmed", return_value=True
+        ), mock.patch.object(helper, "Launchctl", return_value=launchctl):
+            with self.assertRaisesRegex(
+                helper.ActivationError, "source128 snapshot proof keys are not exact"
+            ):
+                helper.finalize_paired(manifest, current_schema=True)
+        launchctl.stop.assert_called_once()
+        self.assertEqual(
+            helper.read_status(manifest)["state"],
+            "activation_failed_database_committed",
+        )
+        self.assertTrue(Path(manifest.active_path).exists())
+
     def test_finalize_failure_quarantines_persistent_target_and_retains_claim(self) -> None:
         database, manifest, _reservation = self.source128_finalization_fixture(migrated=True)
         launchctl = mock.Mock()
