@@ -1,10 +1,13 @@
-import { useLayoutEffect, useRef, type ReactNode } from 'react';
+import { useLayoutEffect, useRef, type MouseEvent, type ReactNode } from 'react';
 import { Link as RouterLink, useLocation } from 'react-router-dom';
 import type { EventPresentation } from '../generated/EventPresentation';
 import type { ConversationHighlight } from './MessageComponents';
 import { CopyButton } from './CopyButton';
 import { coordinatorConversationLinkState } from './conversationReturnOrigin';
-import { openFederationConnections } from './settingsEvents';
+import {
+  FEDERATION_CONNECTIONS_SETTINGS_HREF,
+  requestOpenFederationConnections,
+} from './settingsEvents';
 import './ConversationEventCard.css';
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -81,6 +84,10 @@ export function ConversationEventCard({ presentation, eventId, originalText, act
       ? <>{text.slice(0, highlight.start)}<mark className="viewer-find-inline-match viewer-find-inline-match--active">{text.slice(highlight.start, highlight.end)}</mark>{text.slice(highlight.end)}</>
       : text}</span>;
   }
+  function openConnections(event: MouseEvent<HTMLAnchorElement>) {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (requestOpenFederationConnections()) event.preventDefault();
+  }
   return (
     <section className="conversation-event-card" aria-label="Conversation event">
       <div className="conversation-event-summary">
@@ -92,11 +99,11 @@ export function ConversationEventCard({ presentation, eventId, originalText, act
       </div>
       {remoteNavigation && <p className="conversation-event-navigation-guidance">
         If this configured remote destination is unreachable, verify its saved URL in{' '}
-        <button type="button" className="conversation-event-navigation-action" onClick={openFederationConnections}>Settings → Connections</button> before retrying.
+        <RouterLink className="conversation-event-navigation-action" to={FEDERATION_CONNECTIONS_SETTINGS_HREF} onClick={openConnections}>Settings → Connections</RouterLink> before retrying.
       </p>}
       {remote?.navigation.status === 'unavailable' && remote.navigation.reason === 'missing_connection'
         && <p className="conversation-event-navigation-guidance">Remote navigation unavailable: no connection is configured.{' '}
-          <button type="button" className="conversation-event-navigation-action" onClick={openFederationConnections}>Open Settings → Connections</button> to add one.
+          <RouterLink className="conversation-event-navigation-action" to={FEDERATION_CONNECTIONS_SETTINGS_HREF} onClick={openConnections}>Open Settings → Connections</RouterLink> to add one.
         </p>}
       <details ref={details}>
         <summary>Event details</summary>

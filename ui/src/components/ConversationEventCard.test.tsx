@@ -10,7 +10,10 @@ import { EventPresentationSchema, SseMessageDataSchema } from '../sseSchemas';
 import { ConversationEventCard, eventCardFragments } from './ConversationEventCard';
 import { buildConversationSearchProjection } from './viewer-find/searchProjections';
 import { copyToClipboard } from '../utils/clipboard';
-import { OPEN_FEDERATION_CONNECTIONS_EVENT } from './settingsEvents';
+import {
+  FEDERATION_CONNECTIONS_SETTINGS_HREF,
+  OPEN_FEDERATION_CONNECTIONS_EVENT,
+} from './settingsEvents';
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValue(true) }));
 const available = {
@@ -157,7 +160,8 @@ describe('instance-qualified subscription events', () => {
     const guidance = screen.getByText(/If this configured remote destination is unreachable/);
     expect(guidance).toBeVisible();
     expect(guidance.closest('details')).toBeNull();
-    expect(screen.getByRole('button', { name: 'Settings → Connections' })).toBeVisible();
+    expect(screen.getByRole('link', { name: 'Settings → Connections' }))
+      .toHaveAttribute('href', FEDERATION_CONNECTIONS_SETTINGS_HREF);
     expect(screen.getByRole('link', { name: 'Remote conversation · 11111111' })).toHaveAttribute('href', federatedFact.navigation.stable_url);
     details.open = true;
     expect(screen.getByRole('link', { name: 'Exact destination transcript' })).toHaveAttribute('href', federatedFact.navigation.source_url);
@@ -166,20 +170,36 @@ describe('instance-qualified subscription events', () => {
     expect(container.querySelector('details')!.textContent).toContain('task completion is not inferred');
     expect(eventCardFragments(federatedFact, '').provenance).toContain(federatedFact.instance_id);
   });
-  it('opens Settings Connections from an accessible missing-connection action without inventing a local link', () => {
-    const openSettings = vi.fn();
-    window.addEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openSettings);
+  it('lets a mounted Settings dropdown handle the missing-connection action in place', () => {
+    const openSettings = vi.fn((event: Event) => event.preventDefault());
+    window.addEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openSettings, { once: true });
     const { container } = mount(federatedGap, 'event-provenance');
     expect(screen.getByText('Retention gap')).toBeVisible();
     expect(screen.getByText('Intermediate facts unavailable. Current state: Nonterminal.')).toBeVisible();
-    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText(/Remote navigation unavailable: no connection is configured/)).toBeVisible();
+    expect(container.querySelector('.conversation-event-title[href]')).toBeNull();
     expect(container.querySelector('time')).toBeNull();
-    const action = screen.getByRole('button', { name: 'Open Settings → Connections' });
-    expect(action).toBeVisible();
+    const action = screen.getByRole('link', { name: 'Open Settings → Connections' });
+    expect(action).toHaveAttribute('href', FEDERATION_CONNECTIONS_SETTINGS_HREF);
     expect(action.closest('details')).toBeNull();
+
     fireEvent.click(action);
+
     expect(openSettings).toHaveBeenCalledOnce();
-    window.removeEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openSettings);
+    const request = openSettings.mock.calls[0]![0];
+    expect(request.cancelable).toBe(true);
+    expect(request.defaultPrevented).toBe(true);
+    expect(screen.getByTestId('location')).toHaveTextContent('"pathname":"/global/coordinator"');
+    expect(screen.getByTestId('location')).toHaveTextContent('"search":"?viewer=inspect"');
+  });
+  it('follows the Settings query fallback when no in-place listener is mounted', () => {
+    mount(federatedGap);
+    const action = screen.getByRole('link', { name: 'Open Settings → Connections' });
+
+    fireEvent.click(action);
+
+    expect(screen.getByTestId('location')).toHaveTextContent('"pathname":"/"');
+    expect(screen.getByTestId('location')).toHaveTextContent('"search":"?settings=connections"');
   });
   it('distinguishes a gap terminal snapshot from an intermediate terminal fact', () => {
     const terminalGap = { ...federatedGap, current: { kind: 'terminal', outcome: 'failed' } } as const;
