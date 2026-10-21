@@ -10,6 +10,7 @@ use phoenix_db::workflow::ClaimAuthoritativeTurnInput;
 use phoenix_workflow::{LeaseExpiry, ProcessIncarnation, WorkflowId};
 
 async fn install(db: Database) -> Database {
+    phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
     db.install_goal_controls_for_tests()
         .await
         .unwrap()
@@ -304,14 +305,16 @@ async fn conversation_goal_real_executor_reopen_retry_keeps_request_identity_and
 async fn conversation_goal_real_executor_summary_cannot_borrow_initial_normal_charge() {
     let (_directory, db, _receipt, mut rt, client) = adopted().await;
     let before = ledger(&db).await;
+    let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+        operation_id: "start-summary".into(),
+        rejected_tool_calls: vec![],
+        attempt: 1,
+    };
+    rt.state = ConvState::AwaitingContinuation {
+        request: request.clone(),
+    };
     let error = rt
-        .execute_effect(Effect::RequestContinuation {
-            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-                operation_id: "start-summary".into(),
-                rejected_tool_calls: vec![],
-                attempt: 1,
-            },
-        })
+        .execute_effect(Effect::RequestContinuation { request })
         .await
         .unwrap_err();
     assert!(
@@ -328,14 +331,16 @@ async fn conversation_goal_real_executor_missing_active_start_cannot_fall_back_t
     let (_directory, db, _receipt, mut rt, client) = adopted().await;
     rt.active_direct_turn = None;
     let before = ledger(&db).await;
+    let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+        operation_id: "missing-active-summary".into(),
+        rejected_tool_calls: vec![],
+        attempt: 1,
+    };
+    rt.state = ConvState::AwaitingContinuation {
+        request: request.clone(),
+    };
     let error = rt
-        .execute_effect(Effect::RequestContinuation {
-            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-                operation_id: "missing-active-summary".into(),
-                rejected_tool_calls: vec![],
-                attempt: 1,
-            },
-        })
+        .execute_effect(Effect::RequestContinuation { request })
         .await
         .unwrap_err();
     assert!(error.contains("no active runtime execution"), "{error}");
@@ -362,19 +367,31 @@ async fn conversation_goal_request_purpose_keeps_legacy_message_normal_and_summa
     .with_active_direct_turn(Some(active));
     let before = ledger(&db).await;
     dispatch(&mut rt).await;
-    rt.execute_effect(Effect::RequestContinuation {
-        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-            operation_id: "legacy-summary".into(),
-            rejected_tool_calls: vec![],
-            attempt: 1,
-        },
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), rt.llm_task_handle.take().unwrap())
+    let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+        operation_id: "legacy-summary".into(),
+        rejected_tool_calls: vec![],
+        attempt: 1,
+    };
+    rt.state = ConvState::AwaitingContinuation {
+        request: request.clone(),
+    };
+    let immediate = rt
+        .execute_effect(Effect::RequestContinuation { request })
         .await
-        .unwrap()
         .unwrap();
+    assert!(
+        immediate.is_none(),
+        "summary failed before spawning: {immediate:?}"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.llm_task_handle
+            .take()
+            .expect("admitted summary owns a provider task"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let requests = client.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|request| request

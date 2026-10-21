@@ -17,6 +17,37 @@ Broad tests timed out at 1500s: **4421/5591 executed, 4386 passed, 35 failed,
 are not a Goals E2E journey. No policy/service is installed, no production
 numeric ceiling exists, and the worker/public Start hold remains.
 
+## Exact 72c49 runtime diagnostic — compiled, seven harness failures
+
+Hosted [39591494487](https://github.com/scottopell/phoenix-ide/actions/runs/39591494487)
+on exact `72c49a39a5ceaff5c0f93656cc29b37a40905d57`, artifact `12344190306`,
+compiled (167.2s), passed codegen (1.0s), freshness and formatting, then ran
+**293 focused tests: 286 passed, seven failed**, 3387 skipped, in 175.351s.
+The repeated log summary is the same run, not a second sample. The preceding
+`655a435f7` diagnostic, run `39590507862`/artifact `12341396759`, had stopped at
+a missing test-local `GoalAgentSource` import; the one-line import correction
+allowed these tests to execute.
+
+Six Start tests failed in fixture setup because file-backed `Database::open`
+runs the legacy schema but, unlike `open_in_memory`, not the numbered migration
+chain. The fixture now invokes the existing exported numbered-migration runner
+before the existing test-only policy installers, including on reopen. No SQL or
+production installation path changes. The legacy Summary test submitted an
+effect while the runtime still owned `LlmRequesting`; the executor correctly
+skipped that non-owning effect and did not spawn a task. All three Summary
+harness paths now establish matching `AwaitingContinuation` state, as existing
+executor tests do. The legacy path additionally diagnoses any immediate failure
+event before awaiting the real `llm_task_handle`; it still requires two captured
+requests and no ledger increment. The two Start refusals retain their specific
+`Result::Err` checks at the earlier Start-context boundary, not the later prompt
+projection's `ContinuationFailed` event contract. These corrections are unrun.
+
+Broad tests **completed**, not timed out: 5598 executed, 5559 passed, 39 failed,
+194 skipped, in 945.190s. Broad failures and shared Clippy remain unwaived. All
+seven runnable tests failed, so no runtime Start proof or qualification advance
+is established; exact `6b528d13e` remains the qualified 286-test adoption slice.
+Worker/public Start holds and default Disabled remain unchanged.
+
 ## Exact 92b621 runtime diagnostic — compilation blocked, tests not run
 
 Hosted [39589478157](https://github.com/scottopell/phoenix-ide/actions/runs/39589478157)
