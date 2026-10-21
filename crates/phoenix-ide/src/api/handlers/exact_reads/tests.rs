@@ -321,7 +321,10 @@ async fn exact_route_and_stream_aliases_require_owner_authentication() {
     let router = create_router(state);
     for (uri, reference) in [
         (ROUTE_READS[0], "."),
-        (ROUTE_READS[1], conversation.slug.as_str()),
+        (
+            ROUTE_READS[1],
+            conversation.slug.as_deref().expect("fixture has a slug"),
+        ),
     ] {
         let body = json!({"reference": reference}).to_string();
         let response = router.clone().oneshot(request(uri, &body)).await.unwrap();

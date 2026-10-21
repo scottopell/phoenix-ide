@@ -100,7 +100,7 @@ describe('App Markdown alias navigation', () => {
     expect(href.pathname).toBe('/transcript');
     expect(href.searchParams.getAll('source_transcript')).toEqual([id]);
     fireEvent.click(citation);
-    const destination = `${domain === 'ordinary' ? `/c/${encodeURIComponent(snapshot.product_conversation_id)}` : '/global'}${href.search}${href.hash}`;
+    const destination = `${domain === 'ordinary' ? snapshot.canonical_route : '/global'}${href.search}${href.hash}`;
     await waitFor(() => expect(screen.getByTestId('route').textContent).toBe(destination));
     expect(await screen.findByTestId('product-conversation-page', {}, { timeout: 5_000 })).toBeInTheDocument();
     await waitFor(() => expect(hydration).toHaveBeenCalledWith(snapshot.product_conversation_id, id, expect.any(Number)));
