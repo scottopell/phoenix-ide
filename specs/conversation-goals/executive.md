@@ -52,10 +52,13 @@ asserts disabled acceptance without receipt-schema access.
 The precise remaining integration seam is not a missing storage row: the worker
 and executor still require a distinct typed Start event/effect, lease-fenced
 nonmessage materialization with ambiguous-commit classification, request-local
-context and atomic logical-request state/accounting. The existing workflow
-receipt profile encodes canonical message identities only. Those facts must be
-made typed before Start can dispatch; neither an empty synthetic message nor an
-ordinary persistence effect is an acceptable substitute. Real owner/Coordinator
+context and atomic logical-request state/accounting. The later workflow profile
+source represents receipt input as a typed message-or-Start sum, with a positive
+SQL-range Start receipt identity and a distinct nonmessage delivery event. It
+keeps message receipt serialization message-only and rejects an object claiming
+both input kinds. Three profile serialization tests are authored and **UNRUN**;
+this prepares, but does not install, Start materialization. Neither an empty
+synthetic message nor an ordinary persistence effect is an acceptable substitute. Real owner/Coordinator
 runtime and Start/follow-through E2E proof remain outstanding. No local compiler,
 tests, SQL, codegen or browser execution is claimed for this source.
 

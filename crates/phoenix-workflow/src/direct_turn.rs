@@ -3,6 +3,7 @@ use std::{
     fmt::Write as _,
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -54,8 +55,23 @@ pub struct TurnAuthorityId(pub u64);
 )]
 pub struct CanonicalMessageId(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
 pub struct GoalStartReceiptId(u64);
+
+impl TryFrom<u64> for GoalStartReceiptId {
+    type Error = &'static str;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or("Start receipt identity must be a positive signed-SQL integer")
+    }
+}
+
+impl From<GoalStartReceiptId> for u64 {
+    fn from(value: GoalStartReceiptId) -> Self {
+        value.get()
+    }
+}
 
 impl GoalStartReceiptId {
     #[must_use]

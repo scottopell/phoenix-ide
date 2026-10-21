@@ -50,6 +50,21 @@ pub struct RuntimeTurnIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CanonicalTurnReceipt {
+    Message(DirectTurnReceipt),
+    GoalStart(GoalStartTurnReceipt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalStartTurnReceipt {
+    pub turn_id: u64,
+    pub goal_start_receipt_id: crate::GoalStartReceiptId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DirectTurnReceipt {
     pub turn_id: u64,
     pub canonical_message_id: String,
@@ -58,6 +73,7 @@ pub struct DirectTurnReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectTurnReceiptEvent {
     Materialized { canonical_message_id: String },
+    GoalStartMaterialized { receipt: crate::GoalStartReceiptId },
 }
 
 impl WorkflowProfile for DirectTurnProfile {
@@ -67,7 +83,7 @@ impl WorkflowProfile for DirectTurnProfile {
     type Event = DirectTurnEvent;
     type Intent = RuntimeTurnIntent;
     type Observation = ();
-    type Receipt = DirectTurnReceipt;
+    type Receipt = CanonicalTurnReceipt;
     type ReceiptReducerEvent = DirectTurnReceiptEvent;
     type BarrierEvent = ();
     type ManualPayload = ();
@@ -168,5 +184,59 @@ pub fn receipt_event_codec() -> CodecRef {
     CodecRef {
         family: RECEIPT_EVENT_CODEC_FAMILY,
         version: PROTOCOL_VERSION,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_goal_start_workflow_receipt_is_typed_and_has_no_message_identity() {
+        let receipt = CanonicalTurnReceipt::GoalStart(GoalStartTurnReceipt {
+            turn_id: 9,
+            goal_start_receipt_id: crate::GoalStartReceiptId::new(4).unwrap(),
+        });
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"turn_id":9,"goal_start_receipt_id":4})
+        );
+        assert_eq!(
+            serde_json::from_value::<CanonicalTurnReceipt>(value).unwrap(),
+            receipt
+        );
+        let event = DirectTurnReceiptEvent::GoalStartMaterialized {
+            receipt: crate::GoalStartReceiptId::new(4).unwrap(),
+        };
+        assert_eq!(serde_json::from_value::<DirectTurnReceiptEvent>(
+            serde_json::to_value(&event).unwrap(),
+        ).unwrap(), event);
+    }
+
+    #[test]
+    fn conversation_goal_start_workflow_receipt_rejects_ambiguous_or_invalid_input() {
+        for value in [
+            serde_json::json!({"turn_id":9,"goal_start_receipt_id":4,"canonical_message_id":"fake"}),
+            serde_json::json!({"turn_id":9,"goal_start_receipt_id":0}),
+            serde_json::json!({"turn_id":9,"goal_start_receipt_id":u64::MAX}),
+            serde_json::json!({"turn_id":9}),
+        ] {
+            assert!(serde_json::from_value::<CanonicalTurnReceipt>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn conversation_goal_start_message_receipt_encoding_remains_message_only() {
+        let message = DirectTurnReceipt {
+            turn_id: 9,
+            canonical_message_id: "message".into(),
+        };
+        let value = serde_json::json!({"turn_id":9,"canonical_message_id":"message"});
+        assert_eq!(serde_json::to_value(&message).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<CanonicalTurnReceipt>(value).unwrap(),
+            CanonicalTurnReceipt::Message(message)
+        );
     }
 }
