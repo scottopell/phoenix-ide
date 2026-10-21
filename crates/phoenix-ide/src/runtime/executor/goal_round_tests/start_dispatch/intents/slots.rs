@@ -35,7 +35,7 @@ async fn assert_receipt_matches_slot(
     .await
     .unwrap();
     assert_eq!(receipt.intent().id.as_str(), id);
-    assert_eq!(receipt.intent().generation, intent_generation);
+    assert_eq!(receipt.intent().generation(), intent_generation);
     assert_eq!(receipt.claim_generation(), claim_generation);
     assert_eq!(claim_generation, i64::try_from(active.generation).unwrap());
     assert_eq!(receipt.state_updated_at(), stamp);
@@ -195,7 +195,7 @@ async fn conversation_goal_admission_receipt_distinguishes_retained_intent_from_
         .unwrap()
         .unwrap();
     assert_eq!(
-        context.admitted().intent().generation,
+        context.admitted().intent().generation(),
         i64::try_from(active.generation).unwrap()
     );
     assert_eq!(
@@ -203,7 +203,7 @@ async fn conversation_goal_admission_receipt_distinguishes_retained_intent_from_
         i64::try_from(authority.generation.0).unwrap()
     );
     assert_ne!(
-        context.admitted().intent().generation,
+        context.admitted().intent().generation(),
         context.admitted().claim_generation()
     );
     assert_eq!(context.admitted().state_updated_at(), rt.state_updated_at);
