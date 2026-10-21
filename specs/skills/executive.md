@@ -34,7 +34,7 @@ invocation. Both converge to the same delivery function.
 | **REQ-SK-006:** Skill Discovery | ✅ Complete | CWD walk-up, children, `$HOME`, symlink + content dedup |
 | **REQ-SK-007:** Skill Metadata in System Prompt | ✅ Complete | Catalog injected with names + descriptions |
 
-**Progress:** 4 of 7 complete, 2 partial, 1 blocked by YF616
+Additional turn-boundary requirements and their qualification are described below.
 
 ## Cross-Spec References
 
@@ -46,8 +46,8 @@ invocation. Both converge to the same delivery function.
 
 ## Turn-stability implementation and verification
 
-Ordinary runtime dispatch retains a rendered metadata-only catalog, separate from
-live prompt guidance, permissions, and invocation discovery. It refreshes after
+Ordinary runtime dispatch retains a combined guidance-path/content and skill-metadata
+context, separate from live permissions and invocation discovery. It refreshes after
 successful ordinary input/state persistence (including approval feedback and
 question answers), committed authoritative input, or a committed queued
 start from Idle; a mid-turn queued drain and in-process retries retain it.
@@ -66,5 +66,11 @@ their existing regressions still require CI execution.
 This checkout has no automatic goal-continuation producer. Its required refresh
 contract is specified, but an actual automatic-goal boundary regression remains
 an integration gap, not a test pass. The broader project-guidance snapshot and
-explicit refresh work tracked in task 36009 is not fulfilled by this catalog-only
+explicit refresh work tracked in task 36009 is not fulfilled by the turn-local capture
 change.
+
+## Repository guidance turn stability
+
+REQ-SK-010 extends the ordinary live-turn snapshot to ordered guidance paths and contents. It reuses the committed boundaries from REQ-SK-009; reconstructed executors discover afresh. Skill invocation remains live, Coordinator construction and MCP intra-turn availability remain unchanged. Focused builder and model/tool-loop regressions cover guidance edits and next-turn refresh; validation results must be recorded after hosted CI. This does not deliver task36009's persisted bundle/manual-refresh design.
+
+Lifecycle/projection qualification scope: in-process ordinary retries retain the live capture. Summary uses its separate CompactionPolicy system prompt and does not inject the capture into its system block. Restart and Continue successor reconstruction discover current files; pre-restart or cross-transcript byte parity is not implemented. Provider projection keeps existing Anthropic system, Responses instructions, Codex Lite developer (older Codex instructions), and Chat system roles. Existing provider-tool-policy fixtures cover retained exchanges/current eligibility; this increment does not change MCP advertisement timing. Automatic Goals producer integration belongs to its owner and is not claimed by these tests.
