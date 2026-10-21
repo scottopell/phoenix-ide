@@ -21,7 +21,23 @@ then **298/300** passes with two capacity-message expectation mismatches; their
 corrections do not widen the passing scope. Historical 293/286/259 floors are
 retained separately below. Worker/public Start holds and default Disabled remain.
 
-## Post-adoption runtime reconstruction — source-only, unqualified
+## Post-adoption runtime reconstruction — scoped test pass, qualification held
+
+Hosted run `39642483788` at exact `44ee1e8cb` passed **312/312 focused tests**
+(373.578s; 3387 skipped), including reconstruction race/commit cuts/rollback,
+fences, startup reset, both real RuntimeManager holds, and the replacement
+post-adoption generation proof. Compile (227.0s), codegen (1.1s), freshness and
+formatting (4.9s) passed; the owned UI/E2E compile regressions also cleared in
+both successful lanes. This is scoped recovery evidence, not a clean Slice or
+whole-journey qualification. The run remained terminal failure: broad tests hit
+1500s (5085/5617 run, 5050 passed, 35 failed, 194 skipped; 1499.644s summary),
+unwaived, and two owned Clippy findings remained in the new constructor fixture
+(`unnecessary_literal_bound`, `manual_let_else`). Their bounded source correction
+uses the existing static-return implementation pattern and an equivalent let-else;
+all recovery/hold assertions remain intact. It is not yet hosted-validated.
+The latest fully qualified floor remains `78be57b09`; default-off/public Start and
+worker holds remain. The next integration gate is the actual response/Coordinator
+checkpoint owner, not a claim that these prerequisite tests prove follow-through.
 
 Hosted run `39641187603` at exact `dc9f00c4f` failed before focused execution:
 binaries capture exited 101 on three owned compile defects (missing explicit
@@ -32,8 +48,8 @@ failures; these are not preexisting failures or runtime recovery evidence.
 The bounded corrections use the explicit existing child-file path, the established
 `InstanceId` Display→UUID parse conversion, and a narrow state/stamp borrow at
 runtime construction. They do not change recovery semantics or fences. They
-remain source-only pending independent review and authorized hosted execution;
-`78be57b09` remains the qualified floor.
+cleared in hosted compile and focused execution at `44ee1e8cb`; this does not
+waive the remaining owned lint findings or broader failure.
 
 Source tracing confirmed adoption marks its attempt `ReceiptAccepted` and deletes
 the reclaimable lease. The delivery-claim path therefore cannot rebind an adopted
@@ -71,7 +87,8 @@ old slot before reaching the latest-transcript fence. The earlier invented
 `product_conversations.active` fixture was invalid and is not execution evidence.
 Real RuntimeManager tests assert no provider call for held unmaterialized Start and default-off adopted
 recovery, using startup acknowledgment and closed process admission rather than
-sleep-based absence assertions. These tests are **authored, not executed**.
+sleep-based absence assertions. These tests passed in the scoped hosted run
+at `44ee1e8cb`; the two subsequent lint corrections remain source-only.
 
 This packet supports admitted uncheckpointed Normal/Summary request slots; it
 is not complete checkpointed-response/tool-round/handoff recovery or a qualified

@@ -11,7 +11,7 @@ impl phoenix_llm::LlmService for HeldStartProvider {
         Err(LlmError::invalid_request("held Start reached provider"))
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "claude-sonnet-5"
     }
 }
@@ -74,9 +74,8 @@ async fn conversation_goal_real_constructor_default_off_denies_adopted_recovery_
         .unwrap();
     let provider = Arc::new(HeldStartProvider::default());
     let manager = manager(disabled, provider.clone());
-    let error = match manager.get_or_create(CONVERSATION).await {
-        Ok(_) => panic!("default-off constructor cannot adopt Start ownership"),
-        Err(error) => error,
+    let Err(error) = manager.get_or_create(CONVERSATION).await else {
+        panic!("default-off constructor cannot adopt Start ownership");
     };
     assert!(error.contains("reconstruction refused"), "{error}");
     manager.begin_process_shutdown();
