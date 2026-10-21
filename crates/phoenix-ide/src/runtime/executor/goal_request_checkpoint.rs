@@ -305,10 +305,15 @@ where
         admitted: &mut crate::runtime::AdmittedOperation,
     ) {
         self.publish_live_state_admitted();
-        let publication = self.broadcast_tx.admitted_publication(admitted);
-        let _ = publication.persisted_message(assistant.clone());
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(assistant.clone());
         for result in results {
-            let _ = publication.persisted_message(result.clone());
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(result.clone());
         }
     }
 }
