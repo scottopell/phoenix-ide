@@ -11552,6 +11552,8 @@ def _markerless_status_is_resolved(status: dict[str, object]) -> bool:
             return repaired
         manifest = _read_unique_json_object(transaction / "manifest.json")
         if _manifest_claims_exact_source128(manifest):
+            if status.get("state") == "precondition_failed":
+                return _exact_source128_precondition_failed_status(status, owner)
             exact_status = _read_unique_json_object(LAUNCHD_DEPLOY_STATUS_PATH)
             if (
                 exact_status != status

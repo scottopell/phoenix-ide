@@ -5189,6 +5189,12 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
         self.assertEqual(self.active.read_text().strip(), "replacement")
         self.dev._release_launchd_deploy_claim("replacement")
 
+        manifest, _committed = self.write_exact_source128_completion()
+        status["transaction_id"] = manifest["transaction_id"]
+        self.status.write_text(json.dumps(status))
+        self.assertTrue(self.dev._markerless_status_is_resolved(status))
+        self.assertIsNone(self.dev._markerless_operation_refusal())
+
         for malformed in (
             status | {"unexpected": True},
             {key: value for key, value in status.items() if key != "failure"},
