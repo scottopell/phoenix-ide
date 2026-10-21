@@ -8,7 +8,7 @@ pub struct GoalRequestLimit(i64);
 
 impl GoalRequestLimit {
     /// # Errors
-    /// Rejects zero, negative values and values outside SQLite's integer range.
+    /// Rejects zero, negative values and values outside `SQLite`'s integer range.
     pub fn parse(value: i64) -> Result<Self, GoalError> {
         if value <= 0 {
             return Err(GoalError::Range);

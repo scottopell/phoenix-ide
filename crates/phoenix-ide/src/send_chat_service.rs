@@ -792,6 +792,10 @@ impl SendChatApplicationService {
                     "direct-turn accept returned a rearm-only outcome".to_string(),
                 ));
             }
+            TurnOutcome::GoalStartMaterialized { .. }
+            | TurnOutcome::GoalStartMaterializationReplay { .. } => {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
             TurnOutcome::Materialized { .. }
             | TurnOutcome::MaterializationReplay { .. }
             | TurnOutcome::Terminal { .. } => {

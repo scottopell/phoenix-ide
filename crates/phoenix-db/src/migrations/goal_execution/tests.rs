@@ -215,7 +215,7 @@ async fn seed_goal(
                 owner,
                 principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
                 request_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
-                expected_version: GoalVersion::ZERO,
+                expected_version: GoalVersion::parse(0).unwrap(),
                 change: GoalUserChange::Create {
                     objective: GoalText::parse("perform the goal").unwrap(),
                 },

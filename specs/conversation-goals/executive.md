@@ -64,6 +64,28 @@ immutable input and receipt detach) are **UNRUN**. No runtime E2E or compile pas
 is claimed. Existing hosted strategy must qualify this partial cut before it is
 used as a new floor; `fab412e9` / `39482419906` remains the qualified floor.
 
+### Partial-cut hosted diagnostic 39541003594
+
+Hosted run [39541003594](https://github.com/scottopell/phoenix-ide/actions/runs/39541003594)
+tested exact `5054474b62f66f4e5d0e981a2f1dc3e2733b2e88` and failed before
+Rust test execution/codegen capture: test compilation failed after 89.5 seconds.
+Artifact `12319347360` retains the logs. Three owned compile roots were an absent
+`GoalVersion::ZERO` constructor, missing Start outcomes in chat acceptance and
+calling Display on `TurnConflict`. Owned Clippy/doc failure requires backticks
+around SQLite; spec-shape requires the exact ADR `Options considered` heading.
+Source corrections use the validated zero constructor, reject Start outcomes as
+chat idempotency conflicts, preserve typed Debug diagnostics and fix only the
+doc markup/heading. No lint exemption or alternate interpretation is added.
+
+Cargo fmt passed. UI/spec work passed 10 of its 11 checks (TypeScript, ESLint,
+stylelint, Vitest, Allium and anchors included); spec-shape alone failed. No
+additional devpy result is inferred. New focused Rust tests did not run, no
+binaries or authentic generated exports were captured, and E2E was build-blocked
+rather than browser proof. These fixes are locally UNRUN beyond authorized
+owned-file rustfmt and Git inspection; a subsequent guarded hosted run is owed.
+The `fab412e9` / `39482419906` UI12 + 233/233 floor, shared broad/Clippy gates and
+default-OFF/service-uninstalled state remain unchanged.
+
 ### Independent review corrections to canonical Start storage
 
 Source review of `0d42672a7` found missing nonterminal command arms, cross-root

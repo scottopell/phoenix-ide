@@ -174,7 +174,7 @@ obligations. No new scheduler/worker, watch-triggered execution, ambient goal
 lookup, synthetic chat, grace mode, autonomous management principal or numeric
 default is authorized.
 
-## Alternatives considered
+## Options considered
 
 1. **Continue after model yield using synthetic UserChat or a worker.** Rejected:
    changes message provenance/authority, invents a second owner and bypasses the

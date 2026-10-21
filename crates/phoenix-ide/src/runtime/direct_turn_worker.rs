@@ -401,7 +401,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         let prepared = match candidate
             .prepared
             .message_payload()
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("{error:?}"))
             .and_then(|bytes| {
                 PreparedDirectTurnPayload::from_exact_bytes(bytes)
                     .map_err(|error| error.to_string())
