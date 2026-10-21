@@ -86,6 +86,27 @@ owned-file rustfmt and Git inspection; a subsequent guarded hosted run is owed.
 The `fab412e9` / `39482419906` UI12 + 233/233 floor, shared broad/Clippy gates and
 default-OFF/service-uninstalled state remain unchanged.
 
+### Partial-cut diagnostic 39541824537: incremental Clippy ownership
+
+The exact `7a61bbf33543e82e6c3befd51f9d834f48038e08` run reported UI/spec,
+existing E2E and geometry lanes green while Rust remained active at this update.
+That existing E2E result is not goal Start/follow-through proof. No focused-test,
+codegen export or new-floor claim is made before the terminal artifact receipt.
+
+Actual Clippy output identifies new migration-136 `needless_pass_by_value` and a
+report-checkpoint test crossing the line limit after explicit policy threading.
+The source fixes borrow the old schema text and extract a test-local constructor
+whose two installation policies remain explicitly Disabled. No suppression or
+implicit conversion changes semantics. These fixes are locally UNRUN.
+
+The other reported files (`registered.rs`, `goal_facts/tests.rs`,
+`coordinator_watches.rs`, `migrations/local_goal_watch/tests.rs`) are byte-identical
+between `fab412e9` and the tested cut. The migration-006 test body is likewise
+unchanged; only new migration registration differs in its owner file. Those
+prior-floor/shared Clippy failures remain unwaived and are not silently rewritten
+as part of this new execution-accounting fix. The qualified floor and Disabled
+execution installation remain unchanged.
+
 ### Independent review corrections to canonical Start storage
 
 Source review of `0d42672a7` found missing nonterminal command arms, cross-root

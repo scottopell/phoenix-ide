@@ -1,7 +1,7 @@
 use super::{DbError, DbResult, Migration, WritableSchemaGuard};
 use sqlx::{Connection, SqlitePool};
 
-fn replace_once(schema: String, old: &str, new: &str) -> DbResult<String> {
+fn replace_once(schema: &str, old: &str, new: &str) -> DbResult<String> {
     if schema.matches(old).count() != 1 {
         return Err(DbError::Serialization(format!(
             "migration 136 expected exactly one schema clause: {old}"
@@ -21,12 +21,12 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
         .fetch_one(&mut *tx)
         .await?;
         let schema = replace_once(
-            schema,
+            &schema,
             "prepared_payload BLOB NOT NULL",
             "prepared_payload BLOB",
         )?;
         let schema = replace_once(
-            schema,
+            &schema,
             "origin_kind TEXT NOT NULL DEFAULT 'unknown_historical'",
             "origin_kind TEXT DEFAULT 'unknown_historical'",
         )?;
@@ -64,7 +64,7 @@ pub(super) async fn run(pool: &SqlitePool, migration: &Migration) -> DbResult<()
                     .fetch_one(&mut *tx)
                     .await?;
             let schema = replace_once(
-                schema,
+                &schema,
                 "t.canonical_message_id IS NULL",
                 "t.materialized = 0",
             )?;
