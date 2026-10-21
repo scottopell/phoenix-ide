@@ -14,6 +14,12 @@ pub enum GoalStartError {
     Unauthorized,
     #[error("Start request identity or requester conflicts with historical acceptance")]
     Conflict,
+    #[error("Start requires the exact current underway goal")]
+    StaleGoal,
+    #[error("Start is stopped or has no initialized control state")]
+    Stopped,
+    #[error(transparent)]
+    Request(#[from] super::execution::GoalRequestError),
     #[error(transparent)]
     Goal(#[from] GoalDbError),
     #[error(transparent)]
@@ -22,9 +28,89 @@ pub enum GoalStartError {
     Sqlx(#[from] sqlx::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalStartAcceptance {
+    Accepted(GoalStartReceipt),
+    Replay(GoalStartReceipt),
+}
+
 type Result<T> = std::result::Result<T, GoalStartError>;
 
 impl crate::Database {
+    /// Atomically accepts owner Start, its canonical input, workflow and bindings.
+    ///
+    /// # Errors
+    /// Refuses disabled policy, unauthenticated or changed inputs, unavailable targets,
+    /// busy/stopped owners, stale goals, depleted capacity and unreadable evidence.
+    #[allow(clippy::too_many_lines)]
+    pub async fn accept_owner_goal_start(
+        &self,
+        input: &GoalStartInput,
+        expected_transcript: &str,
+        at: super::GoalTimestampUs,
+    ) -> Result<GoalStartAcceptance> {
+        if self.goal_execution_installation() == GoalExecutionInstallation::Disabled
+            || self.goal_control_installation() == super::control::GoalControlInstallation::Disabled
+        {
+            return Err(GoalStartError::Disabled);
+        }
+        self.authenticate_start_owner(input).await?;
+        let mut tx =
+            crate::workflow::WorkflowTx::new(self.pool().begin_with("BEGIN IMMEDIATE").await?);
+        let owner = &input.goal().owner;
+        super::admission::require_target_tx(&mut tx.tx, owner, expected_transcript).await?;
+        if let Some(retained) = retained_start_tx(&mut tx.tx, input).await? {
+            tx.tx.commit().await?;
+            return Ok(GoalStartAcceptance::Replay(retained));
+        }
+        super::admission::require_settled_owner_tx(&mut tx.tx, owner, expected_transcript).await?;
+        let current = super::current_tx(&mut tx.tx, owner)
+            .await?
+            .ok_or(GoalStartError::StaleGoal)?;
+        if current.fence() != *input.goal()
+            || current.state != phoenix_core::domain::conversation_goal::GoalState::Underway
+        {
+            return Err(GoalStartError::StaleGoal);
+        }
+        let running: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversation_goal_controls WHERE owner_id=? AND stopped=0)")
+            .bind(owner.as_str()).fetch_one(&mut *tx.tx).await?;
+        if running != 1 {
+            return Err(GoalStartError::Stopped);
+        }
+        let capacity: Option<(i64, i64)> = sqlx::query_as("SELECT l.request_limit,(SELECT coalesce(max(ordinal),0) FROM conversation_goal_requests r WHERE r.goal_id=l.goal_id) FROM conversation_goal_limits l WHERE l.goal_id=?")
+            .bind(current.goal_id.as_str()).fetch_optional(&mut *tx.tx).await?;
+        let (limit, used) = capacity.ok_or(super::execution::GoalRequestError::Ineligible)?;
+        if used >= limit {
+            return Err(super::execution::GoalRequestError::Exhausted.into());
+        }
+        crate::workflow::direct_turn::insert_goal_start_turn_tx(
+            &mut tx,
+            input,
+            expected_transcript,
+            phoenix_workflow::Timestamp(
+                u64::try_from(at.get() / 1_000_000)
+                    .map_err(|_| GoalDbError::Integrity("Start time"))?,
+            ),
+            self.goal_control_installation(),
+        )
+        .await?;
+        let retained = retained_start_tx(&mut tx.tx, input)
+            .await?
+            .ok_or(GoalDbError::Integrity("new Start receipt disappeared"))?;
+        tx.tx.commit().await?;
+        Ok(GoalStartAcceptance::Accepted(retained))
+    }
+
+    async fn authenticate_start_owner(&self, input: &GoalStartInput) -> Result<()> {
+        let GoalStartRequester::Owner { principal_id } = &input.requester else {
+            return Err(GoalStartError::Unauthorized);
+        };
+        if principal_id.to_string() != self.instance_id().await?.to_string() {
+            return Err(GoalStartError::Unauthorized);
+        }
+        Ok(())
+    }
+
     /// Looks up retained owner acceptance after authenticating its actual principal.
     ///
     /// # Errors
@@ -37,12 +123,7 @@ impl crate::Database {
         if self.goal_execution_installation() == GoalExecutionInstallation::Disabled {
             return Err(GoalStartError::Disabled);
         }
-        let GoalStartRequester::Owner { principal_id } = &input.requester else {
-            return Err(GoalStartError::Unauthorized);
-        };
-        if principal_id.to_string() != self.instance_id().await?.to_string() {
-            return Err(GoalStartError::Unauthorized);
-        }
+        self.authenticate_start_owner(input).await?;
         let mut tx = self.pool().begin().await?;
         let receipt = retained_start_tx(&mut tx, input).await?;
         tx.commit().await?;

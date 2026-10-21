@@ -1,4 +1,6 @@
 use super::WorkflowRepository;
+mod goal_start;
+pub(crate) use goal_start::insert_goal_start_turn_tx;
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
 use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};

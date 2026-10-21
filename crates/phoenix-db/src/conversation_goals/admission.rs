@@ -30,7 +30,15 @@ pub(super) async fn require_settled_tx(
     mutation: &GoalMutation,
     expected_transcript: &str,
 ) -> Result<()> {
-    let state = require_target_tx(tx, &mutation.owner, expected_transcript).await?;
+    require_settled_owner_tx(tx, &mutation.owner, expected_transcript).await
+}
+
+pub(super) async fn require_settled_owner_tx(
+    tx: &mut GoalTx<'_>,
+    owner: &ProductConversationId,
+    expected_transcript: &str,
+) -> Result<()> {
+    let state = require_target_tx(tx, owner, expected_transcript).await?;
     if !matches!(state, ConvState::Idle) {
         return Err(GoalDbError::Busy);
     }
@@ -51,7 +59,7 @@ pub(super) async fn require_settled_tx(
              WHERE c.product_conversation_id=?1)
          OR EXISTS(SELECT 1 FROM product_creation_jobs WHERE product_conversation_id=?1
              AND status NOT IN ('published','failed','cancelled'))",
-    ).bind(mutation.owner.as_str()).fetch_one(&mut **tx).await?;
+    ).bind(owner.as_str()).fetch_one(&mut **tx).await?;
     if pending != 0 {
         return Err(GoalDbError::Busy);
     }

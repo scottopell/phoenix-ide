@@ -6,13 +6,13 @@ use phoenix_core::domain::conversation_goal::{
 };
 use uuid::Uuid;
 
-fn enable(db: &mut Database) {
+pub(super) fn enable(db: &mut Database) {
     db.goal_execution_installation = GoalExecutionInstallation::Installed {
         ceiling: GoalRequestLimit::parse(3).unwrap(),
     };
 }
 
-async fn input(db: &Database, conversation: &str) -> GoalStartInput {
+pub(super) async fn input(db: &Database, conversation: &str) -> GoalStartInput {
     let owner = db
         .get_conversation(conversation)
         .await
@@ -66,6 +66,15 @@ async fn conversation_goal_start_replay_disabled_and_authentication_do_not_touch
         .product_conversation_id;
     seed_goal(&db, owner.clone(), &conversation).await;
     let owner_input = input(&db, &conversation).await;
+    assert!(matches!(
+        db.accept_owner_goal_start(
+            &owner_input,
+            &conversation,
+            GoalTimestampUs::parse(1).unwrap()
+        )
+        .await,
+        Err(GoalStartError::Disabled)
+    ));
     assert!(matches!(
         db.replay_owner_goal_start(&owner_input).await,
         Err(GoalStartError::Disabled)

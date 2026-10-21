@@ -369,6 +369,14 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         candidate: DiscoverableAcceptedTurn,
         now: Timestamp,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        if matches!(
+            candidate.prepared.input(),
+            phoenix_workflow::PreparedTurnInput::GoalStart(_)
+        ) {
+            tracing::debug!(turn_id = candidate.turn_id.0,
+                "typed Goal Start adoption is not installed; retaining accepted input without dispatch");
+            return Ok(());
+        }
         let lease_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
         let claim_input = ClaimAuthoritativeTurnInput {
             turn_id: candidate.turn_id,

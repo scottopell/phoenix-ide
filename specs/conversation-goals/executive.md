@@ -22,6 +22,43 @@ not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
 execution is claimed.
 
 
+## Owner Start acceptance primitive: later source, unqualified
+
+The later source adds a transactional owner-Start database primitive. It checks
+installed execution and controls, authenticates the actual owner principal and
+revalidates the open ordinary/latest target **before** receipt lookup. Exact
+historical replay precedes fresh settled/Stop/current-fence/capacity checks.
+A fresh receipt, reciprocal typed canonical input, durable turn, existing
+workflow acceptance/effect, and immutable goal/control bindings commit together.
+The Start has no message payload, origin, canonical message, FTS write or message
+broadcast.
+
+Start admission checks eligibility/capacity but **does not charge a request**.
+The first charge remains owed to the later atomic durable request-state commit,
+with the same logical identity and semantic initial cause retained on recovery.
+This is the standing separate Start/request cut, not a new reservation or refund
+policy. A receipt is not dispatch permission. The worker now explicitly retains
+unadopted typed Start input without claiming or quarantining it as a malformed
+message. Production execution remains Disabled; no installer, API Start route,
+Coordinator Start application handler or provider dispatch is added here.
+
+Three additional acceptance tests are authored and **UNRUN**: atomic canonical
+admission/discovery/exact replay after Stop with unchanged request count; injected
+late-control-binding failure rolling back the entire acceptance; and target
+authorization before historical replay. The fixture advances its sequence owners
+past directly seeded historical workflow/turn 1. Existing replay coverage also
+asserts disabled acceptance without receipt-schema access.
+
+The precise remaining integration seam is not a missing storage row: the worker
+and executor still require a distinct typed Start event/effect, lease-fenced
+nonmessage materialization with ambiguous-commit classification, request-local
+context and atomic logical-request state/accounting. The existing workflow
+receipt profile encodes canonical message identities only. Those facts must be
+made typed before Start can dispatch; neither an empty synthetic message nor an
+ordinary persistence effect is an acceptable substitute. Real owner/Coordinator
+runtime and Start/follow-through E2E proof remain outstanding. No local compiler,
+tests, SQL, codegen or browser execution is claimed for this source.
+
 ## Per-goal execution: first source milestone (unqualified)
 
 The parent reserved forward ordinal **136** for the bounded execution cut.

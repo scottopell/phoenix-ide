@@ -1,3 +1,4 @@
+mod start_acceptance;
 mod start_guards;
 mod start_replay;
 
