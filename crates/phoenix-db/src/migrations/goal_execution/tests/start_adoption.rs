@@ -316,8 +316,11 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
         let context = repo
             .goal_start_request_context(
                 input.receipt.historical_transcript().as_str(),
-                TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
-                input.authority.generation.0,
+                Some((
+                    TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
+                    input.authority.generation.0,
+                )),
+                phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
             )
             .await
             .unwrap()
@@ -342,8 +345,11 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
     assert!(repo
         .goal_start_request_context(
             input.receipt.historical_transcript().as_str(),
-            TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
-            input.authority.generation.0
+            Some((
+                TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
+                input.authority.generation.0,
+            )),
+            phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
         )
         .await
         .is_err());

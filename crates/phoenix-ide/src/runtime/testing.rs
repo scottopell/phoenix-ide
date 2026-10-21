@@ -1285,6 +1285,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         _conversation_id: &str,
         _active: Option<&super::traits::ActiveDirectTurn>,
+        _purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
         Ok(None)
     }

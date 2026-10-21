@@ -27,7 +27,7 @@ async fn control(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn fixture(
+pub(super) async fn fixture(
     with_goal: bool,
 ) -> (
     Database,

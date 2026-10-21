@@ -142,6 +142,7 @@ pub trait MessageStore: Send + Sync {
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
+        purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String>;
 
     async fn materialize_authoritative_goal_start(
@@ -907,9 +908,10 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
+        purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
         (**self)
-            .goal_start_request_context(conversation_id, active)
+            .goal_start_request_context(conversation_id, active, purpose)
             .await
     }
 
@@ -1812,13 +1814,15 @@ impl MessageStore for DatabaseStorage {
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
+        purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
-        let Some(active) = active else {
-            return Ok(None);
-        };
         self.db
             .workflow_repository()
-            .goal_start_request_context(conversation_id, active.turn_id, active.generation)
+            .goal_start_request_context(
+                conversation_id,
+                active.map(|active| (active.turn_id, active.generation)),
+                purpose,
+            )
             .await
             .map_err(|error| error.to_string())
     }

@@ -8204,6 +8204,7 @@ where
             .goal_start_request_context(
                 &self.context.conversation_id,
                 self.active_direct_turn.as_deref(),
+                phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
             )
             .await?;
         let goal_dispatch = self
@@ -10640,6 +10641,14 @@ where
         request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        let goal_request_context = self
+            .storage
+            .goal_start_request_context(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+                phoenix_core::domain::conversation_goal::GoalRequestPurpose::Summary,
+            )
+            .await?;
         let operation_id = request.operation_id;
         let rejected_tool_calls = request.rejected_tool_calls;
         let retry_attempt = request.attempt;
@@ -10659,16 +10668,23 @@ where
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
-        let request_id = match &self.state {
-            ConvState::ServerOverloadRetrying { retry }
-                if matches!(
-                    retry.phase,
-                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
-                ) =>
+        let request_id = match (goal_request_context.as_ref(), &self.state) {
+            (context, ConvState::ServerOverloadRetrying { retry })
+                if retry.phase == phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight =>
             {
+                if context
+                    .is_some_and(|context| context.request_id.as_str() != retry.logical_request_id)
+                {
+                    return Err(
+                        "Start summary retry differs from its admitted logical request".into(),
+                    );
+                }
                 retry.logical_request_id.clone()
             }
-            _ => continuation_request_identity(&self.context.conversation_id, &operation_id),
+            (Some(context), _) => context.request_id.as_str().to_owned(),
+            (None, _) => {
+                continuation_request_identity(&self.context.conversation_id, &operation_id)
+            }
         };
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
@@ -10839,6 +10855,10 @@ where
             role: MessageRole::User,
             content: vec![ContentBlock::text(&continuation_prompt)],
         });
+        let system_prompt = goal_request_context.as_ref().map_or_else(
+            || system_prompt.to_owned(),
+            |context| format!("{system_prompt}{}", context.system_context()),
+        );
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let request = LlmRequest {
             messages,

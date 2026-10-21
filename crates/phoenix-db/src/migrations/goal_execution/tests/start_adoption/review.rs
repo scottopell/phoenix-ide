@@ -56,8 +56,11 @@ async fn context(
     db.workflow_repository()
         .goal_start_request_context(
             input.receipt.historical_transcript().as_str(),
-            TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
-            input.authority.generation.0,
+            Some((
+                TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
+                input.authority.generation.0,
+            )),
+            phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
         )
         .await
 }

@@ -1,6 +1,71 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
-## Current qualified partial floor: exact 66abc6522
+## Current qualified adoption partial floor: exact 6b528d13e
+
+Hosted [39581772671](https://github.com/scottopell/phoenix-ide/actions/runs/39581772671)
+on exact `6b528d13ee1ddf238dd53c7bdac700743c02698e`, artifact `12339895648`,
+retains **286/286 focused passes**, 3387 skipped, in 357.485s. Compilation
+(274.6s), codegen (1.0s), freshness and formatting passed. The initial no-chat
+charge, complete-bundle commit-loss/rollback, real Close/History rejection,
+cleanup without resurrection and raw/staged witness-forgery checks passed;
+all fifteen preceding adoption failures are cured. This qualifies the bounded
+DB adoption slice only, not runtime dispatch or Start/follow-through E2E.
+
+Broad tests timed out at 1500s: **4421/5591 executed, 4386 passed, 35 failed,
+194 skipped**, in 1499.676s. That incomplete result and red shared Clippy remain
+**unwaived**. UI/spec, existing E2E and geometry lanes passed; those E2E lanes
+are not a Goals E2E journey. No policy/service is installed, no production
+numeric ceiling exists, and the worker/public Start hold remains.
+
+## Authored runtime request-context cut — unrun
+
+The operation selects `GoalRequestPurpose` end-to-end: ordinary dispatch selects
+Normal and continuation dispatch selects Summary before building a provider
+request. A recognized Start cannot reuse its initial Normal charge for Summary;
+the current reader refuses Summary until an independently admitted Summary
+intent exists. Missing active runtime authority for a live Start also refuses
+rather than falling back to legacy context. Default Disabled bypasses these
+policy lookups. Legacy message requests retain their existing provider identity
+and prompt behavior.
+
+Initial Start context restoration now checks the actual current ordinary
+aggregate/transcript, Close lifecycle, exact control receipt/version, immutable
+goal binding, current goal identity/Underway state and accepted queue inside its
+existing transaction. These are **snapshot checks, not first-poll race proof**.
+A refusal never appends a charge, checkpoint or conversation message. The only
+installation helper added is test-support-only and requires an explicit typed
+finite limit and preinstalled test controls; it cannot activate production.
+
+Seven authored tests exercise real reducer/executor/DatabaseStorage paths:
+full Start-event adoption to an in-process provider capture without synthetic
+chat; adoption-boundary context projection; fresh executor/file reopen and
+Normal retry with the same admitted ID/one charge; Summary refusal before
+provider construction/poll; missing-active refusal; unchanged legacy Normal and
+Summary paths; and committed Stop, Stop/Release version ABA, Close, History,
+stale latest transcript, Complete, replacement and queued-input snapshot
+refusals. Replacement is tested after real execution settlement and preserves a
+stale executor's old active identity. These tests are unrun, not an extension
+of the qualified 286-test DB floor. Only owned-file formatting and diff checks
+were performed locally.
+
+### Worker/public Start hold-lift prerequisites
+
+- Durable ordinary/tool/no-tool follow-up and Summary intents/charges, with
+  response/checkpoint and Coordinator atomicity through the existing pipeline;
+  restart/retry/continuation reuse must not create another charge.
+- Shared accepted-input/Stop dispatch linearization for both ordinary and Summary
+  sends: acceptance gate then DB writer then epoch; no epoch-to-DB inversion,
+  no DB await under the polling gate, no reusable ungated callback, and short
+  first externally acting poll/Pending ownership rather than a stream-long lock.
+  A queue-present snapshot refusal is not queue-ABA protection or successful drain.
+- Real runtime owner/drop/uncertain-adoption recovery and later-request tests,
+  bound-goal no-tool follow-through/exhaustion settlement, and the genuine
+  Start/continuation journey under independent review and hosted verification.
+- The existing worker's Start hold and public Start/service installation remain
+  unchanged until those closure gates are met. DB unit success alone cannot
+  remove them. Default Disabled and immutable SQL132–136/eleven stashes remain.
+
+## Historical storage partial floor: exact 66abc6522
 
 Hosted [39550257368](https://github.com/scottopell/phoenix-ide/actions/runs/39550257368)
 completed on exact `66abc65225344aa0b5157574acdb3a695ec9c833`; artifact
@@ -12,8 +77,9 @@ for the **partial storage/accounting primitives, typed Start model and migration
 
 This is **not** genuine Start-service admission, worker adoption, atomic runtime
 request/response accounting, queue/Stop send-grant or Start/follow-through E2E
-qualification. The retained replay-reader packet below is later source and its
-three additional tests are **UNRUN**. No execution policy or service is installed;
+qualification. Later DB adoption evidence is recorded separately above; the
+historical source and diagnostics below do not qualify runtime dispatch.
+No execution policy or service is installed;
 execution remains Disabled without a numeric production default.
 
 Broad tests completed: **5559 executed, 5527 passed, 32 failed, 194 skipped** in

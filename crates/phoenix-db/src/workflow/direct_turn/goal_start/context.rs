@@ -26,14 +26,29 @@ impl WorkflowRepository {
     pub async fn goal_start_request_context(
         &self,
         transcript: &str,
-        turn_id: TurnAuthorityId,
-        generation: u64,
+        active: Option<(TurnAuthorityId, u64)>,
+        purpose: GoalRequestPurpose,
     ) -> DbResult<Option<GoalStartRequestContext>> {
         if self.goal_execution_installation
             == crate::conversation_goals::execution::GoalExecutionInstallation::Disabled
         {
             return Ok(None);
         }
+        let Some((turn_id, generation)) = active else {
+            let start: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM durable_turns WHERE conversation_id=?
+                 AND input_kind='goal_start' AND owns_conversation=1 AND terminal_kind IS NULL)",
+            )
+            .bind(transcript)
+            .fetch_one(&self.pool)
+            .await?;
+            if start {
+                return Err(DbError::Serialization(
+                    "Start request has no active runtime execution".into(),
+                ));
+            }
+            return Ok(None);
+        };
         let mut tx = self.begin_tx().await?;
         let row=sqlx::query("SELECT t.*,c.state,c.state_updated_at FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id WHERE t.turn_id=? AND t.conversation_id=?")
             .bind(to_i64(turn_id.0,"turn_id")?).bind(transcript).fetch_one(&mut *tx.tx).await?;
@@ -70,6 +85,11 @@ impl WorkflowRepository {
             GoalRequestCause::Initial,
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;
+        if purpose != intent.cause.purpose() {
+            return Err(DbError::Serialization(
+                "Start request purpose requires its own durably admitted intent".into(),
+            ));
+        }
         if witness.get::<String, _>("request_id") != intent.id.as_str() {
             return Err(DbError::Serialization(
                 "Start request witness identity differs".into(),
@@ -83,6 +103,11 @@ impl WorkflowRepository {
         .await
         .map_err(|error| DbError::Serialization(error.to_string()))?
         .ok_or_else(|| DbError::Serialization("Start request was not durably charged".into()))?;
+        crate::conversation_goals::execution::require_live_request_tx(
+            &mut tx.tx, &intent, transcript,
+        )
+        .await
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
         if request.checkpoint.is_some() {
             return Err(DbError::Serialization(
                 "Start initial request already checkpointed; continuation admission required"

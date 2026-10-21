@@ -29,6 +29,28 @@ impl crate::Database {
         }
     }
 
+    /// Install an explicit finite request policy in an isolated migrated test database.
+    ///
+    /// # Errors
+    /// Rejects missing controls or execution tables without installing the policy.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn install_goal_execution_for_tests(
+        mut self,
+        ceiling: GoalRequestLimit,
+    ) -> Result<Self> {
+        if self.goal_control_installation != super::control::GoalControlInstallation::Installed {
+            return Err(GoalRequestError::Disabled);
+        }
+        sqlx::query("SELECT request_id FROM conversation_goal_requests LIMIT 0")
+            .fetch_all(self.pool())
+            .await?;
+        sqlx::query("SELECT start_id FROM conversation_goal_start_materializations LIMIT 0")
+            .fetch_all(self.pool())
+            .await?;
+        self.goal_execution_installation = GoalExecutionInstallation::Installed { ceiling };
+        Ok(self)
+    }
+
     #[must_use]
     pub fn goal_execution_installation(&self) -> GoalExecutionInstallation {
         self.goal_execution_installation
@@ -45,6 +67,10 @@ pub enum GoalRequestError {
     Exhausted,
     #[error("logical request identity or causal slot conflicts")]
     Conflict,
+    #[error("goal request no longer has its exact live Underway binding")]
+    Revoked,
+    #[error("accepted queued input must be drained before this goal request")]
+    QueuedInput,
     #[error("request checkpoint requires its live admitted execution")]
     Detached,
     #[error(transparent)]
@@ -250,6 +276,43 @@ pub async fn append_request_tx(
         live_turn_id: Some(intent.execution.turn_id()),
         checkpoint: None,
     })
+}
+
+pub(crate) async fn require_live_request_tx(
+    tx: &mut GoalTx<'_>,
+    intent: &GoalRequestIntent,
+    transcript: &str,
+) -> Result<()> {
+    super::admission::require_target_tx(tx, &intent.goal.owner, transcript).await?;
+    super::control::require_current_control_tx(tx, &intent.goal.owner, intent.execution)
+        .await
+        .map_err(GoalDbError::from)?;
+    let binding = super::binding_tx(tx, intent.execution.turn_id())
+        .await?
+        .ok_or(GoalRequestError::Detached)?;
+    let current = super::current_tx(tx, &intent.goal.owner)
+        .await?
+        .ok_or(GoalRequestError::Revoked)?;
+    if binding.execution != intent.execution
+        || binding.observation
+            != phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(
+                intent.goal.clone(),
+            )
+        || current.goal_id != intent.goal.goal_id
+        || current.state != phoenix_core::domain::conversation_goal::GoalState::Underway
+    {
+        return Err(GoalRequestError::Revoked);
+    }
+    let queued: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM steering_messages WHERE conversation_id=?)",
+    )
+    .bind(transcript)
+    .fetch_one(&mut **tx)
+    .await?;
+    if queued {
+        return Err(GoalRequestError::QueuedInput);
+    }
+    Ok(())
 }
 
 /// Adds immutable checkpoint evidence to the caller's uncommitted transaction.
