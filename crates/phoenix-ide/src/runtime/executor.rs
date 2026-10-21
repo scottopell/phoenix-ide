@@ -8201,10 +8201,16 @@ where
     ) -> Result<Option<Event>, String> {
         let goal_request_context = self
             .storage
-            .goal_start_request_context(
+            .admit_goal_start_request_context(
                 &self.context.conversation_id,
                 self.active_direct_turn.as_deref(),
-                phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
+                phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal {
+                    attempt: match &self.state {
+                        ConvState::LlmRequesting { attempt } => *attempt,
+                        ConvState::ServerOverloadRetrying { retry } => retry.attempt,
+                        _ => 1,
+                    },
+                },
             )
             .await?;
         let goal_dispatch = self
@@ -10643,10 +10649,15 @@ where
     ) -> Result<Option<Event>, String> {
         let goal_request_context = self
             .storage
-            .goal_start_request_context(
+            .admit_goal_start_request_context(
                 &self.context.conversation_id,
                 self.active_direct_turn.as_deref(),
-                phoenix_core::domain::conversation_goal::GoalRequestPurpose::Summary,
+                phoenix_core::domain::conversation_goal::GoalRequestOperation::Summary {
+                    operation: phoenix_core::domain::conversation_goal::GoalText::parse(
+                        request.operation_id.clone(),
+                    )
+                    .map_err(|error| error.to_string())?,
+                },
             )
             .await?;
         let operation_id = request.operation_id;

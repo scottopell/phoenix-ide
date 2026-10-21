@@ -314,13 +314,15 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
     let before = materialization_counts(&db).await;
     for _ in 0..2 {
         let context = repo
-            .goal_start_request_context(
+            .admit_goal_start_request_context(
                 input.receipt.historical_transcript().as_str(),
                 Some((
                     TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
                     input.authority.generation.0,
                 )),
-                phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
+                phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal {
+                    attempt: 1,
+                },
             )
             .await
             .unwrap()
@@ -343,13 +345,13 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
         .await
         .unwrap();
     assert!(repo
-        .goal_start_request_context(
+        .admit_goal_start_request_context(
             input.receipt.historical_transcript().as_str(),
             Some((
                 TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
                 input.authority.generation.0,
             )),
-            phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
+            phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal { attempt: 1 },
         )
         .await
         .is_err());

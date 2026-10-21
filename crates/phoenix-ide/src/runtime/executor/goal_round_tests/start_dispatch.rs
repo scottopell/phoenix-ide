@@ -1,6 +1,7 @@
 use super::*;
 use phoenix_core::domain::conversation_goal::{
-    GoalAgentSource, GoalRequestLimit, GoalStartInput, GoalStartReceipt, GoalStartRequester,
+    GoalAgentSource, GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalRequestLimit,
+    GoalRequestOperation, GoalStartInput, GoalStartReceipt, GoalStartRequester,
 };
 use phoenix_db::conversation_goals::{
     control::{ControlCommand, ControlRequest},
@@ -9,12 +10,19 @@ use phoenix_db::conversation_goals::{
 use phoenix_db::workflow::ClaimAuthoritativeTurnInput;
 use phoenix_workflow::{LeaseExpiry, ProcessIncarnation, WorkflowId};
 
+#[path = "start_dispatch/intents.rs"]
+mod intents;
+
 async fn install(db: Database) -> Database {
+    install_with_limit(db, 2).await
+}
+
+async fn install_with_limit(db: Database, limit: i64) -> Database {
     phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
     db.install_goal_controls_for_tests()
         .await
         .unwrap()
-        .install_goal_execution_for_tests(GoalRequestLimit::parse(2).unwrap())
+        .install_goal_execution_for_tests(GoalRequestLimit::parse(limit).unwrap())
         .await
         .unwrap()
 }
@@ -25,11 +33,23 @@ async fn claimed_start() -> (
     GoalStartReceipt,
     phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
 ) {
+    claimed_start_with_limit(2).await
+}
+
+async fn claimed_start_with_limit(
+    limit: i64,
+) -> (
+    tempfile::TempDir,
+    Database,
+    GoalStartReceipt,
+    phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let db = install(
+    let db = install_with_limit(
         Database::open(directory.path().join("start.db").to_str().unwrap())
             .await
             .unwrap(),
+        limit,
     )
     .await;
     let root = db
@@ -134,7 +154,19 @@ async fn adopted() -> (
     TestRuntime,
     Arc<RenderingAnthropicClient>,
 ) {
-    let (directory, db, receipt, authority) = claimed_start().await;
+    adopted_with_limit(2).await
+}
+
+async fn adopted_with_limit(
+    limit: i64,
+) -> (
+    tempfile::TempDir,
+    Database,
+    GoalStartReceipt,
+    TestRuntime,
+    Arc<RenderingAnthropicClient>,
+) {
+    let (directory, db, receipt, authority) = claimed_start_with_limit(limit).await;
     let client = Arc::new(RenderingAnthropicClient::new());
     let mut rt = runtime(
         db.clone(),
@@ -301,29 +333,103 @@ async fn conversation_goal_real_executor_reopen_retry_keeps_request_identity_and
     }
 }
 
-#[tokio::test]
-async fn conversation_goal_real_executor_summary_cannot_borrow_initial_normal_charge() {
-    let (_directory, db, _receipt, mut rt, client) = adopted().await;
-    let before = ledger(&db).await;
+async fn summary_state(
+    db: &Database,
+    rt: &mut TestRuntime,
+    operation: &str,
+    attempt: u32,
+) -> phoenix_core::domain::sm_state::ContinuationSummaryRequest {
     let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-        operation_id: "start-summary".into(),
+        operation_id: operation.into(),
         rejected_tool_calls: vec![],
-        attempt: 1,
+        attempt,
     };
     rt.state = ConvState::AwaitingContinuation {
         request: request.clone(),
     };
-    let error = rt
+    db.update_conversation_state(CONVERSATION, &rt.state)
+        .await
+        .unwrap();
+    request
+}
+
+async fn send_summary(
+    rt: &mut TestRuntime,
+    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
+) {
+    let result = rt
         .execute_effect(Effect::RequestContinuation { request })
         .await
-        .unwrap_err();
+        .unwrap();
     assert!(
-        error.contains("purpose requires its own durably admitted intent"),
-        "{error}"
+        result.is_none(),
+        "summary refused before provider task: {result:?}"
     );
-    assert!(rt.llm_task_handle.is_none());
-    assert!(client.requests.lock().unwrap().is_empty());
-    assert_eq!(ledger(&db).await, before);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.llm_task_handle.take().expect("summary provider task"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test]
+async fn conversation_goal_real_executor_summary_has_own_charge_and_reopened_retry_identity() {
+    let (directory, db, receipt, mut rt, client) = adopted().await;
+    let normal_id = request_id(&db).await;
+    let operation = "summary:\"with/delimiters:[1]";
+    let request = summary_state(&db, &mut rt, operation, 1).await;
+    send_summary(&mut rt, request).await;
+    let summary_id: String = sqlx::query_scalar(
+        "SELECT request_id FROM conversation_goal_requests WHERE cause='summary'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_ne!(summary_id, normal_id);
+    let captured = client.requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].telemetry.as_ref().unwrap().request_id,
+        summary_id
+    );
+    assert!(captured[0]
+        .system
+        .iter()
+        .any(|part| part.text.contains("Request purpose: Summary")
+            && part.text.contains(receipt.observation().objective.as_str())));
+    drop(captured);
+    assert_eq!(ledger(&db).await, (2, 0, 1, 0));
+    let active = rt.active_direct_turn.as_deref().unwrap().clone();
+    drop(rt);
+    db.pool().close().await;
+    drop(db);
+    let db = install(
+        Database::open(directory.path().join("start.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    let client = Arc::new(RenderingAnthropicClient::new());
+    let mut rt = runtime(
+        db.clone(),
+        directory.path(),
+        client.clone(),
+        Arc::new(DeferredMcpCatalog::new(false)),
+    )
+    .with_active_direct_turn(Some(active));
+    let request = summary_state(&db, &mut rt, operation, 2).await;
+    send_summary(&mut rt, request).await;
+    assert_eq!(
+        client.requests.lock().unwrap()[0]
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .request_id,
+        summary_id
+    );
+    assert_eq!(ledger(&db).await, (2, 0, 1, 0));
 }
 
 #[tokio::test]

@@ -59,6 +59,22 @@ pub enum GoalRequestPurpose {
     Summary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalRequestOperation {
+    Normal { attempt: u32 },
+    Summary { operation: GoalText },
+}
+
+impl GoalRequestOperation {
+    #[must_use]
+    pub const fn purpose(&self) -> GoalRequestPurpose {
+        match self {
+            Self::Normal { .. } => GoalRequestPurpose::Normal,
+            Self::Summary { .. } => GoalRequestPurpose::Summary,
+        }
+    }
+}
+
 impl GoalRequestCause {
     #[must_use]
     pub const fn purpose(&self) -> GoalRequestPurpose {

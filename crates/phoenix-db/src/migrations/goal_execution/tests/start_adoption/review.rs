@@ -54,13 +54,13 @@ async fn context(
     input: &GoalStartAdoptionInput,
 ) -> crate::DbResult<Option<crate::workflow::GoalStartRequestContext>> {
     db.workflow_repository()
-        .goal_start_request_context(
+        .admit_goal_start_request_context(
             input.receipt.historical_transcript().as_str(),
             Some((
                 TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
                 input.authority.generation.0,
             )),
-            phoenix_core::domain::conversation_goal::GoalRequestPurpose::Normal,
+            phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal { attempt: 1 },
         )
         .await
 }

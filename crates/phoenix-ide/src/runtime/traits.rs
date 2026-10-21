@@ -138,11 +138,11 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
-    async fn goal_start_request_context(
+    async fn admit_goal_start_request_context(
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
-        purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
+        operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String>;
 
     async fn materialize_authoritative_goal_start(
@@ -904,14 +904,14 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
-    async fn goal_start_request_context(
+    async fn admit_goal_start_request_context(
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
-        purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
+        operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
         (**self)
-            .goal_start_request_context(conversation_id, active, purpose)
+            .admit_goal_start_request_context(conversation_id, active, operation)
             .await
     }
 
@@ -1810,18 +1810,18 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
-    async fn goal_start_request_context(
+    async fn admit_goal_start_request_context(
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
-        purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
+        operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
         self.db
             .workflow_repository()
-            .goal_start_request_context(
+            .admit_goal_start_request_context(
                 conversation_id,
                 active.map(|active| (active.turn_id, active.generation)),
-                purpose,
+                operation,
             )
             .await
             .map_err(|error| error.to_string())

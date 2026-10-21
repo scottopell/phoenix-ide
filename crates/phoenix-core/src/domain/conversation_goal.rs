@@ -6,7 +6,8 @@ use super::product_conversation::ProductConversationId;
 
 mod execution;
 pub use execution::{
-    GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalRequestLimit, GoalRequestPurpose,
+    GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalRequestLimit, GoalRequestOperation,
+    GoalRequestPurpose,
 };
 
 mod start;

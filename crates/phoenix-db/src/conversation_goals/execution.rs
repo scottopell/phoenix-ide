@@ -163,6 +163,26 @@ fn decode(row: &SqliteRow) -> super::Result<GoalRequestAdmission> {
     })
 }
 
+pub(crate) async fn latest_request_tx(
+    tx: &mut GoalTx<'_>,
+    execution: GoalExecution,
+) -> Result<Option<GoalRequestAdmission>> {
+    sqlx::query(
+        "SELECT r.*,c.checkpoint_key FROM conversation_goal_requests r
+         LEFT JOIN conversation_goal_request_checkpoints c USING(request_id)
+         WHERE r.historical_turn_id=? AND r.historical_workflow_id=?
+         ORDER BY r.ordinal DESC LIMIT 1",
+    )
+    .bind(execution.turn_id())
+    .bind(execution.workflow_id())
+    .fetch_optional(&mut **tx)
+    .await?
+    .as_ref()
+    .map(decode)
+    .transpose()
+    .map_err(GoalRequestError::from)
+}
+
 /// Reads retained identity/causal-slot evidence without requiring a live turn.
 ///
 /// # Errors

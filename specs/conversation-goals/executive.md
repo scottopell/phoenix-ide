@@ -1,6 +1,76 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
-## Current qualified adoption partial floor: exact 6b528d13e
+## Current qualified initial-purpose/live-snapshot partial floor: exact b4d98adc8
+
+Hosted [39598623682](https://github.com/scottopell/phoenix-ide/actions/runs/39598623682)
+on exact `b4d98adc889d58bd11bec95d02bbc86504fbd5ee`, artifact `12347362029`,
+retains **293/293 focused passes**, 3387 skipped, in 378.047s. Compilation
+(251.6s), codegen (1.3s), freshness and formatting passed. All seven real
+executor/DatabaseStorage tests passed, including the complete eight-case live
+fence test (22.786s): Stop, Stop/Release version ABA, Close, History, stale latest
+transcript, Complete, replacement and accepted queue. Reopen coverage injects
+saved active identity and proves reopened-storage context/retry, not lease
+reacquisition or autonomous recovery.
+
+Broad tests timed out at 1500s: **4579/5598 executed, 4544 passed, 35 failed,
+194 skipped**, in 1499.581s. This is not a full-suite comparison; the incomplete
+result and shared Clippy remain **unwaived**. UI/spec, existing E2E and geometry
+passed, not a Goals journey. This partial floor does not qualify response
+checkpoint atomicity, queue-ABA/first-poll dispatch, later-request/follow-through,
+autonomous recovery or public Start. Worker/public Start holds and default
+Disabled remain.
+
+## Authored durable request-admission dependency — unrun
+
+The runtime now supplies a typed actual operation: Normal with its current
+request attempt, or Summary carrying the exact existing
+`ContinuationSummaryRequest.operation_id`. Within one
+`BEGIN IMMEDIATE` transaction, the Start context boundary checks canonical
+acceptance/witness, exact live binding/control/lifecycle/current goal/queue,
+then chooses and appends through the existing request ledger. A pending Normal
+retry keeps its identity/charge. A new Normal cause is `AfterCheckpoint` only
+when the latest request has durable checkpoint evidence. A pending Summary
+cannot authorize Normal or a different Summary operation. Summary receives its
+own operation-specific ID/charge and restores that identity across retry/reopen;
+a checkpointed Summary operation cannot be dispatched as a new request.
+Stored request state must match the actual operation/Normal attempt before the
+transaction can charge. A new Normal cause requires persisted `LlmRequesting`
+attempt 1 after the initial timestamp; a checkpointed old ordinary attempt or
+overload logical identity cannot manufacture a successor charge. Capacity or
+fence refusal rolls back without a new request or provider poll.
+
+New logical IDs hash the structured, domain-tagged execution/cause encoding
+with the existing SHA-256 dependency, then use the existing typed ID
+constructor. Delimiter-bearing operation/predecessor IDs cannot alter field
+boundaries; bounded hashes avoid recursive predecessor-escaping growth. No
+schema, old migration, provider protocol or policy default changes.
+
+The temporary blanket Summary-refusal test is replaced by independent Summary
+charge/prompt identity and reopen/retry coverage. Six further authored real
+executor/DB tests exercise durable predecessor-only Normal succession and retry,
+concurrent same-operation one-charge admission, pending-purpose conflicts,
+persisted-operation/capacity refusal, pre-admission Stop/control-version/queue
+fences, and refusal of an older Summary after a later Normal or new Summary.
+The stale Normal attempt/overload refusal checks require unchanged ledger and
+capture counts. Explicit finite test ceilings of two or four bound these cases;
+there is no production ceiling default. A pure selector test covers delimiter
+separation and 100 bounded-size successor IDs. All new tests are **unrun**.
+The checkpoint test helper invokes the existing checkpoint primitive directly
+in its own test transaction; it is
+not a production response caller and does not prove atomic response/Coordinator
+checkpoint persistence.
+
+This is an admission dependency only. Production response/checkpoint integration,
+accepted-input/Stop short-epoch first-poll linearization, exact same-attempt
+request-state timestamp/CAS ownership, owner/drop/uncertain recovery and
+follow-through/exhaustion settlement remain outstanding. Attempt/operation
+matching alone is not proof against a stale same-attempt runtime acquiring a
+later persisted request slot. The existing epoch-under-DB-await control
+implementation is not claimed as the required short-poll proof. Worker/public Start holds remain unchanged. Only
+owned-file formatting and diff checks were performed locally; eleven stashes
+and immutable SQL132–136 are preserved.
+
+## Historical qualified adoption partial floor: exact 6b528d13e
 
 Hosted [39581772671](https://github.com/scottopell/phoenix-ide/actions/runs/39581772671)
 on exact `6b528d13ee1ddf238dd53c7bdac700743c02698e`, artifact `12339895648`,
@@ -99,13 +169,15 @@ owned-file formatting and diff checks were performed. The latest executed
 bounded floor remains exact `6b528d13e`, 286/286; all worker/public Start holds
 and default Disabled remain.
 
-## Authored runtime request-context cut — unrun
+## Initial-purpose runtime request-context cut — qualified at b4d98adc8
 
 The operation selects `GoalRequestPurpose` end-to-end: ordinary dispatch selects
 Normal and continuation dispatch selects Summary before building a provider
 request. A recognized Start cannot reuse its initial Normal charge for Summary;
-the current reader refuses Summary until an independently admitted Summary
-intent exists. Missing active runtime authority for a live Start also refuses
+that slice refuses Summary until an independently admitted Summary
+intent exists. The authored admission dependency above replaces that temporary
+refusal with independently charged Summary operations. Missing active runtime
+authority for a live Start also refuses
 rather than falling back to legacy context. Default Disabled bypasses these
 policy lookups. Legacy message requests retain their existing provider identity
 and prompt behavior.
@@ -126,9 +198,9 @@ provider construction/poll; missing-active refusal; unchanged legacy Normal and
 Summary paths; and committed Stop, Stop/Release version ABA, Close, History,
 stale latest transcript, Complete, replacement and queued-input snapshot
 refusals. Replacement is tested after real execution settlement and preserves a
-stale executor's old active identity. These tests are unrun, not an extension
-of the qualified 286-test DB floor. Only owned-file formatting and diff checks
-were performed locally.
+stale executor's old active identity. These seven tests passed at the exact
+293-test partial floor above. Their scope does not establish autonomous
+recovery, durable later-request accounting or first-poll race protection.
 
 ### Worker/public Start hold-lift prerequisites
 

@@ -1281,11 +1281,11 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
-    async fn goal_start_request_context(
+    async fn admit_goal_start_request_context(
         &self,
         _conversation_id: &str,
         _active: Option<&super::traits::ActiveDirectTurn>,
-        _purpose: phoenix_core::domain::conversation_goal::GoalRequestPurpose,
+        _operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
         Ok(None)
     }
