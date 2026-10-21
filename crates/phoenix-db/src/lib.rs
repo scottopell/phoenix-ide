@@ -1756,6 +1756,7 @@ impl Database {
             self.pool.clone(),
             self.sqlite_workload_collector.clone(),
             self.goal_control_installation,
+            self.goal_execution_installation,
         )
     }
 

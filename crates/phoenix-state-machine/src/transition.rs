@@ -841,6 +841,15 @@ pub fn transition_core(
         .with_effect(Effect::PersistState)
         .with_effect(Effect::notify_state_change())
         .with_effect(Effect::RequestLlm)),
+        (CoreState::Idle, CoreEvent::AuthoritativeGoalStart { receipt, authority }) => Ok(
+            CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistAuthoritativeGoalStart {
+                    receipt: receipt.clone(),
+                    authority: authority.clone(),
+                })
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm),
+        ),
         (
             CoreState::Idle | CoreState::Error { .. },
             CoreEvent::AuthoritativeUserMessage { payload, authority },
@@ -857,14 +866,18 @@ pub fn transition_core(
 
         (
             CoreState::Error { .. },
-            CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+            CoreEvent::UserMessage { .. }
+            | CoreEvent::AuthoritativeUserMessage { .. }
+            | CoreEvent::AuthoritativeGoalStart { .. },
         ) => Err(TransitionError::NonResumableError),
 
         (
             CoreState::LlmRequesting { .. }
             | CoreState::ToolExecuting { .. }
             | CoreState::AwaitingSubAgents { .. },
-            CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+            CoreEvent::UserMessage { .. }
+            | CoreEvent::AuthoritativeUserMessage { .. }
+            | CoreEvent::AuthoritativeGoalStart { .. },
         )
         | (
             CoreState::ToolExecuting { .. } | CoreState::AwaitingSubAgents { .. },
@@ -875,6 +888,7 @@ pub fn transition_core(
             CoreState::CancellingTool { .. } | CoreState::CancellingSubAgents { .. },
             CoreEvent::UserMessage { .. }
             | CoreEvent::AuthoritativeUserMessage { .. }
+            | CoreEvent::AuthoritativeGoalStart { .. }
             | CoreEvent::SteerDrainedUserMessages { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
@@ -1278,6 +1292,7 @@ fn handle_core_tool_complete(
         | CoreEvent::SpawnAgentsComplete { .. }
         | CoreEvent::UserMessage { .. }
         | CoreEvent::AuthoritativeUserMessage { .. }
+        | CoreEvent::AuthoritativeGoalStart { .. }
         | CoreEvent::UserCancel { .. }
         | CoreEvent::LlmResponse { .. }
         | CoreEvent::LlmError { .. }
@@ -2516,6 +2531,7 @@ pub fn transition_parent(
             ParentEvent::Core(
                 CoreEvent::UserMessage { .. }
                 | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. }
                 | CoreEvent::UserTriggerContinuation { .. },
             ),
         ) => Err(TransitionError::AwaitingTaskApproval),
@@ -2636,6 +2652,7 @@ pub fn transition_parent(
             ParentEvent::Core(
                 CoreEvent::UserMessage { .. }
                 | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. }
                 | CoreEvent::UserTriggerContinuation { .. },
             ),
         ) => Err(TransitionError::AwaitingUserResponse),
@@ -2909,7 +2926,9 @@ pub fn transition_parent(
         (
             ParentState::ContextExhausted { .. },
             ParentEvent::Core(
-                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. },
             ),
         ) => Err(TransitionError::ContextExhausted),
 
@@ -2923,13 +2942,17 @@ pub fn transition_parent(
         (
             ParentState::HandedOff { .. },
             ParentEvent::Core(
-                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. },
             ),
         )
         | (
             ParentState::Terminal,
             ParentEvent::Core(
-                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. },
             ),
         ) => Err(TransitionError::ConversationTerminal),
 
@@ -4699,6 +4722,82 @@ pub fn llm_error_to_db_error(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn typed_start_event() -> Event {
+        use phoenix_core::domain::conversation_goal::{
+            GoalExecution, GoalId, GoalSnapshot, GoalStartInput, GoalStartReceipt,
+            GoalStartRequester, GoalState, GoalText, GoalVersion,
+        };
+        use phoenix_core::domain::product_conversation::ProductConversationId;
+        let goal = GoalSnapshot {
+            owner: ProductConversationId::parse("start-owner").unwrap(),
+            goal_id: GoalId::parse("start-goal").unwrap(),
+            version: GoalVersion::parse(1).unwrap(),
+            objective: GoalText::parse("Implement the admitted objective").unwrap(),
+            state: GoalState::Underway,
+        };
+        let request = GoalStartInput::new(
+            uuid::Uuid::new_v4(),
+            GoalStartRequester::Owner {
+                principal_id: uuid::Uuid::new_v4(),
+            },
+            goal.fence(),
+        )
+        .unwrap();
+        Event::AuthoritativeGoalStart {
+            receipt: GoalStartReceipt::new(
+                request,
+                GoalExecution::parse(7, 9).unwrap(),
+                GoalText::parse("start-transcript").unwrap(),
+                Some(9),
+                goal,
+            )
+            .unwrap(),
+            authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority::new(
+                7, 9, 1, 1, 1, 0, 10,
+            ),
+        }
+    }
+
+    #[test]
+    fn conversation_goal_start_reducer_uses_only_nonmessage_authoritative_materialization() {
+        let Event::AuthoritativeGoalStart { receipt, authority } = typed_start_event() else {
+            unreachable!()
+        };
+        let result = transition_core(
+            &CoreState::Idle,
+            &test_context(),
+            CoreEvent::AuthoritativeGoalStart { receipt, authority },
+        )
+        .unwrap();
+        assert_eq!(result.new_state, CoreState::LlmRequesting { attempt: 1 });
+        assert_eq!(result.effects.len(), 3);
+        assert!(matches!(
+            &result.effects[0],
+            Effect::PersistAuthoritativeGoalStart { .. }
+        ));
+        assert!(matches!(&result.effects[2], Effect::RequestLlm));
+        assert!(!result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistMessage { .. } | Effect::PersistAuthoritativeUserMessage { .. }
+        )));
+    }
+
+    #[test]
+    fn conversation_goal_start_reducer_rejects_busy_and_subagent_adoption() {
+        assert!(SubAgentEvent::try_from(typed_start_event()).is_err());
+        let Event::AuthoritativeGoalStart { receipt, authority } = typed_start_event() else {
+            unreachable!()
+        };
+        assert!(matches!(
+            transition_core(
+                &CoreState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                CoreEvent::AuthoritativeGoalStart { receipt, authority }
+            ),
+            Err(TransitionError::AgentBusy)
+        ));
+    }
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)

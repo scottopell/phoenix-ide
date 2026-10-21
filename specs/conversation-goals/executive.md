@@ -22,6 +22,57 @@ not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
 execution is claimed.
 
 
+## Nonmessage adoption and additive 137: later source, unqualified
+
+The adoption source connects `AuthoritativeGoalStart` through Event/CoreEvent,
+its distinct persistence effect, required storage methods and the real database
+repository to the executor's proposed-state barrier and affine local-authority
+boundary. One lease-fenced transaction establishes the typed materialized input,
+message-free workflow receipt/delivery/transition, `LlmRequesting { attempt: 1 }`
+and its timestamp, exact Initial logical intent `goal-start:<start_id>` and one
+per-goal charge. No user message, origin, FTS write or message broadcast is used.
+The separate Start-acceptance transaction still charges nothing.
+
+Parent-reserved **137** adds a normalized, immutable, goal-owned materialization
+witness after that real workflow transition and request-state installation. It
+binds the Start and initial request to the original effect/attempt/incarnation
+and state timestamp; it is not a copy of current state or a dispatch grant.
+The witness survives live workflow/turn deletion. SQL 132–136 is unchanged.
+
+All command errors, including an injected post-commit error, enter same-identity
+classification. A live bundle must agree on typed input, witness, admitted intent,
+workflow receipt/delivery/transition and codecs, generation/version, state and
+timestamp before local adoption. Advanced or deleted committed history returns
+`CommittedElsewhere`, never recreated execution. Missing or inconsistent required
+facts remain unclassified rather than being labelled known-uncommitted. The
+executor retains the existing transferred owner and consumer-drop fence around
+this classification before adopting local state.
+
+Request preparation reads the admitted Initial intent and retained goal
+observation/purpose before freezing the provider request. It reuses the durable
+logical ID, including overload restoration, and renders goal context only into
+the request-local system context. The stored request generation remains the
+historical intent's generation, separate from live claim generation. It refuses
+a later initial request phase lacking a new admission instead of silently
+reusing a completed round's charge.
+
+**The worker retention barrier remains installed.** No production policy/service,
+public Start route or Coordinator Start producer is enabled. Shared queue-ABA
+first-poll authority, response checkpoint/new-request admission, automatic host
+follow-through and genuine owner/Coordinator runtime/E2E proof remain outstanding.
+The existing Stop dispatch gate awaits database work under its async lock; it is
+not treated as the missing no-await queue/send grant. No producer may expose the
+new adoption event until those boundaries close.
+
+Nine further tests are authored and **UNRUN**: six database adoption tests for
+atomic message-free state/charge, pre/post-commit fault classification, cleanup
+without resurrection, raw witness forgery/replacement/corrupt receipt, request
+context identity/no recharge and missing-witness live advance; two reducer tests
+for the nonmessage effect and busy/sub-agent rejection; and one six-case fresh
+acceptance refusal matrix. Only source inspection, owned-file rustfmt and Git
+diff checks were performed locally. The qualified floor remains exact 66abc's
+259 tests, not these new tests or runtime activation.
+
 ## Owner Start acceptance primitive: later source, unqualified
 
 The later source adds a transactional owner-Start database primitive. It checks
@@ -49,18 +100,13 @@ authorization before historical replay. The fixture advances its sequence owners
 past directly seeded historical workflow/turn 1. Existing replay coverage also
 asserts disabled acceptance without receipt-schema access.
 
-The precise remaining integration seam is not a missing storage row: the worker
-and executor still require a distinct typed Start event/effect, lease-fenced
-nonmessage materialization with ambiguous-commit classification, request-local
-context and atomic logical-request state/accounting. The later workflow profile
-source represents receipt input as a typed message-or-Start sum, with a positive
-SQL-range Start receipt identity and a distinct nonmessage delivery event. It
-keeps message receipt serialization message-only and rejects an object claiming
-both input kinds. Three profile serialization tests are authored and **UNRUN**;
-this prepares, but does not install, Start materialization. Neither an empty
-synthetic message nor an ordinary persistence effect is an acceptable substitute. Real owner/Coordinator
-runtime and Start/follow-through E2E proof remain outstanding. No local compiler,
-tests, SQL, codegen or browser execution is claimed for this source.
+The workflow profile represents receipt input as a typed message-or-Start sum,
+with a positive SQL-range Start receipt identity and a distinct nonmessage
+delivery event. Message receipt serialization remains message-only and an object
+claiming both input kinds is rejected. Its three serialization tests are
+**UNRUN**. The later adoption source above uses that path without installing a
+producer. Real owner/Coordinator runtime and Start/follow-through E2E proof remain
+outstanding. No local compiler, tests, SQL, codegen or browser execution is claimed.
 
 ## Per-goal execution: first source milestone (unqualified)
 

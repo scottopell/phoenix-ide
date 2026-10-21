@@ -52,6 +52,14 @@ impl LoadedActiveDirectTurn {
 }
 
 #[derive(Debug, Clone)]
+pub struct AuthoritativeGoalStartInput {
+    pub receipt: phoenix_core::domain::conversation_goal::GoalStartReceipt,
+    pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+    pub state_updated_at: DateTime<Utc>,
+    pub now: phoenix_workflow::Timestamp,
+}
+
+#[derive(Debug, Clone)]
 pub enum AuthoritativeUserMessageMaterialization {
     Materialized {
         message: Box<Message>,
@@ -130,6 +138,17 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn goal_start_request_context(
+        &self,
+        conversation_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String>;
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        input: &AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>;
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -884,6 +903,24 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn goal_start_request_context(
+        &self,
+        conversation_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
+        (**self)
+            .goal_start_request_context(conversation_id, active)
+            .await
+    }
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        input: &AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>
+    {
+        (**self).materialize_authoritative_goal_start(input).await
+    }
+
     async fn admit_goal_control_dispatch(
         &self,
         conv_id: &str,
@@ -1771,6 +1808,59 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn goal_start_request_context(
+        &self,
+        conversation_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
+        let Some(active) = active else {
+            return Ok(None);
+        };
+        self.db
+            .workflow_repository()
+            .goal_start_request_context(conversation_id, active.turn_id, active.generation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        input: &AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>
+    {
+        use phoenix_db::workflow::{GoalStartAdoptionInput, LocalAuthorityResult};
+        if self.db.goal_execution_installation()
+            == phoenix_db::conversation_goals::execution::GoalExecutionInstallation::Disabled
+            || self.db.goal_control_installation()
+                == phoenix_db::conversation_goals::control::GoalControlInstallation::Disabled
+            || i64::try_from(input.authority.turn_id.0).ok()
+                != Some(input.receipt.execution().turn_id())
+        {
+            return LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::workflow::GoalStartAdoptionOutcome::Rejected,
+            );
+        }
+        let repo = self.db.workflow_repository();
+        let start_id = match repo.goal_start_id_for_receipt(&input.receipt).await {
+            Ok(Some(id)) => id,
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "Start materialization cannot establish retained canonical receipt identity"
+                );
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+        };
+        repo.materialize_goal_start(&GoalStartAdoptionInput {
+            authority: direct_turn_local_authority(&input.authority),
+            start_id,
+            receipt: input.receipt.clone(),
+            state_updated_at: input.state_updated_at,
+            now: input.now,
+        })
+        .await
+    }
+
     async fn admit_goal_control_dispatch(
         &self,
         conv_id: &str,

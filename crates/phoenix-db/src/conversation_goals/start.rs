@@ -131,18 +131,46 @@ impl crate::Database {
     }
 }
 
+const START_SELECT: &str = "SELECT s.*,h.version,h.state,h.reason,g.objective FROM conversation_goal_starts s
+ LEFT JOIN conversation_goal_history h ON h.owner_id=s.owner_id AND h.goal_id=s.goal_id AND h.version=s.observed_version
+ LEFT JOIN conversation_goal_ids g ON g.owner_id=s.owner_id AND g.goal_id=s.goal_id";
+
+pub(crate) async fn retained_start_for_execution_tx(
+    tx: &mut GoalTx<'_>,
+    execution: GoalExecution,
+) -> Result<Option<GoalStartReceipt>> {
+    let row = sqlx::query(&format!(
+        "{START_SELECT} WHERE s.historical_workflow_id=? AND s.historical_turn_id=?"
+    ))
+    .bind(execution.workflow_id())
+    .bind(execution.turn_id())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(decode_retained).transpose()
+}
+
 pub(crate) async fn retained_start_tx(
     tx: &mut GoalTx<'_>,
     input: &GoalStartInput,
 ) -> Result<Option<GoalStartReceipt>> {
-    let Some(row) = sqlx::query(
-        "SELECT s.*,h.version,h.state,h.reason,g.objective FROM conversation_goal_starts s
-         LEFT JOIN conversation_goal_history h ON h.owner_id=s.owner_id AND h.goal_id=s.goal_id AND h.version=s.observed_version
-         LEFT JOIN conversation_goal_ids g ON g.owner_id=s.owner_id AND g.goal_id=s.goal_id
-         WHERE s.owner_id=? AND s.request_id=?",
-    ).bind(input.goal().owner.as_str()).bind(input.request_id.to_string()).fetch_optional(&mut **tx).await? else {
+    let Some(row) = sqlx::query(&format!(
+        "{START_SELECT} WHERE s.owner_id=? AND s.request_id=?"
+    ))
+    .bind(input.goal().owner.as_str())
+    .bind(input.request_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
         return Ok(None);
     };
+    let receipt = decode_retained(row)?;
+    if receipt.input() != input {
+        return Err(GoalStartError::Conflict);
+    }
+    Ok(Some(receipt))
+}
+
+fn decode_retained(row: sqlx::sqlite::SqliteRow) -> Result<GoalStartReceipt> {
     let requester = match row.try_get::<String, _>("requester_kind")?.as_str() {
         "owner" => GoalStartRequester::Owner {
             principal_id: row
@@ -182,9 +210,6 @@ pub(crate) async fn retained_start_tx(
         },
     )
     .map_err(GoalDbError::from)?;
-    if &retained_input != input {
-        return Err(GoalStartError::Conflict);
-    }
     let execution = GoalExecution::parse(
         row.try_get("historical_workflow_id")?,
         row.try_get("historical_turn_id")?,
@@ -199,5 +224,5 @@ pub(crate) async fn retained_start_tx(
         super::snapshot(&row)?,
     )
     .map_err(GoalDbError::from)?;
-    Ok(Some(receipt))
+    Ok(receipt)
 }

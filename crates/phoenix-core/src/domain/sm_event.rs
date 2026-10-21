@@ -556,6 +556,10 @@ pub enum Event {
         payload: PreparedDirectTurnPayload,
         authority: DirectTurnAttemptAuthority,
     },
+    AuthoritativeGoalStart {
+        receipt: crate::domain::conversation_goal::GoalStartReceipt,
+        authority: DirectTurnAttemptAuthority,
+    },
     /// Starts an admitted sub-agent whose initial user message is already durable.
     PersistedSubAgentBootstrap,
     /// Retries exact buffered child outcomes after a transient acceptance read failure.
@@ -802,6 +806,7 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            Event::AuthoritativeGoalStart { .. } => "AuthoritativeGoalStart",
             Event::PersistedSubAgentBootstrap => "PersistedSubAgentBootstrap",
             Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
@@ -872,6 +877,10 @@ pub enum CoreEvent {
     },
     AuthoritativeUserMessage {
         payload: Box<PreparedDirectTurnPayload>,
+        authority: DirectTurnAttemptAuthority,
+    },
+    AuthoritativeGoalStart {
+        receipt: crate::domain::conversation_goal::GoalStartReceipt,
         authority: DirectTurnAttemptAuthority,
     },
     UserCancel {
@@ -1073,6 +1082,12 @@ impl TryFrom<Event> for ParentEvent {
             Event::AuthoritativeUserMessage { payload, authority } => {
                 Ok(ParentEvent::Core(CoreEvent::AuthoritativeUserMessage {
                     payload: Box::new(payload),
+                    authority,
+                }))
+            }
+            Event::AuthoritativeGoalStart { receipt, authority } => {
+                Ok(ParentEvent::Core(CoreEvent::AuthoritativeGoalStart {
+                    receipt,
                     authority,
                 }))
             }
@@ -1319,6 +1334,10 @@ impl TryFrom<Event> for SubAgentEvent {
                     authority,
                 }))
             }
+            Event::AuthoritativeGoalStart { .. } => Err(EventConversionError {
+                event_variant: "AuthoritativeGoalStart",
+                target_type: "SubAgentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "SubAgentEvent",
@@ -1499,6 +1518,7 @@ impl CoreEvent {
         match self {
             CoreEvent::UserMessage { .. } => "UserMessage",
             CoreEvent::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            CoreEvent::AuthoritativeGoalStart { .. } => "AuthoritativeGoalStart",
             CoreEvent::UserCancel { .. } => "UserCancel",
             CoreEvent::LlmResponse { .. } => "LlmResponse",
             CoreEvent::LlmError { .. } => "LlmError",

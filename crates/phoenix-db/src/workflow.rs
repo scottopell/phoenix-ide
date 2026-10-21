@@ -426,6 +426,7 @@ pub struct WorkflowRepository {
     pool: SqlitePool,
     goal_control_installation: crate::conversation_goals::control::GoalControlInstallation,
     sqlite_workload_collector: Option<crate::SqliteWorkloadCollector>,
+    goal_execution_installation: crate::conversation_goals::execution::GoalExecutionInstallation,
 }
 
 impl WorkflowRepository {
@@ -1281,6 +1282,8 @@ impl WorkflowRepository {
             pool,
             goal_control_installation:
                 crate::conversation_goals::control::GoalControlInstallation::Disabled,
+            goal_execution_installation:
+                crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
             sqlite_workload_collector: None,
         }
     }
@@ -1289,11 +1292,13 @@ impl WorkflowRepository {
         pool: SqlitePool,
         sqlite_workload_collector: crate::SqliteWorkloadCollector,
         goal_control_installation: crate::conversation_goals::control::GoalControlInstallation,
+        goal_execution_installation: crate::conversation_goals::execution::GoalExecutionInstallation,
     ) -> Self {
         Self {
             pool,
             goal_control_installation,
             sqlite_workload_collector: Some(sqlite_workload_collector),
+            goal_execution_installation,
         }
     }
 

@@ -6,7 +6,7 @@ use crate::conversation_goals::{
 use phoenix_core::domain::conversation_goal::{GoalStartInput, GoalTimestampUs};
 use uuid::Uuid;
 
-async fn ready() -> (Database, String, GoalStartInput) {
+pub(super) async fn ready() -> (Database, String, GoalStartInput) {
     let (mut db, transcript) = fixture().await;
     migrate(&db).await.unwrap();
     // fixture() inserts workflow/turn 1 directly after sequence initialization.
@@ -143,4 +143,92 @@ async fn conversation_goal_start_target_authorization_precedes_exact_historical_
         Err(GoalStartError::Goal(_))
     ));
     assert_eq!(counts(&db).await, before);
+}
+
+#[tokio::test]
+async fn conversation_goal_start_fresh_rejections_leave_no_acceptance_artifacts() {
+    use crate::conversation_goals::execution::GoalExecutionInstallation;
+    use phoenix_core::domain::{
+        conversation_goal::{GoalFence, GoalStartInput, GoalStartRequester, GoalVersion},
+        sm_state::ConvState,
+    };
+    for case in [
+        "busy",
+        "stopped",
+        "stale",
+        "forged",
+        "execution_disabled",
+        "controls_disabled",
+    ] {
+        let (mut db, transcript, mut input) = ready().await;
+        match case {
+            "busy" => {
+                sqlx::query(
+                    "UPDATE conversations SET state=?,state_kind='llm_requesting' WHERE id=?",
+                )
+                .bind(serde_json::to_string(&ConvState::LlmRequesting { attempt: 1 }).unwrap())
+                .bind(&transcript)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            "stopped" => {
+                db.apply_goal_control(
+                    &ControlRequest {
+                        owner: input.goal().owner.clone(),
+                        principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
+                        request_id: Uuid::new_v4(),
+                        command: ControlCommand::Stop,
+                        expected_control_version: 1,
+                    },
+                    GoalTimestampUs::parse(3).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            "stale" => {
+                input = GoalStartInput::new(
+                    input.request_id,
+                    input.requester.clone(),
+                    GoalFence {
+                        owner: input.goal().owner.clone(),
+                        goal_id: input.goal().goal_id.clone(),
+                        version: GoalVersion::parse(2).unwrap(),
+                    },
+                )
+                .unwrap();
+            }
+            "forged" => {
+                input = GoalStartInput::new(
+                    input.request_id,
+                    GoalStartRequester::Owner {
+                        principal_id: Uuid::new_v4(),
+                    },
+                    input.goal().clone(),
+                )
+                .unwrap();
+            }
+            "execution_disabled" => {
+                db.goal_execution_installation = GoalExecutionInstallation::Disabled
+            }
+            "controls_disabled" => db.goal_control_installation = GoalControlInstallation::Disabled,
+            _ => unreachable!(),
+        }
+        let before = counts(&db).await;
+        let error = db
+            .accept_owner_goal_start(&input, &transcript, GoalTimestampUs::parse(4).unwrap())
+            .await
+            .unwrap_err();
+        match case {
+            "busy" => assert!(matches!(
+                error,
+                GoalStartError::Goal(crate::conversation_goals::GoalDbError::Busy)
+            )),
+            "stopped" => assert!(matches!(error, GoalStartError::Stopped)),
+            "stale" => assert!(matches!(error, GoalStartError::StaleGoal)),
+            "forged" => assert!(matches!(error, GoalStartError::Unauthorized)),
+            _ => assert!(matches!(error, GoalStartError::Disabled)),
+        }
+        assert_eq!(counts(&db).await, before, "{case}");
+    }
 }

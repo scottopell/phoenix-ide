@@ -1281,6 +1281,25 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn goal_start_request_context(
+        &self,
+        _conversation_id: &str,
+        _active: Option<&super::traits::ActiveDirectTurn>,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
+        Ok(None)
+    }
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        _input: &super::traits::AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>
+    {
+        tracing::debug!("in-memory storage has no durable Start receipt or lease authority");
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+            phoenix_db::workflow::GoalStartAdoptionOutcome::Rejected,
+        )
+    }
+
     async fn admit_goal_control_dispatch(
         &self,
         _conv_id: &str,

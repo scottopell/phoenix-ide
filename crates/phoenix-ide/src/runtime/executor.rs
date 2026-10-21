@@ -116,6 +116,10 @@ enum AuthoritativeEffect {
         authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
         idempotent: bool,
     },
+    PersistAuthoritativeGoalStart {
+        receipt: phoenix_core::domain::conversation_goal::GoalStartReceipt,
+        authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+    },
     PersistState,
     RequestLlm,
     CompleteCreation {
@@ -282,6 +286,9 @@ impl ClassifiedEffect {
                     idempotent,
                 },
             )),
+            Effect::PersistAuthoritativeGoalStart { receipt, authority } => Self::Authoritative(
+                Box::new(AuthoritativeEffect::PersistAuthoritativeGoalStart { receipt, authority }),
+            ),
             Effect::PersistState => {
                 Self::Authoritative(Box::new(AuthoritativeEffect::PersistState))
             }
@@ -3844,8 +3851,10 @@ where
             }
             // Pure state transition
             let terminal_event = current_event.clone();
-            let authoritative_event =
-                matches!(current_event, Event::AuthoritativeUserMessage { .. });
+            let authoritative_event = matches!(
+                current_event,
+                Event::AuthoritativeUserMessage { .. } | Event::AuthoritativeGoalStart { .. }
+            );
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -4108,10 +4117,13 @@ where
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
-        let is_direct_turn_adoption = result
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let is_direct_turn_adoption = result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::PersistAuthoritativeUserMessage { .. }
+                    | Effect::PersistAuthoritativeGoalStart { .. }
+            )
+        });
         let is_task_approval_adoption = result
             .effects
             .iter()
@@ -4343,8 +4355,11 @@ where
                     }
                     _ => false,
                 };
-                let is_authoritative_persist =
-                    matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
+                let is_authoritative_persist = matches!(
+                    effect,
+                    Effect::PersistAuthoritativeUserMessage { .. }
+                        | Effect::PersistAuthoritativeGoalStart { .. }
+                );
                 let checkpoint_satisfies_persist_state = matches!(
                     effect,
                     Effect::PersistCheckpoint { .. }
@@ -4837,8 +4852,11 @@ where
                     _ => {}
                 }
             }
-            let is_authoritative_persist =
-                matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
+            let is_authoritative_persist = matches!(
+                effect,
+                Effect::PersistAuthoritativeUserMessage { .. }
+                    | Effect::PersistAuthoritativeGoalStart { .. }
+            );
             let effect_result = Box::pin(self.execute_effect(effect)).await;
             let effect_result = match effect_result {
                 Ok(effect_result) => effect_result,
@@ -6468,6 +6486,80 @@ where
             }
         }
         match effect {
+            AuthoritativeEffect::PersistAuthoritativeGoalStart { receipt, authority } => {
+                use phoenix_db::workflow::{
+                    GoalStartAdoptionOutcome as Outcome, LocalAuthorityResult,
+                };
+                let proposed = self
+                    .proposed_direct_turn_state
+                    .as_ref()
+                    .ok_or_else(|| "Start adoption has no proposed state".to_owned())?;
+                if proposed.state != (ConvState::LlmRequesting { attempt: 1 }) {
+                    return Err("Start adoption proposed a noninitial request state".into());
+                }
+                let input = crate::runtime::traits::AuthoritativeGoalStartInput {
+                    receipt,
+                    authority,
+                    state_updated_at: proposed.updated_at,
+                    now: phoenix_workflow::Timestamp(
+                        u64::try_from(Utc::now().timestamp())
+                            .map_err(|_| "Start adoption clock precedes epoch")?,
+                    ),
+                };
+                let storage = self.storage.clone();
+                let owner = admitted.transfer();
+                let task = tokio::spawn(async move {
+                    let outcome = storage.materialize_authoritative_goal_start(&input).await;
+                    if matches!(outcome, LocalAuthorityResult::DurableFactUnclassified) {
+                        owner.close("goal_start_materialization");
+                    }
+                    (outcome, owner)
+                });
+                let mut guard = AuthorityBoundaryConsumerGuard {
+                    fence: Some(self.fatal_local_authority_fence.clone()),
+                };
+                let (outcome, _owner) = task.await.map_err(|error| {
+                    tracing::error!(?error, "Start materialization authority owner disappeared");
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:goal_start_boundary_disappeared".to_owned()
+                })?;
+                guard.disarm();
+                match outcome {
+                    LocalAuthorityResult::DurableFactEstablished(
+                        Outcome::Committed {
+                            turn_id,
+                            generation,
+                        }
+                        | Outcome::ClassifiedCommitted {
+                            turn_id,
+                            generation,
+                        },
+                    ) => {
+                        let proposed = self
+                            .proposed_direct_turn_state
+                            .take()
+                            .ok_or_else(|| "committed Start has no proposed state".to_owned())?;
+                        self.state = proposed.state;
+                        self.state_updated_at = proposed.updated_at;
+                        self.active_direct_turn =
+                            Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                                turn_id,
+                                generation,
+                            }));
+                        self.ordinary_skill_catalog = None;
+                        self.publish_live_state_admitted();
+                        Ok(None)
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(_) => {
+                        self.proposed_direct_turn_state = None;
+                        self.direct_turn_materialization_aborted = true;
+                        Ok(None)
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        self.proposed_direct_turn_state = None;
+                        Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:goal_start_materialization".into())
+                    }
+                }
+            }
             AuthoritativeEffect::PersistAuthoritativeUserMessage {
                 payload,
                 authority,
@@ -8107,6 +8199,13 @@ where
         &mut self,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        let goal_request_context = self
+            .storage
+            .goal_start_request_context(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+            )
+            .await?;
         let goal_dispatch = self
             .storage
             .admit_goal_control_dispatch(
@@ -8420,10 +8519,16 @@ where
         // Message, producing a phantom streaming buffer on the
         // client (the "repeated message" bug).
         let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
-        let request_id = overload_incident.as_ref().map_or_else(
-            || uuid::Uuid::new_v4().to_string(),
-            |(_, logical_request_id, _)| logical_request_id.clone(),
-        );
+        let request_id = match (goal_request_context.as_ref(), overload_incident.as_ref()) {
+            (Some(context), Some((_, retry_id, _))) if context.request_id.as_str() != retry_id => {
+                return Err(
+                    "Start transport retry differs from the admitted logical request".into(),
+                );
+            }
+            (Some(context), _) => context.request_id.as_str().to_owned(),
+            (None, Some((_, retry_id, _))) => retry_id.clone(),
+            (None, None) => uuid::Uuid::new_v4().to_string(),
+        };
 
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
@@ -8535,6 +8640,9 @@ where
                 system_prompt.push_str("\n\n");
                 system_prompt.push_str(&orientation);
             }
+        }
+        if let Some(context) = &goal_request_context {
+            system_prompt.push_str(&context.system_context());
         }
         let callable_names = request_tool_surface
             .callable_tools(available_tools.clone())

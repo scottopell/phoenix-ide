@@ -131,6 +131,11 @@ pub enum Effect {
         idempotent: bool,
     },
 
+    PersistAuthoritativeGoalStart {
+        receipt: phoenix_core::domain::conversation_goal::GoalStartReceipt,
+        authority: DirectTurnAttemptAuthority,
+    },
+
     /// Persist the new state
     PersistState,
 

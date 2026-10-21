@@ -1,9 +1,10 @@
 use super::WorkflowRepository;
 mod goal_start;
-pub(crate) use goal_start::insert_goal_start_turn_tx;
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
 use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};
+pub(crate) use goal_start::insert_goal_start_turn_tx;
+pub use goal_start::{GoalStartAdoptionInput, GoalStartAdoptionOutcome, GoalStartRequestContext};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::db_schema::{
@@ -169,6 +170,11 @@ pub enum ScopedDirectTurnReplayLookup {
         turn: DurableTurn,
         prepared: Box<PreparedDirectTurnPayload>,
     },
+}
+
+struct LocalMaterializationCheck<'a> {
+    authority: &'a super::LocalAttemptAuthority,
+    now: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1413,6 +1419,20 @@ impl WorkflowRepository {
             return Ok(DirectTurnMaterializationEligibility::ExactReplay);
         }
 
+        Self::preflight_local_materialization_authority_tx(
+            tx,
+            &LocalMaterializationCheck {
+                authority: &input.authority,
+                now: input.now,
+            },
+        )
+        .await
+    }
+
+    async fn preflight_local_materialization_authority_tx(
+        tx: &mut super::WorkflowTx<'_>,
+        input: &LocalMaterializationCheck<'_>,
+    ) -> DbResult<DirectTurnMaterializationEligibility> {
         let Some(authority_row) = sqlx::query(
             "SELECT e.status AS effect_status, a.status AS attempt_status, l.lease_until
              FROM workflow_effects e
