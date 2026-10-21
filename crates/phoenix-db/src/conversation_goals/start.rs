@@ -153,7 +153,7 @@ pub(crate) async fn retained_start_for_execution_tx(
     .bind(execution.turn_id())
     .fetch_optional(&mut **tx)
     .await?;
-    row.map(decode_retained).transpose()
+    row.as_ref().map(decode_retained).transpose()
 }
 
 pub(crate) async fn retained_start_tx(
@@ -168,14 +168,14 @@ pub(crate) async fn retained_start_tx(
     else {
         return Ok(None);
     };
-    let receipt = decode_retained(row)?;
+    let receipt = decode_retained(&row)?;
     if receipt.input() != input {
         return Err(GoalStartError::Conflict);
     }
     Ok(Some(receipt))
 }
 
-fn decode_retained(row: sqlx::sqlite::SqliteRow) -> Result<GoalStartReceipt> {
+fn decode_retained(row: &sqlx::sqlite::SqliteRow) -> Result<GoalStartReceipt> {
     let requester = match row.try_get::<String, _>("requester_kind")?.as_str() {
         "owner" => GoalStartRequester::Owner {
             principal_id: row
@@ -226,7 +226,7 @@ fn decode_retained(row: sqlx::sqlite::SqliteRow) -> Result<GoalStartReceipt> {
         GoalText::parse(row.try_get::<String, _>("historical_transcript_id")?)
             .map_err(GoalDbError::from)?,
         row.try_get("live_turn_id")?,
-        super::snapshot(&row)?,
+        super::snapshot(row)?,
     )
     .map_err(GoalDbError::from)?;
     Ok(receipt)

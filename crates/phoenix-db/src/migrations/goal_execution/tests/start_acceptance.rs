@@ -209,7 +209,7 @@ async fn conversation_goal_start_fresh_rejections_leave_no_acceptance_artifacts(
                 .unwrap();
             }
             "execution_disabled" => {
-                db.goal_execution_installation = GoalExecutionInstallation::Disabled
+                db.goal_execution_installation = GoalExecutionInstallation::Disabled;
             }
             "controls_disabled" => db.goal_control_installation = GoalControlInstallation::Disabled,
             _ => unreachable!(),

@@ -1,4 +1,12 @@
-use super::super::*;
+use super::super::{
+    direct_turn_profile, finish_workflow_transaction_at_cut, local_codec_owned,
+    next_workflow_sequence_tx, row_to_turn_tx, to_i64, to_u64, AuthorityOutcome, ConvState,
+    ConversationAuthority, DateTime, DbError, DbResult, DeliveryId, DeliveryResolutionDecision,
+    DeliveryResolutionPlan, DirectTurnMaterializationEligibility, GoalStartReceiptId,
+    LocalMaterializationCheck, Materialization, PreparedTurn, ReceiptId, Row, Timestamp,
+    TransactionCut, TurnAuthorityId, TurnLifecycle, Utc, WorkflowRepository, WorkflowStatus,
+    DIRECT_TURN_MATERIALIZED_TRANSITION_ID,
+};
 use phoenix_core::domain::conversation_goal::{
     GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalStartReceipt,
 };
@@ -97,10 +105,13 @@ impl WorkflowRepository {
                 return Ok(DirectTurnMaterializationEligibility::ExactReplay)
             }
             Materialization::UnmaterializedGoalStart { receipt } if receipt == input.start_id => {}
-            _ => {
+            Materialization::Unmaterialized
+            | Materialization::Materialized { .. }
+            | Materialization::UnmaterializedGoalStart { .. }
+            | Materialization::MaterializedGoalStart { .. } => {
                 return Err(DbError::Serialization(
                     "Start input kind/identity differs".into(),
-                ))
+                ));
             }
         }
         Self::preflight_local_materialization_authority_tx(
@@ -184,13 +195,14 @@ impl WorkflowRepository {
             ));
         }
         let preflight = self.preflight_goal_start_tx(&mut tx, input).await?;
-        if preflight != DirectTurnMaterializationEligibility::Fresh {
-            return Ok(match preflight {
-                DirectTurnMaterializationEligibility::ExactReplay => {
-                    GoalStartAdoptionOutcome::ExactReplay
-                }
-                _ => GoalStartAdoptionOutcome::StaleAuthority,
-            });
+        match preflight {
+            DirectTurnMaterializationEligibility::Fresh => {}
+            DirectTurnMaterializationEligibility::ExactReplay => {
+                return Ok(GoalStartAdoptionOutcome::ExactReplay)
+            }
+            DirectTurnMaterializationEligibility::StaleAuthority => {
+                return Ok(GoalStartAdoptionOutcome::StaleAuthority)
+            }
         }
         let eligible: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations c JOIN product_conversations p ON p.id=c.product_conversation_id JOIN conversation_goal_controls g ON g.owner_id=p.id JOIN conversation_goal_control_bindings b ON b.turn_id=? WHERE c.id=? AND c.state_kind='idle' AND p.kind='ordinary' AND p.closed_at IS NULL AND p.latest_transcript_id=c.id AND g.stopped=0 AND b.control_version=g.control_version AND NOT EXISTS(SELECT 1 FROM steering_messages q WHERE q.conversation_id=c.id))")
             .bind(input.receipt.execution().turn_id()).bind(input.receipt.historical_transcript().as_str())

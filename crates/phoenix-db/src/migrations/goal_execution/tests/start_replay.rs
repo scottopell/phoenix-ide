@@ -1,4 +1,5 @@
 use super::*;
+use crate::conversation_goals::user_commands::{GoalUserChange, GoalUserCommand, GoalUserResult};
 use crate::conversation_goals::{execution::GoalExecutionInstallation, start::GoalStartError};
 use phoenix_core::domain::conversation_goal::{
     GoalDisposition, GoalFence, GoalId, GoalRequestLimit, GoalStartInput, GoalStartRequester,
@@ -32,9 +33,6 @@ pub(super) async fn input(db: &Database, conversation: &str) -> GoalStartInput {
 async fn complete_goal(db: &Database, conversation: &str, input: &GoalStartInput) {
     let GoalStartRequester::Owner { principal_id } = &input.requester else {
         unreachable!()
-    };
-    use crate::conversation_goals::user_commands::{
-        GoalUserChange, GoalUserCommand, GoalUserResult,
     };
     let receipt = db
         .apply_user_goal_command(

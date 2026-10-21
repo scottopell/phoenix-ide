@@ -1,4 +1,6 @@
-use super::super::*;
+use super::super::{
+    to_i64, ConvState, DbError, DbResult, Row, TurnAuthorityId, WorkflowRepository,
+};
 use phoenix_core::domain::conversation_goal::{
     GoalExecution, GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalRequestPurpose,
     GoalSnapshot,
@@ -91,17 +93,7 @@ impl WorkflowRepository {
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let initial_timestamp = row.get::<String, _>("state_updated_at")
             == witness.get::<String, _>("state_updated_at");
-        let permitted = match state {
-            ConvState::LlmRequesting { attempt: 1 } => initial_timestamp,
-            ConvState::LlmRequesting { attempt } if attempt > 1 => true,
-            ConvState::ServerOverloadRetrying { retry } => {
-                retry.logical_request_id == intent.id.as_str()
-                    && retry.target
-                        == phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary
-                    && retry.phase == phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
-            }
-            _ => false,
-        };
+        let permitted = permits_initial_request(&state, &intent.id, initial_timestamp);
         if !permitted {
             return Err(DbError::Serialization(
                 "Start request state advanced without a new admitted request".into(),
@@ -112,5 +104,42 @@ impl WorkflowRepository {
             request_id: intent.id,
             observation: retained.observation().clone(),
         }))
+    }
+}
+
+fn permits_initial_request(
+    state: &ConvState,
+    request_id: &GoalRequestId,
+    initial_timestamp: bool,
+) -> bool {
+    match state {
+        ConvState::LlmRequesting { attempt: 1 } => initial_timestamp,
+        ConvState::LlmRequesting { attempt } if *attempt > 1 => true,
+        ConvState::ServerOverloadRetrying { retry } => {
+            retry.logical_request_id == request_id.as_str()
+                && retry.target == phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary
+                && retry.phase == phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
+        }
+        ConvState::Idle
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::CreationCancelled { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::RecoverableContinuationFailure { .. }
+        | ConvState::LlmRequesting { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::Error { .. }
+        | ConvState::Terminal
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::ContextExhausted { .. }
+        | ConvState::HandedOff { .. } => false,
     }
 }
