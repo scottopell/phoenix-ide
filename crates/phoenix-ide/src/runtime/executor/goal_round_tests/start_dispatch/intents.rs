@@ -153,7 +153,7 @@ async fn conversation_goal_real_normal_successor_requires_durable_checkpoint_and
     let before = ledger(&db).await;
     let captures = client.requests.lock().unwrap().len();
     let error = rt.execute_effect(Effect::RequestLlm).await.unwrap_err();
-    assert!(error.contains("budget exhausted"), "{error}");
+    assert!(error.contains("goal request limit is exhausted"), "{error}");
     assert!(rt.llm_task_handle.is_none());
     assert_eq!(client.requests.lock().unwrap().len(), captures);
     assert_eq!(ledger(&db).await, before);
@@ -250,7 +250,7 @@ async fn conversation_goal_summary_requires_exact_persisted_operation_and_capaci
         .execute_effect(Effect::RequestContinuation { request })
         .await
         .unwrap_err();
-    assert!(error.contains("budget exhausted"), "{error}");
+    assert!(error.contains("goal request limit is exhausted"), "{error}");
     assert!(rt.llm_task_handle.is_none());
     assert_eq!(client.requests.lock().unwrap().len(), captures);
     assert_eq!(ledger(&db).await, before);
