@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "intents/slots.rs"]
+mod slots;
+
 // The checkpoint primitive is exercised directly here; these are admission tests,
 // not proof that the production response owner commits this checkpoint atomically.
 async fn checkpoint_latest(
@@ -44,9 +47,7 @@ async fn checkpoint_latest(
 
 async fn normal_state(db: &Database, rt: &mut TestRuntime, attempt: u32) {
     rt.state = ConvState::LlmRequesting { attempt };
-    db.update_conversation_state(CONVERSATION, &rt.state)
-        .await
-        .unwrap();
+    persist_owned_request_state(db, rt).await;
 }
 
 async fn assert_normal_refused(
@@ -86,8 +87,8 @@ async fn conversation_goal_real_normal_successor_requires_durable_checkpoint_and
     db.update_conversation_state(CONVERSATION, &ConvState::LlmRequesting { attempt: 1 })
         .await
         .unwrap();
-    // The stale runtime still owns attempt 2, not the newly persisted attempt 1.
-    assert_normal_refused(&db, &mut rt, &client, "state advanced").await;
+    // The stale runtime still owns attempt 2 and its old slot timestamp.
+    assert_normal_refused(&db, &mut rt, &client, "slot timestamp differs").await;
     let now = Utc::now();
     rt.state = ConvState::ServerOverloadRetrying {
         retry: phoenix_core::domain::sm_state::ServerOverloadRetry {
@@ -100,9 +101,7 @@ async fn conversation_goal_real_normal_successor_requires_durable_checkpoint_and
             model_id: rt.context.model_id.clone(),
         },
     };
-    db.update_conversation_state(CONVERSATION, &rt.state)
-        .await
-        .unwrap();
+    persist_owned_request_state(&db, &mut rt).await;
     assert_normal_refused(&db, &mut rt, &client, "state advanced").await;
     normal_state(&db, &mut rt, 1).await;
     dispatch(&mut rt).await;
@@ -169,6 +168,7 @@ async fn conversation_goal_concurrent_same_summary_operation_commits_one_charge_
     let left = repository.admit_goal_start_request_context(
         CONVERSATION,
         Some((active.turn_id, active.generation)),
+        rt.state_updated_at,
         GoalRequestOperation::Summary {
             operation: text(operation),
         },
@@ -176,15 +176,21 @@ async fn conversation_goal_concurrent_same_summary_operation_commits_one_charge_
     let right = repository.admit_goal_start_request_context(
         CONVERSATION,
         Some((active.turn_id, active.generation)),
+        rt.state_updated_at,
         GoalRequestOperation::Summary {
             operation: text(operation),
         },
     );
     let (left, right) = tokio::join!(left, right);
+    let left = left.unwrap().unwrap();
+    let right = right.unwrap().unwrap();
+    assert_eq!(left.request_id(), right.request_id());
+    assert_eq!(left.admitted().state_updated_at(), rt.state_updated_at);
     assert_eq!(
-        left.unwrap().unwrap().request_id,
-        right.unwrap().unwrap().request_id
+        left.admitted().claim_generation(),
+        i64::try_from(active.generation).unwrap()
     );
+    assert_eq!(left.admitted().intent(), right.admitted().intent());
     assert_eq!(ledger(&db).await, (2, 0, 1, 0));
     assert!(client.requests.lock().unwrap().is_empty());
 }

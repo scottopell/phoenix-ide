@@ -60,6 +60,9 @@ async fn context(
                 TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
                 input.authority.generation.0,
             )),
+            db.get_conversation(input.receipt.historical_transcript().as_str())
+                .await?
+                .state_updated_at,
             phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal { attempt: 1 },
         )
         .await
@@ -78,7 +81,7 @@ async fn conversation_goal_start_retry_context_restores_same_id_ordinary_infligh
     )
     .await;
     let restored = context(&db, &input).await.unwrap().unwrap();
-    assert_eq!(restored.request_id, input.intent().unwrap().id);
+    assert_eq!(restored.request_id(), &input.intent().unwrap().id);
     assert_eq!(&restored.observation, input.receipt.observation());
     assert_eq!(materialization_counts(&db).await, before);
 }

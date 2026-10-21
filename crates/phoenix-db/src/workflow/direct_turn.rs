@@ -4,7 +4,9 @@ use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
 use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};
 pub(crate) use goal_start::insert_goal_start_turn_tx;
-pub use goal_start::{GoalStartAdoptionInput, GoalStartAdoptionOutcome, GoalStartRequestContext};
+pub use goal_start::{
+    AdmittedGoalRequest, GoalStartAdoptionInput, GoalStartAdoptionOutcome, GoalStartRequestContext,
+};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::db_schema::{

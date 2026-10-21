@@ -320,6 +320,7 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
                     TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
                     input.authority.generation.0,
                 )),
+                input.state_updated_at,
                 phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal {
                     attempt: 1,
                 },
@@ -327,7 +328,7 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(context.request_id, input.intent().unwrap().id);
+        assert_eq!(context.request_id(), &input.intent().unwrap().id);
         assert_eq!(&context.observation, input.receipt.observation());
         assert!(context
             .system_context()
@@ -351,6 +352,7 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
                 TurnAuthorityId(u64::try_from(input.receipt.execution().turn_id()).unwrap()),
                 input.authority.generation.0,
             )),
+            input.state_updated_at,
             phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal { attempt: 1 },
         )
         .await

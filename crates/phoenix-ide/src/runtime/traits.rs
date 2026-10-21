@@ -142,6 +142,7 @@ pub trait MessageStore: Send + Sync {
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
+        state_updated_at: DateTime<Utc>,
         operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String>;
 
@@ -908,10 +909,11 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
+        state_updated_at: DateTime<Utc>,
         operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
         (**self)
-            .admit_goal_start_request_context(conversation_id, active, operation)
+            .admit_goal_start_request_context(conversation_id, active, state_updated_at, operation)
             .await
     }
 
@@ -1814,6 +1816,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         conversation_id: &str,
         active: Option<&ActiveDirectTurn>,
+        state_updated_at: DateTime<Utc>,
         operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
     ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
         self.db
@@ -1821,6 +1824,7 @@ impl MessageStore for DatabaseStorage {
             .admit_goal_start_request_context(
                 conversation_id,
                 active.map(|active| (active.turn_id, active.generation)),
+                state_updated_at,
                 operation,
             )
             .await

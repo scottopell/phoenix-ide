@@ -333,6 +333,14 @@ async fn conversation_goal_real_executor_reopen_retry_keeps_request_identity_and
     }
 }
 
+async fn persist_owned_request_state(db: &Database, rt: &mut TestRuntime) {
+    let stamp = Utc::now();
+    db.update_conversation_state_at(CONVERSATION, &rt.state, stamp)
+        .await
+        .unwrap();
+    rt.state_updated_at = stamp;
+}
+
 async fn summary_state(
     db: &Database,
     rt: &mut TestRuntime,
@@ -347,9 +355,7 @@ async fn summary_state(
     rt.state = ConvState::AwaitingContinuation {
         request: request.clone(),
     };
-    db.update_conversation_state(CONVERSATION, &rt.state)
-        .await
-        .unwrap();
+    persist_owned_request_state(db, rt).await;
     request
 }
 

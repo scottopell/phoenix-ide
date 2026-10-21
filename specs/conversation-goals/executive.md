@@ -1,6 +1,69 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
-## Current qualified initial-purpose/live-snapshot partial floor: exact b4d98adc8
+## Current qualified request-admission dependency partial floor: exact 78be57b09
+
+Hosted [39621848940](https://github.com/scottopell/phoenix-ide/actions/runs/39621848940)
+on exact `78be57b098774b7f32d314ec0356d34442818a18`, artifact `12358235904`,
+retains **300/300 focused passes**, 3387 skipped, in 398.713s. Compilation
+(278.3s), codegen (1.3s), freshness (0.1s) and formatting passed. The six causal
+admission tests, bounded-ID selector test and independently charged Summary
+retry/reopen test passed, including stale attempt/overload refusal, same-operation
+concurrency, older Summary refusal, capacity and pre-charge Stop/version/queue
+checks. This qualifies the bounded admission dependency, not response checkpoint
+atomicity or runtime recovery.
+
+Broad tests timed out at 1500s: **4422/5605 executed, 4387 passed, 35 failed,
+194 skipped**, in 1499.585s. The incomplete result and shared Clippy remain
+**unwaived**; there is no overall green qualification. The preceding diagnostics
+`39614443130` (artifact `12352451223`) and `39615962741` (artifact `12355590596`)
+respectively exposed test retry-struct field mismatches/owned hex-format lint,
+then **298/300** passes with two capacity-message expectation mismatches; their
+corrections do not widen the passing scope. Historical 293/286/259 floors are
+retained separately below. Worker/public Start holds and default Disabled remain.
+
+## Authored exact-slot admission/receipt prerequisite — unrun
+
+The real ordinary and Summary executor paths pass their existing persisted
+`state_updated_at` through MessageStore, Arc and DatabaseStorage. Admission
+compares its canonical RFC3339 representation with the actual conversation row
+inside the same `BEGIN IMMEDIATE` transaction, before intent selection or
+append. A recognized Start with a stale timestamp refuses rather than returning
+legacy `None`, even if its attempt and Summary operation still match. Disabled
+and non-Start branches retain their existing behavior. This uses the existing
+state writer's timestamp representation; no timestamp format or precision
+compatibility guarantee is introduced.
+
+Only a successful admission commit constructs `AdmittedGoalRequest`. Its fields
+are private and it has no public constructor, deserializer or clone: it carries
+the exact retained intent, separately the current claim generation read from the
+owned turn, and the admitted slot stamp. Prompt request ID and purpose are
+accessors into that one intent rather than parallel copies. It is a committed
+admission receipt, **not** a response checkpoint, dispatch permit or evidence of
+lease ownership beyond the snapshot. The next transaction integration must
+consume this actual identity, never infer a response checkpoint from the latest
+ledger row.
+
+Three authored real DB/executor tests cover identical-state/different-stamp
+Normal attempt 1 successor and attempt 2 retry; same Summary operation/attempt
+1 and 2; and retained-intent/current-claim generation separation after the
+existing expired-claim reacquisition primitive. Stale owners keep their original
+stamp and must produce no provider request or ledger increment. Fresh owners
+restoring the persisted stamp retain admitted IDs and one-charge retries;
+receipt fields are checked against both canonical request and owned-turn rows.
+The generation test is a bounded primitive exercise, not autonomous recovery.
+Existing fixture stamps are synchronized only after their own successful
+persisted state writes; stale owners under test are never refreshed. All new
+tests are unrun; only owned-file formatting and diff checks were performed.
+
+Production canonical response/Coordinator-round plus request-checkpoint atomic
+persistence remains the next integration gate. Slot comparison is an admission
+snapshot, not a first-poll or response CAS guarantee. Short-epoch accepted-input
+queue-ABA/Stop fences, owner/drop/uncertain recovery, exhaustion/follow-through
+settlement and a genuine Start/continuation journey remain outstanding. The
+worker/public Start hold, default Disabled, immutable SQL132–136 and eleven
+stashes remain unchanged.
+
+## Historical qualified initial-purpose/live-snapshot partial floor: exact b4d98adc8
 
 Hosted [39598623682](https://github.com/scottopell/phoenix-ide/actions/runs/39598623682)
 on exact `b4d98adc889d58bd11bec95d02bbc86504fbd5ee`, artifact `12347362029`,
@@ -20,7 +83,7 @@ checkpoint atomicity, queue-ABA/first-poll dispatch, later-request/follow-throug
 autonomous recovery or public Start. Worker/public Start holds and default
 Disabled remain.
 
-## Authored durable request-admission dependency — unrun
+## Durable request-admission dependency — qualified at 78be57b09
 
 The runtime now supplies a typed actual operation: Normal with its current
 request attempt, or Summary carrying the exact existing
@@ -54,18 +117,18 @@ fences, and refusal of an older Summary after a later Normal or new Summary.
 The stale Normal attempt/overload refusal checks require unchanged ledger and
 capture counts. Explicit finite test ceilings of two or four bound these cases;
 there is no production ceiling default. A pure selector test covers delimiter
-separation and 100 bounded-size successor IDs. All new tests are **unrun**.
-The checkpoint test helper invokes the existing checkpoint primitive directly
+separation and 100 bounded-size successor IDs. These tests passed at the exact
+300-test partial floor above. The checkpoint test helper invokes the existing checkpoint primitive directly
 in its own test transaction; it is
 not a production response caller and does not prove atomic response/Coordinator
 checkpoint persistence.
 
 This is an admission dependency only. Production response/checkpoint integration,
-accepted-input/Stop short-epoch first-poll linearization, exact same-attempt
-request-state timestamp/CAS ownership, owner/drop/uncertain recovery and
-follow-through/exhaustion settlement remain outstanding. Attempt/operation
-matching alone is not proof against a stale same-attempt runtime acquiring a
-later persisted request slot. The existing epoch-under-DB-await control
+accepted-input/Stop short-epoch first-poll linearization, response-state CAS,
+owner/drop/uncertain recovery and follow-through/exhaustion settlement remain
+outstanding. Attempt/operation matching alone does not fence a stale same-attempt
+runtime; the authored slot-stamp prerequisite above adds that admission snapshot
+check without claiming full response ownership. The existing epoch-under-DB-await control
 implementation is not claimed as the required short-poll proof. Worker/public Start holds remain unchanged. Only
 owned-file formatting and diff checks were performed locally; eleven stashes
 and immutable SQL132–136 are preserved.

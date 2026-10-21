@@ -1,6 +1,7 @@
 use super::super::{
     to_i64, ConvState, DbError, DbResult, Row, TurnAuthorityId, WorkflowRepository,
 };
+use chrono::{DateTime, Utc};
 use phoenix_core::domain::conversation_goal::{
     GoalExecution, GoalRequestCause, GoalRequestId, GoalRequestIntent, GoalRequestOperation,
     GoalRequestPurpose, GoalSnapshot,
@@ -10,19 +11,57 @@ use std::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct AdmittedGoalRequest {
+    intent: GoalRequestIntent,
+    claim_generation: i64,
+    state_updated_at: DateTime<Utc>,
+}
+
+impl AdmittedGoalRequest {
+    #[must_use]
+    pub fn intent(&self) -> &GoalRequestIntent {
+        &self.intent
+    }
+
+    #[must_use]
+    pub const fn claim_generation(&self) -> i64 {
+        self.claim_generation
+    }
+
+    #[must_use]
+    pub const fn state_updated_at(&self) -> DateTime<Utc> {
+        self.state_updated_at
+    }
+}
+
+#[derive(Debug)]
 pub struct GoalStartRequestContext {
-    pub request_id: GoalRequestId,
-    pub purpose: GoalRequestPurpose,
+    admitted: AdmittedGoalRequest,
     pub observation: GoalSnapshot,
 }
 
 impl GoalStartRequestContext {
     #[must_use]
+    pub fn admitted(&self) -> &AdmittedGoalRequest {
+        &self.admitted
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &GoalRequestId {
+        &self.admitted.intent.id
+    }
+
+    #[must_use]
+    pub const fn purpose(&self) -> GoalRequestPurpose {
+        self.admitted.intent.cause.purpose()
+    }
+
+    #[must_use]
     pub fn system_context(&self) -> String {
         format!("\n\nAdmitted durable goal (request-local context, not a conversation message):\nOwner: {}\nGoal: {}\nObserved version: {}\nState: underway\nObjective:\n{}\nRequest purpose: {:?}\n",
             self.observation.owner.as_str(),self.observation.goal_id.as_str(),
-            self.observation.version.get(),self.observation.objective.as_str(),self.purpose)
+            self.observation.version.get(),self.observation.objective.as_str(),self.purpose())
     }
 }
 
@@ -36,6 +75,7 @@ impl WorkflowRepository {
         &self,
         transcript: &str,
         active: Option<(TurnAuthorityId, u64)>,
+        state_updated_at: DateTime<Utc>,
         operation: GoalRequestOperation,
     ) -> DbResult<Option<GoalStartRequestContext>> {
         if self.goal_execution_installation
@@ -73,6 +113,11 @@ impl WorkflowRepository {
         {
             return Err(DbError::Serialization(
                 "Start request has no live materialized execution".into(),
+            ));
+        }
+        if row.get::<String, _>("state_updated_at") != state_updated_at.to_rfc3339() {
+            return Err(DbError::Serialization(
+                "Start request slot timestamp differs".into(),
             ));
         }
         let execution = GoalExecution::parse(row.get("workflow_id"), to_i64(turn_id.0, "turn_id")?)
@@ -154,8 +199,11 @@ impl WorkflowRepository {
         }
         tx.commit().await?;
         Ok(Some(GoalStartRequestContext {
-            purpose: selected.cause.purpose(),
-            request_id: selected.id,
+            admitted: AdmittedGoalRequest {
+                intent: admitted.intent,
+                claim_generation: row.get("generation"),
+                state_updated_at,
+            },
             observation: retained.observation().clone(),
         }))
     }

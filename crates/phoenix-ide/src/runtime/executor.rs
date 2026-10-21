@@ -8204,6 +8204,7 @@ where
             .admit_goal_start_request_context(
                 &self.context.conversation_id,
                 self.active_direct_turn.as_deref(),
+                self.state_updated_at,
                 phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal {
                     attempt: match &self.state {
                         ConvState::LlmRequesting { attempt } => *attempt,
@@ -8527,12 +8528,14 @@ where
         // client (the "repeated message" bug).
         let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
         let request_id = match (goal_request_context.as_ref(), overload_incident.as_ref()) {
-            (Some(context), Some((_, retry_id, _))) if context.request_id.as_str() != retry_id => {
+            (Some(context), Some((_, retry_id, _)))
+                if context.request_id().as_str() != retry_id =>
+            {
                 return Err(
                     "Start transport retry differs from the admitted logical request".into(),
                 );
             }
-            (Some(context), _) => context.request_id.as_str().to_owned(),
+            (Some(context), _) => context.request_id().as_str().to_owned(),
             (None, Some((_, retry_id, _))) => retry_id.clone(),
             (None, None) => uuid::Uuid::new_v4().to_string(),
         };
@@ -10652,6 +10655,7 @@ where
             .admit_goal_start_request_context(
                 &self.context.conversation_id,
                 self.active_direct_turn.as_deref(),
+                self.state_updated_at,
                 phoenix_core::domain::conversation_goal::GoalRequestOperation::Summary {
                     operation: phoenix_core::domain::conversation_goal::GoalText::parse(
                         request.operation_id.clone(),
@@ -10683,16 +10687,16 @@ where
             (context, ConvState::ServerOverloadRetrying { retry })
                 if retry.phase == phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight =>
             {
-                if context
-                    .is_some_and(|context| context.request_id.as_str() != retry.logical_request_id)
-                {
+                if context.is_some_and(|context| {
+                    context.request_id().as_str() != retry.logical_request_id
+                }) {
                     return Err(
                         "Start summary retry differs from its admitted logical request".into(),
                     );
                 }
                 retry.logical_request_id.clone()
             }
-            (Some(context), _) => context.request_id.as_str().to_owned(),
+            (Some(context), _) => context.request_id().as_str().to_owned(),
             (None, _) => {
                 continuation_request_identity(&self.context.conversation_id, &operation_id)
             }
