@@ -3158,6 +3158,710 @@ connection.close()
 
 
 
+class ExactSource128To129Tests(unittest.TestCase):
+    setUp = CurrentSchemaPreparedUpgradeTests.setUp
+    database = CurrentSchemaPreparedUpgradeTests.database
+    manifest = CurrentSchemaPreparedUpgradeTests.manifest
+
+    def prepared128_manifest(self, database: Path) -> helper.Manifest:
+        base = self.manifest(database)
+        current = base.current_schema_upgrade
+        registry = Path(current.migration_registry_path)
+        registry.write_bytes(self.current_registry.read_bytes())
+        qualified = helper.PreparedSource128Upgrade(
+            **{**dataclasses.asdict(current), "migration_registry_sha256": helper.sha256(registry)},
+            prepared_source_baseline=128,
+            candidate_registry_expected_sha256=helper.PREPARED_SOURCE128_REGISTRY_SHA256,
+        )
+        return dataclasses.replace(
+            base, current_schema_upgrade=qualified,
+            source_commit=helper.PREPARED_SOURCE128_COMMIT,
+            expected=helper.Identity("0.13.0", helper.PREPARED_SOURCE128_COMMIT),
+        )
+
+    def install_migration129_script(self, manifest: helper.Manifest, *, failure: bool = False, growth: int = 0) -> None:
+        target = Path(manifest.candidate_binary)
+        migration = compiled_ledger(None)[-1]
+        target.write_text(f"""#!/usr/bin/env python3
+import os, sqlite3, sys
+with sqlite3.connect(os.environ['PHOENIX_DB_PATH']) as db:
+    db.execute('INSERT INTO _migrations VALUES (?, ?)', {migration!r})
+    {f"db.execute('CREATE TABLE rehearsal_growth (value BLOB)')" if growth else 'pass'}
+    {f"db.execute('INSERT INTO rehearsal_growth VALUES (zeroblob({growth}))')" if growth else 'pass'}
+sys.exit({7 if failure else 0})
+""")
+        target.chmod(0o755)
+        object.__setattr__(manifest, "candidate_binary_sha256", helper.sha256(target))
+
+    def held_snapshot(self, manifest: helper.Manifest, *, extra: int = 65536) -> helper.DatabaseCapacityReservation:
+        current = manifest.current_schema_upgrade
+        capacity = helper._source_capacity_bytes(Path(current.database_path)) + extra
+        reservation = helper.DatabaseCapacityReservation(
+            Path(current.backup_path),
+            helper._restore_capacity_path(manifest, Path(current.database_path)),
+            capacity, ceiling_bytes=capacity,
+            observed_source_bytes=helper._source_capacity_bytes(Path(current.database_path)),
+            measured_at=helper.utc_now(),
+        )
+        helper._allocate_private_sqlite(reservation.backup_path, capacity)
+        helper._allocate_private_sqlite(reservation.restore_path, capacity)
+        helper._write_capacity_observation(manifest, reservation)
+        with mock.patch.object(helper, "assert_database_exclusive"):
+            helper.create_database_backup(manifest, reservation)
+        return reservation
+
+    def test_exact_source128_only_and_target129_only(self) -> None:
+        self.assertEqual(helper.PREPARED_SOURCE128_REGISTRY_SHA256, helper.sha256(self.current_registry))
+        for through in range(113, 130):
+            with self.subTest(through=through):
+                db = self.database(through=through)
+                manifest = self.prepared128_manifest(db)
+                registry = Path(manifest.current_schema_upgrade.migration_registry_path)
+                if through == 128:
+                    self.assertEqual(helper.validate_current_schema_database(db, registry, manifest=manifest), tuple(compiled_ledger(128)))
+                else:
+                    with self.assertRaises(helper.ActivationError):
+                        helper.validate_current_schema_database(db, registry, manifest=manifest)
+                if through == 129:
+                    self.assertEqual(helper.validate_current_schema_database(db, registry, manifest=manifest, migrated=True), tuple(compiled_ledger(None)))
+                else:
+                    with self.assertRaises(helper.ActivationError):
+                        helper.validate_current_schema_database(db, registry, manifest=manifest, migrated=True)
+        self.assertEqual(helper.migration_registry(self.current_registry, qualified_source128=True)[-1],
+                         (129, "single_conversation_name_and_route_projection"))
+        with self.assertRaises(helper.ActivationError):
+            helper.migration_registry(self.current_registry)
+
+    def test_source128_typed_manifest_and_pin_mismatches_fail_before_disruption(self) -> None:
+        manifest = self.prepared128_manifest(self.database(through=128))
+        path = self.root / "manifest.json"
+        raw = dataclasses.asdict(manifest)
+        path.write_text(json.dumps(raw))
+        self.assertIsInstance(helper.Manifest.load(path).current_schema_upgrade, helper.PreparedSource128Upgrade)
+        current = manifest.current_schema_upgrade
+        for altered in (
+            dataclasses.replace(manifest, source_kind="published_release"),
+            dataclasses.replace(manifest, source_commit="a" * 40),
+            dataclasses.replace(manifest, expected=helper.Identity("0.13.1", manifest.source_commit)),
+            dataclasses.replace(manifest, current_schema_upgrade=dataclasses.replace(current, controller_source_commit=manifest.source_commit)),
+            dataclasses.replace(manifest, current_schema_upgrade=dataclasses.replace(current, candidate_registry_expected_sha256="0" * 64)),
+            dataclasses.replace(manifest, current_schema_upgrade=dataclasses.replace(current, prepared_source_baseline=True)),
+        ):
+            with self.subTest(altered=altered), self.assertRaises(helper.ActivationError):
+                helper.validate_prepared_source_qualification(altered)
+        for baseline in (129, True):
+            raw["current_schema_upgrade"]["prepared_source_baseline"] = baseline
+            path.write_text(json.dumps(raw))
+            with self.assertRaises(helper.ActivationError):
+                helper.validate_manifest_mode(helper.Manifest.load(path), prepare_transaction=False)
+        raw["current_schema_upgrade"]["unknown_qualification"] = True
+        path.write_text(json.dumps(raw))
+        with self.assertRaises(helper.ActivationError):
+            helper.Manifest.load(path)
+        Path(current.migration_registry_path).write_text("tampered")
+        with self.assertRaises(helper.ActivationError):
+            helper.validate_prepared_source128(manifest)
+
+    def test_native_rehearsal_reuses_reserved_slot_and_preserves_backup(self) -> None:
+        db = self.database(through=128)
+        manifest = self.prepared128_manifest(db)
+        self.install_migration129_script(manifest)
+        reservation = self.held_snapshot(manifest)
+        backup_sha = helper.sha256(reservation.backup_path)
+        live_sha = helper.sha256(db)
+        with mock.patch.object(helper, "assert_database_exclusive"):
+            helper.rehearse_prepared_source128(manifest, reservation)
+        self.assertEqual(helper.sha256(db), live_sha)
+        self.assertEqual(helper.sha256(reservation.backup_path), backup_sha)
+        self.assertGreaterEqual(reservation.restore_path.stat().st_blocks * 512, reservation.capacity_bytes)
+        with self.assertRaises(helper.ActivationError):
+            helper.database_ledger(reservation.restore_path)
+        proof = helper._snapshot_proof(manifest)
+        self.assertEqual(proof["rehearsal_ledger"], [list(row) for row in compiled_ledger(None)])
+        self.assertEqual(proof["rehearsal_backup_sha256"], backup_sha)
+        with mock.patch.object(helper, "assert_database_exclusive"), self.assertRaisesRegex(helper.ActivationError, "already been attempted"):
+            helper.rehearse_prepared_source128(manifest, reservation)
+        proof_path = Path(manifest.current_schema_upgrade.proof_path)
+        proof["rehearsal_backup_sha256"] = "0" * 64
+        proof_path.write_text(json.dumps(proof))
+        with self.assertRaisesRegex(helper.ActivationError, "rehearsal proof"):
+            helper._snapshot_proof(manifest)
+
+    def test_pre_marker_recovery_never_replays_backup(self) -> None:
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        self.held_snapshot(manifest)
+        manifest = dataclasses.replace(manifest, target_binary=manifest.rollback_binary)
+        Path(manifest.target_plist).write_bytes(Path(manifest.rollback_plist).read_bytes())
+        original = helper.database_logical_digest(database)
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        helper.write_status(manifest, "activating")
+        with mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "restore_database", side_effect=AssertionError("snapshot replay forbidden")) as replay, \
+             mock.patch.object(helper, "wait_for_identity"):
+            helper.restore(manifest, launchctl, database_snapshot=True,
+                           candidate_binary_mutated=False,
+                           rollback_plist=Path(manifest.rollback_plist))
+        replay.assert_not_called()
+        self.assertEqual(helper.database_logical_digest(database), original)
+        self.assertEqual(helper.read_status(manifest)["recovery_mode"], "unchanged_predecessor")
+
+    def source128_finalization_fixture(self, *, migrated: bool = False):
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        self.install_migration129_script(manifest)
+        reservation = self.held_snapshot(manifest)
+        with mock.patch.object(helper, "assert_database_exclusive"):
+            helper.rehearse_prepared_source128(manifest, reservation)
+            if migrated:
+                helper.invoke_current_schema_candidate(manifest, database, Path(manifest.candidate_binary))
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        helper.write_status(manifest, "migration_started", finalization_pending=True)
+        return database, manifest, reservation
+
+    def test_finalize_source128_reruns_once_only_for_exact_source_ledger(self) -> None:
+        database, manifest, reservation = self.source128_finalization_fixture()
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        real_run = subprocess.run
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper.subprocess, "run", side_effect=lambda args, **kwargs: absence if args[0] == "launchctl" else real_run(args, **kwargs)), \
+             mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "require_loaded_plist"), \
+             mock.patch.object(helper, "wait_for_identity"), \
+             mock.patch.object(helper, "restore_database", side_effect=AssertionError("backup replay forbidden")), \
+             mock.patch.object(helper, "rehearse_prepared_source128", side_effect=AssertionError("rehearsal replay forbidden")), \
+             mock.patch.object(helper, "invoke_current_schema_candidate", wraps=helper.invoke_current_schema_candidate) as invoke:
+            self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
+        invoke.assert_called_once()
+        self.assertEqual(helper.database_ledger(database)[-1][0], 129)
+        self.assertFalse(reservation.restore_path.exists())
+        self.assertFalse(Path(manifest.active_path).exists())
+        self.assertTrue(Path(manifest.target_plist).samefile(Path(manifest.candidate_plist)))
+        launchctl.start.assert_called_once_with(None, plist_path=manifest.candidate_plist)
+
+    def test_finalize_target129_reconstructs_proof_without_rerun(self) -> None:
+        database, manifest, _reservation = self.source128_finalization_fixture(migrated=True)
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper.subprocess, "run", return_value=absence), \
+             mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "require_loaded_plist"), \
+             mock.patch.object(helper, "wait_for_identity"), \
+             mock.patch.object(helper, "invoke_current_schema_candidate", side_effect=AssertionError("migration rerun forbidden")):
+            self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
+        proof = helper._snapshot_proof(manifest)
+        self.assertEqual(proof["migrated_logical_digest"], helper.database_logical_digest(database))
+        self.assertEqual(proof["migrated_ledger"], [list(row) for row in compiled_ledger(None)])
+
+    def test_finalize_failure_quarantines_persistent_target_and_retains_claim(self) -> None:
+        database, manifest, _reservation = self.source128_finalization_fixture(migrated=True)
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        launchctl.start.side_effect = helper.ActivationError("private bootstrap failed")
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper.subprocess, "run", return_value=absence), \
+             mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "restore_database", side_effect=AssertionError("backup replay forbidden")):
+            with self.assertRaisesRegex(helper.ActivationError, "private bootstrap failed"):
+                helper.finalize_paired(manifest, current_schema=True)
+        self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_database_committed")
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assertFalse(Path(manifest.target_plist).exists())
+        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        launchctl.stop.assert_called_once()
+
+    def test_finalize_refuses_persistent_plist_before_private_start(self) -> None:
+        database, manifest, _reservation = self.source128_finalization_fixture(migrated=True)
+        Path(manifest.target_plist).write_bytes(Path(manifest.candidate_plist).read_bytes())
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper.subprocess, "run", return_value=absence), \
+             mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl):
+            with self.assertRaisesRegex(helper.ActivationError, "persistent target plist must be absent"):
+                helper.finalize_paired(manifest, current_schema=True)
+        launchctl.start.assert_not_called()
+        launchctl.stop.assert_called_once()
+        self.assertFalse(Path(manifest.target_plist).exists())
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+
+    def test_source128_activation_isolates_target_before_and_after_stop_and_absence(self) -> None:
+        _database, manifest, reservation = self.activation128_fixture()
+        target = Path(manifest.target_plist)
+        launchctl = mock.Mock()
+        launchctl.disruption_started = False
+        def stop():
+            self.assertFalse(os.path.lexists(target))
+            target.symlink_to(self.root / "missing")
+            return 17
+        def inspect():
+            self.assertFalse(os.path.lexists(target))
+            target.write_text("after absence")
+            return "not_loaded", None
+        launchctl.stop.side_effect = stop
+        launchctl.inspect.side_effect = inspect
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "reserve_database_capacity", return_value=reservation), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "_reservation_still_sufficient"), \
+             mock.patch.object(helper, "rehearse_prepared_source128", side_effect=helper.ActivationError("pre-marker stop")), \
+             mock.patch.object(helper, "restore"), \
+             mock.patch.object(helper, "finalize_verified_predecessor"):
+            self.assertEqual(helper.activate(manifest), "activation_failed_rolled_back")
+        self.assertFalse(os.path.lexists(target))
+        retained = list(Path(manifest.current_schema_upgrade.proof_path).parent.glob("unresolved-launchagent-*.plist.quarantined"))
+        self.assertEqual(len(retained), 3)
+        self.assertTrue(any(path.is_symlink() for path in retained))
+        self.assertTrue(any(path.read_text() == "after absence" for path in retained if path.is_file()))
+
+    def test_source128_quarantine_retains_nonregular_entries_and_bounds_recreation(self) -> None:
+        _database, manifest, _reservation = self.source128_finalization_fixture()
+        target = Path(manifest.target_plist)
+        target.symlink_to(self.root / "missing-link-target")
+        retained = helper.quarantine_source128_target(manifest)
+        self.assertEqual(len(retained), 1)
+        self.assertTrue(retained[0].is_symlink())
+        self.assertFalse(os.path.lexists(target))
+        target.mkdir()
+        retained += helper.quarantine_source128_target(manifest)
+        self.assertEqual(len(retained), 2)
+        self.assertTrue(retained[1].is_dir())
+        self.assertFalse(os.path.lexists(target))
+        original_fsync = helper.fsync_dir
+        def recreate(path):
+            original_fsync(path)
+            if path == target.parent:
+                target.write_text("recreated")
+        target.write_text("initial")
+        with mock.patch.object(helper, "fsync_dir", side_effect=recreate), \
+             self.assertRaisesRegex(helper.ActivationError, "keeps reappearing"):
+            helper.quarantine_source128_target(manifest)
+        self.assertEqual(len(list(Path(manifest.current_schema_upgrade.proof_path).parent.glob("unresolved-launchagent-*.plist.quarantined"))),
+                         2 + helper.SOURCE128_QUARANTINE_ATTEMPTS)
+
+    def test_source128_settlement_isolates_recreated_target_after_stop_and_absence(self) -> None:
+        _database, manifest, _reservation = self.source128_finalization_fixture(migrated=True)
+        target = Path(manifest.target_plist)
+        target.write_text("before stop")
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        original = helper.quarantine_source128_target
+        phases = []
+        def isolate(parent):
+            phases.append("isolate")
+            result = original(parent)
+            if len(phases) < 3:
+                target.write_text(f"recreated {len(phases)}")
+            return result
+        def stop():
+            phases.append("stop")
+        with mock.patch.object(helper, "quarantine_source128_target", side_effect=isolate), \
+             mock.patch.object(helper, "require_launchd_absence", side_effect=lambda *_: phases.append("absence")):
+            launchctl.stop.side_effect = stop
+            helper.settle_source128_failure(manifest, launchctl, "failure")
+        self.assertEqual(phases, ["isolate", "stop", "isolate", "absence", "isolate"])
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(len(list(Path(manifest.current_schema_upgrade.proof_path).parent.glob("unresolved-launchagent-*.plist.quarantined"))), 3)
+
+    def test_source128_proof_rejects_unknown_and_duplicate_keys_before_rehearsal(self) -> None:
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        self.held_snapshot(manifest)
+        path = Path(manifest.current_schema_upgrade.proof_path)
+        original = path.read_text().strip()
+        for altered in (original[:-1] + ', "unknown": true}',
+                        original[:-1] + ', "sha256": "' + '0' * 64 + '"}'):
+            path.write_text(altered)
+            with self.assertRaises(helper.ActivationError):
+                helper._snapshot_proof(manifest, require_rehearsal=False)
+        path.write_text(original)
+        self.assertEqual(helper._snapshot_proof(manifest, require_rehearsal=False)["source_ledger"][-1][0], 128)
+
+    def test_source128_capacity_evidence_rejects_changed_or_unproven_no_snapshot_source(self) -> None:
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        reservation = self.held_snapshot(manifest)
+        evidence = helper._capacity_observation_path(reservation)
+        observed = json.loads(evidence.read_text())
+        self.assertEqual(observed["pre_stop_source_ledger"][-1][0], 128)
+        self.assertEqual(observed["pre_stop_logical_digest"], helper.database_logical_digest(database))
+        Path(manifest.current_schema_upgrade.proof_path).unlink()
+        helper.verify_source128_unchanged_without_snapshot(manifest)
+        with sqlite3.connect(database) as db:
+            db.execute("INSERT INTO product_conversations (id) VALUES ('after-stop')")
+        with self.assertRaisesRegex(helper.ActivationError, "pre-stop capacity evidence"):
+            helper.verify_source128_unchanged_without_snapshot(manifest)
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("not_loaded", None)
+        with mock.patch.object(helper, "assert_database_exclusive"), \
+             self.assertRaisesRegex(helper.ActivationError, "pre-stop capacity evidence"):
+            helper.restore(manifest, launchctl, database_snapshot=False, candidate_binary_mutated=False)
+        launchctl.start.assert_not_called()
+        evidence.unlink()
+        with self.assertRaises(helper.ActivationError):
+            helper.verify_source128_unchanged_without_snapshot(manifest)
+
+    def test_source128_snapshot_recovery_releases_restore_only_after_predecessor_checkpoint(self) -> None:
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        reservation = self.held_snapshot(manifest)
+        helper.write_status(manifest, "activation_failed_rollback_failed", recovery_mode="unchanged_predecessor")
+        with mock.patch.object(helper, "release_unsnapshotted_capacity", side_effect=AssertionError("snapshot retained")) as abandon:
+            helper.finalize_verified_predecessor(manifest, "failure")
+        abandon.assert_not_called()
+        self.assertTrue(reservation.backup_path.exists())
+        self.assertTrue(Path(manifest.current_schema_upgrade.proof_path).exists())
+        self.assertFalse(reservation.restore_path.exists())
+
+    def test_finalize_running_source128_private_candidate_preserves_pre_start_digest(self) -> None:
+        database, manifest, _reservation = self.source128_finalization_fixture(migrated=True)
+        proof_path = Path(manifest.current_schema_upgrade.proof_path)
+        proof = helper._snapshot_proof(manifest)
+        proof.update(migration_committed_at=helper.utc_now(), migrated_ledger=proof["target_ledger"],
+                     migrated_logical_digest=helper.database_logical_digest(database))
+        helper.atomic_write(proof_path, helper._encode_database_proof(proof))
+        helper.checkpoint_source128_start(manifest)
+        before = helper._snapshot_proof(manifest)["migrated_logical_digest"]
+        with sqlite3.connect(database) as db:
+            db.execute("INSERT INTO product_conversations (id) VALUES ('runtime-write')")
+        launchctl = mock.Mock()
+        launchctl.inspect.side_effect = [("running", 42), ("not_loaded", None)]
+        absence = subprocess.CompletedProcess([], 1, "", "service not found")
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper.subprocess, "run", return_value=absence), \
+             mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "require_launchd_absence"), \
+             mock.patch.object(helper, "require_loaded_plist") as loaded, \
+             mock.patch.object(helper, "wait_for_identity") as health, \
+             mock.patch.object(helper, "invoke_current_schema_candidate", side_effect=AssertionError("migration replay forbidden")):
+            self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
+        loaded.assert_called()
+        health.assert_called()
+        launchctl.stop.assert_called_once()
+        self.assertEqual(helper._snapshot_proof(manifest)["migrated_logical_digest"], before)
+        self.assertNotEqual(helper.database_logical_digest(database), before)
+        self.assertFalse(Path(manifest.active_path).exists())
+
+    def test_internal_claim_release_failure_settles_post_marker(self) -> None:
+        database, manifest, reservation = self.activation128_fixture()
+        launchctl = mock.Mock()
+        launchctl.disruption_started = False
+        launchctl.stop.return_value = 17
+        launchctl.inspect.return_value = ("not_loaded", None)
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "reserve_database_capacity", return_value=reservation), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "require_launchd_absence"), \
+             mock.patch.object(helper, "require_loaded_plist"), \
+             mock.patch.object(helper, "wait_for_identity"), \
+             mock.patch.object(helper, "release_durable_terminal_claim", return_value=False), \
+             mock.patch.object(helper, "restore", side_effect=AssertionError("rollback forbidden")):
+            self.assertEqual(helper.activate(manifest), "activation_failed_database_committed")
+        self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_database_committed")
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assertEqual(helper.database_ledger(database)[-1][0], 129)
+
+    def test_source128_pin_matches_approved_base(self) -> None:
+        self.assertEqual(helper.PREPARED_SOURCE128_COMMIT, "1f6558f8db0083b485db074d9e05f0224db93d0e")
+
+    def test_finalizer_refuses_loaded_or_unqualified_database_without_rerun(self) -> None:
+        database, manifest, _reservation = self.source128_finalization_fixture()
+        launchctl = mock.Mock()
+        launchctl.inspect.return_value = ("running", 42)
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "absent")), \
+             mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
+             mock.patch.object(helper, "invoke_current_schema_candidate", side_effect=AssertionError("migration forbidden")):
+            with self.assertRaisesRegex(helper.ActivationError, "stopped candidate"):
+                helper.finalize_paired(manifest, current_schema=True)
+            launchctl.inspect.return_value = ("not_loaded", None)
+            with sqlite3.connect(database) as connection:
+                connection.execute("DELETE FROM _migrations WHERE version=128")
+            with mock.patch.object(helper, "assert_database_exclusive"):
+                with self.assertRaises(helper.ActivationError):
+                    helper.finalize_paired(manifest, current_schema=True)
+        launchctl.start.assert_not_called()
+        self.assertTrue(Path(manifest.active_path).exists())
+
+    def test_rehearsal_rechecks_physical_restore_and_live_digest(self) -> None:
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        self.install_migration129_script(manifest)
+        reservation = self.held_snapshot(manifest)
+        reservation.restore_path.unlink()
+        with mock.patch.object(helper, "assert_database_exclusive"), \
+             self.assertRaisesRegex(helper.ActivationError, "reservation"):
+            helper.rehearse_prepared_source128(manifest, reservation)
+        helper._allocate_private_sqlite(reservation.restore_path, reservation.capacity_bytes)
+        digest = helper.database_logical_digest(database)
+        original = helper.database_logical_digest
+        def changed_live(path):
+            value = original(path)
+            return "0" * 64 if path == database else value
+        with mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "database_logical_digest", side_effect=changed_live), \
+             self.assertRaisesRegex(helper.ActivationError, "live source changed"):
+            helper.rehearse_prepared_source128(manifest, reservation)
+        self.assertEqual(helper.database_logical_digest(database), digest)
+        self.assertGreaterEqual(reservation.restore_path.stat().st_blocks * 512, reservation.capacity_bytes)
+        self.assertFalse(any(reservation.restore_path.with_name(reservation.restore_path.name + suffix).exists()
+                             for suffix in ("-wal", "-shm", "-journal")))
+
+    def test_post_marker_settlement_quarantines_before_stop_and_records_uncertainty(self) -> None:
+        database, manifest, _reservation = self.source128_finalization_fixture(migrated=True)
+        Path(manifest.target_plist).write_bytes(Path(manifest.candidate_plist).read_bytes())
+        launchctl = mock.Mock()
+        launchctl.stop.side_effect = helper.ActivationError("stop failed")
+        launchctl.inspect.return_value = ("running", 42)
+        sequence = []
+        quarantine = helper.quarantine_paired_plist
+        def record_quarantine(parent):
+            sequence.append("quarantine")
+            return quarantine(parent)
+        def record_stop():
+            sequence.append("stop")
+            raise helper.ActivationError("stop failed")
+        launchctl.stop.side_effect = record_stop
+        with mock.patch.object(helper, "quarantine_paired_plist", side_effect=record_quarantine), \
+             mock.patch.object(helper, "require_launchd_absence", side_effect=helper.ActivationError("absence uncertain")):
+            self.assertEqual(helper.settle_source128_failure(manifest, launchctl, "start failed"), "activation_failed_database_committed")
+        self.assertEqual(sequence, ["quarantine", "stop"])
+        self.assertFalse(Path(manifest.target_plist).exists())
+        status = helper.read_status(manifest)
+        self.assertIn("absence unconfirmed", status["rollback_failure"])
+        self.assertTrue(status["finalization_pending"])
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assertTrue(Path(manifest.current_schema_upgrade.backup_path).exists())
+
+    def activation128_fixture(self):
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        self.install_migration129_script(manifest)
+        reservation = self.held_snapshot(manifest)
+        Path(manifest.target_plist).write_bytes(Path(manifest.rollback_plist).read_bytes())
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        helper.write_status(manifest, "prepared")
+        return database, manifest, reservation
+
+    def test_full_source128_activation_migrates_and_publishes_private_plist(self) -> None:
+        database, manifest, reservation = self.activation128_fixture()
+        launchctl = mock.Mock()
+        launchctl.disruption_started = False
+        def stop_after_quarantine():
+            self.assertFalse(os.path.lexists(manifest.target_plist))
+            return 17
+        launchctl.stop.side_effect = stop_after_quarantine
+        launchctl.inspect.return_value = ("not_loaded", None)
+        def private_start(_old_pid, *, plist_path):
+            self.assertEqual(plist_path, manifest.candidate_plist)
+            self.assertFalse(os.path.lexists(manifest.target_plist))
+            self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        launchctl.start.side_effect = private_start
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "reserve_database_capacity", return_value=reservation), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "require_loaded_plist") as loaded, \
+             mock.patch.object(helper, "wait_for_identity"), \
+             mock.patch.object(helper, "restore_database", side_effect=AssertionError("backup replay forbidden")):
+            self.assertEqual(helper.activate(manifest), "committed")
+        loaded.assert_called_once_with(manifest, launchctl, Path(manifest.candidate_plist))
+        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.read_status(manifest)["state"], "committed")
+        self.assertFalse(helper.read_status(manifest)["finalization_pending"])
+        self.assertFalse(Path(manifest.active_path).exists())
+        self.assertIn("candidate_start_attempted_at", helper._snapshot_proof(manifest))
+        self.assertTrue(Path(manifest.target_plist).samefile(Path(manifest.candidate_plist)))
+        self.assertFalse(reservation.restore_path.exists())
+        self.assertTrue(reservation.backup_path.exists())
+        self.assertEqual(helper._snapshot_proof(manifest)["migrated_logical_digest"], helper.database_logical_digest(database))
+
+    def test_ambiguous_marker_write_never_rolls_back(self) -> None:
+        database, manifest, reservation = self.activation128_fixture()
+        launchctl = mock.Mock()
+        launchctl.disruption_started = False
+        launchctl.stop.return_value = 17
+        launchctl.inspect.return_value = ("not_loaded", None)
+        write = helper.write_status
+        def ambiguous(parent, state, **fields):
+            write(parent, state, **fields)
+            if state == "migration_started":
+                raise OSError("marker fsync uncertain")
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "reserve_database_capacity", return_value=reservation), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "require_launchd_absence"), \
+             mock.patch.object(helper, "write_status", side_effect=ambiguous), \
+             mock.patch.object(helper, "restore", side_effect=AssertionError("rollback forbidden")), \
+             mock.patch.object(helper, "run_current_schema_migration") as live:
+            self.assertEqual(helper.activate(manifest), "activation_failed_database_committed")
+        live.assert_not_called()
+        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(128)))
+        self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_database_committed")
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assertFalse(Path(manifest.target_plist).exists())
+        self.assertTrue(reservation.backup_path.exists())
+
+    def assert_post_marker_activation_failure(self, phase: str) -> None:
+        database, manifest, reservation = self.activation128_fixture()
+        launchctl = mock.Mock()
+        launchctl.disruption_started = False
+        launchctl.stop.return_value = 17
+        launchctl.inspect.return_value = ("not_loaded", None)
+        if phase == "start":
+            launchctl.start.side_effect = helper.ActivationError("start failure")
+        write = helper.write_status
+        atomic = helper.atomic_write
+        publish = helper.publish_source128_plist
+        def write_phase(parent, state, **fields):
+            if phase == "status" and state == "committed" and not fields.get("finalization_pending"):
+                raise OSError("final status failure")
+            return write(parent, state, **fields)
+        def atomic_phase(path, payload, *args, **kwargs):
+            if phase == "deployed" and path == Path(manifest.deployed_sha_path):
+                raise OSError("deployed SHA failure")
+            return atomic(path, payload, *args, **kwargs)
+        def publish_phase(prepared, target):
+            if phase == "publish":
+                raise OSError("publication failure")
+            return publish(prepared, target)
+        with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "reserve_database_capacity", return_value=reservation), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "require_launchd_absence"), \
+             mock.patch.object(helper, "require_loaded_plist"), \
+             mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("health failure") if phase == "health" else None), \
+             mock.patch.object(helper, "write_status", side_effect=write_phase), \
+             mock.patch.object(helper, "atomic_write", side_effect=atomic_phase), \
+             mock.patch.object(helper, "publish_source128_plist", side_effect=publish_phase), \
+             mock.patch.object(helper, "restore", side_effect=AssertionError("rollback forbidden")):
+            self.assertEqual(helper.activate(manifest), "activation_failed_database_committed")
+        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertGreaterEqual(launchctl.stop.call_count, 2)
+        self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_database_committed")
+        self.assertTrue(Path(manifest.active_path).exists())
+        self.assertTrue(reservation.backup_path.exists())
+        self.assertFalse(Path(manifest.target_plist).exists())
+
+    def test_post_marker_start_failure_settles(self) -> None:
+        self.assert_post_marker_activation_failure("start")
+
+    def test_post_marker_health_failure_settles(self) -> None:
+        self.assert_post_marker_activation_failure("health")
+
+    def test_post_marker_deployed_sha_failure_settles(self) -> None:
+        self.assert_post_marker_activation_failure("deployed")
+
+    def test_post_marker_publication_failure_settles(self) -> None:
+        self.assert_post_marker_activation_failure("publish")
+
+    def test_post_marker_final_status_failure_settles(self) -> None:
+        self.assert_post_marker_activation_failure("status")
+
+    def test_persistent_publication_is_no_replace(self) -> None:
+        database, manifest, _reservation = self.activation128_fixture()
+        target = Path(manifest.target_plist)
+        prepared = helper.prepare_plist_publication(Path(manifest.candidate_plist), target)
+        try:
+            with self.assertRaisesRegex(helper.ActivationError, "already exists"):
+                helper.publish_source128_plist(prepared, target)
+            self.assertEqual(target.read_bytes(), Path(manifest.rollback_plist).read_bytes())
+        finally:
+            prepared.unlink(missing_ok=True)
+
+    def test_pre_marker_rehearsal_failure_recovers_unchanged_predecessor(self) -> None:
+        self.assert_activation_marker_boundary(before_marker=True)
+
+    def test_post_marker_live_failure_retains_claim_and_never_restores(self) -> None:
+        self.assert_activation_marker_boundary(before_marker=False)
+
+    def assert_activation_marker_boundary(self, *, before_marker: bool) -> None:
+        database = self.database(through=128)
+        manifest = self.prepared128_manifest(database)
+        current = manifest.current_schema_upgrade
+        self.install_migration129_script(manifest)
+        reservation = self.held_snapshot(manifest)
+        Path(manifest.target_plist).write_bytes(Path(manifest.rollback_plist).read_bytes())
+        Path(manifest.active_path).write_text(manifest.transaction_id)
+        helper.write_status(manifest, "prepared")
+        initial_digest = helper.database_logical_digest(database)
+
+        class StoppedLaunchctl:
+            disruption_started = False
+            def stop(self):
+                self.disruption_started = True
+                return 71
+            def inspect(self):
+                return "not_loaded", None
+            def start(self, *args, **kwargs):
+                raise AssertionError("candidate/predecessor startup must be explicitly authorized")
+
+        launchctl = StoppedLaunchctl()
+        with mock.patch.object(helper, "__file__", current.controller_helper_path), \
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "reserve_database_capacity", return_value=reservation), \
+             mock.patch.object(helper, "_reservation_still_sufficient"), \
+             mock.patch.object(helper, "assert_database_exclusive"), \
+             mock.patch.object(helper, "rehearse_prepared_source128", side_effect=helper.ActivationError("rehearsal failed") if before_marker else None) as rehearsal, \
+             mock.patch.object(helper, "run_current_schema_migration", side_effect=helper.ActivationError("live migration failed")) as live, \
+             mock.patch.object(helper, "restore") as restore, \
+             mock.patch.object(helper, "finalize_verified_predecessor"):
+            result = helper.activate(manifest)
+        rehearsal.assert_called_once()
+        if before_marker:
+            live.assert_not_called()
+            restore.assert_called_once()
+            self.assertEqual(result, "activation_failed_rolled_back")
+        else:
+            live.assert_called_once()
+            restore.assert_not_called()
+            self.assertEqual(result, "activation_failed_database_committed")
+            self.assertTrue(helper.read_status(manifest)["finalization_pending"])
+        self.assertEqual(helper.database_logical_digest(database), initial_digest)
+        self.assertEqual(Path(manifest.active_path).read_text(), manifest.transaction_id)
+
+    def test_rehearsal_failure_and_capacity_rejection_leave_live_source_untouched(self) -> None:
+        for failure, growth in ((True, 0), (False, 1024 * 1024)):
+            with self.subTest(failure=failure, growth=growth):
+                db = self.database(through=128)
+                manifest = self.prepared128_manifest(db)
+                self.install_migration129_script(manifest, failure=failure, growth=growth)
+                for name in ("backup.sqlite3", "proof.json", "capacity.json"):
+                    (self.root / "transaction" / name).unlink(missing_ok=True)
+                helper._restore_capacity_path(manifest, db).unlink(missing_ok=True)
+                reservation = self.held_snapshot(manifest)
+                backup_sha = helper.sha256(reservation.backup_path)
+                live_sha = helper.sha256(db)
+                with mock.patch.object(helper, "assert_database_exclusive"), self.assertRaises(helper.ActivationError):
+                    helper.rehearse_prepared_source128(manifest, reservation)
+                self.assertEqual(helper.sha256(db), live_sha)
+                self.assertEqual(helper.sha256(reservation.backup_path), backup_sha)
+                self.assertNotIn("rehearsal_ledger", json.loads(Path(manifest.current_schema_upgrade.proof_path).read_text()))
+
+
 class CurrentSchemaRepairTests(unittest.TestCase):
     """Exact forward replacement; no production or real launchctl invocation."""
 

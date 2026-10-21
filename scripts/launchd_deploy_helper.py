@@ -96,6 +96,66 @@ class CurrentSchemaUpgrade:
 
 PREPARED_SOURCE114_COMMIT = "23badb8be4bc8d05a7e1c49c5367ceb14ebccd92"
 PREPARED_SOURCE114_REGISTRY_SHA256 = "a4eb047e59b21997ea068f1bd5e97c9c943f74a4c5670cdd8ff8ac10ffd5eee6"
+PREPARED_SOURCE128_COMMIT = "1f6558f8db0083b485db074d9e05f0224db93d0e"
+PREPARED_SOURCE128_VERSION = "0.13.0"
+PREPARED_SOURCE128_REGISTRY_SHA256 = "c54f9884b1b86aea19ca214cf059724f456c899a219006b59f1c6a16cca6caa5"
+PREPARED_SOURCE128_TARGET = (129, "single_conversation_name_and_route_projection")
+SOURCE128_QUARANTINE_ATTEMPTS = 8
+SOURCE128_PROOF_BASE_KEYS = {
+    "transaction_id", "source_commit", "database", "sha256", "candidate_binary_sha256",
+    "candidate_plist_sha256", "previous_binary_sha256", "previous_plist_sha256",
+    "controller_source_commit", "controller_helper_sha256", "database_mode",
+    "migration_registry_sha256", "prepared_source_qualification", "source_ledger",
+    "target_ledger", "source_logical_digest", "backup_logical_digest",
+}
+SOURCE128_REHEARSAL_KEYS = {
+    "rehearsal_ledger", "rehearsal_backup_sha256", "rehearsal_logical_digest", "rehearsed_at",
+}
+SOURCE128_MIGRATED_KEYS = {"migration_committed_at", "migrated_ledger", "migrated_logical_digest"}
+SOURCE128_START_KEYS = {"candidate_start_attempted_at"}
+
+
+def _source128_proof_pairs(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ActivationError("duplicate source128 database proof key")
+        result[key] = value
+    return result
+
+
+def _source128_proof_shape(proof: dict) -> None:
+    base = SOURCE128_PROOF_BASE_KEYS
+    rehearsed = base | SOURCE128_REHEARSAL_KEYS
+    migrated = rehearsed | SOURCE128_MIGRATED_KEYS
+    if set(proof) not in (base, rehearsed, migrated, migrated | SOURCE128_START_KEYS):
+        raise ActivationError("source128 requires exact retained proof keys")
+    if proof["backup_logical_digest"] != proof["source_logical_digest"]:
+        raise ActivationError("source128 snapshot digests differ")
+    if "candidate_start_attempted_at" in proof and (not isinstance(proof["candidate_start_attempted_at"], str) or not proof["candidate_start_attempted_at"]):
+        raise ActivationError("source128 candidate start checkpoint is invalid")
+
+
+def checkpoint_source128_start(manifest: Manifest) -> None:
+    proof = _snapshot_proof(manifest)
+    if set(proof) != SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS | SOURCE128_MIGRATED_KEYS:
+        raise ActivationError("source128 start requires committed pre-start proof")
+    current = manifest.current_schema_upgrade
+    assert isinstance(current, PreparedSource128Upgrade)
+    path = Path(current.proof_path)
+    proof["candidate_start_attempted_at"] = utc_now()
+    encoded = _encode_database_proof(proof)
+    _validate_database_proof_lifecycle_budget(
+        b"0" * path.stat().st_size, encoded,
+        max(os.statvfs(path.parent).f_frsize, 4096),
+    )
+    atomic_write(path, encoded, 0o600)
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparedSource128Upgrade(CurrentSchemaUpgrade):
+    prepared_source_baseline: int
+    candidate_registry_expected_sha256: str
 
 
 CURRENT_REPAIR_COMMIT = "237100c79d9ce672867b284167a099fa0b7a2bcf"
@@ -323,7 +383,7 @@ class Manifest:
     health_timeout_secs: float = DEFAULT_HEALTH_TIMEOUT_SECS
     # None is intentional for pre-feature runtime-only manifests.
     paired_database_upgrade: Optional[PairedDatabaseUpgrade] = None
-    current_schema_upgrade: Optional[CurrentSchemaUpgrade | PreparedSource114Upgrade] = None
+    current_schema_upgrade: Optional[CurrentSchemaUpgrade | PreparedSource114Upgrade | PreparedSource128Upgrade] = None
     ordinary_forward_migration: Optional[OrdinaryForwardMigration] = None
 
     @classmethod
@@ -346,10 +406,11 @@ class Manifest:
             ):
                 value = raw.get(key)
                 if value is not None:
-                    if key == "current_schema_upgrade" and isinstance(value, dict) and (
-                        "prepared_source_baseline" in value or "candidate_registry_expected_sha256" in value
-                    ):
-                        record_type = PreparedSource114Upgrade
+                    if key == "current_schema_upgrade" and isinstance(value, dict):
+                        if value.get("prepared_source_baseline") == 128 and type(value.get("prepared_source_baseline")) is int:
+                            record_type = PreparedSource128Upgrade
+                        elif "prepared_source_baseline" in value or "candidate_registry_expected_sha256" in value:
+                            record_type = PreparedSource114Upgrade
                     value = _manifest_record(record_type, value)
                     if any(isinstance(item, str) and not item.strip() for item in dataclasses.asdict(value).values()):
                         raise ValueError(f"{key} string fields must be nonempty")
@@ -695,7 +756,7 @@ def validate_database(path: Path) -> None:
 
 
 def migration_registry(
-    path: Path, *, qualified_current_target: bool = True
+    path: Path, *, qualified_current_target: bool = True, qualified_source128: bool = False
 ) -> tuple[tuple[int, str], ...]:
     try:
         source = path.read_text()
@@ -754,10 +815,14 @@ def migration_registry(
             raise ActivationError(
                 "candidate migration registry lacks required irreversible migrations"
             )
-        if migrations[-1][0] != max(CURRENT_SCHEMA_REQUIRED_MIGRATIONS):
-            raise ActivationError(
-                "candidate migration registry is newer than the qualified target"
-            )
+        expected_target = (
+            PREPARED_SOURCE128_TARGET if qualified_source128
+            else (128, CURRENT_SCHEMA_REQUIRED_MIGRATIONS[128])
+        )
+        if migrations[-1][0] > expected_target[0]:
+            raise ActivationError("candidate migration registry is newer than the qualified target")
+        if migrations[-1] != expected_target:
+            raise ActivationError("candidate migration registry differs from the qualified target")
     return migrations
 
 
@@ -873,12 +938,13 @@ def validate_current_schema_database(
     from contextlib import closing
 
     qualified114 = manifest is not None and isinstance(manifest.current_schema_upgrade, PreparedSource114Upgrade)
-    if qualified114:
-        validate_prepared_source114(manifest)
+    qualified128 = manifest is not None and isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade)
+    if qualified114 or qualified128:
+        validate_prepared_source_qualification(manifest)
         if source_kind != manifest.source_kind or registry_path != Path(manifest.current_schema_upgrade.migration_registry_path):
-            raise ActivationError("prepared source114 registry or source kind differs from manifest")
+            raise ActivationError("qualified prepared registry or source kind differs from manifest")
     validate_database(path)
-    registry = migration_registry(registry_path)
+    registry = migration_registry(registry_path, qualified_source128=qualified128)
     ledger = database_ledger(path)
     target = tuple(registry)
     baseline_version = {
@@ -887,6 +953,8 @@ def validate_current_schema_database(
     }.get(source_kind)
     if qualified114:
         baseline_version = 114
+    elif qualified128:
+        baseline_version = 128
     if baseline_version is None:
         raise ActivationError("current-schema source kind is not qualified")
     if not any(version == baseline_version for version, _name in registry):
@@ -894,7 +962,7 @@ def validate_current_schema_database(
     baseline = tuple(item for item in registry if item[0] <= baseline_version)
     if migrated:
         admitted = (target,)
-    elif source_kind == "published_release":
+    elif source_kind == "published_release" or qualified128:
         admitted = (baseline,)
     else:
         admitted = (baseline, target)
@@ -1188,11 +1256,11 @@ def _database_proof_bytes(
                 manifest.current_schema_upgrade.migration_registry_sha256
             ),
             source_ledger=validate_current_schema_database(source, registry_path, source_kind=manifest.source_kind, manifest=manifest),
-            target_ledger=migration_registry(registry_path),
+            target_ledger=current_schema_target_registry(manifest, registry_path),
             source_logical_digest=source_logical_digest,
             backup_logical_digest=backup_logical_digest,
         )
-    if isinstance(manifest.current_schema_upgrade, PreparedSource114Upgrade):
+    if isinstance(manifest.current_schema_upgrade, (PreparedSource114Upgrade, PreparedSource128Upgrade)):
         payload["prepared_source_qualification"] = prepared_source_qualification(manifest)
     return _encode_database_proof(payload)
 
@@ -1208,9 +1276,17 @@ def _encode_database_proof(payload: dict) -> bytes:
 
 def _project_migrated_database_proof(proof_bytes: bytes) -> bytes:
     payload = json.loads(proof_bytes)
+    qualification = payload.get("prepared_source_qualification")
+    if isinstance(qualification, dict) and qualification.get("prepared_source_baseline") == 128:
+        payload["rehearsal_ledger"] = payload["target_ledger"]
+        payload["rehearsal_backup_sha256"] = "0" * 64
+        payload["rehearsal_logical_digest"] = "0" * 64
+        payload["rehearsed_at"] = PROJECTED_MIGRATION_TIMESTAMP
     payload["migration_committed_at"] = PROJECTED_MIGRATION_TIMESTAMP
     payload["migrated_ledger"] = payload["target_ledger"]
     payload["migrated_logical_digest"] = "0" * 64
+    if isinstance(qualification, dict) and qualification.get("prepared_source_baseline") == 128:
+        payload["candidate_start_attempted_at"] = PROJECTED_MIGRATION_TIMESTAMP
     return _encode_database_proof(payload)
 
 
@@ -1305,6 +1381,24 @@ def _require_current_schema_free_space(
         )
 
 
+def _source128_capacity_source(manifest: Manifest, reservation: DatabaseCapacityReservation) -> dict:
+    path = _capacity_observation_path(reservation)
+    _regular_nosymlink(path, "source128 pre-stop capacity evidence")
+    try:
+        evidence = json.loads(path.read_text(), object_pairs_hook=_source128_proof_pairs)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ActivationError("source128 pre-stop capacity evidence is unreadable") from exc
+    if (not isinstance(evidence, dict) or evidence.get("transaction_id") != manifest.transaction_id
+            or evidence.get("pre_stop_source_ledger") != [list(row) for row in current_schema_target_registry(manifest, _current_schema_registry(manifest)) if row[0] <= 128]
+            or not isinstance(evidence.get("pre_stop_logical_digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence["pre_stop_logical_digest"])):
+        raise ActivationError("source128 pre-stop ledger or logical digest evidence is invalid")
+    return {
+        "pre_stop_source_ledger": evidence["pre_stop_source_ledger"],
+        "pre_stop_logical_digest": evidence["pre_stop_logical_digest"],
+    }
+
+
 def _write_capacity_observation(
     manifest: Manifest,
     reservation: DatabaseCapacityReservation,
@@ -1312,7 +1406,22 @@ def _write_capacity_observation(
     rechecked_source_bytes: Optional[int] = None,
     rechecked_at: Optional[str] = None,
 ) -> None:
+    source128 = isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade)
+    source_evidence = {}
+    if source128:
+        if rechecked_source_bytes is None:
+            source = Path(manifest.current_schema_upgrade.database_path)
+            ledger = validate_current_schema_database(
+                source, _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
+            )
+            source_evidence = {
+                "pre_stop_source_ledger": [list(row) for row in ledger],
+                "pre_stop_logical_digest": database_logical_digest(source),
+            }
+        else:
+            source_evidence = _source128_capacity_source(manifest, reservation)
     payload = {
+        **source_evidence,
         "transaction_id": manifest.transaction_id,
         "observed_source_bytes": reservation.observed_source_bytes,
         "measured_at": reservation.measured_at,
@@ -1489,8 +1598,16 @@ def _reservation_still_sufficient(manifest: Manifest, reservation: DatabaseCapac
     for path in (reservation.backup_path, reservation.restore_path):
         if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
             raise ActivationError("paired database capacity reservation is unavailable")
+        if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade) and path == reservation.backup_path and Path(manifest.current_schema_upgrade.proof_path).exists():
+            _snapshot_proof(manifest, require_rehearsal=False)
+            continue
         if path.stat().st_size < required or path.stat().st_blocks * 512 < required:
             raise ActivationError("paired database grew beyond its reserved capacity")
+    if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+        restore = reservation.restore_path
+        if restore.stat().st_size < reservation.capacity_bytes or restore.stat().st_blocks * 512 < reservation.capacity_bytes:
+            raise ActivationError("physical restore reservation is not fully held")
+        _require_current_schema_free_space(manifest, reservation)
 
 
 def create_database_backup(manifest: Manifest, reservation: Optional[DatabaseCapacityReservation] = None) -> None:
@@ -1598,7 +1715,7 @@ def restore_database(manifest: Manifest) -> None:
         backup_ledger = validate_current_schema_database(backup, registry_path, source_kind=manifest.source_kind, manifest=manifest)
         if [list(item) for item in backup_ledger] != proof.get("source_ledger"):
             raise ActivationError("current-schema backup ledger differs from snapshot proof")
-        if [list(item) for item in migration_registry(registry_path)] != proof.get("target_ledger"):
+        if [list(item) for item in current_schema_target_registry(manifest, registry_path)] != proof.get("target_ledger"):
             raise ActivationError("current-schema target ledger differs from snapshot proof")
     _regular_nosymlink(database, "paired database")
     reserved = _restore_capacity_path(manifest, database)
@@ -1774,6 +1891,23 @@ def restore_deployed_sha(manifest: Manifest) -> None:
         atomic_write(deployed_sha, (manifest.previous_deployed_sha + "\n").encode(), 0o600)
 
 
+def verify_source128_unchanged_without_snapshot(manifest: Manifest) -> None:
+    current = manifest.current_schema_upgrade
+    if not isinstance(current, PreparedSource128Upgrade):
+        return
+    source = Path(current.database_path)
+    reservation = DatabaseCapacityReservation(
+        Path(current.backup_path), _restore_capacity_path(manifest, source), 0,
+    )
+    evidence = _source128_capacity_source(manifest, reservation)
+    ledger = validate_current_schema_database(
+        source, _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
+    )
+    if ([list(row) for row in ledger] != evidence["pre_stop_source_ledger"]
+            or database_logical_digest(source) != evidence["pre_stop_logical_digest"]):
+        raise ActivationError("source128 live source differs from pre-stop capacity evidence")
+
+
 def restore(
     manifest: Manifest,
     launchctl: Launchctl,
@@ -1806,7 +1940,8 @@ def restore(
             raise ActivationError(
                 "current-schema database changed before exclusive snapshot replay"
             )
-        restore_database(manifest)
+        if not isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+            restore_database(manifest)
     elif upgrade is not None:
         assert_database_exclusive(manifest)
         if manifest.paired_database_upgrade is not None:
@@ -1815,6 +1950,7 @@ def restore(
             validate_current_schema_database(
                 Path(upgrade.database_path), _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest
             )
+        verify_source128_unchanged_without_snapshot(manifest)
         if sha256(Path(manifest.target_binary)) != manifest.rollback_binary_sha256:
             raise ActivationError("unchanged predecessor binary proof failed")
         captured = captured_paired_plist(manifest)
@@ -1855,7 +1991,8 @@ def restore(
             existing = json.loads(Path(manifest.status_path).read_text())
         except (OSError, json.JSONDecodeError):
             existing = {}
-        write_status(manifest, "activation_failed_rollback_failed", failure=existing.get("failure"), rollback_failure=existing.get("rollback_failure"), recovery_mode="snapshot_restored" if database_snapshot else "unchanged_predecessor")
+        recovery_mode = "snapshot_restored" if database_snapshot and not isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade) else "unchanged_predecessor"
+        write_status(manifest, "activation_failed_rollback_failed", failure=existing.get("failure"), rollback_failure=existing.get("rollback_failure"), recovery_mode=recovery_mode)
         old_pid = launchctl.inspect()[1]
         launchctl.start(old_pid, plist_path=str(rollback_plist))
     else:
@@ -1906,7 +2043,16 @@ def finalize_verified_predecessor(manifest: Manifest, failure: str | None) -> No
             checkpoint = json.loads(Path(manifest.status_path).read_text())
             if not isinstance(checkpoint, dict) or checkpoint.get("transaction_id") != manifest.transaction_id or checkpoint.get("recovery_mode") not in {"unchanged_predecessor", "snapshot_restored"}:
                 raise ActivationError("verified predecessor recovery checkpoint is unavailable")
-            if checkpoint["recovery_mode"] == "unchanged_predecessor":
+            source128 = isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade)
+            if source128 and Path(manifest.current_schema_upgrade.proof_path).exists():
+                _snapshot_proof(manifest, require_rehearsal=False)
+                release_capacity_reservation(
+                    manifest, DatabaseCapacityReservation(
+                        Path(manifest.current_schema_upgrade.backup_path),
+                        _restore_capacity_path(manifest), 0,
+                    ),
+                )
+            elif checkpoint["recovery_mode"] == "unchanged_predecessor":
                 release_unsnapshotted_capacity(manifest)
         except Exception as exc:
             raise VerifiedPredecessorFinalizationError(f"verified predecessor capacity finalization failed: {exc}") from exc
@@ -1983,12 +2129,47 @@ def validate_status_manifest_mode(manifest: Manifest, status: dict) -> None:
 
 def prepared_source_qualification(manifest: Manifest) -> Optional[dict]:
     current = manifest.current_schema_upgrade
-    if not isinstance(current, PreparedSource114Upgrade):
-        return None
-    return {
-        "prepared_source_baseline": current.prepared_source_baseline,
-        "candidate_registry_expected_sha256": current.candidate_registry_expected_sha256,
-    }
+    if isinstance(current, PreparedSource114Upgrade):
+        return {
+            "prepared_source_baseline": current.prepared_source_baseline,
+            "candidate_registry_expected_sha256": current.candidate_registry_expected_sha256,
+        }
+    if isinstance(current, PreparedSource128Upgrade):
+        return {
+            "prepared_source_baseline": current.prepared_source_baseline,
+            "candidate_registry_expected_sha256": current.candidate_registry_expected_sha256,
+        }
+    return None
+
+
+def validate_prepared_source128(manifest: Manifest) -> None:
+    current = manifest.current_schema_upgrade
+    if not isinstance(current, PreparedSource128Upgrade):
+        return
+    if (
+        manifest.source_kind != "prepared_artifact"
+        or manifest.source_commit != PREPARED_SOURCE128_COMMIT
+        or manifest.expected != Identity(PREPARED_SOURCE128_VERSION, PREPARED_SOURCE128_COMMIT)
+        or manifest.release_tag is not None or manifest.release_commit is not None
+        or manifest.paired_database_upgrade is not None or manifest.ordinary_forward_migration is not None
+        or not FULL_GIT_SHA_RE.fullmatch(current.controller_source_commit)
+        or current.controller_source_commit == PREPARED_SOURCE128_COMMIT
+        or type(current.prepared_source_baseline) is not int or current.prepared_source_baseline != 128
+        or current.candidate_registry_expected_sha256 != PREPARED_SOURCE128_REGISTRY_SHA256
+        or current.migration_registry_sha256 != PREPARED_SOURCE128_REGISTRY_SHA256
+    ):
+        raise ActivationError("invalid exact prepared source128 qualification")
+    registry = verify_staged(current.migration_registry_path, PREPARED_SOURCE128_REGISTRY_SHA256, "prepared source128 candidate registry")
+    migration_registry(registry, qualified_source128=True)
+
+
+def validate_prepared_source_qualification(manifest: Manifest) -> None:
+    validate_prepared_source114(manifest)
+    validate_prepared_source128(manifest)
+
+
+def current_schema_target_registry(manifest: Manifest, path: Path) -> tuple[tuple[int, str], ...]:
+    return migration_registry(path, qualified_source128=isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade))
 
 
 def validate_prepared_source114(manifest: Manifest) -> None:
@@ -2017,7 +2198,7 @@ def validate_manifest_mode(
     *,
     prepare_transaction: bool = True,
 ) -> None:
-    validate_prepared_source114(manifest)
+    validate_prepared_source_qualification(manifest)
     upgrade = prepared_database_upgrade(manifest)
     if manifest.source_kind not in {
         "prepared_artifact",
@@ -2109,13 +2290,11 @@ def validate_manifest_mode(
         )
         if registry.parent != transaction_dir:
             raise ActivationError("migration registry must belong to the helper transaction")
-        migration_registry(registry)
-
-
+        current_schema_target_registry(manifest, registry)
 
 
 def _current_schema_registry(manifest: Manifest) -> Path:
-    validate_prepared_source114(manifest)
+    validate_prepared_source_qualification(manifest)
     current = manifest.current_schema_upgrade
     if current is None:
         raise ActivationError("current-schema upgrade is not configured")
@@ -2126,7 +2305,7 @@ def _current_schema_registry(manifest: Manifest) -> Path:
     )
 
 
-def _snapshot_proof(manifest: Manifest) -> dict:
+def _snapshot_proof(manifest: Manifest, *, require_rehearsal: bool = True) -> dict:
     upgrade = prepared_database_upgrade(manifest)
     if upgrade is None:
         raise ActivationError("prepared database upgrade is not configured")
@@ -2135,9 +2314,16 @@ def _snapshot_proof(manifest: Manifest) -> dict:
     if path.stat().st_mode & 0o777 != 0o600:
         raise ActivationError("database proof must be private")
     try:
-        proof = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        proof = json.loads(
+            path.read_text(),
+            object_pairs_hook=_source128_proof_pairs if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade) else None,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ActivationError("database snapshot proof is unreadable") from exc
+    if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+        if not isinstance(proof, dict):
+            raise ActivationError("source128 database proof is not an object")
+        _source128_proof_shape(proof)
     expected = {
         "transaction_id": manifest.transaction_id,
         "source_commit": manifest.source_commit,
@@ -2152,7 +2338,7 @@ def _snapshot_proof(manifest: Manifest) -> dict:
     }
     if manifest.current_schema_upgrade is not None:
         registry_path = _current_schema_registry(manifest)
-        registry = migration_registry(registry_path)
+        registry = current_schema_target_registry(manifest, registry_path)
         expected["migration_registry_sha256"] = manifest.current_schema_upgrade.migration_registry_sha256
         expected["prepared_source_qualification"] = prepared_source_qualification(manifest)
         expected["target_ledger"] = [list(item) for item in registry]
@@ -2168,6 +2354,15 @@ def _snapshot_proof(manifest: Manifest) -> dict:
             raise ActivationError("database snapshot proof context mismatch")
         if database_logical_digest(backup) != proof.get("source_logical_digest"):
             raise ActivationError("database backup contents differ from snapshot proof")
+        if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade) and require_rehearsal:
+            if (
+                proof.get("rehearsal_ledger") != expected["target_ledger"]
+                or proof.get("rehearsal_backup_sha256") != proof.get("sha256")
+                or not isinstance(proof.get("rehearsed_at"), str)
+                or not isinstance(proof.get("rehearsal_logical_digest"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", proof["rehearsal_logical_digest"])
+            ):
+                raise ActivationError("exact source128 rehearsal proof is unavailable")
     return proof
 
 
@@ -2175,7 +2370,7 @@ def current_schema_database_is_uncommitted(manifest: Manifest) -> bool:
     current = manifest.current_schema_upgrade
     if current is None:
         raise ActivationError("current-schema upgrade is not configured")
-    proof = _snapshot_proof(manifest)
+    proof = _snapshot_proof(manifest, require_rehearsal=False)
     database = Path(current.database_path)
     try:
         ledger = validate_current_schema_database(database, _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest)
@@ -2200,36 +2395,8 @@ def run_current_schema_migration(
     if not current_schema_database_is_uncommitted(manifest):
         raise ActivationError("current-schema database changed before offline migration")
     assert_database_exclusive(manifest)
-    try:
-        with Path(manifest.candidate_plist).open("rb") as stream:
-            plist = plistlib.load(stream)
-        plist_environment = plist.get("EnvironmentVariables", {})
-    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
-        raise ActivationError("candidate launchd environment is unreadable") from exc
-    if not isinstance(plist_environment, dict):
-        raise ActivationError("candidate launchd environment is malformed")
-    environment = os.environ.copy()
-    environment.update({str(key): str(value) for key, value in plist_environment.items()})
-    if environment.get("PHOENIX_DB_PATH") != str(database):
-        raise ActivationError("candidate migration database path differs from manifest")
-    try:
-        result = subprocess.run(
-            [manifest.target_binary, "--migrate-only"],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=7200,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ActivationError("candidate offline migration could not complete") from exc
+    invoke_current_schema_candidate(manifest, database, Path(manifest.target_binary))
     assert_database_exclusive(manifest)
-    if result.returncode != 0:
-        raise ActivationError(
-            f"candidate offline migration failed with exit {result.returncode}"
-        )
     migrated_ledger = validate_current_schema_database(database, registry, source_kind=manifest.source_kind, manifest=manifest, migrated=True)
     migrated_size = _source_capacity_bytes(database)
     if migrated_size > reservation.capacity_bytes:
@@ -2250,6 +2417,108 @@ def run_current_schema_migration(
     )
     _require_current_schema_free_space(manifest, reservation)
     atomic_write(proof_path, encoded, 0o600)
+
+
+def rehearse_prepared_source128(manifest: Manifest, reservation: DatabaseCapacityReservation) -> None:
+    import sqlite3
+
+    current = manifest.current_schema_upgrade
+    if not isinstance(current, PreparedSource128Upgrade):
+        raise ActivationError("exact source128 rehearsal requires typed qualification")
+    assert_database_exclusive(manifest)
+    proof = _snapshot_proof(manifest, require_rehearsal=False)
+    if "rehearsal_ledger" in proof or "migration_committed_at" in proof:
+        raise ActivationError("exact source128 rehearsal has already been attempted")
+    backup = Path(current.backup_path)
+    restore = reservation.restore_path
+    if restore != _restore_capacity_path(manifest, Path(current.database_path)) or restore.is_symlink():
+        raise ActivationError("rehearsal slot does not belong to this transaction")
+    _reservation_still_sufficient(manifest, reservation)
+    try:
+        with closing(_readonly_connection(backup)) as source, closing(sqlite3.connect(restore)) as copy:
+            source.backup(copy)
+        validate_current_schema_database(restore, _current_schema_registry(manifest), manifest=manifest)
+        if database_logical_digest(restore) != proof["source_logical_digest"]:
+            raise ActivationError("rehearsal copy differs from retained backup")
+        candidate = verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "rehearsal candidate binary")
+        invoke_current_schema_candidate(manifest, restore, candidate)
+        assert_database_exclusive(manifest)
+        ledger = validate_current_schema_database(
+            restore, _current_schema_registry(manifest), manifest=manifest, migrated=True,
+        )
+        if _source_capacity_bytes(restore) > reservation.capacity_bytes:
+            raise ActivationError("rehearsal grew beyond held restore capacity")
+        _require_current_schema_free_space(manifest, reservation)
+        if sha256(backup) != proof["sha256"]:
+            raise ActivationError("retained backup changed during rehearsal")
+        proof.update(
+            rehearsal_ledger=ledger,
+            rehearsal_backup_sha256=proof["sha256"],
+            rehearsal_logical_digest=database_logical_digest(restore),
+            rehearsed_at=utc_now(),
+        )
+        proof_path = Path(current.proof_path)
+        encoded = _encode_database_proof(proof)
+        _validate_database_proof_lifecycle_budget(
+            b"0" * proof_path.stat().st_size,
+            _project_migrated_database_proof(encoded),
+            max(os.statvfs(proof_path.parent).f_frsize, 4096),
+        )
+        _require_current_schema_free_space(manifest, reservation)
+        atomic_write(proof_path, encoded, 0o600)
+    except sqlite3.Error as exc:
+        raise ActivationError("native SQLite rehearsal failed") from exc
+    finally:
+        for suffix in ("-journal", "-wal", "-shm"):
+            sidecar = restore.with_name(restore.name + suffix)
+            if sidecar.is_symlink():
+                raise ActivationError("rehearsal SQLite sidecar is a symlink")
+            sidecar.unlink(missing_ok=True)
+        _regular_nosymlink(restore, "rehearsal restore reservation")
+        restore.unlink()
+        fsync_dir(restore.parent)
+        _allocate_private_sqlite(restore, reservation.capacity_bytes)
+    _reservation_still_sufficient(manifest, reservation)
+    _snapshot_proof(manifest)
+    if database_logical_digest(Path(current.database_path)) != proof["source_logical_digest"]:
+        raise ActivationError("live source changed during rehearsal")
+    assert_database_exclusive(manifest)
+
+
+def invoke_current_schema_candidate(manifest: Manifest, database: Path, binary: Path) -> None:
+    current = manifest.current_schema_upgrade
+    if current is None:
+        raise ActivationError("current-schema upgrade is not configured")
+    try:
+        with Path(manifest.candidate_plist).open("rb") as stream:
+            plist = plistlib.load(stream)
+        plist_environment = plist.get("EnvironmentVariables", {})
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        raise ActivationError("candidate launchd environment is unreadable") from exc
+    if not isinstance(plist_environment, dict):
+        raise ActivationError("candidate launchd environment is malformed")
+    environment = os.environ.copy()
+    environment.update({str(key): str(value) for key, value in plist_environment.items()})
+    if environment.get("PHOENIX_DB_PATH") != current.database_path:
+        raise ActivationError("candidate migration database path differs from manifest")
+    environment["PHOENIX_DB_PATH"] = str(database)
+    try:
+        result = subprocess.run(
+            [str(binary), "--migrate-only"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=7200,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ActivationError("candidate offline migration could not complete") from exc
+    if result.returncode != 0:
+        raise ActivationError(
+            f"candidate offline migration failed with exit {result.returncode}"
+        )
 
 
 def validate_manifest_identities(manifest: Manifest) -> None:
@@ -2306,14 +2575,18 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
     exact_prepared_source114 = isinstance(
         manifest.current_schema_upgrade, PreparedSource114Upgrade
     )
-    if exact_prepared_source114:
+    exact_prepared_source128 = isinstance(
+        manifest.current_schema_upgrade, PreparedSource128Upgrade
+    )
+    if exact_prepared_source114 or exact_prepared_source128:
+        qualification = "source114" if exact_prepared_source114 else "source128"
         if manifest.transition_timeout_secs != DEFAULT_TRANSITION_TIMEOUT_SECS:
             raise ActivationError(
-                f"exact prepared source114 transition_timeout_secs must be {DEFAULT_TRANSITION_TIMEOUT_SECS}"
+                f"exact prepared {qualification} transition_timeout_secs must be {DEFAULT_TRANSITION_TIMEOUT_SECS}"
             )
         if manifest.health_timeout_secs != DEFAULT_HEALTH_TIMEOUT_SECS:
             raise ActivationError(
-                f"exact prepared source114 health_timeout_secs must be {DEFAULT_HEALTH_TIMEOUT_SECS}"
+                f"exact prepared {qualification} health_timeout_secs must be {DEFAULT_HEALTH_TIMEOUT_SECS}"
             )
     validate_manifest_identities(manifest)
     validate_manifest_mode(manifest, prepare_transaction=False)
@@ -2330,7 +2603,7 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
         "candidate plist",
     )
     candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
-    if exact_prepared_source114:
+    if exact_prepared_source114 or exact_prepared_source128:
         _validate_staged_plist_binding(
             candidate_plist_contents,
             manifest_label=manifest.label,
@@ -2350,7 +2623,7 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
             "rollback plist",
         )
         rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
-        if exact_prepared_source114:
+        if exact_prepared_source114 or exact_prepared_source128:
             _validate_staged_plist_binding(
                 rollback_plist_contents,
                 manifest_label=manifest.label,
@@ -2472,6 +2745,7 @@ def activate(manifest: Manifest) -> str:
         committed_durable = False
         current_schema_committed = False
         current_schema_migration_started = False
+        source128_post_marker = False
         ordinary_candidate_started = False
         try:
             upgrade = prepared_database_upgrade(manifest)
@@ -2482,14 +2756,31 @@ def activate(manifest: Manifest) -> str:
                     Path(manifest.current_schema_upgrade.database_path),
                     _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
                 )
-            old_pid = launchctl.stop()
-            disrupted = True
-            if upgrade is not None:
+            exact_source128 = isinstance(
+                manifest.current_schema_upgrade, PreparedSource128Upgrade
+            )
+            if exact_source128:
+                disrupted = True
                 quarantined_previous_plist = quarantine_paired_plist(manifest)
                 if quarantined_previous_plist is None:
                     raise ActivationError("prepared predecessor plist is unavailable")
                 if sha256(quarantined_previous_plist) != manifest.rollback_plist_sha256:
                     raise ActivationError("captured predecessor plist checksum mismatch")
+            old_pid = launchctl.stop()
+            disrupted = True
+            if exact_source128:
+                quarantine_source128_target(manifest)
+                state, pid = launchctl.inspect()
+                if state != "not_loaded" or pid is not None:
+                    raise ActivationError("source128 predecessor absence is unconfirmed")
+                quarantine_source128_target(manifest)
+            if upgrade is not None:
+                if not exact_source128:
+                    quarantined_previous_plist = quarantine_paired_plist(manifest)
+                    if quarantined_previous_plist is None:
+                        raise ActivationError("prepared predecessor plist is unavailable")
+                    if sha256(quarantined_previous_plist) != manifest.rollback_plist_sha256:
+                        raise ActivationError("captured predecessor plist checksum mismatch")
                 assert_database_exclusive(manifest)
                 if manifest.paired_database_upgrade is not None:
                     validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
@@ -2502,9 +2793,13 @@ def activate(manifest: Manifest) -> str:
                 _reservation_still_sufficient(manifest, capacity_reservation)
                 create_database_backup(manifest, capacity_reservation)
                 database_snapshot = True
+                if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+                    rehearse_prepared_source128(manifest, capacity_reservation)
             candidate_binary_mutated = True
             commit_atomic_install(prepared_candidate[0], Path(manifest.target_binary))
             if manifest.current_schema_upgrade is not None:
+                if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+                    source128_post_marker = True
                 write_status(
                     manifest,
                     "migration_started",
@@ -2535,8 +2830,38 @@ def activate(manifest: Manifest) -> str:
             else:
                 if manifest.current_schema_upgrade is not None:
                     assert_database_exclusive(manifest)
+                if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+                    if os.path.lexists(manifest.target_plist):
+                        raise ActivationError("persistent target plist must be absent before private start")
+                    checkpoint_source128_start(manifest)
                 launchctl.start(old_pid, plist_path=manifest.candidate_plist)
+            if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+                require_loaded_plist(manifest, launchctl, candidate_plist)
             wait_for_identity(manifest, manifest.expected)
+            if exact_source128:
+                atomic_write(
+                    Path(manifest.deployed_sha_path),
+                    (manifest.source_commit + "\n").encode(),
+                    0o600,
+                )
+                write_status(
+                    manifest,
+                    "committed",
+                    finalization_pending=True,
+                    committed_diagnostic=(
+                        "exact candidate verified; persistent publication and capacity cleanup pending"
+                    ),
+                )
+                publish_source128_plist(
+                    prepared_candidate[1], Path(manifest.target_plist)
+                )
+                assert capacity_reservation is not None
+                release_capacity_reservation(manifest, capacity_reservation)
+                write_status(manifest, "committed")
+                if not release_durable_terminal_claim(manifest, required_state="committed"):
+                    raise ActivationError("source128 activation claim release was unconfirmed")
+                return "committed"
+
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
             prepared_commit = upgrade is not None
             write_status(
@@ -2560,6 +2885,8 @@ def activate(manifest: Manifest) -> str:
         except Exception as activation_exc:
             failure = str(activation_exc)
             disrupted = disrupted or launchctl.disruption_started
+            if source128_post_marker:
+                return settle_source128_failure(manifest, launchctl, failure)
             if committed_durable:
                 try:
                     write_status(manifest, "committed", committed_diagnostic=f"paired finalization interrupted: {failure}", finalization_pending=True)
@@ -2662,10 +2989,40 @@ def activate(manifest: Manifest) -> str:
                 prepared.unlink(missing_ok=True)
 
 
+def quarantine_source128_target(manifest: Manifest) -> list[Path]:
+    upgrade = manifest.current_schema_upgrade
+    if not isinstance(upgrade, PreparedSource128Upgrade):
+        raise ActivationError("source128 target isolation requires exact prepared mode")
+    target = Path(manifest.target_plist)
+    transaction = _private_transaction_dir(Path(upgrade.proof_path).parent)
+    retained = []
+    for _ in range(SOURCE128_QUARANTINE_ATTEMPTS):
+        if not os.path.lexists(target):
+            fsync_dir(target.parent)
+            return retained
+        destination = transaction / f"unresolved-launchagent-{secrets.token_hex(16)}.plist.quarantined"
+        if os.path.lexists(destination):
+            raise ActivationError("source128 quarantine destination already exists")
+        try:
+            os.rename(target, destination)
+        except FileNotFoundError:
+            continue
+        retained.append(destination)
+        fsync_dir(transaction)
+        fsync_dir(target.parent)
+    if os.path.lexists(target):
+        raise ActivationError("source128 persistent target keeps reappearing during bounded isolation")
+    fsync_dir(target.parent)
+    return retained
+
+
 def quarantine_paired_plist(manifest: Manifest) -> Optional[Path]:
     upgrade = prepared_database_upgrade(manifest)
     if upgrade is None:
         return None
+    if isinstance(upgrade, PreparedSource128Upgrade):
+        retained = quarantine_source128_target(manifest)
+        return retained[-1] if retained else None
     target = Path(manifest.target_plist)
     if target.is_symlink():
         raise ActivationError("unresolved target plist must not be a symlink")
@@ -2767,6 +3124,53 @@ def record_recovery_error(manifest: Manifest, error: str | Exception, *, quarant
         if verified_finalization_failed:
             raise VerifiedPredecessorFinalizationError(str(exc)) from exc
         raise
+
+
+def publish_source128_plist(prepared: Path, target: Path) -> None:
+    if os.path.lexists(target):
+        raise ActivationError("persistent target plist already exists")
+    os.link(prepared, target)
+    fsync_dir(target.parent)
+    prepared.unlink()
+    fsync_dir(prepared.parent)
+
+
+def settle_source128_failure(manifest: Manifest, launchctl: Launchctl, failure: str) -> str:
+    teardown = []
+    try:
+        quarantine_paired_plist(manifest)
+    except Exception as exc:
+        teardown.append(f"persistent plist quarantine failed: {exc}")
+    try:
+        launchctl.stop()
+    except Exception as exc:
+        teardown.append(f"candidate stop failed: {exc}")
+    try:
+        quarantine_source128_target(manifest)
+    except Exception as exc:
+        teardown.append(f"post-stop persistent plist quarantine failed: {exc}")
+    try:
+        state, pid = launchctl.inspect()
+        if state != "not_loaded" or pid is not None:
+            teardown.append(f"candidate absence unconfirmed: {state}, pid={pid}")
+    except Exception as exc:
+        teardown.append(f"candidate absence unconfirmed: {exc}")
+    try:
+        require_launchd_absence(manifest.label, manifest.uid)
+    except Exception as exc:
+        teardown.append(f"candidate absence unconfirmed: {exc}")
+    try:
+        quarantine_source128_target(manifest)
+    except Exception as exc:
+        teardown.append(f"final persistent plist quarantine failed: {exc}")
+    if os.path.lexists(manifest.target_plist):
+        teardown.append("persistent target absence unconfirmed")
+    write_status(
+        manifest, "activation_failed_database_committed", failure=failure,
+        rollback_failure="; ".join(teardown) or None, finalization_pending=True,
+        committed_diagnostic="database may be committed; predecessor rollback is forbidden",
+    )
+    return "activation_failed_database_committed"
 
 
 def require_loaded_plist(manifest: Manifest, launchctl: Launchctl, private: Path) -> None:
@@ -3543,6 +3947,106 @@ def activate_current_repair(path: Path) -> str:
             raise
 
 
+def finalize_source128(manifest: Manifest, private: Path) -> str:
+    current = manifest.current_schema_upgrade
+    assert isinstance(current, PreparedSource128Upgrade)
+    launchctl = Launchctl(manifest)
+    proof = _snapshot_proof(manifest)
+    if set(proof) not in (
+        SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS,
+        SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS | SOURCE128_MIGRATED_KEYS,
+        SOURCE128_PROOF_BASE_KEYS | SOURCE128_REHEARSAL_KEYS | SOURCE128_MIGRATED_KEYS | SOURCE128_START_KEYS,
+    ):
+        raise ActivationError("source128 finalization requires exact retained rehearsal proof")
+    state, pid = launchctl.inspect()
+    was_running = state in {"running", "active"} and pid is not None
+    if was_running:
+        try:
+            if "candidate_start_attempted_at" not in proof:
+                raise ActivationError("running source128 candidate lacks durable start-attempt proof")
+            require_loaded_plist(manifest, launchctl, private)
+            wait_for_identity(manifest, manifest.expected)
+            quarantine_source128_target(manifest)
+            launchctl.stop()
+            quarantine_source128_target(manifest)
+            require_launchd_absence(manifest.label, manifest.uid)
+            quarantine_source128_target(manifest)
+        except Exception as exc:
+            settle_source128_failure(manifest, launchctl, str(exc))
+            raise
+    elif state != "not_loaded" or pid is not None:
+        raise ActivationError("source128 finalization requires a stopped candidate")
+    try:
+        require_launchd_absence(manifest.label, manifest.uid)
+        assert_database_exclusive(manifest)
+        database = Path(current.database_path)
+        registry = _current_schema_registry(manifest)
+        source = tuple(tuple(row) for row in proof["source_ledger"])
+        target = current_schema_target_registry(manifest, registry)
+        ledger = database_ledger(database)
+        if ledger not in (source, target):
+            raise ActivationError("source128 finalization rejects an unqualified live ledger")
+        if ledger == source:
+            validate_current_schema_database(database, registry, source_kind=manifest.source_kind, manifest=manifest)
+            if database_logical_digest(database) != proof["source_logical_digest"] or "migrated_ledger" in proof:
+                raise ActivationError("source128 live database differs from retained source")
+        elif "candidate_start_attempted_at" in proof and proof.get("migrated_ledger") != [list(row) for row in target]:
+            raise ActivationError("source128 start proof does not bind target ledger")
+    except Exception as exc:
+        if was_running:
+            settle_source128_failure(manifest, launchctl, str(exc))
+        raise
+    try:
+        if ledger == source:
+            evidence = _repair_json(_capacity_observation_path(DatabaseCapacityReservation(Path(current.backup_path), _restore_capacity_path(manifest, database), 0)))
+            if evidence.get("transaction_id") != manifest.transaction_id or type(evidence.get("reserved_capacity_bytes")) is not int or evidence["reserved_capacity_bytes"] <= 0:
+                raise ActivationError("source128 restore capacity evidence does not match")
+            capacity = evidence["reserved_capacity_bytes"]
+            reservation = DatabaseCapacityReservation(Path(current.backup_path), _restore_capacity_path(manifest, database), capacity)
+            _reservation_still_sufficient(manifest, reservation)
+            run_current_schema_migration(manifest, reservation)
+        else:
+            validate_current_schema_database(database, registry, source_kind=manifest.source_kind, manifest=manifest, migrated=True)
+            digest = database_logical_digest(database)
+            if "migrated_logical_digest" in proof:
+                if (proof.get("migrated_ledger") != [list(row) for row in target]
+                        or ("candidate_start_attempted_at" not in proof and proof["migrated_logical_digest"] != digest)):
+                    raise ActivationError("source128 committed proof differs from live database")
+            else:
+                proof["migration_committed_at"] = utc_now()
+                proof["migrated_ledger"] = [list(row) for row in target]
+                proof["migrated_logical_digest"] = digest
+                encoded = _encode_database_proof(proof)
+                proof_path = Path(current.proof_path)
+                _validate_database_proof_lifecycle_budget(
+                    b"0" * proof_path.stat().st_size, encoded,
+                    max(os.statvfs(proof_path.parent).f_frsize, 4096),
+                )
+                atomic_write(proof_path, encoded, 0o600)
+        assert_database_exclusive(manifest)
+        if os.path.lexists(manifest.target_plist):
+            raise ActivationError("persistent target plist must be absent before private start")
+        if "candidate_start_attempted_at" not in _snapshot_proof(manifest):
+            checkpoint_source128_start(manifest)
+        launchctl.start(None, plist_path=str(private))
+        require_loaded_plist(manifest, launchctl, private)
+        wait_for_identity(manifest, manifest.expected)
+        write_status(manifest, "committed", finalization_pending=True, committed_diagnostic="private candidate verified; publication pending")
+        atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
+        publication = prepare_plist_publication(private, Path(manifest.target_plist))
+        publish_source128_plist(publication, Path(manifest.target_plist))
+        release_capacity_reservation(
+            manifest, DatabaseCapacityReservation(Path(current.backup_path), _restore_capacity_path(manifest, database), 0)
+        )
+        write_status(manifest, "committed")
+        if not release_durable_terminal_claim(manifest, required_state="committed"):
+            raise ActivationError("source128 finalization claim release was unconfirmed")
+        return "committed"
+    except Exception as exc:
+        settle_source128_failure(manifest, launchctl, str(exc))
+        raise
+
+
 def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
     refuse_selected_current_repair(manifest)
     with Path(manifest.lock_path).open("a+") as lock:
@@ -3560,7 +4064,9 @@ def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
             raise ActivationError("finalization command does not match prepared database mode")
         status = read_status(manifest)
         validate_status_manifest_mode(manifest, status)
-        allowed_states = {"committed", "migration_started"} if current_schema else {"committed"}
+        allowed_states = ({"committed", "migration_started", "activation_failed_database_committed"}
+                          if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade)
+                          else {"committed", "migration_started"} if current_schema else {"committed"})
         if status.get("transaction_id") != manifest.transaction_id or status.get("state") not in allowed_states:
             raise ActivationError("finalization requires matching committed database evidence")
         old_helper = subprocess.run(["launchctl", "print", f"gui/{manifest.uid}/{manifest.helper_label}"], capture_output=True, text=True)
@@ -3574,6 +4080,20 @@ def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
             raise ActivationError("retained helper checksum mismatch")
         verify_staged(manifest.target_binary, manifest.candidate_binary_sha256, "committed candidate binary")
         private = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "committed private plist")
+        if isinstance(manifest.current_schema_upgrade, PreparedSource128Upgrade):
+            expected_status = {
+                "transaction_id": manifest.transaction_id, "source_kind": manifest.source_kind,
+                "source_commit": manifest.source_commit, "release_tag": None, "release_commit": None,
+                "expected_version": manifest.expected.version, "expected_git_sha": manifest.expected.git_sha,
+                "created_at": manifest.created_at, "finalization_pending": True,
+                "prepared_mode": "current_schema", "precondition_cleanup_completed": False,
+                "recovery_mode": None, "cleanup_failure": None,
+            }
+            if (owner != manifest.transaction_id or Path(manifest.active_path).is_symlink()
+                    or set(status) != set(expected_status) | {"state", "updated_at", "failure", "rollback_failure", "committed_diagnostic"}
+                    or any(type(status[key]) is not type(value) or status[key] != value for key, value in expected_status.items())):
+                raise ActivationError("source128 finalization requires exact retained claim and status")
+            return finalize_source128(manifest, private)
         if manifest.current_schema_upgrade is not None:
             proof = _snapshot_proof(manifest)
             if proof.get("migration_committed_at") is None:
@@ -3741,6 +4261,7 @@ def recover_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
                     validate_current_schema_database(
                         Path(upgrade.database_path), _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest
                     )
+                    verify_source128_unchanged_without_snapshot(manifest)
                 restore(
                     manifest,
                     launchctl,
