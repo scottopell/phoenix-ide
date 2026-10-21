@@ -89,7 +89,16 @@ async fn claimed_start() -> (
         .unwrap()
         .authority
         .unwrap();
-    (directory, db, receipt, authority)
+    let event_authority = phoenix_core::domain::sm_event::DirectTurnAttemptAuthority::new(
+        authority.workflow_id.0,
+        u64::try_from(receipt.execution().turn_id()).unwrap(),
+        authority.effect_id.0,
+        authority.attempt_id.0,
+        authority.declared_workflow_version.0,
+        authority.generation.0,
+        authority.process_incarnation.0,
+    );
+    (directory, db, receipt, event_authority)
 }
 
 async fn change_control(
@@ -175,7 +184,12 @@ fn assert_start_request(
         request.telemetry.as_ref().unwrap().request_id,
         expected_request_id
     );
-    let system = serde_json::to_string(&request.system).unwrap();
+    let system = request
+        .system
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(system.contains(receipt.observation().objective.as_str()));
     assert!(system.contains("Request purpose: Normal"));
     assert!(request.messages.iter().all(|message| {
@@ -363,11 +377,10 @@ async fn conversation_goal_request_purpose_keeps_legacy_message_normal_and_summa
         .unwrap();
     let requests = client.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests
+    assert!(requests.iter().all(|request| request
+        .system
         .iter()
-        .all(|request| !serde_json::to_string(&request.system)
-            .unwrap()
-            .contains("Admitted durable goal")));
+        .all(|segment| !segment.text.contains("Admitted durable goal"))));
     assert_eq!(requests[0].messages.len(), 1);
     drop(requests);
     assert_eq!(ledger(&db).await, before);
@@ -380,16 +393,13 @@ async fn complete_bound_goal(db: &Database, receipt: &GoalStartReceipt) {
         .await
         .unwrap()
         .unwrap();
-    let actor = GoalActor::OwningAgent(
-        source(
-            &receipt.input().goal().owner,
-            receipt.execution(),
-            CONVERSATION,
-            "runtime-goal-report",
-            "complete",
-        )
-        .unwrap(),
-    );
+    let actor = GoalActor::OwningAgent(GoalAgentSource {
+        product_conversation_id: receipt.input().goal().owner.clone(),
+        transcript_id: text(CONVERSATION),
+        execution: receipt.execution(),
+        message_id: text("runtime-goal-report"),
+        tool_use_id: text("complete"),
+    });
     db.apply_conversation_goal(
         &GoalMutation {
             owner: receipt.input().goal().owner.clone(),

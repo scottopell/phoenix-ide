@@ -17,6 +17,28 @@ Broad tests timed out at 1500s: **4421/5591 executed, 4386 passed, 35 failed,
 are not a Goals E2E journey. No policy/service is installed, no production
 numeric ceiling exists, and the worker/public Start hold remains.
 
+## Exact 92b621 runtime diagnostic — compilation blocked, tests not run
+
+Hosted [39589478157](https://github.com/scottopell/phoenix-ide/actions/runs/39589478157)
+on exact `92b6218e2d8f38fdc7893c36799c784e62fa8c43`, artifact `12341375691`,
+failed binary capture with exit 101. The focused harness failed closed without
+rebuilding: the seven runnable tests and focused suite **did not run**. Four
+owned test compilation errors were retained: a nonexistent `source` helper,
+returning `LocalAttemptAuthority` where the event requires
+`DirectTurnAttemptAuthority`, and two attempts to serialize non-Serialize
+`SystemContent`.
+
+The harness-only correction constructs the actual `GoalAgentSource` fields,
+converts the claimed authority using the worker's event mapping, and inspects
+system-segment `text` fields without adding production serialization. The
+seven tests' meaning and production request-context cut are unchanged. The
+retained Clippy tail contains these same owned compiler errors and shared
+federation/global-read/send-chat findings, not confirmed new test lint findings;
+no shared cleanup or waiver is included. The correction is unrun; only
+owned-file formatting and diff checks were performed. The latest executed
+bounded floor remains exact `6b528d13e`, 286/286; all worker/public Start holds
+and default Disabled remain.
+
 ## Authored runtime request-context cut — unrun
 
 The operation selects `GoalRequestPurpose` end-to-end: ordinary dispatch selects
