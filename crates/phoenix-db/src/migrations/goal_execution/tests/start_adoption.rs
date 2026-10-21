@@ -155,6 +155,58 @@ async fn conversation_goal_start_materialization_commit_loss_and_rollback_are_cl
 }
 
 #[tokio::test]
+async fn conversation_goal_start_materialization_rejects_close_fenced_and_history_owners() {
+    for history in [false, true] {
+        let (db, input) = claimed().await;
+        let transcript = input.receipt.historical_transcript().as_str();
+        if history {
+            sqlx::query("UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id=?")
+                .bind(input.receipt.input().goal().owner.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap();
+        } else {
+            db.begin_close_foundation(
+                &input.receipt.input().goal().owner,
+                &phoenix_core::domain::close::TranscriptConversationId::parse(transcript).unwrap(),
+                "goal-start-close",
+            )
+            .await
+            .unwrap();
+        }
+        assert!(!db
+            .product_conversation_admission(transcript)
+            .await
+            .unwrap()
+            .is_accepted());
+        let before = materialization_counts(&db).await;
+        let state_before = db.get_conversation(transcript).await.unwrap();
+        let result = db
+            .workflow_repository()
+            .materialize_goal_start(&input)
+            .await;
+        assert!(
+            matches!(
+                &result,
+                LocalAuthorityResult::DurableFactEstablished(GoalStartAdoptionOutcome::Rejected)
+            ),
+            "history={history}: expected explicit lifecycle rejection, got {result:?}"
+        );
+        assert_eq!(materialization_counts(&db).await, before);
+        let materialized: i64 =
+            sqlx::query_scalar("SELECT materialized FROM durable_turns WHERE turn_id=?")
+                .bind(input.receipt.execution().turn_id())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(materialized, 0);
+        let state_after = db.get_conversation(transcript).await.unwrap();
+        assert_eq!(state_after.state, state_before.state);
+        assert_eq!(state_after.state_updated_at, state_before.state_updated_at);
+    }
+}
+
+#[tokio::test]
 async fn conversation_goal_start_witness_survives_live_cleanup_but_never_resurrects_execution() {
     let (db, input) = claimed().await;
     let repo = db.workflow_repository();

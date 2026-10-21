@@ -208,7 +208,23 @@ impl WorkflowRepository {
                 return Ok(GoalStartAdoptionOutcome::StaleAuthority)
             }
         }
-        let eligible: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations c JOIN product_conversations p ON p.id=c.product_conversation_id JOIN conversation_goal_controls g ON g.owner_id=p.id JOIN conversation_goal_control_bindings b ON b.turn_id=? WHERE c.id=? AND c.state_kind='idle' AND p.kind='ordinary' AND p.closed_at IS NULL AND p.latest_transcript_id=c.id AND g.stopped=0 AND b.control_version=g.control_version AND NOT EXISTS(SELECT 1 FROM steering_messages q WHERE q.conversation_id=c.id))")
+        let admission = crate::close_foundation::admit_product_conversation_operation_tx(
+            &mut tx.tx,
+            input.receipt.historical_transcript().as_str(),
+        )
+        .await?;
+        if !admission.is_accepted() {
+            return Ok(GoalStartAdoptionOutcome::Rejected);
+        }
+        let aggregate = crate::Database::get_ordinary_product_conversation_on(
+            &mut tx.tx,
+            &input.receipt.input().goal().owner,
+        )
+        .await?;
+        if aggregate.latest_transcript_row_id != input.receipt.historical_transcript().as_str() {
+            return Ok(GoalStartAdoptionOutcome::Rejected);
+        }
+        let eligible: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations c JOIN product_conversations p ON p.id=c.product_conversation_id JOIN conversation_goal_controls g ON g.owner_id=p.id JOIN conversation_goal_control_bindings b ON b.turn_id=? WHERE c.id=? AND c.state_kind='idle' AND p.kind='ordinary' AND g.stopped=0 AND b.control_version=g.control_version AND NOT EXISTS(SELECT 1 FROM steering_messages q WHERE q.conversation_id=c.id))")
             .bind(input.receipt.execution().turn_id()).bind(input.receipt.historical_transcript().as_str())
             .fetch_one(&mut *tx.tx).await?;
         if eligible != 1 {

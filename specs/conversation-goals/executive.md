@@ -22,6 +22,40 @@ not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
 execution is claimed.
 
 
+## Exact 34f32 adoption diagnostic: nonexistent product lifecycle column
+
+Hosted [39574928955](https://github.com/scottopell/phoenix-ide/actions/runs/39574928955)
+on exact `34f32cf2f374b3a550fa32e76a42f1fa42d79181`, artifact `12335024326`,
+ran **285 focused tests: 270 passed, 15 failed**, 3387 skipped, in 344.347s.
+Every positive-adoption failure exposes the command error
+`no such column: p.closed_at`, followed by `NotCommitted`; the post-commit cut
+also fails before it can commit. Compilation (244.4s), codegen (1.3s) and
+freshness passed. No positive adoption or new partial floor is established.
+
+The source correction uses the existing transactional Close admission helper,
+which reads `ordinary_lifecycle` and active/incomplete `close_obligations`.
+It also replaces the adjacent nonexistent `p.latest_transcript_id` reference
+with the existing ordinary-aggregate reader's `latest_transcript_row_id` check.
+Both reads occur in the same adoption transaction, before any materialization,
+request charge or state write. The ordinary-kind, Idle, current control version,
+Stop, queued-input and full-bundle commit-proof gates remain intact. No schema,
+old SQL, fixture column or default is added. New Start product/workflow/timestamp
+references were compared with the owning schema/readers/writers: product `kind`,
+workflow `profile_kind`/`profile_version`, and conversation RFC3339 state/update
+timestamps are real; durable turns remain timestamp-free.
+
+An authored regression begins a real Close attempt after Start is claimed and
+requires explicit rejection without a materialized bit, request charge, witness,
+receipt or request-state change. A second case verifies the History lifecycle
+refusal. These tests and the source correction are unrun. The existing positive
+adoption tests and test-only diagnostics remain unchanged for hosted verification.
+
+Broad tests timed out at 1500s: 4555/5590 executed, 4504 passed, 51 failed,
+194 skipped, in 1499.570s. This incomplete result and Clippy remain unwaived.
+The exact 66abc partial floor, worker/public Start hold, Disabled installation,
+immutable SQL132–136 and eleven stashes remain unchanged. No local compiler,
+tests, SQL, codegen, browser or service execution was performed.
+
 ## Exact 18d572 adoption diagnostic: actual result not yet exposed
 
 Hosted [39568614995](https://github.com/scottopell/phoenix-ide/actions/runs/39568614995)
