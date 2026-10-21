@@ -202,7 +202,7 @@ impl WorkflowRepository {
             previous_generation: input.turn.1,
             generation: next,
             reconstruction_id: input.reconstruction_id.to_string(),
-            request_id: latest.intent.id.to_string(),
+            request_id: latest.intent.id.as_str().to_owned(),
             state_updated_at: input.slot.1.to_rfc3339(),
         };
         let payload = serde_json::to_vec(&event)
