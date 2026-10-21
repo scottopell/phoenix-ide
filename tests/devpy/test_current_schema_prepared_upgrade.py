@@ -3464,11 +3464,14 @@ sys.exit({7 if failure else 0})
         launchctl.inspect.return_value = ("not_loaded", None)
         original = helper.quarantine_source128_target
         phases = []
+        isolate_count = 0
         def isolate(parent):
+            nonlocal isolate_count
+            isolate_count += 1
             phases.append("isolate")
             result = original(parent)
-            if len(phases) < 3:
-                target.write_text(f"recreated {len(phases)}")
+            if isolate_count < 3:
+                target.write_text(f"recreated {isolate_count}")
             return result
         def stop():
             phases.append("stop")
@@ -3502,7 +3505,9 @@ sys.exit({7 if failure else 0})
         observed = json.loads(evidence.read_text())
         self.assertEqual(
             observed["pre_stop_source_ledger_sha256"],
-            helper._ledger_sha256(helper.CURRENT_SCHEMA_REQUIRED_MIGRATIONS),
+            helper._ledger_sha256(
+                tuple(sorted(helper.CURRENT_SCHEMA_REQUIRED_MIGRATIONS.items()))
+            ),
         )
         self.assertEqual(observed["pre_stop_logical_digest"], helper.database_logical_digest(database))
         Path(manifest.current_schema_upgrade.proof_path).unlink()
@@ -3584,8 +3589,8 @@ sys.exit({7 if failure else 0})
         self.assertTrue(Path(manifest.active_path).exists())
         self.assertEqual(helper.database_ledger(database)[-1][0], 129)
 
-    def test_source128_pin_matches_approved_base(self) -> None:
-        self.assertEqual(helper.PREPARED_SOURCE128_COMMIT, "1f6558f8db0083b485db074d9e05f0224db93d0e")
+    def test_source128_pin_matches_immutable_candidate_merge(self) -> None:
+        self.assertEqual(helper.PREPARED_SOURCE128_COMMIT, "d5513ee5d9453f66575a0d9161491fb49bcb0b67")
 
     def test_finalizer_refuses_loaded_or_unqualified_database_without_rerun(self) -> None:
         database, manifest, _reservation = self.source128_finalization_fixture()
@@ -3596,7 +3601,9 @@ sys.exit({7 if failure else 0})
              mock.patch.object(helper.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "absent")), \
              mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
              mock.patch.object(helper, "invoke_current_schema_candidate", side_effect=AssertionError("migration forbidden")):
-            with self.assertRaisesRegex(helper.ActivationError, "stopped candidate"):
+            with self.assertRaisesRegex(
+                helper.ActivationError, "durable start-attempt proof"
+            ):
                 helper.finalize_paired(manifest, current_schema=True)
             launchctl.inspect.return_value = ("not_loaded", None)
             with sqlite3.connect(database) as connection:
