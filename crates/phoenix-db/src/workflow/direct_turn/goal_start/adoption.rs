@@ -158,11 +158,15 @@ impl WorkflowRepository {
         match self.materialize_goal_start_command(input, cut).await {
             Ok(outcome) => LocalAuthorityResult::DurableFactEstablished(outcome),
             Err(error) => {
+                #[cfg(test)]
+                eprintln!("Start materialization command error before classification: {error:?}");
                 tracing::warn!(%error, start_id=input.start_id.get(),
                     "Start materialization requires durable full-bundle classification");
                 match self.classify_goal_start_materialization(input).await {
                     Ok(outcome) => LocalAuthorityResult::DurableFactEstablished(outcome),
                     Err(error) => {
+                        #[cfg(test)]
+                        eprintln!("Start materialization classification error: {error:?}");
                         tracing::error!(%error, start_id=input.start_id.get(),
                             "Start materialization remains unclassified");
                         LocalAuthorityResult::DurableFactUnclassified

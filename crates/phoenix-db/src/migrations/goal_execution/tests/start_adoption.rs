@@ -65,10 +65,16 @@ async fn conversation_goal_start_materialization_charges_initial_state_once_with
     let (db, input) = claimed().await;
     let before = materialization_counts(&db).await;
     let repo = db.workflow_repository();
-    assert!(matches!(
-        repo.materialize_goal_start(&input).await,
-        LocalAuthorityResult::DurableFactEstablished(GoalStartAdoptionOutcome::Committed { .. })
-    ));
+    let result = repo.materialize_goal_start(&input).await;
+    assert!(
+        matches!(
+            &result,
+            LocalAuthorityResult::DurableFactEstablished(
+                GoalStartAdoptionOutcome::Committed { .. }
+            )
+        ),
+        "expected committed Start materialization, got {result:?}"
+    );
     assert_eq!(
         materialization_counts(&db).await,
         (before.0, before.1 + 1, before.2 + 1, before.3 + 1)
@@ -113,23 +119,29 @@ async fn conversation_goal_start_materialization_commit_loss_and_rollback_are_cl
             .materialize_goal_start_test_cut(&input, after_commit)
             .await;
         if after_commit {
-            assert!(matches!(
-                result,
-                LocalAuthorityResult::DurableFactEstablished(
-                    GoalStartAdoptionOutcome::ClassifiedCommitted { .. }
-                )
-            ));
+            assert!(
+                matches!(
+                    &result,
+                    LocalAuthorityResult::DurableFactEstablished(
+                        GoalStartAdoptionOutcome::ClassifiedCommitted { .. }
+                    )
+                ),
+                "expected classified committed Start after commit cut, got {result:?}"
+            );
             assert_eq!(
                 materialization_counts(&db).await,
                 (before.0, before.1 + 1, before.2 + 1, before.3 + 1)
             );
         } else {
-            assert!(matches!(
-                result,
-                LocalAuthorityResult::DurableFactEstablished(
-                    GoalStartAdoptionOutcome::NotCommitted
-                )
-            ));
+            assert!(
+                matches!(
+                    &result,
+                    LocalAuthorityResult::DurableFactEstablished(
+                        GoalStartAdoptionOutcome::NotCommitted
+                    )
+                ),
+                "expected uncommitted Start before commit cut, got {result:?}"
+            );
             assert_eq!(materialization_counts(&db).await, before);
             assert_eq!(
                 db.get_conversation(input.receipt.historical_transcript().as_str())
@@ -146,10 +158,16 @@ async fn conversation_goal_start_materialization_commit_loss_and_rollback_are_cl
 async fn conversation_goal_start_witness_survives_live_cleanup_but_never_resurrects_execution() {
     let (db, input) = claimed().await;
     let repo = db.workflow_repository();
-    assert!(matches!(
-        repo.materialize_goal_start(&input).await,
-        LocalAuthorityResult::DurableFactEstablished(GoalStartAdoptionOutcome::Committed { .. })
-    ));
+    let result = repo.materialize_goal_start(&input).await;
+    assert!(
+        matches!(
+            &result,
+            LocalAuthorityResult::DurableFactEstablished(
+                GoalStartAdoptionOutcome::Committed { .. }
+            )
+        ),
+        "expected committed Start materialization, got {result:?}"
+    );
     let before = materialization_counts(&db).await;
     sqlx::query("DELETE FROM workflows WHERE workflow_id=?")
         .bind(input.receipt.execution().workflow_id())
@@ -193,12 +211,19 @@ async fn conversation_goal_start_materialization_witness_rejects_raw_forgery_rep
         .execute(db.pool())
         .await
         .is_err());
-    assert!(matches!(
-        db.workflow_repository()
-            .materialize_goal_start(&input)
-            .await,
-        LocalAuthorityResult::DurableFactEstablished(GoalStartAdoptionOutcome::Committed { .. })
-    ));
+    let result = db
+        .workflow_repository()
+        .materialize_goal_start(&input)
+        .await;
+    assert!(
+        matches!(
+            &result,
+            LocalAuthorityResult::DurableFactEstablished(
+                GoalStartAdoptionOutcome::Committed { .. }
+            )
+        ),
+        "expected committed Start materialization, got {result:?}"
+    );
     for statement in [
         "UPDATE conversation_goal_start_materializations SET process_incarnation=999",
         "DELETE FROM conversation_goal_start_materializations",
@@ -224,10 +249,16 @@ async fn conversation_goal_start_request_context_reuses_admitted_initial_identit
 ) {
     let (db, input) = claimed().await;
     let repo = db.workflow_repository();
-    assert!(matches!(
-        repo.materialize_goal_start(&input).await,
-        LocalAuthorityResult::DurableFactEstablished(GoalStartAdoptionOutcome::Committed { .. })
-    ));
+    let result = repo.materialize_goal_start(&input).await;
+    assert!(
+        matches!(
+            &result,
+            LocalAuthorityResult::DurableFactEstablished(
+                GoalStartAdoptionOutcome::Committed { .. }
+            )
+        ),
+        "expected committed Start materialization, got {result:?}"
+    );
     let before = materialization_counts(&db).await;
     for _ in 0..2 {
         let context = repo

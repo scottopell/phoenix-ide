@@ -22,6 +22,30 @@ not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
 execution is claimed.
 
 
+## Exact 18d572 adoption diagnostic: actual result not yet exposed
+
+Hosted [39568614995](https://github.com/scottopell/phoenix-ide/actions/runs/39568614995)
+on exact `18d5721ed58a5fdd407c36f0d93bd7b7c83c2dd2`, artifact `12332423954`,
+ran **285 focused tests: 270 passed, 15 failed**, 3387 skipped, in 360.896s.
+Compilation (297.1s), codegen (1.1s), freshness, UI/spec, existing E2E and geometry
+passed. The seven acceptance failures from the preceding run now pass. All 15
+remaining failures stop at positive materialization assertions, including the
+post-commit classification cut; their assertions conceal the returned outcome.
+They do not establish a common production cause or positive adoption proof.
+
+The diagnostic-only correction retains and prints the actual `LocalAuthorityResult`
+in each failing assertion path. Test-only stderr also exposes original command
+and classifier errors, which the outer classifier can otherwise replace with a
+classification result. Production logging, returned classifications, SQL guards,
+fixtures and expected outcomes are unchanged. The diagnostic correction is unrun;
+no guessed source fix or new qualification floor is claimed.
+
+Broad tests timed out at 1500s: 4424/5590 executed, 4374 passed, 50 failed,
+194 skipped, in 1499.624s. This incomplete result and Clippy remain unwaived.
+The exact 66abc partial floor, worker/public Start hold, Disabled installation,
+immutable SQL132–136 and eleven stashes remain unchanged. No local compiler,
+tests, SQL, codegen, browser or service execution was performed.
+
 ## Exact d5ce adoption diagnostic: common Start SQL failure, not qualified
 
 Hosted [39563561756](https://github.com/scottopell/phoenix-ide/actions/runs/39563561756)

@@ -6,12 +6,19 @@ use phoenix_workflow::direct_turn_profile;
 
 async fn materialized() -> (Database, GoalStartAdoptionInput) {
     let (db, input) = claimed().await;
-    assert!(matches!(
-        db.workflow_repository()
-            .materialize_goal_start(&input)
-            .await,
-        LocalAuthorityResult::DurableFactEstablished(GoalStartAdoptionOutcome::Committed { .. })
-    ));
+    let result = db
+        .workflow_repository()
+        .materialize_goal_start(&input)
+        .await;
+    assert!(
+        matches!(
+            &result,
+            LocalAuthorityResult::DurableFactEstablished(
+                GoalStartAdoptionOutcome::Committed { .. }
+            )
+        ),
+        "expected committed Start materialization, got {result:?}"
+    );
     (db, input)
 }
 
