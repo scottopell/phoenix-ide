@@ -410,11 +410,31 @@ async fn complete_bound_goal(db: &Database, receipt: &GoalStartReceipt) {
         .await
         .unwrap()
         .unwrap();
+    let assistant = db_assistant(&AssistantMessage::new(
+        "runtime-goal-report".into(),
+        vec![ContentBlock::ToolUse {
+            id: "complete".into(),
+            name: "goal_report".into(),
+            input: serde_json::to_value(GoalReportOutcome::Complete(text("done"))).unwrap(),
+        }],
+        None,
+        None,
+    ));
+    let persisted = db
+        .add_message(
+            &assistant.message_id,
+            &assistant.conversation_id,
+            &assistant.content,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     let actor = GoalActor::OwningAgent(GoalAgentSource {
         product_conversation_id: receipt.input().goal().owner.clone(),
-        transcript_id: text(CONVERSATION),
+        transcript_id: text(&persisted.conversation_id),
         execution: receipt.execution(),
-        message_id: text("runtime-goal-report"),
+        message_id: text(&persisted.message_id),
         tool_use_id: text("complete"),
     });
     db.apply_conversation_goal(

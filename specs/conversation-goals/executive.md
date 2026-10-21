@@ -17,6 +17,35 @@ Broad tests timed out at 1500s: **4421/5591 executed, 4386 passed, 35 failed,
 are not a Goals E2E journey. No policy/service is installed, no production
 numeric ceiling exists, and the worker/public Start hold remains.
 
+## Exact 8e903 runtime diagnostic — six new passes, completion fixture blocked
+
+Hosted [39595035754](https://github.com/scottopell/phoenix-ide/actions/runs/39595035754)
+on exact `8e903ba45c226f3f3929aea187b7a346fa227ce9`, artifact `12345300478`,
+ran **293 focused tests: 292 passed, one failed**, 3387 skipped, in 188.799s.
+Compilation (171s), codegen (1s), freshness and formatting passed. Six new
+runnable tests passed: actual Start event to provider without synthetic chat,
+adoption-boundary Normal context, reopened-storage retry/one charge, Summary
+own-intent refusal, missing-active Summary refusal, and legacy Normal/Summary.
+This is scoped positive evidence, not a new fully qualified runtime slice.
+
+The remaining committed-fences test stops while completing its goal: its
+`OwningAgent` attribution names `runtime-goal-report`, but no corresponding
+assistant source was persisted. Source validation correctly returns
+`Integrity("source message missing")`. The test-only correction persists the
+canonical assistant `goal_report` ToolUse through the existing message helper
+before applying the unchanged attributed report; transcript/message attribution
+is taken from the persisted record. The matching tool ID, actual Complete
+arguments, bound execution and source checks are retained. Complete/replacement
+assertions are not dropped, and the other revocation cases are not claimed as a
+fully passed test. The report belongs only to the revocation fixture: the
+separate no-chat Start tests remain unchanged. The correction is unrun.
+
+Broad tests completed: **5598 executed, 5564 passed, 34 failed, 194 skipped**, in
+974.303s. Those failures and shared Clippy remain unwaived. The fully qualified
+bounded floor remains exact `6b528d13e`, 286/286. Worker/public Start holds,
+default Disabled, immutable SQL132–136 and eleven stashes remain unchanged.
+Only owned-file formatting and diff checks were performed locally.
+
 ## Exact 72c49 runtime diagnostic — compiled, seven harness failures
 
 Hosted [39591494487](https://github.com/scottopell/phoenix-ide/actions/runs/39591494487)
