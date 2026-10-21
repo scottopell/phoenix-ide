@@ -7,7 +7,7 @@ async fn receipt_tx(
     workflow: i64,
     turn: i64,
 ) {
-    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'33333333-3333-4333-8333-333333333333','migration-start-goal',1,'owner','11111111-1111-4111-8111-111111111111',?,?,?,?)")
+    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'33333333-3333-4333-8333-333333333333',(SELECT goal_id FROM conversation_goal_history WHERE version=1),1,'owner','11111111-1111-4111-8111-111111111111',?,?,?,?)")
         .bind(owner).bind(workflow).bind(turn).bind(transcript).bind(turn)
         .execute(&mut **tx).await.unwrap();
 }
@@ -67,7 +67,7 @@ async fn migration136_receipt_commit_requires_exact_reciprocal_start_not_an_exis
             .execute(&mut *connection)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'33333333-3333-4333-8333-333333333333','migration-start-goal',1,'owner','11111111-1111-4111-8111-111111111111',?,1,?,1)")
+        sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'33333333-3333-4333-8333-333333333333',(SELECT goal_id FROM conversation_goal_history WHERE version=1),1,'owner','11111111-1111-4111-8111-111111111111',?,1,?,1)")
             .bind(owner.as_str()).bind(workflow).bind(transcript).execute(&mut *connection).await.unwrap();
         assert!(sqlx::query("COMMIT")
             .execute(&mut *connection)
@@ -96,7 +96,7 @@ async fn migration136_detaching_an_unaccepted_phantom_receipt_cannot_evade_commi
         .execute(&mut *connection)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'33333333-3333-4333-8333-333333333333','migration-start-goal',1,'owner','11111111-1111-4111-8111-111111111111',99,99,?,99)")
+    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'33333333-3333-4333-8333-333333333333',(SELECT goal_id FROM conversation_goal_history WHERE version=1),1,'owner','11111111-1111-4111-8111-111111111111',99,99,?,99)")
         .bind(owner.as_str()).bind(&conversation).execute(&mut *connection).await.unwrap();
     sqlx::query("UPDATE conversation_goal_starts SET live_turn_id=NULL WHERE start_id=1")
         .execute(&mut *connection)

@@ -203,34 +203,29 @@ async fn seed_goal(
     owner: phoenix_core::domain::product_conversation::ProductConversationId,
     transcript: &str,
 ) {
-    use phoenix_core::domain::conversation_goal::{
-        GoalActor, GoalAttribution, GoalChange, GoalId, GoalMutation, GoalText, GoalTimestampUs,
-        GoalVersion,
+    use crate::conversation_goals::user_commands::{
+        GoalUserChange, GoalUserCommand, GoalUserResult,
     };
-    let actor = GoalActor::UserControl {
-        principal_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
-        request_id: "22222222-2222-4222-8222-222222222222".parse().unwrap(),
-        command: phoenix_core::domain::conversation_goal::GoalUserCommandKind::Create,
-    };
-    db.apply_conversation_goal(
-        &GoalMutation {
-            owner,
-            expected_version: GoalVersion::ZERO,
-            action_id: GoalText::parse("migration-create").unwrap(),
-            change: GoalChange::Create {
-                goal_id: GoalId::parse("migration-start-goal").unwrap(),
-                objective: GoalText::parse("perform the goal").unwrap(),
+    use phoenix_core::domain::conversation_goal::{GoalText, GoalTimestampUs, GoalVersion};
+    sqlx::query("UPDATE durable_turns SET terminal_kind='Cancelled',generation=generation+1,owns_conversation=0 WHERE conversation_id=? AND terminal_kind IS NULL")
+        .bind(transcript).execute(db.pool()).await.unwrap();
+    let receipt = db
+        .apply_user_goal_command(
+            &GoalUserCommand {
+                owner,
+                principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
+                request_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
+                expected_version: GoalVersion::ZERO,
+                change: GoalUserChange::Create {
+                    objective: GoalText::parse("perform the goal").unwrap(),
+                },
             },
-            attribution: GoalAttribution {
-                requested_by: actor.clone(),
-                applied_by: actor,
-            },
-        },
-        transcript,
-        GoalTimestampUs::parse(1).unwrap(),
-    )
-    .await
-    .unwrap();
+            transcript,
+            GoalTimestampUs::parse(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(receipt.result, GoalUserResult::Accepted { .. }));
 }
 
 async fn start_fixture() -> (Database, String, phoenix_workflow::PreparedTurn) {
@@ -254,7 +249,7 @@ async fn start_fixture() -> (Database, String, phoenix_workflow::PreparedTurn) {
     );
     let principal_id = db.instance_id().await.unwrap().to_string();
     let mut tx = db.pool().begin().await.unwrap();
-    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'22222222-2222-4222-8222-222222222222','migration-start-goal',1,'owner',?,2,2,?,2)")
+    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'22222222-2222-4222-8222-222222222222',(SELECT goal_id FROM conversation_goal_history WHERE version=1),1,'owner',?,2,2,?,2)")
         .bind(owner.as_str()).bind(principal_id).bind(&conversation).execute(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,input_kind,goal_start_id) VALUES (2,2,?,'start-key',?,NULL,'Runtime',0,1,NULL,'goal_start',1)")
         .bind(&conversation).bind(prepared.fingerprint()).execute(&mut *tx).await.unwrap();
