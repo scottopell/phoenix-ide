@@ -209,51 +209,52 @@ async fn admitted_fixture_with_control_at(
         };
         if before_user_control {
             historical_message::seed_materialized_message(&db, execution, &payload).await;
-            return (db, command, execution);
-        }
-        let repo = db.workflow_repository();
-        let claim = repo
-            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
-                turn_id,
-                workflow_id: workflow,
-                process_incarnation: phoenix_workflow::ProcessIncarnation(1),
-                now: Timestamp(2),
-                lease_until: phoenix_workflow::LeaseExpiry(100),
-            })
-            .await
-            .unwrap();
-        let LocalAuthorityResult::DurableFactEstablished(
-            MaterializeAuthoritativeTurnOutcome::Materialized(materialized),
-        ) = repo
-            .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
-                turn_id,
-                authority: claim.authority.unwrap(),
-                prepared: payload,
-                sequence_id: 2,
-                created_at: Timestamp(3),
-                accepted_state: ConvState::LlmRequesting { attempt: 1 },
-                state_updated_at: Utc::now(),
-                now: Timestamp(3),
-            })
-            .await
-        else {
-            panic!("materialized accepted Runtime turn")
-        };
-        let canonical: Option<String> =
-            sqlx::query_scalar("SELECT canonical_message_id FROM durable_turns WHERE turn_id=?")
-                .bind(execution.turn_id())
-                .fetch_one(db.pool())
+        } else {
+            let repo = db.workflow_repository();
+            let claim = repo
+                .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                    turn_id,
+                    workflow_id: workflow,
+                    process_incarnation: phoenix_workflow::ProcessIncarnation(1),
+                    now: Timestamp(2),
+                    lease_until: phoenix_workflow::LeaseExpiry(100),
+                })
                 .await
                 .unwrap();
-        assert_eq!(
-            canonical.as_deref(),
-            Some(materialized.message.message_id.as_str())
-        );
-        assert_eq!(
-            materialized.message.message_id,
-            "full-root:goal-owner-input"
-        );
-        assert_eq!(materialized.generation, 0);
+            let LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(materialized),
+            ) = repo
+                .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+                    turn_id,
+                    authority: claim.authority.unwrap(),
+                    prepared: payload,
+                    sequence_id: 2,
+                    created_at: Timestamp(3),
+                    accepted_state: ConvState::LlmRequesting { attempt: 1 },
+                    state_updated_at: Utc::now(),
+                    now: Timestamp(3),
+                })
+                .await
+            else {
+                panic!("materialized accepted Runtime turn")
+            };
+            let canonical: Option<String> = sqlx::query_scalar(
+                "SELECT canonical_message_id FROM durable_turns WHERE turn_id=?",
+            )
+            .bind(execution.turn_id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                canonical.as_deref(),
+                Some(materialized.message.message_id.as_str())
+            );
+            assert_eq!(
+                materialized.message.message_id,
+                "full-root:goal-owner-input"
+            );
+            assert_eq!(materialized.generation, 0);
+        }
     }
     assert_eq!(execution, GoalExecution::parse(1, 1).unwrap());
     let binding = db
