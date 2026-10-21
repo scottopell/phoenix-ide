@@ -212,8 +212,8 @@ impl WorkflowRepository {
         }
         let intent = input.intent()?;
         let accepted_state = ConvState::LlmRequesting { attempt: 1 };
-        let changed = sqlx::query("UPDATE durable_turns SET materialized=1,updated_at=? WHERE turn_id=? AND input_kind='goal_start' AND materialized=0 AND goal_start_id=? AND owns_conversation=1 AND terminal_kind IS NULL AND generation=?")
-            .bind(to_i64(input.now.0, "updated_at")?).bind(intent.execution.turn_id())
+        let changed = sqlx::query("UPDATE durable_turns SET materialized=1 WHERE turn_id=? AND input_kind='goal_start' AND materialized=0 AND goal_start_id=? AND owns_conversation=1 AND terminal_kind IS NULL AND generation=?")
+            .bind(intent.execution.turn_id())
             .bind(to_i64(input.start_id.get(), "Start receipt")?).bind(intent.generation())
             .execute(&mut *tx.tx).await?.rows_affected();
         if changed == 0 {

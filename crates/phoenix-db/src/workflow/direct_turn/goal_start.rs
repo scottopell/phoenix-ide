@@ -50,12 +50,10 @@ pub(crate) async fn insert_goal_start_turn_tx(
         },
     )
     .await?;
-    sqlx::query("INSERT INTO durable_turns (turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,canonical_message_id,owns_conversation,created_at,updated_at,origin_kind,input_kind,materialized,goal_start_id) VALUES (?,?,?,?,?,NULL,'Runtime',0,NULL,1,?,?,NULL,'goal_start',0,?)")
+    sqlx::query("INSERT INTO durable_turns (turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,canonical_message_id,owns_conversation,origin_kind,input_kind,materialized,goal_start_id) VALUES (?,?,?,?,?,NULL,'Runtime',0,NULL,1,NULL,'goal_start',0,?)")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(to_i64(workflow_id.0, "workflow_id")?)
         .bind(transcript).bind(client_key).bind(prepared.fingerprint())
-        .bind(to_i64(accepted_at.0, "created_at")?)
-        .bind(to_i64(accepted_at.0, "updated_at")?)
         .bind(to_i64(receipt.get(), "goal_start_id")?)
         .execute(&mut *tx.tx).await?;
     let admitted = GoalExecution::parse(

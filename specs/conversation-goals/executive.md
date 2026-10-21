@@ -22,6 +22,37 @@ not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
 execution is claimed.
 
 
+## Exact d5ce adoption diagnostic: common Start SQL failure, not qualified
+
+Hosted [39563561756](https://github.com/scottopell/phoenix-ide/actions/runs/39563561756)
+on exact `d5ce0eadfc1a34d6af401b85c53c8ec85b5c85f4` completed with artifact
+`12330389072`. Compilation (255.4s), codegen (1.2s) and freshness passed. The
+expanded focused selection ran **285 tests: 263 passed, 22 failed**, with 3387
+skipped, in 338.439s. All 22 failures shared the production Start INSERT's
+nonexistent `durable_turns.created_at` column; they are not fixture failures.
+UI/spec, existing E2E and geometry passed, not genuine Start E2E.
+
+The bounded correction removes nonexistent timestamp columns/binds from the
+Start durable-turn INSERT and removes the same nonexistent `updated_at` write
+from nonmessage materialization. The actual durable-turn schema and shared
+writer have **no timestamp columns**, including no `_us` timestamp variants.
+Acceptance time remains owned by the existing workflow transition writer;
+request-state time remains the conversation's RFC3339 timestamp and exact
+retained witness text. New Start INSERT/UPDATE columns were compared with their
+actual owning schemas/writers. Positive acceptance/adoption tests are unchanged;
+no fictional columns or fixture escape hatch is added.
+
+A separate owned-Clippy source correction uses explicit imports/variants, a pure
+request-state permission helper, a borrowed retained row and two test idioms,
+without suppressions. Those corrections have not been run. Older registered,
+local-watch and Coordinator findings remain unwaived.
+
+Broad tests timed out: 4599/5590 executed, 4542 passed, 57 failed, 194 skipped,
+1499.577s. This is incomplete and unwaived, not a whole-suite comparison. No
+partial-floor promotion is claimed; exact 66abc's 259-test floor remains. No
+local compiler, tests, SQL, codegen or browser execution was performed, and the
+worker/producer hold, Disabled installation and immutable SQL132–136 remain.
+
 ## Exact b23 adoption diagnostic: compile blocked, not qualified
 
 Hosted [39562054668](https://github.com/scottopell/phoenix-ide/actions/runs/39562054668)
