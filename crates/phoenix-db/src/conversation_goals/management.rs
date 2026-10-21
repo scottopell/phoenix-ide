@@ -258,14 +258,16 @@ impl Database {
             request,
         )
         .await
-        .map_err(|error| GoalDbError::Projection(error.to_string()))?
+        .map_err(|error| GoalDbError::Admission(crate::DbError::Serialization(error.to_string())))?
         .ok_or(GoalDbError::BindingConflict)?;
         if retained.checkpoint.is_some() {
             return Err(GoalDbError::BindingConflict);
         }
         super::execution::require_live_request_tx(&mut tx, request, transcript)
             .await
-            .map_err(|error| GoalDbError::Projection(error.to_string()))?;
+            .map_err(|error| {
+                GoalDbError::Admission(crate::DbError::Serialization(error.to_string()))
+            })?;
         let row = sqlx::query("SELECT c.product_conversation_id,c.state,c.state_updated_at FROM conversations c
             JOIN product_conversations p ON p.id=c.product_conversation_id
             JOIN durable_turns t ON t.conversation_id=c.id
@@ -281,8 +283,9 @@ impl Database {
             .bind(admitted.claim_generation()).fetch_optional(&mut *tx).await?
             .ok_or(GoalDbError::BindingConflict)?;
         let state: phoenix_core::domain::sm_state::ConvState =
-            serde_json::from_str(&row.get::<String, _>("state"))
-                .map_err(|error| GoalDbError::Projection(error.to_string()))?;
+            serde_json::from_str(&row.get::<String, _>("state")).map_err(|error| {
+                GoalDbError::Admission(crate::DbError::Serialization(error.to_string()))
+            })?;
         let exact_source_slot = &state == source_slot.0
             && row.get::<String, _>("state_updated_at") == source_slot.1.to_rfc3339();
         let source_is_owned = exact_source_slot

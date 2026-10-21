@@ -7,6 +7,7 @@ use phoenix_core::domain::{
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::fmt::Write as _;
 
 use super::{execution, management::GoalManagementTarget, round, GoalTx};
 use crate::{workflow::AdmittedGoalRequest, Database, DbError, DbResult};
@@ -353,8 +354,11 @@ fn checkpoint_key(command: &GoalRequestCheckpoint<'_>) -> DbResult<GoalText> {
         replay,
     ))
     .map_err(|error| DbError::Serialization(error.to_string()))?;
-    GoalText::parse(format!("canonical-v1:{:x}", Sha256::digest(bytes)))
-        .map_err(|error| DbError::Serialization(error.to_string()))
+    let mut key = String::from("canonical-v1:");
+    for byte in Sha256::digest(bytes) {
+        write!(&mut key, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    GoalText::parse(key).map_err(|error| DbError::Serialization(error.to_string()))
 }
 
 async fn live_owner_tx(

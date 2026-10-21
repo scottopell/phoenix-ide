@@ -134,18 +134,31 @@ async fn conversation_goal_actual_coordinator_start_management_response_uses_ado
         client.clone(),
         Arc::new(DeferredMcpCatalog::new(false)),
     );
-    rt.state = ConvState::Idle;
+    let stored = db.get_conversation(&source.id).await.unwrap();
+    rt.state = stored.state.clone();
+    rt.state_updated_at = stored.state_updated_at;
+    let authority = event_authority;
     rt.goal_management = Some(Arc::new(
         crate::goal_service::management::GoalManagementService::new(Arc::downgrade(&manager)),
     ));
-    rt.process_event(Event::HostAdoptGoalStart {
-        delivery: phoenix_core::domain::sm_event::PreparedGoalStartDelivery::new(
-            receipt.clone(),
-            event_authority,
-        ),
-    })
-    .await
+    let mut result = transition(
+        &rt.state,
+        &rt.context,
+        Event::AuthoritativeGoalStart {
+            receipt: receipt.clone(),
+            authority,
+        },
+    )
     .unwrap();
+    assert!(result
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::RequestLlm)));
+    // Stop at the real executor's adoption boundary so tests can interpose a committed race.
+    result
+        .effects
+        .retain(|effect| !matches!(effect, Effect::RequestLlm));
+    rt.apply_transition_result(result).await.unwrap();
     let active = rt.active_direct_turn.as_deref().unwrap().clone();
     assert!(
         db.goal_management_execution(&source.id, receipt.execution().turn_id(), active.generation)

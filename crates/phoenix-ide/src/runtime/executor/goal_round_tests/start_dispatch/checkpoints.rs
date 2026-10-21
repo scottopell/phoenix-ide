@@ -4,18 +4,18 @@ mod coordinator;
 use super::*;
 use crate::runtime::executor::goal_request_checkpoint::GoalRequestCompletion;
 
-fn provider_response(content: Vec<ContentBlock>) -> phoenix_core::llm::types::LlmResponse {
-    phoenix_core::llm::types::LlmResponse::non_streaming(
+fn provider_response(content: Vec<ContentBlock>) -> phoenix_core::domain::llm_types::LlmResponse {
+    phoenix_core::domain::llm_types::LlmResponse::non_streaming(
         content,
         true,
-        phoenix_core::llm::types::Usage::default(),
+        phoenix_core::domain::llm_types::Usage::default(),
     )
 }
 
 fn provider_response_with_replay(
     response_id: &str,
     content: Vec<ContentBlock>,
-) -> phoenix_core::llm::types::LlmResponse {
+) -> phoenix_core::domain::llm_types::LlmResponse {
     use phoenix_core::domain::provider_replay::{AnthropicResponseIdentity, AnthropicResponseSet};
     let replay = AnthropicResponseSet::with_public_content(
         AnthropicResponseIdentity {
@@ -406,8 +406,8 @@ async fn conversation_goal_actual_report_round_commits_mutation_and_checkpoint_o
         .unwrap();
     assert_eq!(goal.version.get(), receipt.input().goal().version.get() + 1);
     assert!(matches!(
-        goal.disposition,
-        phoenix_core::domain::conversation_goal::GoalDisposition::Complete(_)
+        goal.state,
+        phoenix_core::domain::conversation_goal::GoalState::Complete(_)
     ));
     assert_eq!(client.requests.lock().unwrap().len(), 1);
     let messages = db.get_messages(CONVERSATION).await.unwrap();

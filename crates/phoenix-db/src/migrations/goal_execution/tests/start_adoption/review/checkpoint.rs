@@ -3,15 +3,19 @@ use crate::conversation_goals::request_checkpoint::{
     GoalRequestCheckpoint, GoalRequestCheckpointOutcome, GoalRequestEvidence,
 };
 
+fn text(value: &str) -> phoenix_core::domain::conversation_goal::GoalText {
+    phoenix_core::domain::conversation_goal::GoalText::parse(value).unwrap()
+}
+
 fn response(input: &GoalStartAdoptionInput) -> crate::Message {
     crate::Message {
         message_id: input.intent().unwrap().id.as_str().to_owned(),
         conversation_id: input.receipt.historical_transcript().as_str().to_owned(),
         sequence_id: 1,
         message_type: crate::MessageType::Agent,
-        content: crate::MessageContent::Agent(vec![phoenix_core::llm::types::ContentBlock::text(
-            "canonical answer",
-        )]),
+        content: crate::MessageContent::Agent(vec![
+            phoenix_core::domain::llm_types::ContentBlock::text("canonical answer"),
+        ]),
         display_data: None,
         usage_data: None,
         origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
@@ -35,7 +39,7 @@ async fn counts(db: &Database) -> (i64, i64, i64, i64) {
 async fn conversation_goal_canonical_response_checkpoint_commit_cuts_and_exact_replay() {
     for after_commit in [false, true] {
         let (db, input) = materialized().await;
-        let admitted = context(&db, &input).await.unwrap().into_admitted();
+        let admitted = context(&db, &input).await.unwrap().unwrap().into_admitted();
         let assistant = response(&input);
         let source = ConvState::LlmRequesting { attempt: 1 };
         let state = ConvState::Idle;
@@ -110,7 +114,7 @@ async fn conversation_goal_canonical_response_checkpoint_commit_cuts_and_exact_r
 #[tokio::test]
 async fn conversation_goal_canonical_state_failure_rolls_back_response_checkpoint_and_fts() {
     let (db, input) = materialized().await;
-    let admitted = context(&db, &input).await.unwrap().into_admitted();
+    let admitted = context(&db, &input).await.unwrap().unwrap().into_admitted();
     let assistant = response(&input);
     let source = ConvState::LlmRequesting { attempt: 1 };
     let before = counts(&db).await;
@@ -155,7 +159,7 @@ async fn conversation_goal_canonical_state_failure_rolls_back_response_checkpoin
 async fn conversation_goal_canonical_obsolete_owner_or_slot_cannot_publish_response() {
     for fence in ["slot", "reconstruction", "queue", "stop"] {
         let (db, input) = materialized().await;
-        let admitted = context(&db, &input).await.unwrap().into_admitted();
+        let admitted = context(&db, &input).await.unwrap().unwrap().into_admitted();
         let assistant = response(&input);
         let source = ConvState::LlmRequesting { attempt: 1 };
         match fence {
@@ -271,7 +275,7 @@ async fn conversation_goal_complete_report_checkpoint_cuts_replay_whole_bundle_a
     };
     for after_commit in [false, true] {
         let (db, input) = materialized().await;
-        let context = context(&db, &input).await.unwrap();
+        let context = context(&db, &input).await.unwrap().unwrap();
         let binding = context.admitted().report_binding().unwrap();
         let admitted = context.into_admitted();
         let outcome = GoalReportOutcome::Complete(text("committed complete report"));
@@ -279,7 +283,7 @@ async fn conversation_goal_complete_report_checkpoint_cuts_replay_whole_bundle_a
         let block = ContentBlock::tool_use("complete-call", "goal_report", tool_input.clone());
         let mut assistant = response(&input);
         assistant.content = crate::MessageContent::Agent(vec![block.clone()]);
-        assistant.usage_data = Some(crate::UsageData::from(Usage::default()));
+        assistant.usage_data = Some(Usage::default());
         let source_assistant = AssistantMessage {
             message_id: assistant.message_id.clone(),
             content: vec![block],
@@ -295,7 +299,7 @@ async fn conversation_goal_complete_report_checkpoint_cuts_replay_whole_bundle_a
             remaining_tools: Vec::new(),
             completed_results: Vec::new(),
             assistant_message: source_assistant,
-            attempt: 1,
+            pending_sub_agents: Vec::new(),
         };
         let source_stamp = input.state_updated_at + chrono::Duration::seconds(2);
         db.update_conversation_state_at(&assistant.conversation_id, &source, source_stamp)
@@ -355,8 +359,8 @@ async fn conversation_goal_complete_report_checkpoint_cuts_replay_whole_bundle_a
         let complete = db.conversation_goal(&initial.owner).await.unwrap().unwrap();
         assert_eq!(complete.version.get(), initial.version.get() + 1);
         assert!(matches!(
-            complete.disposition,
-            phoenix_core::domain::conversation_goal::GoalDisposition::Complete(_)
+            complete.state,
+            phoenix_core::domain::conversation_goal::GoalState::Complete(_)
         ));
         let persisted = counts(&db).await;
         assert_eq!(persisted, (before.0 + 2, before.1, before.2 + 1, before.3));

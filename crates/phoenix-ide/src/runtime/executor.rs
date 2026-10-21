@@ -3700,9 +3700,7 @@ where
                 Some(crate::runtime::traits::LoadedActiveDirectTurn::GoalStart { .. })
             )
         {
-            self.enter_fatal_local_authority_loss(
-                "Start Summary completion has no canonical request checkpoint owner".into(),
-            );
+            self.local_terminal_authority = LocalTerminalAuthority::Fatal;
             return Err("Start Summary completion is held until its canonical request checkpoint owner is integrated".into());
         }
         if self.fatal_local_authority_fence.is_closed()
@@ -8296,9 +8294,7 @@ where
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         if self.pending_goal_request_checkpoint.is_some() {
-            self.enter_fatal_local_authority_loss(
-                "next LLM dispatch attempted before admitted Goal checkpoint commit".into(),
-            );
+            self.local_terminal_authority = LocalTerminalAuthority::Fatal;
             return Err("admitted Goal response is not checkpointed".into());
         }
         let goal_request_context = self
