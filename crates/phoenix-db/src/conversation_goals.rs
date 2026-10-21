@@ -19,6 +19,7 @@ pub mod control;
 pub mod execution;
 pub mod management;
 pub mod round;
+pub mod start;
 pub mod user_commands;
 
 #[derive(Debug, thiserror::Error)]

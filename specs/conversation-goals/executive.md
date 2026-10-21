@@ -1,5 +1,27 @@
 # Durable Conversation Goals — Immutable Storage Foundation
 
+## Current qualified partial floor: exact 66abc6522
+
+Hosted [39550257368](https://github.com/scottopell/phoenix-ide/actions/runs/39550257368)
+completed on exact `66abc65225344aa0b5157574acdb3a695ec9c833`; artifact
+`12324366758` retains **259/259 focused passes**, 3387 skipped, in 167.302s.
+Compilation (230.5s), codegen (1.1s) and freshness passed. UI/spec, existing E2E
+and geometry lanes passed. This supersedes the older `fab412e9` 233-test floor
+for the **partial storage/accounting primitives, typed Start model and migration
+136 only**; the milestone notes below retain their historical diagnostics.
+
+This is **not** genuine Start-service admission, worker adoption, atomic runtime
+request/response accounting, queue/Stop send-grant or Start/follow-through E2E
+qualification. The retained replay-reader packet below is later source and its
+three additional tests are **UNRUN**. No execution policy or service is installed;
+execution remains Disabled without a numeric production default.
+
+Broad tests completed: **5559 executed, 5527 passed, 32 failed, 194 skipped** in
+1023.965s. All 32 failures and red Clippy remain **unwaived**; a focused floor is
+not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
+execution is claimed.
+
+
 ## Per-goal execution: first source milestone (unqualified)
 
 The parent reserved forward ordinal **136** for the bounded execution cut.
@@ -139,6 +161,25 @@ Broad tests timed out at 1499.576s: **4706/5559 executed, 4660 passed, 46 failed
 194 skipped**. Broad/Clippy remain unwaived; the unchanged shared failures are not
 reclassified as passes. Qualified floor remains `fab412e9` / `39482419906`, UI12 +
 233/233. Execution stays Disabled and services remain uninstalled.
+
+### Retained Start owner replay primitive (unqualified)
+
+The repository has a read-only owner replay primitive. Disabled returns before
+policy-table access. Enabled owner lookup authenticates against the actual
+persisted instance principal before reading the target-owner/request-ID receipt;
+changed principal is unauthorized, while changed goal/version at that same key
+is a conflict. It decodes both normalized requester variants without dropping
+Coordinator execution/call identity, and returns the original immutable goal
+observation/execution plus the current nullable live association. Left joins make
+missing historical evidence a decode failure rather than false absence. The
+primitive never creates, materializes, rearms or dispatches a turn, and does not
+reapply fresh Start eligibility to historical replay.
+
+Three additional **UNRUN** regressions cover Disabled/unauthorized behavior with
+the receipt table absent, exact historical replay after goal completion and turn
+cleanup, and same-key changed-requester/goal/version refusal. No API endpoint or
+Coordinator authorizer is installed by this read primitive; actual Start
+acceptance and owning runtime checkpoint integration remain owed.
 
 ### Independent review corrections to canonical Start storage
 
