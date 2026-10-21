@@ -3356,6 +3356,7 @@ sys.exit({7 if failure else 0})
              mock.patch.object(helper, "Launchctl", return_value=launchctl), \
              mock.patch.object(helper, "require_loaded_plist"), \
              mock.patch.object(helper, "wait_for_identity"), \
+             mock.patch.object(helper, "_reservation_still_sufficient"), \
              mock.patch.object(helper, "invoke_current_schema_candidate", side_effect=AssertionError("migration rerun forbidden")):
             self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
         proof = helper._snapshot_proof(manifest)
@@ -3413,7 +3414,7 @@ sys.exit({7 if failure else 0})
             helper, "service_absence_confirmed", return_value=True
         ), mock.patch.object(helper, "Launchctl", return_value=launchctl):
             with self.assertRaisesRegex(
-                helper.ActivationError, "source128 snapshot proof keys are not exact"
+                helper.ActivationError, "source128 requires exact retained proof keys"
             ):
                 helper.finalize_paired(manifest, current_schema=True)
         launchctl.stop.assert_called_once()
@@ -3434,6 +3435,7 @@ sys.exit({7 if failure else 0})
              mock.patch.object(helper.subprocess, "run", return_value=absence), \
              mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
              mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "_reservation_still_sufficient"), \
              mock.patch.object(helper, "restore_database", side_effect=AssertionError("backup replay forbidden")):
             with self.assertRaisesRegex(helper.ActivationError, "private bootstrap failed"):
                 helper.finalize_paired(manifest, current_schema=True)
@@ -3453,7 +3455,8 @@ sys.exit({7 if failure else 0})
              mock.patch.object(helper, "assert_database_exclusive"), \
              mock.patch.object(helper.subprocess, "run", return_value=absence), \
              mock.patch.object(helper, "service_absence_confirmed", return_value=True), \
-             mock.patch.object(helper, "Launchctl", return_value=launchctl):
+             mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+             mock.patch.object(helper, "_reservation_still_sufficient"):
             with self.assertRaisesRegex(helper.ActivationError, "persistent target plist must be absent"):
                 helper.finalize_paired(manifest, current_schema=True)
         launchctl.start.assert_not_called()
@@ -3624,6 +3627,7 @@ sys.exit({7 if failure else 0})
              mock.patch.object(helper, "require_launchd_absence"), \
              mock.patch.object(helper, "require_loaded_plist") as loaded, \
              mock.patch.object(helper, "wait_for_identity") as health, \
+             mock.patch.object(helper, "_reservation_still_sufficient"), \
              mock.patch.object(helper, "invoke_current_schema_candidate", side_effect=AssertionError("migration replay forbidden")):
             self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
         loaded.assert_called()
