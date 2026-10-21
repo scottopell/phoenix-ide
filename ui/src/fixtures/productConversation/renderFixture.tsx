@@ -121,6 +121,7 @@ function ProductConversationFixtureBody({ scenario }: Props) {
                     <Routes>
                       <Route path="/" element={<Navigate replace to={new URLSearchParams(window.location.search).get('fixtureEntry') ?? (scenario.kind === 'coordinator' ? `/global/${scenario.snapshot.latest_transcript_row_id}${fixtureHash}` : `/product-conversations/fixture-product-conversation${fixtureHash}`)} />} />
                       <Route path="/c/:slug" element={<FixtureAlias />} />
+                      <Route path="/global" element={<CoordinatorPage />} />
                       <Route path="/global/:slug" element={<CoordinatorPage />} />
                       <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
                     </Routes>

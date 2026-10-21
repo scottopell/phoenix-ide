@@ -11,6 +11,6 @@ export function coordinatorConversationLinkState(
   currentPath: string,
   destination: string,
 ): ConversationLinkState | undefined {
-  if (!/^\/global(?:\/|$)/.test(currentPath) || !/^\/(?:c|product-conversations)\//.test(destination)) return undefined;
+  if (!/^\/global(?:[/?#]|$)/.test(currentPath) || !/^\/(?:(?:c|product-conversations)\/|transcript(?:\?|#|$))/.test(destination)) return undefined;
   return { conversationReturnOrigin: { kind: 'coordinator', href: currentPath } };
 }

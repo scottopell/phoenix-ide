@@ -1,6 +1,7 @@
 import { Suspense, lazy, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
+import { decodedRouteReference } from '../transcriptReference';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
@@ -22,7 +23,7 @@ import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { HistoryScrollCommand, RestoreBasis } from '../conversation/historyExpansion';
 import { transcriptPositioningInputCommandKey, type TranscriptPositioningCompletion, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '../components/MessageContextMenu';
-import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useReaderNavigationKey, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { useConnection } from '../hooks/useConnection';
@@ -885,12 +886,21 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const productConversationId = productId ?? params.productConversationId;
   const viewerSlot = useViewerSlot();
   const location = useLocation();
+  const routeReference = params.slug === undefined ? undefined : decodedRouteReference(location.pathname);
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const scrollCommandTokenRef = useRef(0);
+  const readerNavigationKey = useReaderNavigationKey();
   const hashNavigationRef = useRef({ key: '', token: 0 });
-  if (hashNavigationRef.current.key !== location.key) {
-    hashNavigationRef.current = { key: location.key, token: ++scrollCommandTokenRef.current };
-  }
+  const committedHashNavigation = hashNavigationRef.current;
+  const nextScrollCommandToken = scrollCommandTokenRef.current + 1;
+  const hashNavigation = useMemo(() => committedHashNavigation.key === readerNavigationKey ? committedHashNavigation : {
+    key: readerNavigationKey,
+    token: nextScrollCommandToken,
+  }, [committedHashNavigation, readerNavigationKey, nextScrollCommandToken]);
+  useLayoutEffect(() => {
+    hashNavigationRef.current = hashNavigation;
+    scrollCommandTokenRef.current = Math.max(scrollCommandTokenRef.current, hashNavigation.token);
+  }, [hashNavigation]);
   const [jumpCompletion, setJumpCompletion] = useState<TranscriptPositioningCompletion | null>(null);
   const desiredJumpRef = useRef<Extract<HistoryScrollCommand, { kind: 'jump_to_message' }> | null>(null);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
@@ -911,7 +921,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   useEffect(() => {
     setRestoreCommand(null);
     setOlderError(null);
-  }, [location.key]);
+  }, [readerNavigationKey]);
   const [openSnapshotGeneration, setOpenSnapshotGeneration] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
@@ -1388,17 +1398,17 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const latestWorkScopeKey = isOpen
     ? currentLatestProjection?.conversation?.work_scope_key
     : undefined;
-  const transcriptView = {
+  const transcriptView = useMemo(() => ({
     conversationId: snapshot?.product_conversation_id ?? '',
     generation: historyGeneration,
     transcriptGeneration: historyGeneration,
-  };
+  }), [snapshot?.product_conversation_id, historyGeneration]);
   const routeReaderSelectionRef = useRef<{ pathname: string; productConversationId: string | undefined; transcriptPin: string | null; awaitingTopology: boolean } | null>(null);
   if (snapshot && (routeReaderSelectionRef.current?.pathname !== location.pathname
     || routeReaderSelectionRef.current.productConversationId !== productConversationId || routeReaderSelectionRef.current.awaitingTopology)) {
     const routeMemberId = snapshot.kind === 'coordinator'
-      ? snapshot.segments.find(segment => segment.transcript_row_id === params.slug || segment.slug === params.slug)?.transcript_row_id
-        ?? params.slug ?? snapshot.requested_transcript_row_id
+      ? snapshot.segments.find(segment => segment.transcript_row_id === routeReference || segment.slug === routeReference)?.transcript_row_id
+        ?? routeReference ?? snapshot.requested_transcript_row_id
       : null;
     routeReaderSelectionRef.current = {
       pathname: location.pathname,
@@ -1443,21 +1453,21 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
   const positioningTargetMessageId = readerSelection.kind === 'unavailable' ? undefined : hashTargetLoaded ? resolvedHashTargetMessageId : transcriptTargetMessage?.message_id;
   const previousJump = desiredJumpRef.current;
   const completedJump = previousJump
-    && previousJump.token === hashNavigationRef.current.token
+    && previousJump.token === hashNavigation.token
     && previousJump.view.conversationId === transcriptView.conversationId
     && previousJump.targetMessageId === positioningTargetMessageId
     && jumpCompletion?.commandKey === transcriptPositioningInputCommandKey({ kind: 'positioning', command: previousJump });
-  const desiredJump = positioningTargetMessageId
+  const desiredJump = useMemo(() => positioningTargetMessageId
     ? completedJump ? previousJump : {
       kind: 'jump_to_message' as const,
-      token: hashNavigationRef.current.token,
+      token: hashNavigation.token,
       requestToken: 0,
       view: transcriptView,
       targetMessageId: positioningTargetMessageId,
     }
-    : null;
-  desiredJumpRef.current = desiredJump;
-  const desiredPositioning: TranscriptPositioningInput = (restoreCommand?.navigationToken === hashNavigationRef.current.token ? restoreCommand.positioning : null)
+    : null, [positioningTargetMessageId, completedJump, previousJump, hashNavigation.token, transcriptView]);
+  useLayoutEffect(() => { desiredJumpRef.current = desiredJump; }, [desiredJump]);
+  const desiredPositioning: TranscriptPositioningInput = (restoreCommand?.navigationToken === hashNavigation.token ? restoreCommand.positioning : null)
     ?? (desiredJump ? { kind: 'positioning', command: desiredJump } : { kind: 'idle', view: transcriptView });
   const desiredPositioningKey = transcriptPositioningInputCommandKey(desiredPositioning);
   const transcriptPositioning: TranscriptPositioningInput = desiredPositioningKey !== null
@@ -1592,7 +1602,7 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
           onViewTailSettled={journey.tailAnchorSettled}
           onViewAnchorProbe={journey.registerAnchorProbe}
           viewAnchorIntent={{
-            scope: `${hashNavigationRef.current.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
+            scope: `${hashNavigation.token}:${observedSegmentId ?? ''}:${historyGeneration}`,
             ...(desiredJump ? { command: desiredJump } : { command: null, view: transcriptView }),
           }}
           historyBoundaries={snapshot.boundaries}

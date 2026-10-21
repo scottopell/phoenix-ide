@@ -190,7 +190,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.getProductConversationAutomaticContinuation = async (id) => ({ aggregate: { kind: 'ordinary', product_conversation_id: id }, auto_continue_on_context_exhaustion: false, admission: null });
   api.getCoordinatorAutomaticContinuation = async () => ({ aggregate: { kind: 'coordinator', product_conversation_id: 'source-product' }, auto_continue_on_context_exhaustion: false, admission: null });
   api.ensureGlobalCoordinator = async () => ({ conversation: scenario.kind === 'coordinator' ? conversation : { ...sourceConversation, id: 'current-global', slug: 'current-global' }, created: false });
-  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && scenario.snapshot.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : scenario.initialEntry === `/global/${id}` ? id : id === sourceId && scenario.sourceIsGlobal ? 'source-product' : null });
+  api.resolveCoordinatorRoute = async (id) => ({ coordinator_id: scenario.kind === 'coordinator' && scenario.snapshot.segments.some(segment => segment.transcript_row_id === id) ? scenario.snapshot.product_conversation_id : scenario.sourceIsGlobal && (id === sourceId || id === 'current-global') ? scenario.sourceSnapshot?.product_conversation_id ?? null : scenario.initialEntry === `/global/${id}` ? id : null });
   api.listConversations = async () => [];
   api.listArchivedConversations = async () => [];
   api.listModels = async () => ({

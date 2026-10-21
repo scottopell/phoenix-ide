@@ -62,7 +62,7 @@ function renderPage(initialEntry = '/global/conv-coordinator') {
   return render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
-        <Route path="/global/:slug" element={<CoordinatorPage />} />
+        <Route path="/global/:slug?" element={<CoordinatorPage />} />
       </Routes>
     </MemoryRouter>,
   );
@@ -70,7 +70,7 @@ function renderPage(initialEntry = '/global/conv-coordinator') {
 
 function CurrentPath() {
   const location = useLocation();
-  return <div>{`${location.pathname}${location.search}${location.hash}`}</div>;
+  return <><div>{`${location.pathname}${location.search}${location.hash}`}</div><output data-testid="location-state">{JSON.stringify(location.state)}</output></>;
 }
 
 const coordinatorConversation = (): Conversation => ({
@@ -166,14 +166,14 @@ describe('CoordinatorPage', () => {
         ? Promise.resolve({ conversation: { id } })
         : new Promise(resolve => { pendingValidations.push(resolve); }));
     render(<MemoryRouter initialEntries={['/global/conv-coordinator?source_transcript=source-1&source_tool=tool-1#message-source']}><Routes>
-      <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+      <Route path="/global/:slug?" element={<><CoordinatorPage /><CurrentPath /></>} />
     </Routes></MemoryRouter>);
 
-    await screen.findByText('/global/source-1?source_transcript=source-1&source_tool=tool-1#message-source');
+    await screen.findByText('/global?source_transcript=source-1&source_tool=tool-1#message-source');
     await waitFor(() => expect(screen.getByText(/Running 1/).closest('.global-statebar-summary')).toHaveTextContent('Running 1'));
     await waitFor(() => expect(screen.getByText('UI tests').closest('.coordinator-conversation')).toHaveAttribute('hidden'));
     expect(pendingValidations.length).toBeGreaterThan(0);
-    expect(screen.getByText('output →')).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    expect(screen.getByText('output →')).toHaveAttribute('href', '/global?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     expect(screen.queryByRole('link', { name: 'output →' })).not.toBeInTheDocument();
     await act(async () => {
       validationReleased = true;
@@ -191,7 +191,7 @@ describe('CoordinatorPage', () => {
     fireEvent.click(commandDetails!.querySelector('summary')!);
     expect(running).toHaveTextContent('/repo/ui');
     expect(running).toHaveTextContent('b-live');
-    expect(output).toHaveAttribute('href', '/global/source-1?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
+    expect(output).toHaveAttribute('href', '/global?source_transcript=source-1&source_tool=tool-1&viewer=inspect&handle=b-live#message-source');
     fireEvent.click(screen.getByRole('button', { name: 'stop' }));
     await waitFor(() => expect(apiMock.stopLiveCoordinatorBashHandle).toHaveBeenCalledWith('b-live'));
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
@@ -253,7 +253,7 @@ describe('CoordinatorPage', () => {
     render(
       <MemoryRouter initialEntries={['/global/ordinary-conversation']}>
         <Routes>
-          <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+          <Route path="/global/:slug?" element={<><CoordinatorPage /><CurrentPath /></>} />
         </Routes>
       </MemoryRouter>,
     );
@@ -266,7 +266,7 @@ describe('CoordinatorPage', () => {
     render(
       <MemoryRouter initialEntries={['/global/old-coordinator?view=history#message-source']}>
         <Routes>
-          <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+          <Route path="/global/:slug?" element={<><CoordinatorPage /><CurrentPath /></>} />
         </Routes>
       </MemoryRouter>,
     );
@@ -279,11 +279,11 @@ describe('CoordinatorPage', () => {
 
   it.each(['old-member', 'conv-coordinator'])('validates and selects direct Global query member %s', async (pin) => {
     render(<MemoryRouter initialEntries={[`/global/conv-coordinator?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`]}><Routes>
-      <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+      <Route path="/global/:slug?" element={<><CoordinatorPage /><CurrentPath /></>} />
     </Routes></MemoryRouter>);
     await screen.findByText('Shared conversation runtime /global');
     expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
-    expect(await screen.findByText(`/global/${pin}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
+    expect(await screen.findByText(`${pin === 'conv-coordinator' ? '/global/conv-coordinator' : '/global'}?source_transcript=${pin}&viewer=inspect#message-old%3Amsg`)).toBeInTheDocument();
   });
 
   it('retains the same acquired-history owner while a different valid source pin is validated', async () => {
@@ -292,7 +292,7 @@ describe('CoordinatorPage', () => {
       return <button onClick={() => navigate('/global/old-member?source_transcript=conv-coordinator#message-new')}>select other member</button>;
     }
     render(<MemoryRouter initialEntries={['/global/old-member?source_transcript=old-member#message-old']}><Routes>
-      <Route path="/global/:slug" element={<><CoordinatorPage /><SelectOtherSource /><CurrentPath /></>} />
+      <Route path="/global/:slug?" element={<><CoordinatorPage /><SelectOtherSource /><CurrentPath /></>} />
     </Routes></MemoryRouter>);
     const owner = await screen.findByTestId('history-reference');
     expect(owner).toHaveTextContent('old-member');
@@ -315,7 +315,7 @@ describe('CoordinatorPage', () => {
       return <button onClick={() => navigate('/global/conv-coordinator?source_transcript=conv-coordinator')}>select valid</button>;
     }
     render(<MemoryRouter initialEntries={['/global/conv-coordinator?source_transcript=']}><Routes>
-      <Route path="/global/:slug" element={<><CoordinatorPage /><SelectValid /></>} />
+      <Route path="/global/:slug?" element={<><CoordinatorPage /><SelectValid /></>} />
     </Routes></MemoryRouter>);
     await screen.findByText('Original source conversation unavailable');
     finish.mockClear();
@@ -328,6 +328,48 @@ describe('CoordinatorPage', () => {
     await screen.findByTestId('history-reference');
     expect(finish.mock.calls.filter(([outcome]) => outcome === 'failed')).toHaveLength(0);
     finish.mockRestore();
+  });
+
+  it.each(['café', 'caf%C3%A9', '%', '%25', 'old%2Frow', 'old%2frow', 'x/y?source_transcript=evil', '[x]', '.', '..'])('admits exact opaque Global query member without a path rewrite: %s', async pin => {
+    const href = `/global?source_transcript=${encodeURIComponent(pin)}&viewer=inspect#message-${encodeURIComponent(pin)}`;
+    const url = new URL(href, 'https://phoenix.test');
+    const state = { conversationReturnOrigin: { kind: 'coordinator', href: '/global/origin?x=1#message-original' } };
+    render(<MemoryRouter initialEntries={[{ pathname: url.pathname, search: url.search, hash: url.hash, state }]}><Routes>
+      <Route path="/global/:slug?" element={<><CoordinatorPage /><CurrentPath /></>} />
+    </Routes></MemoryRouter>);
+    expect(await screen.findByTestId('history-reference')).toHaveTextContent(pin);
+    expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('conv-coordinator');
+    expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(pin);
+    expect(apiMock.getConversation).toHaveBeenCalledWith(pin);
+    expect(screen.getByText(href)).toBeInTheDocument();
+    expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual(state);
+  });
+
+  it.each(['old%2Frow', 'old%2frow', 'café', 'caf%C3%A9', 'x/y?z=1'])('decodes Global path reference exactly once at the receiving boundary: %s', async id => {
+    renderPage(`/global/${encodeURIComponent(id)}?source_transcript=${encodeURIComponent(id)}`);
+    expect(await screen.findByTestId('history-reference')).toHaveTextContent(id);
+    expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith(id);
+    expect(apiMock.getConversation).toHaveBeenCalledWith(id);
+  });
+
+  it.each(['', 'x&source_transcript=x', 'bad%20space', 'bad%23hash', '%ZZ', '%FF'])('fails closed at the query-only Global entry for malformed pin %s', async pin => {
+    renderPage(`/global?source_transcript=${pin}`);
+    await screen.findByText('Original source conversation unavailable');
+    expect(apiMock.getConversation).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('history-reference')).toBeNull();
+  });
+
+  it.each(['missing', 'nonmember', 'slug', 'unrelated-reference'])('does not substitute current Global for %s exact source', async failure => {
+    apiMock.resolveCoordinatorRoute.mockImplementation(async (id: string) => ({
+      coordinator_id: id === 'unrelated' || (failure === 'nonmember' && id === 'exact%2Fpin') ? null : 'conv-coordinator',
+    }));
+    apiMock.getConversation.mockImplementation(async (id: string) => {
+      if (failure === 'missing') throw new Error('Not found');
+      return { conversation: { id: failure === 'slug' ? 'different-id' : id } };
+    });
+    renderPage(`${failure === 'unrelated-reference' ? '/global/unrelated' : '/global'}?source_transcript=exact%252Fpin`);
+    await screen.findByText(failure === 'missing' ? 'Not found' : 'Original source conversation unavailable');
+    expect(screen.queryByTestId('history-reference')).toBeNull();
   });
 
   it('rejects a slug pin even when it belongs to the Global domain', async () => {
@@ -356,7 +398,7 @@ describe('CoordinatorPage', () => {
     render(
       <MemoryRouter initialEntries={['/global/stale-coordinator']}>
         <Routes>
-          <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+          <Route path="/global/:slug?" element={<><CoordinatorPage /><CurrentPath /></>} />
         </Routes>
       </MemoryRouter>,
     );

@@ -46,11 +46,32 @@ describe('ProductConversationFixture', () => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(1000);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 960, bottom: 1000, width: 960, height: 1000, toJSON: () => ({}) });
     render(<ProductConversationFixture scenario={getProductConversationScenario(id)} />);
-    fireEvent.click(await screen.findByRole('link', { name: /transcript ID source-member · source call$/ }));
-    await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toContain(id === 'source-call-global' ? '/global/source-member?' : '/c/source-member?'));
-    expect(document.documentElement.dataset['sourceFixtureLocation']).toContain('source_transcript=source-member');
-    await waitFor(() => expect(document.querySelector('[data-tool-id="source-send-call"]')?.textContent).toContain('Source jump fixture payload'));
+    const sourceLink = await screen.findByRole('link', { name: /transcript ID source-member · source call$/ });
+    const exactTranscript = vi.spyOn(api, 'getConversation');
+    fireEvent.click(sourceLink);
+    const sourceRoute = id === 'source-call-global' ? '/global' : '/c/source-member';
+    await waitFor(() => expect(document.documentElement.dataset['sourceFixtureLocation']).toBe(
+      `${sourceRoute}?source_transcript=source-member&source_tool=source-send-call#message-source-assistant`,
+    ));
+    await waitFor(() => expect(document.querySelector('#message-source-assistant [data-tool-id="source-send-call"]')?.textContent).toContain('Source jump fixture payload'));
+    if (id === 'source-call-global') expect(exactTranscript).toHaveBeenCalledWith('source-member');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('resolves current Global and its exact source member to the same fixture aggregate', async () => {
+    const scenario = getProductConversationScenario('source-call-global');
+    const restore = installProductConversationFixtureApi({
+      ...scenario,
+      sourceSnapshot: { ...scenario.sourceSnapshot!, product_conversation_id: 'fixture-source-global' },
+    });
+    try {
+      const { conversation } = await api.ensureGlobalCoordinator();
+      expect(conversation.id).toBe('current-global');
+      expect(await api.resolveCoordinatorRoute(conversation.id)).toEqual({ coordinator_id: 'fixture-source-global' });
+      expect(await api.resolveCoordinatorRoute('source-member')).toEqual({ coordinator_id: 'fixture-source-global' });
+    } finally {
+      restore();
+    }
   });
 
   it('keeps the fixture default metadata projection distinct from web history without live API fallback', async () => {

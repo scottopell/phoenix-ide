@@ -5,6 +5,7 @@ import { AutomaticContinuationControl } from '../components/AutomaticContinuatio
 import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
 import { useConversationViewJourney } from '../hooks/useConversationViewJourney';
+import { decodedRouteReference, transcriptSelector } from '../transcriptReference';
 
 const ProductConversationPage = lazy(() =>
   import('./ProductConversationPage').then((module) => ({ default: module.ProductConversationPage })),
@@ -144,10 +145,12 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   const location = useLocation();
   const locationRef = useRef(location);
   locationRef.current = location;
-  const { slug } = useParams<{ slug: string }>();
+  const { slug: routeSlug } = useParams<{ slug: string }>();
+  const slug = routeSlug === undefined ? undefined : decodedRouteReference(location.pathname);
+  const invalidRoute = routeSlug !== undefined && slug === undefined;
   const sourceQuery = new URLSearchParams(location.search);
-  const sourcePins = sourceQuery.getAll('source_transcript');
-  const sourceSelectionKey = JSON.stringify([slug, sourcePins, sourcePins.length === 0 && sourceQuery.has('source_tool')]);
+  const sourceSelector = transcriptSelector(location.search);
+  const sourceSelectionKey = JSON.stringify([slug, invalidRoute, sourceSelector, sourceSelector.kind === 'absent' && sourceQuery.has('source_tool')]);
   const [resolvedSourceSelectionKey, setResolvedSourceSelectionKey] = useState(sourceSelectionKey);
   const [failure, setFailure] = useState<{ selectionKey: string; message: string } | null>(null);
   const error = failure?.selectionKey === sourceSelectionKey ? failure.message : null;
@@ -180,12 +183,13 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         const query = new URLSearchParams(locationRef.current.search);
         const pins = query.getAll('source_transcript');
         const pinnedSource = pins.length > 0 || query.has('source_tool');
-        if (pins.length > 0) {
-          const pin = pins[0];
-          if (pins.length !== 1 || !pin || pin.trim() !== pin) {
-            setFailure({ selectionKey: sourceSelectionKey, message: 'Original source conversation unavailable' });
-            return;
-          }
+        const selector = transcriptSelector(locationRef.current.search);
+        if (invalidRoute || selector.kind === 'invalid') {
+          setFailure({ selectionKey: sourceSelectionKey, message: 'Original source conversation unavailable' });
+          return;
+        }
+        if (selector.kind === 'transcript') {
+          const pin = selector.id;
           const [owner, selected, exact] = await Promise.all([
             api.resolveCoordinatorRoute(slug ?? coordinator.conversation.id),
             api.resolveCoordinatorRoute(pin),
@@ -199,14 +203,14 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           setResolvedSourceSelectionKey(sourceSelectionKey);
           if (resolvedCoordinatorId === null) {
             setResolvedCoordinatorId(pin);
-            if (slug !== pin) navigate(`/global/${pin}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+            if (slug !== undefined && slug !== pin) navigate({ pathname: '/global', search: locationRef.current.search, hash: locationRef.current.hash }, { replace: true, state: locationRef.current.state });
           }
           return;
         }
         if (!slug || slug === coordinator.conversation.id) {
           setResolvedSourceSelectionKey(sourceSelectionKey);
           setResolvedCoordinatorId(current => current ?? coordinator.conversation.id);
-          if (!slug) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+          if (!slug) navigate(`/global/${encodeURIComponent(coordinator.conversation.id)}${locationRef.current.search}${locationRef.current.hash}`, { replace: true, state: locationRef.current.state });
         } else {
           api.resolveCoordinatorRoute(slug)
             .then(({ coordinator_id }) => {
@@ -217,12 +221,12 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
               } else if (pinnedSource) {
                 setFailure({ selectionKey: sourceSelectionKey, message: "Original source conversation unavailable" });
               } else {
-                navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+                navigate(`/global/${encodeURIComponent(coordinator.conversation.id)}${locationRef.current.search}${locationRef.current.hash}`, { replace: true, state: locationRef.current.state });
               }
             })
             .catch(() => {
               if (!cancelled && pinnedSource) setFailure({ selectionKey: sourceSelectionKey, message: "Original source conversation unavailable" });
-              else if (!cancelled) navigate(`/global/${coordinator.conversation.id}${locationRef.current.search}${locationRef.current.hash}`, { replace: true });
+              else if (!cancelled) navigate(`/global/${encodeURIComponent(coordinator.conversation.id)}${locationRef.current.search}${locationRef.current.hash}`, { replace: true, state: locationRef.current.state });
             });
         }
         setFailure(null);
@@ -234,7 +238,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [fixtureData, navigate, slug, sourceSelectionKey, topologyRevision, location.search, resolvedCoordinatorId]);
+  }, [fixtureData, navigate, slug, invalidRoute, sourceSelectionKey, topologyRevision, location.search, resolvedCoordinatorId]);
 
   const handleAutomaticContinuationStatus = useCallback((status: string, requiresAttention: boolean) => {
     setAutomaticContinuationStatus(status);

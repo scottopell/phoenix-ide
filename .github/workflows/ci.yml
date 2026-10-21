@@ -610,7 +610,7 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.ui == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -660,6 +660,8 @@ jobs:
           node scripts/capture-assistant-finalization-transcript.mjs
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs
+          node scripts/capture-review-reading-position.mjs
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
