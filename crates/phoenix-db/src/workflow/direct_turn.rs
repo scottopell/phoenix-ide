@@ -3269,6 +3269,7 @@ fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u
         )),
         TurnCommand::Accept { .. }
         | TurnCommand::Materialize { .. }
+        | TurnCommand::MaterializeGoalStart { .. }
         | TurnCommand::Rearm { .. } => Err(DbError::Serialization(
             "terminal repository command required".to_string(),
         )),
@@ -7001,6 +7002,7 @@ mod tests {
                 },
                 TurnCommand::Accept { .. }
                 | TurnCommand::Materialize { .. }
+                | TurnCommand::MaterializeGoalStart { .. }
                 | TurnCommand::Rearm { .. } => unreachable!(),
             };
             let step = repo.terminate_authoritative_turn(command).await.unwrap();

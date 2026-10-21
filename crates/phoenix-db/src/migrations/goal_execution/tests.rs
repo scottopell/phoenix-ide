@@ -1,3 +1,5 @@
+mod start_guards;
+
 use super::*;
 use crate::Database;
 use sqlx::{sqlite::SqlitePoolOptions, Row};
@@ -199,6 +201,7 @@ async fn migration136_materialization_fact_backfills_only_actual_messages_and_re
 async fn seed_goal(
     db: &Database,
     owner: phoenix_core::domain::product_conversation::ProductConversationId,
+    transcript: &str,
 ) {
     use phoenix_core::domain::conversation_goal::{
         GoalActor, GoalAttribution, GoalChange, GoalId, GoalMutation, GoalText, GoalTimestampUs,
@@ -209,7 +212,7 @@ async fn seed_goal(
         request_id: "22222222-2222-4222-8222-222222222222".parse().unwrap(),
         command: phoenix_core::domain::conversation_goal::GoalUserCommandKind::Create,
     };
-    db.mutate_conversation_goal(
+    db.apply_conversation_goal(
         &GoalMutation {
             owner,
             expected_version: GoalVersion::ZERO,
@@ -223,6 +226,7 @@ async fn seed_goal(
                 applied_by: actor,
             },
         },
+        transcript,
         GoalTimestampUs::parse(1).unwrap(),
     )
     .await
@@ -236,7 +240,7 @@ async fn start_fixture() -> (Database, String, phoenix_workflow::PreparedTurn) {
         .await
         .unwrap()
         .product_conversation_id;
-    seed_goal(&db, owner.clone()).await;
+    seed_goal(&db, owner.clone(), &conversation).await;
     migrate(&db).await.unwrap();
     sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) SELECT 2,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at FROM workflows WHERE workflow_id=1").execute(db.pool()).await.unwrap();
     sqlx::query("DELETE FROM durable_turns WHERE turn_id=1")
@@ -248,9 +252,10 @@ async fn start_fixture() -> (Database, String, phoenix_workflow::PreparedTurn) {
         &authority,
         phoenix_workflow::GoalStartReceiptId::new(1).unwrap(),
     );
+    let principal_id = db.instance_id().await.unwrap().to_string();
     let mut tx = db.pool().begin().await.unwrap();
-    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'22222222-2222-4222-8222-222222222222','migration-start-goal',1,'owner','11111111-1111-4111-8111-111111111111',2,2,?,2)")
-        .bind(owner.as_str()).bind(&conversation).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO conversation_goal_starts(start_id,owner_id,request_id,goal_id,observed_version,requester_kind,owner_principal_id,historical_workflow_id,historical_turn_id,historical_transcript_id,live_turn_id) VALUES (1,?,'22222222-2222-4222-8222-222222222222','migration-start-goal',1,'owner',?,2,2,?,2)")
+        .bind(owner.as_str()).bind(principal_id).bind(&conversation).execute(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,input_kind,goal_start_id) VALUES (2,2,?,'start-key',?,NULL,'Runtime',0,1,NULL,'goal_start',1)")
         .bind(&conversation).bind(prepared.fingerprint()).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();

@@ -64,6 +64,27 @@ immutable input and receipt detach) are **UNRUN**. No runtime E2E or compile pas
 is claimed. Existing hosted strategy must qualify this partial cut before it is
 used as a new floor; `fab412e9` / `39482419906` remains the qualified floor.
 
+### Independent review corrections to canonical Start storage
+
+Source review of `0d42672a7` found missing nonterminal command arms, cross-root
+Start association, absence of commit-enforced receipt reciprocity and mutable
+turn/workflow/transcript association. The candidate now checks the actual target
+root on insertion/update and freezes the accepted association. A deferred
+composite FK matches the live canonical turn, Start reference, workflow and
+transcript; its scalar live-turn FK still detaches on deletion. A retained
+canonical-input fact, inserted only against the matching typed turn, is a deferred
+receipt prerequisite. That fact prevents NULL-detaching a never-accepted phantom
+receipt from evading the composite FK while preserving valid history on cleanup.
+It stores only receipt identity/presence, not a second copy of request/binding.
+
+New **UNRUN** raw-SQL regressions cover cross-root insertion, commits pointing to
+an existing Message or mismatched execution/transcript, phantom-detach evasion,
+and all association updates in both materialization states. Existing valid
+insert/cleanup tests exercise the reciprocal insertion cycle and retained fact.
+The migration fixture also uses the public admitted mutation API, not a private
+sibling-module test helper. This remains partial source, not executable/E2E proof;
+no provider or service is installed and qualification is unchanged.
+
 ### Independent review corrections to the first milestone
 
 Parent source review of `cb4deef72` found three defects: the new append trigger
