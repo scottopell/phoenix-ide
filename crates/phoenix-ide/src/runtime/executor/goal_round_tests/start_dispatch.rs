@@ -1,6 +1,6 @@
 use super::*;
 use phoenix_core::domain::conversation_goal::{
-    GoalRequestLimit, GoalStartInput, GoalStartReceipt, GoalStartRequester,
+    GoalAgentSource, GoalRequestLimit, GoalStartInput, GoalStartReceipt, GoalStartRequester,
 };
 use phoenix_db::conversation_goals::{
     control::{ControlCommand, ControlRequest},
