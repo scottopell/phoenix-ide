@@ -1,3 +1,4 @@
+#[path = "slots/reconstruction_owner.rs"]
 mod reconstruction_owner;
 
 use super::*;

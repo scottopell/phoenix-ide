@@ -6035,7 +6035,8 @@ impl RuntimeManager {
             self.reconstruct_goal_start_runtime(
                 &mut materialization_admission,
                 conversation_id,
-                &conv,
+                &conv.state,
+                conv.state_updated_at,
                 &mut active_direct_turn,
             )
             .await?
@@ -7204,7 +7205,8 @@ impl RuntimeManager {
         &self,
         _admitted: &mut AdmittedOperation,
         conversation_id: &str,
-        conv: &crate::db::Conversation,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
         active: &mut Option<LoadedActiveDirectTurn>,
     ) -> Result<bool, String> {
         let Some(LoadedActiveDirectTurn::GoalStart {
@@ -7218,7 +7220,7 @@ impl RuntimeManager {
         let input = phoenix_db::workflow::GoalStartRecoveryInput::new(
             conversation_id.to_owned(),
             (previous.turn_id, previous.generation),
-            (conv.state.clone(), conv.state_updated_at),
+            (state.clone(), state_updated_at),
             phoenix_workflow::Timestamp(
                 u64::try_from(Utc::now().timestamp()).map_err(|error| error.to_string())?,
             ),

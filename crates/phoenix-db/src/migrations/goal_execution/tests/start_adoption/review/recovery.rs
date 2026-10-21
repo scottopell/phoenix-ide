@@ -345,7 +345,7 @@ async fn conversation_goal_reconstruction_stop_release_does_not_refresh_control_
         db.apply_goal_control(
             &ControlRequest {
                 owner: adopted.receipt.input().goal().owner.clone(),
-                principal_id: db.instance_id().await.unwrap().instance_uuid(),
+                principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
                 request_id: uuid::Uuid::new_v4(),
                 command,
                 expected_control_version: version,

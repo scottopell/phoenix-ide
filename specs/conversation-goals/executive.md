@@ -23,6 +23,18 @@ retained separately below. Worker/public Start holds and default Disabled remain
 
 ## Post-adoption runtime reconstruction — source-only, unqualified
 
+Hosted run `39641187603` at exact `dc9f00c4f` failed before focused execution:
+binaries capture exited 101 on three owned compile defects (missing explicit
+nested test-module path, nonexistent `InstanceId::instance_uuid` accessor, and a
+whole-conversation borrow after `conv_mode` was moved). Formatting also failed on
+the module path. The production partial-move defect also owns the UI/E2E compile
+failures; these are not preexisting failures or runtime recovery evidence.
+The bounded corrections use the explicit existing child-file path, the established
+`InstanceId` Display→UUID parse conversion, and a narrow state/stamp borrow at
+runtime construction. They do not change recovery semantics or fences. They
+remain source-only pending independent review and authorized hosted execution;
+`78be57b09` remains the qualified floor.
+
 Source tracing confirmed adoption marks its attempt `ReceiptAccepted` and deletes
 the reclaimable lease. The delivery-claim path therefore cannot rebind an adopted
 Start. The failed generation fixture did not prove recovery; latest `07bb0052`
