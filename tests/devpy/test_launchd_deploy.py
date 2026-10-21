@@ -4906,6 +4906,114 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
         self.status.write_text(json.dumps(payload))
         return payload
 
+    def write_exact_source128_completion(self):
+        install_dir = self.root / "install"
+        install_dir.mkdir(exist_ok=True)
+        target_binary = install_dir / "phoenix-ide"
+        target_plist = self.root / "Library" / "LaunchAgents" / "phoenix.plist"
+        target_plist.parent.mkdir(parents=True, exist_ok=True)
+        deployed_sha = self.root / "deployed.sha"
+        for name, value in {
+            "LAUNCHD_INSTALL_DIR": install_dir,
+            "LAUNCHD_PLIST_PATH": target_plist,
+            "PROD_SHA_PATH": deployed_sha,
+        }.items():
+            patcher = mock.patch.object(self.dev, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        candidate = self.staging / "candidate-phoenix-ide"
+        candidate_plist = self.staging / "candidate.plist"
+        rollback = self.staging / "rollback-phoenix-ide"
+        rollback_plist = self.staging / "rollback.plist"
+        retained = self.staging / "activate.py"
+        registry = self.staging / "migrations.rs"
+        candidate.write_bytes(b"exact source128 candidate")
+        candidate_plist.write_bytes(b"exact source128 plist")
+        rollback.write_bytes(b"exact predecessor")
+        rollback_plist.write_bytes(b"exact predecessor plist")
+        retained.write_bytes(b"exact retained controller")
+        registry.write_bytes(b"exact source128 registry")
+        target_binary.write_bytes(candidate.read_bytes())
+        target_plist.write_bytes(candidate_plist.read_bytes())
+        deployed_sha.write_text(self.dev.PREPARED_SOURCE128_COMMIT + "\n")
+        created_at = "2026-10-20T00:00:00+00:00"
+        commit = self.dev.PREPARED_SOURCE128_COMMIT
+        payload = {
+            "manifest_version": self.dev.LAUNCHD_HANDOFF_PROTOCOL_VERSION,
+            "transaction_id": "protected",
+            "source_kind": "prepared_artifact",
+            "source_commit": commit,
+            "release_tag": None,
+            "release_commit": None,
+            "expected": {"version": self.dev.PREPARED_SOURCE128_VERSION, "git_sha": commit},
+            "previous": {"version": "0.12.9", "git_sha": "b" * 40},
+            "previous_deployed_sha": "b" * 40,
+            "candidate_binary": str(candidate),
+            "candidate_binary_sha256": self.dev._file_sha256(candidate),
+            "candidate_plist": str(candidate_plist),
+            "candidate_plist_sha256": self.dev._file_sha256(candidate_plist),
+            "rollback_binary": str(rollback),
+            "rollback_binary_sha256": self.dev._file_sha256(rollback),
+            "rollback_plist": str(rollback_plist),
+            "rollback_plist_sha256": self.dev._file_sha256(rollback_plist),
+            "target_binary": str(target_binary),
+            "target_plist": str(target_plist),
+            "label": self.dev.LAUNCHD_LABEL,
+            "helper_label": f"{self.dev.LAUNCHD_DEPLOY_HELPER_PREFIX}.protected",
+            "uid": os.getuid(),
+            "health_url": "http://127.0.0.1:8031/api/version",
+            "health_insecure_tls": False,
+            "previous_health_url": "http://127.0.0.1:8031/api/version",
+            "previous_health_insecure_tls": False,
+            "previous_health_json": True,
+            "active_path": str(self.active),
+            "status_path": str(self.status),
+            "deployed_sha_path": str(deployed_sha),
+            "lock_path": str(self.root / "activate.lock"),
+            "claim_lock_path": str(self.root / "claim.lock"),
+            "transition_timeout_secs": 90.0,
+            "health_timeout_secs": 30.0,
+            "paired_database_upgrade": None,
+            "current_schema_upgrade": {
+                "prepared_source_baseline": 128,
+                "candidate_registry_expected_sha256": self.dev.PREPARED_SOURCE128_REGISTRY_SHA256,
+                "database_path": str(self.root / "prod.db"),
+                "backup_path": str(self.staging / "database-backup.sqlite3"),
+                "proof_path": str(self.staging / "database-backup-proof.json"),
+                "controller_source_commit": "c" * 40,
+                "controller_helper_sha256": self.dev._file_sha256(retained),
+                "controller_helper_path": str(retained),
+                "migration_registry_sha256": self.dev.PREPARED_SOURCE128_REGISTRY_SHA256,
+                "migration_registry_path": str(registry),
+            },
+            "created_at": created_at,
+        }
+        status = {
+            "transaction_id": "protected",
+            "state": "committed",
+            "source_kind": "prepared_artifact",
+            "source_commit": commit,
+            "release_tag": None,
+            "release_commit": None,
+            "expected_version": self.dev.PREPARED_SOURCE128_VERSION,
+            "expected_git_sha": commit,
+            "created_at": created_at,
+            "updated_at": "2026-10-20T00:01:00+00:00",
+            "failure": None,
+            "rollback_failure": None,
+            "cleanup_failure": None,
+            "precondition_cleanup_completed": False,
+            "committed_diagnostic": None,
+            "finalization_pending": False,
+            "recovery_mode": None,
+            "prepared_mode": "current_schema",
+        }
+        self.manifest.write_text(json.dumps(payload))
+        self.status.write_text(json.dumps(status))
+        self.script = retained
+        return payload, status
+
     def test_classification_keeps_paired_prepared_only_and_current_release_protected(self):
         for source in ("prepared_artifact", "published_release", "local_head", "unknown"):
             for mode, kind in (("paired_database_upgrade", self.dev.DeployManifestKind.PAIRED),
@@ -4997,6 +5105,212 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
                     self.dev.DeployManifestKind.UNKNOWN,
                 )
                 self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+
+    def test_classifier_accepts_only_exact_prepared_source128_evidence(self):
+        commit = self.dev.PREPARED_SOURCE128_COMMIT
+        qualified = mode_evidence(self.staging, "current_schema_upgrade") | {
+            "prepared_source_baseline": 128,
+            "candidate_registry_expected_sha256": self.dev.PREPARED_SOURCE128_REGISTRY_SHA256,
+            "migration_registry_sha256": self.dev.PREPARED_SOURCE128_REGISTRY_SHA256,
+        }
+        payload = {"source_kind": "prepared_artifact", "source_commit": commit,
+                   "expected": {"version": self.dev.PREPARED_SOURCE128_VERSION, "git_sha": commit},
+                   "current_schema_upgrade": qualified}
+        self.manifest.write_text(json.dumps(payload))
+        self.assertIs(self.dev._deploy_manifest_kind(self.staging), self.dev.DeployManifestKind.CURRENT_SCHEMA)
+        for changed in (
+            payload | {"source_kind": "published_release"},
+            payload | {"source_commit": "a" * 40},
+            payload | {"expected": payload["expected"] | {"version": "0.13.0-rc.4"}},
+            payload | {"expected": payload["expected"] | {"git_sha": "a" * 40}},
+            payload | {"release_tag": "v0.13.0"},
+            payload | {"current_schema_upgrade": qualified | {"prepared_source_baseline": True}},
+            payload | {"current_schema_upgrade": qualified | {"candidate_registry_expected_sha256": "d" * 64}},
+            payload | {"current_schema_upgrade": qualified | {"migration_registry_sha256": "d" * 64}},
+            payload | {"current_schema_upgrade": qualified | {"unexpected": "field"}},
+            payload | {"current_schema_upgrade": {k: v for k, v in qualified.items() if k != "prepared_source_baseline"}},
+        ):
+            with self.subTest(changed=changed):
+                self.manifest.write_text(json.dumps(changed))
+                self.assertIs(self.dev._deploy_manifest_kind(self.staging), self.dev.DeployManifestKind.UNKNOWN)
+                self.assertTrue(self.dev._transaction_must_be_retained(self.staging))
+
+    def test_exact_source128_finalize_admits_ambiguous_commit_and_reports_possible_migration(self):
+        _payload, terminal = self.write_exact_source128_completion()
+        for state in ("migration_started", "activation_failed_database_committed"):
+            with self.subTest(state=state):
+                pending = terminal | {
+                    "state": state,
+                    "failure": "candidate migration interrupted",
+                    "committed_diagnostic": "candidate migration may have committed writes",
+                    "finalization_pending": True,
+                }
+                self.status.write_text(json.dumps(pending))
+                guidance = self.dev._paired_recovery_refusal("protected")
+                self.assertIn("finalize-current protected", guidance)
+                self.assertIn("exact retained candidate migration", guidance)
+                output = io.StringIO()
+                with mock.patch.object(
+                    self.dev.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ) as run, contextlib.redirect_stdout(output):
+                    self.dev.cmd_prod_finalize_paired("protected", current_schema=True)
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(
+                    run.call_args.args[0][1:3],
+                    [str(self.staging / "activate.py"), "finalize-current"],
+                )
+                self.assertIn("may run only the exact retained candidate migration", output.getvalue())
+                self.assertIn("no snapshot restore", output.getvalue())
+
+    def test_exact_source128_precondition_failure_allows_next_claim(self):
+        now = "2026-10-21T04:00:00+00:00"
+        status = {
+            "transaction_id": "protected",
+            "state": "precondition_failed",
+            "source_kind": "prepared_artifact",
+            "prepared_mode": "current_schema",
+            "source_commit": self.dev.PREPARED_SOURCE128_COMMIT,
+            "release_commit": None,
+            "release_tag": None,
+            "expected_version": self.dev.PREPARED_SOURCE128_VERSION,
+            "expected_git_sha": self.dev.PREPARED_SOURCE128_COMMIT,
+            "created_at": now,
+            "updated_at": now,
+            "failure": "RuntimeError: preparation failed before handoff",
+            "finalization_pending": False,
+            "rollback_failure": None,
+        }
+        self.status.write_text(json.dumps(status))
+        self.active.unlink()
+        self.assertTrue(self.dev._markerless_status_is_resolved(status))
+        self.assertIsNone(self.dev._markerless_operation_refusal())
+        self.dev._claim_launchd_deploy("replacement")
+        self.assertEqual(self.active.read_text().strip(), "replacement")
+        self.dev._release_launchd_deploy_claim("replacement")
+
+        manifest, helper_status = self.write_exact_source128_completion()
+        status["transaction_id"] = manifest["transaction_id"]
+        self.status.write_text(json.dumps(status))
+        self.assertTrue(self.dev._markerless_status_is_resolved(status))
+        self.assertIsNone(self.dev._markerless_operation_refusal())
+
+        helper_status.update(
+            state="precondition_failed",
+            failure="capacity precondition rejected",
+            precondition_cleanup_completed=True,
+            finalization_pending=False,
+        )
+        self.status.write_text(json.dumps(helper_status))
+        self.assertTrue(self.dev._markerless_status_is_resolved(helper_status))
+        self.assertIsNone(self.dev._markerless_operation_refusal())
+
+        for malformed in (
+            status | {"unexpected": True},
+            {key: value for key, value in status.items() if key != "failure"},
+            status | {"expected_git_sha": "a" * 40},
+            status | {"failure": "migration failed after handoff"},
+        ):
+            with self.subTest(malformed=malformed):
+                self.status.write_text(json.dumps(malformed))
+                self.assertFalse(self.dev._markerless_status_is_resolved(malformed))
+                self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+        invalid_id = status | {"transaction_id": ""}
+        self.status.write_text(json.dumps(invalid_id))
+        self.assertFalse(self.dev._markerless_status_is_resolved(invalid_id))
+        self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+        self.status.write_text(
+            json.dumps(status)[:-1]
+            + ',"state":"migration_started","state":"precondition_failed",'
+            + '"finalization_pending":true,"finalization_pending":false}'
+        )
+        self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+    def test_exact_source128_claim_release_checkpoint_requires_explicit_strict_finalization(self):
+        _payload, status = self.write_exact_source128_completion()
+        self.assertTrue(self.dev._exact_source128_published_completion(self.staging))
+        self.assertFalse(
+            self.dev._status_is_terminal_for_owner(
+                self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES,
+            )
+        )
+        guidance = self.dev._paired_recovery_refusal("protected")
+        self.assertIn("claim-release checkpoint remains unresolved", guidance)
+        self.assertIn("finalize-current protected", guidance)
+        with self.assertRaisesRegex(
+            self.dev.ConcurrentLaunchdOperation, "claim-release checkpoint"
+        ):
+            self.dev._claim_launchd_deploy("replacement")
+        self.assertEqual(self.active.read_text(), "protected\n")
+
+        output = io.StringIO()
+        with mock.patch.object(
+            self.dev.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run, contextlib.redirect_stdout(output):
+            self.dev.cmd_prod_finalize_paired("protected", current_schema=True)
+        self.assertEqual(run.call_count, 2)
+        self.assertFalse(self.active.exists())
+        self.assertIn("matching claim release completed", output.getvalue())
+        self.assertTrue(self.dev._markerless_status_is_resolved(status))
+        self.assertIsNone(self.dev._markerless_operation_refusal())
+
+    def test_exact_source128_resolution_rejects_status_shape_identity_and_published_artifact_drift(self):
+        payload, status = self.write_exact_source128_completion()
+        malformed_statuses = (
+            status | {"unexpected": "field"},
+            {key: value for key, value in status.items() if key != "cleanup_failure"},
+            status | {"expected_git_sha": "a" * 40},
+            status | {"transaction_id": "protecte"},
+        )
+        for malformed in malformed_statuses:
+            with self.subTest(status=malformed):
+                self.status.write_text(json.dumps(malformed))
+                self.active.write_text("protected\n")
+                self.assertFalse(self.dev._exact_source128_published_completion(self.staging))
+                self.assertFalse(
+                    self.dev._status_is_terminal_for_owner(
+                        self.status, "protected", self.dev._DEPLOY_TERMINAL_STATES,
+                    )
+                )
+                with self.assertRaises(self.dev.ConcurrentLaunchdOperation):
+                    self.dev._claim_launchd_deploy("replacement")
+                self.assertEqual(self.active.read_text(), "protected\n")
+                self.active.unlink()
+                self.assertFalse(self.dev._markerless_status_is_resolved(malformed))
+                self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+        self.status.write_text(json.dumps(status))
+        published_paths = (
+            Path(payload["target_binary"]),
+            Path(payload["target_plist"]),
+            Path(payload["deployed_sha_path"]),
+        )
+        original_bytes = tuple(path.read_bytes() for path in published_paths)
+        for path, replacement in zip(
+            published_paths,
+            (b"wrong binary", b"wrong plist", b"a" * 40 + b"\n"),
+        ):
+            with self.subTest(path=path):
+                path.write_bytes(replacement)
+                self.assertFalse(self.dev._exact_source128_published_completion(self.staging))
+                self.assertFalse(self.dev._markerless_status_is_resolved(status))
+                path.write_bytes(original_bytes[published_paths.index(path)])
+
+        self.manifest.write_text(json.dumps(payload | {"unexpected": "field"}))
+        self.assertFalse(self.dev._exact_source128_published_completion(self.staging))
+        self.assertFalse(self.dev._markerless_status_is_resolved(status))
+        self.manifest.write_text(json.dumps(payload))
+        self.status.write_text(json.dumps(status | {"unexpected": "field"}))
+        self.active.write_text("protected\n")
+        with mock.patch.object(
+            self.dev.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ), self.assertRaisesRegex(SystemExit, "strict terminal status"):
+            self.dev.cmd_prod_finalize_paired("protected", current_schema=True)
+        self.assertEqual(self.active.read_text(), "protected\n")
 
     def test_controller_admission_rejects_status_source_mode_cross_matrix(self):
         for mode in ("paired_database_upgrade", "current_schema_upgrade"):
@@ -5519,6 +5833,50 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 self.assertNotIn(("status", "prepared"), events)
                 self.assertFalse(any(event[0] == "command" and event[1][0] == "launchctl" for event in events))
 
+    def test_ordinary_nonprepared_129_over_live128_retains_predecessor_and_rejects_before_stop(self):
+        preflight = self.dev._preflight_ordinary_launchd_policy
+        registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        for release in (False, True):
+            with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events):
+                database = self.dev.PROD_DB_PATH
+                with sqlite3.connect(database) as connection:
+                    connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                    connection.executemany("INSERT INTO _migrations VALUES (?, ?)", [
+                        item for item in helper.migration_registry(registry, qualified_current_target=False)
+                        if item[0] <= 128
+                    ])
+                before_database = database.read_bytes()
+                before_binary = (self.dev.LAUNCHD_INSTALL_DIR / "phoenix-ide").read_bytes()
+                before_plist = self.dev.LAUNCHD_PLIST_PATH.read_bytes()
+                env = {"PATH": "/test", "PHOENIX_DB_PATH": str(database)}
+                plist = plistlib.dumps({"EnvironmentVariables": env}).decode()
+
+                def materialize(_commit, source_path, destination, _kind):
+                    self.assertEqual(source_path, "crates/phoenix-db/src/migrations.rs")
+                    destination.write_bytes(registry.read_bytes())
+
+                with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(env, None)), \
+                     mock.patch.object(self.dev, "generate_launchd_plist", return_value=plist), \
+                     mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_bytes(Path(helper.__file__).read_bytes())), \
+                     mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
+                     mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=preflight) as policy:
+                    with self.assertRaisesRegex(RuntimeError, "ordinary pending migration interval is not qualified"):
+                        self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+                policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
+                manifest = json.loads((staging / "manifest.json").read_text())
+                self.assertIsNone(manifest["paired_database_upgrade"])
+                self.assertNotIn("current_schema_upgrade", manifest)
+                self.assertIsNotNone(manifest["previous"])
+                self.assertEqual(manifest["ordinary_forward_migration"]["database_path"], str(database))
+                self.assertEqual(database.read_bytes(), before_database)
+                self.assertEqual((self.dev.LAUNCHD_INSTALL_DIR / "phoenix-ide").read_bytes(), before_binary)
+                self.assertEqual(self.dev.LAUNCHD_PLIST_PATH.read_bytes(), before_plist)
+                self.assertIn(("status", "precondition_failed"), events)
+                self.assertNotIn(("status", "prepared"), events)
+                self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+                self.assertFalse(any(event[0] == "command" and event[1][0] == "launchctl" for event in events))
+
     def test_fresh_database_path_switch_preserves_predecessor_rollback(self):
         for release in (False, True):
             with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events):
@@ -5662,6 +6020,167 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             current = json.loads((staging / "manifest.json").read_text())["current_schema_upgrade"]
             self.assertNotIn("prepared_source_baseline", current)
             self.assertNotIn("candidate_registry_expected_sha256", current)
+
+    def test_prepared128_controller_manifest_round_trips_through_helper_exact_qualification(self):
+        commit = self.dev.PREPARED_SOURCE128_COMMIT
+        registry_bytes = subprocess.check_output(
+            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
+        )
+        identity = self.dev.RuntimeIdentity(self.dev.PREPARED_SOURCE128_VERSION, commit)
+        with self.deployment(current=True, candidate_commit=commit, registry_bytes=registry_bytes) as (staging, controller, events), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "ROOT", staging / "different-controller-checkout"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+             mock.patch.object(self.dev, "_prepare_prepared_artifact", return_value=self.dev.PreparedCandidate(
+                 binary=staging.parents[2] / "candidate", source_kind=self.dev.ProdSourceKind.PREPARED_ARTIFACT,
+                 source_commit=commit, identity=identity,
+             )):
+            self.dev.launchd_prod_deploy(controller=controller)
+            manifest_path = staging / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            current = manifest["current_schema_upgrade"]
+            self.assertEqual(commit, helper.PREPARED_SOURCE128_COMMIT)
+            self.assertEqual(self.dev.PREPARED_SOURCE128_VERSION, helper.PREPARED_SOURCE128_VERSION)
+            self.assertEqual(
+                self.dev.PREPARED_SOURCE128_REGISTRY_SHA256,
+                helper.PREPARED_SOURCE128_REGISTRY_SHA256,
+            )
+            self.assertEqual(manifest["expected"], identity.as_dict())
+            self.assertEqual(manifest["source_kind"], "prepared_artifact")
+            self.assertEqual(current["prepared_source_baseline"], 128)
+            self.assertEqual(current["candidate_registry_expected_sha256"], self.dev.PREPARED_SOURCE128_REGISTRY_SHA256)
+            self.assertEqual(current["migration_registry_sha256"], self.dev.PREPARED_SOURCE128_REGISTRY_SHA256)
+            self.assertEqual(current["controller_source_commit"], "d" * 40)
+            self.assertIs(self.dev._deploy_manifest_kind(staging), self.dev.DeployManifestKind.CURRENT_SCHEMA)
+            loaded = helper.Manifest.load(manifest_path)
+            self.assertIsInstance(loaded.current_schema_upgrade, helper.PreparedSource128Upgrade)
+            helper.validate_prepared_source128(loaded)
+            self.assertIn(("command", ("git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs")), events)
+            self.assertFalse(any(event[0] == "command" and event[1][:2] == ("gh", "api") for event in events))
+
+    def test_prepared128_requires_exact_version_registry_and_separate_controller(self):
+        commit = self.dev.PREPARED_SOURCE128_COMMIT
+        registry_bytes = subprocess.check_output(
+            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
+        )
+        for version, content, controller_commit, error in (
+            ("2.0.0", registry_bytes, "d" * 40, "receipt-bound version/commit"),
+            (self.dev.PREPARED_SOURCE128_VERSION, b"substituted registry\n", "d" * 40, "registry SHA-256 mismatch"),
+            (self.dev.PREPARED_SOURCE128_VERSION, registry_bytes, commit, "different clean controller"),
+        ):
+            with self.subTest(version=version, controller_commit=controller_commit, content=content[:20]), \
+                 self.deployment(current=True, candidate_commit=commit, controller_commit=controller_commit, registry_bytes=content) as (staging, controller, events), \
+                 mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=self.dev.RuntimeIdentity(version, commit)), \
+                 mock.patch.object(self.dev, "_prepare_prepared_artifact", return_value=self.dev.PreparedCandidate(
+                     binary=staging.parents[2] / "candidate", source_kind=self.dev.ProdSourceKind.PREPARED_ARTIFACT,
+                     source_commit=commit, identity=self.dev.RuntimeIdentity(version, commit),
+                 )):
+                with self.assertRaisesRegex(SystemExit, error):
+                    self.dev.launchd_prod_deploy(controller=controller)
+                self.assertNotIn(("status", "prepared"), events)
+                self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_prepared128_refuses_missing_predecessor_before_handoff(self):
+        commit = self.dev.PREPARED_SOURCE128_COMMIT
+        identity = self.dev.RuntimeIdentity(self.dev.PREPARED_SOURCE128_VERSION, commit)
+        with self.deployment(current=True, candidate_commit=commit, predecessor=False) as (staging, controller, events), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+             mock.patch.object(self.dev, "_prepare_prepared_artifact", return_value=self.dev.PreparedCandidate(
+                 binary=staging.parents[2] / "candidate", source_kind=self.dev.ProdSourceKind.PREPARED_ARTIFACT,
+                 source_commit=commit, identity=identity,
+             )), \
+             self.assertRaisesRegex(SystemExit, "installed launchd predecessor"):
+            self.dev.launchd_prod_deploy(controller=controller)
+        self.assertNotIn(("status", "prepared"), events)
+        self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_public_prepared129_without_protected_mode_refuses_before_dispatch(self):
+        options = self.dev.ProdDeployControllerOptions(
+            prepared_artifact=Path("prepared"), expected_full_commit=self.dev.PREPARED_SOURCE128_COMMIT,
+        )
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check, \
+             self.assertRaisesRegex(SystemExit, "required together"):
+            self.dev.cmd_prod_deploy(controller=options)
+        deploy.assert_not_called()
+        check.assert_not_called()
+
+    def test_valid_prepared129_over_live128_without_current_schema_rejects_before_materialization_claim_or_launchctl(self):
+        prepare_artifact = self.dev._prepare_prepared_artifact
+        commit = self.dev.PREPARED_SOURCE128_COMMIT
+        registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        with self.deployment(current=True, candidate_commit=commit) as (staging, controller, events):
+            artifact = staging.parents[2] / "prepared129"
+            artifact.mkdir()
+            target = "aarch64-apple-darwin"
+            binary_name = f"phoenix_ide-{target}-prepared-{commit[:12]}"
+            binary = artifact / binary_name
+            binary.write_bytes(b"valid prepared source128 candidate targeting schema129")
+            (artifact / f"PREPARATION-RECEIPT-{target}.json").write_text(json.dumps({
+                "schema": 1,
+                "operation": "prepare-main",
+                "target": target,
+                "commit": commit,
+                "version": self.dev.PREPARED_SOURCE128_VERSION,
+                "checks": {
+                    "developer_id_signature": "verified",
+                    "hardened_runtime": "verified",
+                    "notarization": "accepted",
+                    "stapled_ticket": "validated",
+                    "gatekeeper": "accepted",
+                    "embedded_helper_bytes": "identical",
+                    "notarization_submission_id": "123e4567-e89b-12d3-a456-426614174000",
+                },
+                "sha256": {binary_name: self.dev._file_sha256(binary)},
+            }))
+            identity = self.dev.RuntimeIdentity(self.dev.PREPARED_SOURCE128_VERSION, commit)
+            verify = subprocess.CompletedProcess([], 0, "", "")
+            display = subprocess.CompletedProcess(
+                [], 0, "Authority=Developer ID Application: Example\n"
+                "CodeDirectory v=20500 flags=0x10000(runtime)\nTimestamp=2026-01-01\n", "",
+            )
+            with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 mock.patch.object(self.dev.platform, "machine", return_value="arm64"), \
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=[verify, display]), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=identity):
+                validated = prepare_artifact(artifact, commit)
+            self.assertEqual(validated.identity, identity)
+            self.assertIs(validated.source_kind, self.dev.ProdSourceKind.PREPARED_ARTIFACT)
+
+            database = self.dev.PROD_DB_PATH
+            database.unlink()
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                connection.executemany("INSERT INTO _migrations VALUES (?, ?)", [
+                    item for item in helper.migration_registry(registry, qualified_current_target=False)
+                    if item[0] <= 128
+                ])
+            before = database.read_bytes()
+            for paired in (False, True):
+                unprotected = dataclasses.replace(
+                    controller,
+                    prepared_artifact=artifact,
+                    current_schema_upgrade=False,
+                    paired_database_upgrade=paired,
+                )
+                with self.subTest(paired=paired), \
+                     mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                     mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+                     mock.patch.object(self.dev, "_prepare_prepared_artifact") as candidate_prepare, \
+                     mock.patch.object(self.dev, "_materialize_helper") as materialize_helper, \
+                     mock.patch.object(self.dev.subprocess, "run") as backend, \
+                     self.assertRaisesRegex(SystemExit, "requires --current-schema-upgrade"):
+                    self.dev.launchd_prod_deploy(controller=unprotected)
+                claim.assert_not_called()
+                candidate_prepare.assert_not_called()
+                materialize_helper.assert_not_called()
+                backend.assert_not_called()
+            self.assertEqual(database.read_bytes(), before)
+            self.assertFalse((staging / "manifest.json").exists())
+            self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
 
     def test_prepared114_controller_rejects_bad_registry_same_controller_and_dirty_checkout(self):
         commit = self.dev.PREPARED_SOURCE114_COMMIT
