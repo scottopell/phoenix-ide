@@ -1381,6 +1381,13 @@ def _require_current_schema_free_space(
         )
 
 
+def _ledger_sha256(ledger: Sequence[tuple[int, str]]) -> str:
+    encoded = json.dumps(
+        [list(row) for row in ledger], separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _source128_capacity_source(manifest: Manifest, reservation: DatabaseCapacityReservation) -> dict:
     path = _capacity_observation_path(reservation)
     _regular_nosymlink(path, "source128 pre-stop capacity evidence")
@@ -1388,13 +1395,16 @@ def _source128_capacity_source(manifest: Manifest, reservation: DatabaseCapacity
         evidence = json.loads(path.read_text(), object_pairs_hook=_source128_proof_pairs)
     except (OSError, ValueError, TypeError) as exc:
         raise ActivationError("source128 pre-stop capacity evidence is unreadable") from exc
+    expected_ledger = current_schema_target_registry(
+        manifest, _current_schema_registry(manifest)
+    )[:-1]
     if (not isinstance(evidence, dict) or evidence.get("transaction_id") != manifest.transaction_id
-            or evidence.get("pre_stop_source_ledger") != [list(row) for row in current_schema_target_registry(manifest, _current_schema_registry(manifest)) if row[0] <= 128]
+            or evidence.get("pre_stop_source_ledger_sha256") != _ledger_sha256(expected_ledger)
             or not isinstance(evidence.get("pre_stop_logical_digest"), str)
             or not re.fullmatch(r"[0-9a-f]{64}", evidence["pre_stop_logical_digest"])):
         raise ActivationError("source128 pre-stop ledger or logical digest evidence is invalid")
     return {
-        "pre_stop_source_ledger": evidence["pre_stop_source_ledger"],
+        "pre_stop_source_ledger_sha256": evidence["pre_stop_source_ledger_sha256"],
         "pre_stop_logical_digest": evidence["pre_stop_logical_digest"],
     }
 
@@ -1415,7 +1425,7 @@ def _write_capacity_observation(
                 source, _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
             )
             source_evidence = {
-                "pre_stop_source_ledger": [list(row) for row in ledger],
+                "pre_stop_source_ledger_sha256": _ledger_sha256(ledger),
                 "pre_stop_logical_digest": database_logical_digest(source),
             }
         else:
@@ -1903,7 +1913,7 @@ def verify_source128_unchanged_without_snapshot(manifest: Manifest) -> None:
     ledger = validate_current_schema_database(
         source, _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
     )
-    if ([list(row) for row in ledger] != evidence["pre_stop_source_ledger"]
+    if (_ledger_sha256(ledger) != evidence["pre_stop_source_ledger_sha256"]
             or database_logical_digest(source) != evidence["pre_stop_logical_digest"]):
         raise ActivationError("source128 live source differs from pre-stop capacity evidence")
 

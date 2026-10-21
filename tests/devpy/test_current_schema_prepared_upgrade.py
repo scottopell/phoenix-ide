@@ -3500,7 +3500,10 @@ sys.exit({7 if failure else 0})
         reservation = self.held_snapshot(manifest)
         evidence = helper._capacity_observation_path(reservation)
         observed = json.loads(evidence.read_text())
-        self.assertEqual(observed["pre_stop_source_ledger"][-1][0], 128)
+        self.assertEqual(
+            observed["pre_stop_source_ledger_sha256"],
+            helper._ledger_sha256(helper.CURRENT_SCHEMA_REQUIRED_MIGRATIONS),
+        )
         self.assertEqual(observed["pre_stop_logical_digest"], helper.database_logical_digest(database))
         Path(manifest.current_schema_upgrade.proof_path).unlink()
         helper.verify_source128_unchanged_without_snapshot(manifest)
