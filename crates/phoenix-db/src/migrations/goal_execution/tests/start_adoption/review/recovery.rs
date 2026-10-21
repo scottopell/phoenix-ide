@@ -162,8 +162,9 @@ async fn conversation_goal_reconstruction_rejects_changed_slot_idle_checkpoint_a
         "slot",
         "idle",
         "checkpoint",
-        "closed",
-        "inactive",
+        "history",
+        "close",
+        "stale_latest",
         "queued",
         "terminal",
     ] {
@@ -211,7 +212,7 @@ async fn conversation_goal_reconstruction_rejects_changed_slot_idle_checkpoint_a
                 .unwrap();
                 tx.commit().await.unwrap();
             }
-            "closed" => {
+            "history" => {
                 sqlx::query(
                     "UPDATE product_conversations SET ordinary_lifecycle='history' WHERE id=?",
                 )
@@ -220,12 +221,68 @@ async fn conversation_goal_reconstruction_rejects_changed_slot_idle_checkpoint_a
                 .await
                 .unwrap();
             }
-            "inactive" => {
-                sqlx::query("UPDATE product_conversations SET active=0 WHERE id=?")
-                    .bind(adopted.receipt.input().goal().owner.as_str())
-                    .execute(db.pool())
+            "close" => {
+                db.begin_close_foundation(
+                    &adopted.receipt.input().goal().owner,
+                    &phoenix_core::domain::close::TranscriptConversationId::parse(transcript)
+                        .unwrap(),
+                    "goal-reconstruction-close",
+                )
+                .await
+                .unwrap();
+                assert!(!db
+                    .product_conversation_admission(transcript)
+                    .await
+                    .unwrap()
+                    .is_accepted());
+            }
+            "stale_latest" => {
+                db.update_conversation_state(
+                    transcript,
+                    &ConvState::ContextExhausted {
+                        summary: "continue the retained goal".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let crate::ContinueOutcome::Created(successor) =
+                    db.continue_conversation(transcript).await.unwrap()
+                else {
+                    panic!("fixture must create a real successor transcript");
+                };
+                assert_eq!(
+                    successor.product_conversation_id,
+                    adopted.receipt.input().goal().owner
+                );
+                let aggregate = db
+                    .get_ordinary_product_conversation(&adopted.receipt.input().goal().owner)
                     .await
                     .unwrap();
+                assert_eq!(aggregate.latest_transcript_row_id, successor.id);
+                assert_ne!(aggregate.latest_transcript_row_id, transcript);
+                let lifecycle: String = sqlx::query_scalar(
+                    "SELECT ordinary_lifecycle FROM product_conversations WHERE id=?",
+                )
+                .bind(adopted.receipt.input().goal().owner.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(lifecycle, "open");
+                let mut tx = db.pool().begin().await.unwrap();
+                assert!(matches!(
+                    crate::conversation_goals::execution::require_live_request_tx(
+                        &mut tx,
+                        &adopted.intent().unwrap(),
+                        transcript,
+                    )
+                    .await,
+                    Err(
+                        crate::conversation_goals::execution::GoalRequestError::Goal(
+                            crate::conversation_goals::GoalDbError::TargetChanged
+                        )
+                    )
+                ));
+                tx.rollback().await.unwrap();
             }
             "terminal" => {
                 db.workflow_repository()

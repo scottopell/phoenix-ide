@@ -47,11 +47,17 @@ then `resume_owed_baton_request` → `resume_committed_steering_request` → the
 existing `RequestLlm` effect and actual-dispatch admission guard. Summary keeps
 the existing `AwaitingContinuation` startup effect. Unmaterialized Start does not
 enter reconstruction, and Disabled adopted recovery refuses before minting a
-receipt, so neither branch gains this startup permission. Candidate tests cover racing reconstructions, rollback between
+receipt, so neither branch gains this startup permission. Candidate tests cover
+racing reconstructions, rollback between
 workflow/turn writes, before/after-commit cuts, stale-owner refusal, same-ID/charge
-dispatch, Stop/release, changed slot, checkpoint, queue, inactive/history owner,
-terminal obligation and startup-reset preservation. Real RuntimeManager tests
-assert no provider call for held unmaterialized Start and default-off adopted
+dispatch, Stop/release, changed slot, checkpoint, queue, History/Close/current-
+transcript owner fences, terminal obligation and startup-reset preservation.
+The current-transcript fixture creates a real continuation with the existing
+helper, retains the old recovery request and independently asserts live-request
+`TargetChanged` while the product remains open; recovery can also reject that
+old slot before reaching the latest-transcript fence. The earlier invented
+`product_conversations.active` fixture was invalid and is not execution evidence.
+Real RuntimeManager tests assert no provider call for held unmaterialized Start and default-off adopted
 recovery, using startup acknowledgment and closed process admission rather than
 sleep-based absence assertions. These tests are **authored, not executed**.
 
