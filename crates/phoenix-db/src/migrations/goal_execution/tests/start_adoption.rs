@@ -1,3 +1,5 @@
+mod review;
+
 use super::*;
 use crate::conversation_goals::start::GoalStartAcceptance;
 use crate::workflow::{
@@ -180,14 +182,14 @@ async fn conversation_goal_start_witness_survives_live_cleanup_but_never_resurre
 async fn conversation_goal_start_materialization_witness_rejects_raw_forgery_replace_update_and_delete(
 ) {
     let (db, input) = claimed().await;
-    let forged = "INSERT INTO conversation_goal_start_materializations(start_id,request_id,effect_id,attempt_id,process_incarnation,state_updated_at_us) VALUES (?,?,?,?,?,?)";
+    let forged = "INSERT INTO conversation_goal_start_materializations(start_id,request_id,effect_id,attempt_id,process_incarnation,state_updated_at) VALUES (?,?,?,?,?,?)";
     assert!(sqlx::query(forged)
         .bind(i64::try_from(input.start_id.get()).unwrap())
         .bind(input.intent().unwrap().id.as_str())
         .bind(i64::try_from(input.authority.effect_id.0).unwrap())
         .bind(i64::try_from(input.authority.attempt_id.0).unwrap())
         .bind(10_i64)
-        .bind(input.state_updated_at.timestamp_micros())
+        .bind(input.state_updated_at.to_rfc3339())
         .execute(db.pool())
         .await
         .is_err());
@@ -200,7 +202,7 @@ async fn conversation_goal_start_materialization_witness_rejects_raw_forgery_rep
     for statement in [
         "UPDATE conversation_goal_start_materializations SET process_incarnation=999",
         "DELETE FROM conversation_goal_start_materializations",
-        "INSERT OR REPLACE INTO conversation_goal_start_materializations SELECT start_id,request_id,effect_id,attempt_id,999,state_updated_at_us FROM conversation_goal_start_materializations",
+        "INSERT OR REPLACE INTO conversation_goal_start_materializations SELECT start_id,request_id,effect_id,attempt_id,999,state_updated_at FROM conversation_goal_start_materializations",
     ] {
         assert!(sqlx::query(statement).execute(db.pool()).await.is_err(),"{statement}");
     }

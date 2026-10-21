@@ -22,6 +22,36 @@ not whole-suite qualification. No local compiler, tests, SQL, codegen or browser
 execution is claimed.
 
 
+## Adoption review corrections: later source, unqualified
+
+The bounded review correction uses the actual ordinary retry **target** and
+requires the retry phase to be `InFlight`, with the same admitted logical ID.
+Waiting retries, continuation targets and changed IDs are refused. Committed
+materialization classification checks the transition's own generation separately
+from the receipt, and validates the actual workflow profile, snapshot codec and
+canonical snapshot bytes. Local adoption requires the exact active head version
+and generation; an advanced head cannot be adopted locally. Known-uncommitted
+classification additionally requires absence of workflow receipt/delivery facts
+and the exact active pre-materialization head. Partial proof remains unclassified.
+
+The unlanded additive 137 witness guard requires the accepted reducer delivery
+linked to the materializing transition, canonical whole receipt/event payloads
+and codecs, receipted effect/accepted attempt lineage, exact initial request state
+and current workflow head. The witness stores the accepted state's original
+`state_updated_at` **text**, compared byte-for-byte with the current transaction's
+state timestamp, instead of a lossy numeric conversion or duplicate timestamp
+encoding. No old migration or 132–136 SQL is changed.
+
+Twelve additional review regressions are authored and **UNRUN**: four retry
+identity/target/phase cases; committed transition-generation and head divergence;
+separate partial receipt/delivery cases; exact pre-materialization head; staged
+joined-subset/payload/codec witness forgery; exact state/timestamp (including a
+one-nanosecond mismatch); and a complete canonical-bundle guard control. The
+staged witness tests corrupt isolated facts inside rolled-back test transactions,
+not merely insert into an empty schema. No new compiler, SQL, test or runtime
+qualification is claimed. The producer/worker hold and remaining coverage
+obligations below are unchanged.
+
 ## Nonmessage adoption and additive 137: later source, unqualified
 
 The adoption source connects `AuthoritativeGoalStart` through Event/CoreEvent,

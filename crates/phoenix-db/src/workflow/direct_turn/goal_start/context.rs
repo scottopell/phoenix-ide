@@ -57,7 +57,7 @@ impl WorkflowRepository {
         .await
         .map_err(|error| DbError::Serialization(error.to_string()))?
         .ok_or_else(|| DbError::Serialization("Start request lost canonical acceptance".into()))?;
-        let witness=sqlx::query("SELECT m.request_id,m.state_updated_at_us,r.generation AS request_generation FROM conversation_goal_start_materializations m JOIN conversation_goal_requests r ON r.request_id=m.request_id WHERE m.start_id=?")
+        let witness=sqlx::query("SELECT m.request_id,m.state_updated_at,r.generation AS request_generation FROM conversation_goal_start_materializations m JOIN conversation_goal_requests r ON r.request_id=m.request_id WHERE m.start_id=?")
             .bind(row.get::<i64,_>("goal_start_id")).fetch_one(&mut *tx.tx).await?;
         let intent = GoalRequestIntent::new(
             GoalRequestId::parse(format!("goal-start:{}", row.get::<i64, _>("goal_start_id")))
@@ -89,18 +89,16 @@ impl WorkflowRepository {
         }
         let state: ConvState = serde_json::from_str(&row.get::<String, _>("state"))
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let initial_timestamp = DateTime::parse_from_rfc3339(
-            &row.get::<String, _>("state_updated_at"),
-        )
-        .is_ok_and(|timestamp| {
-            timestamp.timestamp_micros() == witness.get::<i64, _>("state_updated_at_us")
-        });
+        let initial_timestamp = row.get::<String, _>("state_updated_at")
+            == witness.get::<String, _>("state_updated_at");
         let permitted = match state {
             ConvState::LlmRequesting { attempt: 1 } => initial_timestamp,
             ConvState::LlmRequesting { attempt } if attempt > 1 => true,
             ConvState::ServerOverloadRetrying { retry } => {
                 retry.logical_request_id == intent.id.as_str()
-                    && retry.phase == phoenix_core::domain::sm_state::LlmPhase::Ordinary
+                    && retry.target
+                        == phoenix_core::domain::sm_state::ServerOverloadTarget::Ordinary
+                    && retry.phase == phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
             }
             _ => false,
         };

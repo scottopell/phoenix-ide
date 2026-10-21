@@ -294,17 +294,44 @@ impl WorkflowRepository {
                 "Start proposed request state was not installed".into(),
             ));
         }
-        sqlx::query("INSERT INTO conversation_goal_start_materializations (start_id,request_id,effect_id,attempt_id,process_incarnation,state_updated_at_us) VALUES (?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO conversation_goal_start_materializations (start_id,request_id,effect_id,attempt_id,process_incarnation,state_updated_at) VALUES (?,?,?,?,?,?)")
             .bind(to_i64(input.start_id.get(), "Start receipt")?).bind(intent.id.as_str())
             .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
             .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
             .bind(to_i64(input.authority.process_incarnation.0, "process_incarnation")?)
-            .bind(input.state_updated_at.timestamp_micros()).execute(&mut *tx.tx).await?;
+            .bind(input.state_updated_at.to_rfc3339()).execute(&mut *tx.tx).await?;
         finish_workflow_transaction_at_cut(tx, cut).await?;
         Ok(GoalStartAdoptionOutcome::Committed {
             turn_id: TurnAuthorityId(to_u64(intent.execution.turn_id(), "turn_id")?),
             generation: input.authority.generation.0,
         })
+    }
+
+    async fn goal_start_workflow_head_tx(
+        tx: &mut crate::workflow::WorkflowTx<'_>,
+        input: &GoalStartAdoptionInput,
+    ) -> DbResult<sqlx::sqlite::SqliteRow> {
+        let head = sqlx::query("SELECT kind,profile_id,profile_version,status,version,generation,snapshot_codec_family,snapshot_codec_version,snapshot_payload FROM workflows WHERE workflow_id=?")
+            .bind(input.receipt.execution().workflow_id()).fetch_one(&mut *tx.tx).await?;
+        let snapshot = serde_json::to_vec(&direct_turn_profile::DirectTurnSnapshot {
+            turn_id: to_u64(input.receipt.execution().turn_id(), "turn_id")?,
+        })
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        if head.get::<String, _>("kind") != direct_turn_profile::PROFILE_ID
+            || head.get::<String, _>("profile_id") != direct_turn_profile::PROFILE_ID
+            || head.get::<i64, _>("profile_version")
+                != i64::from(direct_turn_profile::PROTOCOL_VERSION)
+            || head.get::<String, _>("snapshot_codec_family")
+                != direct_turn_profile::SNAPSHOT_CODEC_FAMILY
+            || head.get::<i64, _>("snapshot_codec_version")
+                != i64::from(direct_turn_profile::PROTOCOL_VERSION)
+            || head.get::<Vec<u8>, _>("snapshot_payload") != snapshot
+        {
+            return Err(DbError::Serialization(
+                "Start workflow head profile/snapshot diverged".into(),
+            ));
+        }
+        Ok(head)
     }
 
     pub(crate) async fn classify_goal_start_materialization(
@@ -342,7 +369,7 @@ impl WorkflowRepository {
             ));
         }
         let intent = input.intent()?;
-        let witness = sqlx::query("SELECT request_id,effect_id,attempt_id,process_incarnation,state_updated_at_us FROM conversation_goal_start_materializations WHERE start_id=?")
+        let witness = sqlx::query("SELECT request_id,effect_id,attempt_id,process_incarnation,state_updated_at FROM conversation_goal_start_materializations WHERE start_id=?")
             .bind(to_i64(input.start_id.get(), "Start receipt")?).fetch_optional(&mut *tx.tx).await?;
         let live = sqlx::query("SELECT t.*,c.state AS conversation_state,c.state_updated_at AS conversation_updated_at FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id WHERE t.turn_id=?")
             .bind(intent.execution.turn_id()).fetch_optional(&mut *tx.tx).await?;
@@ -368,12 +395,12 @@ impl WorkflowRepository {
                     == to_i64(input.authority.attempt_id.0, "attempt_id")?
                 && witness.get::<i64, _>("process_incarnation")
                     == to_i64(input.authority.process_incarnation.0, "incarnation")?
-                && witness.get::<i64, _>("state_updated_at_us")
-                    == input.state_updated_at.timestamp_micros();
+                && witness.get::<String, _>("state_updated_at")
+                    == input.state_updated_at.to_rfc3339();
             let Some(live) = live else {
                 return Ok(GoalStartAdoptionOutcome::CommittedElsewhere);
             };
-            let proof = sqlx::query("SELECT r.receipt_payload,r.receipt_codec_family,r.receipt_codec_version,r.declared_workflow_version,r.generation,r.process_incarnation,d.payload_blob,d.event_codec_family AS delivery_codec_family,d.event_codec_version AS delivery_codec_version,d.status,d.runtime_acceptance_status,t.event_codec_family AS transition_codec_family,t.event_codec_version AS transition_codec_version,t.event_payload,t.from_version,t.to_version,w.version AS current_version,w.generation AS current_generation FROM workflow_receipts r JOIN workflow_deliveries d ON d.workflow_id=r.workflow_id AND d.effect_id=r.effect_id AND d.accepted_by_transition_id=? JOIN workflow_transitions t ON t.workflow_id=r.workflow_id AND t.transition_id=d.accepted_by_transition_id JOIN workflows w ON w.workflow_id=r.workflow_id WHERE r.workflow_id=? AND r.effect_id=? AND r.attempt_id=?")
+            let proof = sqlx::query("SELECT r.receipt_payload,r.receipt_codec_family,r.receipt_codec_version,r.declared_workflow_version,r.generation,r.process_incarnation,r.origin,d.payload_kind,d.consumer_kind,d.requires_runtime_acceptance,d.suppression_reason,d.payload_blob,d.event_codec_family AS delivery_codec_family,d.event_codec_version AS delivery_codec_version,d.status,d.runtime_acceptance_status,t.event_codec_family AS transition_codec_family,t.event_codec_version AS transition_codec_version,t.event_payload,t.from_version,t.to_version,t.generation AS transition_generation FROM workflow_receipts r JOIN workflow_deliveries d ON d.workflow_id=r.workflow_id AND d.effect_id=r.effect_id AND d.accepted_by_transition_id=? JOIN workflow_transitions t ON t.workflow_id=r.workflow_id AND t.transition_id=d.accepted_by_transition_id WHERE r.workflow_id=? AND r.effect_id=? AND r.attempt_id=?")
                 .bind(to_i64(DIRECT_TURN_MATERIALIZED_TRANSITION_ID,"transition_id")?)
                 .bind(intent.execution.workflow_id()).bind(witness.get::<i64,_>("effect_id"))
                 .bind(witness.get::<i64,_>("attempt_id")).fetch_one(&mut *tx.tx).await?;
@@ -413,8 +440,16 @@ impl WorkflowRepository {
                 || proof.get::<i64, _>("transition_codec_version")
                     != i64::from(direct_turn_profile::PROTOCOL_VERSION)
                 || proof.get::<String, _>("status") != "Accepted"
+                || proof.get::<String, _>("origin") != "Execution"
+                || proof.get::<String, _>("payload_kind") != "Receipt"
+                || proof.get::<String, _>("consumer_kind") != "reducer"
+                || proof.get::<i64, _>("requires_runtime_acceptance") != 1
+                || proof
+                    .get::<Option<String>, _>("suppression_reason")
+                    .is_some()
                 || proof.get::<String, _>("runtime_acceptance_status") != "Accepted"
                 || proof.get::<i64, _>("generation") != intent.generation()
+                || proof.get::<i64, _>("transition_generation") != intent.generation()
                 || proof.get::<i64, _>("process_incarnation")
                     != witness.get::<i64, _>("process_incarnation")
                 || proof.get::<i64, _>("from_version") != declared
@@ -424,9 +459,22 @@ impl WorkflowRepository {
                     "Start materialization workflow bundle diverged".into(),
                 ));
             }
-            let local_workflow = proof.get::<i64, _>("current_version")
-                == proof.get::<i64, _>("to_version")
-                && proof.get::<i64, _>("current_generation") == intent.generation()
+            let head = Self::goal_start_workflow_head_tx(&mut tx, input).await?;
+            if head.get::<i64, _>("version") < proof.get::<i64, _>("to_version")
+                || head.get::<i64, _>("generation") < intent.generation()
+            {
+                return Err(DbError::Serialization(
+                    "Start workflow head precedes materialization proof".into(),
+                ));
+            }
+            let local_workflow = head.get::<i64, _>("version") == proof.get::<i64, _>("to_version")
+                && head.get::<i64, _>("generation") == intent.generation();
+            if local_workflow && head.get::<String, _>("status") != "Active" {
+                return Err(DbError::Serialization(
+                    "Start materialized workflow head status diverged".into(),
+                ));
+            }
+            let local_workflow = local_workflow
                 && declared
                     == to_i64(
                         input.authority.declared_workflow_version.0,
@@ -453,10 +501,8 @@ impl WorkflowRepository {
                 && live.get::<i64, _>("owns_conversation") == 1
                 && live.get::<Option<String>, _>("terminal_kind").is_none()
                 && state == (ConvState::LlmRequesting { attempt: 1 })
-                && DateTime::parse_from_rfc3339(&live.get::<String, _>("conversation_updated_at"))
-                    .is_ok_and(|at| {
-                        at.timestamp_micros() == input.state_updated_at.timestamp_micros()
-                    })
+                && live.get::<String, _>("conversation_updated_at")
+                    == witness.get::<String, _>("state_updated_at")
             {
                 return Ok(GoalStartAdoptionOutcome::ClassifiedCommitted {
                     turn_id: TurnAuthorityId(to_u64(intent.execution.turn_id(), "turn_id")?),
@@ -500,6 +546,26 @@ impl WorkflowRepository {
             if state != ConvState::Idle || transitions != 0 {
                 return Err(DbError::Serialization(
                     "unmaterialized Start advanced without retained witness".into(),
+                ));
+            }
+            let partial: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workflow_receipts WHERE workflow_id=?1) OR EXISTS(SELECT 1 FROM workflow_deliveries WHERE workflow_id=?1)")
+                .bind(intent.execution.workflow_id()).fetch_one(&mut *tx.tx).await?;
+            if partial != 0 {
+                return Err(DbError::Serialization(
+                    "unmaterialized Start has partial receipt/delivery evidence".into(),
+                ));
+            }
+            let head = Self::goal_start_workflow_head_tx(&mut tx, input).await?;
+            if head.get::<i64, _>("version")
+                != to_i64(
+                    input.authority.declared_workflow_version.0,
+                    "declared version",
+                )?
+                || head.get::<i64, _>("generation") != intent.generation()
+                || head.get::<String, _>("status") != "Active"
+            {
+                return Err(DbError::Serialization(
+                    "unmaterialized Start workflow head changed".into(),
                 ));
             }
             let eligible = self.preflight_goal_start_tx(&mut tx, input).await?;
