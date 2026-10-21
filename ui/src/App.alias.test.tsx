@@ -8,9 +8,9 @@ import { ViewJourneyLifecycle } from './hooks/conversationViewLifecycle';
 import { MarkdownRenderer } from './components/MarkdownRenderer';
 import { CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents } from './components/conversationMarkdownImages';
 
-function ReplaceRoute({ target }: { target: string }) {
+function ReplaceRoute({ target, state }: { target: string; state?: unknown }) {
   const navigate = useNavigate();
-  return <><button onClick={() => navigate(target)}>Replace route</button><button onClick={() => navigate(-1)}>Back</button><button onClick={() => navigate(1)}>Forward</button></>;
+  return <><button onClick={() => navigate(target, { state })}>Replace route</button><button onClick={() => navigate(-1)}>Back</button><button onClick={() => navigate(1)}>Forward</button></>;
 }
 
 const embeddedSpy = vi.fn();
@@ -232,12 +232,53 @@ describe('ProductConversationAliasRedirect', () => {
     const url = new URL(entry, 'https://phoenix.test');
     renderAlias(id, `${url.pathname}${url.search}${url.hash}`);
     expect(await screen.findByTestId('product-page')).toHaveTextContent('exact-product');
-    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe(entry.replace('/transcript', '/c/exact-product')));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe(entry.replace('/transcript', '/c/readable-name')));
     expect(vi.mocked(api.getProductConversationSnapshot).mock.calls.map(([reference]) => reference)).toEqual([
-      id, id, 'exact-product', id,
+      id, id, 'readable-name', id,
     ]);
     expect(api.resolveCoordinatorRoute).toHaveBeenCalledWith(id);
     expect(embeddedSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(['.', '..', 'product/id?hash#%雪'])('uses the authoritative slug rather than opaque product identity %s and retains reader/state across history and pending selection', async productId => {
+    const canonical = '/c/readable-%E9%9B%AA';
+    const pin = 'member/雪?value%';
+    const returnState = { from: '/tasks', chapterSelection: 'historical', value: 7 };
+    vi.mocked(api.getProductConversationSnapshot).mockImplementation(async reference => ({
+      product_conversation_id: productId, canonical_route: canonical,
+      requested_transcript_row_id: reference === 'readable-雪' ? null : reference,
+    } as never));
+    render(<MemoryRouter initialEntries={[{ pathname: canonical, state: returnState }]}>
+      <ReplaceRoute target={`/transcript?source_transcript=${encodeURIComponent(pin)}&viewer=inspect#message-source`} state={returnState} />
+      <Location /><Suspense fallback={null}><Routes>
+        <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
+        <Route path="/transcript" element={<ConversationRouteRedirect />} />
+      </Routes></Suspense>
+    </MemoryRouter>);
+    const owner = await screen.findByTestId('product-page');
+    await waitFor(() => expect(owner).toBeVisible());
+    fireEvent.click(screen.getByRole('button', { name: 'Local 0' }));
+    fireEvent.click(screen.getByText('Replace route'));
+    const exactLocation = `${canonical}?source_transcript=${encodeURIComponent(pin)}&viewer=inspect#message-source`;
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe(exactLocation));
+    expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual(returnState);
+    await waitFor(() => expect(owner).toBeVisible());
+    expect(screen.getByTestId('product-page')).toBe(owner);
+    expect(screen.getByRole('button', { name: 'Local 1' })).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Back'));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe(canonical));
+    expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual(returnState);
+    fireEvent.click(screen.getByText('Forward'));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe(exactLocation));
+    expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual(returnState);
+    await waitFor(() => expect(owner).toBeVisible());
+    expect(screen.getByTestId('product-page')).toBe(owner);
+    fireEvent.click(screen.getByRole('button', { name: 'Select pending prompt' }));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe(canonical));
+    await waitFor(() => expect(owner).toBeVisible());
+    expect(screen.getByTestId('product-page')).toBe(owner);
+    expect(screen.getByRole('button', { name: 'Local 1' })).toBeInTheDocument();
+    expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual({ chapterSelection: 'pending' });
   });
 
   it.each(['/TRANSCRIPT', '/transcript//', '/%74ranscript', '/transcrip%74'])('uses exact admission for the router-matched spelling %s', async pathname => {
@@ -246,10 +287,10 @@ describe('ProductConversationAliasRedirect', () => {
     } as never));
     renderAlias('unused', `${pathname}?source_transcript=exact-member&viewer=inspect#message-source`);
     expect(await screen.findByTestId('product-page')).toHaveTextContent('exact-product');
-    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/c/exact-product?source_transcript=exact-member&viewer=inspect#message-source'));
-    expect(vi.mocked(api.resolveCoordinatorRoute).mock.calls.map(([reference]) => reference)).toEqual(['exact-member', 'exact-product']);
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/c/readable-name?source_transcript=exact-member&viewer=inspect#message-source'));
+    expect(vi.mocked(api.resolveCoordinatorRoute).mock.calls.map(([reference]) => reference)).toEqual(['exact-member', 'readable-name']);
     expect(vi.mocked(api.getProductConversationSnapshot).mock.calls.map(([reference]) => reference)).toEqual([
-      'exact-member', 'exact-member', 'exact-product', 'exact-member',
+      'exact-member', 'exact-member', 'readable-name', 'exact-member',
     ]);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(embeddedSpy).not.toHaveBeenCalled();

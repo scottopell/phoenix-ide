@@ -5,8 +5,10 @@ use axum::{
     response::IntoResponse,
     Router,
 };
+use futures::StreamExt;
 use phoenix_core::domain::db_schema::MessageContent;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tower::ServiceExt;
 
 const REFERENCES: &[&str] = &[
@@ -22,6 +24,10 @@ const REFERENCES: &[&str] = &[
     "%",
     "%ZZ",
     " leading ",
+];
+const ROUTE_READS: &[&str] = &[
+    "/api/conversation-reads/route",
+    "/api/conversation-reads/route/by-slug",
 ];
 const TRANSCRIPT_READS: &[&str] = &[
     "/api/conversation-reads/snapshot",
@@ -58,6 +64,291 @@ fn assert_message(value: &Value, message_id: &str) {
         .unwrap();
     assert_eq!(messages.as_array().unwrap().len(), 1, "{value}");
     assert_eq!(messages[0]["message_id"], message_id);
+}
+
+#[tokio::test]
+async fn exact_route_reads_keep_id_and_slug_domains_separate() {
+    let state = make_test_state().await;
+    for (index, reference) in REFERENCES.iter().enumerate() {
+        let by_id = state
+            .db
+            .create_conversation(
+                reference,
+                &format!("id-owner-{index}"),
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let slug_owner = format!("slug-owner-{index}");
+        state
+            .db
+            .create_conversation(&slug_owner, &slug_owner, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        // Persisted historical slugs need not match the current name allocator's projection.
+        sqlx::query("UPDATE conversations SET slug = ?1 WHERE id = ?2")
+            .bind(reference)
+            .bind(&slug_owner)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let router = create_router(state.clone());
+        assert_eq!(
+            read(&router, ROUTE_READS[0], reference).await,
+            json!({"id": reference, "slug": by_id.slug})
+        );
+        assert_eq!(
+            read(&router, ROUTE_READS[1], reference).await,
+            json!({"id": slug_owner, "slug": reference})
+        );
+    }
+    let router = create_router(state);
+    for uri in [
+        "/api/conversations/slug-owner-0/route",
+        "/api/conversations/by-slug/id-owner-0/route",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "unchanged route: {uri}");
+    }
+}
+
+fn stream_request(reference: &str, options: &[(&str, &str)]) -> Request<Body> {
+    let mut url = reqwest::Url::parse("http://phoenix.test/api/conversation-reads/stream").unwrap();
+    url.query_pairs_mut()
+        .append_pair("reference", reference)
+        .extend_pairs(options.iter().copied());
+    Request::get(format!("{}?{}", url.path(), url.query().unwrap()))
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn stream_init(router: &Router, request: Request<Body>) -> Value {
+    let response = tokio::time::timeout(Duration::from_secs(5), router.clone().oneshot(request))
+        .await
+        .expect("stream response timeout")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut body = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("init timeout")
+        .expect("init chunk")
+        .unwrap();
+    let chunk = std::str::from_utf8(&chunk).unwrap();
+    assert!(chunk.lines().any(|line| line == "event: init"));
+    serde_json::from_str(
+        chunk
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn exact_stream_preserves_opaque_identity_and_existing_init() {
+    let state = make_test_state().await;
+    for (index, reference) in REFERENCES.iter().enumerate() {
+        state
+            .db
+            .create_conversation(
+                reference,
+                &format!("stream-{index}"),
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let message_id = format!("stream-message-{index}");
+        state
+            .db
+            .add_message(
+                &message_id,
+                reference,
+                &MessageContent::user(*reference),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let init = stream_init(
+            &create_router(state.clone()),
+            stream_request(reference, &[]),
+        )
+        .await;
+        assert_eq!(init["conversation"]["id"], *reference);
+        assert_message(&init, &message_id);
+    }
+}
+
+#[tokio::test]
+async fn exact_stream_retains_cursor_generation_and_last_event_id_semantics() {
+    use crate::runtime::SseEvent;
+    let state = make_test_state().await;
+    let id = "a/b?雪#%";
+    state
+        .db
+        .create_conversation(id, "cursor-stream", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let persisted = state
+        .db
+        .add_message(
+            "cursor-anchor",
+            id,
+            &MessageContent::user("anchor"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let handle = state.runtime.get_or_create(id).await.unwrap();
+    let broadcast = &handle.broadcast_tx;
+    let _subscription = broadcast.subscribe();
+    broadcast.send_persisted_message(persisted.clone()).unwrap();
+    for text in ["first", "second"] {
+        broadcast
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: text.into(),
+                request_id: "request".into(),
+            })
+            .unwrap();
+    }
+    let generation = state
+        .db
+        .get_conversation(id)
+        .await
+        .unwrap()
+        .transcript_generation
+        .to_string();
+    let cursor = (persisted.sequence_id + 1).to_string();
+    let router = create_router(state);
+    for path in [false, true] {
+        let query = [
+            ("after_event_sequence", cursor.as_str()),
+            ("after_sequence", "999999"),
+            ("transcript_generation", generation.as_str()),
+        ];
+        let mut request = if path {
+            // Safe path alias uses the same row without changing stream behavior.
+            let encoded = super::super::percent_encode_query_value(id);
+            Request::get(format!("/api/conversations/{encoded}/stream?after_event_sequence={cursor}&after_sequence=999999&transcript_generation={generation}")).body(Body::empty()).unwrap()
+        } else {
+            stream_request(id, &query)
+        };
+        request
+            .headers_mut()
+            .insert("last-event-id", "999999".parse().unwrap());
+        let init = stream_init(&router, request).await;
+        assert_eq!(init["conversation"]["id"], id);
+        assert_eq!(init["transcript_coverage"], "preserve");
+        assert!(init["messages"].as_array().unwrap().is_empty());
+        assert_eq!(init["pending_events"].as_array().unwrap().len(), 1);
+        assert_eq!(init["pending_events"][0]["text"], "second");
+    }
+    let mut legacy_only = stream_request(id, &[("after_sequence", "999999")]);
+    legacy_only
+        .headers_mut()
+        .insert("last-event-id", "999999".parse().unwrap());
+    let init = stream_init(&router, legacy_only).await;
+    assert_message(&init, "cursor-anchor");
+    assert_eq!(init["pending_events"].as_array().unwrap().len(), 2);
+    let stale_generation = stream_init(
+        &router,
+        stream_request(
+            id,
+            &[
+                ("after_event_sequence", cursor.as_str()),
+                ("transcript_generation", "999999"),
+            ],
+        ),
+    )
+    .await;
+    assert_message(&stale_generation, "cursor-anchor");
+}
+
+#[tokio::test]
+async fn exact_stream_rejects_malformed_and_duplicate_selectors_before_subscribing() {
+    let state = make_test_state().await;
+    for id in [".", "..", "雪", "�", "%ZZ"] {
+        state
+            .db
+            .create_conversation(id, &format!("invalid-query-{id}"), "/tmp", true, None, None)
+            .await
+            .unwrap();
+    }
+    let router = create_router(state);
+    for query in [
+        "", "reference=", "reference=missing", "reference=.&reference=..", "reference=.&reference=.",
+        "reference=.&%72eference=..", "reference=%FF", "reference=%E9%9B", "reference=%ZZ", "reference=%", "reference=%+1",
+        "reference=.&after_event_sequence=no", "reference=.&after_event_sequence=1&after_event_sequence=2",
+        "reference=.&after_sequence=no", "reference=.&transcript_generation=no", "reference=.&transcript_generation=1&transcript_generation=2",
+        "reference=.&open_id=no", "reference=.&open_id=00000000-0000-0000-0000-000000000000&open_id=00000000-0000-0000-0000-000000000001",
+    ] {
+        let request = Request::get(format!("/api/conversation-reads/stream?{query}")).body(Body::empty()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), router.clone().oneshot(request)).await.expect("invalid query response timeout").unwrap();
+        assert!(response.status().is_client_error(), "{query}: {}", response.status());
+    }
+}
+
+#[tokio::test]
+async fn exact_route_and_stream_aliases_require_owner_authentication() {
+    let mut state = make_test_state().await;
+    let conversation = state
+        .db
+        .create_conversation(".", "readable", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    state.password = Some(
+        phoenix_core::domain::instance_identity::OwnerPassword::parse("secret".into()).unwrap(),
+    );
+    state
+        .db
+        .insert_auth_session("read-session", "", chrono::Duration::minutes(5))
+        .await
+        .unwrap();
+    let router = create_router(state);
+    for (uri, reference) in [
+        (ROUTE_READS[0], "."),
+        (ROUTE_READS[1], conversation.slug.as_str()),
+    ] {
+        let body = json!({"reference": reference}).to_string();
+        let response = router.clone().oneshot(request(uri, &body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let mut authenticated = request(uri, &body);
+        authenticated
+            .headers_mut()
+            .insert("cookie", "phoenix-auth=read-session".parse().unwrap());
+        let response = router.clone().oneshot(authenticated).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for options in [&[][..], &[("password", "secret")][..]] {
+        let response = router
+            .clone()
+            .oneshot(stream_request(".", options))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let mut authenticated = stream_request(".", &[]);
+    authenticated
+        .headers_mut()
+        .insert("cookie", "phoenix-auth=read-session".parse().unwrap());
+    assert_eq!(
+        stream_init(&router, authenticated).await["conversation"]["id"],
+        "."
+    );
 }
 
 #[tokio::test]
@@ -413,7 +704,7 @@ async fn exact_read_history_cursor_retains_its_original_membership() {
 #[tokio::test]
 async fn exact_read_rejects_malformed_duplicate_and_missing_references() {
     let router = create_router(make_test_state().await);
-    for uri in TRANSCRIPT_READS.iter().copied().chain([
+    for uri in TRANSCRIPT_READS.iter().chain(ROUTE_READS).copied().chain([
         "/api/product-conversation-reads/snapshot",
         "/api/global/coordinator/reads/route",
         "/api/global/coordinator/reads/history",
@@ -467,7 +758,7 @@ async fn exact_read_blank_and_missing_references_do_not_fall_back_to_latest() {
             read(&router, "/api/global/coordinator/reads/route", reference).await,
             json!({"coordinator_id": null})
         );
-        for uri in TRANSCRIPT_READS.iter().copied().chain([
+        for uri in TRANSCRIPT_READS.iter().chain(ROUTE_READS).copied().chain([
             "/api/product-conversation-reads/snapshot",
             "/api/global/coordinator/reads/history",
         ]) {
@@ -524,7 +815,7 @@ async fn transcript_direct_get_serves_public_shell_without_exempting_exact_reads
             );
         }
         if password_required {
-            for uri in TRANSCRIPT_READS.iter().copied().chain([
+            for uri in TRANSCRIPT_READS.iter().chain(ROUTE_READS).copied().chain([
                 "/api/product-conversation-reads/snapshot",
                 "/api/global/coordinator/reads/route",
                 "/api/global/coordinator/reads/history",

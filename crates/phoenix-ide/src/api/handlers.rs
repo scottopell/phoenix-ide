@@ -108,6 +108,7 @@ async fn trajectory_export_handler(
 /// stdout/file access log keeps them.
 const STREAMING_ROUTES: &[&str] = &[
     "/api/conversations/:id/stream",
+    "/api/conversation-reads/stream",
     "/api/chains/:rootId/stream",
     "/api/product-conversations/events",
     "/api/share/:token/events",

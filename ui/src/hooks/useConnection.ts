@@ -170,7 +170,7 @@ function buildStreamUrl(
   transcriptGeneration: number | null,
   openId?: string,
 ): string {
-  const params = new URLSearchParams();
+  const params = new URLSearchParams({ reference: conversationId });
   if (lastAppliedEventSeq > 0) {
     params.set('after_event_sequence', String(lastAppliedEventSeq));
     if (transcriptGeneration !== null) {
@@ -178,10 +178,7 @@ function buildStreamUrl(
     }
   }
   if (openId) params.set('open_id', openId);
-  const query = params.toString();
-  return query.length > 0
-    ? `/api/conversations/${conversationId}/stream?${query}`
-    : `/api/conversations/${conversationId}/stream`;
+  return `/api/conversation-reads/stream?${params}`;
 }
 
 function transformInitData(raw: SseInitData): InitPayload {

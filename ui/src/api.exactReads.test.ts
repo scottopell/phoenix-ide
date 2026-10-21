@@ -3,6 +3,8 @@ import { api } from './api';
 
 const references = ['.', '..', '雪', '%E9%9B%AA', '%2F', '/', 'a/b?c#d', 'a\\b', 'a+b', '%', '%ZZ', ' leading ', '7d121a3f-17f8-4da2-b6c0-114934f9a6ab'];
 const reads = [
+  ['route by id', (id: string) => api.getConversationRoute(id), '/api/conversation-reads/route'],
+  ['route by slug', (id: string) => api.getConversationRouteBySlug(id), '/api/conversation-reads/route/by-slug'],
   ['coordinator route', (id: string) => api.resolveCoordinatorRoute(id), '/api/global/coordinator/reads/route'],
   ['transcript', (id: string) => api.getConversation(id), '/api/conversation-reads/snapshot'],
   ['product snapshot', (id: string) => api.getProductConversationSnapshot(id), '/api/product-conversation-reads/snapshot'],

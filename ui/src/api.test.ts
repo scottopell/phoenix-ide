@@ -164,7 +164,7 @@ describe('conversation route client', () => {
     vi.unstubAllGlobals();
   });
 
-  it('GETs route by id', async () => {
+  it('reads route by id', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -174,10 +174,12 @@ describe('conversation route client', () => {
 
     await api.getConversationRoute('conv/1');
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/conv%2F1/route');
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversation-reads/route', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reference: 'conv/1' }),
+    });
   });
 
-  it('GETs route by slug', async () => {
+  it('reads route by slug', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -187,7 +189,9 @@ describe('conversation route client', () => {
 
     await api.getConversationRouteBySlug('slug one');
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/by-slug/slug%20one/route');
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversation-reads/route/by-slug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reference: 'slug one' }),
+    });
   });
 });
 

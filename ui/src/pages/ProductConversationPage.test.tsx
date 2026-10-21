@@ -2706,7 +2706,9 @@ describe('ProductConversationPage', () => {
     const stream = await waitFor(() => {
       const attached = FakeCloseEventSource.instances.at(-1);
       if (!attached) throw new Error('Close conversation stream has not attached');
-      expect(attached.url).toContain('/api/conversations/row-2/stream');
+      const url = new URL(attached.url, 'https://phoenix.test');
+      expect(url.pathname).toBe('/api/conversation-reads/stream');
+      expect(url.searchParams.get('reference')).toBe('row-2');
       return attached;
     });
 

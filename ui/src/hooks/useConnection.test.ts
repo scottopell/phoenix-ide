@@ -191,7 +191,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(FakeEventSource.instances[0]!.url).toMatch(
-      /^\/api\/conversations\/conv-A\/stream\?open_id=[0-9a-f-]{36}$/,
+      /^\/api\/conversation-reads\/stream\?reference=conv-A&open_id=[0-9a-f-]{36}$/,
     );
   });
 
@@ -206,8 +206,34 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(FakeEventSource.instances[0]!.url).toMatch(
-      /^\/api\/conversations\/conv-A\/stream\?after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
+      /^\/api\/conversation-reads\/stream\?reference=conv-A&after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
     );
+  });
+
+  it.each(['.', '..', '/', 'a/b?c#d', '雪', '%E9%9B%AA', '%2F', '%', '%ZZ', 'a+b', 'a\\b', ' leading '])('passes opaque identity %s losslessly to the EventSource constructor and validates its init', conversationId => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const onValidatedInit = vi.fn();
+    const { result, unmount } = renderHook(() => useConnection({
+      conversationId, dispatch, onValidatedInit,
+      getLastAppliedEventSeq: () => 42,
+      getTranscriptGeneration: () => 7,
+    }));
+    expect(FakeEventSource.instances).toHaveLength(1);
+    const stream = FakeEventSource.instances[0]!;
+    const request = new Request(new URL(stream.url, 'https://phoenix.test'));
+    const url = new URL(request.url);
+    expect(url.pathname).toBe('/api/conversation-reads/stream');
+    expect(url.hash).toBe('');
+    expect(url.searchParams.getAll('reference')).toEqual([conversationId]);
+    expect(url.searchParams.get('after_event_sequence')).toBe('42');
+    expect(url.searchParams.get('transcript_generation')).toBe('7');
+    expect(url.searchParams.get('open_id')).toMatch(/^[0-9a-f-]{36}$/);
+    act(() => stream.emit('init', makeInitPayload(conversationId, 'readable-slug')));
+    expect(result.current.state).toBe('connected');
+    expect(onValidatedInit).toHaveBeenCalledTimes(1);
+    expect(onValidatedInit.mock.calls[0]![0].conversation.id).toBe(conversationId);
+    unmount();
+    expect(stream.closed).toBe(true);
   });
 
   it('closes and schedules recovery when init identity differs from the route', () => {

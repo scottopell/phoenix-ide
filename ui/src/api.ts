@@ -1751,7 +1751,7 @@ export const api = {
   },
 
   async getConversationRoute(id: string): Promise<ConversationRouteResponse> {
-    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/route`);
+    const resp = await fetch('/api/conversation-reads/route', exactReadRequest(id));
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to resolve conversation route');
@@ -1937,7 +1937,7 @@ export const api = {
   },
 
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {
-    const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/route`);
+    const resp = await fetch('/api/conversation-reads/route/by-slug', exactReadRequest(slug));
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to resolve conversation route');

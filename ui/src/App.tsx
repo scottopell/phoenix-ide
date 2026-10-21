@@ -199,7 +199,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
               setValidatedSelection(selectionKey);
               if (exactEntry) {
                 navigate({
-                  pathname: `/c/${encodeURIComponent(snapshot.product_conversation_id)}`,
+                  pathname: snapshot.canonical_route,
                   search: locationRef.current.search,
                   hash: locationRef.current.hash,
                 }, { replace: true, state: locationRef.current.state });
