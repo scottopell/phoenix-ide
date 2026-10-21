@@ -3506,7 +3506,10 @@ sys.exit({7 if failure else 0})
         self.assertEqual(
             observed["pre_stop_source_ledger_sha256"],
             helper._ledger_sha256(
-                tuple(sorted(helper.CURRENT_SCHEMA_REQUIRED_MIGRATIONS.items()))
+                helper.current_schema_target_registry(
+                    manifest,
+                    Path(manifest.current_schema_upgrade.migration_registry_path),
+                )[:-1]
             ),
         )
         self.assertEqual(observed["pre_stop_logical_digest"], helper.database_logical_digest(database))
