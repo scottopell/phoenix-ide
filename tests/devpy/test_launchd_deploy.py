@@ -5182,6 +5182,7 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
             "rollback_failure": None,
         }
         self.status.write_text(json.dumps(status))
+        self.active.unlink()
         self.assertTrue(self.dev._markerless_status_is_resolved(status))
         self.assertIsNone(self.dev._markerless_operation_refusal())
         claimed = self.dev._claim_launchd_deploy("replacement")
@@ -5198,6 +5199,18 @@ class ProtectedReleaseRetainedControllerTests(unittest.TestCase):
                 self.status.write_text(json.dumps(malformed))
                 self.assertFalse(self.dev._markerless_status_is_resolved(malformed))
                 self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+        invalid_id = status | {"transaction_id": ""}
+        self.status.write_text(json.dumps(invalid_id))
+        self.assertFalse(self.dev._markerless_status_is_resolved(invalid_id))
+        self.assertIsNotNone(self.dev._markerless_operation_refusal())
+
+        self.status.write_text(
+            json.dumps(status)[:-1]
+            + ',"state":"migration_started","state":"precondition_failed",'
+            + '"finalization_pending":true,"finalization_pending":false}'
+        )
+        self.assertIsNotNone(self.dev._markerless_operation_refusal())
 
     def test_exact_source128_claim_release_checkpoint_requires_explicit_strict_finalization(self):
         _payload, status = self.write_exact_source128_completion()

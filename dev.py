@@ -11537,6 +11537,12 @@ def _exact_source128_precondition_failed_status(
 
 
 def _markerless_status_is_resolved(status: dict[str, object]) -> bool:
+    transaction_id = status.get("transaction_id")
+    if not (
+        isinstance(transaction_id, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id)
+    ):
+        return False
     owner = status.get("transaction_id")
     exact_source128_evidence = False
     if isinstance(owner, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", owner):
@@ -11591,11 +11597,8 @@ def _markerless_operation_refusal() -> str | None:
         return None
     if not LAUNCHD_DEPLOY_STATUS_PATH.is_file():
         return malformed_refusal
-    try:
-        status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return malformed_refusal
-    if not isinstance(status, dict):
+    status = _read_unique_json_object(LAUNCHD_DEPLOY_STATUS_PATH)
+    if status is None:
         return malformed_refusal
     transaction_id = status.get("transaction_id", "unknown")
     if isinstance(transaction_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
