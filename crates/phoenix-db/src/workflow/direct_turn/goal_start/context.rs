@@ -65,6 +65,30 @@ impl GoalStartRequestContext {
     }
 }
 
+pub(super) struct PreparedGoalStartRequestContext {
+    intent: GoalRequestIntent,
+    claim_generation: i64,
+    state_updated_at: DateTime<Utc>,
+    observation: GoalSnapshot,
+}
+
+impl PreparedGoalStartRequestContext {
+    pub(super) fn request_id(&self) -> &GoalRequestId {
+        &self.intent.id
+    }
+
+    fn after_commit(self) -> GoalStartRequestContext {
+        GoalStartRequestContext {
+            admitted: AdmittedGoalRequest {
+                intent: self.intent,
+                claim_generation: self.claim_generation,
+                state_updated_at: self.state_updated_at,
+            },
+            observation: self.observation,
+        }
+    }
+}
+
 impl WorkflowRepository {
     /// Admit or restore the actual Start request operation and its prompt projection.
     ///
@@ -99,6 +123,29 @@ impl WorkflowRepository {
             return Ok(None);
         };
         let mut tx = self.begin_immediate_tx().await?;
+        let context = self
+            .admit_goal_start_request_context_tx(
+                &mut tx,
+                transcript,
+                turn_id,
+                generation,
+                state_updated_at,
+                operation,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(context.map(PreparedGoalStartRequestContext::after_commit))
+    }
+
+    pub(super) async fn admit_goal_start_request_context_tx(
+        &self,
+        tx: &mut crate::workflow::WorkflowTx<'_>,
+        transcript: &str,
+        turn_id: TurnAuthorityId,
+        generation: u64,
+        state_updated_at: DateTime<Utc>,
+        operation: GoalRequestOperation,
+    ) -> DbResult<Option<PreparedGoalStartRequestContext>> {
         let row=sqlx::query("SELECT t.*,c.state,c.state_updated_at FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id WHERE t.turn_id=? AND t.conversation_id=?")
             .bind(to_i64(turn_id.0,"turn_id")?).bind(transcript).fetch_one(&mut *tx.tx).await?;
         if row.get::<String, _>("input_kind") != "goal_start" {
@@ -197,13 +244,10 @@ impl WorkflowRepository {
                 "Start request operation already checkpointed".into(),
             ));
         }
-        tx.commit().await?;
-        Ok(Some(GoalStartRequestContext {
-            admitted: AdmittedGoalRequest {
-                intent: admitted.intent,
-                claim_generation: row.get("generation"),
-                state_updated_at,
-            },
+        Ok(Some(PreparedGoalStartRequestContext {
+            intent: admitted.intent,
+            claim_generation: row.get("generation"),
+            state_updated_at,
             observation: retained.observation().clone(),
         }))
     }

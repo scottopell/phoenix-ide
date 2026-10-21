@@ -405,6 +405,21 @@ contract ExecutionBoundaryContract {
         -- overload retries and restored dispatch reuse this exact identity and
         -- canonical intent; completed logical requests cannot be repurposed.
 
+    @invariant AdoptedRuntimeOwnership
+        -- Adoption accepts delivery and consumes its reclaimable lease. Runtime
+        -- reconstruction is not delivery reclaim or a new Start. At the serialized
+        -- runtime-creation boundary, compare the exact old turn generation and
+        -- persisted request slot, and atomically advance workflow and turn ownership.
+        -- Preserve execution, immutable binding, admitted logical request and charge.
+        -- A competing reconstruction loses on its old-generation comparison; it
+        -- cannot adopt the winner's generation or use replay as fresh permission.
+        -- Only the same in-flight reconstruction's exact committed receipt may
+        -- classify its uncertain commit. Replay outside that classification refuses
+        -- reconstruction. A partial workflow/turn advance rolls back as one unit.
+        -- Current control, open/latest lifecycle, queued input, waits, terminal
+        -- obligations and request completion are revalidated before reconstruction
+        -- and actual dispatch. Recovery never releases Stop or installs policy.
+
     @invariant DeliberateNewGoal
         -- Accepted creation of a distinct immutable goal uses its explicitly supplied
         -- positive policy ceiling and starts with no request admissions. Create is

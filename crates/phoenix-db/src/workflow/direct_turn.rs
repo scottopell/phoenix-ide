@@ -5,7 +5,8 @@ use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};
 pub(crate) use goal_start::insert_goal_start_turn_tx;
 pub use goal_start::{
-    AdmittedGoalRequest, GoalStartAdoptionInput, GoalStartAdoptionOutcome, GoalStartRequestContext,
+    AdmittedGoalRequest, GoalStartAdoptionInput, GoalStartAdoptionOutcome, GoalStartRecoveryInput,
+    GoalStartRecoveryOutcome, GoalStartRequestContext, RecoveredGoalStartRuntime,
 };
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;

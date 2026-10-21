@@ -1,3 +1,5 @@
+mod reconstruction_owner;
+
 use super::*;
 
 async fn commit_same_state_new_slot(db: &Database, rt: &TestRuntime) -> chrono::DateTime<Utc> {
@@ -163,13 +165,34 @@ async fn conversation_goal_same_summary_operation_and_attempt_stale_slot_cannot_
 }
 
 #[tokio::test]
-async fn conversation_goal_admission_receipt_distinguishes_retained_intent_from_reclaimed_generation(
+#[allow(clippy::too_many_lines)]
+async fn conversation_goal_admission_receipt_distinguishes_retained_intent_from_reconstructed_generation(
 ) {
-    let (_directory, db, receipt, rt, client) = adopted().await;
-    let active = rt.active_direct_turn.as_deref().unwrap();
+    let (directory, db, receipt, mut rt, client) = adopted().await;
+    let active = rt.active_direct_turn.as_deref().unwrap().clone();
     let before = ledger(&db).await;
-    let now = u64::try_from(Utc::now().timestamp()).unwrap() + 7200;
-    let authority = db
+    let claim_rows: Vec<(i64, String, i64, String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT e.effect_id,e.status,a.attempt_id,a.status,a.generation,l.lease_until
+         FROM workflow_effects e JOIN workflow_attempts a
+           ON a.workflow_id=e.workflow_id AND a.effect_id=e.effect_id
+         LEFT JOIN workflow_reclaimable_leases l
+           ON l.workflow_id=a.workflow_id AND l.attempt_id=a.attempt_id
+         WHERE e.workflow_id=? AND e.kind='deliver_runtime_turn'
+         ORDER BY e.effect_id,a.ordinal",
+    )
+    .bind(receipt.execution().workflow_id())
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert!(!claim_rows.is_empty());
+    assert!(
+        claim_rows
+            .iter()
+            .all(|row| row.1 == "Receipted" && row.3 == "ReceiptAccepted" && row.5.is_none()),
+        "{claim_rows:?}"
+    );
+    let now = u64::try_from(Utc::now().timestamp()).unwrap();
+    let result = db
         .workflow_repository()
         .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
             turn_id: active.turn_id,
@@ -179,15 +202,33 @@ async fn conversation_goal_admission_receipt_distinguishes_retained_intent_from_
             lease_until: LeaseExpiry(now + 3600),
         })
         .await
-        .unwrap()
-        .authority
-        .expect("expired claim is reacquired through existing primitive");
-    assert!(authority.generation.0 > active.generation);
+        .unwrap();
+    assert_eq!(
+        result.outcome,
+        phoenix_workflow::ClaimOutcome::Ineligible,
+        "adopted delivery is not a reclaimable lease: {result:?}; {claim_rows:?}"
+    );
+    let recovery_input = phoenix_db::workflow::GoalStartRecoveryInput::new(
+        CONVERSATION.to_owned(),
+        (active.turn_id, active.generation),
+        (rt.state.clone(), rt.state_updated_at),
+        Timestamp(now),
+    );
+    let recovery = db
+        .workflow_repository()
+        .recover_goal_start_runtime(&recovery_input)
+        .await
+        .unwrap();
+    let phoenix_db::workflow::GoalStartRecoveryOutcome::Recovered(recovered) = recovery else {
+        panic!("actual reconstruction must establish ownership: {recovery:?}");
+    };
+    assert_eq!(recovered.turn_id(), active.turn_id);
+    assert!(recovered.generation() > active.generation);
     let context = db
         .workflow_repository()
         .admit_goal_start_request_context(
             CONVERSATION,
-            Some((active.turn_id, authority.generation.0)),
+            Some((active.turn_id, recovered.generation())),
             rt.state_updated_at,
             GoalRequestOperation::Normal { attempt: 1 },
         )
@@ -200,7 +241,7 @@ async fn conversation_goal_admission_receipt_distinguishes_retained_intent_from_
     );
     assert_eq!(
         context.admitted().claim_generation(),
-        i64::try_from(authority.generation.0).unwrap()
+        i64::try_from(recovered.generation()).unwrap()
     );
     assert_ne!(
         context.admitted().intent().generation(),
@@ -222,5 +263,30 @@ async fn conversation_goal_admission_receipt_distinguishes_retained_intent_from_
         "{stale}"
     );
     assert_eq!(ledger(&db).await, before);
+    assert_normal_refused(&db, &mut rt, &client, "no live materialized execution").await;
     assert!(client.requests.lock().unwrap().is_empty());
+    let rendered = Arc::new(RenderingAnthropicClient::new());
+    let mut reconstructed = runtime(
+        db.clone(),
+        directory.path(),
+        rendered.clone(),
+        Arc::new(DeferredMcpCatalog::new(false)),
+    )
+    .with_active_direct_turn(Some(crate::runtime::traits::ActiveDirectTurn {
+        turn_id: recovered.turn_id(),
+        generation: recovered.generation(),
+    }))
+    .with_state_updated_at(rt.state_updated_at);
+    reconstructed.state = rt.state.clone();
+    dispatch(&mut reconstructed).await;
+    assert_eq!(ledger(&db).await, before);
+    assert_eq!(rendered.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        rendered.requests.lock().unwrap()[0]
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .request_id,
+        context.request_id().as_str()
+    );
 }

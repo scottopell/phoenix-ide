@@ -7,8 +7,10 @@ use phoenix_core::domain::conversation_goal::{GoalExecution, GoalStartInput};
 
 mod adoption;
 mod context;
+mod recovery;
 pub use adoption::{GoalStartAdoptionInput, GoalStartAdoptionOutcome};
 pub use context::{AdmittedGoalRequest, GoalStartRequestContext};
+pub use recovery::{GoalStartRecoveryInput, GoalStartRecoveryOutcome, RecoveredGoalStartRuntime};
 
 pub(crate) async fn insert_goal_start_turn_tx(
     tx: &mut super::super::WorkflowTx<'_>,

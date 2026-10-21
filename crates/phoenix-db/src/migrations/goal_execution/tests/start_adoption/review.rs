@@ -1,3 +1,5 @@
+mod recovery;
+
 use super::*;
 use phoenix_core::domain::sm_state::{
     ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,

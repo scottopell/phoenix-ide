@@ -21,6 +21,48 @@ then **298/300** passes with two capacity-message expectation mismatches; their
 corrections do not widen the passing scope. Historical 293/286/259 floors are
 retained separately below. Worker/public Start holds and default Disabled remain.
 
+## Post-adoption runtime reconstruction — source-only, unqualified
+
+Source tracing confirmed adoption marks its attempt `ReceiptAccepted` and deletes
+the reclaimable lease. The delivery-claim path therefore cannot rebind an adopted
+Start. The failed generation fixture did not prove recovery; latest `07bb0052`
+retains a separate 302/303 partial result, not qualification beyond `78be57b09`.
+
+The authored reconstruction operation runs under the existing runtime-creation
+slot and borrowed local admission. One `BEGIN IMMEDIATE` transaction compares the
+old generation and exact persisted Normal/Summary request slot, validates the
+live binding/control/lifecycle/queue/terminal fences, then advances workflow and
+durable-turn generation together. It preserves the execution, intent ID, original
+admission generation and charge. Competing or repeated old-generation calls
+refuse; they never load/adopt the winner. Only a private in-flight operation's
+exact transition event can classify its uncertain commit. Its returned receipt
+and outcome are not cloneable. Pre-commit context data has a distinct internal
+prepared type; only the ordinary context operation's successful commit constructs
+`AdmittedGoalRequest`, never recovery's provisional validation.
+
+Runtime construction retains the persisted slot and uses the existing owed-baton
+startup path only after successful reconstruction; it adds no synthetic user or
+restart turn. For Normal, `ConversationRuntime::run` selects `ResumeOwedBaton`,
+then `resume_owed_baton_request` → `resume_committed_steering_request` → the
+existing `RequestLlm` effect and actual-dispatch admission guard. Summary keeps
+the existing `AwaitingContinuation` startup effect. Unmaterialized Start does not
+enter reconstruction, and Disabled adopted recovery refuses before minting a
+receipt, so neither branch gains this startup permission. Candidate tests cover racing reconstructions, rollback between
+workflow/turn writes, before/after-commit cuts, stale-owner refusal, same-ID/charge
+dispatch, Stop/release, changed slot, checkpoint, queue, inactive/history owner,
+terminal obligation and startup-reset preservation. Real RuntimeManager tests
+assert no provider call for held unmaterialized Start and default-off adopted
+recovery, using startup acknowledgment and closed process admission rather than
+sleep-based absence assertions. These tests are **authored, not executed**.
+
+This packet supports admitted uncheckpointed Normal/Summary request slots; it
+is not complete checkpointed-response/tool-round/handoff recovery or a qualified
+actual journey. Atomic answer/Coordinator checkpoint, automatic same-execution
+producer follow-through, logical metadata refresh, structured waits, Stop/input
+races and exhaustion remain integration gates. Worker/public Start holds, default
+Disabled, immutable SQL132–136 and eleven stashes are unchanged. Parent owns
+review/CI; no local build/test or diagnostic-only CI dispatch was performed.
+
 ## Authored exact-slot admission/receipt prerequisite — unrun
 
 The real ordinary and Summary executor paths pass their existing persisted
@@ -46,11 +88,12 @@ ledger row.
 Three authored real DB/executor tests cover identical-state/different-stamp
 Normal attempt 1 successor and attempt 2 retry; same Summary operation/attempt
 1 and 2; and retained-intent/current-claim generation separation after the
-existing expired-claim reacquisition primitive. Stale owners keep their original
+explicit post-adoption runtime reconstruction transition. Stale owners keep their original
 stamp and must produce no provider request or ledger increment. Fresh owners
 restoring the persisted stamp retain admitted IDs and one-charge retries;
 receipt fields are checked against both canonical request and owned-turn rows.
-The generation test is a bounded primitive exercise, not autonomous recovery.
+The generation test uses the authored reconstruction owner, not delivery-lease
+reacquisition; it is not end-to-end autonomous recovery qualification.
 Existing fixture stamps are synchronized only after their own successful
 persisted state writes; stale owners under test are never refreshed. All new
 tests are unrun; only owned-file formatting and diff checks were performed.

@@ -5676,7 +5676,8 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        let (materialization_admission, inherited_materialization) = match slot.take_authority() {
+        let (mut materialization_admission, inherited_materialization) = match slot.take_authority()
+        {
             Some(owner) => (owner, true),
             None => (
                 self.acquire_local_authority_pass().map_err(|()| {
@@ -6030,6 +6031,17 @@ impl RuntimeManager {
                         && loaded.active().generation == obligation.expected_generation
                 })
             });
+        let recovered_goal_start = if recovered_terminal_obligation.is_none() {
+            self.reconstruct_goal_start_runtime(
+                &mut materialization_admission,
+                conversation_id,
+                &conv,
+                &mut active_direct_turn,
+            )
+            .await?
+        } else {
+            false
+        };
         let occurrence_recovery = self.execution_occurrence_recovery(conversation_id).await?;
         let mut has_resumable_occurrence = occurrence_recovery
             .as_ref()
@@ -6042,7 +6054,9 @@ impl RuntimeManager {
         let (startup_llm_recovery_ack_tx, startup_llm_recovery_ack_rx) = oneshot::channel();
         let startup_llm_recovery_ack = Arc::new(AsyncMutex::new(Some(startup_llm_recovery_ack_rx)));
         let (mut initial_state, mut initial_state_updated_at, mut needs_auto_continue) =
-            if let Some(obligation) = &recovered_terminal_obligation {
+            if recovered_goal_start {
+                (conv.state.clone(), conv.state_updated_at, false)
+            } else if let Some(obligation) = &recovered_terminal_obligation {
                 (
                     obligation.projection.state.clone(),
                     obligation.projection.state_updated_at,
@@ -6149,16 +6163,18 @@ impl RuntimeManager {
             active_direct_turn,
             Some(LoadedActiveDirectTurn::Materialized { .. })
         );
-        let startup_llm_recovery = if needs_auto_continue && materialized_baton {
-            crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
-        } else if resumable_owner {
-            crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
-        } else {
-            crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
-        };
+        let startup_llm_recovery =
+            if recovered_goal_start || (needs_auto_continue && materialized_baton) {
+                crate::runtime::executor::StartupLlmRecovery::ResumeOwedBaton
+            } else if resumable_owner {
+                crate::runtime::executor::StartupLlmRecovery::ResumeCommittedSteering
+            } else {
+                crate::runtime::executor::StartupLlmRecovery::SettleInterrupted
+            };
 
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
-            let is_materialized = matches!(loaded, LoadedActiveDirectTurn::Materialized { .. });
+            let is_materialized = recovered_goal_start
+                || matches!(loaded, LoadedActiveDirectTurn::Materialized { .. });
             let active = loaded.into_active();
             if let Some(obligation) = recovered_terminal_obligation {
                 let terminal = match obligation.terminal {
@@ -7182,6 +7198,57 @@ impl RuntimeManager {
             _ => false,
         };
         preserved.then(|| (state.clone(), state_updated_at, false))
+    }
+
+    async fn reconstruct_goal_start_runtime(
+        &self,
+        _admitted: &mut AdmittedOperation,
+        conversation_id: &str,
+        conv: &crate::db::Conversation,
+        active: &mut Option<LoadedActiveDirectTurn>,
+    ) -> Result<bool, String> {
+        let Some(LoadedActiveDirectTurn::GoalStart {
+            active: previous,
+            receipt,
+            materialized: true,
+        }) = active.as_ref()
+        else {
+            return Ok(false);
+        };
+        let input = phoenix_db::workflow::GoalStartRecoveryInput::new(
+            conversation_id.to_owned(),
+            (previous.turn_id, previous.generation),
+            (conv.state.clone(), conv.state_updated_at),
+            phoenix_workflow::Timestamp(
+                u64::try_from(Utc::now().timestamp()).map_err(|error| error.to_string())?,
+            ),
+        );
+        let receipt = *receipt;
+        let recovered = self
+            .db
+            .workflow_repository()
+            .recover_goal_start_runtime(&input)
+            .await
+            .map_err(|error| {
+                self.signal_fatal_local_authority("goal_start_runtime_reconstruction");
+                format!("Start runtime reconstruction failed closed: {error}")
+            })?;
+        match recovered {
+            phoenix_db::workflow::GoalStartRecoveryOutcome::Recovered(recovered) => {
+                *active = Some(LoadedActiveDirectTurn::GoalStart {
+                    active: crate::runtime::traits::ActiveDirectTurn {
+                        turn_id: recovered.turn_id(),
+                        generation: recovered.generation(),
+                    },
+                    receipt,
+                    materialized: true,
+                });
+                Ok(true)
+            }
+            phoenix_db::workflow::GoalStartRecoveryOutcome::Refused => {
+                Err("Start runtime reconstruction refused; no replacement authority adopted".into())
+            }
+        }
     }
 
     async fn determine_resume_state(
