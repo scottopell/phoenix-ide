@@ -506,7 +506,7 @@ pub(crate) async fn settle_request_boundary_tx(
         return Ok(command.state.clone());
     }
     let intent = command.admitted.intent();
-    let Some(goal) = super::snapshot_tx(tx, &intent.goal.owner)
+    let Some(goal) = super::current_tx(tx, &intent.goal.owner)
         .await
         .map_err(round::db_error)?
     else {
@@ -526,12 +526,15 @@ pub(crate) async fn settle_request_boundary_tx(
     .await?;
     if used >= limit {
         if let Some(policies) = policies {
+            execution::require_live_request_tx(tx, intent, &command.assistant.conversation_id)
+                .await
+                .map_err(request_error)?;
             let action = GoalText::parse(format!("{}:allowance-exhausted", intent.id.as_str()))
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             let actor = GoalActor::GeneratedHost {
                 action_id: action.clone(),
             };
-            super::apply_tx(
+            super::apply_goal_tx(
                 tx,
                 &GoalMutation {
                     owner: goal.owner,
@@ -549,6 +552,7 @@ pub(crate) async fn settle_request_boundary_tx(
                         ),
                     },
                 },
+                None,
                 GoalTimestampUs::parse(command.state_updated_at.timestamp_micros())
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
                 policies,

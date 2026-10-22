@@ -639,8 +639,8 @@ async fn conversation_goal_complete_report_checkpoint_cuts_replay_whole_bundle_a
                 .unwrap();
         assert_eq!(serde_json::from_str::<ConvState>(&state).unwrap(), source,
             "canonical checkpoint stages the existing terminal obligation; only terminal settlement projects Idle");
-        let obligation = fixture
-            .repo
+        let obligation = db
+            .workflow_repository()
             .load_terminal_obligation(phoenix_workflow::TurnAuthorityId(
                 u64::try_from(admitted.intent().execution.turn_id()).unwrap(),
             ))
