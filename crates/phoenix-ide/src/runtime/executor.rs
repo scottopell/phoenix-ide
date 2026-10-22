@@ -16246,7 +16246,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     async fn db_backed_targeted_stop_fixture(queued_steer: bool) {
-        let db = Arc::new(crate::db::Database::open_in_memory().await.unwrap());
+        let db = crate::db::Database::open_in_memory().await.unwrap();
         let conversation = db
             .create_conversation("conv-direct", "Stop", "/tmp", true, None, None)
             .await
@@ -16272,19 +16272,48 @@ mod authoritative_user_message_effect_tests {
             panic!("expected accepted turn");
         };
         let active = ConvState::LlmRequesting { attempt: 1 };
-        db.update_state_and_replay(
-            "conv-direct",
-            &active,
-            chrono::Utc::now(),
-            &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
-        )
-        .await
-        .unwrap();
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&phoenix_db::workflow::ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: phoenix_workflow::ProcessIncarnation(1),
+                now: phoenix_workflow::Timestamp(2),
+                lease_until: phoenix_workflow::LeaseExpiry(30),
+            })
+            .await
+            .unwrap();
+        let materialized = repo
+            .materialize_authoritative_turn(
+                &phoenix_db::workflow::MaterializeAuthoritativeTurnInput {
+                    turn_id,
+                    authority: claim.authority.unwrap(),
+                    prepared: payload("stop-input"),
+                    sequence_id: 1,
+                    created_at: phoenix_workflow::Timestamp(3),
+                    accepted_state: active.clone(),
+                    state_updated_at: chrono::Utc::now(),
+                    now: phoenix_workflow::Timestamp(3),
+                },
+            )
+            .await
+            .established()
+            .unwrap();
+        assert!(matches!(
+            materialized,
+            phoenix_db::workflow::MaterializeAuthoritativeTurnOutcome::Materialized(_)
+        ));
+        assert_eq!(
+            db.get_message_by_id("stop-input")
+                .await
+                .unwrap()
+                .sequence_id,
+            1
+        );
         use phoenix_core::domain::provider_replay::{
-            AnthropicPrivateBlock, AnthropicReplayPayload, AnthropicResponseIdentity,
-            AnthropicResponseSet, ContentIndex,
+            AnthropicPrivateBlock, AnthropicResponseIdentity, AnthropicResponseSet, ContentIndex,
         };
-        let replay = AnthropicReplayPayload::new(vec![AnthropicResponseSet::new(
+        let replay = AnthropicResponseSet::new(
             AnthropicResponseIdentity {
                 response_id: "stop-replay".into(),
                 model: "test".into(),
@@ -16295,11 +16324,15 @@ mod authoritative_user_message_effect_tests {
                 signature: "test".into(),
             }],
         )
-        .unwrap()])
         .unwrap();
-        db.store_provider_replay_state("conv-direct", &replay)
-            .await
-            .unwrap();
+        db.update_state_and_replay(
+            "conv-direct",
+            &active,
+            chrono::Utc::now(),
+            &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Anthropic(replay),
+        )
+        .await
+        .unwrap();
         assert!(db
             .load_provider_replay_state("conv-direct")
             .await
@@ -16323,7 +16356,7 @@ mod authoritative_user_message_effect_tests {
             crate::terminal::ActiveTerminals::new(),
             receiver,
             sender,
-            SseBroadcaster::new(32, 0),
+            SseBroadcaster::new(32, 1),
         )
         .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
         rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
@@ -16336,17 +16369,20 @@ mod authoritative_user_message_effect_tests {
             output: "must clear after model abort".to_string(),
         }];
         if queued_steer {
-            rt.steering_queue
-                .push(crate::state_machine::event::SteerEntry {
-                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-                    text: "next queued work".to_string(),
-                    llm_text: None,
-                    images: vec![],
-                    files: vec![],
-                    message_id: "queued-after-stop".to_string(),
-                    user_agent: None,
-                    skill_invocation: None,
-                });
+            let entry = crate::state_machine::event::SteerEntry {
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+                text: "next queued work".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "queued-after-stop".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            };
+            db.append_steering_entry("conv-direct", &entry, "queued-after-stop-fingerprint")
+                .await
+                .unwrap();
+            rt.steering_queue.push(entry);
         }
         rt.active_llm_attempt = Some(phoenix_llm::LlmAttemptCapture::new());
         rt.process_event(Event::DirectTurnStopRequested {
@@ -16360,8 +16396,16 @@ mod authoritative_user_message_effect_tests {
             rt.steering_queue.is_empty(),
             "queued steer must not be stranded by source-state loss"
         );
+        assert_eq!(db.steering_queue_depth("conv-direct").await.unwrap(), 0);
         if queued_steer {
             assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+            let drained = db.get_message_by_id("queued-after-stop").await.unwrap();
+            assert_eq!(drained.conversation_id, "conv-direct");
+            assert!(drained.sequence_id > 1);
+            assert!(matches!(
+                db.get_conversation("conv-direct").await.unwrap().state,
+                ConvState::LlmRequesting { .. }
+            ));
             rt.abort_active_llm_task();
             return;
         }

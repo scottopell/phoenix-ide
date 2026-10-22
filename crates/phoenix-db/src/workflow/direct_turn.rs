@@ -4791,14 +4791,15 @@ mod tests {
     async fn accepted_stop_finalization_must_commit_the_reducer_projection() {
         let repo = repo().await;
         let (turn_id, _) = created_turn(&repo, "stop-projection", 95).await;
+        let projection = stop_projection();
         let active_state = serde_json::to_string(&ConvState::LlmRequesting { attempt: 1 }).unwrap();
-        sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-a'")
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = 'llm_requesting' WHERE id = 'conv-a'")
             .bind(active_state)
             .execute(&repo.pool)
             .await
             .unwrap();
         let DirectTurnStopAcceptance::Accepted(receipt) = repo
-            .accept_direct_turn_stop(turn_id, 0, &stop_projection())
+            .accept_direct_turn_stop(turn_id, 0, &projection)
             .await
             .unwrap()
         else {
@@ -4810,15 +4811,23 @@ mod tests {
                 turn_id,
                 expected_generation: 0,
             },
-            projection: Some(PersistedConversationProjection {
-                state: ConvState::Idle,
-                state_updated_at: Utc::now(),
-            }),
+            projection: Some(projection.clone()),
             provider_replay_settlement:
                 phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
         })
         .await
         .unwrap();
+        let timestamp: String =
+            sqlx::query_scalar("SELECT state_updated_at FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            DateTime::parse_from_rfc3339(&timestamp)
+                .unwrap()
+                .timestamp_micros(),
+            projection.state_updated_at.timestamp_micros()
+        );
         let state: String =
             sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
                 .fetch_one(&repo.pool)
@@ -4838,7 +4847,7 @@ mod tests {
         ] {
             let repo = repo().await;
             let (turn_id, _) = created_turn(&repo, "stop-uncertain-commit", 94).await;
-            sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-a'")
+            sqlx::query("UPDATE conversations SET state = ?1, state_kind = 'llm_requesting' WHERE id = 'conv-a'")
                 .bind(serde_json::to_string(&ConvState::LlmRequesting { attempt: 1 }).unwrap())
                 .execute(&repo.pool)
                 .await
