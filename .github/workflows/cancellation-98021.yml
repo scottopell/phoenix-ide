@@ -1,11 +1,11 @@
-name: Cancellation 98021 focused qualification
+name: Cancellation 98021 round 2 qualification
 on:
   push:
-    branches: [qualification/cancellation-98021-once]
+    branches: [qualification/cancellation-98021-round2]
 permissions:
   contents: read
 concurrency:
-  group: cancellation-98021-once
+  group: cancellation-98021-round2
   cancel-in-progress: false
 jobs:
   focused:
@@ -27,9 +27,10 @@ jobs:
         run: |
           printf 'CARGO_TARGET_DIR=%s/cancellation-98021-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           mkdir -p qualification-evidence
+          printf '%s\n' 'EXCLUDED EXPECTED RED: authoritative_settlement_is_not_reclassified_by_legacy_cancel_observation; publisher override remains unfixed. This is slice qualification, not full-branch CI or merge readiness.' > qualification-evidence/remaining-failure.txt
           git rev-parse HEAD | tee qualification-evidence/head.txt
-          printf '%s\n' 'source-parent=9c09b889f1515a6afeab1335759cada83eaa2778' > qualification-evidence/source-parent.txt
-      - name: Three-package all-target check and focused regressions
+          printf '%s\n' 'source-parent=ff9bd30f87527d1484eb8768aed9761d4fb84435' > qualification-evidence/source-parent.txt
+      - name: Four-package all-target check and ten named regressions
         shell: bash
         run: |
           set -uo pipefail
@@ -42,21 +43,35 @@ jobs:
             printf '%s\n' "$code" > "qualification-evidence/$name.exit"
             if [[ "$name" != compile && "$code" = 0 ]]; then
               grep -Eq 'test result: ok\. [1-9][0-9]* passed' "qualification-evidence/$name.log" || return 1
+              grep -F "::$name ... ok" "qualification-evidence/$name.log" > /dev/null || return 1
             fi
             return "$code"
           }
-          run_check compile cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix_ide || exit "$?"
+          run_check compile cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide || exit "$?"
           result=0
-          run_check child-expiry cargo test -p phoenix-state-machine child_wait_expiry || result=1
-          run_check user-stop cargo test -p phoenix-state-machine user_stop_during_timeout_drain_cannot_resume_parent || result=1
-          run_check parent-outcome cargo test -p phoenix_ide child_wait_expiry_does_not_classify_parent_completion_as_cancelled || result=1
+          for test in \
+            accepted_direct_turn_stop_replays_exact_command_not_replacement_generation \
+            established_terminal_obligation_rejects_stop_without_revoking_owner \
+            accepted_stop_fences_later_terminal_obligation \
+            accepted_stop_finalization_must_commit_the_reducer_projection \
+            stop_commit_error_is_classified_from_exact_durable_fact; do
+            run_check "$test" cargo test -p phoenix-db "$test" || result=1
+          done
+          for test in \
+            db_backed_targeted_stop_commits_projection_before_teardown_and_restart \
+            targeted_stop_does_not_fabricate_idle_for_nonterminal_drain \
+            direct_stop_storage_failure_cannot_abort_model_work \
+            stale_direct_turn_stop_is_rejected_before_teardown \
+            direct_turn_stop_cannot_fall_back_to_unowned_parent_work; do
+            run_check "$test" cargo test -p phoenix_ide "$test" || result=1
+          done
           grep -h 'test result:' qualification-evidence/*.log > qualification-evidence/test-counts.txt || true
           exit "$result"
       - name: Retain qualification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cancellation-98021-evidence
+          name: cancellation-98021-round2-evidence
           path: qualification-evidence/
           if-no-files-found: error
       - name: Remove runner-owned target
