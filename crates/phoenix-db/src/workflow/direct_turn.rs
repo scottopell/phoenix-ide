@@ -1837,7 +1837,11 @@ impl WorkflowRepository {
                     DirectTurnStopRejection::Conflict(conflict),
                 ));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return self
+                    .classify_direct_turn_stop_error(turn_id, expected_generation, error)
+                    .await;
+            }
         };
         match step.outcome {
             TurnOutcome::Terminal {
@@ -1864,6 +1868,41 @@ impl WorkflowRepository {
             _ => Err(DbError::Serialization(
                 "Cancel returned no exact cancelled terminal evidence".to_string(),
             )),
+        }
+    }
+
+    async fn classify_direct_turn_stop_error(
+        &self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        original: DbError,
+    ) -> DbResult<DirectTurnStopAcceptance> {
+        let observation: Result<Option<(i64, Option<String>, i64)>, sqlx::Error> = sqlx::query_as(
+            "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .fetch_optional(&self.pool)
+        .await;
+        match observation {
+            Ok(Some((generation, Some(terminal), 0)))
+                if u64::try_from(generation).ok()
+                    == Some(expected_generation.saturating_add(1))
+                    && terminal == "Cancelled" =>
+            {
+                Ok(DirectTurnStopAcceptance::Accepted(AcceptedDirectTurnStop {
+                    turn_id,
+                    command_generation: expected_generation,
+                }))
+            }
+            Ok(Some((generation, None, 1)))
+                if u64::try_from(generation).ok() == Some(expected_generation) =>
+            {
+                Err(original)
+            }
+            observed => Err(DbError::DirectTurnStopUnclassified {
+                turn_id,
+                detail: format!("after {original}; exact terminal observation: {observed:?}"),
+            }),
         }
     }
 
@@ -4525,7 +4564,7 @@ mod tests {
             assert!(!receipt.matches(turn_id, 1));
         }
         assert!(matches!(
-            repo.accept_direct_turn_stop(turn_id, 2).await.unwrap(),
+            repo.accept_direct_turn_stop(turn_id, 1).await.unwrap(),
             DirectTurnStopAcceptance::NotAccepted(DirectTurnStopRejection::Conflict(_))
         ));
     }
@@ -4586,7 +4625,67 @@ mod tests {
             },
             response_message_id: None,
         };
-        assert!(repo.persist_terminal_obligation(&obligation).await.is_err());
+        let error = repo
+            .persist_terminal_obligation(&obligation)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::DirectTurnConflict(TurnConflict::StaleGeneration { .. })
+        ));
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM direct_turn_terminal_obligations WHERE turn_id = ?1",
+        )
+        .bind(to_i64(turn_id.0, "turn_id").unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, 0);
+        let generation: i64 =
+            sqlx::query_scalar("SELECT generation FROM durable_turns WHERE turn_id = ?1")
+                .bind(to_i64(turn_id.0, "turn_id").unwrap())
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(generation, 1);
+    }
+
+    #[tokio::test]
+    async fn stop_commit_error_is_classified_from_exact_durable_fact() {
+        for (cut, accepted) in [
+            (TransactionCut::BeforeCommit, false),
+            (TransactionCut::AfterCommit, true),
+        ] {
+            let repo = repo().await;
+            let (turn_id, _) = created_turn(&repo, "stop-uncertain-commit", 94).await;
+            let error = repo
+                .terminalize_authoritative_turn_with_occurrence_at_cut(
+                    &TerminalizeAuthoritativeTurnInput {
+                        command: TurnCommand::Cancel {
+                            turn_id,
+                            expected_generation: 0,
+                        },
+                        projection: None,
+                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                    },
+                    None,
+                    None,
+                    cut,
+                )
+                .await
+                .unwrap_err();
+            let result = repo
+                .classify_direct_turn_stop_error(turn_id, 0, error)
+                .await;
+            if accepted {
+                let DirectTurnStopAcceptance::Accepted(receipt) = result.unwrap() else {
+                    panic!("committed Cancel must be recovered from exact evidence");
+                };
+                assert!(receipt.matches(turn_id, 0));
+            } else {
+                assert!(matches!(result, Err(DbError::Serialization(_))));
+            }
+        }
     }
 
     #[tokio::test]

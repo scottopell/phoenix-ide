@@ -2440,6 +2440,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::ForkProposalConflict(_)
         | DbError::DirectTurnConflict(_)
         | DbError::DirectTurnTerminalObligationEstablished(_)
+        | DbError::DirectTurnStopUnclassified { .. }
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | DbError::DormantGitRepositoryCatchupStaleOperation

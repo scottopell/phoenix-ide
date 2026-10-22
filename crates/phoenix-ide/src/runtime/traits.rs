@@ -456,6 +456,11 @@ pub struct PersistedStateSnapshot {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    async fn accept_direct_turn_stop(
+        &self,
+        target: &ActiveDirectTurn,
+    ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String>;
+
     async fn record_execution_cancel(&self, _conversation_id: &str) -> Result<(), String> {
         Ok(())
     }
@@ -1129,6 +1134,13 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
+    async fn accept_direct_turn_stop(
+        &self,
+        target: &ActiveDirectTurn,
+    ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String> {
+        (**self).accept_direct_turn_stop(target).await
+    }
+
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         (**self).record_execution_cancel(conversation_id).await
     }
@@ -2377,6 +2389,17 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn accept_direct_turn_stop(
+        &self,
+        target: &ActiveDirectTurn,
+    ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String> {
+        self.db
+            .workflow_repository()
+            .accept_direct_turn_stop(target.turn_id, target.generation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1) ON CONFLICT DO NOTHING")
             .bind(conversation_id).execute(self.db.pool()).await.map_err(|error| error.to_string())?;

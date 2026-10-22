@@ -266,6 +266,11 @@ pub enum DbError {
     DirectTurnConflict(phoenix_workflow::TurnConflict),
     #[error("direct-turn terminal obligation already established for {0:?}")]
     DirectTurnTerminalObligationEstablished(phoenix_workflow::TurnAuthorityId),
+    #[error("direct Stop authority could not be classified for {turn_id:?}: {detail}")]
+    DirectTurnStopUnclassified {
+        turn_id: phoenix_workflow::TurnAuthorityId,
+        detail: String,
+    },
     /// A fork-proposal resolution was attempted but the proposal is already
     /// resolved to a different state or child id (REQ-PROJ-034/037). Distinct
     /// from the idempotent no-op case (same child id), which returns `Ok`.

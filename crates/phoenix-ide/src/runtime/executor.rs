@@ -3414,7 +3414,14 @@ where
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
         }
-        let event = match event {
+        if !self.context.is_sub_agent
+            && self.terminal_transition_retry.is_some()
+            && self.pending_direct_turn_terminal.is_some()
+            && matches!(event, Event::DirectTurnStopRequested { .. })
+        {
+            return Ok(());
+        }
+        let (event, accepted_direct_turn_stop) = match event {
             Event::DirectTurnStopRequested {
                 turn_id,
                 expected_generation,
@@ -3430,12 +3437,39 @@ where
                     );
                     return Ok(());
                 }
-                Event::UserCancel {
-                    reason: None,
-                    cause: crate::state_machine::event::CancelCause::UserRequested,
-                }
+                let target = self
+                    .active_direct_turn
+                    .as_ref()
+                    .expect("target checked above");
+                let acceptance = self.storage.accept_direct_turn_stop(target).await?;
+                let receipt = match acceptance {
+                    phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(receipt)
+                        if receipt.matches(target.turn_id, target.generation) =>
+                    {
+                        receipt
+                    }
+                    phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(_) => {
+                        return Err("Stop receipt did not match captured target".to_string());
+                    }
+                    phoenix_db::workflow::DirectTurnStopAcceptance::NotAccepted(reason) => {
+                        tracing::debug!(
+                            ?reason,
+                            turn_id,
+                            expected_generation,
+                            "direct Stop not accepted"
+                        );
+                        return Ok(());
+                    }
+                };
+                (
+                    Event::UserCancel {
+                        reason: None,
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
+                    },
+                    Some(receipt),
+                )
             }
-            event => event,
+            event => (event, None),
         };
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
@@ -3452,6 +3486,16 @@ where
         if matches!(event, Event::UserCancel { .. }) {
             if let Some(capture) = self.active_llm_attempt.as_ref() {
                 match capture.claim_cancelled() {
+                    phoenix_llm::LlmAttemptCancellationClaim::Lost(metrics)
+                        if accepted_direct_turn_stop.is_some() =>
+                    {
+                        tracing::debug!(
+                            ?metrics.outcome,
+                            "accepted execution Stop is not superseded by a model-attempt outcome"
+                        );
+                        self.abort_active_llm_task();
+                        self.active_llm_attempt = None;
+                    }
                     phoenix_llm::LlmAttemptCancellationClaim::Lost(metrics) => {
                         tracing::debug!(
                             conv_id = %self.context.conversation_id,
@@ -16136,6 +16180,36 @@ mod authoritative_user_message_effect_tests {
             storage.get_current_state(&rt.context.conversation_id),
             Some(ConvState::RecoverableContinuationFailure { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_stop_storage_failure_cannot_abort_model_work() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(10),
+            generation: 0,
+        }));
+        rt.llm_task_handle = Some(tokio::spawn(std::future::pending::<()>()));
+        let result = rt
+            .process_event(Event::DirectTurnStopRequested {
+                turn_id: 10,
+                expected_generation: 0,
+            })
+            .await;
+        assert!(result.is_err(), "non-durable test storage must fail closed");
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        let task = rt
+            .llm_task_handle
+            .take()
+            .expect("acceptance failure must not abort");
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
