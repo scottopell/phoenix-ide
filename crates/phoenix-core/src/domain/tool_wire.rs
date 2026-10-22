@@ -332,6 +332,10 @@ pub enum BashErrorResponse {
     SpawnFailed {
         error_message: String,
     },
+    LaunchReleaseUnknown {
+        error_message: String,
+        handle: String,
+    },
     /// Catch-all for input-shape failures the schema didn't reject:
     /// missing `op`, missing required peer field for the chosen op,
     /// invalid `lines` value (REQ-BASH-010). The variant name is
@@ -411,6 +415,25 @@ mod bash_tmux_wire_tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn launch_release_unknown_has_stable_error_and_handle() {
+        let value = serde_json::to_value(BashErrorResponse::LaunchReleaseUnknown {
+            error_message: "execution may have started; do not retry".into(),
+            handle: "b-42".into(),
+        })
+        .unwrap();
+        assert_eq!(value["error"], "launch_release_unknown");
+        assert_eq!(value["handle"], "b-42");
+        assert_eq!(
+            value["error_message"],
+            "execution may have started; do not retry"
+        );
+        assert!(matches!(
+            serde_json::from_value::<BashErrorResponse>(value).unwrap(),
+            BashErrorResponse::LaunchReleaseUnknown { handle, .. } if handle == "b-42"
+        ));
     }
 
     #[test]

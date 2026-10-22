@@ -1253,6 +1253,7 @@ function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux
         `error: ${record['error']}`,
         typeof record[messageKey] === 'string' ? record[messageKey] : '',
         family === 'bash' && typeof record['hint'] === 'string' ? record['hint'] : '',
+        family === 'bash' && typeof record['handle'] === 'string' ? `handle: ${record['handle']}` : '',
       ].filter(Boolean).join('\n');
     }
 

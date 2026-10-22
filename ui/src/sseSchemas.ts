@@ -801,6 +801,11 @@ export const BashErrorResponseSchema = v.variant('error', [
     error_message: v.string(),
   }),
   v.looseObject({
+    error: v.literal('launch_release_unknown'),
+    error_message: v.string(),
+    handle: v.string(),
+  }),
+  v.looseObject({
     error: v.literal('mutually_exclusive_modes'),
     error_message: v.string(),
     conflicting_args: v.array(v.string()),

@@ -1859,6 +1859,10 @@ function BashErrorView({ response }: { response: Record<string, unknown> }) {
         <span className="bash-status bash-status-error">error: {error}</span>
       </div>
       {message && <div className="bash-error-message">{message}</div>}
+      {error === 'launch_release_unknown' && (
+        <div className="bash-error-hint">The command outcome is uncertain. Do not automatically retry.</div>
+      )}
+      {typeof response['handle'] === 'string' && <div className="bash-error-hint">handle: {response['handle']}</div>}
       {hint && <div className="bash-error-hint">{hint}</div>}
     </div>
   );

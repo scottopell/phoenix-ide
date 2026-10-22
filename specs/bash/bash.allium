@@ -528,13 +528,12 @@ rule HandleSpawned {
         --   3. Check live cap. On reject, return handle_cap_reached;
         --      RunRejectedByCap governs.
         --   4. Allocate a globally unique opaque handle_id.
-        --   5. Spawn child via Command::new("bash").args(["-c", cmd]) with
-        --      pre_exec(setpgid(0,0)) so the child becomes its own process
-        --      group leader. stdout and stderr piped, stdin null. Working
-        --      dir from spawn_target.canonical_working_dir.
-        --      Capture birth identity exactly once and register within a bounded
-        --      caller-independent task. On failure, BashPostLaunchSettlement applies
-        --      instead of creating a Handle or entering the registered wait race.
+        --   5. Launch a held native process-group leader without the user command
+        --      or environment. Capture birth identity exactly once and register
+        --      within a bounded caller-independent task. Identity/registration
+        --      failure invokes BashPostLaunchSettlement without releasing the
+        --      command or creating a controllable Handle. Registered pending
+        --      gates count once against capacity, but retain teardown custody.
         --   6. Spawn two reader tasks (stdout, stderr) feeding the same ring
         --      under a mutex. Each task ingests bytes, splits on '\n', and
         --      appends RingLine entries with monotonically increasing
@@ -543,8 +542,14 @@ rule HandleSpawned {
         --      HandleProcessExited / HandleProcessSignaled (depending on
         --      whether the kernel reported a status code or only a signal
         --      number).
-        --   8. The agent's response is shaped by RunExitsWithinWait or
-        --      RunExceedsWait, depending on which event fires first.
+        --   8. After waiter and reader custody exist, release the bounded command
+        --      payload. Direct restores its environment and null stdin; Explore
+        --      enters the existing sandbox before command execution. Exec retains
+        --      the captured process identity. Settle the pending gate lease.
+        --      Failed release retains the Handle and sticky scope uncertainty,
+        --      returning launch_release_unknown with no automatic retry; complete
+        --      delivery followed by EOF may have allowed execution. Otherwise the
+        --      response is shaped by RunExitsWithinWait or RunExceedsWait.
 }
 
 -- REQ-BASH-016: the Coordinator runtime surface discovers only its live
@@ -1317,6 +1322,14 @@ surface AgentBashAccess {
         -- foreign handle remains unavailable even if its id is learned. A
         -- continuation chain shares one owner table, while Coordinator-run
         -- handles remain controllable through their Coordinator scope.
+
+    @guarantee LaunchCustodyBeforeCommandExecution
+        -- REQ-BASH-017. On supported Linux/Darwin hosts a new command cannot
+        -- execute before exact launch identity, registry and independent waiter/
+        -- output custody exist. A failed registered release returns the retained
+        -- handle with execution uncertainty and forbids automatic retry.
+        -- Preventive gating and application restart do not reconcile historical
+        -- unverified descendants or clear an existing scope uncertainty fence.
 
     @guarantee NoSilentEviction
         -- Within a single Phoenix process lifetime, a handle handed to the

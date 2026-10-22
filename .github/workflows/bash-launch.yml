@@ -7,8 +7,11 @@ on:
       - 'crates/phoenix-tools/src/bash/**'
       - 'crates/phoenix-core/src/process_identity.rs'
       - 'crates/phoenix-core/src/domain/tool_wire.rs'
+      - 'crates/phoenix-ide/src/main.rs'
+      - 'crates/phoenix-tools/src/bash.rs'
       - 'crates/phoenix-ide/src/runtime.rs'
       - 'crates/phoenix-ide/src/runtime/**'
+      - 'crates/phoenix-ide/src/coordinator_tools.rs'
       - '.github/workflows/bash-launch.yml'
   workflow_dispatch:
 
@@ -34,17 +37,27 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Generate wire contracts
         run: ./dev.py codegen
+      - name: Build native launcher executable
+        run: cargo build -p phoenix_ide --bin phoenix_ide
       - name: Fault-injected launch and identity regressions
+        env:
+          PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
+          PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
         run: |
-          cargo test -p phoenix-core process_identity::tests
-          cargo test -p phoenix-core domain::tool_wire::bash_tmux_wire_tests
-          cargo test -p phoenix-tools bash::operations::tests
-          cargo test -p phoenix-tools bash::ring::tests
-          cargo test -p phoenix-tools bash::registry::tests::cascade_same_scope_inheritor_reports_unregistered_launch_uncertainty
-          cargo test -p phoenix-tools bash::registry::tests::unregistered_launch_retains_pending_reservation_until_settlement
-          cargo test -p phoenix-tools bash::registry::tests::browser_teardown_
-          cargo test -p phoenix-tools bash::registry::tests::stale_lifecycle_failure_cannot_reopen_newer_teardown
-          cargo test -p phoenix_ide browser_retirement
+          test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
+          cargo test -p phoenix-core process_identity::tests -- --show-output
+          cargo test -p phoenix-core domain::tool_wire::bash_tmux_wire_tests -- --show-output
+          cargo test -p phoenix-tools bash::operations::tests -- --show-output
+          cargo test -p phoenix-tools bash::launch_protocol::tests -- --show-output
+          cargo test -p phoenix-tools bash::ring::tests -- --show-output
+          cargo test -p phoenix-tools bash::registry::tests -- --show-output
+          # One libtest invocation preserves all filters without recompiling the
+          # large IDE test harness for each filter. Keep its cases serial.
+          cargo test -p phoenix_ide --lib -- --show-output --test-threads=1 \
+            browser_retirement \
+            coordinator_bash_executes_owned_home_with_zero_ordinary_conversations \
+            real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay \
+            conversation_runtime_dispatches_real_zero_and_normal_bash_waits
       - uses: actions/upload-artifact@v4
         if: always()
         with:
