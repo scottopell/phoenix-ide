@@ -3409,7 +3409,7 @@ mod tests {
                 libc::waitid(
                     libc::P_PID,
                     libc::id_t::try_from(pid).expect("child pid fits waitid id_t"),
-                    &mut info,
+                    &raw mut info,
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
             };
