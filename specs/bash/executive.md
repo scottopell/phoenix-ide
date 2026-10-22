@@ -139,6 +139,15 @@ entirely.
 | **REQ-BASH-016:** Coordinator Live-Handle Surface | ✅ Complete | Process-local discovery exposes only live Coordinator-controlled handles with immutable spawn cwd; output uses the authorized inspector, and exact stop is incarnation-bound and offered only on supported hosts |
 | **REQ-BASH-017:** Post-launch Identity and Registration Settlement | Implemented; reconciled-head hosted qualification pending | The preventive gated launcher validates birth identity and commits registration before releasing user payload; the pre-release native denial path proves no command marker is created. Caller-independent owned-child custody, 250ms natural-exit settlement, bounded capture (including empty records), and focused fault regressions cover failures after a child exists. Failed release returns a typed `launch_release_unknown` error with the retained handle and explicit no-retry/may-have-executed guidance; it is not reported as `spawn_failed`. Scope uncertainty remains conservative and sticky, blocks successful Close retirement, and never fabricates a PGID or authorizes reset/recovery. Generated TypeScript wire contracts are checked in; `.github/workflows/bash-launch.yml` regenerates them and requires the native executable for focused Linux/macOS qualification. Ordinary test runs explicitly skip native-executable cases when the fixture is absent; hosted qualification fails if it is absent. Exact-successor hosted CI and fault qualification remain required after integration; no local tests/compiler run.
 
+For local runs that include native-launch cases, build the production executable and select it explicitly:
+
+```sh
+cargo build -p phoenix_ide --bin phoenix_ide
+PHOENIX_BASH_LAUNCH_TEST_EXE="$PWD/target/debug/phoenix_ide" ./dev.py check
+```
+
+A Rust test harness executable is not a launcher fixture; without the native executable, gated launches fail closed.
+
 The branch-observation slice is implemented: bash-handle terminal completion reconciles
 WorkScope-scoped local Git state into durable observed-branch and PR-association facts, then
 re-derives explicit active-PR selection with terminal-generation fencing. Other rows in this table

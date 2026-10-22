@@ -1212,14 +1212,15 @@ fn spawn_child_with_identity_probe_protocol(
     let payload = if use_gate {
         #[cfg(unix)]
         {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let executable = std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE")
                 .map(std::path::PathBuf::from)
-                .ok_or_else(|| {
-                    "PHOENIX_BASH_LAUNCH_TEST_EXE must name the native phoenix_ide binary"
-                        .to_string()
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    std::env::current_exe()
+                        .map_err(|error| format!("failed to resolve phoenix executable: {error}"))
                 })?;
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             let executable = std::env::current_exe()
                 .map_err(|error| format!("failed to resolve phoenix executable: {error}"))?;
             let (mode, working_dir, mut environment): (

@@ -74,6 +74,8 @@ jobs:
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
       PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1500"
+      PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
+      PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,6 +106,10 @@ jobs:
           git config --global user.name "Phoenix CI"
       - name: Install musl compiler
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build native bash launcher fixture
+        run: |
+          cargo build -j 1 -p phoenix_ide --bin phoenix_ide
+          test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
       - name: ./dev.py check (rust,cargo-fmt)
         run: ./dev.py check --lanes rust,cargo-fmt
       - name: Check production feature on musl
