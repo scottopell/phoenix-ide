@@ -47,13 +47,20 @@ impl IdentityObservationFailure {
     pub const fn rc(self) -> Option<i32> {
         match self {
             Self::ShortBsdRead { rc, .. } => Some(rc),
-            _ => None,
+            Self::InvalidPid
+            | Self::MissingProcess { .. }
+            | Self::IoError { .. }
+            | Self::InvalidBirth
+            | Self::Unsupported => None,
         }
     }
 }
 
 /// Returns exact identity or a typed, bounded observation failure.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`IdentityObservationFailure`] when the host cannot prove the process identity.
 pub fn observe_process_identity(pid: u32) -> Result<ProcessIdentity, IdentityObservationFailure> {
     if pid == 0 {
         return Err(IdentityObservationFailure::InvalidPid);
@@ -79,7 +86,8 @@ pub fn process_identity_matches(expected: ProcessIdentity) -> bool {
 
 #[cfg(target_os = "linux")]
 fn process_start_time(pid: u32) -> Result<u128, IdentityObservationFailure> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(classify_io_error)?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| classify_io_error(&error))?;
     parse_linux_start_time(&stat)
 }
 
@@ -99,7 +107,7 @@ fn parse_linux_start_time(stat: &str) -> Result<u128, IdentityObservationFailure
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn classify_io_error(error: std::io::Error) -> IdentityObservationFailure {
+fn classify_io_error(error: &std::io::Error) -> IdentityObservationFailure {
     let errno = error.raw_os_error();
     if error.kind() == std::io::ErrorKind::NotFound || errno == Some(libc::ESRCH) {
         IdentityObservationFailure::MissingProcess { errno }
@@ -231,14 +239,16 @@ mod tests {
     #[test]
     fn io_errors_distinguish_missing_from_denied_or_other_io() {
         use super::IdentityObservationFailure as Failure;
+        let missing = std::io::Error::from_raw_os_error(libc::ESRCH);
         assert_eq!(
-            super::classify_io_error(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            super::classify_io_error(&missing),
             Failure::MissingProcess {
                 errno: Some(libc::ESRCH)
             }
         );
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
         assert_eq!(
-            super::classify_io_error(std::io::Error::from_raw_os_error(libc::EACCES)),
+            super::classify_io_error(&denied),
             Failure::IoError {
                 errno: Some(libc::EACCES)
             }
@@ -252,7 +262,7 @@ mod tests {
             Err(super::IdentityObservationFailure::InvalidPid)
         );
         assert_eq!(
-            super::classify_io_error(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            super::classify_io_error(&std::io::Error::from_raw_os_error(libc::ESRCH)),
             super::IdentityObservationFailure::MissingProcess {
                 errno: Some(libc::ESRCH)
             }
