@@ -702,6 +702,10 @@ impl BashHandleRegistry {
         self.commit_spawn_inner(reservation, handle, true).await
     }
 
+    /// Registers an admitted launch while retaining its pending gate custody lease.
+    ///
+    /// # Errors
+    /// Returns [`BashHandleError::SpawnFenced`] if the owner table disappeared.
     pub async fn commit_spawn_gated(
         &self,
         reservation: &mut SpawnReservation,

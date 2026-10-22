@@ -32,6 +32,10 @@ pub struct BashLaunchPayload {
 
 #[cfg(unix)]
 impl BashLaunchPayload {
+    /// Encodes a bounded launch payload without executing or exposing its contents.
+    ///
+    /// # Errors
+    /// Returns an error if any field, environment count, or total payload exceeds its bound.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         use std::os::unix::ffi::OsStrExt;
         if self.environment.len() > MAX_ENV {
@@ -64,7 +68,9 @@ impl BashLaunchPayload {
         });
         put_field(&mut out, command)?;
         put_field(&mut out, working_dir)?;
-        out.extend_from_slice(&(self.environment.len() as u32).to_be_bytes());
+        let environment_count = u32::try_from(self.environment.len())
+            .map_err(|_| "bash launch environment count exceeds limit")?;
+        out.extend_from_slice(&environment_count.to_be_bytes());
         for (key, value) in &self.environment {
             put_field(&mut out, key.as_os_str().as_bytes())?;
             put_field(&mut out, value.as_os_str().as_bytes())?;

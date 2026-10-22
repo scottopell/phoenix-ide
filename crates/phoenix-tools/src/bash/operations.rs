@@ -581,6 +581,7 @@ enum SpawnProtocol {
     Gated,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_run_with_identity_probe(
     cmd: &str,
@@ -1150,6 +1151,7 @@ fn spawn_child(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::similar_names, clippy::too_many_arguments)]
 fn spawn_child_with_identity_probe(
     cmd: &str,
