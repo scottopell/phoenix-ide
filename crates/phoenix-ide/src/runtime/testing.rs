@@ -2087,6 +2087,16 @@ impl StateStore for InMemoryStorage {
         Err("in-memory storage has no durable Cancel transaction".to_string())
     }
 
+    async fn accept_direct_turn_drain(
+        &self,
+        _target: &crate::runtime::traits::ActiveDirectTurn,
+        _conversation_id: &str,
+        _source: &phoenix_db::workflow::PersistedConversationProjection,
+        _projection: &phoenix_db::workflow::UserRequestedDrainProjection,
+    ) -> Result<phoenix_db::workflow::DirectTurnDrainAcceptance, String> {
+        Err("in-memory storage has no durable nonterminal drain authority".into())
+    }
+
     async fn update_state(
         &self,
         conv_id: &str,

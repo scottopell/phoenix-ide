@@ -478,3 +478,27 @@ Executed properties include exact terminal reducer projection/timestamp acceptan
 Artifact 12461767573, digest sha256:45c89f1f66dab244e9ea3df4814a31cc5a50b3a8afeee5b81a2bcc9eca8ccd67, retains commands, source HEAD, logs, per-command exits and raw counts. Artifact upload and guarded runner-owned target cleanup both succeeded. Full downloaded evidence is retained at /tmp/cancellation-98021-39858948853. The historical source-parent ff9 literal is qualification lineage; head.txt records actual tested a005. Prior failures and artifacts remain preserved, not relabelled as passes.
 
 Production ingress is not switched. Generic cancellation/sticky inference and the excluded legacy-watch override remain unfixed; targeted nonterminal drain and standalone occurrence acceptance are incomplete. Therefore this is not whole-branch required-check completion, merge readiness, activation, or deployment. The next source packet must use existing settlement/checkpoint projection ownership to carry real drain state and exact causal authority before effects, without another lifecycle/retry framework or historical outcome rewrite; shared Goals seams retain their existing owner except explicitly yielded hunks. No additional execution is inferred from this passing result.
+
+## 33. Nonterminal direct-turn Stop source packet (unqualified)
+
+The next source packet uses the existing conversation projection and exact owning turn/generation as durable cancellation evidence, not another cancellation table, scheduler, lifecycle, retry loop or finalizer. `UserRequestedDrainProjection` has a private field and admits only reducer-shaped user-requested CancellingTool/CancellingSubAgents states. Its separate accepted-drain receipt cannot be confused with the already-terminal Cancel receipt.
+
+`accept_direct_turn_drain` binds conversation, turn, generation and the exact source projection used for preview. One immediate transaction admits only a live owner with no terminal obligation; it compares source state/microsecond timestamp or the exact already-committed target, then changes only state/state_kind/timestamp. It retains generation, ownership, replay, occurrence rows and watch events. A reported commit error is classified from the exact target+owner+generation+no-obligation tuple in a fresh immediate transaction; no receipt is returned on an unproven fact. A shared direction guard at the existing terminal-obligation sink and direct terminalization sink rejects Completed/Failed while user-requested drain is durable. First committed completion obligation still rejects subsequent drain acceptance.
+
+Runtime targeted Stop selects either terminal or draining receipt, preserves the pre-transition source, and passes the committed projection through the existing apply wrapper before abort/cancel effects. StateStore/Arc forwarding/DatabaseStorage/test storage thread the distinct drain API explicitly. Final classification derives cancellation from the actual old user-requested drain even with empty process history; Timeout remains distinct. The old generic sticky flag is not removed in this packet and generic ingress/watch override is not switched.
+
+Existing startup recovery is reused, not replaced: reset unions standalone user-requested child drains into its existing parent reconciliation set before generic reset, and no-fan-in user tool drains create the existing Cancel action rather than Resume. Existing action owner/generation capture and RuntimeManager cancellation settlement remain unchanged. These changes do not touch Goals-owned ToolRound helper moves, admitted-operation routing, Product send branch, or migration 138.
+
+Eight added source regressions (NOT RUN) target:
+- direct_stop_drain_preserves_owner_and_defers_watch_until_terminal (including replay preservation, rejection of direct Complete and Completed/Failed obligations, final ordinary Cancel/watch);
+- direct_stop_drain_rejects_stale_source_target_and_completion_first;
+- direct_stop_drain_commit_cuts_require_exact_durable_projection;
+- direct_stop_drain_type_rejects_idle_and_timeout_direction;
+- db_backed_targeted_stop_retains_drain_owner_projection_and_replay;
+- durable_drain_direction_classifies_without_process_cancellation_history;
+- reset_preserves_standalone_user_child_drain_as_cancel_action;
+- reset_retains_user_tool_drain_cancel_direction_without_fan_in.
+
+The real-DB runtime helper retains its prior passing model/no-queue and model/queue variants, now additionally supports a timeout-child-drain source and loads the authoritative persisted timestamp. The drain fixture has empty pending children and does not prove physical child teardown, a full live ToolAborted checkpoint, or owner-bound manager restart settlement. Reset fixtures invoke the real reset/action path but have no direct-turn owner; they are not proof of exact owner recovery. These limitations require review/stronger regression coverage before production activation.
+
+Only rustfmt parsing and diff checks have run locally. No compile/tests/push/workflow execution has run for this packet; the unchanged workflow still selects the earlier ten tests only and cannot qualify the eight additions. Exact independent source review, declaration/callsite audit, explicit finite named test packet and host resource/no-duplicate admission precede any hosted qualification. The a005 passing evidence remains scoped to its original source and ten tests. Whole-fix, required-check, merge and deployment claims remain prohibited.

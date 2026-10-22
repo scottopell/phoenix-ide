@@ -11793,7 +11793,25 @@ impl Database {
         // persistence happens at end-of-round). Without this, a deploy/crash
         // mid-round silently drops them and rewinds the conversation to the
         // prior user turn (REQ-BED-007, F1).
-        let materialized = self.materialize_in_flight_tool_rounds(&now, None).await?;
+        let mut materialized = self.materialize_in_flight_tool_rounds(&now, None).await?;
+        let draining_children = sqlx::query(
+            "SELECT id, state FROM conversations WHERE state_kind = 'cancelling_sub_agents'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in draining_children {
+            let state: ConvState = serde_json::from_str(row.get::<&str, _>("state"))
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if matches!(
+                state,
+                ConvState::CancellingSubAgents {
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                    ..
+                }
+            ) {
+                materialized.insert(row.get::<String, _>("id"));
+            }
+        }
         if !materialized.is_empty() {
             self.reconcile_startup_obligated_parents(&materialized)
                 .await?;
@@ -12786,7 +12804,7 @@ impl Database {
                 sqlx::query(
                     "INSERT OR REPLACE INTO startup_parent_actions
                          (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
-                     SELECT c.id, 'Resume', c.transcript_generation, t.turn_id, t.generation, ?2
+                     SELECT c.id, ?3, c.transcript_generation, t.turn_id, t.generation, ?2
                      FROM conversations AS c
                      LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                          AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
@@ -12794,6 +12812,9 @@ impl Database {
                 )
                 .bind(conversation_id)
                 .bind(now.to_rfc3339())
+                .bind(if matches!(conversation.state, ConvState::CancellingTool {
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested, ..
+                }) { "Cancel" } else { "Resume" })
                 .execute(&mut *tx)
                 .await?;
                 reconciled.push(StartupParentReconciliation {
@@ -25930,6 +25951,85 @@ mod tests {
             .unwrap();
         assert!(!raw.contains("result"));
         assert!(db.list_startup_parent_actions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_standalone_user_child_drain_as_cancel_action() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("standalone-drain", "drain", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "standalone-drain",
+            &ConvState::CancellingSubAgents {
+                pending: vec![],
+                completed_results: vec![],
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                spawn_tool_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        db.reset_all_to_idle().await.unwrap();
+        let actions = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].conversation_id, "standalone-drain");
+        assert_eq!(actions[0].action, StartupParentAction::Cancel);
+        assert!(matches!(
+            db.get_conversation("standalone-drain").await.unwrap().state,
+            ConvState::Idle
+        ));
+        let watches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator_watch_events WHERE source_transcript_id = 'standalone-drain'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(watches, 0);
+    }
+
+    #[tokio::test]
+    async fn reset_retains_user_tool_drain_cancel_direction_without_fan_in() {
+        use phoenix_core::domain::sm_event::CancelCause;
+        for cause in [CancelCause::UserRequested, CancelCause::Timeout] {
+            let db = Database::open_in_memory().await.unwrap();
+            db.create_conversation("tool-drain", "drain", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let assistant = phoenix_core::domain::sm_state::AssistantMessage::new(
+                "cancelled-round".into(),
+                vec![ContentBlock::tool_use(
+                    "cancelled-tool",
+                    "bash",
+                    serde_json::json!({"cmd":"true"}),
+                )],
+                None,
+                None,
+            );
+            db.update_conversation_state(
+                "tool-drain",
+                &ConvState::CancellingTool {
+                    tool_use_id: "cancelled-tool".into(),
+                    cause,
+                    skipped_tools: vec![],
+                    completed_results: vec![],
+                    assistant_message: assistant,
+                    pending_sub_agents: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            db.reset_all_to_idle().await.unwrap();
+            let actions = db.list_startup_parent_actions().await.unwrap();
+            assert_eq!(actions.len(), 1);
+            assert_eq!(
+                actions[0].action,
+                match cause {
+                    CancelCause::UserRequested => StartupParentAction::Cancel,
+                    CancelCause::Timeout => StartupParentAction::Resume,
+                }
+            );
+            assert!(matches!(
+                db.get_conversation("tool-drain").await.unwrap().state,
+                ConvState::Idle
+            ));
+        }
     }
 
     #[tokio::test]

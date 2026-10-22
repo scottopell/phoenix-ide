@@ -462,6 +462,14 @@ pub trait StateStore: Send + Sync {
         projection: &phoenix_db::workflow::PersistedConversationProjection,
     ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String>;
 
+    async fn accept_direct_turn_drain(
+        &self,
+        target: &ActiveDirectTurn,
+        conversation_id: &str,
+        source: &phoenix_db::workflow::PersistedConversationProjection,
+        projection: &phoenix_db::workflow::UserRequestedDrainProjection,
+    ) -> Result<phoenix_db::workflow::DirectTurnDrainAcceptance, String>;
+
     async fn record_execution_cancel(&self, _conversation_id: &str) -> Result<(), String> {
         Ok(())
     }
@@ -1141,6 +1149,18 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         projection: &phoenix_db::workflow::PersistedConversationProjection,
     ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String> {
         (**self).accept_direct_turn_stop(target, projection).await
+    }
+
+    async fn accept_direct_turn_drain(
+        &self,
+        target: &ActiveDirectTurn,
+        conversation_id: &str,
+        source: &phoenix_db::workflow::PersistedConversationProjection,
+        projection: &phoenix_db::workflow::UserRequestedDrainProjection,
+    ) -> Result<phoenix_db::workflow::DirectTurnDrainAcceptance, String> {
+        (**self)
+            .accept_direct_turn_drain(target, conversation_id, source, projection)
+            .await
     }
 
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
@@ -2399,6 +2419,26 @@ impl StateStore for DatabaseStorage {
         self.db
             .workflow_repository()
             .accept_direct_turn_stop(target.turn_id, target.generation, projection)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_direct_turn_drain(
+        &self,
+        target: &ActiveDirectTurn,
+        conversation_id: &str,
+        source: &phoenix_db::workflow::PersistedConversationProjection,
+        projection: &phoenix_db::workflow::UserRequestedDrainProjection,
+    ) -> Result<phoenix_db::workflow::DirectTurnDrainAcceptance, String> {
+        self.db
+            .workflow_repository()
+            .accept_direct_turn_drain(
+                target.turn_id,
+                target.generation,
+                conversation_id,
+                source,
+                projection,
+            )
             .await
             .map_err(|error| error.to_string())
     }

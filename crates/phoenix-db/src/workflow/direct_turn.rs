@@ -64,6 +64,64 @@ pub enum DirectTurnStopRejection {
     Conflict(TurnConflict),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserRequestedDrainProjection(PersistedConversationProjection);
+
+impl UserRequestedDrainProjection {
+    pub fn new(projection: PersistedConversationProjection) -> DbResult<Self> {
+        if !is_user_requested_drain(&projection.state) {
+            return Err(DbError::Serialization(
+                "Stop drain projection must retain user-requested tool or child cancellation"
+                    .into(),
+            ));
+        }
+        Ok(Self(projection))
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> &PersistedConversationProjection {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcceptedDirectTurnDrain {
+    turn_id: TurnAuthorityId,
+    generation: u64,
+    projection: UserRequestedDrainProjection,
+}
+
+impl AcceptedDirectTurnDrain {
+    #[must_use]
+    pub fn matches(&self, turn_id: TurnAuthorityId, generation: u64) -> bool {
+        self.turn_id == turn_id && self.generation == generation
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> &PersistedConversationProjection {
+        self.projection.projection()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectTurnDrainAcceptance {
+    Accepted(AcceptedDirectTurnDrain),
+    NotAccepted,
+}
+
+fn is_user_requested_drain(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::CancellingTool {
+            cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+            ..
+        } | ConvState::CancellingSubAgents {
+            cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+            ..
+        }
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptAuthoritativeTurn {
     pub client_key: ClientTurnKey,
@@ -1811,6 +1869,130 @@ impl WorkflowRepository {
         Ok(outcome)
     }
 
+    pub async fn accept_direct_turn_drain(
+        &self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        conversation_id: &str,
+        source: &PersistedConversationProjection,
+        target: &UserRequestedDrainProjection,
+    ) -> DbResult<DirectTurnDrainAcceptance> {
+        self.accept_direct_turn_drain_at_cut(
+            turn_id,
+            expected_generation,
+            conversation_id,
+            source,
+            target,
+            TransactionCut::None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_direct_turn_drain_at_cut(
+        &self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        conversation_id: &str,
+        source: &PersistedConversationProjection,
+        target: &UserRequestedDrainProjection,
+        cut: TransactionCut,
+    ) -> DbResult<DirectTurnDrainAcceptance> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(
+            "SELECT c.state, c.state_updated_at FROM conversations c
+             JOIN durable_turns t ON t.conversation_id = c.id
+             WHERE t.turn_id = ?1 AND t.generation = ?2 AND t.conversation_id = ?3
+               AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+               AND NOT EXISTS (SELECT 1 FROM direct_turn_terminal_obligations o WHERE o.turn_id = t.turn_id)",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(to_i64(expected_generation, "generation")?)
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(DirectTurnDrainAcceptance::NotAccepted);
+        };
+        let actual = projection_from_drain_row(&row)?;
+        if !projections_match(&actual, source) && !projections_match(&actual, target.projection()) {
+            return Ok(DirectTurnDrainAcceptance::NotAccepted);
+        }
+        let projection = target.projection();
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
+            .bind(serde_json::to_string(&projection.state).map_err(|error| DbError::Serialization(error.to_string()))?)
+            .bind(crate::conv_state_kind(&projection.state))
+            .bind(projection.state_updated_at.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        let result = finish_workflow_transaction_at_cut(tx, cut).await;
+        drop(connection);
+        if let Err(error) = result {
+            return self
+                .classify_direct_turn_drain_error(
+                    turn_id,
+                    expected_generation,
+                    conversation_id,
+                    target,
+                    error,
+                )
+                .await;
+        }
+        Ok(DirectTurnDrainAcceptance::Accepted(
+            AcceptedDirectTurnDrain {
+                turn_id,
+                generation: expected_generation,
+                projection: target.clone(),
+            },
+        ))
+    }
+
+    async fn classify_direct_turn_drain_error(
+        &self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        conversation_id: &str,
+        target: &UserRequestedDrainProjection,
+        original: DbError,
+    ) -> DbResult<DirectTurnDrainAcceptance> {
+        let observation = async {
+            let mut connection = self.pool.acquire().await?;
+            let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+            let row = sqlx::query(
+                "SELECT c.state, c.state_updated_at FROM conversations c
+                 JOIN durable_turns t ON t.conversation_id = c.id
+                 WHERE t.turn_id = ?1 AND t.generation = ?2 AND t.conversation_id = ?3
+                   AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM direct_turn_terminal_obligations o WHERE o.turn_id = t.turn_id)",
+            )
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .bind(to_i64(expected_generation, "generation")?)
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let established = row.as_ref().map(projection_from_drain_row).transpose()?
+                .is_some_and(|actual| projections_match(&actual, target.projection()));
+            tx.commit().await?;
+            Ok::<_, DbError>(established)
+        }.await;
+        match observation {
+            Ok(true) => Ok(DirectTurnDrainAcceptance::Accepted(
+                AcceptedDirectTurnDrain {
+                    turn_id,
+                    generation: expected_generation,
+                    projection: target.clone(),
+                },
+            )),
+            Ok(false) => Err(original),
+            Err(error) => Err(DbError::DirectTurnStopUnclassified {
+                turn_id,
+                detail: error.to_string(),
+            }),
+        }
+    }
+
     pub async fn accept_direct_turn_stop(
         &self,
         turn_id: TurnAuthorityId,
@@ -2744,6 +2926,8 @@ impl WorkflowRepository {
             .await?;
             return Ok(step);
         }
+        require_drain_terminal_direction_tx(&mut tx.tx, turn_id, expected_generation, &terminal)
+            .await?;
         let (terminal_kind, reason) = terminal_sql(&terminal);
         let next_generation = expected_generation.saturating_add(1);
         let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn_id.0 };
@@ -3151,6 +3335,34 @@ fn canonical_message_id_for_turn(
     CanonicalMessageId(format!("{}:{}", turn.conversation.0, prepared.message_id()))
 }
 
+async fn require_drain_terminal_direction_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    turn_id: TurnAuthorityId,
+    expected_generation: u64,
+    terminal: &TurnTerminal,
+) -> DbResult<()> {
+    if !matches!(terminal, TurnTerminal::Cancelled) {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT c.state FROM conversations c JOIN durable_turns t ON t.conversation_id = c.id
+             WHERE t.turn_id = ?1 AND t.generation = ?2 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(to_i64(expected_generation, "generation")?)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(state) = state {
+            let state = serde_json::from_str(&state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if is_user_requested_drain(&state) {
+                return Err(DbError::Serialization(
+                    "accepted user Stop drain forbids a non-Cancelled terminal outcome".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn persist_terminal_obligation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     input: &DirectTurnTerminalObligationInput,
@@ -3160,6 +3372,13 @@ async fn persist_terminal_obligation_tx(
             "direct-turn terminal target timestamp must be nonnegative".to_string(),
         ));
     }
+    require_drain_terminal_direction_tx(
+        tx,
+        input.turn_id,
+        input.expected_generation,
+        &input.terminal,
+    )
+    .await?;
     let (terminal_kind, terminal_reason) = terminal_sql(&input.terminal);
     let target_state = serde_json::to_string(&input.projection.state).map_err(|error| {
         DbError::Serialization(format!("encode direct-turn terminal target state: {error}"))
@@ -3221,6 +3440,18 @@ fn expected_conversation_id(evidence: &TerminalEvidenceExpectation) -> &str {
             conversation_id, ..
         } => conversation_id,
     }
+}
+
+fn projection_from_drain_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<PersistedConversationProjection> {
+    Ok(PersistedConversationProjection {
+        state: serde_json::from_str(row.get::<&str, _>("state"))
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+        state_updated_at: DateTime::parse_from_rfc3339(row.get::<&str, _>("state_updated_at"))
+            .map_err(|error| DbError::Serialization(error.to_string()))?
+            .with_timezone(&Utc),
+    })
 }
 
 fn projections_match(
@@ -4631,6 +4862,225 @@ mod tests {
             .probe_terminal_evidence("conv-a", "response-terminal-retired", &unrelated)
             .await
             .is_err());
+    }
+
+    fn drain_projection() -> UserRequestedDrainProjection {
+        UserRequestedDrainProjection::new(PersistedConversationProjection {
+            state: ConvState::CancellingSubAgents {
+                pending: vec![],
+                completed_results: vec![],
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                spawn_tool_id: None,
+            },
+            state_updated_at: DateTime::from_timestamp_micros(5).unwrap(),
+        })
+        .unwrap()
+    }
+
+    async fn seed_drain_source(repo: &WorkflowRepository) -> PersistedConversationProjection {
+        let source = PersistedConversationProjection {
+            state: ConvState::CancellingSubAgents {
+                pending: vec![],
+                completed_results: vec![],
+                cause: phoenix_core::domain::sm_event::CancelCause::Timeout,
+                spawn_tool_id: None,
+            },
+            state_updated_at: DateTime::from_timestamp_micros(4).unwrap(),
+        };
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = 'cancelling_sub_agents', state_updated_at = ?2 WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&source.state).unwrap())
+            .bind(source.state_updated_at.to_rfc3339())
+            .execute(&repo.pool).await.unwrap();
+        source
+    }
+
+    #[tokio::test]
+    async fn direct_stop_drain_preserves_owner_and_defers_watch_until_terminal() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "drain-checkpoint", 191).await;
+        let source = seed_drain_source(&repo).await;
+        sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('conv-a', 'anthropic', 'test', 'preserved-replay', '{\"response_sets\":[] }')")
+            .execute(&repo.pool).await.unwrap();
+        let target = drain_projection();
+        let acceptance = repo
+            .accept_direct_turn_drain(turn_id, 0, "conv-a", &source, &target)
+            .await
+            .unwrap();
+        let DirectTurnDrainAcceptance::Accepted(receipt) = acceptance else {
+            panic!("expected committed drain");
+        };
+        assert!(receipt.matches(turn_id, 0));
+        assert_eq!(receipt.projection(), target.projection());
+        let owner: (i64, i64, Option<String>) = sqlx::query_as("SELECT generation, owns_conversation, terminal_kind FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id").unwrap()).fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(owner, (0, 1, None));
+        let actual =
+            sqlx::query("SELECT state, state_updated_at FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert!(projections_match(
+            &projection_from_drain_row(&actual).unwrap(),
+            target.projection()
+        ));
+        let watches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events WHERE source_transcript_id = 'conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(watches, 0);
+        assert!(matches!(
+            repo.accept_direct_turn_drain(turn_id, 0, "conv-a", &source, &target)
+                .await
+                .unwrap(),
+            DirectTurnDrainAcceptance::Accepted(_)
+        ));
+        let replay: (String, String) = sqlx::query_as("SELECT response_id, payload FROM active_provider_replay_state WHERE conversation_id = 'conv-a'")
+            .fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(
+            replay,
+            ("preserved-replay".into(), "{\"response_sets\":[] }".into())
+        );
+        assert!(repo
+            .terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+                command: TurnCommand::Complete {
+                    turn_id,
+                    expected_generation: 0
+                },
+                projection: Some(stop_projection()),
+                provider_replay_settlement:
+                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+            })
+            .await
+            .is_err());
+        let mut obligation = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection: stop_projection(),
+            response_message_id: None,
+        };
+        assert!(repo.persist_terminal_obligation(&obligation).await.is_err());
+        obligation.terminal = TurnTerminal::Failed {
+            reason: "late failure".into(),
+        };
+        assert!(repo.persist_terminal_obligation(&obligation).await.is_err());
+        obligation.terminal = TurnTerminal::Cancelled;
+        repo.persist_terminal_obligation(&obligation).await.unwrap();
+        assert!(matches!(
+            repo.accept_direct_turn_drain(turn_id, 0, "conv-a", &source, &target)
+                .await
+                .unwrap(),
+            DirectTurnDrainAcceptance::NotAccepted
+        ));
+        assert!(matches!(
+            repo.accept_direct_turn_stop(turn_id, 0, &obligation.projection)
+                .await
+                .unwrap(),
+            DirectTurnStopAcceptance::Accepted(_)
+        ));
+        let watches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events WHERE source_transcript_id = 'conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(watches, 1);
+        let owner: (i64, i64, Option<String>) = sqlx::query_as("SELECT generation, owns_conversation, terminal_kind FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id").unwrap()).fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(owner, (1, 0, Some("Cancelled".into())));
+    }
+
+    #[tokio::test]
+    async fn direct_stop_drain_rejects_stale_source_target_and_completion_first() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "drain-race", 192).await;
+        let source = seed_drain_source(&repo).await;
+        let target = drain_projection();
+        let mut stale = source.clone();
+        stale.state_updated_at = DateTime::from_timestamp_micros(3).unwrap();
+        for (id, generation, conversation, projection) in [
+            (turn_id, 0, "conv-a", &stale),
+            (turn_id, 1, "conv-a", &source),
+            (turn_id, 0, "other", &source),
+            (TurnAuthorityId(turn_id.0 + 999), 0, "conv-a", &source),
+        ] {
+            assert!(matches!(
+                repo.accept_direct_turn_drain(id, generation, conversation, projection, &target)
+                    .await
+                    .unwrap(),
+                DirectTurnDrainAcceptance::NotAccepted
+            ));
+        }
+        repo.persist_terminal_obligation(&DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection: stop_projection(),
+            response_message_id: None,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.accept_direct_turn_drain(turn_id, 0, "conv-a", &source, &target)
+                .await
+                .unwrap(),
+            DirectTurnDrainAcceptance::NotAccepted
+        ));
+        let actual =
+            sqlx::query("SELECT state, state_updated_at FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert!(projections_match(
+            &projection_from_drain_row(&actual).unwrap(),
+            &source
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_stop_drain_commit_cuts_require_exact_durable_projection() {
+        for cut in [TransactionCut::BeforeCommit, TransactionCut::AfterCommit] {
+            let repo = repo().await;
+            let (turn_id, _) = created_turn(&repo, "drain-cut", 193).await;
+            let source = seed_drain_source(&repo).await;
+            let target = drain_projection();
+            let result = repo
+                .accept_direct_turn_drain_at_cut(turn_id, 0, "conv-a", &source, &target, cut)
+                .await;
+            let actual = sqlx::query(
+                "SELECT state, state_updated_at FROM conversations WHERE id = 'conv-a'",
+            )
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+            let actual = projection_from_drain_row(&actual).unwrap();
+            match cut {
+                TransactionCut::BeforeCommit => {
+                    assert!(result.is_err());
+                    assert!(projections_match(&actual, &source));
+                }
+                TransactionCut::AfterCommit => {
+                    assert!(matches!(
+                        result.unwrap(),
+                        DirectTurnDrainAcceptance::Accepted(_)
+                    ));
+                    assert!(projections_match(&actual, target.projection()));
+                }
+                TransactionCut::None => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn direct_stop_drain_type_rejects_idle_and_timeout_direction() {
+        assert!(UserRequestedDrainProjection::new(stop_projection()).is_err());
+        let mut timeout = drain_projection().projection().clone();
+        if let ConvState::CancellingSubAgents { cause, .. } = &mut timeout.state {
+            *cause = phoenix_core::domain::sm_event::CancelCause::Timeout;
+        }
+        assert!(UserRequestedDrainProjection::new(timeout).is_err());
     }
 
     fn stop_projection() -> PersistedConversationProjection {

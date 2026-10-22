@@ -406,6 +406,30 @@ pub(crate) enum RuntimeExitDisposition {
     RecreateFromDatabase,
 }
 
+enum AcceptedTargetedStop {
+    Terminal {
+        receipt: phoenix_db::workflow::AcceptedDirectTurnStop,
+        projection: phoenix_db::workflow::PersistedConversationProjection,
+    },
+    Draining(phoenix_db::workflow::AcceptedDirectTurnDrain),
+}
+
+impl AcceptedTargetedStop {
+    fn matches(&self, turn_id: phoenix_workflow::TurnAuthorityId, generation: u64) -> bool {
+        match self {
+            Self::Terminal { receipt, .. } => receipt.matches(turn_id, generation),
+            Self::Draining(receipt) => receipt.matches(turn_id, generation),
+        }
+    }
+
+    fn projection(&self) -> &phoenix_db::workflow::PersistedConversationProjection {
+        match self {
+            Self::Terminal { projection, .. } => projection,
+            Self::Draining(receipt) => receipt.projection(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalFactDurability {
     ProcessOnly,
@@ -3447,43 +3471,70 @@ where
                 };
                 let preview = transition(&self.state, &self.context, stop_event.clone())
                     .map_err(|error| error.to_string())?;
-                if !matches!(preview.new_state, ConvState::Idle) {
-                    return Err("targeted Stop requires retained nonterminal drain authority before activation".to_string());
-                }
+                let source = phoenix_db::workflow::PersistedConversationProjection {
+                    state: self.state.clone(),
+                    state_updated_at: self.state_updated_at,
+                };
                 let projection = phoenix_db::workflow::PersistedConversationProjection {
                     state: preview.new_state,
                     state_updated_at: chrono::Utc::now(),
                 };
-                let acceptance = self
-                    .storage
-                    .accept_direct_turn_stop(target, &projection)
-                    .await?;
-                let receipt = match acceptance {
-                    phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(receipt)
-                        if receipt.matches(target.turn_id, target.generation) =>
+                let accepted = if matches!(projection.state, ConvState::Idle) {
+                    let acceptance = self
+                        .storage
+                        .accept_direct_turn_stop(target, &projection)
+                        .await?;
+                    let receipt = match acceptance {
+                        phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(receipt)
+                            if receipt.matches(target.turn_id, target.generation) =>
+                        {
+                            receipt
+                        }
+                        phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(_) => {
+                            return Err("Stop receipt did not match captured target".to_string());
+                        }
+                        phoenix_db::workflow::DirectTurnStopAcceptance::NotAccepted(reason) => {
+                            tracing::debug!(
+                                ?reason,
+                                turn_id,
+                                expected_generation,
+                                "direct Stop not accepted"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    AcceptedTargetedStop::Terminal {
+                        receipt,
+                        projection,
+                    }
+                } else {
+                    let projection =
+                        phoenix_db::workflow::UserRequestedDrainProjection::new(projection)
+                            .map_err(|error| error.to_string())?;
+                    match self
+                        .storage
+                        .accept_direct_turn_drain(
+                            target,
+                            &self.context.conversation_id,
+                            &source,
+                            &projection,
+                        )
+                        .await?
                     {
-                        receipt
-                    }
-                    phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(_) => {
-                        return Err("Stop receipt did not match captured target".to_string());
-                    }
-                    phoenix_db::workflow::DirectTurnStopAcceptance::NotAccepted(reason) => {
-                        tracing::debug!(
-                            ?reason,
-                            turn_id,
-                            expected_generation,
-                            "direct Stop not accepted"
-                        );
-                        return Ok(());
+                        phoenix_db::workflow::DirectTurnDrainAcceptance::Accepted(receipt)
+                            if receipt.matches(target.turn_id, target.generation) =>
+                        {
+                            AcceptedTargetedStop::Draining(receipt)
+                        }
+                        phoenix_db::workflow::DirectTurnDrainAcceptance::Accepted(_) => {
+                            return Err("Stop drain receipt did not match captured target".into())
+                        }
+                        phoenix_db::workflow::DirectTurnDrainAcceptance::NotAccepted => {
+                            return Ok(())
+                        }
                     }
                 };
-                (
-                    Event::UserCancel {
-                        reason: None,
-                        cause: crate::state_machine::event::CancelCause::UserRequested,
-                    },
-                    Some((receipt, projection)),
-                )
+                (stop_event, Some(accepted))
             }
             event => (event, None),
         };
@@ -3728,22 +3779,21 @@ where
                     .record_execution_cancel(&self.context.conversation_id)
                     .await?;
             }
-            let committed_projection =
-                if let Some((receipt, projection)) = accepted_direct_turn_stop.take() {
-                    let target = self.active_direct_turn.as_ref().ok_or_else(|| {
-                        "accepted Stop lost its exact runtime turn before install".to_string()
-                    })?;
-                    if !receipt.matches(target.turn_id, target.generation)
-                        || projection.state != result.new_state
-                    {
-                        return Err(
-                            "accepted Stop projection does not match reducer result".to_string()
-                        );
-                    }
-                    Some(projection)
-                } else {
-                    None
-                };
+            let committed_projection = if let Some(accepted) = accepted_direct_turn_stop.take() {
+                let target = self.active_direct_turn.as_ref().ok_or_else(|| {
+                    "accepted Stop lost its exact runtime turn before install".to_string()
+                })?;
+                if !accepted.matches(target.turn_id, target.generation)
+                    || accepted.projection().state != result.new_state
+                {
+                    return Err(
+                        "accepted Stop projection does not match reducer result".to_string()
+                    );
+                }
+                Some(accepted.projection().clone())
+            } else {
+                None
+            };
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
                 .clone_from(&accepted_sub_agent);
@@ -6154,7 +6204,17 @@ where
         }
         self.direct_turn_terminal_fact = TerminalFactDurability::ProcessOnly;
         if matches!(new_state, ConvState::Idle) {
-            if self.direct_turn_cancellation_initiated {
+            if matches!(
+                &self.state,
+                ConvState::CancellingTool {
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                    ..
+                } | ConvState::CancellingSubAgents {
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                    ..
+                }
+            ) || self.direct_turn_cancellation_initiated
+            {
                 self.pending_direct_turn_terminal = Some(Box::new(
                     crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
                 ));
@@ -16241,11 +16301,26 @@ mod authoritative_user_message_effect_tests {
 
     #[tokio::test]
     async fn db_backed_targeted_stop_commits_projection_before_teardown_and_restart() {
-        db_backed_targeted_stop_fixture(false).await;
-        db_backed_targeted_stop_fixture(true).await;
+        db_backed_targeted_stop_fixture(DbStopFixture::Model {
+            queued_steer: false,
+        })
+        .await;
+        db_backed_targeted_stop_fixture(DbStopFixture::Model { queued_steer: true }).await;
     }
 
-    async fn db_backed_targeted_stop_fixture(queued_steer: bool) {
+    #[derive(Clone, Copy)]
+    enum DbStopFixture {
+        Model { queued_steer: bool },
+        TimeoutDrain,
+    }
+
+    #[tokio::test]
+    async fn db_backed_targeted_stop_retains_drain_owner_projection_and_replay() {
+        db_backed_targeted_stop_fixture(DbStopFixture::TimeoutDrain).await;
+    }
+
+    async fn db_backed_targeted_stop_fixture(mode: DbStopFixture) {
+        let queued_steer = matches!(mode, DbStopFixture::Model { queued_steer: true });
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let conversation = db
             .create_conversation("conv-direct", "Stop", "/tmp", true, None, None)
@@ -16332,6 +16407,15 @@ mod authoritative_user_message_effect_tests {
             }],
         )
         .unwrap();
+        let active = match mode {
+            DbStopFixture::Model { .. } => active,
+            DbStopFixture::TimeoutDrain => ConvState::CancellingSubAgents {
+                pending: vec![],
+                completed_results: vec![],
+                cause: crate::state_machine::event::CancelCause::Timeout,
+                spawn_tool_id: None,
+            },
+        };
         db.update_state_and_replay(
             "conv-direct",
             &active,
@@ -16365,7 +16449,13 @@ mod authoritative_user_message_effect_tests {
             sender,
             SseBroadcaster::new(32, 1),
         )
-        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
+        .with_state_updated_at(
+            db.get_conversation("conv-direct")
+                .await
+                .unwrap()
+                .state_updated_at,
+        );
         rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
             turn_id,
             generation: 0,
@@ -16398,6 +16488,40 @@ mod authoritative_user_message_effect_tests {
         })
         .await
         .unwrap();
+        if matches!(mode, DbStopFixture::TimeoutDrain) {
+            assert!(matches!(
+                rt.state,
+                ConvState::CancellingSubAgents {
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                    ..
+                }
+            ));
+            let durable = db.get_conversation("conv-direct").await.unwrap();
+            assert_eq!(durable.state, rt.state);
+            assert_eq!(
+                durable.state_updated_at.timestamp_micros(),
+                rt.state_updated_at.timestamp_micros()
+            );
+            assert!(rt.pending_direct_turn_terminal.is_none());
+            assert!(repo
+                .load_active_terminal_obligation(&target)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                db.pending_coordinator_watch_events(16).await.unwrap().len(),
+                0
+            );
+            assert!(db
+                .load_provider_replay_state("conv-direct")
+                .await
+                .unwrap()
+                .is_some());
+            let owner: (i64, i64, Option<String>) = sqlx::query_as("SELECT generation, owns_conversation, terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id.0).unwrap()).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(owner, (0, 1, None));
+            return;
+        }
         assert!(rt.pending_trusted_tool_results.is_empty());
         assert!(
             rt.steering_queue.is_empty(),
@@ -16561,6 +16685,36 @@ mod authoritative_user_message_effect_tests {
         .unwrap();
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
         assert!(rt.pending_direct_turn_terminal.is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_drain_direction_classifies_without_process_cancellation_history() {
+        for cause in [
+            crate::state_machine::event::CancelCause::UserRequested,
+            crate::state_machine::event::CancelCause::Timeout,
+        ] {
+            let (mut rt, _, _) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(10),
+                generation: 0,
+            }));
+            rt.state = cancelling_state(&["child"], cause);
+            assert!(!rt.direct_turn_cancellation_initiated);
+            rt.classify_active_direct_turn_outcome_terminal(&ConvState::Idle);
+            match cause {
+                crate::state_machine::event::CancelCause::UserRequested => assert!(matches!(
+                    rt.pending_direct_turn_terminal.as_deref(),
+                    Some(crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled)
+                )),
+                crate::state_machine::event::CancelCause::Timeout => assert!(matches!(
+                    rt.pending_direct_turn_terminal.as_deref(),
+                    Some(crate::runtime::traits::ActiveDirectTurnTerminal::Completed)
+                )),
+            }
+        }
     }
 
     #[tokio::test]
