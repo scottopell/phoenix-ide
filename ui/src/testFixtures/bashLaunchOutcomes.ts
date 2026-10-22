@@ -18,3 +18,9 @@ export const bashLaunchOutcomes: UnregisteredBashResponse[] = (
       error_message: 'The command may still be running. Do not automatically retry.' },
   ];
 });
+
+export const bashLaunchReleaseUnknown = {
+  error: 'launch_release_unknown',
+  error_message: 'The command may still be running. Do not automatically retry.',
+  handle: 'bash-handle-42',
+} as const;

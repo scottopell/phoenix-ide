@@ -1,4 +1,4 @@
-import { bashLaunchOutcomes } from '../testFixtures/bashLaunchOutcomes';
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from '../testFixtures/bashLaunchOutcomes';
 import { describe, expect, it } from 'vitest';
 import type { Message } from '../api';
 import { deriveToolStripItems } from './agentTurnToolStrip';
@@ -27,6 +27,15 @@ function toolResult(toolUseId: string, opts: { isError?: boolean; content?: stri
 }
 
 describe('deriveToolStripItems', () => {
+  it('preserves launch-release-unknown semantics and handle in the compact card', () => {
+    const msg = agentMessage([{ type: 'tool_use', id: 'release-unknown', name: 'bash', input: { cmd: 'side-effecting-command' } }]);
+    const result = toolResult('release-unknown', { isError: true, content: JSON.stringify(bashLaunchReleaseUnknown) });
+    const [item] = deriveToolStripItems(msg, new Map([['release-unknown', result]]));
+    expect(item?.finalStatus).toContain('outcome uncertain');
+    expect(item?.finalStatus).toContain('do not automatically retry');
+    expect(item?.finalStatus).toContain('bash-handle-42');
+  });
+
   it('emits one item per non-think tool_use block, in document order', () => {
     const msg = agentMessage([
       { type: 'text', text: 'hello' },

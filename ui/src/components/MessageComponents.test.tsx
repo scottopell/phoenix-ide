@@ -1,4 +1,4 @@
-import { bashLaunchOutcomes } from '../testFixtures/bashLaunchOutcomes';
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from '../testFixtures/bashLaunchOutcomes';
 import { SvgArtifactAccessContext } from '../contexts/SvgArtifactAccessContext';
 import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
@@ -4191,6 +4191,16 @@ describe('tool result ownership across repeated provider IDs', () => {
     render(transcript(messages));
     assertArtifacts();
   });
+});
+
+it('renders launch-release-unknown with its retained handle and retry warning', () => {
+  const { container } = render(<MemoryRouter><ToolUseBlock
+    block={{ type: 'tool_use', id: 'release-unknown', name: 'bash', input: { cmd: 'side-effecting-command' } }}
+    result={{ event_presentation: null, message_id: 'release-unknown-result', sequence_id: 2, conversation_id: 'c1', message_type: 'tool', created_at: '', content: { tool_use_id: 'release-unknown', result: JSON.stringify(bashLaunchReleaseUnknown), is_error: true } }}
+    onOpenFile={undefined}
+  /></MemoryRouter>);
+  expect(container).toHaveTextContent('The command outcome is uncertain. Do not automatically retry.');
+  expect(container).toHaveTextContent('bash-handle-42');
 });
 
 it.each(bashLaunchOutcomes)('renders full no-handle outcome $status / $launch_error', (response) => {

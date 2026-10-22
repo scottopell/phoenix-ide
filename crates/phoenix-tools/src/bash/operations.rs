@@ -1360,7 +1360,7 @@ fn spawn_child_with_identity_probe_protocol(
         launch_uuid,
     };
     // pgid == pid because we made the child a process group leader.
-    let pgid = i32::try_from(pid).unwrap_or(0);
+    let process_group_id = i32::try_from(pid).unwrap_or(0);
 
     let handle = Handle::new_live_for_actor_with_owner_and_launch_identity(
         ctx.work_scope.clone(),
@@ -1371,7 +1371,7 @@ fn spawn_child_with_identity_probe_protocol(
         cmd.to_string(),
         label,
         spawn_context.working_dir.clone(),
-        pgid,
+        process_group_id,
         pid,
         ring_bytes_cap,
     );
@@ -1379,7 +1379,7 @@ fn spawn_child_with_identity_probe_protocol(
         handle,
         SpawnedProcessGroup::new(
             child,
-            pgid,
+            process_group_id,
             sandbox_scratch_dir,
             started_at,
             payload.map(|(_, payload)| payload),
@@ -3093,7 +3093,7 @@ mod tests {
         let mut context = spawn_context_for(&ctx);
         context.working_dir = dir.path().to_path_buf();
         let output = run_run_with_identity_probe_mode(
-            "printf executed > forbidden.txt",
+            "printf explore-preidentity-executed",
             None,
             2,
             ReadArgs::default(),
@@ -3104,11 +3104,18 @@ mod tests {
             |_| None,
         )
         .await;
-        assert_eq!(
-            response_json(&output)["launch_error"],
-            "identity_unavailable"
-        );
-        assert!(!dir.path().join("forbidden.txt").exists());
+        let response = response_json(&output);
+        assert_eq!(response["launch_error"], "identity_unavailable");
+        // Printing is sandbox-permitted, unlike the denied repository write in
+        // the success case; the sandbox cannot mask accidental early execution.
+        assert!(response["lines"]
+            .as_array()
+            .expect("captured output window")
+            .iter()
+            .all(|line| !line["bytes"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("explore-preidentity-executed")));
     }
 
     #[cfg(unix)]
