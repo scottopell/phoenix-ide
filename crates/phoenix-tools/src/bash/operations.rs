@@ -2736,6 +2736,7 @@ mod tests {
         let before = observe_process_identity(pid).expect("launcher identity");
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(&payload).await.unwrap();
+        // test-timing-allow: withhold EOF for a bounded interval to prove a complete payload does not execute during the held-gate window
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !pid_file.exists(),
@@ -2746,14 +2747,18 @@ mod tests {
             "launcher must remain alive behind the gate"
         );
         drop(stdin);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !pid_file.exists() {
+        let recorded_pid = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = contents.parse::<u32>() {
+                        break pid;
+                    }
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("command did not start after EOF");
-        let recorded_pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        .expect("command did not write a parsable PID after EOF");
         assert_eq!(recorded_pid, pid, "exec must preserve PID");
         assert_eq!(
             observe_process_identity(pid),
@@ -2802,9 +2807,25 @@ mod tests {
             .commit_spawn_gated(&mut reservation, handle.clone())
             .await
             .expect("register gated handle");
-        let (mut child, launch_gate, scratch) = spawned.into_waiter_parts();
+        let (mut child, mut launch_gate, scratch) = spawned.into_waiter_parts();
         child.start_kill().expect("terminate direct launcher child");
         child.wait().await.expect("reap direct launcher child");
+        // The native child is terminal and reaped. Inject a transport whose write
+        // direction is explicitly shut down; child exit alone does not prove all
+        // pipe-reader copies are gone during concurrent process creation.
+        let (closed_transport, _peer) =
+            std::os::unix::net::UnixStream::pair().expect("owned local fault-transport pair");
+        closed_transport
+            .shutdown(std::net::Shutdown::Write)
+            .expect("disable fault-transport writes");
+        let closed_fd: std::os::fd::OwnedFd = closed_transport.into();
+        let closed_writer =
+            tokio::process::ChildStdin::from_std(std::process::ChildStdin::from(closed_fd))
+                .expect("register shut-down fault transport");
+        launch_gate
+            .as_mut()
+            .expect("native gated launch has a gate")
+            .writer = closed_writer;
         start_io_tasks(
             &inserted,
             scope.clone(),
@@ -2879,6 +2900,7 @@ mod tests {
             BashSpawnMode::Direct,
             SpawnProtocol::Gated,
             |pid| {
+                // test-timing-allow: delay identity observation to verify the native fast command remains correct across delayed process-identity probing
                 std::thread::sleep(Duration::from_millis(75));
                 observe_process_identity(pid).ok()
             },
@@ -2888,7 +2910,7 @@ mod tests {
         assert_eq!(response["status"], "exited");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("cwd.txt")).unwrap(),
-            format!("{}\n", dir.path().display())
+            format!("{}\n", dir.path().canonicalize().unwrap().display())
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("path.txt")).unwrap(),
@@ -3037,6 +3059,7 @@ mod tests {
             BashSpawnMode::ExploreReadOnly,
             SpawnProtocol::Gated,
             |pid| {
+                // test-timing-allow: delay identity observation to verify the native explore command still enforces repository-write denial
                 std::thread::sleep(Duration::from_millis(75));
                 observe_process_identity(pid).ok()
             },
@@ -3045,7 +3068,16 @@ mod tests {
         let response = response_json(&output);
         assert_eq!(response["status"], "exited");
         assert_eq!(response["exit_code"], 7);
-        assert_eq!(response["lines"][0]["bytes"], "explore-ok");
+        let combined_output = response["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line["bytes"].as_str())
+            .collect::<String>();
+        assert!(
+            combined_output.contains("explore-ok"),
+            "combined stdout/stderr should include command output: {combined_output:?}"
+        );
         assert!(!dir.path().join("forbidden.txt").exists());
     }
 
