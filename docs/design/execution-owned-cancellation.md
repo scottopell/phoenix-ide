@@ -239,3 +239,51 @@ Replacement rules: same message/source replay preserves acceptance; different id
 Close dispatch currently has captured exact targets but sends a conversation-addressed UserCancel. Its captured target/attempt must survive delivery so a stale Close A cannot stop replacement B. Preserve Close behavior and existing receipt replay; reason text and UserRequested cannot serve as authority. Parent cycle-cap and propagated child cancellation also use UserRequested, so that variant does not prove a human Stop.
 
 Required exact partitions before integration: (1) process_event acceptance before cancellation-claim/abort and deadline clearing; (2) canonical provider_replay interaction-response UPSERT and its existing transaction-bound settlement hooks. Neither requires replacing the Goals checkpoint algorithm. Independent review performed source analysis only, no compile/tests; this proposal requires bounded schema/API review before migration/source implementation. No additional execution authority was requested or used.
+
+## 16. Exact hook-2 proposal for the existing canonical transaction owner
+
+**Review-only diff; not applied to provider_replay or migrations.** Its owner retains that file. Replace only the interaction-response UPSERT at canonical provider_replay's UserApi-origin branch:
+
+```diff
+- sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES (?1,?2,'interaction_response') ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'interaction_response'")
+-     .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
++ crate::execution_occurrence::adopt_tx(
++     &mut tx,
++     conversation_id,
++     message_id,
++     crate::coordinator_watches::MessageExecutionSource::InteractionResponse,
++ ).await?;
+```
+
+Proposed crate-private signature (new focused helper module, not a new subsystem):
+
+```rust
+pub(crate) async fn adopt_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    message_id: &str,
+    source: MessageExecutionSource,
+) -> DbResult<()>;
+```
+
+The function never begins/commits a transaction, publishes a message, changes replay, chooses a Goal report, or handles commit uncertainty. Those remain entirely with the caller. It uses the caller's existing writer transaction to read exact occurrence message/source and accepted interruption fields:
+
+| Existing row | Requested identity | Result |
+|---|---|---|
+| Absent | new | Insert with NULL interruption fields |
+| Same message and source | exact replay | Preserve row and accepted evidence unchanged |
+| Same message, different source | conflict | Return typed identity-conflict error, rolling back caller; do not relabel source |
+| Different message, no accepted interruption | replacement | Existing replacement behavior, new fields NULL |
+| Different message, accepted interruption | collision | Return typed interrupted-occurrence-pending error, rolling back caller; no eager synthetic settlement or erased notification |
+
+Choose the last-row fail-closed policy rather than introducing settlement during adoption. Before landing, the runtime admission path must consume/reconcile the old accepted interruption and retry through existing receipt rules. If a valid existing question-response flow requires atomic old settlement plus new adoption, provide the contrasting exact identity/transaction trace and revise this helper contract with the transaction owner; do not assume a blanket rejection is behavior-neutral.
+
+All other occurrence writers must call the same helper under their existing transaction. Seeded fork insertion has no conflicting row at creation but still shares the constrained shape. A helper accepting source enum avoids divergent SQL source strings. Exact natural/interrupted settlement reloads the row and deletes by conversation AND message AND source, never by conversation alone. `record_initial_execution_outcome_tx` must use that resolver before publication, including restart and normal state updates. Direct-turn captured-source settlement uses its existing authoritative terminal; standalone acceptance is forbidden while that accepted-turn ownership applies.
+
+No migration is authorized by this review packet. Proposed columns require first-acceptance validation and explicit table CHECK/FK described in section 15; their rollout, legacy pending-marker retirement, and Close target binding must be reviewed together before production callers depend on them. This is a precise source/API contract proposal for one-writer integration, not an instruction to the Goals writer to redesign its canonical response pipeline.
+
+### Hook 1 guard placement and captured target
+
+The yielded guard belongs after existing terminal-obligation/continuation-settlement absorption, but before any LLM terminal claim, abort, retry/deadline clearing or pure cancellation transition. It must receive an identity captured at ingress (exact accepted turn/generation or exact occurrence message/source), not select whatever happens to be current when a delayed UserCancel is processed. A mismatch is stale/no-op with observable rejection, never fallback cancellation of replacement work. Close carries its existing captured target and attempt; internal propagation carries child admission/parent cause. Public event adapters cannot turn a generic reason or UserRequested into an accepted receipt.
+
+When source acceptance succeeds, runtime teardown proceeds under that receipt. When an established completion obligation wins, preserve owed completion and the independent prospective Stop fence; do not abort the task first and then discover rejection. Lost acknowledgement replays the exact acceptance target/command. Existing LLM-attempt outcome arbitration must be tested against durable Stop acceptance: attempt-completed does not by itself prove execution-terminal completion, while a committed terminal obligation does. This is the concrete contrast that the early guard must encode.
