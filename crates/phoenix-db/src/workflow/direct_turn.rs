@@ -3342,18 +3342,24 @@ async fn require_drain_terminal_direction_tx(
     terminal: &TurnTerminal,
 ) -> DbResult<()> {
     if !matches!(terminal, TurnTerminal::Cancelled) {
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT c.state FROM conversations c JOIN durable_turns t ON t.conversation_id = c.id
+        let row = sqlx::query(
+            "SELECT c.state, EXISTS (
+                 SELECT 1 FROM startup_parent_actions a
+                 WHERE a.conversation_id = c.id AND a.action = 'Cancel'
+                   AND a.turn_id = t.turn_id AND a.turn_generation = t.generation
+                   AND a.transcript_generation = c.transcript_generation
+             ) AS pending_exact_cancel
+             FROM conversations c JOIN durable_turns t ON t.conversation_id = c.id
              WHERE t.turn_id = ?1 AND t.generation = ?2 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(to_i64(expected_generation, "generation")?)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some(state) = state {
-            let state = serde_json::from_str(&state)
+        if let Some(row) = row {
+            let state = serde_json::from_str(row.get::<&str, _>("state"))
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
-            if is_user_requested_drain(&state) {
+            if is_user_requested_drain(&state) || row.get::<i64, _>("pending_exact_cancel") != 0 {
                 return Err(DbError::Serialization(
                     "accepted user Stop drain forbids a non-Cancelled terminal outcome".into(),
                 ));
@@ -5071,6 +5077,194 @@ mod tests {
                 TransactionCut::None => unreachable!(),
             }
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn startup_exact_cancel_action_fences_both_terminal_sinks_for_real_owner() {
+        use phoenix_core::domain::sm_event::{CancelCause, SubAgentMode};
+        use phoenix_core::domain::sm_state::PendingSubAgent;
+        let db = crate::Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-a", "recovery", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = db.workflow_repository();
+        let (turn_id, workflow_id) = created_turn(&repo, "recovery-drain", 194).await;
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 2))
+            .await
+            .unwrap();
+        let materialized = repo
+            .materialize_authoritative_turn(&materialize_input(
+                turn_id,
+                claim.authority.unwrap(),
+                194,
+                195,
+                "message-conv-a-recovery-drain",
+                3,
+            ))
+            .await
+            .established()
+            .unwrap();
+        assert!(matches!(
+            materialized,
+            MaterializeAuthoritativeTurnOutcome::Materialized(_)
+        ));
+        db.create_conversation(
+            "recovery-child",
+            "child",
+            "/tmp",
+            false,
+            Some("conv-a"),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sub_agent_batches (batch_id, parent_conversation_id, parent_transcript_generation, active) VALUES ('recovery-batch', 'conv-a', 0, 1)")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO sub_agent_runs (child_conversation_id, batch_id, ordinal, task, agent_mode, active) VALUES ('recovery-child', 'recovery-batch', 0, 'recover', 'explore', 1)")
+            .execute(db.pool()).await.unwrap();
+        let mut source = seed_drain_source(&repo).await;
+        if let ConvState::CancellingSubAgents { pending, .. } = &mut source.state {
+            pending.push(PendingSubAgent {
+                agent_id: "recovery-child".into(),
+                task: "recover".into(),
+                mode: SubAgentMode::Explore,
+            });
+        }
+        db.update_state_and_replay(
+            "conv-a",
+            &source.state,
+            source.state_updated_at,
+            &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+        )
+        .await
+        .unwrap();
+        let mut target = source.clone();
+        if let ConvState::CancellingSubAgents { cause, .. } = &mut target.state {
+            *cause = CancelCause::UserRequested;
+        }
+        target.state_updated_at = DateTime::from_timestamp_micros(5).unwrap();
+        let target = UserRequestedDrainProjection::new(target).unwrap();
+        assert!(matches!(
+            repo.accept_direct_turn_drain(turn_id, 0, "conv-a", &source, &target)
+                .await
+                .unwrap(),
+            DirectTurnDrainAcceptance::Accepted(_)
+        ));
+        db.reset_all_to_idle().await.unwrap();
+        let actions = db.list_startup_parent_actions().await.unwrap();
+        let action = actions
+            .iter()
+            .find(|action| action.conversation_id == "conv-a")
+            .unwrap();
+        assert_eq!(action.action, crate::StartupParentAction::Cancel);
+        assert_eq!(action.turn_id, Some(turn_id));
+        assert_eq!(action.turn_generation, Some(0));
+        let conversation = db.get_conversation("conv-a").await.unwrap();
+        assert!(matches!(conversation.state, ConvState::Idle));
+        assert_eq!(
+            action.transcript_generation,
+            conversation.transcript_generation
+        );
+        let accepted: Option<String> = sqlx::query_scalar("SELECT parent_accepted_at FROM sub_agent_runs WHERE child_conversation_id = 'recovery-child'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert!(
+            accepted.is_some(),
+            "real child outcome must be consumed during recovery"
+        );
+        let projection = PersistedConversationProjection {
+            state: conversation.state,
+            state_updated_at: conversation.state_updated_at,
+        };
+        for terminal in [
+            TurnTerminal::Completed,
+            TurnTerminal::Failed {
+                reason: "late failure".into(),
+            },
+        ] {
+            let obligation_error = repo
+                .persist_terminal_obligation(&DirectTurnTerminalObligationInput {
+                    turn_id,
+                    expected_generation: 0,
+                    terminal: terminal.clone(),
+                    projection: projection.clone(),
+                    response_message_id: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(obligation_error
+                .to_string()
+                .contains("accepted user Stop drain"));
+            let command = match terminal {
+                TurnTerminal::Completed => TurnCommand::Complete {
+                    turn_id,
+                    expected_generation: 0,
+                },
+                TurnTerminal::Failed { reason } => TurnCommand::Fail {
+                    turn_id,
+                    expected_generation: 0,
+                    reason,
+                },
+                TurnTerminal::Cancelled => unreachable!(),
+            };
+            let terminal_error = repo
+                .terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+                    command,
+                    projection: Some(projection.clone()),
+                    provider_replay_settlement:
+                        phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                })
+                .await
+                .unwrap_err();
+            assert!(terminal_error
+                .to_string()
+                .contains("accepted user Stop drain"));
+        }
+        let owner: (i64, i64, Option<String>) = sqlx::query_as("SELECT generation, owns_conversation, terminal_kind FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id").unwrap()).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(owner, (0, 1, None));
+        let watches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events WHERE source_transcript_id = 'conv-a'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(watches, 0);
+        let cancellation = TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Cancel {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(projection),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear,
+        };
+        repo.terminalize_authoritative_turn(&cancellation)
+            .await
+            .unwrap();
+        repo.terminalize_authoritative_turn(&cancellation)
+            .await
+            .unwrap();
+        db.delete_startup_parent_action("conv-a", action.action_id)
+            .await
+            .unwrap();
+        assert!(db
+            .list_startup_parent_actions()
+            .await
+            .unwrap()
+            .iter()
+            .all(|action| action.conversation_id != "conv-a"));
+        let watches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM coordinator_watch_events WHERE source_transcript_id = 'conv-a'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(watches, 1);
+        let owner: (i64, i64, Option<String>) = sqlx::query_as("SELECT generation, owns_conversation, terminal_kind FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id").unwrap()).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(owner, (1, 0, Some("Cancelled".into())));
     }
 
     #[test]
