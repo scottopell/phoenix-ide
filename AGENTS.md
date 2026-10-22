@@ -317,6 +317,18 @@ pub enum ToolOutputContent {
 }
 ```
 
+#### Preserve distinctions required by downstream decisions
+
+Before reducing lifecycle history to a flag or status, ask:
+
+> Can two different histories produce the same stored value but require different downstream behavior?
+
+If yes, the representation has discarded necessary information. Preserve the distinction through typed states, variants, or causal references, and test the contrasting histories. Downstream code must not reconstruct it from unrelated state or conventions.
+
+For example, stopping a timed-out helper and accepting a user Stop for its parent cannot both become an undifferentiated `cancellation_seen: bool`: the parent may complete normally in the first case but must stop in the second.
+
+This is not a blanket ban on Booleans or a requirement to retain all history.
+
 #### Omission is data loss — unless the component is a typed sink
 
 If a field exists in struct A and struct B is the next layer that accepts that kind of data, threading it through is required. A component *may* be an intentional consumer/terminator of a value, but this must be enforced by its type — not by implicit omission or a comment. There must be no structural ambiguity between "forgot to thread" and "deliberately consumed."
