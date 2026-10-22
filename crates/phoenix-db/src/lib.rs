@@ -10292,6 +10292,8 @@ impl Database {
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<Option<i64>> {
         let mut tx = self.pool.begin().await?;
+        workflow::WorkflowRepository::require_terminal_obligation_direction_tx(&mut tx, obligation)
+            .await?;
         let transcript_generation = match evidence {
             workflow::TerminalEvidenceExpectation::ObligationOnly { .. } => None,
             workflow::TerminalEvidenceExpectation::Messages(messages) => {

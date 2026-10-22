@@ -2483,6 +2483,19 @@ impl WorkflowRepository {
         Ok(())
     }
 
+    pub(crate) async fn require_terminal_obligation_direction_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: &DirectTurnTerminalObligationInput,
+    ) -> DbResult<()> {
+        require_drain_terminal_direction_tx(
+            tx,
+            input.turn_id,
+            input.expected_generation,
+            &input.terminal,
+        )
+        .await
+    }
+
     pub(crate) async fn persist_terminal_obligation_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         input: &DirectTurnTerminalObligationInput,
@@ -5082,6 +5095,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn startup_exact_cancel_action_fences_both_terminal_sinks_for_real_owner() {
+        use phoenix_core::domain::db_schema::{MessageContent, ToolContent};
         use phoenix_core::domain::sm_event::{CancelCause, SubAgentMode};
         use phoenix_core::domain::sm_state::PendingSubAgent;
         let db = crate::Database::open_in_memory().await.unwrap();
@@ -5110,6 +5124,20 @@ mod tests {
             materialized,
             MaterializeAuthoritativeTurnOutcome::Materialized(_)
         ));
+        db.add_message_with_seq(
+            "recovery-evidence",
+            "conv-a",
+            4,
+            &MessageContent::Tool(ToolContent::new(
+                "recovery-spawn",
+                "original evidence",
+                false,
+            )),
+            Some(&serde_json::json!({"phase": "original"})),
+            None,
+        )
+        .await
+        .unwrap();
         db.create_conversation(
             "recovery-child",
             "child",
@@ -5177,6 +5205,18 @@ mod tests {
             state: conversation.state,
             state_updated_at: conversation.state_updated_at,
         };
+        let evidence_before = db.get_message_by_id("recovery-evidence").await.unwrap();
+        let transcript_before = conversation.transcript_generation;
+        let mutation = TerminalEvidenceExpectation::MessageMutation {
+            conversation_id: "conv-a".into(),
+            message_id: "recovery-evidence".into(),
+            content: MessageContent::Tool(ToolContent::new(
+                "recovery-spawn",
+                "late rewrite",
+                false,
+            )),
+            display_data: serde_json::json!({"phase": "late"}),
+        };
         let workflow_before: (i64, i64, String) = sqlx::query_as(
             "SELECT version, generation, status FROM workflows WHERE workflow_id = ?1",
         )
@@ -5190,19 +5230,37 @@ mod tests {
                 reason: "late failure".into(),
             },
         ] {
+            let obligation = DirectTurnTerminalObligationInput {
+                turn_id,
+                expected_generation: 0,
+                terminal: terminal.clone(),
+                projection: projection.clone(),
+                response_message_id: None,
+            };
             let obligation_error = repo
-                .persist_terminal_obligation(&DirectTurnTerminalObligationInput {
-                    turn_id,
-                    expected_generation: 0,
-                    terminal: terminal.clone(),
-                    projection: projection.clone(),
-                    response_message_id: None,
-                })
+                .persist_terminal_obligation(&obligation)
                 .await
                 .unwrap_err();
             assert!(obligation_error
                 .to_string()
                 .contains("accepted user Stop drain"));
+            let mutation_error = db
+                .persist_sub_agent_terminal_evidence(&mutation, &obligation)
+                .await
+                .unwrap_err();
+            assert!(mutation_error
+                .to_string()
+                .contains("accepted user Stop drain"));
+            let evidence_after = db.get_message_by_id("recovery-evidence").await.unwrap();
+            assert_eq!(evidence_after.content, evidence_before.content);
+            assert_eq!(evidence_after.display_data, evidence_before.display_data);
+            assert_eq!(
+                db.get_conversation("conv-a")
+                    .await
+                    .unwrap()
+                    .transcript_generation,
+                transcript_before
+            );
             let command = match terminal {
                 TurnTerminal::Completed => TurnCommand::Complete {
                     turn_id,
