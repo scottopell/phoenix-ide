@@ -979,15 +979,19 @@ async fn conversation_goal_two_actual_response_operations_cannot_consume_each_ot
 async fn conversation_goal_actual_report_round_commits_mutation_and_checkpoint_once_then_holds_next_request(
 ) {
     let (_directory, db, receipt, mut rt, client) = adopted().await;
+    let execution = rt.active_direct_turn.as_deref().unwrap().clone();
     client
         .responses
         .lock()
         .unwrap()
-        .push_back(provider_response(vec![ContentBlock::tool_use(
-            "actual-report-complete",
-            "goal_report",
-            serde_json::json!({"status":"complete","reason":"actual admitted report"}),
-        )]));
+        .push_back(provider_response_with_replay(
+            "actual-report-complete-response",
+            vec![ContentBlock::tool_use(
+                "actual-report-complete",
+                "goal_report",
+                serde_json::json!({"status":"complete","reason":"actual admitted report"}),
+            )],
+        ));
     let before = canonical_counts(&db).await;
     let completion = dispatch_response(&mut rt).await;
     let request_id = completion
@@ -999,12 +1003,30 @@ async fn conversation_goal_actual_report_round_commits_mutation_and_checkpoint_o
         .as_str()
         .to_owned();
     rt.process_llm_completion(completion).await.unwrap();
+    assert!(
+        rt.pending_provider_replay_update.is_some(),
+        "the actual response replay remains owned until the queued report commits"
+    );
     process_prepared_report(&mut rt).await;
     assert_eq!(rt.state, ConvState::Idle);
     assert!(rt.active_direct_turn.is_none());
     assert!(rt.pending_direct_turn_terminal.is_none());
+    assert_completed_start_owner(&db, execution.turn_id.0, execution.generation).await;
+    assert!(
+        db.load_provider_replay(CONVERSATION)
+            .await
+            .unwrap()
+            .is_none(),
+        "ordinary terminal settlement clears replay rather than retaining a settled response"
+    );
+    assert!(rt.pending_provider_replay_update.is_none());
+    assert!(
+        rt.llm_task_handle.is_none(),
+        "Complete cannot dispatch a successor"
+    );
+    assert!(rt.llm_outcome_rx.try_recv().is_err());
     let after = canonical_counts(&db).await;
-    assert_eq!(after, (before.0 + 2, before.1, before.2 + 1, before.3 + 1));
+    assert_eq!(after, (before.0 + 2, before.1, before.2 + 1, before.3));
     let goal = db
         .conversation_goal(&receipt.input().goal().owner)
         .await
