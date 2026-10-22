@@ -66,6 +66,113 @@ async fn conversation_goal_real_constructor_keeps_unmaterialized_start_held_with
 }
 
 #[tokio::test]
+async fn conversation_goal_actual_allowance_terminal_failure_reopens_through_existing_manager_before_idle(
+) {
+    use super::super::super::checkpoints::{
+        assert_completed_start_owner, dispatch_response, guard_terminal_projection_order,
+        receive_automatic_response,
+    };
+    use phoenix_core::domain::conversation_goal::GoalState;
+    let (directory, db, receipt, mut rt, client) = adopted().await;
+    let active = rt.active_direct_turn.as_deref().unwrap().clone();
+    guard_terminal_projection_order(&db).await;
+    let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.effective_state());
+    rt.state_watcher = Some(watch_tx);
+    for answer in ["ordinary yield before crash", "last ordinary answer"] {
+        client
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(LlmResponse::non_streaming(
+                vec![ContentBlock::text(answer)],
+                true,
+                phoenix_core::domain::llm_types::Usage::default(),
+            ));
+    }
+    let first = dispatch_response(&mut rt).await;
+    rt.process_llm_completion(first).await.unwrap();
+    let final_response = receive_automatic_response(&mut rt).await;
+    sqlx::query(
+        "CREATE TRIGGER fail_goal_terminal_settlement BEFORE UPDATE OF terminal_kind ON durable_turns
+         WHEN NEW.input_kind='goal_start' AND NEW.terminal_kind='Completed'
+         BEGIN SELECT RAISE(ABORT, 'terminal owner failure after canonical commit'); END",
+    ).execute(db.pool()).await.unwrap();
+    assert!(rt.process_llm_completion(final_response).await.is_err());
+    assert!(rt.active_direct_turn.is_some());
+    assert!(rt.pending_direct_turn_terminal.is_some());
+    assert!(
+        rt.pending_goal_request_checkpoint.is_some(),
+        "failed settlement must not hide its accounting receipt"
+    );
+    assert_eq!(
+        rt.direct_turn_terminal_fact,
+        TerminalFactDurability::Durable
+    );
+    assert_eq!(
+        rt.recovery_disposition,
+        RuntimeRecoveryDisposition::RecreateFromDatabase
+    );
+    assert!(
+        matches!(&*watch_rx.borrow(), ConvState::LlmRequesting { .. }),
+        "Idle cannot escape failed terminal settlement"
+    );
+    assert!(matches!(
+        db.get_conversation(CONVERSATION).await.unwrap().state,
+        ConvState::LlmRequesting { .. }
+    ));
+    let obligation = db
+        .workflow_repository()
+        .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+            CONVERSATION.into(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(obligation.turn_id, active.turn_id);
+    assert_eq!(obligation.expected_generation, active.generation);
+    assert_eq!(obligation.projection.state, ConvState::Idle);
+    assert!(matches!(
+        db.conversation_goal(&receipt.input().goal().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        GoalState::Exhausted(_)
+    ));
+    let before = ledger(&db).await;
+    assert_eq!(before, (2, 2, 1, 2));
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
+    drop(rt);
+    drop(client);
+    db.pool().close().await;
+    drop(db);
+    let db = install(
+        Database::open(directory.path().join("start.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    sqlx::query("DROP TRIGGER fail_goal_terminal_settlement")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let provider = Arc::new(HeldStartProvider::default());
+    let manager = manager(db.clone(), provider.clone());
+    let handle = manager.get_or_create(CONVERSATION).await.unwrap();
+    assert_eq!(*handle.state_rx.borrow(), ConvState::Idle);
+    assert_completed_start_owner(&db, active.turn_id.0, active.generation).await;
+    assert_eq!(
+        ledger(&db).await,
+        before,
+        "terminal recovery never repeats or replenishes a completed request"
+    );
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+    manager.begin_process_shutdown();
+    manager.drain_process_shutdown().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn conversation_goal_real_constructor_default_off_denies_adopted_recovery_without_provider() {
     let (directory, db, receipt, _old_runtime, _client) = adopted().await;
     let counts = ledger(&db).await;

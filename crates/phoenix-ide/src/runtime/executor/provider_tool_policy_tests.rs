@@ -38,6 +38,7 @@ struct RenderingAnthropicClient {
     requests: Mutex<Vec<LlmRequest>>,
     wires: Mutex<Vec<serde_json::Value>>,
     responses: Mutex<std::collections::VecDeque<LlmResponse>>,
+    streamed_text: Mutex<Option<String>>,
     pending: Mutex<Option<Arc<PendingExternalCall>>>,
 }
 
@@ -120,6 +121,7 @@ impl RenderingAnthropicClient {
             requests: Mutex::new(vec![]),
             wires: Mutex::new(vec![]),
             responses: Mutex::new(std::collections::VecDeque::new()),
+            streamed_text: Mutex::new(None),
             pending: Mutex::new(None),
         }
     }
@@ -163,6 +165,18 @@ impl LlmClient for RenderingAnthropicClient {
         Err(LlmError::network(
             "Injected transport failure after local request rendering",
         ))
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let text = self.streamed_text.lock().unwrap().take();
+        if let Some(text) = text {
+            let _ = chunk_tx.send(phoenix_llm::TokenChunk::Text(text)).await;
+        }
+        self.complete(request).await
     }
 
     fn model_id(&self) -> &'static str {

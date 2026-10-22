@@ -2,7 +2,7 @@
 mod coordinator;
 
 use super::*;
-use crate::runtime::executor::goal_request_checkpoint::GoalRequestCompletion;
+use crate::runtime::executor::goal_request_checkpoint::LlmCompletion as GoalRequestCompletion;
 
 fn provider_response(content: Vec<ContentBlock>) -> phoenix_core::domain::llm_types::LlmResponse {
     phoenix_core::domain::llm_types::LlmResponse::non_streaming(
@@ -31,18 +31,15 @@ fn provider_response_with_replay(
     response
 }
 
-async fn dispatch_response<T: ToolExecutor + 'static>(
+pub(super) async fn dispatch_response<T: ToolExecutor + 'static>(
     rt: &mut ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, T>,
 ) -> GoalRequestCompletion {
     rt.execute_effect(Effect::RequestLlm).await.unwrap();
     rt.llm_task_handle.as_mut().unwrap().await.unwrap();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        rt.goal_request_completion_rx.recv(),
-    )
-    .await
-    .expect("actual provider completion liveness")
-    .expect("receipt owner remains open")
+    tokio::time::timeout(std::time::Duration::from_secs(30), rt.llm_outcome_rx.recv())
+        .await
+        .expect("actual provider completion liveness")
+        .expect("receipt owner remains open")
 }
 
 fn actual_tool_runtime(
@@ -68,6 +65,562 @@ fn actual_tool_runtime(
     )
     .with_state_updated_at(initial.state_updated_at)
     .with_active_direct_turn(initial.active_direct_turn.take().map(|active| *active))
+}
+
+pub(super) async fn receive_automatic_response<T: ToolExecutor + 'static>(
+    rt: &mut ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, T>,
+) -> GoalRequestCompletion {
+    rt.llm_task_handle
+        .as_mut()
+        .expect("existing producer dispatched the next request")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), rt.llm_outcome_rx.recv())
+        .await
+        .expect("ordinary completion-channel liveness")
+        .unwrap()
+}
+
+pub(super) async fn guard_terminal_projection_order(db: &Database) {
+    sqlx::query(
+        "CREATE TRIGGER goal_idle_requires_settled_owner
+         BEFORE UPDATE OF state ON conversations
+         WHEN json_extract(NEW.state, '$.type')='idle'
+         BEGIN
+           SELECT CASE WHEN EXISTS(SELECT 1 FROM durable_turns
+             WHERE conversation_id=NEW.id AND owns_conversation=1 AND terminal_kind IS NULL)
+           THEN RAISE(ABORT, 'Idle preceded actual terminal-owner settlement') END;
+         END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER goal_terminal_requires_obligation
+         BEFORE UPDATE OF terminal_kind ON durable_turns
+         WHEN NEW.input_kind='goal_start' AND NEW.terminal_kind='Completed'
+         BEGIN
+           SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM direct_turn_terminal_obligations
+             WHERE turn_id=NEW.turn_id AND expected_generation=OLD.generation)
+           THEN RAISE(ABORT, 'terminal settlement omitted its existing obligation') END;
+         END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+pub(super) async fn assert_completed_start_owner(db: &Database, turn_id: u64, generation: u64) {
+    let (terminal, owns, current): (Option<String>, bool, i64) = sqlx::query_as(
+        "SELECT terminal_kind, owns_conversation, generation FROM durable_turns WHERE turn_id=?",
+    )
+    .bind(i64::try_from(turn_id).unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(terminal.as_deref(), Some("Completed"));
+    assert!(!owns);
+    assert_eq!(u64::try_from(current).unwrap(), generation + 1);
+    let state: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?")
+        .bind(CONVERSATION)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<ConvState>(&state).unwrap(),
+        ConvState::Idle
+    );
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_terminal_report_in_same_execution(
+) {
+    use phoenix_core::domain::conversation_goal::{GoalReportOutcome, GoalState};
+    for outcome in [
+        GoalReportOutcome::Complete(text("finished")),
+        GoalReportOutcome::Blocked(text("needs external input")),
+    ] {
+        let (_directory, db, receipt, mut initial, client) = adopted().await;
+        let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
+        let execution = rt.active_direct_turn.as_deref().unwrap().clone();
+        guard_terminal_projection_order(&db).await;
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.effective_state());
+        rt.state_watcher = Some(watch_tx);
+        client
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(provider_response_with_replay(
+                "automatic-first",
+                vec![ContentBlock::text(
+                    "ordinary yield, not a Goal progress report",
+                )],
+            ));
+        client
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(provider_response(vec![ContentBlock::tool_use(
+                "explicit-final-report",
+                "goal_report",
+                serde_json::to_value(&outcome).unwrap(),
+            )]));
+        let first = dispatch_response(&mut rt).await;
+        let first_id = first.admitted.as_ref().unwrap().intent().id.clone();
+        rt.process_llm_completion(first).await.unwrap();
+        let after_yield = db
+            .conversation_goal(&receipt.input().goal().owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_yield.version, receipt.input().goal().version);
+        assert!(matches!(after_yield.state, GoalState::Underway));
+        assert!(matches!(
+            &*watch_rx.borrow(),
+            ConvState::LlmRequesting { .. }
+        ));
+        let obligations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM direct_turn_terminal_obligations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            obligations, 0,
+            "yield retains its baton without a terminal obligation"
+        );
+        let second = receive_automatic_response(&mut rt).await;
+        let second_receipt = second
+            .admitted
+            .as_ref()
+            .expect("same-execution automatic request is accounted");
+        assert_ne!(second_receipt.intent().id, first_id);
+        assert_eq!(second_receipt.intent().execution, receipt.execution());
+        assert_eq!(
+            second_receipt.intent().goal,
+            *receipt.input().goal(),
+            "unreported Underway yield preserves the exact immutable admission fence"
+        );
+        assert_eq!(
+            rt.active_direct_turn.as_deref().unwrap().turn_id,
+            execution.turn_id
+        );
+        assert_eq!(
+            rt.active_direct_turn.as_deref().unwrap().generation,
+            execution.generation
+        );
+        rt.process_llm_completion(second).await.unwrap();
+        assert!(
+            rt.tool_outcome_rx.try_recv().is_err(),
+            "goal_report returns its prepared event synchronously"
+        );
+        let goal = db
+            .conversation_goal(&receipt.input().goal().owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.version.get(), receipt.input().goal().version.get() + 1);
+        match outcome {
+            GoalReportOutcome::Complete(_) => assert!(matches!(goal.state, GoalState::Complete(_))),
+            GoalReportOutcome::Blocked(_) => assert!(matches!(goal.state, GoalState::Blocked(_))),
+            _ => unreachable!(),
+        }
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert_completed_start_owner(&db, execution.turn_id.0, execution.generation).await;
+        assert!(rt.llm_task_handle.is_none());
+        assert_eq!(
+            client.requests.lock().unwrap().len(),
+            2,
+            "last-allowance report must not dispatch a third request or be clobbered by Exhausted"
+        );
+        let (requests, checkpoints, executions, messages) = ledger(&db).await;
+        assert_eq!((requests, checkpoints, executions, messages), (2, 2, 1, 3));
+        assert!(db
+            .get_messages(CONVERSATION)
+            .await
+            .unwrap()
+            .iter()
+            .all(|message| message.message_type != crate::db::MessageType::User));
+    }
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_refresh() {
+    use phoenix_core::domain::conversation_goal::{
+        GoalActor, GoalAttribution, GoalChange, GoalDisposition, GoalMutation,
+        GoalRequestOperation, GoalState,
+    };
+    let (_directory, db, receipt, mut initial, client) = adopted_with_limit(3).await;
+    let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
+    let old = rt.active_direct_turn.as_deref().unwrap().clone();
+    let old_stamp = rt.state_updated_at;
+    let old_binding = db
+        .conversation_goal_execution_binding(receipt.execution())
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(provider_response(vec![ContentBlock::ToolUse {
+            id: "explicit-blocked-before-resume".into(),
+            name: "goal_report".into(),
+            input: serde_json::json!({"status":"blocked", "reason":"need user input"}),
+        }]));
+    let response = dispatch_response(&mut rt).await;
+    rt.process_llm_completion(response).await.unwrap();
+    assert_eq!(rt.state, ConvState::Idle);
+    assert!(rt.active_direct_turn.is_none());
+    let blocked = db
+        .conversation_goal(&receipt.input().goal().owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(blocked.state, GoalState::Blocked(_)));
+    assert_eq!(
+        blocked.version.get(),
+        receipt.input().goal().version.get() + 1
+    );
+    let actor = GoalActor::GeneratedHost {
+        action_id: text("explicit-user-authorized-resume"),
+    };
+    let resumed = db
+        .apply_conversation_goal(
+            &GoalMutation {
+                owner: blocked.owner.clone(),
+                expected_version: blocked.version,
+                action_id: text("explicit-user-authorized-resume"),
+                attribution: GoalAttribution {
+                    requested_by: actor.clone(),
+                    applied_by: actor,
+                },
+                change: GoalChange::SetDisposition {
+                    goal_id: blocked.goal_id.clone(),
+                    disposition: GoalDisposition::Underway,
+                },
+            },
+            CONVERSATION,
+            GoalTimestampUs::parse(30).unwrap(),
+        )
+        .await
+        .unwrap()
+        .snapshot;
+    assert_eq!(resumed.goal_id, blocked.goal_id);
+    assert_eq!(resumed.version.get(), blocked.version.get() + 1);
+    assert_eq!(resumed.state, GoalState::Underway);
+    let before = ledger(&db).await;
+    let repo = db.workflow_repository();
+    assert!(repo
+        .admit_goal_start_request_context(
+            CONVERSATION,
+            Some((old.turn_id, old.generation)),
+            old_stamp,
+            GoalRequestOperation::Normal { attempt: 1 }
+        )
+        .await
+        .is_err());
+    assert!(matches!(
+        repo.recover_goal_start_runtime(&phoenix_db::workflow::GoalStartRecoveryInput::new(
+            CONVERSATION.into(),
+            (old.turn_id, old.generation),
+            (ConvState::LlmRequesting { attempt: 1 }, old_stamp),
+            Timestamp(31),
+        ))
+        .await
+        .unwrap(),
+        phoenix_db::workflow::GoalStartRecoveryOutcome::Refused
+    ));
+    assert_eq!(
+        ledger(&db).await,
+        before,
+        "resuming facts never starts or refreshes the old execution"
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        db.conversation_goal_execution_binding(receipt.execution())
+            .await
+            .unwrap()
+            .unwrap(),
+        old_binding
+    );
+    let start = GoalStartInput::new(
+        uuid::Uuid::new_v4(),
+        GoalStartRequester::Owner {
+            principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
+        },
+        resumed.fence(),
+    )
+    .unwrap();
+    let GoalStartAcceptance::Accepted(new_receipt) = db
+        .accept_owner_goal_start(&start, CONVERSATION, GoalTimestampUs::parse(32).unwrap())
+        .await
+        .unwrap()
+    else {
+        panic!("new explicit Start is required")
+    };
+    assert_ne!(new_receipt.execution(), receipt.execution());
+    assert_eq!(new_receipt.input().goal(), &resumed.fence());
+    assert_eq!(
+        ledger(&db).await,
+        before,
+        "typed Start acceptance is not a request charge or provider send"
+    );
+    let workflow =
+        phoenix_workflow::WorkflowId(u64::try_from(new_receipt.execution().workflow_id()).unwrap());
+    let now = u64::try_from(Utc::now().timestamp()).unwrap();
+    let claim = repo
+        .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+            turn_id: TurnAuthorityId(u64::try_from(new_receipt.execution().turn_id()).unwrap()),
+            workflow_id: workflow,
+            process_incarnation: ProcessIncarnation(1),
+            now: Timestamp(now),
+            lease_until: LeaseExpiry(now + 3600),
+        })
+        .await
+        .unwrap()
+        .authority
+        .unwrap();
+    let authority = phoenix_core::domain::sm_event::DirectTurnAttemptAuthority::new(
+        claim.workflow_id.0,
+        u64::try_from(new_receipt.execution().turn_id()).unwrap(),
+        claim.effect_id.0,
+        claim.attempt_id.0,
+        claim.declared_workflow_version.0,
+        claim.generation.0,
+        claim.process_incarnation.0,
+    );
+    let stored = db.get_conversation(CONVERSATION).await.unwrap();
+    rt.state = stored.state;
+    rt.state_updated_at = stored.state_updated_at;
+    let mut transition = transition(
+        &rt.state,
+        &rt.context,
+        Event::AuthoritativeGoalStart {
+            receipt: new_receipt.clone(),
+            authority,
+        },
+    )
+    .unwrap();
+    transition
+        .effects
+        .retain(|effect| !matches!(effect, Effect::RequestLlm));
+    rt.apply_transition_result(transition).await.unwrap();
+    let active = rt.active_direct_turn.as_deref().unwrap();
+    let context = repo
+        .admit_goal_start_request_context(
+            CONVERSATION,
+            Some((active.turn_id, active.generation)),
+            rt.state_updated_at,
+            GoalRequestOperation::Normal { attempt: 1 },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.admitted().intent().goal, resumed.fence());
+    assert_eq!(
+        db.conversation_goal_execution_binding(new_receipt.execution())
+            .await
+            .unwrap()
+            .unwrap()
+            .observation,
+        phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(resumed.fence())
+    );
+    assert_eq!(
+        db.conversation_goal_execution_binding(receipt.execution())
+            .await
+            .unwrap()
+            .unwrap(),
+        old_binding
+    );
+    assert_eq!(
+        ledger(&db).await,
+        (before.0 + 1, before.1, before.2 + 1, before.3),
+        "new binding uses the same finite per-goal ledger, not a refill"
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_automatic_yields_exhaust_once_without_inferred_progress_or_refill(
+) {
+    use phoenix_core::domain::conversation_goal::GoalState;
+    let (_directory, db, receipt, mut rt, client) = adopted().await;
+    let execution = rt.active_direct_turn.as_deref().unwrap().clone();
+    guard_terminal_projection_order(&db).await;
+    let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.effective_state());
+    rt.state_watcher = Some(watch_tx);
+    for answer in ["first ordinary answer", "second ordinary answer"] {
+        client
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(provider_response(vec![ContentBlock::text(answer)]));
+    }
+    let first = dispatch_response(&mut rt).await;
+    rt.process_llm_completion(first).await.unwrap();
+    let second = receive_automatic_response(&mut rt).await;
+    rt.process_llm_completion(second).await.unwrap();
+    let goal = db
+        .conversation_goal(&receipt.input().goal().owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(goal.state, GoalState::Exhausted(_)));
+    assert_eq!(goal.version.get(), receipt.input().goal().version.get() + 1);
+    assert_eq!(rt.state, ConvState::Idle);
+    assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+    assert!(rt.active_direct_turn.is_none());
+    assert!(rt.pending_direct_turn_terminal.is_none());
+    assert_completed_start_owner(&db, execution.turn_id.0, execution.generation).await;
+    assert!(rt.llm_task_handle.is_none());
+    assert_eq!(ledger(&db).await, (2, 2, 1, 2));
+    let new_start = GoalStartInput::new(
+        uuid::Uuid::new_v4(),
+        GoalStartRequester::Owner {
+            principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
+        },
+        goal.fence(),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.accept_owner_goal_start(
+            &new_start,
+            CONVERSATION,
+            GoalTimestampUs::parse(20).unwrap()
+        )
+        .await,
+        Err(phoenix_db::conversation_goals::start::GoalStartError::StaleGoal)
+    ));
+    assert_eq!(ledger(&db).await, (2, 2, 1, 2));
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
+    change_control(&db, &receipt.input().goal().owner, ControlCommand::Stop, 1).await;
+    change_control(
+        &db,
+        &receipt.input().goal().owner,
+        ControlCommand::Release,
+        2,
+    )
+    .await;
+    assert!(matches!(
+        db.accept_owner_goal_start(
+            &new_start,
+            CONVERSATION,
+            GoalTimestampUs::parse(21).unwrap()
+        )
+        .await,
+        Err(phoenix_db::conversation_goals::start::GoalStartError::StaleGoal)
+    ));
+    assert_eq!(
+        ledger(&db).await,
+        (2, 2, 1, 2),
+        "Stop/release never refills an immutable goal's allowance"
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
+    assert!(matches!(
+        db.conversation_goal(&receipt.input().goal().owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        GoalState::Exhausted(_)
+    ));
+}
+
+#[tokio::test]
+async fn conversation_goal_ephemeral_tokens_use_ordinary_stream_before_canonical_commit_without_goal_mutation(
+) {
+    let (_directory, db, receipt, mut rt, client) = adopted().await;
+    *client.streamed_text.lock().unwrap() = Some("ordinary streamed text".into());
+    client
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(provider_response(vec![ContentBlock::text(
+            "canonical answer",
+        )]));
+    let before = canonical_counts(&db).await;
+    let mut events = rt.broadcast_tx.subscribe();
+    let completion = dispatch_response(&mut rt).await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let SseEvent::Token { text, .. } = events.recv().await.unwrap().as_ref() {
+                assert_eq!(text, "ordinary streamed text");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("actual token forwarder publication");
+    assert_eq!(canonical_counts(&db).await, before);
+    let goal = db
+        .conversation_goal(&receipt.input().goal().owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.version, receipt.input().goal().version);
+    assert!(matches!(
+        goal.state,
+        phoenix_core::domain::conversation_goal::GoalState::Underway
+    ));
+    rt.process_llm_completion(completion).await.unwrap();
+    assert_eq!(canonical_counts(&db).await.2, 1);
+    rt.abort_external_effects_in_memory();
+}
+
+#[tokio::test]
+async fn conversation_goal_automatic_logical_boundary_refreshes_guidance_and_skill_metadata_without_new_execution(
+) {
+    let (directory, _db, receipt, mut rt, client) = adopted().await;
+    let skill_dir = directory.path().join(".claude/skills/goal-boundary");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let skill = skill_dir.join("SKILL.md");
+    std::fs::write(
+        directory.path().join("AGENTS.md"),
+        "goal guidance before logical yield",
+    )
+    .unwrap();
+    std::fs::write(&skill, "---\nname: goal-boundary\ndescription: metadata before logical yield\n---\nUse current instructions.\n").unwrap();
+    client
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(provider_response(vec![ContentBlock::text("yield")]));
+    let first = dispatch_response(&mut rt).await;
+    std::fs::write(
+        directory.path().join("AGENTS.md"),
+        "goal guidance after logical yield",
+    )
+    .unwrap();
+    std::fs::write(&skill, "---\nname: goal-boundary\ndescription: metadata after logical yield\n---\nUse current instructions.\n").unwrap();
+    rt.process_llm_completion(first).await.unwrap();
+    let second = receive_automatic_response(&mut rt).await;
+    assert_eq!(
+        second.admitted.as_ref().unwrap().intent().execution,
+        receipt.execution()
+    );
+    let requests = client.requests.lock().unwrap();
+    let before = requests[0]
+        .system
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let after = requests[1]
+        .system
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(before.contains("goal guidance before logical yield"));
+    assert!(before.contains("metadata before logical yield"));
+    assert!(after.contains("goal guidance after logical yield"));
+    assert!(after.contains("metadata after logical yield"));
+    assert!(!after.contains("metadata before logical yield"));
+    drop(requests);
+    rt.abort_external_effects_in_memory();
 }
 
 async fn canonical_counts(db: &Database) -> (i64, i64, i64, i64) {
@@ -114,7 +667,14 @@ async fn conversation_goal_actual_provider_response_commits_checkpoint_and_keeps
         usage: usage.clone(),
         request_id: request_id.clone(),
     };
-    let request_id = completion.admitted.intent().id.as_str().to_owned();
+    let request_id = completion
+        .admitted
+        .as_ref()
+        .unwrap()
+        .intent()
+        .id
+        .as_str()
+        .to_owned();
     assert_eq!(
         canonical_counts(&db).await,
         before,
@@ -122,16 +682,17 @@ async fn conversation_goal_actual_provider_response_commits_checkpoint_and_keeps
     );
     let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(rt.state.clone());
     rt.state_watcher = Some(watch_tx);
-    rt.process_goal_request_completion(completion)
-        .await
-        .unwrap();
+    rt.process_llm_completion(completion).await.unwrap();
     let after = canonical_counts(&db).await;
-    assert_eq!(after, (before.0 + 1, before.1, before.2 + 1, before.3));
+    assert_eq!(after, (before.0 + 1, before.1 + 1, before.2 + 1, before.3));
     let message = db.get_message_by_id(&request_id).await.unwrap();
     assert!(matches!(message.content, MessageContent::Agent(_)));
-    assert_eq!(rt.state, ConvState::Idle);
+    assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
     assert!(watch_rx.has_changed().unwrap());
-    assert_eq!(*watch_rx.borrow_and_update(), ConvState::Idle);
+    assert!(matches!(
+        *watch_rx.borrow_and_update(),
+        ConvState::LlmRequesting { .. }
+    ));
     let persisted = db.get_conversation(CONVERSATION).await.unwrap();
     assert_eq!(
         (persisted.state, persisted.state_updated_at),
@@ -154,11 +715,17 @@ async fn conversation_goal_actual_provider_response_commits_checkpoint_and_keeps
     assert!(publications.try_recv().is_err());
     assert_eq!(canonical_counts(&db).await, after);
     assert!(!watch_rx.has_changed().unwrap());
+    let successor = receive_automatic_response(&mut rt).await;
+    assert_eq!(
+        successor.admitted.as_ref().unwrap().intent().execution,
+        receipt.execution()
+    );
     assert_eq!(
         client.requests.lock().unwrap().len(),
-        1,
-        "producer is not activated by this checkpoint"
+        2,
+        "the existing producer dispatches the admitted same-execution successor"
     );
+    rt.abort_external_effects_in_memory();
 }
 
 #[tokio::test]
@@ -179,10 +746,15 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
             )],
         ));
     let completion = dispatch_response(&mut rt).await;
-    let first_request = completion.admitted.intent().id.as_str().to_owned();
-    rt.process_goal_request_completion(completion)
-        .await
-        .unwrap();
+    let first_request = completion
+        .admitted
+        .as_ref()
+        .unwrap()
+        .intent()
+        .id
+        .as_str()
+        .to_owned();
+    rt.process_llm_completion(completion).await.unwrap();
     assert!(matches!(rt.state, ConvState::ToolExecuting { .. }));
     let persisted = db.get_conversation(CONVERSATION).await.unwrap();
     assert_eq!(
@@ -312,11 +884,19 @@ async fn conversation_goal_late_actual_response_after_stop_input_slot_or_reconst
         }
         let before = canonical_counts(&db).await;
         let mut publications = rt.broadcast_tx.subscribe();
+        let handle = rt.llm_task_handle.as_ref().unwrap().id();
+        rt.process_llm_completion(completion).await.unwrap();
+        assert_eq!(rt.llm_task_handle.as_ref().unwrap().id(), handle, "{fence}");
         assert!(
-            rt.process_goal_request_completion(completion)
-                .await
-                .is_err(),
-            "{fence}"
+            matches!(
+                db.conversation_goal(&receipt.input().goal().owner)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                phoenix_core::domain::conversation_goal::GoalState::Underway
+            ),
+            "{fence}: stale/blocked admission is not allowance exhaustion"
         );
         assert!(publications.try_recv().is_err(), "{fence}");
         assert_eq!(canonical_counts(&db).await, before, "{fence}");
@@ -360,20 +940,26 @@ async fn conversation_goal_two_actual_response_operations_cannot_consume_each_ot
     }
     let old = dispatch_response(&mut rt).await;
     let current = dispatch_response(&mut rt).await;
-    assert_eq!(old.admitted.intent().id, current.admitted.intent().id);
+    assert_eq!(
+        old.admitted.as_ref().unwrap().intent().id,
+        current.admitted.as_ref().unwrap().intent().id
+    );
     assert_ne!(old.generation, current.generation);
     let before = canonical_counts(&db).await;
     let mut publications = rt.broadcast_tx.subscribe();
-    rt.process_goal_request_completion(old).await.unwrap();
+    rt.process_llm_completion(old).await.unwrap();
     assert_eq!(canonical_counts(&db).await, before);
     assert!(publications.try_recv().is_err());
     assert!(rt.pending_goal_request_checkpoint.is_none());
-    rt.process_goal_request_completion(current).await.unwrap();
+    rt.process_llm_completion(current).await.unwrap();
     assert_eq!(
         canonical_counts(&db).await,
-        (before.0 + 1, before.1, before.2 + 1, before.3)
+        (before.0 + 1, before.1 + 1, before.2 + 1, before.3)
     );
-    assert_eq!(client.requests.lock().unwrap().len(), 2);
+    let successor = receive_automatic_response(&mut rt).await;
+    assert!(successor.admitted.is_some());
+    assert_eq!(client.requests.lock().unwrap().len(), 3);
+    rt.abort_external_effects_in_memory();
 }
 
 #[tokio::test]
@@ -391,14 +977,20 @@ async fn conversation_goal_actual_report_round_commits_mutation_and_checkpoint_o
         )]));
     let before = canonical_counts(&db).await;
     let completion = dispatch_response(&mut rt).await;
-    let request_id = completion.admitted.intent().id.as_str().to_owned();
-    let result = rt.process_goal_request_completion(completion).await;
-    assert!(
-        result.is_err(),
-        "completed goal cannot admit another provider request"
-    );
+    let request_id = completion
+        .admitted
+        .as_ref()
+        .unwrap()
+        .intent()
+        .id
+        .as_str()
+        .to_owned();
+    rt.process_llm_completion(completion).await.unwrap();
+    assert_eq!(rt.state, ConvState::Idle);
+    assert!(rt.active_direct_turn.is_none());
+    assert!(rt.pending_direct_turn_terminal.is_none());
     let after = canonical_counts(&db).await;
-    assert_eq!(after, (before.0 + 2, before.1, before.2 + 1, before.3));
+    assert_eq!(after, (before.0 + 2, before.1, before.2 + 1, before.3 + 1));
     let goal = db
         .conversation_goal(&receipt.input().goal().owner)
         .await
@@ -449,10 +1041,10 @@ async fn conversation_goal_actual_tool_round_rollback_keeps_exact_source_and_no_
             )],
         ));
     let current = dispatch_response(&mut rt).await;
+    rt.process_llm_completion(current).await.unwrap();
     let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.state.clone());
     rt.state_watcher = Some(watch_tx);
     let mut publications = rt.broadcast_tx.subscribe();
-    rt.process_goal_request_completion(current).await.unwrap();
     let source = rt.state.clone();
     let source_stamp = rt.state_updated_at;
     assert!(matches!(source, ConvState::ToolExecuting { .. }));
@@ -519,56 +1111,63 @@ async fn conversation_goal_stale_same_id_completion_preserves_newer_handle_and_c
     let mut old_error = dispatch_response(&mut rt).await;
     let old_response = dispatch_response(&mut rt).await;
     let current = dispatch_response(&mut rt).await;
-    assert_eq!(old_error.admitted.intent().id, current.admitted.intent().id);
     assert_eq!(
-        old_response.admitted.intent().id,
-        current.admitted.intent().id
+        old_error.admitted.as_ref().unwrap().intent().id,
+        current.admitted.as_ref().unwrap().intent().id
+    );
+    assert_eq!(
+        old_response.admitted.as_ref().unwrap().intent().id,
+        current.admitted.as_ref().unwrap().intent().id
     );
     assert!(old_error.generation < old_response.generation);
     assert!(old_response.generation < current.generation);
     let handle_id = rt.llm_task_handle.as_ref().unwrap().id();
     let current_generation = current.generation;
     let before = canonical_counts(&db).await;
-    let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.state.clone());
+    let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(rt.state.clone());
     rt.state_watcher = Some(watch_tx);
     let mut publications = rt.broadcast_tx.subscribe();
     old_error.outcome = LlmOutcome::NetworkError {
         message: "late actual task failure".into(),
     };
-    rt.process_goal_request_completion(old_error).await.unwrap();
+    rt.process_llm_completion(old_error).await.unwrap();
     assert_eq!(rt.llm_task_handle.as_ref().unwrap().id(), handle_id);
     assert!(rt.active_llm_attempt.is_some());
-    assert!(rt.active_goal_request_dispatch.is_some());
     assert_eq!(canonical_counts(&db).await, before);
     assert!(!watch_rx.has_changed().unwrap());
     assert!(publications.try_recv().is_err());
 
-    rt.process_goal_request_completion(current).await.unwrap();
+    rt.process_llm_completion(current).await.unwrap();
     assert!(matches!(rt.state, ConvState::ToolExecuting { .. }));
-    assert_eq!(
-        rt.pending_goal_request_checkpoint
-            .as_ref()
-            .unwrap()
-            .generation,
-        current_generation
-    );
+    assert!(rt.pending_goal_request_checkpoint.is_some());
     let tool_handle = rt.tool_task_handle.as_ref().unwrap().id();
-    rt.process_goal_request_completion(old_response)
-        .await
-        .unwrap();
+    let source_before_stale = rt
+        .pending_goal_request_checkpoint
+        .as_ref()
+        .unwrap()
+        .source
+        .clone();
+    let stamp_before_stale = rt
+        .pending_goal_request_checkpoint
+        .as_ref()
+        .unwrap()
+        .source_updated_at;
+    watch_rx.borrow_and_update();
+    while publications.try_recv().is_ok() {}
+    rt.process_llm_completion(old_response).await.unwrap();
     assert_eq!(rt.tool_task_handle.as_ref().unwrap().id(), tool_handle);
     let pending = rt.pending_goal_request_checkpoint.as_ref().unwrap();
-    assert_eq!(pending.generation, current_generation);
-    assert_eq!(pending.source, rt.state);
-    assert_eq!(pending.source_updated_at, rt.state_updated_at);
+    assert_eq!(rt.llm_request_generation, current_generation);
+    assert_eq!(pending.source, source_before_stale);
+    assert_eq!(pending.source_updated_at, stamp_before_stale);
     assert_eq!(canonical_counts(&db).await, before);
     assert!(
         !watch_rx.has_changed().unwrap(),
-        "tool source is durable but not published before canonical commit"
+        "stale envelope must not publish a different state"
     );
     assert!(
         publications.try_recv().is_err(),
-        "no assistant, tool preview or selected state before commit"
+        "stale envelope has no publication"
     );
     rt.abort_external_effects_in_memory();
 }
@@ -587,8 +1186,8 @@ async fn conversation_goal_pending_actual_round_refuses_next_dispatch_without_cl
             serde_json::json!({"thoughts":"no next dispatch yet"}),
         )]));
     let current = dispatch_response(&mut rt).await;
-    let id = current.admitted.intent().id.clone();
-    rt.process_goal_request_completion(current).await.unwrap();
+    let id = current.admitted.as_ref().unwrap().intent().id.clone();
+    rt.process_llm_completion(current).await.unwrap();
     let before = canonical_counts(&db).await;
     assert!(rt.execute_effect(Effect::RequestLlm).await.is_err());
     assert_eq!(canonical_counts(&db).await, before);
@@ -668,10 +1267,7 @@ async fn conversation_goal_actual_response_rollback_publishes_neither_message_no
     .execute(db.pool())
     .await
     .unwrap();
-    assert!(rt
-        .process_goal_request_completion(completion)
-        .await
-        .is_err());
+    assert!(rt.process_llm_completion(completion).await.is_err());
     assert_eq!(canonical_counts(&db).await, before);
     let persisted = db.get_conversation(CONVERSATION).await.unwrap();
     assert_eq!(

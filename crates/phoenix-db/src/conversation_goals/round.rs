@@ -207,7 +207,7 @@ pub(super) fn result_message(
     })
 }
 
-async fn retained_message_tx(tx: &mut GoalTx<'_>, id: &str) -> Result<Option<Message>> {
+pub(crate) async fn retained_message_tx(tx: &mut GoalTx<'_>, id: &str) -> Result<Option<Message>> {
     Ok(sqlx::query("SELECT message_id,conversation_id,sequence_id,message_type,content,display_data,usage_data,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_instance_id,origin_source_message_id,origin_source_tool_use_id FROM messages WHERE message_id=?")
         .bind(id).try_map(crate::parse_message_row).fetch_optional(&mut **tx).await?)
 }

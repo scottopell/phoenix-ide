@@ -103,6 +103,10 @@ impl PreparedGoalStartRequestContext {
         &self.intent.id
     }
 
+    pub(super) fn intent(&self) -> &GoalRequestIntent {
+        &self.intent
+    }
+
     fn after_commit(self) -> GoalStartRequestContext {
         GoalStartRequestContext {
             admitted: AdmittedGoalRequest {
@@ -225,11 +229,6 @@ impl WorkflowRepository {
         .await
         .map_err(|error| DbError::Serialization(error.to_string()))?
         .ok_or_else(|| DbError::Serialization("Start request was not durably charged".into()))?;
-        crate::conversation_goals::execution::require_live_request_tx(
-            &mut tx.tx, &intent, transcript,
-        )
-        .await
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
         let state: ConvState = serde_json::from_str(&row.get::<String, _>("state"))
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let initial_timestamp = row.get::<String, _>("state_updated_at")
@@ -240,6 +239,11 @@ impl WorkflowRepository {
             .ok_or_else(|| DbError::Serialization("Start request lost its latest intent".into()))?;
         let new_intent = latest.checkpoint.is_some();
         let selected = select_intent(&intent, latest, generation, &operation)?;
+        crate::conversation_goals::execution::require_live_request_tx(
+            &mut tx.tx, &selected, transcript,
+        )
+        .await
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
         let permitted = match (&operation, &selected.cause) {
             (GoalRequestOperation::Normal { attempt }, GoalRequestCause::Initial) => {
                 permits_initial_request(&state, &selected.id, initial_timestamp)
@@ -502,7 +506,13 @@ mod tests {
         )
         .unwrap();
         assert_ne!(left.id, right.id);
+        assert_eq!(left.goal, initial.goal);
+        assert_eq!(right.goal, initial.goal);
         assert_eq!(left.id.as_str().len(), "goal-request:".len() + 64);
+        let mut changed_version = retained.clone();
+        changed_version.intent.goal.version = GoalVersion::parse(2).unwrap();
+        assert!(select_intent(&initial, changed_version, 1, &GoalRequestOperation::Normal { attempt: 1 }).is_err(),
+            "even a retained request for the same Goal ID cannot silently upgrade the admission version");
         let mut predecessor = retained;
         for ordinal in 1..=100 {
             predecessor.checkpoint = Some(GoalText::parse("durable checkpoint").unwrap());
@@ -514,6 +524,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(next.id.as_str().len(), "goal-request:".len() + 64);
+            assert_eq!(
+                next.goal, initial.goal,
+                "a new causal request never refreshes Goal authority"
+            );
             predecessor = crate::conversation_goals::execution::GoalRequestAdmission {
                 intent: next,
                 ordinal: i64::try_from(ordinal).unwrap(),

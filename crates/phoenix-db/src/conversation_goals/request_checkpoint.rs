@@ -9,10 +9,16 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::fmt::Write as _;
 
-use super::{execution, management::GoalManagementTarget, round, GoalTx};
+use super::{execution, round, GoalTx};
 use crate::{workflow::AdmittedGoalRequest, Database, DbError, DbResult};
 
 /// Actual-dispatch receipt and the exact source/target state of its canonical commit.
+pub(crate) struct GoalAccounting<'a> {
+    pub admitted: &'a AdmittedGoalRequest,
+    pub source: &'a ConvState,
+    pub source_updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct GoalRequestCheckpoint<'a> {
     pub admitted: &'a AdmittedGoalRequest,
     pub source: &'a ConvState,
@@ -26,10 +32,7 @@ pub struct GoalRequestCheckpoint<'a> {
 
 pub enum GoalRequestEvidence<'a> {
     Response,
-    Round {
-        results: &'a [ToolRoundResult],
-        management_targets: &'a [GoalManagementTarget],
-    },
+    Round { results: &'a [ToolRoundResult] },
 }
 
 #[derive(Debug)]
@@ -38,14 +41,7 @@ pub enum GoalRequestCheckpointOutcome {
     Refused,
 }
 
-#[derive(Clone, Copy)]
-enum Cut {
-    None,
-    #[cfg(test)]
-    BeforeCommit,
-    #[cfg(test)]
-    AfterCommit,
-}
+pub(crate) use crate::provider_replay::CanonicalCommitCut as Cut;
 
 impl Database {
     /// Validate a completion before it can publish an in-flight assistant or run tools.
@@ -106,176 +102,97 @@ impl Database {
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn commit_goal_request_checkpoint_at_cut(
         &self,
         command: &GoalRequestCheckpoint<'_>,
         cut: Cut,
     ) -> DbResult<GoalRequestCheckpointOutcome> {
-        use GoalRequestCheckpointOutcome::{Committed, Refused};
-        if self.goal_execution_installation == execution::GoalExecutionInstallation::Disabled {
-            return Ok(Refused);
+        match self.persist_canonical_checkpoint(command, cut).await? {
+            crate::provider_replay::CanonicalWriteOutcome::Committed(round) => {
+                Ok(GoalRequestCheckpointOutcome::Committed(round))
+            }
+            crate::provider_replay::CanonicalWriteOutcome::Superseded => {
+                Ok(GoalRequestCheckpointOutcome::Refused)
+            }
         }
-        validate_shape(command)?;
-        let key = checkpoint_key(command)?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if !live_owner_tx(
-            &mut tx,
-            command.admitted,
-            &command.assistant.conversation_id,
-        )
-        .await?
-        {
-            return Ok(Refused);
-        }
-        let retained = execution::retained_request_tx(
-            &mut tx,
-            self.goal_execution_installation,
-            command.admitted.intent(),
-        )
+    }
+}
+
+pub(crate) enum AccountingAdmission {
+    Ready(GoalText),
+    Retained(round::CommittedGoalRound),
+    Refused,
+}
+
+pub(crate) async fn admit_accounting_tx(
+    tx: &mut GoalTx<'_>,
+    command: &GoalRequestCheckpoint<'_>,
+    installation: execution::GoalExecutionInstallation,
+) -> DbResult<AccountingAdmission> {
+    use AccountingAdmission::{Ready, Refused, Retained};
+    if installation == execution::GoalExecutionInstallation::Disabled {
+        return Ok(Refused);
+    }
+    validate_shape(command)?;
+    let key = checkpoint_key(command)?;
+    let retained = execution::retained_request_tx(tx, installation, command.admitted.intent())
         .await
         .map_err(request_error)?
         .ok_or_else(|| {
             DbError::Serialization("canonical checkpoint lost admitted request".into())
         })?;
-        if retained.checkpoint.is_some() {
-            return Ok(
-                match retained_bundle_tx(&mut tx, command, &key, self.goal_execution_installation)
-                    .await?
-                {
-                    Some(committed) => Committed(committed),
-                    None => Refused,
-                },
-            );
-        }
-        if !exact_slot_tx(
-            &mut tx,
-            &command.assistant.conversation_id,
-            command.source,
-            command.source_updated_at,
-        )
-        .await?
-        {
-            return Ok(Refused);
-        }
-        match execution::require_live_request_tx(
-            &mut tx,
-            command.admitted.intent(),
-            &command.assistant.conversation_id,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(error) if ordinary_refusal(&error) => return Ok(Refused),
-            Err(error) => return Err(request_error(error)),
-        }
-        execution::checkpoint_request_tx(
-            &mut tx,
-            self.goal_execution_installation,
-            command.admitted.intent(),
-            command.admitted.claim_generation(),
-            &key,
-        )
-        .await
-        .map_err(request_error)?;
-        let results = match &command.evidence {
-            GoalRequestEvidence::Response => {
-                crate::insert_message_tx(&mut tx, command.assistant).await?;
-                Vec::new()
-            }
-            GoalRequestEvidence::Round {
-                results,
-                management_targets,
-            } => {
-                let (messages, replayed) = round::write_round_tx(
-                    &mut tx,
-                    &command.assistant.conversation_id,
-                    command.assistant,
-                    round::ToolRoundWrite::Management {
-                        execution: command.admitted.intent().execution,
-                        results,
-                        targets: management_targets,
-                    },
-                    command.state,
-                    command.state_updated_at,
-                    self.goal_write_policies(),
-                )
-                .await?;
-                if replayed {
-                    return Err(DbError::Serialization(
-                        "canonical round exists without request checkpoint".into(),
-                    ));
-                }
-                messages
-            }
-        };
-        if let Some(update) = command.provider_replay {
-            crate::provider_replay::validate_goal_round_replay(command.assistant, update)?;
-            crate::provider_replay::apply_replay_tx(
-                &mut tx,
-                &command.assistant.conversation_id,
-                update,
-            )
-            .await?;
-        }
-        let (state, state_updated_at) = round::selected_state_tx(
-            &mut tx,
-            &command.assistant.conversation_id,
-            command.state,
-            command.state_updated_at,
-            false,
-            self.goal_control_installation,
-        )
-        .await
-        .map_err(round::db_error)?;
-        let committed = round::CommittedGoalRound {
-            results,
-            state,
-            state_updated_at,
-            replayed: false,
-        };
-        let result = match cut {
-            Cut::None => tx.commit().await.map_err(DbError::from),
-            #[cfg(test)]
-            Cut::BeforeCommit => {
-                tx.rollback().await?;
-                Err(DbError::Serialization(
-                    "injected before canonical request commit".into(),
-                ))
-            }
-            #[cfg(test)]
-            Cut::AfterCommit => {
-                tx.commit().await?;
-                Err(DbError::Serialization(
-                    "injected after canonical request commit".into(),
-                ))
-            }
-        };
-        if let Err(error) = result {
-            let mut probe = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            if !live_owner_tx(
-                &mut probe,
-                command.admitted,
-                &command.assistant.conversation_id,
-            )
-            .await?
-            {
-                return Err(error);
-            }
-            return match retained_bundle_tx(
-                &mut probe,
-                command,
-                &key,
-                self.goal_execution_installation,
-            )
-            .await?
-            {
-                Some(committed) => Ok(Committed(committed)),
-                None => Err(error),
-            };
-        }
-        Ok(Committed(committed))
+    if retained.checkpoint.is_some() {
+        return Ok(
+            match retained_bundle_tx(tx, command, &key, installation).await? {
+                Some(round) => Retained(round),
+                None => Refused,
+            },
+        );
     }
+    if !live_owner_tx(tx, command.admitted, &command.assistant.conversation_id).await? {
+        return Ok(Refused);
+    }
+    if !exact_slot_tx(
+        tx,
+        &command.assistant.conversation_id,
+        command.source,
+        command.source_updated_at,
+    )
+    .await?
+    {
+        return Ok(Refused);
+    }
+    match execution::require_live_request_tx(
+        tx,
+        command.admitted.intent(),
+        &command.assistant.conversation_id,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) if ordinary_refusal(&error) => return Ok(Refused),
+        Err(error) => return Err(request_error(error)),
+    }
+    // The explicit report may close the Goal. Charge settlement precedes that write in this transaction.
+    execution::checkpoint_request_tx(
+        tx,
+        installation,
+        command.admitted.intent(),
+        command.admitted.claim_generation(),
+        &key,
+    )
+    .await
+    .map_err(request_error)?;
+    Ok(Ready(key))
+}
+
+pub(crate) async fn classify_accounting_tx(
+    tx: &mut GoalTx<'_>,
+    command: &GoalRequestCheckpoint<'_>,
+    key: &GoalText,
+    installation: execution::GoalExecutionInstallation,
+) -> DbResult<Option<round::CommittedGoalRound>> {
+    retained_bundle_tx(tx, command, key, installation).await
 }
 
 fn validate_shape(command: &GoalRequestCheckpoint<'_>) -> DbResult<()> {
@@ -366,14 +283,30 @@ async fn live_owner_tx(
     admitted: &AdmittedGoalRequest,
     transcript: &str,
 ) -> DbResult<bool> {
+    if !same_claim_tx(tx, admitted, transcript).await? {
+        return Ok(false);
+    }
+    let terminal: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM direct_turn_terminal_obligations WHERE turn_id=?)",
+    )
+    .bind(admitted.intent().execution.turn_id())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(!terminal)
+}
+
+async fn same_claim_tx(
+    tx: &mut GoalTx<'_>,
+    admitted: &AdmittedGoalRequest,
+    transcript: &str,
+) -> DbResult<bool> {
     let intent = admitted.intent();
     let live: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM durable_turns t JOIN workflows w ON w.workflow_id=t.workflow_id
          WHERE t.turn_id=? AND t.workflow_id=? AND t.conversation_id=? AND t.generation=?
            AND w.generation=t.generation AND w.status='Active' AND t.input_kind='goal_start'
            AND t.disposition='Runtime' AND t.materialized=1 AND t.owns_conversation=1
-           AND t.terminal_kind IS NULL AND NOT EXISTS(
-             SELECT 1 FROM direct_turn_terminal_obligations o WHERE o.turn_id=t.turn_id))",
+           AND t.terminal_kind IS NULL)",
     ).bind(intent.execution.turn_id()).bind(intent.execution.workflow_id())
         .bind(transcript).bind(admitted.claim_generation())
         .fetch_one(&mut **tx).await?;
@@ -401,17 +334,34 @@ async fn retained_bundle_tx(
     key: &GoalText,
     installation: execution::GoalExecutionInstallation,
 ) -> DbResult<Option<round::CommittedGoalRound>> {
+    if !same_claim_tx(tx, command.admitted, &command.assistant.conversation_id).await? {
+        return Ok(None);
+    }
+    let selected = settle_request_boundary_tx(tx, command, None).await?;
+    let terminal = terminal_obligation(command, &selected)?;
+    let slot_matches = if let Some(obligation) = terminal.as_ref() {
+        crate::workflow::WorkflowRepository::terminal_obligation_matches_tx(tx, obligation).await?
+            && exact_slot_tx(
+                tx,
+                &command.assistant.conversation_id,
+                command.source,
+                command.source_updated_at,
+            )
+            .await?
+    } else {
+        live_owner_tx(tx, command.admitted, &command.assistant.conversation_id).await?
+            && exact_slot_tx(
+                tx,
+                &command.assistant.conversation_id,
+                &selected,
+                command.state_updated_at,
+            )
+            .await?
+    };
     let retained = execution::retained_request_tx(tx, installation, command.admitted.intent())
         .await
         .map_err(request_error)?;
-    if !retained.is_some_and(|retained| retained.checkpoint.as_ref() == Some(key))
-        || !exact_slot_tx(
-            tx,
-            &command.assistant.conversation_id,
-            command.state,
-            command.state_updated_at,
-        )
-        .await?
+    if !retained.is_some_and(|retained| retained.checkpoint.as_ref() == Some(key)) || !slot_matches
     {
         return Ok(None);
     }
@@ -460,7 +410,7 @@ async fn retained_bundle_tx(
                     assistant: command.assistant,
                     execution: command.admitted.intent().execution,
                     results,
-                    state: command.state,
+                    state: &selected,
                     state_updated_at: command.state_updated_at,
                 },
             )
@@ -485,7 +435,7 @@ async fn retained_bundle_tx(
     }
     Ok(Some(round::CommittedGoalRound {
         results,
-        state: command.state.clone(),
+        state: selected,
         state_updated_at: command.state_updated_at,
         replayed: true,
     }))
@@ -515,4 +465,98 @@ fn ordinary_refusal(error: &execution::GoalRequestError) -> bool {
                     )
             )
     )
+}
+
+pub(crate) fn terminal_obligation(
+    command: &GoalRequestCheckpoint<'_>,
+    selected: &ConvState,
+) -> DbResult<Option<crate::workflow::DirectTurnTerminalObligationInput>> {
+    if !matches!(selected, ConvState::Idle) {
+        return Ok(None);
+    }
+    let turn = u64::try_from(command.admitted.intent().execution.turn_id())
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let generation = u64::try_from(command.admitted.claim_generation())
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    Ok(Some(crate::workflow::DirectTurnTerminalObligationInput {
+        turn_id: phoenix_workflow::TurnAuthorityId(turn),
+        expected_generation: generation,
+        terminal: phoenix_workflow::TurnTerminal::Completed,
+        projection: crate::workflow::PersistedConversationProjection {
+            state: selected.clone(),
+            state_updated_at: command.state_updated_at,
+        },
+        response_message_id: None,
+    }))
+}
+
+pub(crate) async fn settle_request_boundary_tx(
+    tx: &mut GoalTx<'_>,
+    command: &GoalRequestCheckpoint<'_>,
+    policies: Option<execution::GoalWritePolicies>,
+) -> DbResult<ConvState> {
+    use phoenix_core::domain::conversation_goal::{
+        GoalActor, GoalAttribution, GoalChange, GoalDisposition, GoalMutation, GoalState,
+        GoalTimestampUs,
+    };
+    if !matches!(
+        command.state,
+        ConvState::Idle | ConvState::LlmRequesting { .. }
+    ) {
+        return Ok(command.state.clone());
+    }
+    let intent = command.admitted.intent();
+    let Some(goal) = super::snapshot_tx(tx, &intent.goal.owner)
+        .await
+        .map_err(round::db_error)?
+    else {
+        return Ok(ConvState::Idle);
+    };
+    if goal.goal_id != intent.goal.goal_id || !matches!(goal.state, GoalState::Underway) {
+        return Ok(ConvState::Idle);
+    }
+    let (used, limit): (i64, i64) = sqlx::query_as(
+        "SELECT
+        (SELECT count(*) FROM conversation_goal_requests WHERE goal_id=?),request_limit
+        FROM conversation_goal_limits WHERE goal_id=?",
+    )
+    .bind(goal.goal_id.as_str())
+    .bind(goal.goal_id.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    if used >= limit {
+        if let Some(policies) = policies {
+            let action = GoalText::parse(format!("{}:allowance-exhausted", intent.id.as_str()))
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let actor = GoalActor::GeneratedHost {
+                action_id: action.clone(),
+            };
+            super::apply_tx(
+                tx,
+                &GoalMutation {
+                    owner: goal.owner,
+                    expected_version: goal.version,
+                    action_id: action,
+                    attribution: GoalAttribution {
+                        requested_by: actor.clone(),
+                        applied_by: actor,
+                    },
+                    change: GoalChange::SetDisposition {
+                        goal_id: goal.goal_id,
+                        disposition: GoalDisposition::Exhausted(
+                            GoalText::parse("request allowance exhausted")
+                                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                        ),
+                    },
+                },
+                GoalTimestampUs::parse(command.state_updated_at.timestamp_micros())
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                policies,
+            )
+            .await
+            .map_err(round::db_error)?;
+        }
+        return Ok(ConvState::Idle);
+    }
+    Ok(ConvState::LlmRequesting { attempt: 1 })
 }

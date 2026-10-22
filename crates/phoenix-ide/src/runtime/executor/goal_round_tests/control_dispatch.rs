@@ -249,11 +249,14 @@ async fn conversation_goal_stop_after_model_admission_before_first_poll_prevents
             .await
             .unwrap()
             .unwrap();
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let LlmCompletion {
+            generation: generation,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(outcome, LlmOutcome::GoalControlRevoked));
         rt.process_generation_tagged_llm_outcome(generation, outcome)
             .await;
@@ -359,11 +362,14 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_provider_future() {
             .await
             .unwrap()
             .unwrap();
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let LlmCompletion {
+            generation: generation,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(outcome, LlmOutcome::GoalControlRevoked));
         rt.process_generation_tagged_llm_outcome(generation, outcome)
             .await;

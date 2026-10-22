@@ -10318,34 +10318,29 @@ impl Database {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<conversation_goals::round::CommittedGoalRound> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (results, replayed) = conversation_goals::round::write_round_tx(
-            &mut tx,
-            conversation_id,
-            assistant,
-            input,
-            state,
-            state_updated_at,
-            self.goal_write_policies(),
-        )
-        .await?;
-        let (state, state_updated_at) = conversation_goals::round::selected_state_tx(
-            &mut tx,
-            conversation_id,
-            state,
-            state_updated_at,
-            replayed,
-            self.goal_control_installation,
-        )
-        .await
-        .map_err(conversation_goals::round::db_error)?;
-        tx.commit().await?;
-        Ok(conversation_goals::round::CommittedGoalRound {
-            results,
-            state,
-            state_updated_at,
-            replayed,
-        })
+        use crate::provider_replay::{CanonicalCommitCut, CanonicalWriteOutcome};
+        if assistant.conversation_id != conversation_id {
+            return Err(DbError::Serialization(
+                "canonical round conversation mismatch".into(),
+            ));
+        }
+        match self
+            .persist_canonical_state_and_replay_input(
+                assistant,
+                Some(input),
+                state,
+                state_updated_at,
+                None,
+                None,
+                CanonicalCommitCut::None,
+            )
+            .await?
+        {
+            CanonicalWriteOutcome::Committed(round) => Ok(round),
+            CanonicalWriteOutcome::Superseded => {
+                Err(DbError::Serialization("canonical round superseded".into()))
+            }
+        }
     }
 
     /// Persist a terminal tool checkpoint and its direct-turn obligation atomically.

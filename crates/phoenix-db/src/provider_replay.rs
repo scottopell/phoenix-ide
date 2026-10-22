@@ -35,7 +35,219 @@ pub(crate) fn validate_goal_round_replay(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CanonicalCommitCut {
+    None,
+    #[cfg(test)]
+    BeforeCommit,
+    #[cfg(test)]
+    AfterCommit,
+}
+
+pub(crate) enum CanonicalWriteOutcome {
+    Committed(crate::conversation_goals::round::CommittedGoalRound),
+    Superseded,
+}
+
 impl Database {
+    pub(crate) async fn persist_canonical_checkpoint(
+        &self,
+        command: &crate::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+        cut: CanonicalCommitCut,
+    ) -> DbResult<CanonicalWriteOutcome> {
+        use crate::conversation_goals::{
+            request_checkpoint::GoalRequestEvidence, round::ToolRoundWrite,
+        };
+        let input = match &command.evidence {
+            GoalRequestEvidence::Response => None,
+            GoalRequestEvidence::Round { results } => Some(ToolRoundWrite::Pending {
+                execution: command.admitted.intent().execution,
+                results,
+            }),
+        };
+        self.persist_canonical_state_and_replay_input(
+            command.assistant,
+            input,
+            command.state,
+            command.state_updated_at,
+            command.provider_replay,
+            Some(
+                crate::conversation_goals::request_checkpoint::GoalAccounting {
+                    admitted: command.admitted,
+                    source: command.source,
+                    source_updated_at: command.source_updated_at,
+                },
+            ),
+            cut,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) async fn persist_canonical_state_and_replay_input(
+        &self,
+        assistant: &phoenix_core::domain::db_schema::Message,
+        input: Option<crate::conversation_goals::round::ToolRoundWrite<'_>>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        accounting: Option<crate::conversation_goals::request_checkpoint::GoalAccounting<'_>>,
+        cut: CanonicalCommitCut,
+    ) -> DbResult<CanonicalWriteOutcome> {
+        use crate::conversation_goals::{
+            request_checkpoint::{self, AccountingAdmission},
+            round::{self, CommittedGoalRound},
+        };
+        let conversation_id = &assistant.conversation_id;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let accounting = accounting.as_ref().map(|witness| {
+            let evidence = match &input {
+                Some(round::ToolRoundWrite::Pending { results, .. }) => {
+                    request_checkpoint::GoalRequestEvidence::Round { results: *results }
+                }
+                _ => request_checkpoint::GoalRequestEvidence::Response,
+            };
+            request_checkpoint::GoalRequestCheckpoint {
+                admitted: witness.admitted,
+                assistant,
+                source: witness.source,
+                source_updated_at: witness.source_updated_at,
+                state,
+                state_updated_at,
+                evidence,
+                provider_replay: replay,
+            }
+        });
+        let key = if let Some(command) = accounting.as_ref() {
+            match request_checkpoint::admit_accounting_tx(
+                &mut tx,
+                command,
+                self.goal_execution_installation,
+            )
+            .await?
+            {
+                AccountingAdmission::Ready(key) => Some(key),
+                AccountingAdmission::Retained(round) => {
+                    return Ok(CanonicalWriteOutcome::Committed(round))
+                }
+                AccountingAdmission::Refused => return Ok(CanonicalWriteOutcome::Superseded),
+            }
+        } else {
+            None
+        };
+        if accounting.is_some()
+            || matches!(
+                &input,
+                Some(
+                    round::ToolRoundWrite::Pending { .. }
+                        | round::ToolRoundWrite::Management { .. }
+                )
+            )
+        {
+            if let Some(update) = replay {
+                validate_goal_round_replay(assistant, update)?;
+            }
+        }
+        let (results, replayed) = if let Some(input) = input {
+            round::write_round_tx(
+                &mut tx,
+                conversation_id,
+                assistant,
+                input,
+                state,
+                state_updated_at,
+                self.goal_write_policies(),
+            )
+            .await?
+        } else {
+            crate::insert_message_tx(&mut tx, assistant).await?;
+            (Vec::new(), false)
+        };
+        if accounting.is_some() && replayed {
+            return Err(crate::DbError::Serialization(
+                "canonical round exists without request checkpoint".into(),
+            ));
+        }
+        let selected = if let Some(command) = accounting.as_ref() {
+            request_checkpoint::settle_request_boundary_tx(
+                &mut tx,
+                command,
+                Some(self.goal_write_policies()),
+            )
+            .await?
+        } else {
+            state.clone()
+        };
+        let terminal = accounting
+            .as_ref()
+            .map(|command| request_checkpoint::terminal_obligation(command, &selected))
+            .transpose()?
+            .flatten();
+        let (state, state_updated_at) = if let Some(obligation) = terminal.as_ref() {
+            crate::workflow::WorkflowRepository::persist_terminal_obligation_tx(
+                &mut tx, obligation,
+            )
+            .await?;
+            (selected, state_updated_at)
+        } else {
+            round::selected_state_tx(
+                &mut tx,
+                conversation_id,
+                &selected,
+                state_updated_at,
+                replayed,
+                self.goal_control_installation,
+            )
+            .await
+            .map_err(round::db_error)?
+        };
+        if !replayed {
+            if let Some(update) = replay {
+                apply_replay_tx(&mut tx, conversation_id, update).await?;
+            }
+        }
+        let committed = CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        };
+        let commit = match cut {
+            CanonicalCommitCut::None => tx.commit().await.map_err(crate::DbError::from),
+            #[cfg(test)]
+            CanonicalCommitCut::BeforeCommit => {
+                tx.rollback().await?;
+                Err(crate::DbError::Serialization(
+                    "injected before canonical request commit".into(),
+                ))
+            }
+            #[cfg(test)]
+            CanonicalCommitCut::AfterCommit => {
+                tx.commit().await?;
+                Err(crate::DbError::Serialization(
+                    "injected after canonical request commit".into(),
+                ))
+            }
+        };
+        if let Err(error) = commit {
+            if let (Some(command), Some(key)) = (accounting.as_ref(), key.as_ref()) {
+                let mut probe = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+                if let Some(round) = request_checkpoint::classify_accounting_tx(
+                    &mut probe,
+                    command,
+                    key,
+                    self.goal_execution_installation,
+                )
+                .await?
+                {
+                    return Ok(CanonicalWriteOutcome::Committed(round));
+                }
+            }
+            return Err(error);
+        }
+        Ok(CanonicalWriteOutcome::Committed(committed))
+    }
+
     #[cfg(test)]
     /// # Errors
     /// Returns errors from the atomic state and replay write.
@@ -216,46 +428,28 @@ impl Database {
         state_updated_at: chrono::DateTime<chrono::Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> DbResult<crate::conversation_goals::round::CommittedGoalRound> {
-        use crate::conversation_goals::round::{
-            db_error, selected_state_tx, write_round_tx, CommittedGoalRound, ToolRoundWrite,
-        };
-        if matches!(
-            &input,
-            ToolRoundWrite::Pending { .. } | ToolRoundWrite::Management { .. }
-        ) {
-            validate_goal_round_replay(assistant, update)?;
+        if assistant.conversation_id != conversation_id {
+            return Err(crate::DbError::Serialization(
+                "canonical round conversation mismatch".into(),
+            ));
         }
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let (results, replayed) = write_round_tx(
-            &mut tx,
-            conversation_id,
-            assistant,
-            input,
-            state,
-            state_updated_at,
-            self.goal_write_policies(),
-        )
-        .await?;
-        let (state, state_updated_at) = selected_state_tx(
-            &mut tx,
-            conversation_id,
-            state,
-            state_updated_at,
-            replayed,
-            self.goal_control_installation,
-        )
-        .await
-        .map_err(db_error)?;
-        if !replayed {
-            apply_replay_tx(&mut tx, conversation_id, update).await?;
+        match self
+            .persist_canonical_state_and_replay_input(
+                assistant,
+                Some(input),
+                state,
+                state_updated_at,
+                Some(update),
+                None,
+                CanonicalCommitCut::None,
+            )
+            .await?
+        {
+            CanonicalWriteOutcome::Committed(round) => Ok(round),
+            CanonicalWriteOutcome::Superseded => Err(crate::DbError::Serialization(
+                "canonical round refused".into(),
+            )),
         }
-        tx.commit().await?;
-        Ok(CommittedGoalRound {
-            results,
-            state,
-            state_updated_at,
-            replayed,
-        })
     }
 
     /// Atomically persist one public message and clear private replay state.

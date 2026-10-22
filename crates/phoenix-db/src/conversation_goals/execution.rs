@@ -318,7 +318,7 @@ pub(crate) async fn require_live_request_tx(
             != phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(
                 intent.goal.clone(),
             )
-        || current.goal_id != intent.goal.goal_id
+        || current.fence() != intent.goal
         || current.state != phoenix_core::domain::conversation_goal::GoalState::Underway
     {
         return Err(GoalRequestError::Revoked);

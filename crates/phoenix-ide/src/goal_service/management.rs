@@ -84,35 +84,6 @@ impl GoalManagementService {
         )
     }
 
-    pub(crate) async fn prepare_admitted_request(
-        &self,
-        transcript: &str,
-        admitted: &phoenix_db::workflow::AdmittedGoalRequest,
-        source_slot: (
-            &phoenix_core::domain::sm_state::ConvState,
-            chrono::DateTime<chrono::Utc>,
-        ),
-        message: &str,
-        tool_use: &str,
-        request: phoenix_core::domain::conversation_goal::GoalManagementRequest,
-    ) -> Result<GoalPendingManagement, String> {
-        let runtime = self.runtime.upgrade().ok_or("management runtime closed")?;
-        let (owner, execution) = runtime
-            .db()
-            .goal_management_admitted_execution(transcript, message, admitted, source_slot)
-            .await
-            .map_err(|error| error.to_string())?;
-        let generation =
-            u64::try_from(admitted.claim_generation()).map_err(|error| error.to_string())?;
-        Self::pending_management(
-            (owner, execution, generation),
-            transcript,
-            message,
-            tool_use,
-            request,
-        )
-    }
-
     fn pending_management(
         authority: (
             phoenix_core::domain::product_conversation::ProductConversationId,

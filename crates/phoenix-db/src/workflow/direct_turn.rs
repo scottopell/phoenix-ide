@@ -2199,6 +2199,28 @@ impl WorkflowRepository {
         persist_terminal_obligation_tx(tx, input).await
     }
 
+    pub(crate) async fn terminal_obligation_matches_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        expected: &DirectTurnTerminalObligationInput,
+    ) -> DbResult<bool> {
+        let row = sqlx::query(
+            "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
+                    target_state, target_state_updated_at_us, response_message_id
+             FROM direct_turn_terminal_obligations WHERE turn_id=?",
+        )
+        .bind(to_i64(expected.turn_id.0, "turn_id")?)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let actual = parse_terminal_obligation_row(&row)?;
+        Ok(actual.expected_generation == expected.expected_generation
+            && actual.terminal == expected.terminal
+            && projections_match(&actual.projection, &expected.projection)
+            && actual.response_message_id == expected.response_message_id)
+    }
+
     pub async fn load_active_terminal_obligation(
         &self,
         conversation: &ConversationAuthority,

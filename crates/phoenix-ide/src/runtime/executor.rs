@@ -47,9 +47,7 @@ use tracing::Instrument;
 
 mod continuation;
 mod goal_request_checkpoint;
-use goal_request_checkpoint::{
-    GoalRequestCompletion, GoalResponseMessage, PendingGoalRequestCheckpoint,
-};
+use goal_request_checkpoint::{LlmCompletion, PendingGoalRequestCheckpoint};
 #[cfg(test)]
 mod provider_tool_policy_tests;
 #[cfg(test)]
@@ -1315,7 +1313,8 @@ mod grace_response_admission_tests {
 async fn forward_llm_outcome(
     llm_rx: oneshot::Receiver<LlmOutcome>,
     generation: u64,
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
+    llm_outcome_tx: mpsc::Sender<LlmCompletion>,
+    admitted: Option<phoenix_db::workflow::AdmittedGoalRequest>,
 ) {
     let llm_outcome = match llm_rx.await {
         Ok(llm_outcome) => llm_outcome,
@@ -1330,7 +1329,13 @@ async fn forward_llm_outcome(
             }
         }
     };
-    let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
+    let _ = llm_outcome_tx
+        .send(LlmCompletion {
+            generation,
+            outcome: llm_outcome,
+            admitted,
+        })
+        .await;
 }
 
 /// The outcome of planning a stale tool-result clearing sweep over one
@@ -2212,11 +2217,8 @@ where
     /// outcome to `process_outcome` only when the generation is still current.
     /// The epoch tag stays executor-side and
     /// never leaks into the pure `EffectOutcome` type.
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
-    llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
-    goal_request_completion_tx: mpsc::Sender<GoalRequestCompletion>,
-    goal_request_completion_rx: mpsc::Receiver<GoalRequestCompletion>,
-    active_goal_request_dispatch: Option<goal_request_checkpoint::GoalRequestDispatchSlot>,
+    llm_outcome_tx: mpsc::Sender<LlmCompletion>,
+    llm_outcome_rx: mpsc::Receiver<LlmCompletion>,
     pending_goal_request_checkpoint: Option<PendingGoalRequestCheckpoint>,
     terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
@@ -2479,8 +2481,7 @@ where
         // oneshot channels; forwarders stamp the dispatch generation and relay
         // them here, where the select loop discards superseded outcomes before
         // routing live ones into `process_outcome`.
-        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
-        let (goal_request_completion_tx, goal_request_completion_rx) = mpsc::channel(64);
+        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<LlmCompletion>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
 
@@ -2531,9 +2532,6 @@ where
             llm_request_generation: 0,
             llm_outcome_tx,
             llm_outcome_rx,
-            goal_request_completion_tx,
-            goal_request_completion_rx,
-            active_goal_request_dispatch: None,
             pending_goal_request_checkpoint: None,
             terminal_transition_retry: None,
             terminal_settlement_attempt: TerminalSettlementAttempt::Initial,
@@ -3203,14 +3201,10 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
-                Some(completion) = self.goal_request_completion_rx.recv() => {
-                    if let Err(error) = self.process_goal_request_completion(completion).await {
-                        tracing::warn!(%error, "admitted Goal response refused");
+                Some(completion) = self.llm_outcome_rx.recv() => {
+                    if let Err(error) = self.process_llm_completion(completion).await {
+                        tracing::warn!(%error, "Outcome rejected by state machine");
                     }
-                }
-                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
-                    self.process_generation_tagged_llm_outcome(generation, llm_outcome)
-                        .await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -3412,19 +3406,14 @@ where
         generation: u64,
         llm_outcome: LlmOutcome,
     ) {
-        if self.llm_outcome_is_stale(generation) {
-            tracing::debug!(
-                outcome_generation = generation,
-                current_generation = self.llm_request_generation,
-                state = self.state.variant_name(),
-                "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
-            );
-            return;
-        }
-
-        self.llm_task_handle = None;
-        self.active_llm_attempt = None;
-        if let Err(error) = self.process_outcome(EffectOutcome::Llm(llm_outcome)).await {
+        if let Err(error) = self
+            .process_llm_completion(LlmCompletion {
+                generation,
+                outcome: llm_outcome,
+                admitted: None,
+            })
+            .await
+        {
             tracing::warn!(%error, "Outcome rejected by state machine");
         }
     }
@@ -4141,14 +4130,27 @@ where
             }
         }
         let goal_checkpoint_transition = self.is_goal_checkpoint_transition(&result);
+        if self.pending_goal_request_checkpoint.is_some()
+            && matches!(result.new_state, ConvState::ToolExecuting { .. })
+            && !result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistState))
+        {
+            result.effects.insert(0, Effect::PersistState);
+        }
+        if goal_checkpoint_transition && matches!(result.new_state, ConvState::Idle) {
+            result.new_state = ConvState::LlmRequesting { attempt: 1 };
+            result.effects.push(Effect::RequestLlm);
+        }
         if goal_checkpoint_transition {
-            self.pending_direct_turn_terminal = None;
             if let Some(pending) = self.pending_goal_request_checkpoint.as_mut() {
                 pending.source = self.state.clone();
                 pending.source_updated_at = self.state_updated_at;
             }
         }
-        let terminal_direct_turn_transition = !self.context.is_sub_agent
+        let terminal_direct_turn_transition = !goal_checkpoint_transition
+            && !self.context.is_sub_agent
             && self.active_direct_turn.is_some()
             && self.pending_direct_turn_terminal.is_some();
         let terminal_retry_transition = (terminal_subagent_transition
@@ -4227,11 +4229,12 @@ where
                     ..
                 }
             );
-            let next_state_updated_at = if state_changed && !retry_has_durable_fact {
-                self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
-            } else {
-                self.state_updated_at
-            };
+            let next_state_updated_at =
+                if (state_changed || goal_checkpoint_transition) && !retry_has_durable_fact {
+                    self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
+                } else {
+                    self.state_updated_at
+                };
             let will_drain_from_idle = matches!(result.new_state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
@@ -4246,7 +4249,6 @@ where
                 )
             });
             let publish = state_changed
-                && self.pending_goal_request_checkpoint.is_none()
                 && !goal_checkpoint_transition
                 && !will_drain_from_idle
                 && !will_commit_steering_drain
@@ -4443,6 +4445,12 @@ where
                 ) || (checkpoint_satisfies_persist_state
                     && !has_specialized_state_work);
                 let is_state_persist = satisfies_persist_state || checkpoint_commits_state;
+                if goal_checkpoint_transition
+                    && matches!(effect, Effect::RequestLlm)
+                    && !matches!(self.state, ConvState::LlmRequesting { .. })
+                {
+                    continue;
+                }
                 if goal_checkpoint_transition && matches!(effect, Effect::PersistState) {
                     if self.pending_goal_request_checkpoint.is_some() {
                         return Err(
@@ -4858,7 +4866,7 @@ where
         // the await inside `run_effects_with_inline_drain`, which would cause a
         // concurrent `POST /chat` to route a `UserMessage` before the drain has
         // advanced the state back to `LlmRequesting` (FM-7).
-        if !goal_checkpoint_transition && self.pending_goal_request_checkpoint.is_none() {
+        if !goal_checkpoint_transition {
             if terminal_direct_turn_transition {
                 let _admitted = terminal_unit_admission
                     .as_deref_mut()
@@ -5077,7 +5085,7 @@ where
             let _ = activation.sender.send(());
         }
 
-        if broadcast && self.pending_goal_request_checkpoint.is_none() {
+        if broadcast {
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
@@ -6450,7 +6458,6 @@ where
 
     fn abort_active_llm_task(&mut self) {
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
-        self.active_goal_request_dispatch = None;
         if let Some(handle) = self.llm_task_handle.take() {
             handle.abort();
         }
@@ -6761,31 +6768,18 @@ where
                 idempotent,
                 origin,
             } => {
-                if self
+                let goal_checkpoint = self
                     .pending_goal_request_checkpoint
                     .as_ref()
-                    .is_some_and(|pending| pending.admitted.intent().id.as_str() == message_id)
-                {
-                    return self
-                        .persist_goal_response_message(
-                            GoalResponseMessage {
-                                content,
-                                display_data,
-                                usage_data,
-                                message_id,
-                                origin,
-                            },
-                            admitted,
-                        )
-                        .await;
-                }
+                    .is_some_and(|pending| pending.admitted.intent().id.as_str() == message_id);
                 // Idempotent recovery paths skip an already-persisted identity;
                 // ordinary message effects avoid the extra existence query.
-                if (idempotent
-                    || matches!(
-                        self.terminal_settlement_attempt,
-                        TerminalSettlementAttempt::Retry { .. }
-                    ))
+                if !goal_checkpoint
+                    && (idempotent
+                        || matches!(
+                            self.terminal_settlement_attempt,
+                            TerminalSettlementAttempt::Retry { .. }
+                        ))
                     && self.storage.message_exists(&message_id).await?
                 {
                     tracing::debug!(
@@ -6795,8 +6789,39 @@ where
                     return Ok(None);
                 }
 
-                let seq = self.broadcast_tx.next_seq();
-                let msg = if matches!(
+                let reservation = if goal_checkpoint {
+                    Some(
+                        self.broadcast_tx
+                            .persisted_message_reservation_authority()
+                            .await
+                            .reserve_next_range(1)
+                            .expect("executor owns persisted-message reservation"),
+                    )
+                } else {
+                    None
+                };
+                let seq = reservation
+                    .as_ref()
+                    .map(|(_, sequences)| sequences[0])
+                    .unwrap_or_else(|| self.broadcast_tx.next_seq());
+                let msg = if goal_checkpoint {
+                    let message = crate::db::Message {
+                        message_type: content.message_type(),
+                        content,
+                        display_data,
+                        usage_data,
+                        message_id: message_id.clone(),
+                        origin,
+                        conversation_id: self.context.conversation_id.clone(),
+                        sequence_id: seq,
+                        created_at: Utc::now(),
+                    };
+                    self.commit_admitted_goal_request(
+                        &message, phoenix_db::conversation_goals::request_checkpoint::GoalRequestEvidence::Response,
+                    ).await?;
+                    self.publish_live_state_admitted();
+                    message
+                } else if matches!(
                     self.pending_provider_replay_update,
                     Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear)
                 ) {
@@ -6843,6 +6868,7 @@ where
                     .admitted_publication(admitted)
                     .persisted_opening_message(&self.storage, msg)
                     .await?;
+                drop(reservation);
                 Ok(None)
             }
 
@@ -7698,10 +7724,7 @@ where
                     )
                     .await?;
 
-                let _ = self
-                    .broadcast_tx
-                    .admitted_publication(admitted)
-                    .persisted_message(msg);
+                self.publish_canonical_rows(&msg, &[], admitted);
                 Ok(None)
             }
 
@@ -7813,11 +7836,6 @@ where
             }
 
             AuthoritativeEffect::BroadcastAssistantMessage { message } => {
-                if self.pending_goal_request_checkpoint.is_some() {
-                    tracing::debug!(message_id = %message.message_id,
-                        "holding admitted Goal assistant preview until checkpoint commit");
-                    return Ok(None);
-                }
                 #[cfg(test)]
                 if let Some(barrier) = self.semantic_publication_barrier.take() {
                     barrier.wait().await;
@@ -7899,9 +7917,6 @@ where
                 Ok(None)
             }
             ControlEffect::NotifyStateChange => {
-                if self.pending_goal_request_checkpoint.is_some() {
-                    return Ok(None);
-                }
                 let state = self.state.clone();
                 let state_name = state.variant_name();
                 let presentation_mode = state.presentation_mode().to_string();
@@ -8837,10 +8852,6 @@ where
             cache_key: PromptCacheKey::stable(&conv_id),
         };
 
-        let publish_response_progress = goal_request_context.is_none();
-        if !publish_response_progress {
-            tracing::debug!(%request_id, "holding admitted Goal response tokens until checkpoint commit");
-        }
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
         let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
@@ -8863,7 +8874,7 @@ where
                             first_text_seen = true;
                             let observed_at = Utc::now();
                             *first_byte_at_for_fwd.lock().await = Some(observed_at);
-                            if publish_response_progress {
+                            {
                                 let request_id_for_first = request_id_for_fwd.clone();
                                 let _ = broadcast_tx_for_tokens.send_seq(|seq| {
                                     SseEvent::LlmFirstByte {
@@ -8873,7 +8884,7 @@ where
                                 });
                             }
                         }
-                        if publish_response_progress {
+                        {
                             let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
                                 sequence_id: seq,
                                 text,
@@ -9083,33 +9094,12 @@ where
         // wedge the conversation, while the generation lets the select loop
         // drop a stale outcome from an intentionally-aborted request. See
         // `forward_llm_outcome`.
-        if let Some(context) = goal_request_context {
-            let completion_tx = self.goal_request_completion_tx.clone();
-            self.active_goal_request_dispatch =
-                Some(goal_request_checkpoint::GoalRequestDispatchSlot::spawned(
-                    dispatch_generation,
-                    context.admitted(),
-                    self.state.clone(),
-                ));
-            tokio::spawn(async move {
-                let outcome = llm_rx.await.unwrap_or_else(|_| LlmOutcome::NetworkError {
-                    message: "admitted Goal request task dropped its outcome".into(),
-                });
-                let _ = completion_tx
-                    .send(GoalRequestCompletion {
-                        generation: dispatch_generation,
-                        admitted: context.into_admitted(),
-                        outcome,
-                    })
-                    .await;
-            });
-        } else {
-            tokio::spawn(forward_llm_outcome(
-                llm_rx,
-                dispatch_generation,
-                llm_outcome_tx,
-            ));
-        }
+        tokio::spawn(forward_llm_outcome(
+            llm_rx,
+            dispatch_generation,
+            llm_outcome_tx,
+            goal_request_context.map(|context| context.into_admitted()),
+        ));
 
         Ok(None)
     }
@@ -9143,9 +9133,6 @@ where
     /// per-result `duration_ms` (`schema.rs:649`) takes over the
     /// display.
     fn broadcast_tool_start_timestamp(&self, tool_use_id: &str) {
-        if self.pending_goal_request_checkpoint.is_some() {
-            return;
-        }
         let assistant_message_id = match &self.state {
             ConvState::ToolExecuting {
                 assistant_message, ..
@@ -9859,16 +9846,6 @@ where
             GoalManagementRoundKind::Terminal(obligation)
         } else if let Some(proposal) = proposal {
             GoalManagementRoundKind::Fork(proposal)
-        } else if let Some(pending) = &self.pending_goal_request_checkpoint {
-            if pending.generation != self.llm_request_generation {
-                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
-                return Err("management checkpoint lost actual dispatch generation".into());
-            }
-            GoalManagementRoundKind::AdmittedRequest {
-                admitted: &pending.admitted,
-                source: &pending.source,
-                source_updated_at: pending.source_updated_at,
-            }
         } else {
             GoalManagementRoundKind::Runtime
         };
@@ -9959,6 +9936,23 @@ where
         Ok(())
     }
 
+    fn publish_canonical_rows(
+        &self,
+        assistant: &crate::db::Message,
+        results: &[crate::db::Message],
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) {
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(assistant.clone());
+        for result in results {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(result.clone());
+        }
+    }
     async fn persist_pending_goal_round(
         &mut self,
         mut assistant: crate::db::Message,
@@ -10341,74 +10335,97 @@ where
                     created_at: assistant_message.created_at,
                 };
 
-                if self
+                let (tool_msgs, new_trusted_results) = if self
                     .pending_goal_request_checkpoint
                     .as_ref()
                     .is_some_and(|pending| {
                         pending.admitted.intent().id.as_str() == agent_msg.message_id
-                    })
-                {
-                    return self
-                        .persist_admitted_goal_tool_round(agent_msg, tool_results, admitted)
-                        .await;
-                }
-                if contains_pending_goal_result(&tool_results) {
-                    return self
-                        .persist_pending_goal_round(agent_msg, tool_results, None, None, admitted)
-                        .await;
-                }
-                let tool_results = finalized_round_results(&tool_results)?;
-                let new_trusted_results =
-                    trusted_tool_results(&agent_msg.message_id, &tool_results);
-
-                // Build all tool-result rows.
-                let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-                for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-                    let tool_content = tool_result_message_content(result);
-                    let merged_display =
-                        merge_duration_into_display_data(result.display_data(), result.duration_ms);
-                    tool_msgs.push(crate::db::Message {
-                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                        message_id: tool_result_message_id(
-                            &agent_msg.message_id,
-                            &result.tool_use_id,
-                        ),
-                        conversation_id: conv_id.clone(),
-                        sequence_id: *tool_seq,
-                        message_type: tool_content.message_type(),
-                        content: tool_content,
-                        display_data: merged_display,
-                        usage_data: None,
-                        created_at: Utc::now(),
-                    });
-                }
-
-                // Persist the assistant message and every tool result in one
-                // transaction: either the full round is durable or none of it
-                // is. A partial write would leave an unpaired `tool_use` that
-                // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                if let Some(update) = self.pending_provider_replay_update.take() {
-                    self.storage
-                        .persist_tool_round_state_and_provider_replay(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                            &update,
-                        )
-                        .await?;
+                    }) {
+                    let finalized: Vec<_> = tool_results
+                        .iter()
+                        .filter_map(|result| match result {
+                            ToolRoundResult::Finalized(result) => Some(result.clone()),
+                            ToolRoundResult::PendingGoalReport { .. }
+                            | ToolRoundResult::PendingGoalManagement { .. } => None,
+                        })
+                        .collect();
+                    let trusted = trusted_tool_results(&agent_msg.message_id, &finalized);
+                    let committed = self.commit_admitted_goal_request(&agent_msg,
+                        phoenix_db::conversation_goals::request_checkpoint::GoalRequestEvidence::Round { results: &tool_results },
+                    ).await?;
+                    self.publish_live_state_admitted();
+                    (committed.results, trusted)
                 } else {
-                    self.storage
-                        .persist_tool_round_and_state(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                        )
-                        .await?;
-                }
+                    if contains_pending_goal_result(&tool_results) {
+                        return self
+                            .persist_pending_goal_round(
+                                agent_msg,
+                                tool_results,
+                                None,
+                                None,
+                                admitted,
+                            )
+                            .await;
+                    }
+                    let tool_results = finalized_round_results(&tool_results)?;
+                    let new_trusted_results =
+                        trusted_tool_results(&agent_msg.message_id, &tool_results);
+
+                    // Build all tool-result rows.
+                    let mut tool_msgs: Vec<crate::db::Message> =
+                        Vec::with_capacity(tool_results.len());
+                    for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1))
+                    {
+                        let tool_content = tool_result_message_content(result);
+                        let merged_display = merge_duration_into_display_data(
+                            result.display_data(),
+                            result.duration_ms,
+                        );
+                        tool_msgs.push(crate::db::Message {
+                            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                            message_id: tool_result_message_id(
+                                &agent_msg.message_id,
+                                &result.tool_use_id,
+                            ),
+                            conversation_id: conv_id.clone(),
+                            sequence_id: *tool_seq,
+                            message_type: tool_content.message_type(),
+                            content: tool_content,
+                            display_data: merged_display,
+                            usage_data: None,
+                            created_at: Utc::now(),
+                        });
+                    }
+
+                    // Persist the assistant message and every tool result in one
+                    // transaction: either the full round is durable or none of it
+                    // is. A partial write would leave an unpaired `tool_use` that
+                    // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
+                    if let Some(update) = self.pending_provider_replay_update.take() {
+                        self.storage
+                            .persist_tool_round_state_and_provider_replay(
+                                &conv_id,
+                                &agent_msg,
+                                &tool_msgs,
+                                &self.state,
+                                self.state_updated_at,
+                                &update,
+                            )
+                            .await?;
+                    } else {
+                        self.storage
+                            .persist_tool_round_and_state(
+                                &conv_id,
+                                &agent_msg,
+                                &tool_msgs,
+                                &self.state,
+                                self.state_updated_at,
+                            )
+                            .await?;
+                    }
+
+                    (tool_msgs, new_trusted_results)
+                };
 
                 merge_trusted_tool_results(
                     &mut self.pending_trusted_tool_results,
@@ -20463,7 +20480,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_event(user("first")))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -20502,7 +20523,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_outcome(EffectOutcome::Tool(outcome)))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -20539,7 +20564,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_event(user("second")))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -20569,7 +20598,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_event(Event::SteerDrainedUserMessages { entries }))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -23290,11 +23323,14 @@ mod steer_drain_detector_tests {
             .expect("durable queue notification while first request is in flight");
         assert_eq!(storage.get_steering_queue(conversation_id).len(), 1);
 
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
-                .await
-                .expect("first provider response arrives")
-                .expect("LLM outcome channel remains open");
+        let LlmCompletion {
+            generation: generation,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+            .await
+            .expect("first provider response arrives")
+            .expect("LLM outcome channel remains open");
         rt.process_generation_tagged_llm_outcome(generation, outcome)
             .await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
@@ -23314,11 +23350,14 @@ mod steer_drain_detector_tests {
             if content.text == literal && content.llm_text.is_none())
         );
 
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
-                .await
-                .expect("second provider response arrives")
-                .expect("LLM outcome channel remains open");
+        let LlmCompletion {
+            generation: generation,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+            .await
+            .expect("second provider response arrives")
+            .expect("LLM outcome channel remains open");
         let requests = rt.llm_client.recorded_requests();
         assert_eq!(requests.len(), 2, "one dispatch per turn");
         let latest_user = requests[1]
@@ -26055,11 +26094,11 @@ mod sender_drop_forwarder_tests {
     #[tokio::test]
     async fn llm_sender_drop_yields_network_error_outcome() {
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(4);
+        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<super::LlmCompletion>(4);
 
         drop(llm_tx);
 
-        forward_llm_outcome(llm_rx, 7, llm_outcome_tx).await;
+        forward_llm_outcome(llm_rx, 7, llm_outcome_tx, None).await;
 
         match llm_outcome_rx.try_recv() {
             Ok((generation, LlmOutcome::NetworkError { message })) => {

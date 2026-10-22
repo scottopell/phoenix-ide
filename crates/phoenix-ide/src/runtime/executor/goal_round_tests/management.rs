@@ -86,11 +86,14 @@ async fn provider_preparation(runtime: &mut TestRuntime) -> Event {
     if let Some(event) = events {
         runtime.process_event(event).await.unwrap();
     }
-    let (generation, outcome) =
-        tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+    let LlmCompletion {
+        generation: generation,
+        outcome: outcome,
+        ..
+    } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let expected_replay = match &outcome {
         LlmOutcome::Response {
             provider_replay: Some(update),
@@ -155,11 +158,14 @@ async fn conversation_goal_coordinator_provider_management_commits_only_at_its_c
         .is_some());
     assert_checkpoint(&fixture, &call).await;
     assert!(tools.recorded_executions().is_empty());
-    let (generation, outcome) =
-        tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+    let LlmCompletion {
+        generation: generation,
+        outcome: outcome,
+        ..
+    } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!runtime.llm_outcome_is_stale(generation));
     runtime
         .process_generation_tagged_llm_outcome(generation, outcome)
@@ -277,11 +283,14 @@ async fn conversation_goal_coordinator_provider_management_rejects_missing_or_st
         if let Some(event) = events {
             runtime.process_event(event).await.unwrap();
         }
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let LlmCompletion {
+            generation: generation,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let expected_replay = match &outcome {
             LlmOutcome::Response {
                 provider_replay: Some(update),
@@ -488,11 +497,14 @@ async fn conversation_goal_coordinator_provider_management_rolls_back_replay_and
         .await
         .unwrap()
         .is_some());
-    let (generation, outcome) =
-        tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+    let LlmCompletion {
+        generation: generation,
+        outcome: outcome,
+        ..
+    } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!runtime.llm_outcome_is_stale(generation));
     runtime
         .process_generation_tagged_llm_outcome(generation, outcome)
@@ -599,11 +611,14 @@ async fn conversation_goal_coordinator_provider_state_commands_use_the_tagged_di
                 .len(),
             usize::try_from(seed.version.get() + 1).unwrap()
         );
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let LlmCompletion {
+            generation: generation,
+            outcome: outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!runtime.llm_outcome_is_stale(generation));
         runtime
             .process_generation_tagged_llm_outcome(generation, outcome)

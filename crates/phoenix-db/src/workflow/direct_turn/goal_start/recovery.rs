@@ -4,7 +4,9 @@ use super::super::{
     TurnAuthorityId, WorkflowRepository, WorkflowStatus,
 };
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::conversation_goal::{GoalExecution, GoalRequestOperation, GoalText};
+use phoenix_core::domain::conversation_goal::{
+    GoalExecution, GoalRequestCause, GoalRequestId, GoalRequestOperation, GoalText,
+};
 use phoenix_workflow::{direct_turn_profile, TransitionId};
 
 #[derive(Debug, Clone)]
@@ -148,7 +150,8 @@ impl WorkflowRepository {
             .await
             .map_err(|error| DbError::Serialization(error.to_string()))?
             .ok_or_else(|| DbError::Serialization("Start recovery lost admitted request".into()))?;
-        if latest.checkpoint.is_some() {
+        if latest.checkpoint.is_some() && !matches!(state, ConvState::LlmRequesting { attempt: 1 })
+        {
             return Ok(GoalStartRecoveryOutcome::Refused);
         }
         match execution::require_live_request_tx(&mut tx.tx, &latest.intent, &input.transcript)
@@ -169,9 +172,28 @@ impl WorkflowRepository {
             )
             .await?
             .ok_or_else(|| DbError::Serialization("Start recovery lost its context".into()))?;
-        if context.request_id() != &latest.intent.id {
+        if let GoalRequestCause::AfterCheckpoint { predecessor } = &context.intent().cause {
+            if !completed_predecessor_retained_tx(
+                &mut tx.tx,
+                predecessor,
+                execution,
+                &input.transcript,
+            )
+            .await?
+            {
+                return Ok(GoalStartRecoveryOutcome::Refused);
+            }
+        }
+        let same_decision = match (&latest.checkpoint, &context.intent().cause) {
+            (Some(_), GoalRequestCause::AfterCheckpoint { predecessor }) => {
+                predecessor == &latest.intent.id && context.request_id() != &latest.intent.id
+            }
+            (None, _) => context.intent() == &latest.intent,
+            _ => false,
+        };
+        if !same_decision {
             return Err(DbError::Serialization(
-                "Start recovery changed admitted intent".into(),
+                "Start recovery did not preserve its committed request decision".into(),
             ));
         }
         let workflow_id =
@@ -202,7 +224,7 @@ impl WorkflowRepository {
             previous_generation: input.turn.1,
             generation: next,
             reconstruction_id: input.reconstruction_id.to_string(),
-            request_id: latest.intent.id.as_str().to_owned(),
+            request_id: context.request_id().as_str().to_owned(),
             state_updated_at: input.slot.1.to_rfc3339(),
         };
         let payload = serde_json::to_vec(&event)
@@ -251,7 +273,7 @@ impl WorkflowRepository {
                     head.version.next(),
                     &payload,
                     &snapshot,
-                    &latest.intent,
+                    context.intent(),
                 )
                 .await?
             {
@@ -319,6 +341,18 @@ impl WorkflowRepository {
             if latest.checkpoint.is_some() || &latest.intent != intent {
                 return Ok(false);
             }
+            if let GoalRequestCause::AfterCheckpoint { predecessor } = &intent.cause {
+                if !completed_predecessor_retained_tx(
+                    &mut tx.tx,
+                    predecessor,
+                    execution,
+                    &input.transcript,
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+            }
             match crate::conversation_goals::execution::require_live_request_tx(
                 &mut tx.tx,
                 &latest.intent,
@@ -333,6 +367,64 @@ impl WorkflowRepository {
         }
         Ok(exact)
     }
+}
+
+async fn completed_predecessor_retained_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    predecessor: &GoalRequestId,
+    execution: GoalExecution,
+    transcript: &str,
+) -> DbResult<bool> {
+    use crate::conversation_goals::round;
+    use phoenix_core::domain::llm_types::ContentBlock;
+    let checkpoint: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversation_goal_requests r
+         JOIN conversation_goal_request_checkpoints c USING(request_id)
+         WHERE r.request_id=? AND r.historical_turn_id=? AND r.historical_workflow_id=?)",
+    )
+    .bind(predecessor.as_str())
+    .bind(execution.turn_id())
+    .bind(execution.workflow_id())
+    .fetch_one(&mut **tx)
+    .await?;
+    if !checkpoint {
+        return Ok(false);
+    }
+    let Some(assistant) = round::retained_message_tx(tx, predecessor.as_str())
+        .await
+        .map_err(round::db_error)?
+    else {
+        return Ok(false);
+    };
+    let crate::MessageContent::Agent(blocks) = &assistant.content else {
+        return Ok(false);
+    };
+    if assistant.message_type != crate::MessageType::Agent
+        || assistant.conversation_id != transcript
+    {
+        return Ok(false);
+    }
+    for block in blocks {
+        if let ContentBlock::ToolUse { id, .. } = block {
+            let message_id = phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                predecessor.as_str(),
+                id,
+            );
+            let Some(result) = round::retained_message_tx(tx, &message_id)
+                .await
+                .map_err(round::db_error)?
+            else {
+                return Ok(false);
+            };
+            if result.conversation_id != transcript
+                || result.message_type != crate::MessageType::Tool
+                || !matches!(&result.content, crate::MessageContent::Tool(content) if content.tool_use_id == *id)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn recovery_refusal(error: &crate::conversation_goals::execution::GoalRequestError) -> bool {
