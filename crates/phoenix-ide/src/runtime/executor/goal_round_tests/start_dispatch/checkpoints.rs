@@ -81,6 +81,17 @@ pub(super) async fn receive_automatic_response<T: ToolExecutor + 'static>(
         .unwrap()
 }
 
+async fn process_prepared_report<T: ToolExecutor + 'static>(
+    rt: &mut ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, T>,
+) {
+    let event = rt
+        .event_rx
+        .try_recv()
+        .expect("goal_report queued its prepared event");
+    assert!(matches!(event, Event::GoalReportPrepared { .. }));
+    rt.process_event(event).await.unwrap();
+}
+
 pub(super) async fn guard_terminal_projection_order(db: &Database) {
     sqlx::query(
         "CREATE TRIGGER goal_idle_requires_settled_owner
@@ -209,9 +220,10 @@ async fn conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_t
             execution.generation
         );
         rt.process_llm_completion(second).await.unwrap();
+        process_prepared_report(&mut rt).await;
         assert!(
             rt.tool_outcome_rx.try_recv().is_err(),
-            "goal_report returns its prepared event synchronously"
+            "goal_report queues the prepared event rather than an async tool outcome"
         );
         let goal = db
             .conversation_goal(&receipt.input().goal().owner)
@@ -272,6 +284,7 @@ async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_
         }]));
     let response = dispatch_response(&mut rt).await;
     rt.process_llm_completion(response).await.unwrap();
+    process_prepared_report(&mut rt).await;
     assert_eq!(rt.state, ConvState::Idle);
     assert!(rt.active_direct_turn.is_none());
     let blocked = db
@@ -986,6 +999,7 @@ async fn conversation_goal_actual_report_round_commits_mutation_and_checkpoint_o
         .as_str()
         .to_owned();
     rt.process_llm_completion(completion).await.unwrap();
+    process_prepared_report(&mut rt).await;
     assert_eq!(rt.state, ConvState::Idle);
     assert!(rt.active_direct_turn.is_none());
     assert!(rt.pending_direct_turn_terminal.is_none());

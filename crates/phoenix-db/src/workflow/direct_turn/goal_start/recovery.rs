@@ -150,7 +150,15 @@ impl WorkflowRepository {
             .await
             .map_err(|error| DbError::Serialization(error.to_string()))?
             .ok_or_else(|| DbError::Serialization("Start recovery lost admitted request".into()))?;
-        if latest.checkpoint.is_some() && !matches!(state, ConvState::LlmRequesting { attempt: 1 })
+        if latest.checkpoint.is_some()
+            && (!matches!(state, ConvState::LlmRequesting { attempt: 1 })
+                || !completed_predecessor_retained_tx(
+                    &mut tx.tx,
+                    &latest.intent.id,
+                    execution,
+                    &input.transcript,
+                )
+                .await?)
         {
             return Ok(GoalStartRecoveryOutcome::Refused);
         }

@@ -3590,10 +3590,12 @@ where
 
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => {
-                self.pending_provider_replay_update =
-                    replay_update.map(|(update, owner_message_id)| {
-                        update.with_owner_message_id(owner_message_id)
-                    });
+                if is_llm_outcome {
+                    self.pending_provider_replay_update =
+                        replay_update.map(|(update, owner_message_id)| {
+                            update.with_owner_message_id(owner_message_id)
+                        });
+                }
                 r
             }
             Err(invalid) => {
@@ -4762,7 +4764,11 @@ where
                             self.state_updated_at = retained_timestamp;
                             self.manage_deadline(&failed_state);
                         } else {
-                            self.install_live_state(retained_state, retained_timestamp, true)?;
+                            self.install_live_state(
+                                retained_state,
+                                retained_timestamp,
+                                !goal_checkpoint_transition,
+                            )?;
                             self.manage_deadline(&failed_state);
                         }
                         if (terminal_subagent_transition || terminal_direct_turn_transition)

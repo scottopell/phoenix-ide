@@ -640,11 +640,11 @@ async fn conversation_goal_complete_report_checkpoint_cuts_replay_whole_bundle_a
             persisted,
             (before.0 + 2, before.1, before.2 + 1, before.3 + 1)
         );
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM conversations WHERE id='adopt-start'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?")
+            .bind(input.receipt.historical_transcript().as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(serde_json::from_str::<ConvState>(&state).unwrap(), source,
             "canonical checkpoint stages the existing terminal obligation; only terminal settlement projects Idle");
         let obligation = db
