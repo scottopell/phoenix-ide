@@ -995,6 +995,8 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::CoordinatorWorkScope(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::SubAgentLifecycleConflict(_)
+        | crate::db::DbError::DirectTurnTerminalObligationEstablished(_)
+        | crate::db::DbError::DirectTurnStopUnclassified { .. }
         | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
@@ -1048,6 +1050,8 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::CoordinatorWorkScope(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::SubAgentLifecycleConflict(_)
+        | crate::db::DbError::DirectTurnTerminalObligationEstablished(_)
+        | crate::db::DbError::DirectTurnStopUnclassified { .. }
         | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)

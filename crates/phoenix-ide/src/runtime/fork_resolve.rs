@@ -1656,6 +1656,8 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::CloseFoundationNotFound(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::DirectTurnConflict(_)
+        | DbError::DirectTurnTerminalObligationEstablished(_)
+        | DbError::DirectTurnStopUnclassified { .. }
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | DbError::DormantGitRepositoryCatchupStaleOperation
