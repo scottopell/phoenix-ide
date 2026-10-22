@@ -3414,6 +3414,29 @@ where
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
         }
+        let event = match event {
+            Event::DirectTurnStopRequested {
+                turn_id,
+                expected_generation,
+            } => {
+                if !self.active_direct_turn.as_ref().is_some_and(|active| {
+                    active.turn_id.0 == turn_id && active.generation == expected_generation
+                }) {
+                    tracing::debug!(
+                        conv_id = %self.context.conversation_id,
+                        turn_id,
+                        expected_generation,
+                        "ignoring Stop for a replaced direct-turn target"
+                    );
+                    return Ok(());
+                }
+                Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                }
+            }
+            event => event,
+        };
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
             && self.terminal_transition_retry.is_some()
@@ -16113,6 +16136,54 @@ mod authoritative_user_message_effect_tests {
             storage.get_current_state(&rt.context.conversation_id),
             Some(ConvState::RecoverableContinuationFailure { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_direct_turn_stop_is_rejected_before_teardown() {
+        for (target_turn, target_generation) in [(9, 0), (10, 1)] {
+            let (mut rt, _storage, _rx) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            rt.state = ConvState::LlmRequesting { attempt: 1 };
+            rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(10),
+                generation: 0,
+            }));
+            rt.llm_task_handle = Some(tokio::spawn(std::future::pending::<()>()));
+            rt.process_event(Event::DirectTurnStopRequested {
+                turn_id: target_turn,
+                expected_generation: target_generation,
+            })
+            .await
+            .unwrap();
+            assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+            assert!(rt.pending_direct_turn_terminal.is_none());
+            let task = rt
+                .llm_task_handle
+                .take()
+                .expect("stale Stop must not abort work");
+            assert!(!task.is_finished());
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_turn_stop_cannot_fall_back_to_unowned_parent_work() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        rt.process_event(Event::DirectTurnStopRequested {
+            turn_id: 10,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.pending_direct_turn_terminal.is_none());
     }
 
     #[tokio::test]

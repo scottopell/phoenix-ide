@@ -563,6 +563,10 @@ pub enum Event {
         job_id: String,
         claim: super::creation_protocol::CreationClaim,
     },
+    DirectTurnStopRequested {
+        turn_id: u64,
+        expected_generation: u64,
+    },
     SubAgentWaitExpired {
         pending_ids: Vec<String>,
     },
@@ -801,6 +805,7 @@ impl Event {
             Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
+            Event::DirectTurnStopRequested { .. } => "DirectTurnStopRequested",
             Event::SubAgentWaitExpired { .. } => "SubAgentWaitExpired",
             Event::UserCancel { .. } => "UserCancel",
             Event::LlmResponse { .. } => "LlmResponse",
@@ -1073,6 +1078,10 @@ impl TryFrom<Event> for ParentEvent {
                 event_variant: "RetryBufferedSubAgentResults",
                 target_type: "ParentEvent",
             }),
+            Event::DirectTurnStopRequested { .. } => Err(EventConversionError {
+                event_variant: "DirectTurnStopRequested",
+                target_type: "ParentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
@@ -1297,6 +1306,10 @@ impl TryFrom<Event> for SubAgentEvent {
                     authority,
                 }))
             }
+            Event::DirectTurnStopRequested { .. } => Err(EventConversionError {
+                event_variant: "DirectTurnStopRequested",
+                target_type: "SubAgentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "SubAgentEvent",
@@ -1568,8 +1581,9 @@ mod spec_runtime_name_alignment_tests {
 #[cfg(test)]
 mod direct_turn_payload_tests {
     use super::{
-        PreparedDirectTurnDelivery, PreparedDirectTurnPayload, PreparedDirectTurnPayloadCodecError,
-        SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        Event, ParentEvent, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+        PreparedDirectTurnPayloadCodecError, SubAgentEvent, SubmittedDirectTurnExpansionPolicy,
+        SubmittedDirectTurnIdentity,
     };
 
     fn submitted(
@@ -1696,6 +1710,16 @@ mod direct_turn_payload_tests {
             user.llm_text.as_deref(),
             Some("display <file>expanded</file>")
         );
+    }
+
+    #[test]
+    fn direct_turn_stop_requires_runtime_target_validation() {
+        let event = Event::DirectTurnStopRequested {
+            turn_id: 10,
+            expected_generation: 2,
+        };
+        assert!(ParentEvent::try_from(event.clone()).is_err());
+        assert!(SubAgentEvent::try_from(event).is_err());
     }
 
     #[test]
