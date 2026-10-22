@@ -43,6 +43,7 @@ use phoenix_core::domain::tool_wire::{
     BashUnregisteredRun, BashUnregisteredTerminalPayload, BashUnregisteredUnknownPayload,
     BashWaiterPanickedPayload,
 };
+#[cfg(test)]
 use phoenix_core::process_identity::current_process_identity;
 
 // ---------------------------------------------------------------------------
