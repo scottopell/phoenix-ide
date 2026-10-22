@@ -27,7 +27,7 @@ use phoenix_core::domain::sm_state::ExploreBashCapability;
 pub use crate::skills::{discover_skills, discover_skills_with_options, SkillSource};
 
 /// A discovered guidance file with its path and content
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidanceFile {
     pub path: PathBuf,
     pub content: String,
@@ -161,8 +161,24 @@ pub(crate) fn explore_bash_prompt_capability(
 }
 
 /// Rendered ordinary metadata only; invocation discovery and bodies remain live.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrdinarySkillCatalog(String);
+
+/// Ordinary prompt inputs captured together for the lifetime of one live turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrdinaryTurnContext {
+    catalog: OrdinarySkillCatalog,
+    guidance_files: Vec<GuidanceFile>,
+}
+
+impl OrdinaryTurnContext {
+    pub fn discover(working_dir: &Path) -> Self {
+        Self {
+            catalog: OrdinarySkillCatalog::discover(working_dir),
+            guidance_files: discover_guidance_files(working_dir),
+        }
+    }
+}
 
 impl OrdinarySkillCatalog {
     pub fn discover(working_dir: &Path) -> Self {
@@ -260,6 +276,57 @@ pub fn build_system_prompt_with_catalog(
     catalog: &OrdinarySkillCatalog,
 ) -> String {
     let explore_bash = explore_bash.into();
+    let guidance_files = discover_guidance_files(working_dir);
+    build_system_prompt_with_snapshot(
+        working_dir,
+        tasks_dir_name,
+        is_sub_agent,
+        mode,
+        language,
+        persona,
+        explore_bash,
+        catalog,
+        &guidance_files,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_system_prompt_with_turn_context(
+    working_dir: &Path,
+    tasks_dir_name: &str,
+    is_sub_agent: bool,
+    mode: Option<&ModeContext>,
+    language: LlmLanguage,
+    persona: Option<&str>,
+    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
+    context: &OrdinaryTurnContext,
+) -> String {
+    build_system_prompt_with_snapshot(
+        working_dir,
+        tasks_dir_name,
+        is_sub_agent,
+        mode,
+        language,
+        persona,
+        explore_bash,
+        &context.catalog,
+        &context.guidance_files,
+    )
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn build_system_prompt_with_snapshot(
+    working_dir: &Path,
+    tasks_dir_name: &str,
+    is_sub_agent: bool,
+    mode: Option<&ModeContext>,
+    language: LlmLanguage,
+    persona: Option<&str>,
+    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
+    catalog: &OrdinarySkillCatalog,
+    guidance_files: &[GuidanceFile],
+) -> String {
+    let explore_bash = explore_bash.into();
 
     // REQ-AG-006: a named agent's persona replaces the generic assistant
     // preamble at the head of the prompt. Everything below (guidance, skills,
@@ -272,7 +339,6 @@ pub fn build_system_prompt_with_catalog(
     prompt.push_str(llm_language::mermaid_rendering_hint(language));
 
     // Add guidance from discovered files
-    let guidance_files = discover_guidance_files(working_dir);
     if !guidance_files.is_empty() {
         prompt.push_str("\n\n<project_guidance>\n");
 
@@ -421,6 +487,44 @@ mod tests {
         let temp = TempDir::new().unwrap();
         crate::skills::builtin::extract_to(temp.path()).unwrap();
         build_coordinator_system_prompt_with_options(language, Some(temp.path()))
+    }
+
+    #[test]
+    fn turn_context_retains_guidance_until_rediscovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let root_file = temp.path().join("AGENTS.md");
+        let child_file = child.join("AGENTS.md");
+        std::fs::write(&root_file, "snapshot ancestor original").unwrap();
+        std::fs::write(&child_file, "snapshot child original").unwrap();
+        let captured = OrdinaryTurnContext::discover(&child);
+        let render = |context: &OrdinaryTurnContext| {
+            build_system_prompt_with_turn_context(
+                &child,
+                "tasks",
+                false,
+                None,
+                LlmLanguage::PhoenixNative,
+                None,
+                phoenix_core::llm_language::ExploreBashPromptCapability::Unavailable,
+                context,
+            )
+        };
+        let before = render(&captured);
+        assert!(
+            before.find("snapshot ancestor original").unwrap()
+                < before.find("snapshot child original").unwrap()
+        );
+        std::fs::write(&root_file, "snapshot ancestor changed").unwrap();
+        std::fs::remove_file(&child_file).unwrap();
+        std::fs::write(child.join("AGENT.md"), "snapshot fallback added").unwrap();
+        assert_eq!(before, render(&captured));
+        let refreshed = render(&OrdinaryTurnContext::discover(&child));
+        assert!(refreshed.contains("snapshot ancestor changed"));
+        assert!(refreshed.contains("snapshot fallback added"));
+        assert!(!refreshed.contains("snapshot child original"));
+        assert!(refreshed.contains(&child.join("AGENT.md").display().to_string()));
     }
 
     #[test]

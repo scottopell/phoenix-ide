@@ -15,7 +15,7 @@ export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
 export type MarkdownImageProps = React.ComponentPropsWithoutRef<'img'> & { node?: unknown };
 
 function isPhoenixConversationDestination(path: string): boolean {
-  return /^\/(?:(?:c|product-conversations|chains)\/[^/]+|global(?:\/[^/]+)?)\/?$/.test(path);
+  return /^\/(?:(?:c|product-conversations|chains)\/[^/]+|transcript|global(?:\/[^/]+)?)\/?$/.test(path);
 }
 
 function appLocalDestination(href: string | undefined): string | undefined {

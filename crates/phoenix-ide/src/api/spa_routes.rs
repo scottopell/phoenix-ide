@@ -58,6 +58,7 @@ pub const SPA_ROUTES: &[SpaRoute] = &[
     SpaRoute::Exact("/"),
     SpaRoute::Exact("/new"),
     SpaRoute::Exact("/terminal"),
+    SpaRoute::Exact("/transcript"),
     SpaRoute::Exact("/about"),
     SpaRoute::Exact("/usage"),
     SpaRoute::Exact("/global"),
@@ -95,6 +96,7 @@ mod tests {
         assert!(is_spa_route("/"));
         assert!(is_spa_route("/new"));
         assert!(is_spa_route("/terminal"));
+        assert!(is_spa_route("/transcript"));
         assert!(is_spa_route("/about"));
         assert!(is_spa_route("/usage"));
         assert!(is_spa_route("/global"));
@@ -111,6 +113,7 @@ mod tests {
         // Privileged / server-owned paths must NOT be treated as SPA routes,
         // otherwise the auth exemption that consumes this would leak them.
         assert!(!is_spa_route("/api/conversations"));
+        assert!(!is_spa_route("/api/conversation-reads/snapshot"));
         assert!(!is_spa_route("/api/models"));
         assert!(!is_spa_route("/preview/some/file.html"));
         assert!(!is_spa_route("/assets/index-abc.js"));
@@ -122,6 +125,8 @@ mod tests {
         // `/newish` must not be mistaken for `/new`.
         assert!(!is_spa_route("/newish"));
         assert!(!is_spa_route("/terminals"));
+        assert!(!is_spa_route("/transcripts"));
+        assert!(!is_spa_route("/transcript/private"));
     }
 
     #[test]

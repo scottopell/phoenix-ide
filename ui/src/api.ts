@@ -1342,6 +1342,15 @@ export interface ActiveCoordinatorWatch {
   state: string;
 }
 
+// JSON keeps opaque references out of WHATWG-normalized URL path segments.
+function exactReadRequest(reference: string): RequestInit {
+  return {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reference }),
+  };
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1503,7 +1512,7 @@ export const api = {
 
   async resolveCoordinatorRoute(conversation: string): Promise<{ coordinator_id: string | null }> {
     const resp = await fetch(
-      `/api/global/coordinator/route/${encodeURIComponent(conversation)}`,
+      '/api/global/coordinator/reads/route', exactReadRequest(conversation),
     );
     if (!resp.ok) throw new Error('Failed to resolve Coordinator route');
     return resp.json();
@@ -1724,7 +1733,7 @@ export const api = {
   },
 
   async getConversation(id: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; presentation_mode: string; context_window_size: number }> {
-    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
+    const resp = await fetch('/api/conversation-reads/snapshot', exactReadRequest(id));
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to get conversation');
@@ -1742,7 +1751,7 @@ export const api = {
   },
 
   async getConversationRoute(id: string): Promise<ConversationRouteResponse> {
-    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/route`);
+    const resp = await fetch('/api/conversation-reads/route', exactReadRequest(id));
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to resolve conversation route');
@@ -1875,7 +1884,7 @@ export const api = {
     if (options?.before) params.set('before', options.before);
     if (options?.open_id) params.set('open_id', options.open_id);
     if (options?.request_id) params.set('request_id', options.request_id);
-    const response = await fetch(`/api/global/coordinator/history/${encodeURIComponent(reference)}?${params}`);
+    const response = await fetch(`/api/global/coordinator/reads/history?${params}`, exactReadRequest(reference));
     observeViewResponse(response, options?.onTelemetry);
     if (!response.ok) throw new ApiResponseError('Unable to read Global conversation history', response.status);
     const snapshot = await response.json();
@@ -1891,7 +1900,7 @@ export const api = {
     if (options?.before) params.set('before', options.before);
     if (options?.open_id) params.set('open_id', options.open_id);
     if (options?.request_id) params.set('request_id', options.request_id);
-    const response = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}?${params}`);
+    const response = await fetch(`/api/product-conversation-reads/snapshot?${params}`, exactReadRequest(productConversationId));
     observeViewResponse(response, options?.onTelemetry);
     if (!response.ok) throw new ApiResponseError('Unable to read product conversation history', response.status);
     const snapshot = await response.json();
@@ -1914,7 +1923,7 @@ export const api = {
     }
     const query = params.toString();
     const resp = await fetch(
-      `/api/product-conversations/${encodeURIComponent(productConversationId)}${query ? `?${query}` : ''}`,
+      `/api/product-conversation-reads/snapshot${query ? `?${query}` : ''}`, exactReadRequest(productConversationId),
     );
     observeViewResponse(resp, options?.onTelemetry);
     if (!resp.ok) {
@@ -1928,7 +1937,7 @@ export const api = {
   },
 
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {
-    const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/route`);
+    const resp = await fetch('/api/conversation-reads/route/by-slug', exactReadRequest(slug));
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to resolve conversation route');
@@ -1974,7 +1983,7 @@ export const api = {
   ): Promise<ConversationMessageSliceResponse> {
     const params = new URLSearchParams({ limit: String(limit) });
     const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(id)}/messages/latest?${params}`,
+      `/api/conversation-reads/messages/latest?${params}`, exactReadRequest(id),
     );
     if (!resp.ok) {
       const error = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
@@ -1996,7 +2005,7 @@ export const api = {
       limit: String(limit),
     });
     const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(id)}/messages?${params}`,
+      `/api/conversation-reads/messages?${params}`, exactReadRequest(id),
     );
     if (!resp.ok) throw new Error('Failed to fetch conversation messages before sequence');
     return resp.json();
@@ -2012,7 +2021,7 @@ export const api = {
       limit: String(limit),
     });
     const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(id)}/messages?${params}`,
+      `/api/conversation-reads/messages?${params}`, exactReadRequest(id),
     );
     if (!resp.ok) throw new Error('Failed to fetch conversation messages after sequence');
     return resp.json();
@@ -2028,7 +2037,7 @@ export const api = {
       end_message_sequence: String(end),
     });
     const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(id)}/messages/range?${params}`,
+      `/api/conversation-reads/messages/range?${params}`, exactReadRequest(id),
     );
     if (!resp.ok) throw new Error('Failed to fetch conversation message range');
     return resp.json();
@@ -2045,7 +2054,7 @@ export const api = {
       after: String(after),
     });
     const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(id)}/messages/around/${encodeURIComponent(sequence)}?${params}`,
+      `/api/conversation-reads/messages/around/${encodeURIComponent(sequence)}?${params}`, exactReadRequest(id),
     );
     if (!resp.ok) throw new Error('Failed to fetch conversation messages around sequence');
     return resp.json();

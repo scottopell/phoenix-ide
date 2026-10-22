@@ -1,7 +1,10 @@
 import { readFileSync } from 'node:fs';
+import { fromMarkdown } from 'mdast-util-from-markdown';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import ReactMarkdown from 'react-markdown';
+import { MarkdownRenderer } from './MarkdownRenderer';
+import { prepareMarkdown } from './prepareMarkdown';
+import { prepareStreamingBlocks } from './prepareStreamingBlocks';
 import { CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents } from './conversationMarkdownImages';
 import { describe, expect, it, vi } from 'vitest';
 import { ConversationMarkdownAnchor } from './conversationMarkdown';
@@ -27,15 +30,15 @@ function renderAnchor(href: string, onFileClick?: (path: string) => void) {
 
 describe('ConversationMarkdownAnchor', () => {
   it.each(['@conv:javascript:alert(1)', '@conv:../private', '@conv:58cff20d-81c3-4655-b9d8-61fe615bda28/extra', 'javascript:alert(1)'])('does not promote unsafe or malformed typed href %s', (href) => {
-    render(<MemoryRouter><ReactMarkdown components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{`[unsafe](${href})`}</ReactMarkdown></MemoryRouter>);
+    render(<MemoryRouter><MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{`[unsafe](${href})`}</MarkdownRenderer></MemoryRouter>);
     expect(document.querySelector('a[href^="/c/"]')).toBeNull();
   });
 
   it('routes the actual typed conversation citation through the Markdown sanitizer and router', () => {
     render(<MemoryRouter initialEntries={['/global/coordinator']}>
-      <ReactMarkdown components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+      <MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
         {'[UI testing conversation](@conv:58cff20d-81c3-4655-b9d8-61fe615bda28)'}
-      </ReactMarkdown>
+      </MarkdownRenderer>
       <CurrentLocation />
     </MemoryRouter>);
     const link = screen.getByRole('link', { name: 'UI testing conversation' });
@@ -44,6 +47,117 @@ describe('ConversationMarkdownAnchor', () => {
     fireEvent.click(link);
     expect(screen.getByTestId('location')).toHaveTextContent('/c/58cff20d-81c3-4655-b9d8-61fe615bda28');
     expect(screen.getByTestId('location-state')).toHaveTextContent('/global/coordinator');
+  });
+
+  it.each(['', '#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2'])('routes the literal transcript citation with exact pinning and return state (%s)', (fragment) => {
+    const transcript = 'aceb02b4-0735-491e-bd5c-854e844f1591';
+    const origin = '/global/coordinator?viewer=inspect#message-origin';
+    const destination = `/transcript?source_transcript=${transcript}${fragment}`;
+    render(<MemoryRouter initialEntries={[origin]}>
+      <MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+        {`[Proposal](@transcript:aceb02b4-0735-491e-bd5c-854e844f1591${fragment})`}
+      </MarkdownRenderer>
+      <CurrentLocation />
+    </MemoryRouter>);
+    const link = screen.getByRole('link', { name: 'Proposal' });
+    expect(link).toHaveAttribute('href', destination);
+    expect(link).not.toHaveAttribute('target');
+    fireEvent.click(link);
+    expect(screen.getByTestId('location').textContent).toBe(destination);
+    expect(screen.getByTestId('location-state').textContent).toBe(JSON.stringify({
+      conversationReturnOrigin: { kind: 'coordinator', href: origin },
+    }));
+  });
+
+  it.each([
+    '@transcript:',
+    '@transcript:row#message-',
+    '@transcript:row#other',
+    '@transcript:row#message-id#extra',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2#extra',
+    'javascript:alert(1)',
+    'data:text/html,unsafe',
+  ])('keeps unsafe or malformed transcript href sanitized: %s', (href) => {
+    render(<MemoryRouter><MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{`[unsafe](${href})`}</MarkdownRenderer></MemoryRouter>);
+    expect(screen.getByText('unsafe', { selector: 'a' })).toHaveAttribute('href', '');
+  });
+
+  it.each([
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591',
+    '@transcript:aceb02b4-0735-491e-bd5c-854e844f1591#message-ee6445ef-fc3e-451b-989a-1fa18225aaa2',
+  ])('does not promote transcript references used as image sources: %s', (src) => {
+    render(<MemoryRouter><MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{`![Proposal](${src})`}</MarkdownRenderer></MemoryRouter>);
+    expect(screen.getByRole('img', { name: 'Proposal' })).toHaveAttribute('src', '');
+  });
+
+  it.each([
+    'café', 'caf%C3%A9', '%', '%25', 'has[bracket]', 'has%5Bbracket%5D',
+    'old%2Frow', 'old%2frow', 'history/row?x=1&source_transcript=other',
+    '.', '..', '../private', 'javascript:alert(1)', "punct!$'()*+,;=:@[]/?",
+  ])('promotes original opaque MDAST URLs losslessly through every tree path: %s', id => {
+    const inline = `[exact](<@transcript:${id}#message-${id}>) [whole](<@transcript:${id}>)`;
+    const reference = `[exact][e] [whole][w] ![not a link][e]\n\n[e]: <@transcript:${id}#message-${id}>\n[w]: <@transcript:${id}>`;
+    const prepared = prepareMarkdown(reference, 'conversation');
+    const stream = prepareStreamingBlocks(`before\n\n\`\`\`text\ncode\n\`\`\`\n\n${reference}`).filter(block => block.type === 'markdown').at(-1)!;
+    const trees = [
+      { source: inline }, { source: reference }, { source: reference, tree: prepared },
+      { source: stream.content, tree: stream.tree },
+      // A caller-supplied parser tree can retain unresolved reference nodes.
+      { source: reference, tree: fromMarkdown(reference) },
+    ];
+    const original = JSON.stringify(prepared);
+    for (const { source, tree } of trees) {
+      const view = render(<MemoryRouter initialEntries={['/global?viewer=inspect']}>
+        <MarkdownRenderer mode="conversation" tree={tree} components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{source}</MarkdownRenderer>
+        <CurrentLocation />
+      </MemoryRouter>);
+      for (const name of ['exact', 'whole']) {
+        const link = screen.getByRole('link', { name });
+        const expected = `/transcript?source_transcript=${encodeURIComponent(id)}${name === 'exact' ? `#message-${encodeURIComponent(id)}` : ''}`;
+        const expectedUrl = new URL(expected, 'https://phoenix.test');
+        expect(link).toHaveAttribute('href', `${expectedUrl.pathname}${expectedUrl.search}${expectedUrl.hash}`);
+        const url = new URL(link.getAttribute('href')!, 'https://phoenix.test');
+        expect(url.pathname).toBe('/transcript');
+        expect(url.searchParams.getAll('source_transcript')).toEqual([id]);
+        if (name === 'exact') expect(decodeURIComponent(url.hash.slice('#message-'.length))).toBe(id);
+      }
+      if (source !== inline) expect(screen.getByRole('img', { name: 'not a link' })).toHaveAttribute('src', '');
+      fireEvent.click(screen.getByRole('link', { name: 'exact' }));
+      expect(JSON.parse(screen.getByTestId('location-state').textContent!)).toEqual({
+        conversationReturnOrigin: { kind: 'coordinator', href: '/global?viewer=inspect' },
+      });
+      view.unmount();
+    }
+    expect(JSON.stringify(prepared)).toBe(original);
+  });
+
+  it('resolves full, collapsed, and shortcut reference links without promoting shared image definitions', () => {
+    const source = '[full][ref] [ref][] [ref] ![image][ref]\n\n[ref]: <@transcript:literal%20row#message-m%2Fid> "title"\n[ref]: <@transcript:other>';
+    render(<MemoryRouter><MarkdownRenderer mode="conversation" tree={fromMarkdown(source)} components={createConversationMarkdownComponents()} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM} /></MemoryRouter>);
+    for (const link of screen.getAllByRole('link')) {
+      expect(link).toHaveAttribute('href', '/transcript?source_transcript=literal%2520row#message-m%252Fid');
+      expect(link).toHaveAttribute('title', 'title');
+    }
+    expect(screen.getAllByRole('link')).toHaveLength(3);
+    expect(screen.getByRole('img', { name: 'image' })).toHaveAttribute('src', '');
+  });
+
+  it('does not add typed promotion to standard Markdown or change default unsafe-scheme filtering', () => {
+    const view = render(<MarkdownRenderer mode="standard">{'[typed](<@transcript:café>) [bad](javascript:alert%281%29) [web](https://example.com)'}</MarkdownRenderer>);
+    expect(screen.getByText('typed', { selector: 'a' })).toHaveAttribute('href', '');
+    expect(screen.getByText('bad', { selector: 'a' })).toHaveAttribute('href', '');
+    expect(screen.getByRole('link', { name: 'web' })).toHaveAttribute('href', 'https://example.com');
+    view.unmount();
+    render(<MemoryRouter><MarkdownRenderer mode="conversation">{'[typed](<@transcript:literal%20row>) [bad](javascript:alert%281%29)'}</MarkdownRenderer></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'typed' })).toHaveAttribute('href', '/transcript?source_transcript=literal%2520row');
+    expect(screen.getByText('bad', { selector: 'a' })).toHaveAttribute('href', '');
+  });
+
+  it.each(['row space', 'row\tspace', 'row#extra', 'row#message-', 'row#message-bad#extra'])('does not promote malformed parsed typed URLs: %s', id => {
+    render(<MemoryRouter><MarkdownRenderer mode="conversation" components={createConversationMarkdownComponents()} tree={{
+      type: 'root', children: [{ type: 'paragraph', children: [{ type: 'link', url: `@transcript:${id}`, children: [{ type: 'text', value: 'bad' }] }] }],
+    }} /></MemoryRouter>);
+    expect(screen.getByText('bad', { selector: 'a' })).toHaveAttribute('href', '');
   });
 
   it.each(['/c/source#message-id', 'https://example.com/source'])('adds inline affordance without replacing caller props for %s', (href) => {
@@ -211,12 +325,12 @@ describe('ConversationMarkdownAnchor', () => {
     const onFileClick = vi.fn();
     const { container } = render(
       <MemoryRouter initialEntries={['/global/coordinator']}>
-        <ReactMarkdown
+        <MarkdownRenderer mode="conversation"
           components={createConversationMarkdownComponents({ onFileClick })}
           urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}
         >
           {'[Citation](/product-conversations/source)\n\n`/product-conversations/source`\n\n```text\n[Citation](/product-conversations/source)\n```\n\n[unsafe](javascript:alert%281%29)'}
-        </ReactMarkdown>
+        </MarkdownRenderer>
         <CurrentLocation />
       </MemoryRouter>,
     );

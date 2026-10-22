@@ -1,7 +1,8 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { useConversationViewJourney } from './hooks/useConversationViewJourney';
 import { generateUUID } from './utils/uuid';
-import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useNavigate, useLocation, useMatch } from 'react-router-dom';
+import { decodedRouteReference, transcriptSelector } from './transcriptReference';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -102,8 +103,9 @@ function AppRoutes() {
                 <Route path="/new" element={<NewConversationPage />} />
                 <Route path="/terminal" element={<TerminalPage />} />
                 <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
+                <Route path="/transcript" element={<ConversationRouteRedirect />} />
                 <Route path="/product-conversations/:slug" element={<ConversationRouteRedirect />} />
-                <Route path="/chains/:rootConvId" element={<ChainRouteRedirect />} />
+                <Route path="/chains/:rootConvId" element={<ConversationRouteRedirect />} />
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
                 <Route path="/usage" element={<UsagePage />} />
@@ -126,6 +128,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   useLayoutEffect(() => { journeyRef.current = journey; }, [journey]);
   const navigate = useNavigate();
   const location = useLocation();
+  const exactEntry = useMatch('/transcript') !== null;
   const [fallbackSnapshot, setFallbackSnapshot] = useState<{
     selectionKey: string;
     rowSlug: string;
@@ -137,10 +140,10 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   const [retryToken, setRetryToken] = useState(0);
   const locationRef = useRef(location);
   locationRef.current = location;
-  const sourcePins = new URLSearchParams(location.search).getAll('source_transcript');
-  const pinned = sourcePins[0];
-  const invalidPin = sourcePins.length > 1 || (pinned !== undefined && (!pinned || pinned.trim() !== pinned));
-  const selectionKey = JSON.stringify([reference, sourcePins, location.pathname]);
+  const selector = transcriptSelector(location.search);
+  const pinned = selector.kind === 'transcript' ? selector.id : undefined;
+  const invalidPin = selector.kind === 'invalid';
+  const selectionKey = JSON.stringify([reference, selector, location.pathname]);
   const activeFallback = fallbackSnapshot?.selectionKey === selectionKey ? fallbackSnapshot : null;
   const pinError = pinFailure?.selectionKey === selectionKey ? pinFailure.message : null;
 
@@ -174,7 +177,11 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             const [source, exact] = await Promise.all([api.resolveCoordinatorRoute(pinned), api.getConversation(pinned)]);
             if (exact.conversation.id !== pinned || source.coordinator_id !== coordinator_id) throw new Error('Transcript is not a member of this Global conversation');
           }
-          if (!cancelled) navigate({ pathname: `/global/${pinned ?? reference}`, search: locationRef.current.search, hash: locationRef.current.hash }, { replace: true });
+          if (!cancelled) navigate({
+            pathname: pinned === undefined ? `/global/${encodeURIComponent(reference)}` : '/global',
+            search: locationRef.current.search,
+            hash: locationRef.current.hash,
+          }, { replace: true, state: locationRef.current.state });
           return null;
         }
         return peek(reference);
@@ -190,6 +197,13 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
             if (!cancelled) {
               setResolvedProduct({ id: snapshot.product_conversation_id, admittedJourney: requestJourney });
               setValidatedSelection(selectionKey);
+              if (exactEntry) {
+                navigate({
+                  pathname: snapshot.canonical_route,
+                  search: locationRef.current.search,
+                  hash: locationRef.current.hash,
+                }, { replace: true, state: locationRef.current.state });
+              }
             }
             return;
           }
@@ -226,7 +240,7 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
         }
       });
     return () => { cancelled = true; };
-  }, [invalidPin, location.pathname, navigate, pinned, reference, retryToken, selectionKey]);
+  }, [exactEntry, invalidPin, location.pathname, navigate, pinned, reference, retryToken, selectionKey]);
 
   useEffect(() => {
     if (pinError || activeFallback) journey.finish('failed');
@@ -264,14 +278,19 @@ export function ProductConversationAliasRedirect({ reference }: { reference: str
   return <RouteFallback viewRef={journey.attach} />;
 }
 
-function ConversationRouteRedirect() {
-  const { slug } = useParams<{ slug: string }>();
-  return <ProductConversationAliasRedirect reference={slug} />;
-}
-
-function ChainRouteRedirect() {
-  const { rootConvId } = useParams<{ rootConvId: string }>();
-  return <ProductConversationAliasRedirect reference={rootConvId} />;
+export function ConversationRouteRedirect() {
+  const location = useLocation();
+  const exactEntry = useMatch('/transcript') !== null;
+  const selector = transcriptSelector(location.search);
+  if (exactEntry && selector.kind !== 'transcript') {
+    return <main><div role="alert">Invalid exact transcript reference.</div></main>;
+  }
+  const reference = exactEntry && selector.kind === 'transcript'
+    ? selector.id
+    : decodedRouteReference(location.pathname);
+  return reference === undefined
+    ? <main><div role="alert">Invalid conversation reference.</div></main>
+    : <ProductConversationAliasRedirect reference={reference} />;
 }
 
 function App() {
