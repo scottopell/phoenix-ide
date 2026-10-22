@@ -5150,39 +5150,22 @@ where
         )
     }
 
-    /// Handle the `AwaitingSubAgents` completion timeout (REQ-SA-006) by routing
-    /// it through the cancellation protocol rather than racing it.
-    ///
-    /// Dispatched by `handle_deadline_expiry` when the liveness deadline fires in
-    /// `AwaitingSubAgents`; the deadline is already cleared by the dispatcher.
-    ///
-    /// Injecting a single `UserCancel { cause: Timeout }` drives the
-    /// `AwaitingSubAgents + UserCancel -> CancellingSubAgents` transition, which
-    /// emits `Effect::CancelSubAgents` (the real cancel) and stamps
-    /// `cause: Timeout` on the state. Real cancelled results then drain through
-    /// `CancellingSubAgents` — each sub-agent terminates and reports within its
-    /// own 3s `CancellingTool` backstop — and the drain arm labels non-success
-    /// outcomes `TimedOut` per the state's cause. The 6s `CancellingSubAgents`
-    /// last-resort backstop (`handle_cancelling_sub_agents_timeout`) presumes any
-    /// still-pending agent dead after that. This handler no longer sends a direct
-    /// cancel or fabricates per-agent results; the transition owns the cancel.
     async fn handle_sub_agent_timeout(&mut self) {
-        let pending_count = if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
-            pending.len()
+        let pending_ids = if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
+            pending
+                .iter()
+                .map(|agent| agent.agent_id.clone())
+                .collect::<Vec<_>>()
         } else {
-            // Deadline fired but state already moved on — nothing to do.
             return;
         };
 
         tracing::warn!(
-            count = pending_count,
-            "Sub-agent completion timeout reached, cancelling pending agents via cancel protocol"
+            count = pending_ids.len(),
+            "Sub-agent completion timeout reached, expiring pending child wait"
         );
 
-        let event = Event::UserCancel {
-            reason: None,
-            cause: crate::state_machine::event::CancelCause::Timeout,
-        };
+        let event = Event::SubAgentWaitExpired { pending_ids };
         if let Err(e) = self.process_event(event).await {
             tracing::warn!(error = %e, "Failed to process sub-agent timeout cancel");
         }
@@ -16129,6 +16112,29 @@ mod authoritative_user_message_effect_tests {
         assert!(matches!(
             storage.get_current_state(&rt.context.conversation_id),
             Some(ConvState::RecoverableContinuationFailure { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_wait_expiry_does_not_classify_parent_completion_as_cancelled() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(10),
+            generation: 0,
+        }));
+        rt.classify_active_direct_turn_terminal(
+            &Event::SubAgentWaitExpired {
+                pending_ids: vec!["child".to_string()],
+            },
+            &ConvState::LlmRequesting { attempt: 1 },
+        );
+        rt.classify_active_direct_turn_outcome_terminal(&ConvState::Idle);
+        assert!(matches!(
+            rt.pending_direct_turn_terminal.as_deref(),
+            Some(crate::runtime::traits::ActiveDirectTurnTerminal::Completed)
         ));
     }
 

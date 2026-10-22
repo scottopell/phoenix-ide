@@ -144,6 +144,18 @@ AND report timeout failure to the parent conversation
 WHEN sub-agent timeout fires
 THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
+WHEN the parent's wait for admitted sub-agents expires
+THE SYSTEM SHALL target only the child admissions belonging to that wait
+AND SHALL retain the timeout as child-scoped failure evidence rather than execution-level cancellation of the parent
+AND SHALL permit the parent to continue after child teardown unless an execution-level Stop has been accepted
+
+WHEN an expiry event refers to child admissions that no longer belong to the current wait
+THE SYSTEM SHALL NOT terminate replacement children or interrupt ordinary parent model work
+
+WHEN an execution-level Stop is accepted while timeout teardown is draining children
+THE SYSTEM SHALL preserve the Stop's terminal direction
+AND SHALL NOT resume parent model work when child teardown finishes
+
 **Rationale:** Without enforced time limits, a stuck or slow sub-agent
 holds the parent conversation indefinitely. Users need assurance that
 sub-agent work completes or fails within a bounded time.

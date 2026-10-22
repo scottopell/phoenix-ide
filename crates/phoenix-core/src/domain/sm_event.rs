@@ -563,6 +563,9 @@ pub enum Event {
         job_id: String,
         claim: super::creation_protocol::CreationClaim,
     },
+    SubAgentWaitExpired {
+        pending_ids: Vec<String>,
+    },
     UserCancel {
         /// Why the cancel was issued. `None` means user-initiated or parent-propagated.
         reason: Option<String>,
@@ -798,6 +801,7 @@ impl Event {
             Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
+            Event::SubAgentWaitExpired { .. } => "SubAgentWaitExpired",
             Event::UserCancel { .. } => "UserCancel",
             Event::LlmResponse { .. } => "LlmResponse",
             Event::LlmError { .. } => "LlmError",
@@ -863,6 +867,9 @@ pub enum CoreEvent {
     AuthoritativeUserMessage {
         payload: Box<PreparedDirectTurnPayload>,
         authority: DirectTurnAttemptAuthority,
+    },
+    SubAgentWaitExpired {
+        pending_ids: Vec<String>,
     },
     UserCancel {
         reason: Option<String>,
@@ -1074,6 +1081,11 @@ impl TryFrom<Event> for ParentEvent {
                 event_variant: "CreationRequestResume",
                 target_type: "ParentEvent",
             }),
+            Event::SubAgentWaitExpired { pending_ids } => {
+                Ok(ParentEvent::Core(CoreEvent::SubAgentWaitExpired {
+                    pending_ids,
+                }))
+            }
             Event::UserCancel { reason, cause } => {
                 Ok(ParentEvent::Core(CoreEvent::UserCancel { reason, cause }))
             }
@@ -1293,6 +1305,11 @@ impl TryFrom<Event> for SubAgentEvent {
                 event_variant: "CreationRequestResume",
                 target_type: "SubAgentEvent",
             }),
+            Event::SubAgentWaitExpired { pending_ids } => {
+                Ok(SubAgentEvent::Core(CoreEvent::SubAgentWaitExpired {
+                    pending_ids,
+                }))
+            }
             Event::UserCancel { reason, cause } => {
                 Ok(SubAgentEvent::Core(CoreEvent::UserCancel { reason, cause }))
             }
@@ -1463,6 +1480,7 @@ impl CoreEvent {
         match self {
             CoreEvent::UserMessage { .. } => "UserMessage",
             CoreEvent::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            CoreEvent::SubAgentWaitExpired { .. } => "SubAgentWaitExpired",
             CoreEvent::UserCancel { .. } => "UserCancel",
             CoreEvent::LlmResponse { .. } => "LlmResponse",
             CoreEvent::LlmError { .. } => "LlmError",

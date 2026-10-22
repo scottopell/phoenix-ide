@@ -920,8 +920,11 @@ pub fn transition_core(
             handle_core_tool_complete(state, event)
         }
 
+        (_, CoreEvent::SubAgentWaitExpired { .. }) => handle_core_cancellation(state, event),
+
         // Cancellation (REQ-BED-005)
         (CoreState::AwaitingSubAgents { .. }, CoreEvent::UserCancel { .. })
+        | (CoreState::CancellingSubAgents { .. }, CoreEvent::UserCancel { .. })
         | (CoreState::ToolExecuting { .. }, CoreEvent::UserCancel { .. })
         | (CoreState::LlmRequesting { .. }, CoreEvent::UserCancel { .. })
         | (CoreState::ServerOverloadRetrying { .. }, CoreEvent::UserCancel { .. })
@@ -1278,6 +1281,7 @@ fn handle_core_tool_complete(
         | CoreEvent::UserMessage { .. }
         | CoreEvent::AuthoritativeUserMessage { .. }
         | CoreEvent::UserCancel { .. }
+        | CoreEvent::SubAgentWaitExpired { .. }
         | CoreEvent::LlmResponse { .. }
         | CoreEvent::LlmError { .. }
         | CoreEvent::ServerOverloaded { .. }
@@ -1305,6 +1309,50 @@ fn handle_core_cancellation(
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
     match (state, event) {
+        (
+            CoreState::AwaitingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+            },
+            CoreEvent::SubAgentWaitExpired { pending_ids },
+        ) if !pending.is_empty()
+            && pending
+                .iter()
+                .map(|agent| &agent.agent_id)
+                .eq(pending_ids.iter()) =>
+        {
+            Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
+                pending: pending.clone(),
+                completed_results: completed_results.clone(),
+                cause: CancelCause::Timeout,
+                spawn_tool_id: spawn_tool_id.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::CancelSubAgents {
+                ids: pending_ids,
+                cause: CancelCause::Timeout,
+            }))
+        }
+        (_, CoreEvent::SubAgentWaitExpired { .. }) => Ok(CoreTransitionResult::new(state.clone())),
+        (
+            CoreState::CancellingSubAgents {
+                pending,
+                completed_results,
+                spawn_tool_id,
+                ..
+            },
+            CoreEvent::UserCancel {
+                cause: CancelCause::UserRequested,
+                ..
+            },
+        ) => Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
+            pending: pending.clone(),
+            completed_results: completed_results.clone(),
+            cause: CancelCause::UserRequested,
+            spawn_tool_id: spawn_tool_id.clone(),
+        })
+        .with_effect(Effect::PersistState)),
         // AwaitingSubAgents + UserCancel -> CancellingSubAgents
         (
             CoreState::AwaitingSubAgents {
@@ -9869,13 +9917,79 @@ mod teardown_tests {
         );
     }
 
-    /// Test 6: the parent's `AwaitingSubAgents` completion timeout reroutes
-    /// through the cancel protocol. `AwaitingSubAgents + UserCancel{Timeout}`
-    /// lands in `CancellingSubAgents{cause: Timeout}` and emits the real
-    /// `Effect::CancelSubAgents` — it does NOT fabricate per-agent `TimedOut`
-    /// results directly (those drain later through `CancellingSubAgents`).
     #[test]
-    fn timeout_user_cancel_reroutes_to_cancelling_subagents_with_cancel_effect() {
+    fn user_stop_during_timeout_drain_cannot_resume_parent() {
+        let draining = ConvState::CancellingSubAgents {
+            pending: vec![pending("a")],
+            completed_results: vec![],
+            cause: CancelCause::Timeout,
+            spawn_tool_id: None,
+        };
+        let stopped = transition(
+            &draining,
+            &test_context(),
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
+        )
+        .unwrap();
+        let settled = transition(
+            &stopped.new_state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: SubAgentOutcome::TimedOut,
+            },
+        )
+        .unwrap();
+        assert!(matches!(settled.new_state, ConvState::Idle));
+        assert!(!settled
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn stale_child_wait_expiry_does_not_cancel_another_admission() {
+        let state = ConvState::AwaitingSubAgents {
+            pending: vec![pending("replacement")],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::SubAgentWaitExpired {
+                pending_ids: vec!["old-child".to_string()],
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingSubAgents { .. }
+        ));
+        assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn child_wait_expiry_cannot_stop_parent_llm_work() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::SubAgentWaitExpired {
+                pending_ids: vec!["old-child".to_string()],
+            },
+        )
+        .unwrap();
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        assert!(result.effects.is_empty());
+    }
+
+    /// Test 6: the parent's `AwaitingSubAgents` completion timeout reroutes
+    /// through the child-wait expiry protocol.
+    #[test]
+    fn child_wait_expiry_reroutes_to_cancelling_subagents_with_cancel_effect() {
         let state = ConvState::AwaitingSubAgents {
             pending: vec![pending("a"), pending("b")],
             completed_results: vec![],
@@ -9884,9 +9998,8 @@ mod teardown_tests {
         let result = transition(
             &state,
             &test_context(),
-            Event::UserCancel {
-                reason: None,
-                cause: CancelCause::Timeout,
+            Event::SubAgentWaitExpired {
+                pending_ids: vec!["a".to_string(), "b".to_string()],
             },
         )
         .unwrap();
