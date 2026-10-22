@@ -2710,6 +2710,34 @@ impl WorkflowRepository {
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model.apply(command).map_err(conflict)?;
         if matches!(step.outcome, TurnOutcome::TerminalReplay { .. }) {
+            if let (TurnCommand::Cancel { .. }, Some(projection)) =
+                (&input.command, &input.projection)
+            {
+                let row = sqlx::query(
+                    "SELECT state, state_updated_at, EXISTS(SELECT 1 FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1) AS has_owner FROM conversations WHERE id = ?1",
+                )
+                .bind(&turn.conversation.0)
+                .fetch_one(&mut *tx.tx)
+                .await?;
+                let persisted = PersistedConversationProjection {
+                    state: serde_json::from_str(row.get::<&str, _>("state"))
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    state_updated_at: DateTime::parse_from_rfc3339(
+                        row.get::<&str, _>("state_updated_at"),
+                    )
+                    .map_err(|error| DbError::Serialization(error.to_string()))?
+                    .with_timezone(&Utc),
+                };
+                if !projections_match(&persisted, projection)?
+                    || row.get::<i64, _>("has_owner") != 0
+                {
+                    return Err(DbError::DirectTurnStopUnclassified {
+                        turn_id,
+                        detail: "terminal replay does not own the exact projected conversation"
+                            .to_string(),
+                    });
+                }
+            }
             Self::clear_provider_replay_for_settlement(
                 &mut tx.tx,
                 &input.provider_replay_settlement,
@@ -4649,6 +4677,9 @@ mod tests {
     async fn historical_projectionless_cancel_is_not_projected_stop_evidence() {
         let repo = repo().await;
         let (turn_id, _) = created_turn(&repo, "legacy-stop-no-projection", 96).await;
+        let replay_bytes = "retained-current-replay-bytes";
+        sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('conv-a','anthropic','test','current',?1)")
+            .bind(replay_bytes).execute(&repo.pool).await.unwrap();
         repo.terminate_authoritative_turn(TurnCommand::Cancel {
             turn_id,
             expected_generation: 0,
@@ -4660,6 +4691,16 @@ mod tests {
                 .await,
             Err(DbError::DirectTurnStopUnclassified { .. })
         ));
+        let retained: String = sqlx::query_scalar(
+            "SELECT payload FROM active_provider_replay_state WHERE conversation_id = 'conv-a'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, replay_bytes,
+            "rejected stale replay must be mutation-free"
+        );
     }
 
     #[tokio::test]
