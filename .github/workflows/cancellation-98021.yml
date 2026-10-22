@@ -30,42 +30,69 @@ jobs:
           printf '%s\n' 'EXCLUDED EXPECTED RED: authoritative_settlement_is_not_reclassified_by_legacy_cancel_observation; publisher override remains unfixed. This is slice qualification, not full-branch CI or merge readiness.' > qualification-evidence/remaining-failure.txt
           git rev-parse HEAD | tee qualification-evidence/head.txt
           printf '%s\n' 'source-parent=ff9bd30f87527d1484eb8768aed9761d4fb84435' > qualification-evidence/source-parent.txt
-      - name: Four-package all-target check and ten named regressions
+      - name: Four-package all-target check and nineteen exact named regressions
         shell: bash
         run: |
-          set -uo pipefail
-          run_check() {
-            local name="$1" code; shift
-            printf '%q ' "$@" > "qualification-evidence/$name.command"
-            printf '\n' >> "qualification-evidence/$name.command"
-            "$@" 2>&1 | tee "qualification-evidence/$name.log"
-            code=${PIPESTATUS[0]}
-            printf '%s\n' "$code" > "qualification-evidence/$name.exit"
-            if [[ "$name" != compile && "$code" = 0 ]]; then
-              grep -Eq 'test result: ok\. [1-9][0-9]* passed' "qualification-evidence/$name.log" || return 1
-              grep -F "::$name ... ok" "qualification-evidence/$name.log" > /dev/null || return 1
-            fi
-            return "$code"
-          }
-          run_check compile cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide || exit "$?"
+          set -euo pipefail
+          OUT=qualification-evidence
+          cat > "$OUT/named-cases.txt" <<'CASES'
+          phoenix-db|workflow::direct_turn::tests::accepted_direct_turn_stop_replays_exact_command_not_replacement_generation
+          phoenix-db|workflow::direct_turn::tests::established_terminal_obligation_rejects_stop_without_revoking_owner
+          phoenix-db|workflow::direct_turn::tests::accepted_stop_fences_later_terminal_obligation
+          phoenix-db|workflow::direct_turn::tests::accepted_stop_finalization_must_commit_the_reducer_projection
+          phoenix-db|workflow::direct_turn::tests::stop_commit_error_is_classified_from_exact_durable_fact
+          phoenix_ide|runtime::executor::authoritative_user_message_effect_tests::db_backed_targeted_stop_commits_projection_before_teardown_and_restart
+          phoenix_ide|runtime::executor::authoritative_user_message_effect_tests::targeted_stop_does_not_fabricate_idle_for_nonterminal_drain
+          phoenix_ide|runtime::executor::authoritative_user_message_effect_tests::direct_stop_storage_failure_cannot_abort_model_work
+          phoenix_ide|runtime::executor::authoritative_user_message_effect_tests::stale_direct_turn_stop_is_rejected_before_teardown
+          phoenix_ide|runtime::executor::authoritative_user_message_effect_tests::direct_turn_stop_cannot_fall_back_to_unowned_parent_work
+          phoenix-db|workflow::direct_turn::tests::direct_stop_drain_preserves_owner_and_defers_watch_until_terminal
+          phoenix-db|workflow::direct_turn::tests::direct_stop_drain_rejects_stale_source_target_and_completion_first
+          phoenix-db|workflow::direct_turn::tests::direct_stop_drain_commit_cuts_require_exact_durable_projection
+          phoenix-db|workflow::direct_turn::tests::direct_stop_drain_type_rejects_idle_and_timeout_direction
+          phoenix_ide|runtime::executor::authoritative_user_message_effect_tests::db_backed_targeted_stop_retains_drain_owner_projection_and_replay
+          phoenix_ide|runtime::executor::authoritative_user_message_effect_tests::durable_drain_direction_classifies_without_process_cancellation_history
+          phoenix-db|tests::reset_preserves_standalone_user_child_drain_as_cancel_action
+          phoenix-db|tests::reset_retains_user_tool_drain_cancel_direction_without_fan_in
+          phoenix-db|workflow::direct_turn::tests::startup_exact_cancel_action_fences_both_terminal_sinks_for_real_owner
+          CASES
+          test "$(wc -l < "$OUT/named-cases.txt")" -eq 19
+          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sort -u | wc -l)" -eq 19
+          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sed 's/.*:://' | sort -u | wc -l)" -eq 19
+          while IFS='|' read -r pkg fullname; do
+            printf '%s\n' 'NOT RUN (compile gate not passed)' > "$OUT/${fullname##*::}.disposition"
+          done < "$OUT/named-cases.txt"
+          printf '%s\n' 'cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide' > "$OUT/compile.command"
+          set +e
+          cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide 2>&1 | tee "$OUT/compile.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$code" > "$OUT/compile.exit"
+          if test "$code" -ne 0; then exit "$code"; fi
           result=0
-          for test in \
-            accepted_direct_turn_stop_replays_exact_command_not_replacement_generation \
-            established_terminal_obligation_rejects_stop_without_revoking_owner \
-            accepted_stop_fences_later_terminal_obligation \
-            accepted_stop_finalization_must_commit_the_reducer_projection \
-            stop_commit_error_is_classified_from_exact_durable_fact; do
-            run_check "$test" cargo test -p phoenix-db "$test" || result=1
-          done
-          for test in \
-            db_backed_targeted_stop_commits_projection_before_teardown_and_restart \
-            targeted_stop_does_not_fabricate_idle_for_nonterminal_drain \
-            direct_stop_storage_failure_cannot_abort_model_work \
-            stale_direct_turn_stop_is_rejected_before_teardown \
-            direct_turn_stop_cannot_fall_back_to_unowned_parent_work; do
-            run_check "$test" cargo test -p phoenix_ide "$test" || result=1
-          done
-          grep -h 'test result:' qualification-evidence/*.log > qualification-evidence/test-counts.txt || true
+          while IFS='|' read -r pkg fullname; do
+            name=${fullname##*::}
+            case "$pkg" in phoenix-db|phoenix_ide) ;; *) exit 1 ;; esac
+            printf 'cargo test -p %s --lib %s -- --exact --nocapture\n' "$pkg" "$fullname" > "$OUT/$name.command"
+            printf '%s\n' 'RUNNING' > "$OUT/$name.disposition"
+            set +e
+            cargo test -p "$pkg" --lib "$fullname" -- --exact --nocapture 2>&1 | tee "$OUT/$name.log"
+            code=${PIPESTATUS[0]}
+            set -e
+            printf '%s\n' "$code" > "$OUT/$name.exit"
+            cases=$(grep -Ec '^test .* \.\.\. (ok|FAILED|ignored)$' "$OUT/$name.log" || true)
+            named_pass=$(grep -Fxc "test $fullname ... ok" "$OUT/$name.log" || true)
+            summary=$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in ' "$OUT/$name.log" || true)
+            verification=0
+            if test "$code" -ne 0 || test "$cases" -ne 1 || test "$named_pass" -ne 1 || test "$summary" -ne 1; then
+              verification=1
+              result=1
+            fi
+            printf '%s\n' "$verification" > "$OUT/$name.verification.exit"
+            printf '%s cases=%s exact_named_pass=%s one_pass_summary=%s command_exit=%s verification_exit=%s\n' "$fullname" "$cases" "$named_pass" "$summary" "$code" "$verification" >> "$OUT/test-counts.txt"
+            if test "$verification" -eq 0; then verdict=PASS; else verdict=FAIL; fi
+            printf '%s\n' "$verdict" > "$OUT/$name.disposition"
+          done < "$OUT/named-cases.txt"
           exit "$result"
       - name: Retain qualification evidence
         if: always()
