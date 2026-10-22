@@ -46,6 +46,36 @@ use phoenix_core::domain::tool_wire::{
 #[cfg(test)]
 use phoenix_core::process_identity::current_process_identity;
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn rca_probe_record(
+    pid: u32,
+) -> (
+    Result<
+        phoenix_core::process_identity::ProcessIdentity,
+        phoenix_core::process_identity::IdentityObservationFailure,
+    >,
+    String,
+) {
+    let observed = phoenix_core::process_identity::observe_process_identity(pid);
+    let record = match &observed {
+        Ok(identity) => format!(
+            "category=present rc=none errno=none birth={}",
+            identity.start_time
+        ),
+        Err(failure) => format!(
+            "category={} rc={} errno={}",
+            failure.kind(),
+            failure
+                .rc()
+                .map_or_else(|| "none".to_string(), |value| value.to_string()),
+            failure
+                .errno()
+                .map_or_else(|| "none".to_string(), |value| value.to_string())
+        ),
+    };
+    (observed, record)
+}
+
 // ---------------------------------------------------------------------------
 // Configuration constants (REQ-BASH config)
 // ---------------------------------------------------------------------------
@@ -2876,7 +2906,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn native_gated_delayed_probe_runs_fast_command_with_direct_process_contract() {
         if !native_launcher_available() {
@@ -2891,6 +2921,7 @@ mod tests {
             context
         };
         let command = "pwd > cwd.txt; printf '%s' \"$PATH\" > path.txt; test -c /dev/fd/0 && printf char > stdin.txt; printf native-fast";
+        let probe_record = std::sync::Mutex::new(None);
         let output = run_run_with_identity_probe_mode(
             command,
             None,
@@ -2903,11 +2934,26 @@ mod tests {
             |pid| {
                 // test-timing-allow: delay identity observation to verify the native fast command remains correct across delayed process-identity probing
                 std::thread::sleep(Duration::from_millis(75));
-                observe_process_identity(pid).ok()
+                let (observed, record) = rca_probe_record(pid);
+                *probe_record.lock().unwrap() = Some((pid, record));
+                observed.ok()
             },
         )
         .await;
         let response = response_json(&output);
+        let (pid, probe) = probe_record
+            .lock()
+            .unwrap()
+            .take()
+            .expect("native probe recorded");
+        eprintln!(
+            "RCA_SAMPLE phase=native_gated_delayed_probe platform={} pid={} probe={} status={} exit_code={}",
+            std::env::consts::OS,
+            pid,
+            probe,
+            response["status"].as_str().unwrap_or("unknown"),
+            response["exit_code"].as_i64().map_or_else(|| "none".to_string(), |code| code.to_string())
+        );
         assert_eq!(response["status"], "exited");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("cwd.txt")).unwrap(),
@@ -3285,6 +3331,172 @@ mod tests {
         assert_eq!(response["exit_code"], 4);
         assert_eq!(response["lines"][0]["bytes"], "late-tail");
         assert_eq!(response["output_complete"], true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct OwnedChild(std::process::Child);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => eprintln!("RCA child cleanup try_wait failed: {error}"),
+            }
+            if let Err(error) = self.0.kill() {
+                eprintln!("RCA child cleanup kill failed: {error}");
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.0.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::yield_now();
+                    }
+                    Ok(None) => {
+                        eprintln!("RCA child cleanup exceeded five-second deadline");
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("RCA child cleanup wait failed: {error}");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_birth_probe_records_alive_exited_unreaped_and_postmortem_phases() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+
+        let mut child = OwnedChild(
+            Command::new("sh")
+                .arg("-c")
+                .arg("IFS= read -r release; printf RCA_CHILD_COMPLETE; exit 0")
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn owned barrier child"),
+        );
+        let pid = child.0.id();
+        let (_, alive_probe) = rca_probe_record(pid);
+        eprintln!(
+            "RCA_SAMPLE phase=alive platform={} pid={} probe={} status=held_on_parent_pipe",
+            std::env::consts::OS,
+            pid,
+            alive_probe
+        );
+
+        child
+            .0
+            .stdin
+            .take()
+            .expect("owned child stdin")
+            .write_all(b"release\n")
+            .expect("release owned child");
+
+        let expected_pid = libc::pid_t::try_from(pid).expect("child pid fits pid_t");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: pid is this test's unreaped owned child. WNOWAIT retains it.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::try_from(pid).expect("child pid fits waitid id_t"),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(rc, 0, "waitid failed: {}", std::io::Error::last_os_error());
+            if unsafe { info.si_pid() } == expected_pid {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned child did not exit"
+            );
+            std::thread::yield_now();
+        }
+        let (_, unreaped_probe) = rca_probe_record(pid);
+        eprintln!(
+            "RCA_SAMPLE phase=exited_unreaped platform={} pid={} probe={} status=waitid_WEXITED_WNOWAIT",
+            std::env::consts::OS,
+            pid,
+            unreaped_probe
+        );
+
+        let status = child.0.wait().expect("reap only the owned child");
+        assert_eq!(status.code(), Some(0));
+        let mut output = String::new();
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert_eq!(output, "RCA_CHILD_COMPLETE");
+        let (_, postmortem_probe) = rca_probe_record(pid);
+        eprintln!(
+            "RCA_SAMPLE phase=postmortem_diagnostic_only platform={} pid={} probe={} status=owned_wait_exit0 authority=false pid_reuse_possible=true",
+            std::env::consts::OS,
+            pid,
+            postmortem_probe
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_none_probe_fast_command_records_terminal_and_keeps_public_scope_fence() {
+        // The legacy Option probe collapses missing-process and other probe failures;
+        // this fixture asserts the observed None path, not a particular kernel cause.
+        let ctx = test_context(&scope("legacy-none-fast-fence"));
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = "printf RCA_LEGACY_SENTINEL; exit 0";
+        let mut child = injected_unregistered_child(&ctx, dir.path(), cmd, |_| None);
+        let pid = child.child.id().expect("owned legacy child pid");
+        let status = tokio::time::timeout(Duration::from_secs(5), child.child.wait())
+            .await
+            .expect("injected owned child exits before legacy settlement")
+            .expect("wait for injected owned child");
+        assert_eq!(status.code(), Some(0));
+        let registry = ctx.bash_handle_registry();
+        let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
+        let response = response_json(
+            &settle_unregistered_run(
+                child,
+                reservation,
+                cmd,
+                None,
+                RING_BUFFER_BYTES,
+                &ReadArgs::default(),
+                BashLaunchError::IdentityUnavailable,
+            )
+            .await,
+        );
+        assert_eq!(response["status"], "unregistered_exited");
+        assert_eq!(response["exit_code"], 0);
+        assert_eq!(response["lines"][0]["bytes"], "RCA_LEGACY_SENTINEL");
+        assert!(registry.reserve_spawn(&ctx.work_scope).await.is_err());
+        let fence = registry
+            .begin_teardown(&ctx.work_scope)
+            .await
+            .expect("public owner fence");
+        assert_eq!(
+            fence.scope_uncertainty().await,
+            Some(crate::bash::registry::BashScopeUncertainty::UnregisteredLaunch)
+        );
+        eprintln!(
+            "RCA_SAMPLE phase=legacy_none_probe platform={} pid={} probe=category=none status=unregistered_exited_exit0 public_spawn_rejected=true scope_uncertainty=unregistered_launch",
+            std::env::consts::OS,
+            pid
+        );
     }
 
     #[cfg(unix)]
