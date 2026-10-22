@@ -431,6 +431,79 @@ async fn conversation_goal_canonical_state_failure_rolls_back_response_checkpoin
     assert_eq!(indexed, 0);
 }
 
+async fn apply_checkpoint_fence(
+    db: &Database,
+    input: &GoalStartAdoptionInput,
+    assistant: &crate::Message,
+    source: &ConvState,
+    fence: &str,
+) {
+    match fence {
+        "slot" => db
+            .update_conversation_state_at(
+                &assistant.conversation_id,
+                source,
+                input.state_updated_at + chrono::Duration::microseconds(1),
+            )
+            .await
+            .unwrap(),
+        "reconstruction" => {
+            assert!(matches!(
+                db.workflow_repository()
+                    .recover_goal_start_runtime(&crate::workflow::GoalStartRecoveryInput::new(
+                        assistant.conversation_id.clone(),
+                        (
+                            TurnAuthorityId(
+                                u64::try_from(input.receipt.execution().turn_id()).unwrap()
+                            ),
+                            input.authority.generation.0
+                        ),
+                        (source.clone(), input.state_updated_at),
+                        Timestamp(30),
+                    ))
+                    .await
+                    .unwrap(),
+                crate::workflow::GoalStartRecoveryOutcome::Recovered(_)
+            ));
+        }
+        "queue" => {
+            let entry = phoenix_core::domain::sm_event::SteerEntry {
+                message_id: "accepted-checkpoint-input".into(),
+                text: "accepted input".into(),
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            };
+            db.append_steering_entry(
+                &assistant.conversation_id,
+                &entry,
+                "checkpoint-input-fingerprint",
+            )
+            .await
+            .unwrap();
+        }
+        "stop" => {
+            use crate::conversation_goals::control::{ControlCommand, ControlRequest};
+            db.apply_goal_control(
+                &ControlRequest {
+                    owner: input.receipt.input().goal().owner.clone(),
+                    principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
+                    request_id: uuid::Uuid::new_v4(),
+                    command: ControlCommand::Stop,
+                    expected_control_version: 1,
+                },
+                GoalTimestampUs::parse(100).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        _ => unreachable!(),
+    }
+}
+
 #[tokio::test]
 async fn conversation_goal_canonical_obsolete_owner_or_slot_cannot_publish_response() {
     for fence in ["slot", "reconstruction", "queue", "stop"] {
@@ -438,70 +511,7 @@ async fn conversation_goal_canonical_obsolete_owner_or_slot_cannot_publish_respo
         let admitted = context(&db, &input).await.unwrap().unwrap().into_admitted();
         let assistant = response(&input);
         let source = ConvState::LlmRequesting { attempt: 1 };
-        match fence {
-            "slot" => db
-                .update_conversation_state_at(
-                    &assistant.conversation_id,
-                    &source,
-                    input.state_updated_at + chrono::Duration::microseconds(1),
-                )
-                .await
-                .unwrap(),
-            "reconstruction" => {
-                assert!(matches!(
-                    db.workflow_repository()
-                        .recover_goal_start_runtime(&crate::workflow::GoalStartRecoveryInput::new(
-                            assistant.conversation_id.clone(),
-                            (
-                                TurnAuthorityId(
-                                    u64::try_from(input.receipt.execution().turn_id()).unwrap()
-                                ),
-                                input.authority.generation.0
-                            ),
-                            (source.clone(), input.state_updated_at),
-                            Timestamp(30),
-                        ))
-                        .await
-                        .unwrap(),
-                    crate::workflow::GoalStartRecoveryOutcome::Recovered(_)
-                ));
-            }
-            "queue" => {
-                let entry = phoenix_core::domain::sm_event::SteerEntry {
-                    message_id: "accepted-checkpoint-input".into(),
-                    text: "accepted input".into(),
-                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-                    llm_text: None,
-                    images: Vec::new(),
-                    files: Vec::new(),
-                    user_agent: None,
-                    skill_invocation: None,
-                };
-                db.append_steering_entry(
-                    &assistant.conversation_id,
-                    &entry,
-                    "checkpoint-input-fingerprint",
-                )
-                .await
-                .unwrap();
-            }
-            "stop" => {
-                use crate::conversation_goals::control::{ControlCommand, ControlRequest};
-                db.apply_goal_control(
-                    &ControlRequest {
-                        owner: input.receipt.input().goal().owner.clone(),
-                        principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
-                        request_id: uuid::Uuid::new_v4(),
-                        command: ControlCommand::Stop,
-                        expected_control_version: 1,
-                    },
-                    GoalTimestampUs::parse(100).unwrap(),
-                )
-                .await
-                .unwrap();
-            }
-            _ => unreachable!(),
-        }
+        apply_checkpoint_fence(&db, &input, &assistant, &source, fence).await;
         let before = counts(&db).await;
         let retained = db
             .get_conversation(&assistant.conversation_id)

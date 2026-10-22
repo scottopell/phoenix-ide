@@ -179,7 +179,7 @@ where
                     self.ordinary_turn_context = None;
                 }
                 self.pending_provider_replay_update = None;
-                Ok(committed)
+                Ok(*committed)
             }
             Ok(GoalRequestCheckpointOutcome::Refused) => {
                 self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;

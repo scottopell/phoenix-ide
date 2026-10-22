@@ -316,16 +316,20 @@ async fn saved_goal_is_frozen_not_admission_or_execution_completion_and_dedup_ne
             matches!(&event.goal_capture, Some(WatchGoalCapture::CapturedSavedGoal { owner_version: 2, state: WatchGoalState::Blocked { reason }, .. }) if reason == "  exact blocked reason  ")
         );
     }
+    assert_goal_capture_is_immutable(&db, &first.event_id).await;
+}
+
+async fn assert_goal_capture_is_immutable(db: &Database, event_id: &str) {
     assert!(sqlx::query(
         "UPDATE coordinator_watch_goal_captures SET objective='rewrite' WHERE event_id=?"
     )
-    .bind(&first.event_id)
+    .bind(event_id)
     .execute(db.pool())
     .await
     .is_err());
     assert!(
         sqlx::query("DELETE FROM coordinator_watch_goal_captures WHERE event_id=?")
-            .bind(&first.event_id)
+            .bind(event_id)
             .execute(db.pool())
             .await
             .is_err()
@@ -333,7 +337,7 @@ async fn saved_goal_is_frozen_not_admission_or_execution_completion_and_dedup_ne
     assert!(sqlx::query(
         "UPDATE coordinator_watch_events SET goal_capture_kind='disabled' WHERE event_id=?"
     )
-    .bind(&first.event_id)
+    .bind(event_id)
     .execute(db.pool())
     .await
     .is_err());
@@ -654,7 +658,7 @@ async fn captured_facts_survive_source_deletion_and_follow_event_lifetime() {
     db.delete_conversation(&transcript).await.unwrap();
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
     let mut presentations = db
-        .coordinator_watch_event_presentations(&[before.event_id.clone()])
+        .coordinator_watch_event_presentations(std::slice::from_ref(&before.event_id))
         .await
         .unwrap();
     let after = presentations

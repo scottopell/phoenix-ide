@@ -504,18 +504,28 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         acceptance(&exact_response).accepting_transcript.as_str(),
         coordinator_id
     );
+    assert_coordinator_has_no_history_lifecycle(&receiver, &coordinator_id).await;
+    let history_target = ordinary(&receiver, "remote-history-target").await;
     receiver
         .state
         .db
-        .set_legacy_conversation_archived(&coordinator_id)
+        .set_legacy_conversation_archived(&history_target.id)
         .await
         .unwrap();
+    let before = receiver
+        .state
+        .db
+        .get_messages(&history_target.id)
+        .await
+        .unwrap()
+        .len();
     let mut archived = request(
         peer.peer_instance_id,
-        RemoteSendTarget::Transcript {
-            transcript_id: TranscriptConversationId::parse(coordinator_id).unwrap(),
+        RemoteSendTarget::ProductConversation {
+            product_conversation_id: history_target.product_conversation_id.clone(),
         },
     );
+    assert_ne!(archived.message_id, exact_coordinator.message_id);
     archived.sender = RemoteSenderAttestation::from_conversation(
         source_coordinator,
         SourceToolCall {
@@ -529,10 +539,62 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         .unwrap();
     assert!(matches!(
         response.receipt,
-        RemoteSendReceipt::Rejected { .. }
+        RemoteSendReceipt::Rejected {
+            code: RemoteSendRejectionCode::TargetUnavailable,
+            ..
+        }
     ));
+    assert_eq!(
+        receiver
+            .state
+            .db
+            .get_messages(&history_target.id)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
     caller.stop().await;
     receiver.stop().await;
+}
+
+async fn assert_coordinator_has_no_history_lifecycle(instance: &TestInstance, transcript: &str) {
+    let coordinator = instance
+        .state
+        .db
+        .get_conversation(transcript)
+        .await
+        .unwrap();
+    let before: (String, Option<String>) =
+        sqlx::query_as("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id=?")
+            .bind(coordinator.product_conversation_id.as_str())
+            .fetch_one(instance.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(before, ("coordinator".into(), None));
+    assert!(instance
+        .state
+        .db
+        .set_legacy_conversation_archived(transcript)
+        .await
+        .is_err());
+    let after: (String, Option<String>) =
+        sqlx::query_as("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id=?")
+            .bind(coordinator.product_conversation_id.as_str())
+            .fetch_one(instance.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        instance
+            .state
+            .db
+            .coordinator_conversation_id()
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(transcript)
+    );
 }
 
 pub(super) async fn materialize_received(

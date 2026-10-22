@@ -104,47 +104,42 @@ mod tests {
             .unwrap();
         let db = Database::from_pool_for_tests(pool, String::new());
         db.run_migrations().await.unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE IF NOT EXISTS _migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO _migrations(version,name) VALUES (131,'fixture_skip_131')")
-            .execute(db.pool())
-            .await
+        let index = super::super::MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 131)
             .unwrap();
         assert_eq!(
-            run_pending_migrations(db.pool()).await.unwrap() as usize,
-            super::super::MIGRATIONS.len() - 1
+            super::super::run_migration_list(db.pool(), &super::super::MIGRATIONS[..index])
+                .await
+                .unwrap() as usize,
+            index
         );
+        let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(latest, 130);
+        let pending_131: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version=131")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(pending_131, 0);
         let source = db
             .create_conversation("historical-source", "source", "/tmp", true, None, None)
             .await
             .unwrap();
         let target = db
-            .create_conversation(
-                "historical-coordinator",
-                "coordinator",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
-        sqlx::query("UPDATE product_conversations SET kind = 'coordinator', ordinary_lifecycle = NULL WHERE id = ?1").bind(target.product_conversation_id.as_str()).execute(db.pool()).await.unwrap();
-        sqlx::query(
-            "INSERT INTO coordinator_roots(product_conversation_id,name) VALUES (?1,'historical')",
-        )
-        .bind(target.product_conversation_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
+        let coordinator_kind: (String, Option<String>) =
+            sqlx::query_as("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id=?")
+                .bind(target.product_conversation_id.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(coordinator_kind, ("coordinator".into(), None));
         db.watch_product_conversation(&source.product_conversation_id)
             .await
             .unwrap();
@@ -167,24 +162,13 @@ mod tests {
             .bind(&target.id).bind(&events[2]).execute(db.pool()).await.unwrap();
         let before = history(db.pool()).await;
         assert!(before.iter().all(|rows| !rows.is_empty()));
-        sqlx::query("DELETE FROM _migrations WHERE version = 131")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
-        assert_eq!(history(db.pool()).await, before);
-        let fresh = Database::open_in_memory().await.unwrap();
-        let schema = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name";
         assert_eq!(
-            sqlx::query_as::<_, Schema>(schema)
-                .fetch_all(db.pool())
+            super::super::run_migration_list(db.pool(), &super::super::MIGRATIONS[..=index])
                 .await
                 .unwrap(),
-            sqlx::query_as::<_, Schema>(schema)
-                .fetch_all(fresh.pool())
-                .await
-                .unwrap()
+            1
         );
+        assert_eq!(history(db.pool()).await, before);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM subscription_delivery_identities WHERE local_event_id IS NOT NULL"
@@ -199,6 +183,32 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            let parent: (String, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT \"table\", \"to\" FROM pragma_foreign_key_list('{table}') WHERE \"from\"='origin_subscription_event_id'"
+            )))
+            .fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                parent,
+                ("subscription_delivery_identities".into(), "id".into())
+            );
+        }
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            super::super::MIGRATIONS.len() - index - 1
+        );
+        let fresh = Database::open_in_memory().await.unwrap();
+        let schema = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name";
+        assert_eq!(
+            sqlx::query_as::<_, Schema>(schema)
+                .fetch_all(db.pool())
+                .await
+                .unwrap(),
+            sqlx::query_as::<_, Schema>(schema)
+                .fetch_all(fresh.pool())
+                .await
+                .unwrap()
+        );
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
     }
 }

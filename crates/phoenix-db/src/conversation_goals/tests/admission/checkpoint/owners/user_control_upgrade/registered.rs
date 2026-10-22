@@ -250,7 +250,7 @@ async fn assert_unreceipted_actor_rejected(db: &Database, command: &GoalUserComm
     assert!(
         error
             .as_database_error()
-            .is_some_and(|error| error.is_foreign_key_violation()),
+            .is_some_and(sqlx::error::DatabaseError::is_foreign_key_violation),
         "immediate actor->receipt FK must reject valid actor shape: {error}"
     );
     tx.rollback().await.unwrap();
@@ -269,7 +269,7 @@ async fn assert_receipt_without_next_history_rejected(db: &Database, command: &G
     assert!(
         error
             .as_database_error()
-            .is_some_and(|error| error.is_foreign_key_violation()),
+            .is_some_and(sqlx::error::DatabaseError::is_foreign_key_violation),
         "deferred receipt->history FK must reject missing next version at commit: {error}"
     );
     let receipts: i64 = sqlx::query_scalar(

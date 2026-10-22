@@ -37,7 +37,7 @@ pub enum GoalRequestEvidence<'a> {
 
 #[derive(Debug)]
 pub enum GoalRequestCheckpointOutcome {
-    Committed(round::CommittedGoalRound),
+    Committed(Box<round::CommittedGoalRound>),
     Refused,
 }
 
@@ -109,7 +109,7 @@ impl Database {
     ) -> DbResult<GoalRequestCheckpointOutcome> {
         match self.persist_canonical_checkpoint(command, cut).await? {
             crate::provider_replay::CanonicalWriteOutcome::Committed(round) => {
-                Ok(GoalRequestCheckpointOutcome::Committed(*round))
+                Ok(GoalRequestCheckpointOutcome::Committed(round))
             }
             crate::provider_replay::CanonicalWriteOutcome::Superseded => {
                 Ok(GoalRequestCheckpointOutcome::Refused)
@@ -223,7 +223,12 @@ fn validate_shape(command: &GoalRequestCheckpoint<'_>) -> DbResult<()> {
                 && assistant_message.content
                     == match &command.assistant.content {
                         crate::MessageContent::Agent(content) => content.clone(),
-                        _ => {
+                        crate::MessageContent::User(_)
+                        | crate::MessageContent::Tool(_)
+                        | crate::MessageContent::System(_)
+                        | crate::MessageContent::Error(_)
+                        | crate::MessageContent::Continuation(_)
+                        | crate::MessageContent::Skill(_) => {
                             return Err(DbError::Serialization(
                                 "canonical round is not assistant content".into(),
                             ))
@@ -453,7 +458,14 @@ async fn retained_bundle_tx(
 fn request_error(error: execution::GoalRequestError) -> DbError {
     match error {
         execution::GoalRequestError::Sqlx(error) => DbError::Sqlx(error),
-        other => DbError::Serialization(other.to_string()),
+        other @ (execution::GoalRequestError::Disabled
+        | execution::GoalRequestError::Ineligible
+        | execution::GoalRequestError::Exhausted
+        | execution::GoalRequestError::Conflict
+        | execution::GoalRequestError::Revoked
+        | execution::GoalRequestError::QueuedInput
+        | execution::GoalRequestError::Detached
+        | execution::GoalRequestError::Goal(_)) => DbError::Serialization(other.to_string()),
     }
 }
 

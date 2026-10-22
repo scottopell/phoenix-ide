@@ -1424,6 +1424,25 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        accept_watch_success_opening(&db, &source).await;
+        let (state, continuation): (String, String) = sqlx::query_as(
+            "SELECT delivery_state, continuation_state FROM coordinator_watch_events",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (state.as_str(), continuation.as_str()),
+            ("suppressed", "suppressed")
+        );
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    async fn accept_watch_success_opening(db: &Database, source: &crate::Conversation) {
         let (outcome, _) = db
             .continue_conversation_with_intent(
                 &source.id,
@@ -1444,21 +1463,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let (state, continuation): (String, String) = sqlx::query_as(
-            "SELECT delivery_state, continuation_state FROM coordinator_watch_events",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            (state.as_str(), continuation.as_str()),
-            ("suppressed", "suppressed")
-        );
-        assert!(db
-            .pending_coordinator_watch_events(16)
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     fn expect_created(outcome: crate::ContinueOutcome) -> crate::Conversation {

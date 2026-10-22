@@ -65,12 +65,12 @@ async fn fixture() -> (Database, String) {
         .unwrap();
     let events = ["old-terminal", "old-question", "old-approval"];
     sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at,origin_kind,origin_subscription_event_id) VALUES ('historical-message',?1,1,'user','{ \"text\": \"preserve exact bytes\" }','2026-01-01T00:00:00Z','subscription_event',?2)")
-        .bind(&target.id).bind(&events[0]).execute(db.pool()).await.unwrap();
+        .bind(&target.id).bind(events[0]).execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO steering_messages(message_id,conversation_id,ordinal,text,origin_kind,origin_subscription_event_id) VALUES ('historical-steering',?1,0,'preserve steering','subscription_event',?2)")
-        .bind(&target.id).bind(&events[1]).execute(db.pool()).await.unwrap();
+        .bind(&target.id).bind(events[1]).execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'direct_turn',1,0,1,1,7,'Active','direct_turn.snapshot',1,X'0001FF',10,20)").execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,origin_subscription_event_id) VALUES (1,1,?1,'historical-key','historical-fingerprint',X'FF000A','Steering',7,0,'subscription_event',?2)")
-        .bind(&target.id).bind(&events[2]).execute(db.pool()).await.unwrap();
+        .bind(&target.id).bind(events[2]).execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us,delivery_state) VALUES ('retired-wake',?,'wake','old-wake',0,?,'completed',20,'suppressed')")
         .bind(watch).bind(&source.id).execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO coordinator_event_feature_retirements(event_id,reason) VALUES ('retired-wake','WakeFeatureRetired')").execute(db.pool()).await.unwrap();
@@ -331,6 +331,49 @@ async fn unexpected_check_fails_before_partial_new_schema() {
     );
 }
 
+const CACHED_INSERT: &str = "INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us) VALUES (?,?,?,?,?,?,?,?)";
+async fn assert_cached_shapes_rejected(
+    retained: &mut sqlx::SqliteConnection,
+    watch: i64,
+    source: &crate::Conversation,
+) {
+    let old_shape_error = sqlx::query(CACHED_INSERT)
+        .bind("cached-goal-change")
+        .bind(watch)
+        .bind("goal_change")
+        .bind(source.product_conversation_id.as_str())
+        .bind(1_i64)
+        .bind(&source.id)
+        .bind("goal_changed")
+        .bind(3_i64)
+        .execute(&mut *retained)
+        .await
+        .unwrap_err();
+    assert!(old_shape_error
+        .to_string()
+        .contains("goal capture requires eligible local subscription"));
+    let packet_shape_error = sqlx::query(CACHED_INSERT)
+        .bind("cached-wrong-packet")
+        .bind(watch)
+        .bind("creation")
+        .bind("cached-wrong-packet")
+        .bind(0_i64)
+        .bind(&source.id)
+        .bind("goal_changed")
+        .bind(3_i64)
+        .execute(&mut *retained)
+        .await
+        .unwrap_err();
+    let packet_shape_error = packet_shape_error.as_database_error().unwrap();
+    assert_eq!(packet_shape_error.code().as_deref(), Some("275"));
+    assert!(packet_shape_error
+        .message()
+        .starts_with("CHECK constraint failed:"));
+    assert!(packet_shape_error
+        .message()
+        .contains("((source_occurrence_kind = 'goal_change') = (terminal_kind = 'goal_changed'))"));
+}
+
 #[tokio::test]
 async fn another_pooled_connection_reparses_the_new_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -365,7 +408,6 @@ async fn another_pooled_connection_reparses_the_new_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    const CACHED_INSERT: &str = "INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us) VALUES (?,?,?,?,?,?,?,?)";
     let mut retained = pool.acquire().await.unwrap();
     let before: i64 = sqlx::query_scalar("PRAGMA schema_version")
         .fetch_one(&mut *retained)
@@ -405,41 +447,7 @@ async fn another_pooled_connection_reparses_the_new_schema() {
         .execute(&mut *retained)
         .await
         .unwrap();
-    let old_shape_error = sqlx::query(CACHED_INSERT)
-        .bind("cached-goal-change")
-        .bind(watch)
-        .bind("goal_change")
-        .bind(source.product_conversation_id.as_str())
-        .bind(1_i64)
-        .bind(&source.id)
-        .bind("goal_changed")
-        .bind(3_i64)
-        .execute(&mut *retained)
-        .await
-        .unwrap_err();
-    assert!(old_shape_error
-        .to_string()
-        .contains("goal capture requires eligible local subscription"));
-    let packet_shape_error = sqlx::query(CACHED_INSERT)
-        .bind("cached-wrong-packet")
-        .bind(watch)
-        .bind("creation")
-        .bind("cached-wrong-packet")
-        .bind(0_i64)
-        .bind(&source.id)
-        .bind("goal_changed")
-        .bind(3_i64)
-        .execute(&mut *retained)
-        .await
-        .unwrap_err();
-    let packet_shape_error = packet_shape_error.as_database_error().unwrap();
-    assert_eq!(packet_shape_error.code().as_deref(), Some("275"));
-    assert!(packet_shape_error
-        .message()
-        .starts_with("CHECK constraint failed:"));
-    assert!(packet_shape_error
-        .message()
-        .contains("((source_occurrence_kind = 'goal_change') = (terminal_kind = 'goal_changed'))"));
+    assert_cached_shapes_rejected(&mut retained, watch, &source).await;
     let mut tx = sqlx::Acquire::begin(&mut *retained).await.unwrap();
     sqlx::query("INSERT INTO coordinator_watch_events(event_id,watch_id,source_occurrence_kind,source_occurrence_id,source_generation,source_transcript_id,terminal_kind,occurred_at_us,goal_capture_kind) VALUES ('cached-goal-change',?,'goal_change',?,1,?,'goal_changed',3,'captured')")
         .bind(watch).bind(source.product_conversation_id.as_str()).bind(&source.id)

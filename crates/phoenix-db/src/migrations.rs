@@ -13077,7 +13077,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
-        assert_outbox_child_indexes_are_used(db.pool()).await;
+        assert_current_outbox_child_indexes_are_used(db.pool()).await;
         let ledger: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version IN (119, 122) ORDER BY version",
         )
@@ -15748,6 +15748,104 @@ with tempfile.TemporaryDirectory() as directory:
             handle.remove_progress_handler();
         }
         steps.load(Ordering::Relaxed)
+    }
+
+    async fn assert_current_outbox_child_indexes_are_used(pool: &SqlitePool) {
+        let watch_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM coordinator_watch_events WHERE event_id = 'explain'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        assert!(
+            watch_plan
+                .iter()
+                .any(|detail| detail.contains("SEARCH subscription_delivery_identities")),
+            "{watch_plan:?}"
+        );
+        let parent: (String, String, String) = sqlx::query_as(
+            "SELECT \"table\", \"to\", on_delete FROM pragma_foreign_key_list('subscription_delivery_identities') WHERE \"from\"='local_event_id'",
+        )
+        .fetch_one(pool).await.unwrap();
+        assert_eq!(
+            parent,
+            (
+                "coordinator_watch_events".into(),
+                "event_id".into(),
+                "CASCADE".into()
+            )
+        );
+        let delivery_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM subscription_delivery_identities WHERE id = 'explain'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        for (table, index) in [
+            ("messages", "idx_messages_origin_subscription_event_id"),
+            (
+                "steering_messages",
+                "idx_steering_messages_origin_subscription_event_id",
+            ),
+            (
+                "durable_turns",
+                "idx_durable_turns_origin_subscription_event_id",
+            ),
+        ] {
+            let parent: (String, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT \"table\", \"to\" FROM pragma_foreign_key_list('{table}') WHERE \"from\"='origin_subscription_event_id'",
+            )))
+            .fetch_one(pool).await.unwrap();
+            assert_eq!(
+                parent,
+                ("subscription_delivery_identities".into(), "id".into())
+            );
+            let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno",
+            )))
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            assert_eq!(columns, vec!["origin_subscription_event_id"], "{index}");
+            let partial: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT partial FROM pragma_index_list('{table}') WHERE name=?",
+            )))
+            .bind(index)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(partial, 1, "{index}");
+            let sql: String =
+                sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type='index' AND name=?")
+                    .bind(index)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            let predicate = sql
+                .split_once("WHERE")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                predicate.trim_end_matches(';'),
+                "origin_subscription_event_id IS NOT NULL",
+                "{index}"
+            );
+            assert!(
+                delivery_plan.iter().any(|detail| detail.contains(&format!(
+                    "SEARCH {table} USING COVERING INDEX {index} (origin_subscription_event_id=?)"
+                ))),
+                "{table} must use its indexed child lookup: {delivery_plan:?}"
+            );
+        }
     }
 
     async fn assert_outbox_child_indexes_are_used(pool: &SqlitePool) {
@@ -20588,6 +20686,43 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(row.get::<i64, _>("chain_messages_at_answer"), 17);
     }
 
+    async fn skip_later_migrations_for_partial_archive_fixture(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO _migrations (version, name)
+             VALUES (70, 'temporarily_skip_product_conversation_migration'),
+                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
+                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
+                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
+                    (74, 'temporarily_skip_completed_continuation_handoffs'),
+                    (91, 'temporarily_skip_product_creation_jobs'),
+                    (92, 'temporarily_skip_creation_checkout_pin'),
+                    (93, 'temporarily_skip_product_creation_ownership'),
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (101, 'temporarily_skip_svg_artifacts'),
+                    (102, 'temporarily_skip_automatic_continuation_superseded'),
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (113, 'temporarily_skip_historical_continuation_settlement'),
+                    (119, 'temporarily_skip_close_cleanup_failures'),
+                    (120, 'temporarily_skip_coordinator_question_wait_events'),
+                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
+                    (123, 'temporarily_skip_close_startup_interruption'),
+                    (124, 'temporarily_skip_federation_peer_tls_trust'),
+                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
+                    (128, 'temporarily_skip_product_creation_provisioning_stage'),
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
+                    (130, 'temporarily_skip_normalized_remote_input_origin'),
+                    (131, 'temporarily_skip_bounded_federated_terminal_subscriptions')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// Migration 006: a chain with mixed `archived` state has every member
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
@@ -20633,40 +20768,7 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO _migrations (version, name)
-             VALUES (70, 'temporarily_skip_product_conversation_migration'),
-                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
-                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
-                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (91, 'temporarily_skip_product_creation_jobs'),
-                    (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership'),
-                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_svg_artifacts'),
-                    (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches'),
-                    (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures'),
-                    (120, 'temporarily_skip_coordinator_question_wait_events'),
-                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption'),
-                    (124, 'temporarily_skip_federation_peer_tls_trust'),
-                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement'),
-                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
-                    (128, 'temporarily_skip_product_creation_provisioning_stage'),
-                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
-                    (130, 'temporarily_skip_normalized_remote_input_origin'),
-                    (131, 'temporarily_skip_bounded_federated_terminal_subscriptions')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        skip_later_migrations_for_partial_archive_fixture(&pool).await;
         run_before_goal_storage_for_test(&pool).await.unwrap();
         assert_pre_goal_storage_fixture(&pool).await;
         let ledger_name: String =
