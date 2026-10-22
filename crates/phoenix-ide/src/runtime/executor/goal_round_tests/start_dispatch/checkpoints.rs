@@ -1013,7 +1013,7 @@ async fn conversation_goal_actual_report_round_commits_mutation_and_checkpoint_o
     assert!(rt.pending_direct_turn_terminal.is_none());
     assert_completed_start_owner(&db, execution.turn_id.0, execution.generation).await;
     assert!(
-        db.load_provider_replay(CONVERSATION)
+        db.load_provider_replay_state(CONVERSATION)
             .await
             .unwrap()
             .is_none(),
