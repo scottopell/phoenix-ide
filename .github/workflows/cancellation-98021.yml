@@ -13,7 +13,6 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: "2"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cancellation-98021-target
       RUST_TEST_THREADS: "2"
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "-D warnings"
@@ -26,6 +25,7 @@ jobs:
           cache: false
       - name: Exact source and command evidence
         run: |
+          printf 'CARGO_TARGET_DIR=%s/cancellation-98021-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           mkdir -p qualification-evidence
           git rev-parse HEAD | tee qualification-evidence/head.txt
           printf '%s\n' 'source-parent=9c09b889f1515a6afeab1335759cada83eaa2778' > qualification-evidence/source-parent.txt
