@@ -1017,7 +1017,8 @@ class OpeningQualificationTests(unittest.TestCase):
         job = workflow.split('  check-rust:', 1)[1].split('\n  check-clippy:', 1)[0]
         minutes = int(re.search(r'    timeout-minutes: (\d+)', job).group(1))
         cargo = int(re.search(r'PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "(\d+)"', job).group(1))
-        self.assertGreaterEqual(cargo, 1500)
+        self.assertEqual(cargo, 2100)
+        self.assertEqual(minutes, 60)
         self.assertGreaterEqual(minutes * 60, cargo + 600 + 300)
         self.assertIn('./dev.py check --lanes rust,cargo-fmt', job)
         self.assertIn('cargo check --target x86_64-unknown-linux-musl', job)

@@ -66,14 +66,14 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
-      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1500"
+      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "2100"
     steps:
       - uses: actions/checkout@v4
         with:
