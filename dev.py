@@ -10097,11 +10097,25 @@ class ProdDeployControllerOptions:
     paired_database_upgrade: bool = False
     current_schema_upgrade: bool = False
     systemd_current_schema_upgrade: bool = False
+    same_schema_refresh: bool = False
     controller_source_commit: str | None = None
 
     def require_controller_source(self, release: str | None) -> None:
+        if self.same_schema_refresh:
+            if (release is not None or self.prepared_artifact is None
+                    or self.paired_database_upgrade or self.current_schema_upgrade
+                    or self.systemd_current_schema_upgrade or self.enabled
+                    or any(value is not None for value in (
+                        self.exact_release_tag, self.expected_asset_name, self.expected_asset_sha256,
+                    )) or re.fullmatch(r"[0-9a-f]{40}", self.expected_full_commit or "") is None
+                    or re.fullmatch(r"[0-9a-f]{64}", self.expected_preparation_receipt_sha256 or "") is None
+                    or self.backend not in (None, "launchd") or sys.platform != "darwin"):
+                raise SystemExit("--same-schema-refresh requires macOS launchd, a prepared artifact, exact full commit and authenticated receipt SHA-256; excludes all other deployment modes")
+            if self.controller_source_commit is not None:
+                raise SystemExit("--same-schema-refresh uses the separate clean controller checkout; do not supply --controller-source-commit")
+            return
         if self.expected_preparation_receipt_sha256 is not None and not self.systemd_current_schema_upgrade:
-            raise SystemExit("--expected-preparation-receipt-sha256 requires a prepared systemd artifact")
+            raise SystemExit("--expected-preparation-receipt-sha256 requires protected prepared mode")
         if self.systemd_current_schema_upgrade:
             self.require_systemd_current(release)
             return
@@ -10734,6 +10748,20 @@ PREPARED_SOURCE128_VERSION = "0.13.0"
 PREPARED_SOURCE128_REGISTRY_SHA256 = "c54f9884b1b86aea19ca214cf059724f456c899a219006b59f1c6a16cca6caa5"
 
 
+SAME_SCHEMA129_REGISTRY_SHA256 = "c54f9884b1b86aea19ca214cf059724f456c899a219006b59f1c6a16cca6caa5"
+
+
+@dataclasses.dataclass(frozen=True)
+class SameSchema129RefreshEvidence:
+    prepared_source_baseline: int
+    candidate_registry_expected_sha256: str
+    receipt_path: str
+    receipt_sha256: str
+
+    def as_dict(self) -> dict[str, str | int]:
+        return dataclasses.asdict(self)
+
+
 class PreparedSource128Qualification:
     def __init__(self, prepared: PreparedCandidate, expected_commit: str | None, controller_commit: str | None):
         if (prepared.source_kind is not ProdSourceKind.PREPARED_ARTIFACT
@@ -11038,12 +11066,38 @@ def _deploy_manifest_kind(transaction: Path) -> DeployManifestKind:
     prepared_source114_fields = required_fields[DeployManifestKind.CURRENT_SCHEMA] | {
         "prepared_source_baseline", "candidate_registry_expected_sha256",
     }
+    refresh_fields = required_fields[DeployManifestKind.CURRENT_SCHEMA] | {
+        "prepared_source_baseline", "candidate_registry_expected_sha256",
+        "receipt_path", "receipt_sha256",
+    }
     for kind, value in mode_payloads.items():
         if value is None:
             continue
         if not isinstance(value, dict):
             return DeployManifestKind.UNKNOWN
-        if kind is DeployManifestKind.CURRENT_SCHEMA and value.keys() == prepared_source114_fields:
+        if kind is DeployManifestKind.CURRENT_SCHEMA and value.keys() == refresh_fields:
+            if (payload.get("source_kind") != "prepared_artifact"
+                    or payload.get("release_tag") is not None or payload.get("release_commit") is not None
+                    or not isinstance(payload.get("expected"), dict)
+                    or payload.get("source_commit") != payload["expected"].get("git_sha")
+                    or not isinstance(payload.get("source_commit"), str)
+                    or re.fullmatch(r"[0-9a-f]{40}", payload["source_commit"]) is None
+                    or type(value["prepared_source_baseline"]) is not int
+                    or value["prepared_source_baseline"] != 129
+                    or value["candidate_registry_expected_sha256"] != SAME_SCHEMA129_REGISTRY_SHA256
+                    or value["migration_registry_sha256"] != SAME_SCHEMA129_REGISTRY_SHA256
+                    or value["receipt_path"] != str(transaction / "receipt.json")
+                    or not isinstance(value["receipt_sha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", value["receipt_sha256"]) is None
+                    or not _regular_file_matches_sha256(
+                        transaction / "receipt.json", value["receipt_sha256"]
+                    )
+                    or value["controller_source_commit"] == payload["source_commit"]
+                    or any(not isinstance(field, str) or not field.strip()
+                           for key, field in value.items()
+                           if key != "prepared_source_baseline")):
+                return DeployManifestKind.UNKNOWN
+        elif kind is DeployManifestKind.CURRENT_SCHEMA and value.keys() == prepared_source114_fields:
             baseline = value["prepared_source_baseline"]
             if (
                 type(baseline) is not int
@@ -11161,6 +11215,10 @@ def _manifest_claims_exact_source128(payload: object) -> bool:
     ) or (
         payload.get("source_kind") == ProdSourceKind.PREPARED_ARTIFACT.value
         and payload.get("source_commit") == PREPARED_SOURCE128_COMMIT
+        and not (
+            isinstance(upgrade, dict)
+            and upgrade.get("prepared_source_baseline") == 129
+        )
     )
 
 
@@ -11504,6 +11562,11 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
     manifest = _read_unique_json_object(transaction / "manifest.json")
     kind = _deploy_manifest_kind(transaction)
     exact_source128 = _manifest_claims_exact_source128(manifest)
+    refresh = (
+        kind is DeployManifestKind.CURRENT_SCHEMA
+        and isinstance(manifest.get("current_schema_upgrade"), dict)
+        and manifest["current_schema_upgrade"].get("prepared_source_baseline") == 129
+    )
     paired = kind in {
         DeployManifestKind.PAIRED,
         DeployManifestKind.CURRENT_SCHEMA,
@@ -11568,6 +11631,8 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         action = (
             f"run ./dev.py prod finalize-current {owner}; it may run only the exact retained candidate migration before candidate start and publication"
             if exact_source128
+            else f"run ./dev.py prod finalize-current {owner}; it may start only the exact retained refresh candidate after proof verification"
+            if refresh
             else f"use ./dev.py prod finalize-current {owner} only if the retained proof has the exact target commit; otherwise qualify a compatible forward repair"
         )
         return (
@@ -11580,6 +11645,8 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             f"After confirming the old helper is absent, run ./dev.py prod finalize-current {owner}; "
             "it may run only the exact retained candidate migration before candidate start and publication."
             if exact_source128
+            else f"After confirming the old helper is absent, run ./dev.py prod finalize-current {owner}; only the exact retained refresh candidate may start."
+            if refresh
             else "Qualify a compatible candidate repair before changing production state."
         )
         return (
@@ -11592,6 +11659,8 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
         action = (
             "it may run only the exact retained candidate migration before candidate start, publication, and cleanup"
             if exact_source128
+            else "it verifies the retained refresh proof and may start only the exact candidate without live migration before publication/cleanup"
+            if refresh
             else "it verifies the committed migrated database and may start only the exact retained candidate before publication/cleanup"
             if current_schema
             else "it verifies the running committed candidate and only retries publication/cleanup"
@@ -11711,7 +11780,17 @@ def _markerless_status_is_resolved(status: dict[str, object]) -> bool:
             if status.get("state") == "committed":
                 return _exact_source128_published_completion(transaction)
             exact_source128_evidence = True
-    if _status_claims_exact_source128(status) and not exact_source128_evidence:
+    valid_refresh = False
+    if isinstance(owner, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", owner):
+        transaction = LAUNCHD_DEPLOY_DIR / "transactions" / owner
+        refresh_manifest = _read_unique_json_object(transaction / "manifest.json")
+        refresh_upgrade = refresh_manifest.get("current_schema_upgrade") if refresh_manifest else None
+        valid_refresh = (
+            isinstance(refresh_upgrade, dict)
+            and refresh_upgrade.get("prepared_source_baseline") == 129
+            and _deploy_manifest_kind(transaction) is DeployManifestKind.CURRENT_SCHEMA
+        )
+    if _status_claims_exact_source128(status) and not exact_source128_evidence and not valid_refresh:
         return _exact_source128_precondition_failed_status(status, owner)
     transaction_id = status.get("transaction_id")
     state = status.get("state")
@@ -12481,9 +12560,14 @@ def cmd_prod_finalize_paired(transaction_id: str, *, current_schema: bool = Fals
     status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
     owner = _deploy_claim_owner()
     exact_source128 = current_schema and _manifest_claims_exact_source128(payload)
+    refresh = (
+        current_schema
+        and isinstance(payload.get("current_schema_upgrade"), dict)
+        and payload["current_schema_upgrade"].get("prepared_source_baseline") == 129
+    )
     allowed_states = (
         {"committed", "migration_started", "activation_failed_database_committed"}
-        if exact_source128
+        if exact_source128 or refresh
         else {"committed", "migration_started"}
         if current_schema
         else {"committed"}
@@ -13055,7 +13139,8 @@ def launchd_prod_deploy(
         or controller.expected_full_commit is None
     ):
         raise SystemExit("--current-schema-upgrade requires --prepared-artifact and --expected-full-commit, excludes --paired-database-upgrade and --release")
-    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if (controller.paired_database_upgrade or controller.current_schema_upgrade) and LAUNCHD_PLIST_PATH.is_file() else None
+    protected_current = controller.current_schema_upgrade or controller.same_schema_refresh
+    installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if (controller.paired_database_upgrade or protected_current) and LAUNCHD_PLIST_PATH.is_file() else None
     launchd_env, _env_file = _launchd_candidate_env(controller)
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
@@ -13074,7 +13159,7 @@ def launchd_prod_deploy(
     selected_identity: RuntimeIdentity | None = None
     prepared_mode = (
         "current_schema"
-        if controller.current_schema_upgrade
+        if protected_current
         else "paired"
         if controller.paired_database_upgrade
         else None
@@ -13108,7 +13193,7 @@ def launchd_prod_deploy(
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, initial_status)
         if installed_config_hash is not None and _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
             raise SystemExit("installed configuration changed before claim acquisition")
-        if (controller.paired_database_upgrade or controller.current_schema_upgrade) and installed_config_hash is not None:
+        if (controller.paired_database_upgrade or protected_current) and installed_config_hash is not None:
             launchd_env, _env_file = _launchd_candidate_env(controller)
             _preflight_prod_bind_auth(launchd_env, socket_activated=True)
             if _file_sha256(LAUNCHD_PLIST_PATH) != installed_config_hash:
@@ -13119,8 +13204,18 @@ def launchd_prod_deploy(
         staging.mkdir(mode=0o700)
         _fsync_directory(staging.parent)
         staging.chmod(0o700)
+        receipt_copy = staging / "receipt.json"
+        if controller.same_schema_refresh:
+            receipt_source = controller.prepared_artifact / f"PREPARATION-RECEIPT-{_macos_prepared_target()}.json"
+            if not receipt_source.is_file() or receipt_source.is_symlink():
+                raise SystemExit("prepared refresh receipt must be a regular file")
+            _stage_disposable_validation_file(receipt_source, receipt_copy, 0o600)
+            if _file_sha256(receipt_copy) != controller.expected_preparation_receipt_sha256:
+                raise SystemExit("prepared refresh receipt does not match independently authenticated SHA-256")
+            if _file_sha256(receipt_source) != controller.expected_preparation_receipt_sha256:
+                raise SystemExit("prepared refresh receipt changed during validation")
         if controller.prepared_artifact is not None:
-            if release or controller.paired_database_upgrade == controller.current_schema_upgrade or controller.expected_full_commit is None:
+            if release or sum((controller.paired_database_upgrade, controller.current_schema_upgrade, controller.same_schema_refresh)) != 1 or controller.expected_full_commit is None:
                 raise SystemExit("--prepared-artifact, --expected-full-commit, and exactly one upgrade mode are required together and exclude --release")
             prepared = _prepare_prepared_artifact(controller.prepared_artifact, controller.expected_full_commit)
         else:
@@ -13156,6 +13251,8 @@ def launchd_prod_deploy(
         observed_identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
         if observed_identity != selected_identity:
             raise SystemExit("staged candidate identity changed after signing")
+        if controller.same_schema_refresh and _file_sha256(candidate_binary) != _file_sha256(binary):
+            raise SystemExit("prepared refresh candidate changed during staging")
 
         env_overrides = dict(launchd_env)
         env_file = _env_file
@@ -13243,13 +13340,29 @@ def launchd_prod_deploy(
         )
         if source128_qualification is not None and (installed_config_hash is None or not target_binary.is_file()):
             raise SystemExit("exact prepared source128 requires an installed launchd predecessor and configuration")
+        refresh_evidence = None
+        if controller.same_schema_refresh:
+            if (installed_config_hash is None or not target_binary.is_file()
+                    or prepared.source_kind is not ProdSourceKind.PREPARED_ARTIFACT
+                    or selected_identity.git_sha != controller.expected_full_commit
+                    or controller_source_commit == selected_identity.git_sha):
+                raise SystemExit("same-schema refresh requires an installed predecessor and a different clean controller from the exact receipt-bound candidate")
+            if (_file_sha256(receipt_copy) != controller.expected_preparation_receipt_sha256
+                    or _file_sha256(receipt_source) != controller.expected_preparation_receipt_sha256):
+                raise SystemExit("prepared refresh receipt changed during candidate validation")
+            refresh_evidence = SameSchema129RefreshEvidence(
+                129,
+                SAME_SCHEMA129_REGISTRY_SHA256,
+                str(receipt_copy),
+                controller.expected_preparation_receipt_sha256,
+            )
         migration_registry = None
         ordinary_forward_migration = (
             prepared.source_kind != ProdSourceKind.PREPARED_ARTIFACT
             and not controller.current_schema_upgrade
             and Path(candidate_database_path).exists()
         )
-        if controller.current_schema_upgrade or ordinary_forward_migration:
+        if protected_current or ordinary_forward_migration:
             migration_registry = staging / "migrations.rs"
             _materialize_source_file(
                 source_commit,
@@ -13262,6 +13375,8 @@ def launchd_prod_deploy(
                 raise SystemExit("exact prepared source114 candidate registry SHA-256 mismatch")
             if source128_qualification is not None and _file_sha256(migration_registry) != PREPARED_SOURCE128_REGISTRY_SHA256:
                 raise SystemExit("exact prepared source128 candidate registry SHA-256 mismatch")
+            if refresh_evidence is not None and _file_sha256(migration_registry) != SAME_SCHEMA129_REGISTRY_SHA256:
+                raise SystemExit("same-schema refresh candidate registry129 SHA-256 mismatch")
         python_executable = Path(sys.executable).resolve()
         protocol = subprocess.run(
             [str(python_executable), str(helper), "--protocol-version"],
@@ -13344,6 +13459,7 @@ def launchd_prod_deploy(
                     "candidate_registry_expected_sha256": PREPARED_SOURCE114_REGISTRY_SHA256,
                 } if prepared_source114 else {}),
                 **(source128_qualification.evidence() if source128_qualification is not None else {}),
+                **(refresh_evidence.as_dict() if refresh_evidence is not None else {}),
                 "database_path": candidate_database_path,
                 "backup_path": str(staging / "database-backup.sqlite3"),
                 "proof_path": str(staging / "database-backup-proof.json"),
@@ -13352,7 +13468,7 @@ def launchd_prod_deploy(
                 "controller_helper_path": str(helper),
                 "migration_registry_sha256": _file_sha256(migration_registry),
                 "migration_registry_path": str(migration_registry),
-            }} if controller.current_schema_upgrade else {}),
+            }} if protected_current else {}),
             **({"ordinary_forward_migration": {
                 "database_path": candidate_database_path,
                 "helper_sha256": _file_sha256(helper),
@@ -13372,6 +13488,8 @@ def launchd_prod_deploy(
         retained_artifacts.extend(path for path in (rollback_binary, rollback_plist) if path.exists())
         if migration_registry is not None:
             retained_artifacts.append(migration_registry)
+        if refresh_evidence is not None:
+            retained_artifacts.append(staging / "receipt.json")
         for artifact in retained_artifacts:
             with artifact.open("rb") as stream:
                 os.fsync(stream.fileno())
@@ -13402,7 +13520,7 @@ def launchd_prod_deploy(
                     controller is not None
                     and (
                         controller.paired_database_upgrade
-                        or controller.current_schema_upgrade
+                        or protected_current
                     )
                 )
             )
@@ -13970,9 +14088,9 @@ def cmd_prod_deploy(
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
     controller.require_controller_source(release)
-    upgrade_modes = (controller.paired_database_upgrade, controller.current_schema_upgrade)
-    if all(upgrade_modes):
-        raise SystemExit("--paired-database-upgrade and --current-schema-upgrade are mutually exclusive")
+    upgrade_modes = (controller.paired_database_upgrade, controller.current_schema_upgrade, controller.same_schema_refresh)
+    if sum(upgrade_modes) > 1:
+        raise SystemExit("--paired-database-upgrade, --current-schema-upgrade and --same-schema-refresh are mutually exclusive")
     if controller.expected_full_commit is not None and release is None and controller.prepared_artifact is None and not any(upgrade_modes):
         raise SystemExit("--expected-full-commit requires all prepared upgrade options or an exact release controller")
     if not (release is not None and controller.current_schema_upgrade and controller.prepared_artifact is None) and not controller.systemd_current_schema_upgrade and (controller.prepared_artifact is not None or any(upgrade_modes)) and (
@@ -14384,6 +14502,7 @@ def main():
     upgrade_group.add_argument("--paired-database-upgrade", action="store_true", help="Explicit legacy to ProductConversation paired database upgrade")
     upgrade_group.add_argument("--current-schema-upgrade", action="store_true", help="Explicit protected current-schema database upgrade")
     upgrade_group.add_argument("--systemd-current-schema-upgrade", action="store_true", help="Protected exact-schema65 to release128 systemd controller upgrade")
+    upgrade_group.add_argument("--same-schema-refresh", action="store_true", help="Private prepared-only exact schema129-to-129 launchd refresh")
     cleanup_parser = prod_sub.add_parser(
         "cleanup-paired",
         help="Finish retained pre-stop paired capacity cleanup without runtime/database action",
@@ -14595,6 +14714,7 @@ def main():
                     paired_database_upgrade=args.paired_database_upgrade,
                     current_schema_upgrade=args.current_schema_upgrade,
                     systemd_current_schema_upgrade=args.systemd_current_schema_upgrade,
+                    same_schema_refresh=args.same_schema_refresh,
                     backend=args.controller_backend,
                 ),
             )
