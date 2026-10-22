@@ -16213,6 +16213,11 @@ mod authoritative_user_message_effect_tests {
 
     #[tokio::test]
     async fn db_backed_targeted_stop_commits_projection_before_teardown_and_restart() {
+        db_backed_targeted_stop_fixture(false).await;
+        db_backed_targeted_stop_fixture(true).await;
+    }
+
+    async fn db_backed_targeted_stop_fixture(queued_steer: bool) {
         let db = Arc::new(crate::db::Database::open_in_memory().await.unwrap());
         let conversation = db
             .create_conversation("conv-direct", "Stop", "/tmp", true, None, None)
@@ -16298,6 +16303,23 @@ mod authoritative_user_message_effect_tests {
             generation: 0,
         }));
         rt.llm_task_handle = Some(tokio::spawn(std::future::pending::<()>()));
+        rt.pending_trusted_tool_results = vec![PendingTrustedToolResult {
+            tool_result_message_id: "trusted-before-stop".to_string(),
+            output: "must clear after model abort".to_string(),
+        }];
+        if queued_steer {
+            rt.steering_queue
+                .push(crate::state_machine::event::SteerEntry {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+                    text: "next queued work".to_string(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "queued-after-stop".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                });
+        }
         rt.active_llm_attempt = Some(phoenix_llm::LlmAttemptCapture::new());
         rt.process_event(Event::DirectTurnStopRequested {
             turn_id: turn_id.0,
@@ -16305,6 +16327,16 @@ mod authoritative_user_message_effect_tests {
         })
         .await
         .unwrap();
+        assert!(rt.pending_trusted_tool_results.is_empty());
+        assert!(
+            rt.steering_queue.is_empty(),
+            "queued steer must not be stranded by source-state loss"
+        );
+        if queued_steer {
+            assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+            rt.abort_active_llm_task();
+            return;
+        }
         assert!(matches!(rt.state, ConvState::Idle));
         assert!(rt.active_direct_turn.is_none());
         assert!(rt.llm_task_handle.is_none());

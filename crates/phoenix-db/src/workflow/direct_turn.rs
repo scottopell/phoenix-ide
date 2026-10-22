@@ -1822,6 +1822,11 @@ impl WorkflowRepository {
                 "direct Stop requires the reducer's terminal Idle projection; draining is not terminal".to_string(),
             ));
         }
+        let conversation_id: String =
+            sqlx::query_scalar("SELECT conversation_id FROM durable_turns WHERE turn_id = ?1")
+                .bind(to_i64(turn_id.0, "turn_id")?)
+                .fetch_one(&self.pool)
+                .await?;
         let step = match self
             .terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
                 command: TurnCommand::Cancel {
@@ -1830,7 +1835,7 @@ impl WorkflowRepository {
                 },
                 projection: Some(projection.clone()),
                 provider_replay_settlement:
-                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(&projection.state),
+                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(&conversation_id, &projection.state),
             })
             .await
         {
@@ -4641,6 +4646,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_projectionless_cancel_is_not_projected_stop_evidence() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "legacy-stop-no-projection", 96).await;
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.accept_direct_turn_stop(turn_id, 0, &stop_projection())
+                .await,
+            Err(DbError::DirectTurnStopUnclassified { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn established_terminal_obligation_rejects_stop_without_revoking_owner() {
         let repo = repo().await;
         let (turn_id, _) = created_turn(&repo, "completion-before-stop", 92).await;
@@ -4790,7 +4812,9 @@ mod tests {
                         },
                         projection: Some(stop_projection()),
                         provider_replay_settlement:
-                            phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear,
+                            phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear {
+                                conversation_id: "conv-a".to_string(),
+                            },
                     },
                     None,
                     None,
