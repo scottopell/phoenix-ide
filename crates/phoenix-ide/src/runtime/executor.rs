@@ -3421,7 +3421,7 @@ where
         {
             return Ok(());
         }
-        let (event, accepted_direct_turn_stop) = match event {
+        let (event, mut accepted_direct_turn_stop) = match event {
             Event::DirectTurnStopRequested {
                 turn_id,
                 expected_generation,
@@ -3482,7 +3482,7 @@ where
                         reason: None,
                         cause: crate::state_machine::event::CancelCause::UserRequested,
                     },
-                    Some(receipt),
+                    Some((receipt, projection)),
                 )
             }
             event => (event, None),
@@ -3727,6 +3727,19 @@ where
                 self.storage
                     .record_execution_cancel(&self.context.conversation_id)
                     .await?;
+            }
+            if let Some((receipt, projection)) = accepted_direct_turn_stop.take() {
+                let target = self.active_direct_turn.as_ref().ok_or_else(|| {
+                    "accepted Stop lost its exact runtime turn before install".to_string()
+                })?;
+                if !receipt.matches(target.turn_id, target.generation)
+                    || projection.state != result.new_state
+                {
+                    return Err(
+                        "accepted Stop projection does not match reducer result".to_string()
+                    );
+                }
+                self.install_live_state(projection.state, projection.state_updated_at, false)?;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
@@ -16234,6 +16247,31 @@ mod authoritative_user_message_effect_tests {
         )
         .await
         .unwrap();
+        use phoenix_core::domain::provider_replay::{
+            AnthropicPrivateBlock, AnthropicReplayPayload, AnthropicResponseIdentity,
+            AnthropicResponseSet, ContentIndex,
+        };
+        let replay = AnthropicReplayPayload::new(vec![AnthropicResponseSet::new(
+            AnthropicResponseIdentity {
+                response_id: "stop-replay".into(),
+                model: "test".into(),
+            },
+            vec![AnthropicPrivateBlock::Thinking {
+                index: ContentIndex(0),
+                thinking: "test".into(),
+                signature: "test".into(),
+            }],
+        )
+        .unwrap()])
+        .unwrap();
+        db.store_provider_replay_state("conv-direct", &replay)
+            .await
+            .unwrap();
+        assert!(db
+            .load_provider_replay_state("conv-direct")
+            .await
+            .unwrap()
+            .is_some());
         let (template, _, _) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
@@ -16277,11 +16315,16 @@ mod authoritative_user_message_effect_tests {
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome.label(), "cancelled");
-        drop(rt);
+        assert!(db
+            .load_provider_replay_state("conv-direct")
+            .await
+            .unwrap()
+            .is_none());
         let projection = phoenix_db::workflow::PersistedConversationProjection {
             state: ConvState::Idle,
-            state_updated_at: chrono::Utc::now(),
+            state_updated_at: rt.state_updated_at,
         };
+        drop(rt);
         assert!(matches!(
             repo.accept_direct_turn_stop(turn_id, 0, &projection)
                 .await

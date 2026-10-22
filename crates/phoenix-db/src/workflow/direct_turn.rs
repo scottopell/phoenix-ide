@@ -1830,7 +1830,7 @@ impl WorkflowRepository {
                 },
                 projection: Some(projection.clone()),
                 provider_replay_settlement:
-                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::for_conversation_state(&projection.state),
             })
             .await
         {
@@ -1909,7 +1909,7 @@ impl WorkflowRepository {
                     == Some(expected_generation.saturating_add(1))
                     && terminal == "Cancelled" =>
             {
-                let actual = sqlx::query("SELECT c.state, EXISTS(SELECT 1 FROM durable_turns newer WHERE newer.conversation_id = c.id AND newer.owns_conversation = 1) AS has_owner FROM conversations c JOIN durable_turns t ON t.conversation_id = c.id WHERE t.turn_id = ?1")
+                let actual = sqlx::query("SELECT c.state, c.state_updated_at, EXISTS(SELECT 1 FROM durable_turns newer WHERE newer.conversation_id = c.id AND newer.owns_conversation = 1) AS has_owner FROM conversations c JOIN durable_turns t ON t.conversation_id = c.id WHERE t.turn_id = ?1")
                     .bind(to_i64(turn_id.0, "turn_id")?)
                     .fetch_one(&self.pool).await
                     .map_err(|error| DbError::DirectTurnStopUnclassified { turn_id, detail: error.to_string() })?;
@@ -1918,7 +1918,20 @@ impl WorkflowRepository {
                         turn_id,
                         detail: error.to_string(),
                     })?;
-                if state != projection.state || actual.get::<i64, _>("has_owner") != 0 {
+                let actual_projection = PersistedConversationProjection {
+                    state,
+                    state_updated_at: DateTime::parse_from_rfc3339(
+                        actual.get::<&str, _>("state_updated_at"),
+                    )
+                    .map_err(|error| DbError::DirectTurnStopUnclassified {
+                        turn_id,
+                        detail: error.to_string(),
+                    })?
+                    .with_timezone(&Utc),
+                };
+                if !projections_match(&actual_projection, projection)?
+                    || actual.get::<i64, _>("has_owner") != 0
+                {
                     return Err(DbError::DirectTurnStopUnclassified {
                         turn_id,
                         detail: "Cancelled terminal lacks the expected reducer projection"
@@ -4591,7 +4604,7 @@ mod tests {
     fn stop_projection() -> PersistedConversationProjection {
         PersistedConversationProjection {
             state: ConvState::Idle,
-            state_updated_at: Utc::now(),
+            state_updated_at: DateTime::<Utc>::from_timestamp_micros(1).unwrap(),
         }
     }
 
@@ -4610,6 +4623,15 @@ mod tests {
             assert!(receipt.matches(turn_id, 0));
             assert!(!receipt.matches(turn_id, 1));
         }
+        let changed_projection = PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: DateTime::<Utc>::from_timestamp_micros(2).unwrap(),
+        };
+        assert!(matches!(
+            repo.accept_direct_turn_stop(turn_id, 0, &changed_projection)
+                .await,
+            Err(DbError::DirectTurnStopUnclassified { .. })
+        ));
         assert!(matches!(
             repo.accept_direct_turn_stop(turn_id, 1, &stop_projection())
                 .await
@@ -4767,7 +4789,8 @@ mod tests {
                             expected_generation: 0,
                         },
                         projection: Some(stop_projection()),
-                        provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                        provider_replay_settlement:
+                            phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear,
                     },
                     None,
                     None,
