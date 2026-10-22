@@ -25988,6 +25988,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_retains_user_tool_drain_cancel_direction_without_fan_in() {
+        use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_event::CancelCause;
         for cause in [CancelCause::UserRequested, CancelCause::Timeout] {
             let db = Database::open_in_memory().await.unwrap();

@@ -5096,8 +5096,8 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn startup_exact_cancel_action_fences_both_terminal_sinks_for_real_owner() {
         use phoenix_core::domain::db_schema::{MessageContent, ToolContent};
-        use phoenix_core::domain::sm_event::{CancelCause, SubAgentMode};
-        use phoenix_core::domain::sm_state::PendingSubAgent;
+        use phoenix_core::domain::sm_event::CancelCause;
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
         let db = crate::Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-a", "recovery", "/tmp", true, None, None)
             .await
