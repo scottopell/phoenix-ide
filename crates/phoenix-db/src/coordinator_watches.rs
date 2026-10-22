@@ -1024,6 +1024,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoritative_settlement_is_not_reclassified_by_legacy_cancel_observation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation(
+                "watch-authority",
+                "watch-authority",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1)")
+            .bind(&source.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let mut tx = db.pool().begin().await.unwrap();
+        record_terminal_event_tx(&mut tx, 7586, 0, &source.id, "Completed", None, false)
+            .await
+            .unwrap();
+        record_steering_event_tx(
+            &mut tx,
+            MessageExecutionSource::InteractionResponse,
+            "question-response",
+            &source.id,
+            "Completed",
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "source occurrence cardinality is unchanged"
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.outcome.label() == "completed"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_cancel_publication_replay_preserves_two_source_occurrences() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = db
+            .create_conversation("watch-stop", "watch-stop", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&source.product_conversation_id)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let mut tx = db.pool().begin().await.unwrap();
+            record_terminal_event_tx(&mut tx, 7586, 0, &source.id, "Cancelled", None, false)
+                .await
+                .unwrap();
+            record_steering_event_tx(
+                &mut tx,
+                MessageExecutionSource::InteractionResponse,
+                "question-response",
+                &source.id,
+                "Cancelled",
+                None,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.outcome.label() == "cancelled"));
+    }
+
+    #[tokio::test]
     async fn recorded_cancel_overrides_idle_completion_without_inventing_actor() {
         let db = Database::open_in_memory().await.unwrap();
         let source = db
