@@ -16200,7 +16200,7 @@ mod authoritative_user_message_effect_tests {
 
     #[tokio::test]
     async fn db_backed_targeted_stop_commits_projection_before_teardown_and_restart() {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = Arc::new(crate::db::Database::open_in_memory().await.unwrap());
         let conversation = db
             .create_conversation("conv-direct", "Stop", "/tmp", true, None, None)
             .await
@@ -16260,6 +16260,7 @@ mod authoritative_user_message_effect_tests {
             generation: 0,
         }));
         rt.llm_task_handle = Some(tokio::spawn(std::future::pending::<()>()));
+        rt.active_llm_attempt = Some(phoenix_llm::LlmAttemptCapture::new());
         rt.process_event(Event::DirectTurnStopRequested {
             turn_id: turn_id.0,
             expected_generation: 0,
