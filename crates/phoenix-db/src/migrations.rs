@@ -13284,9 +13284,9 @@ mod tests {
                      VALUES (6, 2, 'wake-history', 'wake-history:message', 'tool-6', 'Fired', 1, 20);
                  INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
                      prepared_fingerprint, prepared_payload, disposition, generation, owns_conversation,
-                     canonical_message_id)
+                     canonical_message_id, materialized)
                      VALUES (100, 100, 'wake-history', 'wake:6:2', 'accepted-fingerprint', X'FF000A',
-                         'Runtime', 7, 1, 'wake-history:message');
+                         'Runtime', 7, 1, 'wake-history:message', 1);
                  INSERT INTO workflow_external_acceptance_bindings (profile_kind, profile_version,
                      target_scope, idempotency_key, intent_fingerprint, workflow_id,
                      receipt_handle, disposition_handle, created_at)
@@ -15410,9 +15410,13 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(db.pool())
         .await
         .unwrap();
+        let before_130 = MIGRATIONS.partition_point(|migration| migration.version < 130);
+        let through_131 = MIGRATIONS.partition_point(|migration| migration.version <= 131);
         assert_eq!(
-            run_pending_migrations(db.pool()).await.unwrap() as usize,
-            MIGRATIONS.iter().filter(|m| m.version <= 129).count()
+            run_migration_list(db.pool(), &MIGRATIONS[..before_130])
+                .await
+                .unwrap() as usize,
+            before_130
         );
         sqlx::query("DELETE FROM _migrations WHERE version = 130")
             .execute(db.pool())
@@ -15538,7 +15542,12 @@ with tempfile.TemporaryDirectory() as directory:
             .await
             .unwrap();
         assert!(!foreign_keys_before.is_empty());
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(
+            run_migration_list(db.pool(), &MIGRATIONS[..through_131])
+                .await
+                .unwrap(),
+            1
+        );
         for (table, select, before) in history {
             let after: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(select))
                 .fetch_all(db.pool())
@@ -15571,7 +15580,12 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(db.pool())
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(
+            run_migration_list(db.pool(), &MIGRATIONS[..through_131])
+                .await
+                .unwrap(),
+            1
+        );
         let goal_table_before: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='conversation_goals')",
         ).fetch_one(db.pool()).await.unwrap();
@@ -15583,7 +15597,10 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(db.pool())
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 3);
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            MIGRATIONS.len() - through_131
+        );
         let user_control_ledger: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version=134")
                 .fetch_one(db.pool())

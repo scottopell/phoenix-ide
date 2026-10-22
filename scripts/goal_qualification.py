@@ -185,8 +185,10 @@ def reuse_command(mode, threads, expression=None):
     command = ["cargo", "nextest", "run", "--cargo-metadata", str(directory / "cargo.json"),
                "--binaries-metadata", str(directory / "binaries.json"),
                "-E", expression, "--test-threads", str(threads), "--no-tests", "fail"]
+    if mode == "broad":
+        command += ["--failure-output", "immediate"]
     if mode == "focused":
-        command += ["--no-fail-fast", "--failure-output", "immediate-final",
+        command += ["--no-fail-fast", "--failure-output", "immediate",
                     "--status-level", "all", "--final-status-level", "all"]
     return command
 

@@ -741,40 +741,17 @@ async fn conversation_goal_actual_provider_response_commits_checkpoint_and_keeps
     rt.abort_external_effects_in_memory();
 }
 
-#[tokio::test]
-async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_source_before_next_request(
-) {
-    let (_directory, db, _receipt, mut initial, client) = adopted().await;
-    let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
-    client
-        .responses
-        .lock()
-        .unwrap()
-        .push_back(provider_response_with_replay(
-            "tool-round-response",
-            vec![ContentBlock::tool_use(
-                "actual-think-call",
-                "think",
-                serde_json::json!({"thoughts":"checkpoint the actual round"}),
-            )],
-        ));
-    let completion = dispatch_response(&mut rt).await;
-    let first_request = completion
-        .admitted
-        .as_ref()
-        .unwrap()
-        .intent()
-        .id
-        .as_str()
-        .to_owned();
-    rt.process_llm_completion(completion).await.unwrap();
+async fn assert_goal_tool_source_persisted(
+    db: &Database,
+    rt: &ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, MockToolExecutor>,
+) -> (i64, i64, i64, i64) {
     assert!(matches!(rt.state, ConvState::ToolExecuting { .. }));
     let persisted = db.get_conversation(CONVERSATION).await.unwrap();
     assert_eq!(
         (persisted.state, persisted.state_updated_at),
         (rt.state.clone(), rt.state_updated_at)
     );
-    let before = canonical_counts(&db).await;
+    let before = canonical_counts(db).await;
     assert_eq!(before.2, 0);
     assert!(rt.pending_provider_replay_update.is_some());
     assert!(
@@ -784,22 +761,18 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
             .is_none(),
         "real provider replay must not persist with intermediate ToolExecuting state"
     );
-    let (generation, outcome) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        rt.tool_outcome_rx.recv(),
-    )
-    .await
-    .expect("actual tool completion liveness")
-    .unwrap();
-    assert!(!rt.tool_outcome_is_stale(generation));
-    rt.process_outcome(EffectOutcome::Tool(outcome))
-        .await
-        .unwrap();
-    let counts = canonical_counts(&db).await;
+    before
+}
+
+async fn assert_goal_tool_checkpoint(
+    db: &Database,
+    before: (i64, i64, i64, i64),
+    first_request: String,
+) {
+    let counts = canonical_counts(db).await;
     assert_eq!(counts.0, before.0 + 2);
     assert_eq!(counts.2, 1);
     assert_eq!(counts.3, 0);
-    assert!(rt.pending_goal_request_checkpoint.is_none());
     assert!(db
         .load_provider_replay_state(CONVERSATION)
         .await
@@ -814,13 +787,135 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
     let next: (i64, String) = sqlx::query_as("SELECT ordinal,predecessor_request_id FROM conversation_goal_requests ORDER BY ordinal DESC LIMIT 1")
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(next, (2, first_request));
-    rt.llm_task_handle.take().unwrap().await.unwrap();
-    let requests = client.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests[1].provider_replay.is_some(),
-        "successor observes the committed replay bundle"
+}
+
+fn assert_goal_tool_turn_context(
+    request: &phoenix_core::domain::llm_types::LlmRequest,
+    before: bool,
+) {
+    let prompt = request
+        .system
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        prompt.contains("goal tool turn guidance before mutation"),
+        before
     );
+    assert_eq!(
+        prompt.contains("goal tool metadata before mutation"),
+        before
+    );
+    assert_eq!(
+        prompt.contains("goal tool turn guidance after mutation"),
+        !before
+    );
+    assert_eq!(
+        prompt.contains("goal tool metadata after mutation"),
+        !before
+    );
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_source_before_next_request(
+) {
+    let (directory, db, receipt, mut initial, client) = adopted_with_limit(3).await;
+    let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
+    let guidance = directory.path().join("AGENTS.md");
+    let skill = directory
+        .path()
+        .join(".agents/skills/goal-tool-boundary/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&guidance, "goal tool turn guidance before mutation").unwrap();
+    std::fs::write(&skill, "---\nname: goal-tool-boundary\ndescription: goal tool metadata before mutation\n---\nUse current instructions.\n").unwrap();
+    client
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(provider_response_with_replay(
+            "tool-round-response",
+            vec![ContentBlock::tool_use(
+                "actual-think-call",
+                "think",
+                serde_json::json!({"thoughts":"checkpoint the actual round"}),
+            )],
+        ));
+    client.responses.lock().unwrap().extend([
+        provider_response(vec![ContentBlock::text("noncomplete logical yield")]),
+        provider_response(vec![ContentBlock::text("next logical turn response")]),
+    ]);
+    let completion = dispatch_response(&mut rt).await;
+    let dispatch_generation = completion.generation;
+    assert_eq!(
+        completion.admitted.as_ref().unwrap().intent().execution,
+        receipt.execution()
+    );
+    std::fs::write(&guidance, "goal tool turn guidance after mutation").unwrap();
+    std::fs::write(&skill, "---\nname: goal-tool-boundary\ndescription: goal tool metadata after mutation\n---\nUse current instructions.\n").unwrap();
+    let first_request = completion
+        .admitted
+        .as_ref()
+        .unwrap()
+        .intent()
+        .id
+        .as_str()
+        .to_owned();
+    rt.process_llm_completion(completion).await.unwrap();
+    let before = assert_goal_tool_source_persisted(&db, &rt).await;
+    let (generation, outcome) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rt.tool_outcome_rx.recv(),
+    )
+    .await
+    .expect("actual tool completion liveness")
+    .unwrap();
+    assert!(!rt.tool_outcome_is_stale(generation));
+    rt.process_outcome(EffectOutcome::Tool(outcome))
+        .await
+        .unwrap();
+    assert!(rt.pending_goal_request_checkpoint.is_none());
+    assert_goal_tool_checkpoint(&db, before, first_request).await;
+    let successor = receive_automatic_response(&mut rt).await;
+    assert_eq!(successor.generation, dispatch_generation);
+    assert_eq!(
+        successor.admitted.as_ref().unwrap().intent().execution,
+        receipt.execution()
+    );
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].provider_replay.is_some(),
+            "successor observes the committed replay bundle"
+        );
+        for request in &requests[..2] {
+            assert_goal_tool_turn_context(request, true);
+        }
+    }
+    rt.process_llm_completion(successor).await.unwrap();
+    let logical_successor = receive_automatic_response(&mut rt).await;
+    assert_eq!(logical_successor.generation, dispatch_generation);
+    assert_eq!(
+        logical_successor
+            .admitted
+            .as_ref()
+            .unwrap()
+            .intent()
+            .execution,
+        receipt.execution()
+    );
+    let active = rt.active_direct_turn.as_deref().unwrap();
+    assert_eq!(
+        (active.turn_id, active.generation),
+        (receipt.execution().turn_id, receipt.execution().generation)
+    );
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_goal_tool_turn_context(&requests[2], false);
+    }
+    rt.abort_external_effects_in_memory();
 }
 
 #[tokio::test]

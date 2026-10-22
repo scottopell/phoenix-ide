@@ -893,6 +893,7 @@ async fn restart_preserves_staged_identity_and_admitted_cursor_after_lost_ack() 
         .to_string_lossy()
         .into_owned();
     let db = Database::open(&path).await.unwrap();
+    db.run_pending_migrations().await.unwrap();
     let target = coordinator(&db).await;
     let remote = remote_fixture(&db).await;
     let replay = single_fact();
@@ -1529,6 +1530,7 @@ async fn unsubscribe_identity_is_durable_retryable_and_never_reenrolls() {
         .to_string_lossy()
         .into_owned();
     let db = Database::open(&path).await.unwrap();
+    db.run_pending_migrations().await.unwrap();
     let remote = remote_fixture(&db).await;
     db.stage_remote_replay(&remote, &single_fact())
         .await
@@ -1609,6 +1611,7 @@ async fn authorization_refresh_replaces_an_expired_attempt_without_ending_or_adv
 #[tokio::test]
 async fn received_navigation_is_canonical_durable_and_batched_before_authorization() {
     let db = Database::open(":memory:").await.unwrap();
+    db.run_pending_migrations().await.unwrap();
     let remote = remote_fixture(&db).await;
     db.stage_remote_replay(&remote, &single_fact())
         .await

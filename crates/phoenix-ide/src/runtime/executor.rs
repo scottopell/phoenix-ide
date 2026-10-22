@@ -32,7 +32,9 @@ use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
     Effect, Event, SteeringDrainMessage, SteeringDrainPostCommit, StepResult,
 };
-use crate::system_prompt::{build_system_prompt_with_catalog, ModeContext, OrdinarySkillCatalog};
+use crate::system_prompt::{
+    build_system_prompt_with_turn_context, ModeContext, OrdinaryTurnContext,
+};
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::conversation_goal::ToolRoundResult;
@@ -2324,7 +2326,7 @@ where
     /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
     llm_turn_count: u32,
-    ordinary_skill_catalog: Option<OrdinarySkillCatalog>,
+    ordinary_turn_context: Option<OrdinaryTurnContext>,
     /// Whether this sub-agent has been given its grace turn (one extra LLM turn to produce a terminal outcome)
     grace_turn_granted: bool,
     /// Wall-clock marker for the start of the grace turn. The hard-stop fallback
@@ -2560,7 +2562,7 @@ where
             #[cfg(test)]
             terminal_effect_admission_barrier: None,
             llm_turn_count: 0,
-            ordinary_skill_catalog: None,
+            ordinary_turn_context: None,
             grace_turn_granted: false,
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
@@ -4732,7 +4734,7 @@ where
                     Ok(effect_result) => {
                         new_turn_input_persisted |= is_new_turn_input;
                         if is_state_persist && new_turn_input_persisted {
-                            self.ordinary_skill_catalog = None;
+                            self.ordinary_turn_context = None;
                         }
                         if is_state_persist {
                             committed_state = Some((self.state.clone(), self.state_updated_at));
@@ -6628,7 +6630,7 @@ where
                                 turn_id,
                                 generation,
                             }));
-                        self.ordinary_skill_catalog = None;
+                        self.ordinary_turn_context = None;
                         self.publish_live_state_admitted();
                         Ok(None)
                     }
@@ -6743,7 +6745,7 @@ where
                         self.state = proposed.state;
                         self.state_updated_at = proposed.updated_at;
                         self.active_direct_turn = Some(Box::new(active));
-                        self.ordinary_skill_catalog = None;
+                        self.ordinary_turn_context = None;
                         self.publish_live_state_admitted();
                         let mut materialization_owner = materialization_owner;
                         let _ = self
@@ -8079,7 +8081,7 @@ where
     ) -> Result<Option<Event>, String> {
         match post_commit {
             SteeringDrainPostCommit::StartLlmAndNotifyState => {
-                self.ordinary_skill_catalog = None;
+                self.ordinary_turn_context = None;
                 self.parent_tool_cycle_count = 0;
                 let _ = self
                     .broadcast_tx
@@ -8734,14 +8736,14 @@ where
                 tool_executor.coordinator_skill_catalog().as_ref(),
             )
         } else {
-            let catalog = self.ordinary_skill_catalog.get_or_insert_with(|| {
-                OrdinarySkillCatalog::discover(
+            let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
+                OrdinaryTurnContext::discover(
                     working_dir
                         .as_deref()
                         .expect("filesystem conversation has cwd"),
                 )
             });
-            build_system_prompt_with_catalog(
+            build_system_prompt_with_turn_context(
                 working_dir
                     .as_deref()
                     .expect("filesystem conversation has cwd"),
@@ -8751,7 +8753,7 @@ where
                 llm_language,
                 persona.as_deref(),
                 explore_bash_capability,
-                catalog,
+                turn_context,
             )
         };
         if is_coordinator {
@@ -20415,6 +20417,8 @@ mod explore_prompt_cache_shape_tests {
         };
         write("edited", "old description");
         write("removed", "removed description");
+        let guidance = temp.path().join("AGENTS.md");
+        std::fs::write(&guidance, "turn guidance old").unwrap();
         let llm = Arc::new(MockLlmClient::new("test-model"));
         llm.queue_response(LlmResponse {
             provider_replay: None,
@@ -20501,6 +20505,8 @@ mod explore_prompt_cache_shape_tests {
         .unwrap();
         write("edited", "new description");
         write("added", "added description");
+        std::fs::write(&guidance, "turn guidance changed").unwrap();
+        std::fs::write(temp.path().join("AGENT.md"), "fallback must not appear").unwrap();
         std::fs::remove_dir_all(temp.path().join(".claude/skills/removed")).unwrap();
         // Rejected busy input must not refresh the active turn.
         assert!(Box::pin(runtime.process_event(user("busy"))).await.is_err());
@@ -20548,6 +20554,9 @@ mod explore_prompt_cache_shape_tests {
         let first = llm.recorded_requests();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].system[0].text, first[1].system[0].text);
+        assert!(first[0].system[0].text.contains("turn guidance old"));
+        assert!(!first[0].system[0].text.contains("turn guidance changed"));
+        assert!(!first[0].system[0].text.contains("fallback must not appear"));
         assert!(first[0].system[0].text.contains("old description"));
         assert!(first[0].system[0].text.contains("turn-test-removed"));
         assert!(first[0].system[0].text.contains(&format!(
@@ -20556,7 +20565,7 @@ mod explore_prompt_cache_shape_tests {
         )));
         assert!(!first[0].system[0].text.contains("turn-test-added"));
         assert!(matches!(runtime.state, ConvState::Idle));
-        let retained_catalog = format!("{:?}", runtime.ordinary_skill_catalog);
+        let retained_context = runtime.ordinary_turn_context.clone();
         storage.set_fail_state_update(true);
         assert!(Box::pin(runtime.process_event(user("failed-state")))
             .await
@@ -20564,9 +20573,8 @@ mod explore_prompt_cache_shape_tests {
         storage.set_fail_state_update(false);
         assert!(matches!(runtime.state, ConvState::Idle));
         assert_eq!(
-            format!("{:?}", runtime.ordinary_skill_catalog),
-            retained_catalog,
-            "a failed state commit must retain the prior advertised catalog"
+            runtime.ordinary_turn_context, retained_context,
+            "a failed state commit must retain guidance and advertised catalog"
         );
         assert_eq!(llm.recorded_requests().len(), 2);
         Box::pin(runtime.process_event(user("second")))
@@ -20584,6 +20592,10 @@ mod explore_prompt_cache_shape_tests {
         .unwrap()
         .unwrap();
         let refreshed = llm.recorded_requests();
+        assert!(refreshed[2].system[0]
+            .text
+            .contains("turn guidance changed"));
+        assert!(!refreshed[2].system[0].text.contains("turn guidance old"));
         assert!(refreshed[2].system[0].text.contains("new description"));
         assert!(refreshed[2].system[0].text.contains("turn-test-added"));
         assert!(!refreshed[2].system[0].text.contains("turn-test-removed"));
@@ -20592,6 +20604,7 @@ mod explore_prompt_cache_shape_tests {
             .await
             .unwrap();
         write("edited", "queued description");
+        std::fs::remove_file(&guidance).unwrap();
         let entries = vec![crate::state_machine::event::SteerEntry {
             text: "queued work".into(),
             origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
@@ -20620,6 +20633,15 @@ mod explore_prompt_cache_shape_tests {
         assert!(llm.recorded_requests()[3].system[0]
             .text
             .contains("queued description"));
+        assert!(llm.recorded_requests()[3].system[0]
+            .text
+            .contains("fallback must not appear"));
+        assert!(!llm.recorded_requests()[3].system[0]
+            .text
+            .contains("turn guidance changed"));
+        assert!(llm.recorded_requests()[3].system[0]
+            .text
+            .contains(&temp.path().join("AGENT.md").display().to_string()));
         Box::pin(runtime.process_outcome(EffectOutcome::Llm(outcome)))
             .await
             .unwrap();

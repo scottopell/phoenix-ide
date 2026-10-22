@@ -133,6 +133,7 @@ where
             .pending_goal_request_checkpoint
             .as_ref()
             .ok_or("canonical checkpoint has no actual dispatch receipt")?;
+        let logical_turn_boundary = matches!(evidence, GoalRequestEvidence::Response);
         let result = self
             .storage
             .commit_goal_request_checkpoint(&GoalRequestCheckpoint {
@@ -174,7 +175,9 @@ where
                     self.pending_direct_turn_terminal = None;
                 }
                 self.pending_goal_request_checkpoint = None;
-                self.ordinary_skill_catalog = None;
+                if logical_turn_boundary {
+                    self.ordinary_turn_context = None;
+                }
                 self.pending_provider_replay_update = None;
                 Ok(committed)
             }

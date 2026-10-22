@@ -473,7 +473,8 @@ class GoalQualificationCommandTests(unittest.TestCase):
         self.assertIn('reuse_env = compiler_cache_env if goal_reuse_commands is not None else None', source)
         self.assertIn('env_extra={**(reuse_env or {}), "TS_RS_EXPORT_DIR": str(codegen_export_base)}', source)
         self.assertIn('run_step("cargo test", test_cmd, env_extra=reuse_env, timeout=CARGO_TEST_TIMEOUT)', source)
-        self.assertIn('text=True, env=env, start_new_session=True, bufsize=1', source)
+        self.assertIn('text=output_log is None, env=env, start_new_session=True', source)
+        self.assertIn('bufsize=1 if output_log is None else 0', source)
         self.assertIn('def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT):', source)
         check = next(node for node in ast.parse(source).body
                      if isinstance(node, ast.FunctionDef) and node.name == "cmd_check")

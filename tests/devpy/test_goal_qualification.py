@@ -161,6 +161,8 @@ class GoalQualificationTests(unittest.TestCase):
             self.assertEqual(command[command.index("-E") + 1], expression)
             self.assertEqual(command[command.index("--test-threads") + 1], "3")
             self.assertEqual(command[command.index("--no-tests") + 1], "fail")
+            if mode == "broad":
+                self.assertEqual(command[-2:], ["--failure-output", "immediate"])
             for forbidden in ("--workspace", "-p", "--no-run", "--ignored", "--ignore-default-filter", "--profile"):
                 self.assertNotIn(forbidden, command)
             for option, name in (("--cargo-metadata", "cargo.json"), ("--binaries-metadata", "binaries.json")):
@@ -169,7 +171,7 @@ class GoalQualificationTests(unittest.TestCase):
         command = self.helper.reuse_command("focused", 2, expression)
         self.assertEqual(command[command.index("-E") + 1],
                          "(package(=phoenix-core) | package(=phoenix-db) | package(=phoenix_ide)) & (" + expression + ")")
-        self.assertEqual(command[-7:], ["--no-fail-fast", "--failure-output", "immediate-final",
+        self.assertEqual(command[-7:], ["--no-fail-fast", "--failure-output", "immediate",
                                        "--status-level", "all", "--final-status-level", "all"])
         with self.assertRaises(ValueError):
             self.helper.reuse_command("focused", 3, expression)
@@ -286,10 +288,14 @@ class GoalQualificationTests(unittest.TestCase):
         self.assertIn('timeout --signal=TERM --kill-after=10s 7m cargo nextest run --locked', pr)
         self.assertIn('-p phoenix-core -p phoenix-db -p phoenix_ide', pr)
         self.assertIn('-E "$goal_filter"', pr)
-        self.assertIn('--test-threads 2 --no-fail-fast --failure-output immediate-final', pr)
+        self.assertIn('--test-threads 2 --no-fail-fast --failure-output immediate', pr)
         self.assertIn('--status-level all --final-status-level all', pr)
         self.assertEqual(script.count('fi 2>&1 | tee ci-rust-logs/goals.log'), 1)
-        self.assertEqual(workflow.count("env.PHOENIX_GOAL_REUSE_DIR != '' && format("), 2)
+        self.assertEqual(workflow.count("env.PHOENIX_GOAL_REUSE_DIR != '' && format("), 3)
+        self.assertIn("format('{0}/cargo-tests.full.log', env.PHOENIX_GOAL_REUSE_DIR)", workflow)
+        self.assertIn('PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "2100"', workflow)
+        rust_job = workflow.split("  check-rust:", 1)[1].split("\n  check-", 1)[0]
+        self.assertIn("    timeout-minutes: 85\n", rust_job)
 
     def test_clean_identity_binds_inputs_tools_flags_but_never_exports_credentials(self):
         (self.root / "Cargo.lock").write_text("lock fixture")

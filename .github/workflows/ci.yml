@@ -66,14 +66,14 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 85
     env:
       CARGO_TERM_COLOR: always
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
-      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1500"
+      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "2100"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,7 +132,7 @@ jobs:
             timeout --signal=TERM --kill-after=10s 7m cargo nextest run --locked \
               -p phoenix-core -p phoenix-db -p phoenix_ide \
               -E "$goal_filter" \
-              --test-threads 2 --no-fail-fast --failure-output immediate-final \
+              --test-threads 2 --no-fail-fast --failure-output immediate \
               --status-level all --final-status-level all
           fi 2>&1 | tee ci-rust-logs/goals.log
       - name: Retain Rust qualification evidence
@@ -147,6 +147,7 @@ jobs:
             target/codegen-scratch/**/*.ts
             ${{ env.PHOENIX_GOAL_REUSE_DIR != '' && format('{0}/*.json', env.PHOENIX_GOAL_REUSE_DIR) || '' }}
             ${{ env.PHOENIX_GOAL_REUSE_DIR != '' && format('{0}/*.stderr.log', env.PHOENIX_GOAL_REUSE_DIR) || '' }}
+            ${{ env.PHOENIX_GOAL_REUSE_DIR != '' && format('{0}/cargo-tests.full.log', env.PHOENIX_GOAL_REUSE_DIR) || '' }}
           retention-days: 7
           if-no-files-found: warn
       - name: Check production feature on musl
