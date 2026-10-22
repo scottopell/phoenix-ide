@@ -5120,9 +5120,9 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("INSERT INTO sub_agent_batches (batch_id, parent_conversation_id, parent_transcript_generation, active) VALUES ('recovery-batch', 'conv-a', 0, 1)")
+        sqlx::query("INSERT INTO sub_agent_batches (batch_id, parent_conversation_id, parallel_work_qualified, admitted_at_unix_micros) VALUES ('recovery-batch', 'conv-a', 0, 1)")
             .execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO sub_agent_runs (child_conversation_id, batch_id, ordinal, task, agent_mode, active) VALUES ('recovery-child', 'recovery-batch', 0, 'recover', 'explore', 1)")
+        sqlx::query("INSERT INTO sub_agent_runs (child_conversation_id, batch_id, ordinal, execution_authority) VALUES ('recovery-child', 'recovery-batch', 0, 'read_only')")
             .execute(db.pool()).await.unwrap();
         let mut source = seed_drain_source(&repo).await;
         if let ConvState::CancellingSubAgents { pending, .. } = &mut source.state {
@@ -5167,7 +5167,7 @@ mod tests {
             action.transcript_generation,
             conversation.transcript_generation
         );
-        let accepted: Option<String> = sqlx::query_scalar("SELECT parent_accepted_at FROM sub_agent_runs WHERE child_conversation_id = 'recovery-child'")
+        let accepted: Option<i64> = sqlx::query_scalar("SELECT parent_accepted_at_unix_micros FROM sub_agent_runs WHERE child_conversation_id = 'recovery-child'")
             .fetch_one(db.pool()).await.unwrap();
         assert!(
             accepted.is_some(),
@@ -5238,7 +5238,9 @@ mod tests {
             },
             projection: Some(projection),
             provider_replay_settlement:
-                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear,
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Clear {
+                    conversation_id: "conv-a".into(),
+                },
         };
         repo.terminalize_authoritative_turn(&cancellation)
             .await
