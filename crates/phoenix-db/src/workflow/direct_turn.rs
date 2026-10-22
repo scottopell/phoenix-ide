@@ -1934,7 +1934,7 @@ impl WorkflowRepository {
                     })?
                     .with_timezone(&Utc),
                 };
-                if !projections_match(&actual_projection, projection)?
+                if !projections_match(&actual_projection, projection)
                     || actual.get::<i64, _>("has_owner") != 0
                 {
                     return Err(DbError::DirectTurnStopUnclassified {
@@ -2728,8 +2728,7 @@ impl WorkflowRepository {
                     .map_err(|error| DbError::Serialization(error.to_string()))?
                     .with_timezone(&Utc),
                 };
-                if !projections_match(&persisted, projection)?
-                    || row.get::<i64, _>("has_owner") != 0
+                if !projections_match(&persisted, projection) || row.get::<i64, _>("has_owner") != 0
                 {
                     return Err(DbError::DirectTurnStopUnclassified {
                         turn_id,

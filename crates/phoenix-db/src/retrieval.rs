@@ -958,6 +958,8 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::CloseFoundationNotFound(_)
         | crate::DbError::SubAgentLifecycleConflict(_)
         | crate::DbError::DirectTurnConflict(_)
+        | crate::DbError::DirectTurnTerminalObligationEstablished(_)
+        | crate::DbError::DirectTurnStopUnclassified { .. }
         | crate::DbError::ForkProposalConflict(_)
         | crate::DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | crate::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
