@@ -1815,11 +1815,22 @@ impl WorkflowRepository {
         &self,
         turn_id: TurnAuthorityId,
         expected_generation: u64,
+        projection: &PersistedConversationProjection,
     ) -> DbResult<DirectTurnStopAcceptance> {
+        if !matches!(projection.state, ConvState::Idle) {
+            return Err(DbError::Serialization(
+                "direct Stop requires the reducer's terminal Idle projection; draining is not terminal".to_string(),
+            ));
+        }
         let step = match self
-            .terminate_authoritative_turn(TurnCommand::Cancel {
-                turn_id,
-                expected_generation,
+            .terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+                command: TurnCommand::Cancel {
+                    turn_id,
+                    expected_generation,
+                },
+                projection: Some(projection.clone()),
+                provider_replay_settlement:
+                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
             })
             .await
         {
@@ -1839,7 +1850,12 @@ impl WorkflowRepository {
             }
             Err(error) => {
                 return self
-                    .classify_direct_turn_stop_error(turn_id, expected_generation, error)
+                    .classify_direct_turn_stop_error(
+                        turn_id,
+                        expected_generation,
+                        projection,
+                        error,
+                    )
                     .await;
             }
         };
@@ -1860,10 +1876,13 @@ impl WorkflowRepository {
                 terminal: TurnTerminal::Cancelled,
                 ..
             } if actual == turn_id && generation == expected_generation.saturating_add(1) => {
-                Ok(DirectTurnStopAcceptance::Accepted(AcceptedDirectTurnStop {
+                self.classify_direct_turn_stop_error(
                     turn_id,
-                    command_generation: expected_generation,
-                }))
+                    expected_generation,
+                    projection,
+                    DbError::Serialization("verifying exact Stop replay projection".to_string()),
+                )
+                .await
             }
             _ => Err(DbError::Serialization(
                 "Cancel returned no exact cancelled terminal evidence".to_string(),
@@ -1875,6 +1894,7 @@ impl WorkflowRepository {
         &self,
         turn_id: TurnAuthorityId,
         expected_generation: u64,
+        projection: &PersistedConversationProjection,
         original: DbError,
     ) -> DbResult<DirectTurnStopAcceptance> {
         let observation: Result<Option<(i64, Option<String>, i64)>, sqlx::Error> = sqlx::query_as(
@@ -1889,6 +1909,22 @@ impl WorkflowRepository {
                     == Some(expected_generation.saturating_add(1))
                     && terminal == "Cancelled" =>
             {
+                let actual = sqlx::query("SELECT c.state, EXISTS(SELECT 1 FROM durable_turns newer WHERE newer.conversation_id = c.id AND newer.owns_conversation = 1) AS has_owner FROM conversations c JOIN durable_turns t ON t.conversation_id = c.id WHERE t.turn_id = ?1")
+                    .bind(to_i64(turn_id.0, "turn_id")?)
+                    .fetch_one(&self.pool).await
+                    .map_err(|error| DbError::DirectTurnStopUnclassified { turn_id, detail: error.to_string() })?;
+                let state: ConvState = serde_json::from_str(actual.get::<&str, _>("state"))
+                    .map_err(|error| DbError::DirectTurnStopUnclassified {
+                        turn_id,
+                        detail: error.to_string(),
+                    })?;
+                if state != projection.state || actual.get::<i64, _>("has_owner") != 0 {
+                    return Err(DbError::DirectTurnStopUnclassified {
+                        turn_id,
+                        detail: "Cancelled terminal lacks the expected reducer projection"
+                            .to_string(),
+                    });
+                }
                 Ok(DirectTurnStopAcceptance::Accepted(AcceptedDirectTurnStop {
                     turn_id,
                     command_generation: expected_generation,
@@ -2703,13 +2739,15 @@ impl WorkflowRepository {
                 actual: turn.generation,
             }));
         }
-        if input.projection.is_none() {
+        if input.projection.is_none() || matches!(input.command, TurnCommand::Cancel { .. }) {
             let obligation_exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM direct_turn_terminal_obligations WHERE turn_id = ?1
+                    AND (?2 OR terminal_kind != 'Cancelled')
                  )",
             )
             .bind(to_i64(turn_id.0, "turn_id")?)
+            .bind(input.projection.is_none())
             .fetch_one(&mut *tx.tx)
             .await?;
             if obligation_exists != 0 {
@@ -4550,13 +4588,22 @@ mod tests {
             .is_err());
     }
 
+    fn stop_projection() -> PersistedConversationProjection {
+        PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn accepted_direct_turn_stop_replays_exact_command_not_replacement_generation() {
         let repo = repo().await;
         let (turn_id, _) = created_turn(&repo, "stop-receipt-replay", 91).await;
         for _ in 0..2 {
-            let DirectTurnStopAcceptance::Accepted(receipt) =
-                repo.accept_direct_turn_stop(turn_id, 0).await.unwrap()
+            let DirectTurnStopAcceptance::Accepted(receipt) = repo
+                .accept_direct_turn_stop(turn_id, 0, &stop_projection())
+                .await
+                .unwrap()
             else {
                 panic!("exact Cancel or its replay must retain accepted evidence");
             };
@@ -4564,7 +4611,9 @@ mod tests {
             assert!(!receipt.matches(turn_id, 1));
         }
         assert!(matches!(
-            repo.accept_direct_turn_stop(turn_id, 1).await.unwrap(),
+            repo.accept_direct_turn_stop(turn_id, 1, &stop_projection())
+                .await
+                .unwrap(),
             DirectTurnStopAcceptance::NotAccepted(DirectTurnStopRejection::Conflict(_))
         ));
     }
@@ -4585,7 +4634,9 @@ mod tests {
         };
         repo.persist_terminal_obligation(&obligation).await.unwrap();
         assert_eq!(
-            repo.accept_direct_turn_stop(turn_id, 0).await.unwrap(),
+            repo.accept_direct_turn_stop(turn_id, 0, &stop_projection())
+                .await
+                .unwrap(),
             DirectTurnStopAcceptance::NotAccepted(
                 DirectTurnStopRejection::TerminalObligationEstablished
             )
@@ -4612,7 +4663,9 @@ mod tests {
         let repo = repo().await;
         let (turn_id, _) = created_turn(&repo, "stop-before-completion", 93).await;
         assert!(matches!(
-            repo.accept_direct_turn_stop(turn_id, 0).await.unwrap(),
+            repo.accept_direct_turn_stop(turn_id, 0, &stop_projection())
+                .await
+                .unwrap(),
             DirectTurnStopAcceptance::Accepted(_)
         ));
         let obligation = DirectTurnTerminalObligationInput {
@@ -4660,8 +4713,10 @@ mod tests {
             .execute(&repo.pool)
             .await
             .unwrap();
-        let DirectTurnStopAcceptance::Accepted(receipt) =
-            repo.accept_direct_turn_stop(turn_id, 0).await.unwrap()
+        let DirectTurnStopAcceptance::Accepted(receipt) = repo
+            .accept_direct_turn_stop(turn_id, 0, &stop_projection())
+            .await
+            .unwrap()
         else {
             panic!("Stop must be accepted for the live exact target");
         };
@@ -4699,6 +4754,11 @@ mod tests {
         ] {
             let repo = repo().await;
             let (turn_id, _) = created_turn(&repo, "stop-uncertain-commit", 94).await;
+            sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-a'")
+                .bind(serde_json::to_string(&ConvState::LlmRequesting { attempt: 1 }).unwrap())
+                .execute(&repo.pool)
+                .await
+                .unwrap();
             let error = repo
                 .terminalize_authoritative_turn_with_occurrence_at_cut(
                     &TerminalizeAuthoritativeTurnInput {
@@ -4706,7 +4766,7 @@ mod tests {
                             turn_id,
                             expected_generation: 0,
                         },
-                        projection: None,
+                        projection: Some(stop_projection()),
                         provider_replay_settlement: phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
                     },
                     None,
@@ -4716,7 +4776,7 @@ mod tests {
                 .await
                 .unwrap_err();
             let result = repo
-                .classify_direct_turn_stop_error(turn_id, 0, error)
+                .classify_direct_turn_stop_error(turn_id, 0, &stop_projection(), error)
                 .await;
             if accepted {
                 let DirectTurnStopAcceptance::Accepted(receipt) = result.unwrap() else {
@@ -4725,6 +4785,17 @@ mod tests {
                 assert!(receipt.matches(turn_id, 0));
             } else {
                 assert!(matches!(result, Err(DbError::Serialization(_))));
+            }
+            let persisted: String =
+                sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+            let persisted: ConvState = serde_json::from_str(&persisted).unwrap();
+            if accepted {
+                assert!(matches!(persisted, ConvState::Idle));
+            } else {
+                assert!(matches!(persisted, ConvState::LlmRequesting { .. }));
             }
         }
     }

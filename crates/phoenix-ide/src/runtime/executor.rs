@@ -3441,7 +3441,23 @@ where
                     .active_direct_turn
                     .as_ref()
                     .expect("target checked above");
-                let acceptance = self.storage.accept_direct_turn_stop(target).await?;
+                let stop_event = Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                };
+                let preview = transition(&self.state, &self.context, stop_event.clone())
+                    .map_err(|error| error.to_string())?;
+                if !matches!(preview.new_state, ConvState::Idle) {
+                    return Err("targeted Stop requires retained nonterminal drain authority before activation".to_string());
+                }
+                let projection = phoenix_db::workflow::PersistedConversationProjection {
+                    state: preview.new_state,
+                    state_updated_at: chrono::Utc::now(),
+                };
+                let acceptance = self
+                    .storage
+                    .accept_direct_turn_stop(target, &projection)
+                    .await?;
                 let receipt = match acceptance {
                     phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(receipt)
                         if receipt.matches(target.turn_id, target.generation) =>
@@ -16180,6 +16196,138 @@ mod authoritative_user_message_effect_tests {
             storage.get_current_state(&rt.context.conversation_id),
             Some(ConvState::RecoverableContinuationFailure { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn db_backed_targeted_stop_commits_projection_before_teardown_and_restart() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("conv-direct", "Stop", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
+        let repo = db.workflow_repository();
+        let target = phoenix_workflow::ConversationAuthority("conv-direct".to_string());
+        let step = repo
+            .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
+                client_key: phoenix_workflow::ClientTurnKey::new("targeted-stop").unwrap(),
+                prepared: phoenix_workflow::PreparedTurn::from_exact_payload(
+                    &target,
+                    payload("stop-input").to_exact_bytes().unwrap(),
+                ),
+                disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                accepted_at: phoenix_workflow::Timestamp(1),
+            })
+            .await
+            .unwrap();
+        let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = step.outcome else {
+            panic!("expected accepted turn");
+        };
+        let active = ConvState::LlmRequesting { attempt: 1 };
+        db.update_state_and_replay(
+            "conv-direct",
+            &active,
+            chrono::Utc::now(),
+            &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+        )
+        .await
+        .unwrap();
+        let (template, _, _) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (sender, receiver) = mpsc::channel(8);
+        let mut rt = ConversationRuntime::new(
+            template.context,
+            active,
+            crate::runtime::traits::DatabaseStorage::new(db.clone()),
+            template.llm_client,
+            template.tool_executor,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            template.llm_registry,
+            crate::terminal::ActiveTerminals::new(),
+            receiver,
+            sender,
+            SseBroadcaster::new(32, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id,
+            generation: 0,
+        }));
+        rt.llm_task_handle = Some(tokio::spawn(std::future::pending::<()>()));
+        rt.process_event(Event::DirectTurnStopRequested {
+            turn_id: turn_id.0,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.llm_task_handle.is_none());
+        assert!(matches!(
+            db.get_conversation("conv-direct").await.unwrap().state,
+            ConvState::Idle
+        ));
+        let events = db.pending_coordinator_watch_events(16).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome.label(), "cancelled");
+        drop(rt);
+        let projection = phoenix_db::workflow::PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: chrono::Utc::now(),
+        };
+        assert!(matches!(
+            repo.accept_direct_turn_stop(turn_id, 0, &projection)
+                .await
+                .unwrap(),
+            phoenix_db::workflow::DirectTurnStopAcceptance::Accepted(_)
+        ));
+        assert!(repo
+            .load_active_terminal_obligation(&target)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        assert!(matches!(
+            db.get_conversation("conv-direct").await.unwrap().state,
+            ConvState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn targeted_stop_does_not_fabricate_idle_for_nonterminal_drain() {
+        let (mut rt, _, _) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(10),
+            generation: 0,
+        }));
+        rt.state = ConvState::CancellingSubAgents {
+            pending: vec![],
+            completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::Timeout,
+            spawn_tool_id: None,
+        };
+        let error = rt
+            .process_event(Event::DirectTurnStopRequested {
+                turn_id: 10,
+                expected_generation: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("nonterminal drain authority"));
+        assert!(matches!(rt.state, ConvState::CancellingSubAgents { .. }));
+        assert!(rt.pending_direct_turn_terminal.is_none());
     }
 
     #[tokio::test]

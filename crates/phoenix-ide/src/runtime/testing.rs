@@ -2082,6 +2082,7 @@ impl StateStore for InMemoryStorage {
     async fn accept_direct_turn_stop(
         &self,
         _target: &crate::runtime::traits::ActiveDirectTurn,
+        _projection: &phoenix_db::workflow::PersistedConversationProjection,
     ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String> {
         Err("in-memory storage has no durable Cancel transaction".to_string())
     }

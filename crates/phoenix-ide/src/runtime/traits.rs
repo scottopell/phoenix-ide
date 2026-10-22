@@ -459,6 +459,7 @@ pub trait StateStore: Send + Sync {
     async fn accept_direct_turn_stop(
         &self,
         target: &ActiveDirectTurn,
+        projection: &phoenix_db::workflow::PersistedConversationProjection,
     ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String>;
 
     async fn record_execution_cancel(&self, _conversation_id: &str) -> Result<(), String> {
@@ -1137,8 +1138,9 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     async fn accept_direct_turn_stop(
         &self,
         target: &ActiveDirectTurn,
+        projection: &phoenix_db::workflow::PersistedConversationProjection,
     ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String> {
-        (**self).accept_direct_turn_stop(target).await
+        (**self).accept_direct_turn_stop(target, projection).await
     }
 
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
@@ -2392,10 +2394,11 @@ impl StateStore for DatabaseStorage {
     async fn accept_direct_turn_stop(
         &self,
         target: &ActiveDirectTurn,
+        projection: &phoenix_db::workflow::PersistedConversationProjection,
     ) -> Result<phoenix_db::workflow::DirectTurnStopAcceptance, String> {
         self.db
             .workflow_repository()
-            .accept_direct_turn_stop(target.turn_id, target.generation)
+            .accept_direct_turn_stop(target.turn_id, target.generation, projection)
             .await
             .map_err(|error| error.to_string())
     }
