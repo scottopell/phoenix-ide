@@ -28,12 +28,12 @@ use super::handle::{
     BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState,
     KillSignal, BASH_LAUNCH_UUID_ENV_VAR, TOMBSTONE_TAIL_LINES,
 };
+use super::ValidatedBashSpawnTarget;
 use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary, SpawnReservation};
 use super::ring::RingBuffer;
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
-use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
@@ -545,7 +545,19 @@ async fn run_run(
         ctx,
         spawn_context,
         spawn_mode,
-        current_process_identity,
+        |pid| match phoenix_core::process_identity::observe_process_identity(pid) {
+            Ok(identity) => Some(identity),
+            Err(cause) => {
+                tracing::warn!(
+                    pid,
+                    cause = cause.kind(),
+                    rc = cause.rc(),
+                    errno = cause.errno(),
+                    "bash child identity unavailable; execution outcome may be ambiguous and automatic retry is unsafe"
+                );
+                None
+            }
+        },
     )
     .await
 }

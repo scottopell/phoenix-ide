@@ -36,6 +36,12 @@ to Phoenix rather than init; at shutdown, a kill-tree pass SIGKILLs every
 live handle's process group. This replaces the prior draft's wrong
 assumption that SIGHUP cascade would clean up children when Phoenix died.
 
+An `identity_unavailable` launch warning records the typed local observation
+cause and bounded numeric return/errno fields when available. It means Phoenix
+could not prove the launched child's identity: execution outcome may be
+ambiguous, and it does not authorize a reset, adoption, cleanup, or automatic
+retry. The warning contains no command or environment values.
+
 ## Input-failure evidence
 
 A bounded read-only corpus query on the local Phoenix application database covered
