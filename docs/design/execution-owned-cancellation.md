@@ -100,7 +100,7 @@ Remove publication's power to override terminal outcome from `execution_cancel_o
 
 The existing cancelled-event null-reason schema constraint means provenance needs an explicit schema/type/wire change. Preserve downstream distinctions through Rust, generated TypeScript, SSE schemas, coordinator input and UI; unsupported sinks log capability gaps. A cancelled parent should say who/what stopped that execution when known; helper timeout appears with the helper, not as parent Stop.
 
-Two valid source occurrences may refer to the same terminal fact. Recommended policy: one execution-terminal notification per watch with all contributing source identities retained as related evidence, plus separate wait-entry events. This changes coordinator input, not just visual cards, and requires explicit review approval. Do not silently alter occurrence uniqueness or merge unrelated executions by timestamp. Until policy approval, preserve distinct events and fix factual outcome agreement first. Event IDs remain transport dedup identities; settlement identity supplies semantic grouping.
+Two valid source occurrences may refer to the same terminal fact. Preserve existing event cardinality for this fix: distinct source events must agree with the same authoritative outcome. Optional execution-level grouping changes coordinator input, not just visual cards, and awaits a separate explicit user decision; it is not an acceptance prerequisite for authority/timeout correction. Do not alter occurrence uniqueness or merge unrelated executions by timestamp. Event IDs remain transport dedup identities; any future semantic grouping must use proven settlement identity.
 
 Close suppresses unaccepted watch notifications under existing subscription rules. It must not destroy settlement evidence or invent delivery acknowledgement. No watch is re-enrolled or history replayed as part of migration.
 
@@ -132,10 +132,10 @@ Use pure state-machine/property tests plus exact-authority DB transactions and d
 
 These are proposal decisions, not unresolved questions in a normative Allium spec:
 
-1. **Execution notification grouping:** recommend one terminal notification with contributing sources; alternative retain separate source notifications linked to one settlement. Either must preserve causal evidence and factual agreement.
-2. **Close presentation:** existing Close reuses exact cancellation settlement; recommend Cancelled with lifecycle/Close provenance, not user Stop. Confirm before changing public reason taxonomy.
-3. **Legacy pending observations:** recommend audit retention without authority over new settlements; active ambiguity requires exact existing recovery/manual resolution, not invented user intent.
-4. **Terminal linearization:** implementation must map accepted Stop versus already-durable terminal obligation onto one existing transaction authority. Review exact current declarations after Goals handoff before choosing schema/API changes.
+1. **Execution notification grouping (deferred, nonblocking):** retain existing cardinality in this fix. Optional grouping will be presented separately for explicit user decision; distinct source events must agree with authoritative settlement regardless.
+2. **Close provenance (behavior preserved):** distinguish lifecycle Close from user Stop where evidence supports it, without changing existing Close settlement or control behavior. Any public reason-taxonomy expansion needs explicit contract review.
+3. **Legacy pending observations (implementation review required):** preserve historical facts and propose exact forward-only retirement of ambiguous pending rows without granting them new cancellation authority. Bind the proposal to actual schema and existing recovery/manual-resolution behavior; no inferred historical repair.
+4. **Terminal linearization (source-grounded implementation decision):** map accepted Stop versus already-durable terminal obligation onto the existing transaction authority before choosing schema/API changes. No duplicate generic lifecycle table.
 
 Do not ask the user to decide compiler-level representation details. Present concrete product choices for 1–3; resolve authority mechanics with source evidence and review. Turn approved outcomes into timeless requirements/Allium and a new project ADR, following specs/AUTHORING.md. This proposal itself remains historical design evidence.
 
@@ -147,3 +147,20 @@ Do not ask the user to decide compiler-level representation details. Present con
 - Host 5d57fcc6-e336-469f-850b-63cc253ea0ea: heavy-execution admission, not documentation permission.
 
 After contract review and ownership handoff: introduce typed operations/settlement authority with all-target compile inventory; integrate durability/recovery; then publication/provenance and any approved grouping. Prefer coherent small slices with no public fallback accepting ambiguous cancellation evidence. Obtain exact-HEAD adversarial review and host-admitted focused/crash/property qualification before broad validation. Report source review, compile, executed tests and deployment separately. No merge or deployment is authorized by task approval.
+
+## 11. Review narrowing and concrete implementation seams
+
+Contract feedback after fa54ac46e: grouping is optional and deferred; preserve event cardinality. Close provenance must not change Close behavior. Historical facts stay untouched. The following source mapping is against checkpoint baseline 66005abb, not an endorsement of a future Goals integration.
+
+- API `cancel_active_direct_turn` loads exact runtime-turn authority, then calls `terminate_authoritative_turn(TurnCommand::Cancel { turn_id, expected_generation })`. Runtime event delivery is downstream of that durable command; do not replace it with a process-local Stop flag.
+- `WorkflowRepository::persist_terminal_obligation` opens and commits a transaction; its `_tx` form participates in an existing response/state checkpoint transaction. `load_active_terminal_obligation(&ConversationAuthority)` recovers the obligation bound to owning turn/generation. This is the candidate completion linearization seam, distinct from eventual terminal settlement.
+- `terminalize_authoritative_turn_with_occurrence_at_cut` uses BEGIN IMMEDIATE, captures exact source occurrence, invokes `terminalize_authoritative_turn_in_tx`, and settles captured occurrence with the committed/replayed turn outcome in that transaction. Its AlreadyTerminal branch reads the persisted terminal rather than accepting the caller's proposed replacement. Preserve that path.
+- Before implementation, inspect the post-handoff definitions of `terminate_authoritative_turn`, terminal-obligation insertion and generation CAS together. Determine whether Cancel checks an existing terminal obligation or can win after it. Specify one winner at those existing transactions and test both commit orderings. Merely changing later executor classification is insufficient. This remaining source question is engineering review work, not a product decision for the user.
+
+### Precise pending-marker retirement proposal
+
+The legacy table has only `conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE`. It contains no accepted-turn identity, generation, initiator, timestamp, or cause. Therefore migration cannot honestly bind any row to an execution or reconstruct user intent.
+
+Propose a forward migration that renames the table to `legacy_execution_cancel_observations` without altering its rows, retaining its FK/deletion behavior. Remove every production write/consume path to that retired table in the same release; production settlement/publication must have no API that accepts these rows as authority. Do not copy rows into a new cancellation-receipt table, clear them as processed, emit historical notifications, or rewrite any terminal result. Their sole meaning is retained evidence of an ambiguous pre-migration marker, not accepted Stop.
+
+Active legacy work is classified only using existing exact turn/generation, committed terminal obligations, and existing recovery rules. If those rules cannot resolve an execution, use the already-supported failure/manual-resolution contract; this proposal does not invent a new fallback or turn an ambiguous marker into cancellation. Migration tests must preserve row counts/identities and terminal/event payloads, prove next-execution noninterference, and verify that no runtime publisher consults the retired table. Exact migration registration/DDL ownership and the corresponding normative retention clause require implementation review before coding. No database migration is applied by this checkpoint.
