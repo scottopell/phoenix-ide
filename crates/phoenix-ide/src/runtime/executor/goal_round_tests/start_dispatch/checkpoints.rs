@@ -822,6 +822,11 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
 ) {
     let (directory, db, receipt, mut initial, client) = adopted_with_limit(3).await;
     let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
+    let start_owner = rt.active_direct_turn.as_deref().unwrap().clone();
+    assert_eq!(
+        i64::try_from(start_owner.turn_id.0).unwrap(),
+        receipt.execution().turn_id()
+    );
     let guidance = directory.path().join("AGENTS.md");
     let skill = directory
         .path()
@@ -878,6 +883,7 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
     assert_goal_tool_checkpoint(&db, before, first_request).await;
     let successor = receive_automatic_response(&mut rt).await;
     assert_eq!(successor.generation, dispatch_generation);
+    assert_eq!(rt.active_direct_turn.as_deref(), Some(&start_owner));
     assert_eq!(
         successor.admitted.as_ref().unwrap().intent().execution,
         receipt.execution()
@@ -905,11 +911,7 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
             .execution,
         receipt.execution()
     );
-    let active = rt.active_direct_turn.as_deref().unwrap();
-    assert_eq!(
-        (active.turn_id, active.generation),
-        (receipt.execution().turn_id, receipt.execution().generation)
-    );
+    assert_eq!(rt.active_direct_turn.as_deref(), Some(&start_owner));
     {
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
