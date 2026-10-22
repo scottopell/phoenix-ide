@@ -297,3 +297,40 @@ Added three unexecuted regressions: adapter bypass rejection, stale ID/generatio
 Canonical transaction owner's read-only Hook2 response is conditional agreement with caller-owned adoption helper, not schema approval. Normal question answers create a fresh UserApi message and replace a prior **unaccepted** occurrence; old row presence or NULL settlement alone cannot trigger collision. Same identity replay must preserve evidence; only accepted-but-unsettled interruption blocks replacement. The owner reported a newer source helper `record_message_execution_tx`; re-resolve its exact declared source at handoff, rather than applying the canonical-baseline UPSERT diff blindly. Provider/report/replay transaction semantics remain that owner's responsibility.
 
 Remaining precise dependency: approve concrete existing-occurrence interruption column/check/FK allocation and typed acceptance/rejection declaration, then have its single canonical owner integrate the reviewed adoption/settlement helper. Existing migration/legacy-retirement proposal remains unimplemented. Without that, no-active-turn genuine Stop cannot be represented durably without the old marker, so removing that marker/flag now would be an unsound partial fix. Stop-between-model-requests remains in the invariant test matrix; model-attempt terminal outcome must not replace execution-level terminal obligation arbitration.
+
+## 18. Independent schema disposition and required corrections
+
+Independent reviewer 76f8afbb reviewed exact 7c5c9004bf7e1852837f3b04187b67cf75bfa45d read-only. Existing-row design is viable, conditional on two blockers being resolved in the concrete implementation contract. No DDL, migration allocation, build or execution accompanied that review.
+
+### Retention is part of accepted authority
+
+The existing occurrence conversation/message FKs cascade. Accepted-but-unsettled evidence must not disappear through parent deletion. A Close ID FK must explicitly use NO ACTION/RESTRICT and acceptance must validate captured membership in `close_attempt_members` plus admissible attempt phase in the same BEGIN IMMEDIATE; mere existence of a Close attempt is insufficient. Existing exact Close direct-turn target/generation checks remain mandatory for the direct target variant.
+
+Before schema coding, choose and review the narrow retention enforcement: rebuild the same occurrence table with restrictive retention, or prove/structurally enforce that deleting a parent with accepted-unsettled evidence is forbidden until exact settlement. Do not broaden deletion behavior for all historical/unaccepted rows accidentally. If restrictive FKs change those behaviors, enumerate the affected Close/deletion paths and update the contract deliberately. Accepted evidence cannot be removed as a cleanup workaround. Historical occurrence rows receive NULL provenance only; legacy markers furnish no backfill authority.
+
+### Adoption collision must have a progress owner
+
+Section 16's generic typed collision is insufficient without mandatory progress. Concrete proposed result:
+
+```rust
+pub(crate) enum AdoptOccurrence {
+    Inserted,
+    ExactReplay { interruption: Option<AcceptedOccurrenceInterruption> },
+    ReplacedUnaccepted,
+}
+pub(crate) enum AdoptOccurrenceError {
+    SameMessageDifferentSource,
+    AcceptedInterruptionPending(AcceptedOccurrenceInterruption),
+    Database(DbError),
+}
+```
+
+`adopt_occurrence_tx` returns the pending receipt without changing any row; the outer canonical transaction must roll back its response/replay/state changes. Its owning orchestration layer then settles **that exact old receipt** outside the rolled-back transaction, and retries the same new-message operation under the existing admission/replay contract. It must not generate another question-answer UUID, mask an uncertain commit, or retry forever without authority/progress. This is a required narrow canonical-owner integration, not a helper allowed to commit its caller's transaction. If exact old settlement is rejected/stale, classify and reconcile through existing authority rules before retry; never cancel replacement work.
+
+Acceptance distinguishes Accepted, AlreadyAccepted and NotAccepted, returning an opaque DB-issued receipt for the first two. Same identity and cause replay preserves stored evidence; different cause/source/identity cannot overwrite it. Exact settlement reloads conversation/message/source plus interruption kind/Close attempt. Natural Completed/Failed settlement finding accepted evidence returns the retained interruption for interrupted settlement/recovery rather than publishing a natural outcome. No free-standing Cancelled proposal is added.
+
+All raw occurrence writers and settlement/recovery consumers migrate coherently. A publisher-only override removal is still unsafe. Add negative deletion, wrong Close membership/phase, same-ID/cause replay, different-source collision, accepted A → answer B rollback/settle/retry, and ordinary unaccepted A → B tests. Existing cardinality and historical outcomes remain unchanged.
+
+### Allocation status
+
+Reviewer's bounded scan found canonical migration ceiling 129, reservations 130–133 for #902 and 134–137 for Goals #959. 138 is only a first-known candidate, **not reserved or allocated**. Recheck through the integrator immediately before registration; do not hand-assign it from this document. Schema/API implementation proceeds only after the concrete retention and canonical progress-owner contract review, not a new user/compiler decision.
