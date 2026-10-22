@@ -1,0 +1,67 @@
+name: Cancellation 98021 focused qualification
+on:
+  push:
+    branches: [qualification/cancellation-98021-once]
+permissions:
+  contents: read
+concurrency:
+  group: cancellation-98021-once
+  cancel-in-progress: false
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cancellation-98021-target
+      RUST_TEST_THREADS: "2"
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Exact source and command evidence
+        run: |
+          mkdir -p qualification-evidence
+          git rev-parse HEAD | tee qualification-evidence/head.txt
+          printf '%s\n' 'source-parent=9c09b889f1515a6afeab1335759cada83eaa2778' > qualification-evidence/source-parent.txt
+      - name: Three-package all-target check and focused regressions
+        shell: bash
+        run: |
+          set -uo pipefail
+          run_check() {
+            local name="$1" code; shift
+            printf '%q ' "$@" > "qualification-evidence/$name.command"
+            printf '\n' >> "qualification-evidence/$name.command"
+            "$@" 2>&1 | tee "qualification-evidence/$name.log"
+            code=${PIPESTATUS[0]}
+            printf '%s\n' "$code" > "qualification-evidence/$name.exit"
+            if [[ "$name" != compile && "$code" = 0 ]]; then
+              grep -Eq 'test result: ok\. [1-9][0-9]* passed' "qualification-evidence/$name.log" || return 1
+            fi
+            return "$code"
+          }
+          run_check compile cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix_ide || exit "$?"
+          result=0
+          run_check child-expiry cargo test -p phoenix-state-machine child_wait_expiry || result=1
+          run_check user-stop cargo test -p phoenix-state-machine user_stop_during_timeout_drain_cannot_resume_parent || result=1
+          run_check parent-outcome cargo test -p phoenix_ide child_wait_expiry_does_not_classify_parent_completion_as_cancelled || result=1
+          grep -h 'test result:' qualification-evidence/*.log > qualification-evidence/test-counts.txt || true
+          exit "$result"
+      - name: Retain qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cancellation-98021-evidence
+          path: qualification-evidence/
+          if-no-files-found: error
+      - name: Remove runner-owned target
+        if: always()
+        shell: bash
+        run: |
+          test "$CARGO_TARGET_DIR" = "$RUNNER_TEMP/cancellation-98021-target"
+          rm -rf -- "$CARGO_TARGET_DIR"
