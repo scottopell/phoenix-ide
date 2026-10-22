@@ -4651,6 +4651,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_stop_finalization_must_commit_the_reducer_projection() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "stop-projection", 95).await;
+        let active_state = serde_json::to_string(&ConvState::LlmRequesting { attempt: 1 }).unwrap();
+        sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-a'")
+            .bind(active_state)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let DirectTurnStopAcceptance::Accepted(receipt) =
+            repo.accept_direct_turn_stop(turn_id, 0).await.unwrap()
+        else {
+            panic!("Stop must be accepted for the live exact target");
+        };
+        assert!(receipt.matches(turn_id, 0));
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Cancel {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            }),
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        })
+        .await
+        .unwrap();
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ConvState>(&state).unwrap(),
+            ConvState::Idle
+        ));
+    }
+
+    #[tokio::test]
     async fn stop_commit_error_is_classified_from_exact_durable_fact() {
         for (cut, accepted) in [
             (TransactionCut::BeforeCommit, false),
