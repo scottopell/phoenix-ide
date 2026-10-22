@@ -109,7 +109,7 @@ impl Database {
     ) -> DbResult<GoalRequestCheckpointOutcome> {
         match self.persist_canonical_checkpoint(command, cut).await? {
             crate::provider_replay::CanonicalWriteOutcome::Committed(round) => {
-                Ok(GoalRequestCheckpointOutcome::Committed(round))
+                Ok(GoalRequestCheckpointOutcome::Committed(*round))
             }
             crate::provider_replay::CanonicalWriteOutcome::Superseded => {
                 Ok(GoalRequestCheckpointOutcome::Refused)
@@ -120,7 +120,7 @@ impl Database {
 
 pub(crate) enum AccountingAdmission {
     Ready(GoalText),
-    Retained(round::CommittedGoalRound),
+    Retained(Box<round::CommittedGoalRound>),
     Refused,
 }
 
@@ -144,7 +144,7 @@ pub(crate) async fn admit_accounting_tx(
     if retained.checkpoint.is_some() {
         return Ok(
             match retained_bundle_tx(tx, command, &key, installation).await? {
-                Some(round) => Retained(round),
+                Some(round) => Retained(Box::new(round)),
                 None => Refused,
             },
         );
@@ -328,17 +328,12 @@ async fn exact_slot_tx(
     Ok(&actual == state && row.get::<String, _>("state_updated_at") == stamp.to_rfc3339())
 }
 
-async fn retained_bundle_tx(
+async fn retained_decision_matches_tx(
     tx: &mut GoalTx<'_>,
     command: &GoalRequestCheckpoint<'_>,
-    key: &GoalText,
-    installation: execution::GoalExecutionInstallation,
-) -> DbResult<Option<round::CommittedGoalRound>> {
-    if !same_claim_tx(tx, command.admitted, &command.assistant.conversation_id).await? {
-        return Ok(None);
-    }
-    let selected = settle_request_boundary_tx(tx, command, None).await?;
-    let terminal = terminal_obligation(command, &selected)?;
+    selected: &ConvState,
+) -> DbResult<bool> {
+    let terminal = terminal_obligation(command, selected)?;
     let slot_matches = if let Some(obligation) = terminal.as_ref() {
         crate::workflow::WorkflowRepository::terminal_obligation_matches_tx(tx, obligation).await?
             && exact_slot_tx(
@@ -353,11 +348,25 @@ async fn retained_bundle_tx(
             && exact_slot_tx(
                 tx,
                 &command.assistant.conversation_id,
-                &selected,
+                selected,
                 command.state_updated_at,
             )
             .await?
     };
+    Ok(slot_matches)
+}
+
+async fn retained_bundle_tx(
+    tx: &mut GoalTx<'_>,
+    command: &GoalRequestCheckpoint<'_>,
+    key: &GoalText,
+    installation: execution::GoalExecutionInstallation,
+) -> DbResult<Option<round::CommittedGoalRound>> {
+    if !same_claim_tx(tx, command.admitted, &command.assistant.conversation_id).await? {
+        return Ok(None);
+    }
+    let selected = settle_request_boundary_tx(tx, command, None).await?;
+    let slot_matches = retained_decision_matches_tx(tx, command, &selected).await?;
     let retained = execution::retained_request_tx(tx, installation, command.admitted.intent())
         .await
         .map_err(request_error)?;

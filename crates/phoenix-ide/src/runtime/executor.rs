@@ -3401,6 +3401,7 @@ where
     /// A later dispatch or abort supersedes the generation. Its stale outcome
     /// cannot clear the current request's task handle or metrics capture;
     /// current outcomes consume both before entering the state machine.
+    #[cfg(test)]
     #[allow(clippy::large_futures)]
     async fn process_generation_tagged_llm_outcome(
         &mut self,
@@ -20483,7 +20484,7 @@ mod explore_prompt_cache_shape_tests {
             .unwrap();
         let LlmCompletion {
             generation: _,
-            outcome: outcome,
+            outcome,
             ..
         } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -20526,7 +20527,7 @@ mod explore_prompt_cache_shape_tests {
             .unwrap();
         let LlmCompletion {
             generation: _,
-            outcome: outcome,
+            outcome,
             ..
         } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -20567,7 +20568,7 @@ mod explore_prompt_cache_shape_tests {
             .unwrap();
         let LlmCompletion {
             generation: _,
-            outcome: outcome,
+            outcome,
             ..
         } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -20601,7 +20602,7 @@ mod explore_prompt_cache_shape_tests {
             .unwrap();
         let LlmCompletion {
             generation: _,
-            outcome: outcome,
+            outcome,
             ..
         } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -23325,8 +23326,8 @@ mod steer_drain_detector_tests {
         assert_eq!(storage.get_steering_queue(conversation_id).len(), 1);
 
         let LlmCompletion {
-            generation: generation,
-            outcome: outcome,
+            generation,
+            outcome,
             ..
         } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
             .await
@@ -23352,8 +23353,8 @@ mod steer_drain_detector_tests {
         );
 
         let LlmCompletion {
-            generation: generation,
-            outcome: outcome,
+            generation,
+            outcome,
             ..
         } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
             .await

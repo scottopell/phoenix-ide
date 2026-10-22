@@ -110,3 +110,43 @@ There are no block moves in this correction. The original common envelope remain
 Retained compiler evidence for the lookup failure (server-local paths): `check.log` at `/Users/scottopell/.phoenix-ide/coordinator/evidence/goals-ci-39701127095/artifact/phoenix-ide/phoenix-ide/ci-rust-logs/check.log`, SHA-256 `0f2f5fb3b4ed33f463d417e9d48e473cb5ce99c9e9b2d15563e3f90d2cd3d4d9`; `failed-jobs.log` in that run's evidence directory, SHA-256 `7ccbd5b471384ee78d5f9a871c8184315d56d1d85908117dfc22b8cdc70ffe87`. Exact excerpts are check.log 15–21 plus failed-jobs.log 2521–2541, concatenated in `/tmp/goals-39701127095-db-compiler-excerpt.txt`, SHA-256 `07f5721ce66bb596461ea75bc2a71e9eba8fff54205838e731eb8534d82287ae`. The excerpt explicitly reports E0599 and a suggested similar name; the correction was checked against the actual method's conversation-authority argument and return type, not just that suggestion. No `binaries.stderr` evidence is asserted.
 
 The full envelope's `admitted` receipt must never be discarded by `journey_provider_step`: it now calls `process_llm_completion(completion)` exactly as the runtime loop does, not the ordinary-only `(generation, outcome)` ingress. The actual Start journey helpers also carry that whole envelope. Existing unchanged end-to-end assertions in `conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_terminal_report_in_same_execution` require ledger `(requests, checkpoints, executions, messages) == (2, 2, 1, 3)`, and `conversation_goal_actual_automatic_yields_exhaust_once_without_inferred_progress_or_refill` requires `(2, 2, 1, 2)` before and after denial/Stop-release. Those checkpoint/charge assertions would detect bypassing optional accounting in the actual journey; they remain executable obligations, not passing evidence. Repository-wide envelope-reference inventory (39 references) and surrounding consumer contexts are retained in `/tmp/goals-39701127095-all-envelope-references.txt` and `/tmp/goals-39701127095-envelope-consumers.txt` for exact snapshot review.
+
+## Warnings-as-errors correction and lint ownership — run 39702759600
+
+Exact `26357580` failed hosted compilation under `-D warnings`. Previous type/name errors cleared; the remaining compiler diagnostics were the now-production-unused generation ingress and 22 redundant envelope field patterns. Focused qualification failed closed without binaries, so all actual journeys remain NOT RUN. No warning policy or assertion is relaxed here.
+
+- `process_generation_tagged_llm_outcome` is now `#[cfg(test)]`. Repository-wide caller inventory contains its definition plus 15 calls, all in existing `#[cfg(test)]` inline modules or the cfg-test `goal_round_tests` modules (`/tmp/goals-39702759600-wrapper-callers.txt`). Production already receives the whole `LlmCompletion` and calls `process_llm_completion`; no artificial production use or dead-code allowance is introduced. The wrapper still constructs the ordinary no-receipt envelope for its test callers. Whole-envelope Start helpers and terminal ID/generation/Idle assertions are unchanged.
+- All 22 `generation: generation` / `outcome: outcome` field patterns in executor, control-dispatch, and management tests use shorthand. Bindings, receipt handling, and assertions are identical.
+
+### Five directly owned clippy findings corrected
+
+| Diagnostic | Bounded correction and all ownership boundaries |
+|---|---|
+| New internal `AccountingAdmission` large variant | Box only its retained committed-round variant at construction. Canonical owner transfers the same box onward; no clone, second payload, or receipt copy. |
+| New internal `CanonicalWriteOutcome` large variant | Box its committed-round variant at the normal commit/uncertain-commit construction sites. Existing Goal checkpoint and ordinary state/replay/round adapters explicitly move the round out of the box at their unchanged public return boundaries. No public return type or persisted/wire shape changes. |
+| Explicit auto-deref in canonical accounting evidence | Borrow `results` directly; Rust's existing coercion supplies the same slice. No content is dropped. |
+| Retained canonical checkpoint classifier exceeds the line budget | MOVE the existing selected-state/terminal-obligation/source-slot predicate to private `retained_decision_matches_tx`, borrowing the same transaction, command, and selected state. It is called at exactly the old point after selection and before retained ledger/canonical evidence checks. No query order or mutation changes. |
+| New checkpointed-yield refusal test exceeds the line budget | MOVE only its existing per-case setup match into private test helper `apply_yield_recovery_fence`, called at the old point before the before-count snapshot. All five cases and every refusal/charge/state assertion stay in the original test. No new helper API or test execution path. |
+
+Both moves used exact cut/paste clipboards. Production predicate bodies compare equal after removing whitespace and the redundant borrow of the newly borrowed parameter; normalized SHA-256 is `7761d9e581d3b72c2cd2428e1c00401da847aa458862b5b1dbbf11f467451425`. Test setup bodies compare equal after the same normalization and rustfmt's optional call trailing comma; normalized SHA-256 is `7e6b9eefc53b4564050ff43f50b071d3ab36d816d3f8db986b09dbe1df8c0a11`. Before/after comparisons are retained under `/tmp/goals-39702759600-{slot,fence}-*`. No assertion or domain rule moved into an alternate authority.
+
+### Fifteen inherited lint findings remain blocking, unchanged
+
+Classification is against the pre-simplification sole parent `feea29c3f245d63ebab5df966c1ca02e026e9928`, not a claim that any old run qualified this source. Whole-file git comparisons or exact definition byte comparisons established the following inherited sites; they are deliberately not swept into this bounded correction:
+
+| Existing site | Count / diagnostics |
+|---|---|
+| Public `GoalRequestCheckpointOutcome` | 1 large variant; original public representation untouched. |
+| `validate_shape` and `request_error` in request checkpoint | 2 wildcard-single-variant diagnostics; both complete function bodies unchanged. |
+| Existing `conversation_goal_canonical_obsolete_owner_or_slot_cannot_publish_response` | 1 length diagnostic; complete function body unchanged. |
+| `conversation_goals/tests/admission/checkpoint/owners/user_control_upgrade/registered.rs` | 2 redundant foreign-key error closures; whole file unchanged. |
+| `coordinator_watches/goal_facts/tests.rs` | 2 findings: length of `saved_goal_is_frozen_not_admission_or_execution_completion_and_dedup_never_enriches` (104 lines, reported at 235), and `cloned_ref_to_slice_refs` (reported at 657); whole file unchanged. |
+| `coordinator_watches.rs` | 1 existing `successful_auto_handoff_suppresses_original_failure` length diagnostic (reported at 1350); whole file unchanged. |
+| `migrations/local_goal_watch/tests.rs` | 5 findings: 3 needless borrows, 1 length diagnostic, 1 const-after-statements; whole file unchanged. |
+| `migrations.rs` | 1 existing migration-006 length diagnostic; whole file unchanged. |
+
+Baseline comparison blob/definition hashes are retained in `/tmp/goals-39702759600-baseline-classification.txt`, SHA-256 `ce817f8bfc9e36c5eac8fce40dc9feb18d70d9227a67acdf3202981792452fed`. This is an explicit list of unresolved inherited check blockers, not an allowance, suppression, or passing-clippy claim.
+
+Retained evidence: exact compiler excerpt from artifact `12393433648`, `_temp/goal-qualification-39702759600-1-check-rust/binaries.stderr.log` lines 438–593 is `/tmp/goals-39702759600-rust-excerpt.txt`, SHA-256 `6a28f37979aceab46ddf880e377e9afbd25c04df90315ae88e84e740445085e7`. The clippy failure excerpt from the retained `failed-jobs.log` is `/tmp/goals-39702759600-clippy-excerpt.txt`, SHA-256 `dc625fb0e913fcce1a4c6b8eab4a8cfd3485ff25435e38e4788623cd846cf7df`. Full artifacts remain in `/Users/scottopell/.phoenix-ide/coordinator/evidence/goals-ci-39702759600`.
+
+The integrator reports #966 merged as squash `c1125c6eff420adefa819bb6ecf62565b0c1728d`; this worktree has not integrated, rebased, or cherry-picked it. Its peer-owned main run is not Goal qualification. Notify the integrator before any eventual integration. No activation, public-Start/default-OFF, resource, merge, deployment, or independent-execution hold is lifted by this correction.

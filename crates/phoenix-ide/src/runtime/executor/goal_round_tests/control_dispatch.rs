@@ -250,8 +250,8 @@ async fn conversation_goal_stop_after_model_admission_before_first_poll_prevents
             .unwrap()
             .unwrap();
         let LlmCompletion {
-            generation: generation,
-            outcome: outcome,
+            generation,
+            outcome,
             ..
         } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
             .await
@@ -363,8 +363,8 @@ async fn conversation_goal_stop_cancels_the_actual_inflight_provider_future() {
             .unwrap()
             .unwrap();
         let LlmCompletion {
-            generation: generation,
-            outcome: outcome,
+            generation,
+            outcome,
             ..
         } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
             .await

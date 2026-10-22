@@ -10336,7 +10336,7 @@ impl Database {
             )
             .await?
         {
-            CanonicalWriteOutcome::Committed(round) => Ok(round),
+            CanonicalWriteOutcome::Committed(round) => Ok(*round),
             CanonicalWriteOutcome::Superseded => {
                 Err(DbError::Serialization("canonical round superseded".into()))
             }

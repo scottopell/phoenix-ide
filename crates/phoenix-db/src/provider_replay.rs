@@ -45,7 +45,7 @@ pub(crate) enum CanonicalCommitCut {
 }
 
 pub(crate) enum CanonicalWriteOutcome {
-    Committed(crate::conversation_goals::round::CommittedGoalRound),
+    Committed(Box<crate::conversation_goals::round::CommittedGoalRound>),
     Superseded,
 }
 
@@ -103,7 +103,7 @@ impl Database {
         let accounting = accounting.as_ref().map(|witness| {
             let evidence = match &input {
                 Some(round::ToolRoundWrite::Pending { results, .. }) => {
-                    request_checkpoint::GoalRequestEvidence::Round { results: *results }
+                    request_checkpoint::GoalRequestEvidence::Round { results }
                 }
                 _ => request_checkpoint::GoalRequestEvidence::Response,
             };
@@ -240,12 +240,12 @@ impl Database {
                 )
                 .await?
                 {
-                    return Ok(CanonicalWriteOutcome::Committed(round));
+                    return Ok(CanonicalWriteOutcome::Committed(Box::new(round)));
                 }
             }
             return Err(error);
         }
-        Ok(CanonicalWriteOutcome::Committed(committed))
+        Ok(CanonicalWriteOutcome::Committed(Box::new(committed)))
     }
 
     #[cfg(test)]
@@ -445,7 +445,7 @@ impl Database {
             )
             .await?
         {
-            CanonicalWriteOutcome::Committed(round) => Ok(round),
+            CanonicalWriteOutcome::Committed(round) => Ok(*round),
             CanonicalWriteOutcome::Superseded => Err(crate::DbError::Serialization(
                 "canonical round refused".into(),
             )),

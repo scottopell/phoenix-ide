@@ -87,8 +87,8 @@ async fn provider_preparation(runtime: &mut TestRuntime) -> Event {
         runtime.process_event(event).await.unwrap();
     }
     let LlmCompletion {
-        generation: generation,
-        outcome: outcome,
+        generation,
+        outcome,
         ..
     } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
         .await
@@ -159,8 +159,8 @@ async fn conversation_goal_coordinator_provider_management_commits_only_at_its_c
     assert_checkpoint(&fixture, &call).await;
     assert!(tools.recorded_executions().is_empty());
     let LlmCompletion {
-        generation: generation,
-        outcome: outcome,
+        generation,
+        outcome,
         ..
     } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
         .await
@@ -284,8 +284,8 @@ async fn conversation_goal_coordinator_provider_management_rejects_missing_or_st
             runtime.process_event(event).await.unwrap();
         }
         let LlmCompletion {
-            generation: generation,
-            outcome: outcome,
+            generation,
+            outcome,
             ..
         } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
             .await
@@ -498,8 +498,8 @@ async fn conversation_goal_coordinator_provider_management_rolls_back_replay_and
         .unwrap()
         .is_some());
     let LlmCompletion {
-        generation: generation,
-        outcome: outcome,
+        generation,
+        outcome,
         ..
     } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
         .await
@@ -612,8 +612,8 @@ async fn conversation_goal_coordinator_provider_state_commands_use_the_tagged_di
             usize::try_from(seed.version.get() + 1).unwrap()
         );
         let LlmCompletion {
-            generation: generation,
-            outcome: outcome,
+            generation,
+            outcome,
             ..
         } = tokio::time::timeout(Duration::from_secs(10), runtime.llm_outcome_rx.recv())
             .await

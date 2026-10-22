@@ -174,6 +174,85 @@ async fn conversation_goal_reconstruct_after_committed_yield_admits_distinct_cha
     }
 }
 
+async fn apply_yield_recovery_fence(
+    db: &Database,
+    input: &GoalStartAdoptionInput,
+    state: &ConvState,
+    stamp: chrono::DateTime<chrono::Utc>,
+    fence: &str,
+) {
+    match fence {
+        "stop" => {
+            use crate::conversation_goals::control::{ControlCommand, ControlRequest};
+            db.apply_goal_control(
+                &ControlRequest {
+                    owner: input.receipt.input().goal().owner.clone(),
+                    principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
+                    request_id: uuid::Uuid::new_v4(),
+                    command: ControlCommand::Stop,
+                    expected_control_version: 1,
+                },
+                GoalTimestampUs::parse(30).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        "queue" => {
+            let entry = phoenix_core::domain::sm_event::SteerEntry {
+                message_id: "yield-recovery-accepted-input".into(),
+                text: "accepted input wins".into(),
+                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            };
+            db.append_steering_entry(
+                input.receipt.historical_transcript().as_str(),
+                &entry,
+                "yield-recovery-fingerprint",
+            )
+            .await
+            .unwrap();
+        }
+        "missing_response" => {
+            sqlx::query("DELETE FROM messages WHERE message_id=?")
+                .bind(input.intent().unwrap().id.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        "old_attempt" => {
+            db.update_conversation_state_at(
+                input.receipt.historical_transcript().as_str(),
+                state,
+                stamp,
+            )
+            .await
+            .unwrap();
+        }
+        "terminal_obligation" => {
+            db.workflow_repository()
+                .persist_terminal_obligation(&crate::workflow::DirectTurnTerminalObligationInput {
+                    turn_id: TurnAuthorityId(
+                        u64::try_from(input.receipt.execution().turn_id()).unwrap(),
+                    ),
+                    expected_generation: input.authority.generation.0,
+                    terminal: phoenix_workflow::TurnTerminal::Completed,
+                    projection: crate::workflow::PersistedConversationProjection {
+                        state: ConvState::Idle,
+                        state_updated_at: stamp,
+                    },
+                    response_message_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        _ => unreachable!(),
+    }
+}
+
 #[tokio::test]
 async fn conversation_goal_checkpointed_slot_without_canonical_predecessor_or_fresh_attempt_cannot_reconstruct(
 ) {
@@ -190,78 +269,7 @@ async fn conversation_goal_checkpointed_slot_without_canonical_predecessor_or_fr
         } else {
             ConvState::LlmRequesting { attempt: 1 }
         };
-        match fence {
-            "stop" => {
-                use crate::conversation_goals::control::{ControlCommand, ControlRequest};
-                db.apply_goal_control(
-                    &ControlRequest {
-                        owner: input.receipt.input().goal().owner.clone(),
-                        principal_id: db.instance_id().await.unwrap().to_string().parse().unwrap(),
-                        request_id: uuid::Uuid::new_v4(),
-                        command: ControlCommand::Stop,
-                        expected_control_version: 1,
-                    },
-                    GoalTimestampUs::parse(30).unwrap(),
-                )
-                .await
-                .unwrap();
-            }
-            "queue" => {
-                let entry = phoenix_core::domain::sm_event::SteerEntry {
-                    message_id: "yield-recovery-accepted-input".into(),
-                    text: "accepted input wins".into(),
-                    origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-                    llm_text: None,
-                    images: Vec::new(),
-                    files: Vec::new(),
-                    user_agent: None,
-                    skill_invocation: None,
-                };
-                db.append_steering_entry(
-                    input.receipt.historical_transcript().as_str(),
-                    &entry,
-                    "yield-recovery-fingerprint",
-                )
-                .await
-                .unwrap();
-            }
-            "missing_response" => {
-                sqlx::query("DELETE FROM messages WHERE message_id=?")
-                    .bind(input.intent().unwrap().id.as_str())
-                    .execute(db.pool())
-                    .await
-                    .unwrap();
-            }
-            "old_attempt" => {
-                db.update_conversation_state_at(
-                    input.receipt.historical_transcript().as_str(),
-                    &state,
-                    stamp,
-                )
-                .await
-                .unwrap();
-            }
-            "terminal_obligation" => {
-                db.workflow_repository()
-                    .persist_terminal_obligation(
-                        &crate::workflow::DirectTurnTerminalObligationInput {
-                            turn_id: TurnAuthorityId(
-                                u64::try_from(input.receipt.execution().turn_id()).unwrap(),
-                            ),
-                            expected_generation: input.authority.generation.0,
-                            terminal: phoenix_workflow::TurnTerminal::Completed,
-                            projection: crate::workflow::PersistedConversationProjection {
-                                state: ConvState::Idle,
-                                state_updated_at: stamp,
-                            },
-                            response_message_id: None,
-                        },
-                    )
-                    .await
-                    .unwrap();
-            }
-            _ => unreachable!(),
-        }
+        apply_yield_recovery_fence(&db, &input, &state, stamp, fence).await;
         let before = counts(&db).await;
         let request = crate::workflow::GoalStartRecoveryInput::new(
             input.receipt.historical_transcript().as_str().to_owned(),
