@@ -144,7 +144,7 @@ async fn conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_t
         let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
         let execution = rt.active_direct_turn.as_deref().unwrap().clone();
         guard_terminal_projection_order(&db).await;
-        let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.effective_state());
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.state.clone());
         rt.state_watcher = Some(watch_tx);
         client
             .responses
@@ -450,7 +450,7 @@ async fn conversation_goal_actual_automatic_yields_exhaust_once_without_inferred
     let (_directory, db, receipt, mut rt, client) = adopted().await;
     let execution = rt.active_direct_turn.as_deref().unwrap().clone();
     guard_terminal_projection_order(&db).await;
-    let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.effective_state());
+    let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.state.clone());
     rt.state_watcher = Some(watch_tx);
     for answer in ["first ordinary answer", "second ordinary answer"] {
         client
@@ -546,7 +546,7 @@ async fn conversation_goal_ephemeral_tokens_use_ordinary_stream_before_canonical
     let completion = dispatch_response(&mut rt).await;
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            if let SseEvent::Token { text, .. } = events.recv().await.unwrap().as_ref() {
+            if let SseEvent::Token { text, .. } = events.recv().await.unwrap() {
                 assert_eq!(text, "ordinary streamed text");
                 break;
             }

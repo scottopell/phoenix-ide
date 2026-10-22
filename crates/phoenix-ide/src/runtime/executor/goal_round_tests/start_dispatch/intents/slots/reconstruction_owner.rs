@@ -76,7 +76,7 @@ async fn conversation_goal_actual_allowance_terminal_failure_reopens_through_exi
     let (directory, db, receipt, mut rt, client) = adopted().await;
     let active = rt.active_direct_turn.as_deref().unwrap().clone();
     guard_terminal_projection_order(&db).await;
-    let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.effective_state());
+    let (watch_tx, watch_rx) = tokio::sync::watch::channel(rt.state.clone());
     rt.state_watcher = Some(watch_tx);
     for answer in ["ordinary yield before crash", "last ordinary answer"] {
         client

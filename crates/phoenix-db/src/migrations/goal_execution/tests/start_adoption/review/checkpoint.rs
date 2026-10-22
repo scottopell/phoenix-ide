@@ -641,13 +641,19 @@ async fn conversation_goal_complete_report_checkpoint_cuts_replay_whole_bundle_a
             "canonical checkpoint stages the existing terminal obligation; only terminal settlement projects Idle");
         let obligation = db
             .workflow_repository()
-            .load_terminal_obligation(phoenix_workflow::TurnAuthorityId(
-                u64::try_from(admitted.intent().execution.turn_id()).unwrap(),
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                input.receipt.historical_transcript().as_str().to_owned(),
             ))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(obligation.projection.state, ConvState::Idle);
+        assert_eq!(
+            obligation.turn_id,
+            phoenix_workflow::TurnAuthorityId(
+                u64::try_from(admitted.intent().execution.turn_id()).unwrap(),
+            )
+        );
         assert_eq!(
             obligation.expected_generation,
             u64::try_from(admitted.claim_generation()).unwrap()

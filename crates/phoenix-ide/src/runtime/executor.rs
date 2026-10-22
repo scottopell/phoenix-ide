@@ -35,6 +35,7 @@ use crate::state_machine::{
 use crate::system_prompt::{build_system_prompt_with_catalog, ModeContext, OrdinarySkillCatalog};
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::conversation_goal::ToolRoundResult;
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
@@ -4112,7 +4113,7 @@ where
     #[allow(clippy::large_futures)]
     async fn apply_transition_result_inner(
         &mut self,
-        result: crate::state_machine::transition::TransitionResult,
+        mut result: crate::state_machine::transition::TransitionResult,
         ordinary_input_id: Option<&str>,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
@@ -26101,7 +26102,12 @@ mod sender_drop_forwarder_tests {
         forward_llm_outcome(llm_rx, 7, llm_outcome_tx, None).await;
 
         match llm_outcome_rx.try_recv() {
-            Ok((generation, LlmOutcome::NetworkError { message })) => {
+            Ok(super::LlmCompletion {
+                generation,
+                outcome: LlmOutcome::NetworkError { message },
+                admitted,
+            }) => {
+                assert!(admitted.is_none(), "ordinary sender-drop has no Goal receipt");
                 assert_eq!(
                     generation, 7,
                     "forwarder must stamp the dispatch generation"
@@ -26111,7 +26117,11 @@ mod sender_drop_forwarder_tests {
                     "message should explain the sender-drop, got: {message}"
                 );
             }
-            other => panic!("expected a NetworkError LLM outcome on sender-drop, got {other:?}"),
+            Ok(super::LlmCompletion { generation, outcome, admitted }) => panic!(
+                "expected a NetworkError LLM outcome on sender-drop, got generation={generation} outcome={outcome:?} goal_receipt={}",
+                admitted.is_some(),
+            ),
+            Err(error) => panic!("expected a NetworkError LLM outcome on sender-drop, got channel error {error:?}"),
         }
     }
 }

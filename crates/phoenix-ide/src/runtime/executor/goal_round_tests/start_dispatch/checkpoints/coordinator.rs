@@ -2,8 +2,8 @@ use super::*;
 
 #[tokio::test]
 async fn conversation_goal_coordinator_role_cannot_consume_an_ordinary_start_receipt() {
-    let (_directory, db, _receipt, mut rt, client) = adopted().await;
-    let owner = rt.context.product_conversation_id.clone();
+    let (_directory, db, receipt, mut rt, client) = adopted().await;
+    let owner = &receipt.input().goal().owner;
     sqlx::query("UPDATE product_conversations SET kind='coordinator' WHERE id=?")
         .bind(owner.as_str())
         .execute(db.pool())

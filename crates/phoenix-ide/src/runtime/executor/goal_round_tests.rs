@@ -958,13 +958,12 @@ fn journey_response(content: Vec<ContentBlock>, end_turn: bool) -> LlmResponse {
 }
 
 async fn journey_provider_step(rt: &mut TestRuntime) {
-    let (generation, outcome) =
+    let completion =
         tokio::time::timeout(std::time::Duration::from_secs(30), rt.llm_outcome_rx.recv())
             .await
             .expect("provider completion")
             .expect("outcome channel");
-    rt.process_generation_tagged_llm_outcome(generation, outcome)
-        .await;
+    rt.process_llm_completion(completion).await.unwrap();
 }
 
 async fn journey_report_step(rt: &mut TestRuntime) {
