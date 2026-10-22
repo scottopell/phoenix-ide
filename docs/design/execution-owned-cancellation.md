@@ -334,3 +334,27 @@ All raw occurrence writers and settlement/recovery consumers migrate coherently.
 ### Allocation status
 
 Reviewer's bounded scan found canonical migration ceiling 129, reservations 130–133 for #902 and 134–137 for Goals #959. 138 is only a first-known candidate, **not reserved or allocated**. Recheck through the integrator immediately before registration; do not hand-assign it from this document. Schema/API implementation proceeds only after the concrete retention and canonical progress-owner contract review, not a new user/compiler decision.
+
+## 19. Simplified adoption contract — supersedes external retry proposal
+
+Canonical owner proved ordinary QuestionResponse has no retained original operation after persistence failure. Therefore section 18's external settle/retry proposal is rejected: do not build a saved-response/retry subsystem to make it work. Independent reviewer subsequently accepted the narrower same-transaction alternative, conditional on actual admission fences:
+
+- Exact replay preserves evidence; unaccepted replacement remains normal.
+- Only accepted **user_stop** may be terminalized and replaced within the existing execution-start transaction, after re-reading a quiescent durable predecessor (Idle or exact AwaitingUserResponse boundary), ordinary mutation admission, and absence of an owning direct turn. Exact old terminal publication/deletion and new response/replay/state either all commit or all roll back.
+- Accepted **close** is not finalized by new-work adoption. Revalidate the Close fence in the same transaction and return CloseAdmissionBlocked without replacing its evidence; existing Close teardown owner settles it.
+- Non-quiescent accepted Stop returns AcceptedStopNotQuiescent unchanged. No blanket settlement rule for raw writers, and no inference that accepted cancellation proves physical teardown.
+- Delayed runtime Stop/Close delivery carries exact old identity and cannot affect new work after atomic replacement.
+
+Concrete canonical-owner counterexample: an in-memory validated QuestionResponse can race Close acceptance before response persistence. The old canonical write lacks a same-TX Close admission/wait/owner fence; unconditional settlement+adoption would commit LlmRequesting despite Close. The new helper must check that boundary, not merely accepted fields. Accepted evidence alone does not authorize new work. No new retry owner or scheduler is proposed.
+
+### Narrow retention enforcement candidate
+
+Keep existing parent CASCADE behavior for ordinary rows. Reviewer proposes a same-row one-way `settled_terminal_kind`, constrained to NULL or cancelled with accepted provenance, as a real settlement witness. SQL guards prevent deleting accepted-unsettled rows (including parent deletes) and changing accepted identity/cause; exact settlement changes NULL→cancelled, publishes, and exact-deletes in one transaction, so any publication/commit failure restores the whole old fact. No session bypass flag, event-existence heuristic, blanket restrictive parent FK or new lifecycle table. Close receipt FK is restrictive and membership/phase validation remains required. This is still a reviewed candidate for coherent schema implementation, not an applied migration or policy allowing indefinite Close/deletion blockage.
+
+## 20. Schema-independent direct-turn acceptance implementation slice
+
+Added `WorkflowRepository::accept_direct_turn_stop(turn_id, expected_generation)` that invokes the existing Cancel transaction and returns an opaque private-field `AcceptedDirectTurnStop` only for its exact Cancelled Terminal/TerminalReplay result at the expected successor generation. No new persistence record is introduced. Exact replay reuses existing command history; stale/terminal conflicts become typed NotAccepted; corruption/storage errors remain errors.
+
+The existing projection-less terminal-obligation guard now raises a typed DbError variant rather than a serialization string. Its transaction location/rollback behavior is unchanged. The API's exhaustive internal-error mapping adds this variant, preserving the existing HTTP classification. Added three unexecuted DB regressions for exact Cancel replay versus wrong generation, completion obligation winning without generation/owner mutation, and Cancel winning before old completion-obligation insertion.
+
+This slice is not yet wired to StateStore/runtime ingress and does not create a success-default acceptance API. It provides actual durable evidence for that next wiring independently of the occurrence schema. The direct request target-validation slice remains unqualified after the first event slice; new DB tests also remain unexecuted. No new hosted run is authorized or started by this commit. The deliberately tests-first watch regression remains expected red until publisher authority is migrated; do not call this branch merge-ready.

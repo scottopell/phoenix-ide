@@ -40,6 +40,31 @@ const DIRECT_TURN_REARMED_TRANSITION_ID: u64 = 4;
 const DIRECT_TURN_EFFECT_ID: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedDirectTurnStop {
+    turn_id: TurnAuthorityId,
+    command_generation: u64,
+}
+
+impl AcceptedDirectTurnStop {
+    #[must_use]
+    pub fn matches(&self, turn_id: TurnAuthorityId, command_generation: u64) -> bool {
+        self.turn_id == turn_id && self.command_generation == command_generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectTurnStopAcceptance {
+    Accepted(AcceptedDirectTurnStop),
+    NotAccepted(DirectTurnStopRejection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectTurnStopRejection {
+    TerminalObligationEstablished,
+    Conflict(TurnConflict),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptAuthoritativeTurn {
     pub client_key: ClientTurnKey,
     pub prepared: PreparedTurn,
@@ -1786,6 +1811,62 @@ impl WorkflowRepository {
         Ok(outcome)
     }
 
+    pub async fn accept_direct_turn_stop(
+        &self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+    ) -> DbResult<DirectTurnStopAcceptance> {
+        let step = match self
+            .terminate_authoritative_turn(TurnCommand::Cancel {
+                turn_id,
+                expected_generation,
+            })
+            .await
+        {
+            Ok(step) => step,
+            Err(DbError::DirectTurnTerminalObligationEstablished(_)) => {
+                return Ok(DirectTurnStopAcceptance::NotAccepted(
+                    DirectTurnStopRejection::TerminalObligationEstablished,
+                ));
+            }
+            Err(error @ DbError::DirectTurnConflict(TurnConflict::CorruptAggregate(_))) => {
+                return Err(error);
+            }
+            Err(DbError::DirectTurnConflict(conflict)) => {
+                return Ok(DirectTurnStopAcceptance::NotAccepted(
+                    DirectTurnStopRejection::Conflict(conflict),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        match step.outcome {
+            TurnOutcome::Terminal {
+                generation,
+                terminal: TurnTerminal::Cancelled,
+                ..
+            } if generation == expected_generation.saturating_add(1) => {
+                Ok(DirectTurnStopAcceptance::Accepted(AcceptedDirectTurnStop {
+                    turn_id,
+                    command_generation: expected_generation,
+                }))
+            }
+            TurnOutcome::TerminalReplay {
+                turn_id: actual,
+                generation,
+                terminal: TurnTerminal::Cancelled,
+                ..
+            } if actual == turn_id && generation == expected_generation.saturating_add(1) => {
+                Ok(DirectTurnStopAcceptance::Accepted(AcceptedDirectTurnStop {
+                    turn_id,
+                    command_generation: expected_generation,
+                }))
+            }
+            _ => Err(DbError::Serialization(
+                "Cancel returned no exact cancelled terminal evidence".to_string(),
+            )),
+        }
+    }
+
     pub async fn terminate_authoritative_turn(&self, command: TurnCommand) -> DbResult<TurnStep> {
         self.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
             command,
@@ -2593,10 +2674,7 @@ impl WorkflowRepository {
             .fetch_one(&mut *tx.tx)
             .await?;
             if obligation_exists != 0 {
-                return Err(DbError::Serialization(
-                    "projection-less terminalization cannot consume an established obligation"
-                        .to_string(),
-                ));
+                return Err(DbError::DirectTurnTerminalObligationEstablished(turn_id));
             }
         }
         let updated = sqlx::query(
@@ -4431,6 +4509,84 @@ mod tests {
             .probe_terminal_evidence("conv-a", "response-terminal-retired", &unrelated)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn accepted_direct_turn_stop_replays_exact_command_not_replacement_generation() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "stop-receipt-replay", 91).await;
+        for _ in 0..2 {
+            let DirectTurnStopAcceptance::Accepted(receipt) =
+                repo.accept_direct_turn_stop(turn_id, 0).await.unwrap()
+            else {
+                panic!("exact Cancel or its replay must retain accepted evidence");
+            };
+            assert!(receipt.matches(turn_id, 0));
+            assert!(!receipt.matches(turn_id, 1));
+        }
+        assert!(matches!(
+            repo.accept_direct_turn_stop(turn_id, 2).await.unwrap(),
+            DirectTurnStopAcceptance::NotAccepted(DirectTurnStopRejection::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn established_terminal_obligation_rejects_stop_without_revoking_owner() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "completion-before-stop", 92).await;
+        let obligation = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+            response_message_id: None,
+        };
+        repo.persist_terminal_obligation(&obligation).await.unwrap();
+        assert_eq!(
+            repo.accept_direct_turn_stop(turn_id, 0).await.unwrap(),
+            DirectTurnStopAcceptance::NotAccepted(
+                DirectTurnStopRejection::TerminalObligationEstablished
+            )
+        );
+        let (generation, owns): (i64, i64) = sqlx::query_as(
+            "SELECT generation, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+        )
+        .bind(to_i64(turn_id.0, "turn_id").unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!((generation, owns), (0, 1));
+        let retained = repo
+            .load_active_terminal_obligation(&ConversationAuthority("conv-a".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.turn_id, turn_id);
+        assert_eq!(retained.terminal, TurnTerminal::Completed);
+    }
+
+    #[tokio::test]
+    async fn accepted_stop_fences_later_terminal_obligation() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "stop-before-completion", 93).await;
+        assert!(matches!(
+            repo.accept_direct_turn_stop(turn_id, 0).await.unwrap(),
+            DirectTurnStopAcceptance::Accepted(_)
+        ));
+        let obligation = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+            response_message_id: None,
+        };
+        assert!(repo.persist_terminal_obligation(&obligation).await.is_err());
     }
 
     #[tokio::test]
