@@ -78,6 +78,18 @@ returned."
 
 ### REQ-BASH-017: Post-launch Identity and Registration Settlement
 
+WHEN preparing a new Bash launch on supported Linux or Darwin hosts
+THE SYSTEM SHALL withhold the user command and its environment from execution until the owned launch process has one captured birth identity, a registered handle, and caller-independent waiter/output custody
+AND SHALL preserve that process identity across execution of Direct or Explore commands, applying the existing Explore sandbox before the command runs
+AND SHALL count a registered gated handle only once against capacity while retaining its pending custody lease until release or abort.
+
+WHEN releasing a registered launch fails or times out
+THE SYSTEM SHALL return `error: "launch_release_unknown"` with the retained controllable handle and explicit may-have-executed/no-automatic-retry guidance
+AND SHALL retain sticky scope uncertainty and settle the pending custody lease without removing the registered handle or claiming the command did not execute.
+
+THE SYSTEM SHALL NOT treat preventive launch gating, a successful later launch, or an application restart as reconciliation of historical unverified descendants
+AND SHALL NOT clear an existing uncertainty fence through these launch paths.
+
 WHEN OS process creation fails before a child is returned
 THE SYSTEM SHALL return `error: "spawn_failed"` and release spawn admission.
 
