@@ -16701,7 +16701,16 @@ mod authoritative_user_message_effect_tests {
                 turn_id: phoenix_workflow::TurnAuthorityId(10),
                 generation: 0,
             }));
-            rt.state = cancelling_state(&["child"], cause);
+            rt.state = ConvState::CancellingSubAgents {
+                pending: vec![crate::state_machine::state::PendingSubAgent {
+                    agent_id: "child".into(),
+                    task: "drain".into(),
+                    mode: SubAgentMode::Explore,
+                }],
+                completed_results: vec![],
+                cause,
+                spawn_tool_id: None,
+            };
             assert!(!rt.direct_turn_cancellation_initiated);
             rt.classify_active_direct_turn_outcome_terminal(&ConvState::Idle);
             match cause {

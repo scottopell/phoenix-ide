@@ -1927,7 +1927,7 @@ impl WorkflowRepository {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
-        let result = finish_workflow_transaction_at_cut(tx, cut).await;
+        let result = finish_workflow_transaction_at_cut(super::WorkflowTx::new(tx), cut).await;
         drop(connection);
         if let Err(error) = result {
             return self
