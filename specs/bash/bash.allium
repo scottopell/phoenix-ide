@@ -448,24 +448,24 @@ rule PhoenixSetsSubreaperOnStartup {
         -- still runs.
 }
 
--- REQ-BASH-007: at Phoenix shutdown, walk the live handle table and SIGKILL
--- every process group as a final cleanup pass. SIGKILL rather than SIGTERM
--- because Phoenix is exiting anyway — graceful-shutdown handlers in the
--- children would race with our exit.
+-- REQ-BASH-007: bounded best-effort shutdown, not a tree-reaping guarantee.
 rule PhoenixKillsLiveHandlesOnShutdown {
     when: PhoenixShutdownInitiated()
 
-    ensures: AllLiveHandleGroupsSigkilled()
-        -- Composite: for every Handle h with status = running, kill(-h.pgid, SIGKILL).
-    ensures: ShutdownKillGraceObserved(config.shutdown_kill_grace_seconds)
-        -- Wait briefly for the kernel to deliver exit before we leave.
+    ensures: IncarnationBoundShutdownPassBounded(config.shutdown_kill_grace_seconds)
+        -- Snapshot registered handles, attempt SIGKILL only through retained
+        -- incarnation-bound authority, and observe available exit notifications
+        -- within one shared deadline, including registry-lock acquisition.
+    ensures: UnverifiedShutdownEvidenceRetained()
+        -- Unsupported signaling, errors, and deadline expiry remain incomplete;
+        -- this pass must not discard registry or scratch evidence.
 
     @guidance
-        -- The reaper bit set at startup ensures that descendants reparented
-        -- to Phoenix are visible in the handle's process group; the SIGKILL
-        -- to -pgid catches them along with the immediate child. Any
-        -- escapees that re-setpgid'd remain a known limitation; they will
-        -- linger as orphans in the user's session until init reaps them.
+        -- Release registry locks before signal attempts or exit observation.
+        -- Never fall back to a raw numeric PID/PGID signal. Unsupported platforms
+        -- fail closed and report incomplete cleanup. A successful signal or
+        -- leader exit does not prove descendant absence or complete group reaping.
+        -- Subreaper adoption does not place escapees into the original group.
 }
 
 ------------------------------------------------------------

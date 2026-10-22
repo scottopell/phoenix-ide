@@ -30,11 +30,13 @@ Persistence across Phoenix or system restart belongs to the separate
 `tmux` tool (see `specs/tmux-integration/`); this tool is "cheap and
 ephemeral, with a graceful failure mode."
 
-Phoenix sets `PR_SET_CHILD_SUBREAPER` at startup so descendants that escape
-their original process group (double-forks, `setsid`-using daemons) reparent
-to Phoenix rather than init; at shutdown, a kill-tree pass SIGKILLs every
-live handle's process group. This replaces the prior draft's wrong
-assumption that SIGHUP cascade would clean up children when Phoenix died.
+Phoenix attempts `PR_SET_CHILD_SUBREAPER` at startup where supported. Shutdown
+snapshots registered live handles and attempts incarnation-bound SIGKILL under
+one global deadline, then observes handle exit notifications while time remains.
+This is best-effort: successful signals or leader exits do not prove descendant
+absence or complete process-group reaping. Platforms without an
+incarnation-bound signaling primitive fail closed and log unsupported signaling;
+there is no raw numeric PID/PGID fallback.
 
 An `identity_unavailable` launch warning records the typed local observation
 cause and bounded numeric return/errno fields when available. It means Phoenix
@@ -122,7 +124,7 @@ entirely.
 | **REQ-BASH-004:** Ring Buffer + Read Semantics | 🔄 Rewrite | Bytes-bounded ring, per-line offsets, caller-controlled read window, plus typed ephemeral live-output projection for conversation cards with terminal handoff back to the normal tool result |
 | **REQ-BASH-005:** Live Handle Cap | ❌ New | Hard refusal with structured live-handles list |
 | **REQ-BASH-006:** Tombstones and Process Exit | ❌ New | Demote-on-exit, in-memory only, retained until conv hard-delete or Phoenix exit |
-| **REQ-BASH-007:** Child Process Reaper | ❌ New | `PR_SET_CHILD_SUBREAPER` at startup + SIGKILL kill-tree at shutdown |
+| **REQ-BASH-007:** Child Process Reaper | ❌ New | Subreaper where supported; bounded, incarnation-bound shutdown signal attempts (no complete-tree-reaping guarantee) |
 | **REQ-BASH-008:** Error Reporting | 🔄 Rewrite | Stable error ids, structured envelopes; non-zero exit is not an error |
 | **REQ-BASH-009:** No TTY Attached | 🔄 Carry-forward | Existing behavior; tool description points at `tmux` |
 | **REQ-BASH-010:** Tool Schema and Mutual Exclusion | 🔄 Rewrite (rev 3) | `op` discriminator with `run`/`peek`/`wait`/`kill`; `label` field added; legacy four-sibling inference, `mode` shim, `command` alias, and empty-string-as-absent tolerance retired (`deny_unknown_fields`); two narrow tolerances retained for active GPT default-fill (`since=0`, `lines+since`) |

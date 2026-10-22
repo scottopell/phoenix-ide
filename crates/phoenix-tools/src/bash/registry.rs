@@ -828,11 +828,23 @@ impl BashHandleRegistry {
         );
     }
 
-    /// Snapshot live process-group ids across ALL work scopes, for the
-    /// shutdown kill-tree pass. Acquires read locks; callers must NOT
-    /// hold any per-scope lock while invoking this.
-    ///
-    /// REQ-BASH-007: walks live handles for the `shutdown_kill_tree` pass.
+    /// Clone handles across all work scopes for bounded shutdown signaling.
+    /// The returned handles retain their incarnation identity without holding
+    /// registry locks across signal attempts or exit observation.
+    pub(crate) async fn snapshot_handles_for_shutdown(&self) -> Vec<Arc<Handle>> {
+        let mut handles = Vec::new();
+        let map = self.inner.read().await;
+        for entry in map.values() {
+            let scope_handles = entry.read().await;
+            handles.extend(scope_handles.all().cloned());
+        }
+        handles
+    }
+
+    /// Diagnostic snapshot of live process-group ids across ALL work scopes.
+    /// These numbers convey no signaling authority; shutdown uses retained
+    /// handles instead. Acquires read locks; callers must NOT hold any
+    /// per-scope lock while invoking this.
     pub async fn snapshot_live_pgids(&self) -> Vec<i32> {
         let mut out = Vec::new();
         let map = self.inner.read().await;
