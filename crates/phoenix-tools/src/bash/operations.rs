@@ -1176,7 +1176,7 @@ fn spawn_child_with_identity_probe(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn spawn_child_with_identity_probe_protocol(
     cmd: &str,
     label: Option<String>,
@@ -2562,12 +2562,13 @@ mod tests {
     use crate::bash::handle::{Handle, HandleId};
     use crate::bash::registry::{BashHandleRegistry, BashLifecyclePhase};
     use crate::bash::ring::{PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
+    use phoenix_core::process_identity::observe_process_identity;
     use phoenix_core::work_scope::ResourceScopeKey;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, ReadBuf};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 
     fn scope(id: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
@@ -2616,9 +2617,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let Some(executable) = std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE") else {
-            if std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_REQUIRED").is_some() {
-                panic!("PHOENIX_BASH_LAUNCH_TEST_EXE is required but unset");
-            }
+            assert!(
+                std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_REQUIRED").is_none(),
+                "PHOENIX_BASH_LAUNCH_TEST_EXE is required but unset"
+            );
             eprintln!(
                 "explicitly skipping native launcher test: PHOENIX_BASH_LAUNCH_TEST_EXE is unset"
             );
@@ -2663,7 +2665,6 @@ mod tests {
                 .spawn()
                 .unwrap();
             if !bytes.is_empty() {
-                use tokio::io::AsyncWriteExt;
                 child.stdin.take().unwrap().write_all(&bytes).await.unwrap();
             }
             drop(child.stdin.take());
@@ -2702,8 +2703,7 @@ mod tests {
         if !native_launcher_available() {
             return;
         }
-        use phoenix_core::process_identity::observe_process_identity;
-        use tokio::io::AsyncWriteExt;
+
         let executable =
             std::path::PathBuf::from(std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE").unwrap());
         let dir = tempfile::tempdir().unwrap();
@@ -2775,7 +2775,6 @@ mod tests {
         if !native_launcher_available() {
             return;
         }
-        use phoenix_core::process_identity::observe_process_identity;
 
         let scope = scope("native-registered-gate-release-failure");
         let ctx = test_context(&scope);
@@ -2861,7 +2860,6 @@ mod tests {
         if !native_launcher_available() {
             return;
         }
-        use phoenix_core::process_identity::observe_process_identity;
 
         let ctx = test_context(&scope("native-gated-delayed-probe"));
         let dir = tempfile::tempdir().unwrap();
@@ -2936,7 +2934,7 @@ mod tests {
         if !native_launcher_available() {
             return;
         }
-        use phoenix_core::process_identity::observe_process_identity;
+
         let scope = scope("native-foreign-registry-denial");
         let ctx = test_context(&scope);
         let foreign = BashHandleRegistry::new();
@@ -3006,9 +3004,10 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn require_native_explore_test_support() -> bool {
         if !ExploreSandboxLauncher::supported() {
-            if std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_REQUIRED").is_some() {
-                panic!("required native Explore launch test is unsupported on this host");
-            }
+            assert!(
+                std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_REQUIRED").is_none(),
+                "required native Explore launch test is unsupported on this host"
+            );
             eprintln!(
                 "explicitly skipping native Explore launch test: host sandbox is unsupported"
             );
@@ -3023,7 +3022,6 @@ mod tests {
         if !require_native_explore_test_support() {
             return;
         }
-        use phoenix_core::process_identity::observe_process_identity;
 
         let ctx = test_context(&scope("native-gated-explore-write-denied"));
         let dir = tempfile::tempdir().unwrap();
@@ -3185,8 +3183,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn unregistered_capture_stays_open_until_direct_child_terminal() {
-        use tokio::io::AsyncWriteExt;
-
         let ctx = test_context(&scope("capture-until-exit"));
         let dir = tempfile::tempdir().unwrap();
         let cmd = "printf ready > ready; read -r release; printf 'late-tail'; exit 4";

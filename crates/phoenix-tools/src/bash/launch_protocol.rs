@@ -203,12 +203,9 @@ pub fn early_exec_from_stdin() -> ! {
     }
     drop(null_stdin);
     if payload.mode == BashLaunchMode::ExploreReadOnly {
-        let command = match payload.command.into_string() {
-            Ok(command) => command,
-            Err(_) => {
-                eprintln!("phoenix bash launcher rejected non-UTF-8 Explore command");
-                std::process::exit(126);
-            }
+        let Ok(command) = payload.command.into_string() else {
+            eprintln!("phoenix bash launcher rejected non-UTF-8 Explore command");
+            std::process::exit(126);
         };
         for (key, value) in payload.environment {
             std::env::set_var(key, value);
