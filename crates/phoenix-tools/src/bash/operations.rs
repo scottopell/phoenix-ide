@@ -657,7 +657,7 @@ async fn run_run_with_identity_probe_mode(
         label.clone(),
         ctx,
         spawn_context,
-        reservation.handle_id().to_string(),
+        reservation.handle_id().clone(),
         ring_bytes_cap,
         &spawn_mode,
         protocol,
@@ -749,16 +749,12 @@ async fn run_run_with_identity_probe_mode(
                     progress_reporter.clone(),
                 );
                 if let Some(gate) = launch_gate.take() {
-                    if let Err(error) = gate.release().await {
-                        reservation.mark_unregistered();
-                        tracing::error!(%error, handle = %handle.handle_id, "registered bash launch gate release failed; command execution may have started and outcome is uncertain");
-                        registry.abort_spawn(reservation);
-                        return BashError::LaunchReleaseUnknown {
-                            handle: handle.handle_id.to_string(),
-                            error_message: format!("bash launch release failed ({error}); command execution may have started. Do not retry automatically; the command may have executed."),
-                        }.into_tool_output();
+                    if let Err(error) =
+                        release_registered_gate(gate, reservation, &registry, handle.clone()).await
+                    {
+                        tracing::error!(?error, handle = %handle.handle_id, "registered bash launch gate release failed; command execution may have started and outcome is uncertain");
+                        return error.into_tool_output();
                     }
-                    registry.abort_spawn(reservation);
                 }
                 race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
@@ -845,6 +841,30 @@ impl LaunchGate {
             Err(_) => Err(format!(
                 "bash launch payload write/close exceeded {LAUNCH_RELEASE_TIMEOUT:?}"
             )),
+        }
+    }
+}
+
+async fn release_registered_gate(
+    gate: LaunchGate,
+    mut reservation: SpawnReservation,
+    registry: &super::registry::BashHandleRegistry,
+    handle: Arc<Handle>,
+) -> Result<(), BashError> {
+    match gate.release().await {
+        Ok(()) => {
+            registry.abort_spawn(reservation);
+            Ok(())
+        }
+        Err(error) => {
+            reservation.mark_unregistered();
+            registry.abort_spawn(reservation);
+            Err(BashError::LaunchReleaseUnknown {
+                handle: handle.handle_id.to_string(),
+                error_message: format!(
+                    "bash launch release failed ({error}); command execution may have started. Do not retry automatically; the command may have executed."
+                ),
+            })
         }
     }
 }
@@ -1200,7 +1220,11 @@ fn spawn_child_with_identity_probe_protocol(
             #[cfg(not(test))]
             let executable = std::env::current_exe()
                 .map_err(|error| format!("failed to resolve phoenix executable: {error}"))?;
-            let (mode, working_dir, mut environment) = match spawn_mode {
+            let (mode, working_dir, mut environment): (
+                super::launch_protocol::BashLaunchMode,
+                std::path::PathBuf,
+                Vec<(std::ffi::OsString, std::ffi::OsString)>,
+            ) = match spawn_mode {
                 BashSpawnMode::ExploreReadOnly => {
                     let sandbox = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
                     sandbox_scratch_dir = Some(sandbox.scratch_dir);
@@ -2745,6 +2769,92 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn native_registered_gate_release_failure_preserves_handle_and_marks_uncertainty() {
+        if !native_launcher_available() {
+            return;
+        }
+        use phoenix_core::process_identity::observe_process_identity;
+
+        let scope = scope("native-registered-gate-release-failure");
+        let ctx = test_context(&scope);
+        let registry = ctx.bash_handle_registry().clone();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("executed");
+        let command = format!("printf executed > {}", marker.display());
+        let mut context = spawn_context_for(&ctx);
+        context.working_dir = dir.path().to_path_buf();
+        let mut reservation = registry.reserve_spawn(&scope).await.unwrap();
+        let (handle, spawned) = spawn_child_with_identity_probe_protocol(
+            &command,
+            None,
+            &ctx,
+            &context,
+            reservation.handle_id().clone(),
+            RING_BUFFER_BYTES,
+            &BashSpawnMode::Direct,
+            SpawnProtocol::Gated,
+            |pid| observe_process_identity(pid).ok(),
+        )
+        .expect("native gated child should launch with verified identity");
+        reservation.mark_launched();
+        let inserted = registry
+            .commit_spawn_gated(&mut reservation, handle.clone())
+            .await
+            .expect("register gated handle");
+        let (mut child, launch_gate, scratch) = spawned.into_waiter_parts();
+        child.start_kill().expect("terminate direct launcher child");
+        child.wait().await.expect("reap direct launcher child");
+        start_io_tasks(
+            &inserted,
+            scope.clone(),
+            child,
+            registry.lifecycle_sink(),
+            BashTerminalEffect::InventoryAndBranchReconcile,
+            scratch,
+            None,
+        );
+        let error = release_registered_gate(
+            launch_gate.expect("native gated launch has a gate"),
+            reservation,
+            &registry,
+            handle.clone(),
+        )
+        .await
+        .expect_err("closed child stdin must produce uncertain release error");
+        let output = error.into_tool_output();
+        let response = response_json(&output);
+        assert_eq!(response["error"], "launch_release_unknown");
+        assert_eq!(response["handle"], handle.handle_id.as_str());
+        assert!(response["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("Do not retry automatically"));
+        assert_eq!(
+            registry
+                .get_by_id(&handle.handle_id)
+                .await
+                .unwrap()
+                .handle
+                .handle_id,
+            handle.handle_id
+        );
+        let fence = tokio::time::timeout(Duration::from_secs(3), registry.begin_teardown(&scope))
+            .await
+            .expect("registered release failure must settle pending custody")
+            .expect("owner teardown fence");
+        assert_eq!(
+            fence.scope_uncertainty().await,
+            Some(crate::bash::registry::BashScopeUncertainty::UnregisteredLaunch)
+        );
+        assert!(!marker.exists(), "the gated command must not execute");
+        assert!(matches!(
+            registry.reserve_spawn(&scope).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn native_gated_delayed_probe_runs_fast_command_with_direct_process_contract() {
         if !native_launcher_available() {
             return;
@@ -2878,17 +2988,17 @@ mod tests {
             Some("unregistered_killed" | "unregistered_exited")
         ));
         assert!(!dir.path().join("side-effect.txt").exists());
-        let table = ctx
-            .bash_handle_registry()
-            .get_existing(&scope)
-            .await
-            .unwrap();
-        assert!(table
-            .read()
-            .await
-            .admission
-            .unverified_launch
-            .load(std::sync::atomic::Ordering::Acquire));
+        let fence = tokio::time::timeout(
+            Duration::from_secs(3),
+            ctx.bash_handle_registry().begin_teardown(&scope),
+        )
+        .await
+        .expect("denied registration must settle pending custody")
+        .expect("owner teardown fence");
+        assert_eq!(
+            fence.scope_uncertainty().await,
+            Some(crate::bash::registry::BashScopeUncertainty::UnregisteredLaunch)
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
