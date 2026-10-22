@@ -4915,7 +4915,15 @@ mod tests {
 
     #[tokio::test]
     async fn direct_stop_drain_preserves_owner_and_defers_watch_until_terminal() {
-        let repo = repo().await;
+        let db = crate::Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("conv-a", "drain", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
+        let repo = db.workflow_repository();
         let (turn_id, _) = created_turn(&repo, "drain-checkpoint", 191).await;
         let source = seed_drain_source(&repo).await;
         sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('conv-a', 'anthropic', 'test', 'preserved-replay', '{\"response_sets\":[] }')")
@@ -5099,7 +5107,11 @@ mod tests {
         use phoenix_core::domain::sm_event::CancelCause;
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
         let db = crate::Database::open_in_memory().await.unwrap();
-        db.create_conversation("conv-a", "recovery", "/tmp", true, None, None)
+        let watched_conversation = db
+            .create_conversation("conv-a", "recovery", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&watched_conversation.product_conversation_id)
             .await
             .unwrap();
         let repo = db.workflow_repository();
