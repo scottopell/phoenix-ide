@@ -219,6 +219,13 @@ WHEN an ordinary executor dispatches the first model request of a new turn
 THE SYSTEM SHALL capture the ordered repository/ancestor guidance source paths and contents using the existing discovery precedence and deduplication
 AND SHALL retain them with the advertised skill metadata throughout that live turn's model/tool rounds and retries.
 
-Guidance SHALL refresh at the same committed new-input boundaries specified by REQ-SK-009, not mid-turn steering or rejected/failed input. Reconstructed executors SHALL discover current guidance afresh. This is not a persisted historical snapshot or a guarantee that all other instruction/tool content is stable.
+Guidance SHALL refresh at the same committed new-input boundaries specified by REQ-SK-009, not mid-turn steering or rejected/failed input.
+
+WHEN an executor is reconstructed after a process restart, including resumption of an interrupted turn,
+OR a successor executor is constructed by Continue after context exhaustion,
+THE SYSTEM SHALL discover current repository guidance for its first ordinary model request
+AND SHALL NOT restore the predecessor executor's in-memory guidance snapshot.
+
+Guidance stability SHALL apply only within an uninterrupted live executor turn. Next-turn refresh, restart rediscovery and Continue successor rediscovery are intended adoption boundaries, not failures requiring snapshot persistence. This contract does not promise a persisted historical snapshot or stability of all other instruction/tool content.
 
 Guidance SHALL remain at its existing system/developer authority through provider translation. Next-turn replacement MAY incur a cache miss; no synthetic provider event, manual refresh action, new transcript or configuration version is required. Current runtime permissions, skill invocation bodies and MCP availability policies SHALL remain independent of this snapshot. Global Coordinator construction SHALL remain unchanged.
