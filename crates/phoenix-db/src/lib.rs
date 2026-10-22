@@ -28427,6 +28427,99 @@ mod tests {
         }
     }
 
+    async fn populate_chain_query_fixture(db: &Database) {
+        build_linear_chain(db, &["a", "b", "c"]).await;
+
+        db.add_message_with_seq("a-1", "a", 1, &MessageContent::user("a1"), None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq("c-1", "c", 1, &MessageContent::user("c1"), None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq("c-2", "c", 2, &MessageContent::user("c2"), None, None)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_chain_member_queries(db: &Database) {
+        let members = db.chain_members_forward("a").await.unwrap();
+        assert_eq!(members, vec!["a", "b", "c"]);
+
+        let full = db.chain_members_forward_full("a").await.unwrap();
+        let ids: Vec<&str> = full
+            .iter()
+            .map(|conversation| conversation.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        for member in &full {
+            let direct = db.get_conversation(&member.id).await.unwrap();
+            assert_eq!(member.id, direct.id);
+            assert_eq!(member.message_count, direct.message_count);
+        }
+        let counts: Vec<i64> = full
+            .iter()
+            .map(|conversation| conversation.message_count)
+            .collect();
+        assert_eq!(counts, vec![1, 0, 2]);
+
+        for member in ["a", "b", "c"] {
+            assert_eq!(
+                db.chain_root_of(member).await.unwrap(),
+                Some("a".to_string())
+            );
+            assert_eq!(
+                db.chain_root_if_member(member).await.unwrap(),
+                Some("a".to_string())
+            );
+        }
+    }
+
+    async fn assert_empty_chain_queries(db: &Database) {
+        assert!(db.chain_members_forward("ghost").await.unwrap().is_empty());
+        assert!(db
+            .chain_members_forward_full("ghost")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.chain_root_of("ghost").await.unwrap(), None);
+        assert_eq!(db.chain_root_if_member("ghost").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn chain_queries_cover_populated_singleton_and_unrelated_membership() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("solo", "slug-solo", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.chain_members_forward("solo").await.unwrap(),
+            vec!["solo"]
+        );
+        assert_eq!(
+            db.chain_members_forward_full("solo")
+                .await
+                .unwrap()
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["solo"]
+        );
+        assert_eq!(
+            db.chain_root_of("solo").await.unwrap(),
+            Some("solo".to_string())
+        );
+        assert_eq!(db.chain_root_if_member("solo").await.unwrap(), None);
+
+        populate_chain_query_fixture(&db).await;
+        assert_chain_member_queries(&db).await;
+    }
+
+    #[tokio::test]
+    async fn chain_queries_on_empty_database_return_empty_membership() {
+        let db = Database::open_in_memory().await.unwrap();
+        assert_empty_chain_queries(&db).await;
+    }
+
     #[tokio::test]
     async fn task_handoff_creation_job_owns_detached_scope_and_immutable_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
@@ -28691,148 +28784,6 @@ mod tests {
         let listed = db.list_conversations().await.unwrap();
         let named = listed.iter().find(|c| c.id == "conv-named").unwrap();
         assert_eq!(named.title, Some("auth refactor".to_string()));
-    }
-
-    /// REQ-CHN-002: `chain_members_forward` returns members in chain order
-    /// for a 3-member linear chain.
-    #[tokio::test]
-    async fn test_chain_members_forward_three_member_linear() {
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["a", "b", "c"]).await;
-
-        let members = db.chain_members_forward("a").await.unwrap();
-        assert_eq!(
-            members,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-    }
-
-    /// `chain_members_forward_full` returns the same membership and order as the
-    /// id-only walk, fully hydrated, with an accurate `message_count` per member.
-    /// This is the single-query equivalent of looping `get_conversation` over
-    /// `chain_members_forward`, so the two must not diverge.
-    #[tokio::test]
-    async fn test_chain_members_forward_full_matches_per_member_fetch() {
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["a", "b", "c"]).await;
-
-        // Give members distinct message counts so the COUNT subquery is exercised.
-        db.add_message_with_seq("a-1", "a", 1, &MessageContent::user("a1"), None, None)
-            .await
-            .unwrap();
-        db.add_message_with_seq("c-1", "c", 1, &MessageContent::user("c1"), None, None)
-            .await
-            .unwrap();
-        db.add_message_with_seq("c-2", "c", 2, &MessageContent::user("c2"), None, None)
-            .await
-            .unwrap();
-
-        let full = db.chain_members_forward_full("a").await.unwrap();
-
-        // Same ids, same root-first order as the id-only walk.
-        let ids: Vec<&str> = full.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b", "c"]);
-
-        // Per-member parity with the loop it replaces.
-        for member in &full {
-            let direct = db.get_conversation(&member.id).await.unwrap();
-            assert_eq!(member.id, direct.id);
-            assert_eq!(member.message_count, direct.message_count);
-        }
-
-        let counts: Vec<i64> = full.iter().map(|c| c.message_count).collect();
-        assert_eq!(counts, vec![1, 0, 2]);
-    }
-
-    /// A non-existent root yields an empty vec, mirroring `chain_members_forward`.
-    #[tokio::test]
-    async fn test_chain_members_forward_full_nonexistent_root() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        let members = db.chain_members_forward_full("ghost").await.unwrap();
-        assert!(members.is_empty());
-    }
-
-    /// REQ-CHN-002: a single conversation with no continuation returns just itself.
-    #[tokio::test]
-    async fn test_chain_members_forward_single_member() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("solo", "slug-solo", "/tmp", true, None, None)
-            .await
-            .unwrap();
-
-        let members = db.chain_members_forward("solo").await.unwrap();
-        assert_eq!(members, vec!["solo".to_string()]);
-    }
-
-    /// REQ-CHN-002: a non-existent root yields an empty vec, not an error —
-    /// callers (Phase 2 Q&A) use this to short-circuit when the chain root
-    /// has been hard-deleted.
-    #[tokio::test]
-    async fn test_chain_members_forward_nonexistent_root() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        let members = db.chain_members_forward("ghost").await.unwrap();
-        assert!(
-            members.is_empty(),
-            "nonexistent root should yield empty vec, got: {members:?}"
-        );
-    }
-
-    /// REQ-CHN-002: `chain_root_of` walks back from the leaf to the root.
-    #[tokio::test]
-    async fn test_chain_root_of_leaf_returns_root() {
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["root-x", "mid-x", "leaf-x"]).await;
-
-        let root = db.chain_root_of("leaf-x").await.unwrap();
-        assert_eq!(root, Some("root-x".to_string()));
-
-        // Mid-chain walks back to the same root.
-        let from_mid = db.chain_root_of("mid-x").await.unwrap();
-        assert_eq!(from_mid, Some("root-x".to_string()));
-    }
-
-    /// REQ-CHN-002: `chain_root_of` on a root returns the same id.
-    #[tokio::test]
-    async fn test_chain_root_of_root_returns_self() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("only-root", "slug-only-root", "/tmp", true, None, None)
-            .await
-            .unwrap();
-
-        let root = db.chain_root_of("only-root").await.unwrap();
-        assert_eq!(root, Some("only-root".to_string()));
-    }
-
-    /// REQ-CHN-002: `chain_root_of` on a nonexistent id yields None.
-    #[tokio::test]
-    async fn test_chain_root_of_nonexistent_returns_none() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        let root = db.chain_root_of("ghost").await.unwrap();
-        assert_eq!(root, None);
-    }
-
-    /// `chain_root_if_member` returns Some(root) for any chain member
-    /// (root, mid, leaf) and None for solo conversations.
-    #[tokio::test]
-    async fn test_chain_root_if_member() {
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["m-a", "m-b", "m-c"]).await;
-        db.create_conversation("solo-x", "slug-solo-x", "/tmp", true, None, None)
-            .await
-            .unwrap();
-
-        for id in ["m-a", "m-b", "m-c"] {
-            assert_eq!(
-                db.chain_root_if_member(id).await.unwrap(),
-                Some("m-a".to_string()),
-                "{id} should report root m-a",
-            );
-        }
-        assert_eq!(db.chain_root_if_member("solo-x").await.unwrap(), None);
-        assert_eq!(db.chain_root_if_member("nonexistent").await.unwrap(), None);
     }
 
     // ------------------------------------------------------------------
