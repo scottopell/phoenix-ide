@@ -264,8 +264,8 @@ class GoalQualificationTests(unittest.TestCase):
         )
         self.assertEqual(self.helper.digest(expression.encode()),
                          "2783437b7a762c80522985f3795913782b8ca0502584998274caca513d13204a")
-        for text in ("timeout --signal=TERM --kill-after=10s 7m python3 scripts/goal_qualification.py focused",
-                     "timeout-minutes: 8", "RUST_TEST_THREADS: \"2\"", "CARGO_BUILD_JOBS: \"2\"",
+        for text in ("timeout --signal=TERM --kill-after=10s 9m python3 scripts/goal_qualification.py focused",
+                     "timeout-minutes: 10", "RUST_TEST_THREADS: \"2\"", "CARGO_BUILD_JOBS: \"2\"",
                      "2>&1 | tee ci-rust-logs/goals.log", "format('{0}/*.stderr.log', env.PHOENIX_GOAL_REUSE_DIR)",
                      "format('{0}/*.json', env.PHOENIX_GOAL_REUSE_DIR)"):
             self.assertIn(text, workflow)
@@ -285,7 +285,7 @@ class GoalQualificationTests(unittest.TestCase):
         self.assertEqual(producer.count("scripts/goal_qualification.py focused"), 1)
         self.assertNotIn("cargo nextest run", producer)
         self.assertNotIn("scripts/goal_qualification.py", pr)
-        self.assertIn('timeout --signal=TERM --kill-after=10s 7m cargo nextest run --locked', pr)
+        self.assertIn('timeout --signal=TERM --kill-after=10s 9m cargo nextest run --locked', pr)
         self.assertIn('-p phoenix-core -p phoenix-db -p phoenix_ide', pr)
         self.assertIn('-E "$goal_filter"', pr)
         self.assertIn('--test-threads 2 --no-fail-fast --failure-output immediate', pr)
@@ -295,7 +295,17 @@ class GoalQualificationTests(unittest.TestCase):
         self.assertIn("format('{0}/cargo-tests.full.log', env.PHOENIX_GOAL_REUSE_DIR)", workflow)
         self.assertIn('PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "2100"', workflow)
         rust_job = workflow.split("  check-rust:", 1)[1].split("\n  check-", 1)[0]
-        self.assertIn("    timeout-minutes: 85\n", rust_job)
+        self.assertIn("    timeout-minutes: 87\n", rust_job)
+        self.assertIn("        timeout-minutes: 10\n", rust_job)
+        self.assertIn('timeout --signal=TERM --kill-after=10s 9m python3 scripts/goal_qualification.py focused', producer)
+        self.assertEqual(script.count('timeout --signal=TERM --kill-after=10s 9m'), 2)
+        prior_allocation = 85 * 60
+        old_focused_step = 480
+        focused_step = 600
+        self.assertEqual(prior_allocation - old_focused_step + focused_step, 87 * 60)
+        self.assertEqual(87 * 60 - 2100 - focused_step, 2520)
+        self.assertEqual(focused_step - 540 - 10, 50)
+        self.assertLess(rust_job.index('- name: Retain Rust qualification evidence'), rust_job.index('- name: Check production feature on musl'))
 
     def test_clean_identity_binds_inputs_tools_flags_but_never_exports_credentials(self):
         (self.root / "Cargo.lock").write_text("lock fixture")

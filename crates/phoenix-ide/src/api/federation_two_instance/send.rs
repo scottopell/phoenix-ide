@@ -35,7 +35,9 @@ fn acceptance(response: &RemoteSendMessageResponse) -> &RemoteMessageAcceptance 
     match &response.receipt {
         RemoteSendReceipt::Accepted { acceptance }
         | RemoteSendReceipt::Duplicate { acceptance } => acceptance,
-        receipt => panic!("expected acceptance-only receipt, got {receipt:?}"),
+        receipt @ RemoteSendReceipt::Rejected { .. } => {
+            panic!("expected acceptance-only receipt, got {receipt:?}")
+        }
     }
 }
 
@@ -537,13 +539,24 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
     let response = send_remote_conversation_message(&caller.state.db, &peer, &archived)
         .await
         .unwrap();
-    assert!(matches!(
-        response.receipt,
-        RemoteSendReceipt::Rejected {
-            code: RemoteSendRejectionCode::TargetUnavailable,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            response.receipt,
+            RemoteSendReceipt::Rejected {
+                code: RemoteSendRejectionCode::TargetUnavailable,
+                ..
+            }
+        ),
+        "{}",
+        history_rejection_diagnostic(
+            &receiver,
+            &history_target,
+            &archived.sender,
+            &response.receipt,
+            before,
+        )
+        .await
+    );
     assert_eq!(
         receiver
             .state
@@ -556,6 +569,50 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
     );
     caller.stop().await;
     receiver.stop().await;
+}
+
+async fn history_rejection_diagnostic(
+    instance: &TestInstance,
+    target: &phoenix_core::domain::db_schema::Conversation,
+    sender: &RemoteSenderAttestation,
+    receipt: &RemoteSendReceipt,
+    before: usize,
+) -> String {
+    let receipt = match receipt {
+        RemoteSendReceipt::Rejected { code, message } => {
+            let message: String = message
+                .chars()
+                .scan(0, |bytes, character| {
+                    *bytes += character.len_utf8();
+                    (*bytes <= 4096).then_some(character)
+                })
+                .collect();
+            format!("Rejected code={code:?} message={message:?}")
+        }
+        RemoteSendReceipt::Accepted { acceptance } => {
+            format!("Accepted transcript={}", acceptance.accepting_transcript)
+        }
+        RemoteSendReceipt::Duplicate { acceptance } => {
+            format!("Duplicate transcript={}", acceptance.accepting_transcript)
+        }
+    };
+    let sender_kind = match sender {
+        RemoteSenderAttestation::RemoteApi {} => "remote_api",
+        RemoteSenderAttestation::Conversation { .. } => "conversation",
+        RemoteSenderAttestation::Coordinator { .. } => "coordinator",
+    };
+    let lifecycle: Result<(String, Option<String>), _> =
+        sqlx::query_as("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id=?")
+            .bind(target.product_conversation_id.as_str())
+            .fetch_one(instance.state.db.pool())
+            .await;
+    let after = instance
+        .state
+        .db
+        .get_messages(&target.id)
+        .await
+        .map(|rows| rows.len());
+    format!("{receipt}; target={} transcript={} sender_kind={sender_kind} lifecycle={lifecycle:?} messages_before={before} messages_after={after:?}", target.product_conversation_id, target.id)
 }
 
 async fn assert_coordinator_has_no_history_lifecycle(instance: &TestInstance, transcript: &str) {
@@ -652,7 +709,11 @@ pub(super) async fn materialize_received(
         MaterializeAuthoritativeTurnOutcome::Materialized(row)
         | MaterializeAuthoritativeTurnOutcome::ExactReplay(row)
         | MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(row) => *row.message,
-        other => panic!("expected authoritative message projection: {other:?}"),
+        other @ (MaterializeAuthoritativeTurnOutcome::NotCommitted
+        | MaterializeAuthoritativeTurnOutcome::StaleAuthority
+        | MaterializeAuthoritativeTurnOutcome::CommandRejected(_)) => {
+            panic!("expected authoritative message projection: {other:?}")
+        }
     }
 }
 
@@ -1010,11 +1071,18 @@ async fn shared_selectors_never_fall_back_on_unknown_tls_auth_or_unavailable_pee
         let tool = tools.iter().find(|tool| tool.name() == *name).unwrap();
         let local = tool.run(input.clone(), context(&caller, &source.id)).await;
         assert!(local.is_success(), "local {name}: {}", local.output());
-        let marker = if *name == "query_database" {
-            local_target.title.as_deref().unwrap()
-        } else {
-            "localsentinelmarker"
+        let marker = match *name {
+            "query_database" | "resolve_reference" => local_target.title.as_deref().unwrap(),
+            "read_conversation" => "localsentinelmarker",
+            other => panic!("missing local result oracle for {other}"),
         };
+        if *name == "resolve_reference" {
+            assert!(
+                local.output().contains(&local_target.id),
+                "local resolver identity: {}",
+                local.output()
+            );
+        }
         assert!(
             local.output().contains(marker),
             "local {name} expected {marker:?}: {}",

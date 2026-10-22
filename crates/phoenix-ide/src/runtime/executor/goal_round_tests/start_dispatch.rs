@@ -396,18 +396,20 @@ async fn conversation_goal_real_executor_summary_has_own_charge_and_reopened_ret
     .await
     .unwrap();
     assert_ne!(summary_id, normal_id);
-    let captured = client.requests.lock().unwrap();
-    assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].telemetry.as_ref().unwrap().request_id,
-        summary_id
-    );
-    assert!(captured[0]
-        .system
-        .iter()
-        .any(|part| part.text.contains("Request purpose: Summary")
-            && part.text.contains(receipt.observation().objective.as_str())));
-    drop(captured);
+    {
+        let captured = client.requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].telemetry.as_ref().unwrap().request_id,
+            summary_id
+        );
+        assert!(captured[0]
+            .system
+            .iter()
+            .any(|part| part.text.contains("Request purpose: Summary")
+                && part.text.contains(receipt.observation().objective.as_str())));
+    }
+
     assert_eq!(ledger(&db).await, (2, 0, 1, 0));
     let active = rt.active_direct_turn.as_deref().unwrap().clone();
     drop(rt);
@@ -506,14 +508,16 @@ async fn conversation_goal_request_purpose_keeps_legacy_message_normal_and_summa
     .await
     .unwrap()
     .unwrap();
-    let requests = client.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert!(requests.iter().all(|request| request
-        .system
-        .iter()
-        .all(|segment| !segment.text.contains("Admitted durable goal"))));
-    assert_eq!(requests[0].messages.len(), 1);
-    drop(requests);
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request
+            .system
+            .iter()
+            .all(|segment| !segment.text.contains("Admitted durable goal"))));
+        assert_eq!(requests[0].messages.len(), 1);
+    }
+
     assert_eq!(ledger(&db).await, before);
     assert_eq!(before.0, 0);
 }

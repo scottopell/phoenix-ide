@@ -98,7 +98,7 @@ async fn conversation_goal_same_normal_attempt_stale_slot_cannot_claim_successor
             ledger(&db).await,
             (
                 if attempt == 1 { 2 } else { 1 },
-                if attempt == 1 { 1 } else { 0 },
+                i64::from(attempt == 1),
                 1,
                 0
             )
@@ -154,13 +154,17 @@ async fn conversation_goal_same_summary_operation_and_attempt_stale_slot_cannot_
         fresh.state = stale.state.clone();
         send_summary(&mut fresh, request.clone()).await;
         send_summary(&mut fresh, request).await;
-        let captures = client.requests.lock().unwrap();
-        assert_eq!(captures.len(), 2);
-        assert!(captures
-            .iter()
-            .all(|captured| captured.telemetry.as_ref().unwrap().request_id
+        {
+            let captures = client.requests.lock().unwrap();
+            assert_eq!(captures.len(), 2);
+            assert!(captures.iter().all(|captured| captured
+                .telemetry
+                .as_ref()
+                .unwrap()
+                .request_id
                 == context.request_id().as_str()));
-        drop(captures);
+        }
+
         assert_eq!(ledger(&db).await, (2, 0, 1, 0));
     }
 }

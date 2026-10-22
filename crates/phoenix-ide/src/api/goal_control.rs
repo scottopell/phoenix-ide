@@ -170,16 +170,18 @@ fn command_error(error: &GoalCommandServiceError) -> ApiError {
             phoenix_db::DbError::ConversationNotFound(_),
         )) => api_error(StatusCode::NOT_FOUND, "ordinary owner unavailable"),
         GoalCommandServiceError::Goal(
-            GoalDbError::Busy | GoalDbError::TargetChanged | GoalDbError::RetryConflict,
+            GoalDbError::Busy
+            | GoalDbError::TargetChanged
+            | GoalDbError::RetryConflict
+            | GoalDbError::Admission(
+                phoenix_db::DbError::CloseAdmissionFenced(_)
+                | phoenix_db::DbError::ProductConversationUnavailable(_),
+            ),
         )
-        | GoalCommandServiceError::Storage(phoenix_db::DbError::CloseAdmissionFenced(_))
-        | GoalCommandServiceError::Storage(phoenix_db::DbError::ProductConversationUnavailable(
-            _,
-        ))
-        | GoalCommandServiceError::Goal(GoalDbError::Admission(
+        | GoalCommandServiceError::Storage(
             phoenix_db::DbError::CloseAdmissionFenced(_)
             | phoenix_db::DbError::ProductConversationUnavailable(_),
-        )) => api_error(
+        ) => api_error(
             StatusCode::CONFLICT,
             "goal command admission changed or is fenced",
         ),

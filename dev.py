@@ -5366,8 +5366,6 @@ class _QualificationOutputLog:
     READ_BYTES = 64 * 1024
     TAIL_BYTES = 128 * 1024
     DRAIN_SECONDS = 5
-    TERM_GRACE_SECONDS = 3
-    KILL_GRACE_SECONDS = 5
 
     def __init__(self, path):
         self.path = path
@@ -5418,23 +5416,12 @@ class _QualificationOutputLog:
         if pending:
             observe(pending)
 
-    def settle_reader(self, process, reader, stop, timed_out):
+    def settle_reader(self, reader, stop):
         reader.join(timeout=self.DRAIN_SECONDS)
         if not reader.is_alive():
             return
         if not self.error:
-            self.error = "owned process group retained stdout after root exit; payload INCOMPLETE"
-        for sig, grace in ((signal.SIGTERM, self.TERM_GRACE_SECONDS),
-                           (signal.SIGKILL, self.KILL_GRACE_SECONDS)):
-            if timed_out and sig == signal.SIGTERM:
-                continue
-            try:
-                os.killpg(process.pid, sig)
-            except ProcessLookupError:
-                pass
-            reader.join(timeout=grace)
-            if not reader.is_alive():
-                return
+            self.error = "stdout remained open after root wait; payload INCOMPLETE; writer ownership unresolved"
         stop.set()
         reader.join(timeout=1)
         if reader.is_alive():
@@ -5449,6 +5436,8 @@ class _QualificationOutputLog:
 
     def finish(self, returncode, timed_out, reader_complete):
         with self.lock:
+            if returncode is None:
+                self.error = (self.error + "; " if self.error else "") + "root wait has no terminal status; payload INCOMPLETE; process ownership unresolved"
             if not reader_complete and not self.error:
                 self.error = "output reader did not finish; payload INCOMPLETE"
             footer = (f"\nQUALIFICATION_CAPTURE process_returncode={returncode} "
@@ -5574,6 +5563,12 @@ def _finish_check_step_span(
     if artifact_attributes:
         attributes.update(artifact_attributes)
     _finish_dev_span(span, attributes, failed=returncode != 0, end_time=end_time)
+
+
+def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
+    if name == "cargo clippy" and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / "cargo-clippy.full.log"
+    return None
 
 
 def _check_step_artifact_dir(lane: str, name: str, env: dict[str, str]) -> Path | None:
@@ -5744,6 +5739,9 @@ def cmd_check(
         if name == "cargo test" and goal_reuse_commands is not None:
             output_log = _QualificationOutputLog(
                 Path(env["PHOENIX_GOAL_REUSE_DIR"]) / "cargo-tests.full.log")
+        elif diagnostic_path := _check_diagnostic_log_path(name, env):
+            diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+            output_log = _QualificationOutputLog(diagnostic_path)
         try:
             proc = subprocess.Popen(
                 launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -5815,7 +5813,7 @@ def cmd_check(
         finally:
             capture_error = ""
             if output_log is not None:
-                output_log.settle_reader(proc, rt, stop_reader, timed_out)
+                output_log.settle_reader(rt, stop_reader)
                 capture_error = output_log.finish(proc.returncode, timed_out, not rt.is_alive())
             else:
                 rt.join(timeout=5)

@@ -69,8 +69,7 @@ async fn conversation_goal_real_constructor_keeps_unmaterialized_start_held_with
 async fn conversation_goal_actual_allowance_terminal_failure_reopens_through_existing_manager_before_idle(
 ) {
     use super::super::super::checkpoints::{
-        assert_completed_start_owner, dispatch_response, guard_terminal_projection_order,
-        receive_automatic_response,
+        dispatch_response, guard_terminal_projection_order, receive_automatic_response,
     };
     use phoenix_core::domain::conversation_goal::GoalState;
     let (directory, db, receipt, mut rt, client) = adopted().await;
@@ -156,13 +155,22 @@ async fn conversation_goal_actual_allowance_terminal_failure_reopens_through_exi
         .execute(db.pool())
         .await
         .unwrap();
+    assert_terminal_reopen_has_no_request(&db, active.turn_id.0, active.generation, before).await;
+}
+
+async fn assert_terminal_reopen_has_no_request(
+    db: &Database,
+    turn_id: u64,
+    generation: u64,
+    before: (i64, i64, i64, i64),
+) {
     let provider = Arc::new(HeldStartProvider::default());
     let manager = manager(db.clone(), provider.clone());
     let handle = manager.get_or_create(CONVERSATION).await.unwrap();
     assert_eq!(*handle.state_rx.borrow(), ConvState::Idle);
-    assert_completed_start_owner(&db, active.turn_id.0, active.generation).await;
+    super::super::super::checkpoints::assert_completed_start_owner(db, turn_id, generation).await;
     assert_eq!(
-        ledger(&db).await,
+        ledger(db).await,
         before,
         "terminal recovery never repeats or replenishes a completed request"
     );

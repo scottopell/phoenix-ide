@@ -32,6 +32,172 @@ async fn source(instance: &TestInstance) -> phoenix_db::Conversation {
         .await
         .unwrap()
 }
+const COLLISION_SOURCE_ID: &str = "remote-terminal-source";
+
+async fn source_with_product_id(
+    instance: &TestInstance,
+    product_id: &ProductConversationId,
+) -> phoenix_db::Conversation {
+    use phoenix_core::{
+        domain::product_conversation::{
+            OrdinaryProductConversationLifecycle, ProductConversationKind,
+        },
+        work_scope::{AuthorityKind, WorkScopeId, WorkScopeLifecycle},
+    };
+    let scope_id = WorkScopeId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = instance.state.db.pool().begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO product_conversations(id, kind, ordinary_lifecycle) VALUES (?1, ?2, ?3)",
+    )
+    .bind(product_id.as_str())
+    .bind(ProductConversationKind::Ordinary.as_str())
+    .bind(OrdinaryProductConversationLifecycle::Open.as_str())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO work_scopes(id, authority_kind, lifecycle, environment_kind, cwd,
+             worktree_path, branch_name, base_branch, worktree_id, worktree_fingerprint,
+             created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'unowned_cwd', '/tmp', NULL, NULL, NULL, NULL, NULL, ?4, ?4)",
+    )
+    .bind(scope_id.as_str())
+    .bind(AuthorityKind::RestrictedExplore.as_str())
+    .bind(WorkScopeLifecycle::Active.as_str())
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    insert_collision_source_root(&mut tx, product_id, &scope_id, &now).await;
+    tx.commit().await.unwrap();
+    assert_collision_source_graph(instance, product_id, &scope_id).await
+}
+
+async fn insert_collision_source_root(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    product_id: &ProductConversationId,
+    scope_id: &phoenix_core::work_scope::WorkScopeId,
+    now: &str,
+) {
+    use phoenix_core::{
+        domain::{llm_types::ServiceTier, sm_state::ConvState},
+        llm_language::LlmLanguage,
+        work_scope::RuntimeRole,
+    };
+    let name = "source";
+    assert_ne!(name, COLLISION_SOURCE_ID);
+    let occupied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversations WHERE slug = ?1 AND id <> ?2)
+             OR EXISTS(SELECT 1 FROM conversations WHERE id = ?1)
+             OR EXISTS(SELECT 1 FROM product_conversations WHERE id = ?1)
+             OR EXISTS(SELECT 1 FROM product_creation_jobs WHERE product_conversation_id = ?1)",
+    )
+    .bind(name)
+    .bind(COLLISION_SOURCE_ID)
+    .fetch_one(&mut **tx)
+    .await
+    .unwrap();
+    assert!(
+        !occupied,
+        "fixture's canonical source slug must be unoccupied"
+    );
+    sqlx::query(
+        "INSERT INTO conversations (id, product_conversation_id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override, service_tier)
+         VALUES (?1, ?2, ?3, ?3, NULL, 1, ?4, 'idle', ?5, ?5, ?5, 0, 1,
+             NULL, NULL, NULL, NULL, NULL, NULL, ?6, 'explore', NULL, NULL, NULL,
+             ?7, ?8, NULL, ?9)",
+    )
+    .bind(COLLISION_SOURCE_ID)
+    .bind(product_id.as_str())
+    .bind(name)
+    .bind(serde_json::to_string(&ConvState::Idle).unwrap())
+    .bind(now)
+    .bind(LlmLanguage::default().as_str())
+    .bind(RuntimeRole::User.as_str())
+    .bind(scope_id.as_str())
+    .bind(ServiceTier::Standard.as_wire_name())
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+}
+
+async fn assert_collision_source_graph(
+    instance: &TestInstance,
+    product_id: &ProductConversationId,
+    scope_id: &phoenix_core::work_scope::WorkScopeId,
+) -> phoenix_db::Conversation {
+    use phoenix_core::{
+        domain::product_conversation::{OrdinaryProductConversationLifecycle, ProductConversation},
+        work_scope::{AuthorityKind, WorkScopeLifecycle},
+    };
+    let conversation = instance
+        .state
+        .db
+        .get_conversation(COLLISION_SOURCE_ID)
+        .await
+        .unwrap();
+    assert_eq!(&conversation.product_conversation_id, product_id);
+    assert_eq!(conversation.attached_work_scope_id.as_ref(), Some(scope_id));
+    assert!(conversation.parent_conversation_id.is_none());
+    assert_eq!(conversation.slug.as_deref(), Some("source"));
+    assert_eq!(conversation.title.as_deref(), Some("source"));
+    let aggregate = instance
+        .state
+        .db
+        .get_ordinary_product_conversation(product_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        aggregate.product_conversation,
+        ProductConversation::ordinary(
+            product_id.clone(),
+            OrdinaryProductConversationLifecycle::Open,
+        )
+    );
+    assert_eq!(aggregate.root.conversation.id, COLLISION_SOURCE_ID);
+    assert_eq!(aggregate.latest_transcript_row_id, COLLISION_SOURCE_ID);
+    assert_eq!(aggregate.segments.len(), 1);
+    assert_eq!(
+        aggregate.segments[0].transcript_row.conversation.id,
+        COLLISION_SOURCE_ID
+    );
+    assert_eq!(
+        aggregate.root.conversation.attached_work_scope_id.as_ref(),
+        Some(scope_id)
+    );
+    let owner: String = sqlx::query_scalar(
+        "SELECT product_conversation_id FROM product_conversation_work_scopes WHERE work_scope_id = ?1",
+    )
+    .bind(scope_id.as_str())
+    .fetch_one(instance.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(owner, product_id.as_str());
+    let shape: (String, String, String, String) = sqlx::query_as(
+        "SELECT authority_kind, lifecycle, environment_kind, cwd FROM work_scopes WHERE id = ?1",
+    )
+    .bind(scope_id.as_str())
+    .fetch_one(instance.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        shape,
+        (
+            AuthorityKind::RestrictedExplore.as_str().to_string(),
+            WorkScopeLifecycle::Active.as_str().to_string(),
+            "unowned_cwd".to_string(),
+            "/tmp".to_string(),
+        )
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(instance.state.db.pool())
+        .await
+        .unwrap()
+        .is_empty());
+    conversation
+}
+
 async fn commit_terminal(
     instance: &TestInstance,
     source: &phoenix_db::Conversation,
@@ -152,7 +318,8 @@ async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and
     let connection = a.connect_to(&b).await;
     let caller = a.state.db.instance_id().await.unwrap();
     let destination = b.state.db.instance_id().await.unwrap();
-    let source = source(&b).await;
+    let shared_product_id = ProductConversationId::new();
+    let source = source_with_product_id(&b, &shared_product_id).await;
     commit_terminal(&b, &source, TerminalFactOutcome::Completed).await;
     let id = Uuid::new_v4();
     let req = create_request(
@@ -194,7 +361,7 @@ async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and
     assert!(
         matches!(response.result,SubscriptionResult::Replay { replay: SubscriptionReplay::Facts { events } } if events.is_empty())
     );
-    let local_collision = self::source(&a).await;
+    let local_collision = source_with_product_id(&a, &shared_product_id).await;
     assert_eq!(local_collision.id, source.id);
     assert_eq!(
         local_collision.product_conversation_id,
@@ -832,7 +999,7 @@ async fn unsubscribe_before_create_reaches_source_confirms_exact_retry_and_fence
         Err(crate::api::federation::FederationClientError::RemoteRejected(_))
     ));
     let reopened =
-        phoenix_db::Database::open(b._tempdir.path().join("instance.db").to_str().unwrap())
+        phoenix_db::Database::open(b.tempdir.path().join("instance.db").to_str().unwrap())
             .await
             .unwrap();
     let fences: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM federation_subscription_create_fences WHERE id = ?1 AND product_id = ?2")

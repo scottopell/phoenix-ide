@@ -146,7 +146,7 @@ pub(super) async fn assert_completed_start_owner(db: &Database, turn_id: u64, ge
 #[tokio::test]
 async fn conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_terminal_report_in_same_execution(
 ) {
-    use phoenix_core::domain::conversation_goal::{GoalReportOutcome, GoalState};
+    use phoenix_core::domain::conversation_goal::GoalReportOutcome;
     for outcome in [
         GoalReportOutcome::Complete(text("finished")),
         GoalReportOutcome::Blocked(text("needs external input")),
@@ -225,17 +225,7 @@ async fn conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_t
             rt.tool_outcome_rx.try_recv().is_err(),
             "goal_report queues the prepared event rather than an async tool outcome"
         );
-        let goal = db
-            .conversation_goal(&receipt.input().goal().owner)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(goal.version.get(), receipt.input().goal().version.get() + 1);
-        match outcome {
-            GoalReportOutcome::Complete(_) => assert!(matches!(goal.state, GoalState::Complete(_))),
-            GoalReportOutcome::Blocked(_) => assert!(matches!(goal.state, GoalState::Blocked(_))),
-            _ => unreachable!(),
-        }
+        assert_explicit_terminal_goal(&db, &receipt, outcome).await;
         assert_eq!(rt.state, ConvState::Idle);
         assert_eq!(*watch_rx.borrow(), ConvState::Idle);
         assert!(rt.active_direct_turn.is_none());
@@ -258,45 +248,32 @@ async fn conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_t
     }
 }
 
-#[tokio::test]
-async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_refresh() {
-    use phoenix_core::domain::conversation_goal::{
-        GoalActor, GoalAttribution, GoalChange, GoalDisposition, GoalMutation,
-        GoalRequestOperation, GoalState,
-    };
-    let (_directory, db, receipt, mut initial, client) = adopted_with_limit(3).await;
-    let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
-    let old = rt.active_direct_turn.as_deref().unwrap().clone();
-    let old_stamp = rt.state_updated_at;
-    let old_binding = db
-        .conversation_goal_execution_binding(receipt.execution())
-        .await
-        .unwrap()
-        .unwrap();
-    client
-        .responses
-        .lock()
-        .unwrap()
-        .push_back(provider_response(vec![ContentBlock::ToolUse {
-            id: "explicit-blocked-before-resume".into(),
-            name: "goal_report".into(),
-            input: serde_json::json!({"status":"blocked", "reason":"need user input"}),
-        }]));
-    let response = dispatch_response(&mut rt).await;
-    rt.process_llm_completion(response).await.unwrap();
-    process_prepared_report(&mut rt).await;
-    assert_eq!(rt.state, ConvState::Idle);
-    assert!(rt.active_direct_turn.is_none());
-    let blocked = db
+async fn assert_explicit_terminal_goal(
+    db: &Database,
+    receipt: &GoalStartReceipt,
+    outcome: phoenix_core::domain::conversation_goal::GoalReportOutcome,
+) {
+    use phoenix_core::domain::conversation_goal::{GoalReportOutcome, GoalState};
+    let goal = db
         .conversation_goal(&receipt.input().goal().owner)
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(blocked.state, GoalState::Blocked(_)));
-    assert_eq!(
-        blocked.version.get(),
-        receipt.input().goal().version.get() + 1
-    );
+    assert_eq!(goal.version.get(), receipt.input().goal().version.get() + 1);
+    match outcome {
+        GoalReportOutcome::Complete(_) => assert!(matches!(goal.state, GoalState::Complete(_))),
+        GoalReportOutcome::Blocked(_) => assert!(matches!(goal.state, GoalState::Blocked(_))),
+        GoalReportOutcome::Exhausted(_) => unreachable!(),
+    }
+}
+
+async fn explicitly_resume_blocked_goal(
+    db: &Database,
+    blocked: &phoenix_core::domain::conversation_goal::GoalSnapshot,
+) -> phoenix_core::domain::conversation_goal::GoalSnapshot {
+    use phoenix_core::domain::conversation_goal::{
+        GoalActor, GoalAttribution, GoalChange, GoalDisposition, GoalMutation, GoalState,
+    };
     let actor = GoalActor::GeneratedHost {
         action_id: text("explicit-user-authorized-resume"),
     };
@@ -324,41 +301,17 @@ async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_
     assert_eq!(resumed.goal_id, blocked.goal_id);
     assert_eq!(resumed.version.get(), blocked.version.get() + 1);
     assert_eq!(resumed.state, GoalState::Underway);
-    let before = ledger(&db).await;
-    let repo = db.workflow_repository();
-    assert!(repo
-        .admit_goal_start_request_context(
-            CONVERSATION,
-            Some((old.turn_id, old.generation)),
-            old_stamp,
-            GoalRequestOperation::Normal { attempt: 1 }
-        )
-        .await
-        .is_err());
-    assert!(matches!(
-        repo.recover_goal_start_runtime(&phoenix_db::workflow::GoalStartRecoveryInput::new(
-            CONVERSATION.into(),
-            (old.turn_id, old.generation),
-            (ConvState::LlmRequesting { attempt: 1 }, old_stamp),
-            Timestamp(31),
-        ))
-        .await
-        .unwrap(),
-        phoenix_db::workflow::GoalStartRecoveryOutcome::Refused
-    ));
-    assert_eq!(
-        ledger(&db).await,
-        before,
-        "resuming facts never starts or refreshes the old execution"
-    );
-    assert_eq!(client.requests.lock().unwrap().len(), 1);
-    assert_eq!(
-        db.conversation_goal_execution_binding(receipt.execution())
-            .await
-            .unwrap()
-            .unwrap(),
-        old_binding
-    );
+    resumed
+}
+
+async fn accept_explicit_resumed_start(
+    db: &Database,
+    receipt: &GoalStartReceipt,
+    resumed: &phoenix_core::domain::conversation_goal::GoalSnapshot,
+    before: (i64, i64, i64, i64),
+) -> GoalStartReceipt {
+    use phoenix_core::domain::conversation_goal::{GoalStartInput, GoalStartRequester};
+    use phoenix_db::conversation_goals::start::GoalStartAcceptance;
     let start = GoalStartInput::new(
         uuid::Uuid::new_v4(),
         GoalStartRequester::Owner {
@@ -377,10 +330,19 @@ async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_
     assert_ne!(new_receipt.execution(), receipt.execution());
     assert_eq!(new_receipt.input().goal(), &resumed.fence());
     assert_eq!(
-        ledger(&db).await,
+        ledger(db).await,
         before,
         "typed Start acceptance is not a request charge or provider send"
     );
+    new_receipt
+}
+
+async fn adopt_explicit_resumed_start(
+    db: &Database,
+    rt: &mut ConversationRuntime<DatabaseStorage, Arc<RenderingAnthropicClient>, MockToolExecutor>,
+    new_receipt: &GoalStartReceipt,
+) {
+    let repo = db.workflow_repository();
     let workflow =
         phoenix_workflow::WorkflowId(u64::try_from(new_receipt.execution().workflow_id()).unwrap());
     let now = u64::try_from(Utc::now().timestamp()).unwrap();
@@ -421,6 +383,90 @@ async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_
         .effects
         .retain(|effect| !matches!(effect, Effect::RequestLlm));
     rt.apply_transition_result(transition).await.unwrap();
+}
+
+async fn assert_old_goal_binding_unchanged(
+    db: &Database,
+    receipt: &GoalStartReceipt,
+    old_binding: &phoenix_core::domain::conversation_goal::GoalExecutionBinding,
+) {
+    assert_eq!(
+        db.conversation_goal_execution_binding(receipt.execution())
+            .await
+            .unwrap()
+            .unwrap(),
+        *old_binding
+    );
+}
+
+#[tokio::test]
+async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_refresh() {
+    use phoenix_core::domain::conversation_goal::{GoalRequestOperation, GoalState};
+    let (_directory, db, receipt, mut initial, client) = adopted_with_limit(3).await;
+    let mut rt = actual_tool_runtime(&mut initial, &db, client.clone());
+    let old = rt.active_direct_turn.as_deref().unwrap().clone();
+    let old_stamp = rt.state_updated_at;
+    let old_binding = db
+        .conversation_goal_execution_binding(receipt.execution())
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(provider_response(vec![ContentBlock::ToolUse {
+            id: "explicit-blocked-before-resume".into(),
+            name: "goal_report".into(),
+            input: serde_json::json!({"status":"blocked", "reason":"need user input"}),
+        }]));
+    let response = dispatch_response(&mut rt).await;
+    rt.process_llm_completion(response).await.unwrap();
+    process_prepared_report(&mut rt).await;
+    assert_eq!(rt.state, ConvState::Idle);
+    assert!(rt.active_direct_turn.is_none());
+    let blocked = db
+        .conversation_goal(&receipt.input().goal().owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(blocked.state, GoalState::Blocked(_)));
+    assert_eq!(
+        blocked.version.get(),
+        receipt.input().goal().version.get() + 1
+    );
+    let resumed = explicitly_resume_blocked_goal(&db, &blocked).await;
+    let before = ledger(&db).await;
+    let repo = db.workflow_repository();
+    assert!(repo
+        .admit_goal_start_request_context(
+            CONVERSATION,
+            Some((old.turn_id, old.generation)),
+            old_stamp,
+            GoalRequestOperation::Normal { attempt: 1 }
+        )
+        .await
+        .is_err());
+    assert!(matches!(
+        repo.recover_goal_start_runtime(&phoenix_db::workflow::GoalStartRecoveryInput::new(
+            CONVERSATION.into(),
+            (old.turn_id, old.generation),
+            (ConvState::LlmRequesting { attempt: 1 }, old_stamp),
+            Timestamp(31),
+        ))
+        .await
+        .unwrap(),
+        phoenix_db::workflow::GoalStartRecoveryOutcome::Refused
+    ));
+    assert_eq!(
+        ledger(&db).await,
+        before,
+        "resuming facts never starts or refreshes the old execution"
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+    assert_old_goal_binding_unchanged(&db, &receipt, &old_binding).await;
+    let new_receipt = accept_explicit_resumed_start(&db, &receipt, &resumed, before).await;
+    adopt_explicit_resumed_start(&db, &mut rt, &new_receipt).await;
     let active = rt.active_direct_turn.as_deref().unwrap();
     let context = repo
         .admit_goal_start_request_context(
@@ -441,13 +487,7 @@ async fn conversation_goal_actual_blocked_resume_requires_new_start_not_version_
             .observation,
         phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(resumed.fence())
     );
-    assert_eq!(
-        db.conversation_goal_execution_binding(receipt.execution())
-            .await
-            .unwrap()
-            .unwrap(),
-        old_binding
-    );
+    assert_old_goal_binding_unchanged(&db, &receipt, &old_binding).await;
     assert_eq!(
         ledger(&db).await,
         (before.0 + 1, before.1, before.2 + 1, before.3),
@@ -817,6 +857,28 @@ fn assert_goal_tool_turn_context(
     );
 }
 
+fn assert_same_turn_tool_context(client: &RenderingAnthropicClient) {
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].provider_replay.is_some(),
+            "successor observes the committed replay bundle"
+        );
+        for request in &requests[..2] {
+            assert_goal_tool_turn_context(request, true);
+        }
+    }
+}
+
+fn assert_logical_tool_successor_context(client: &RenderingAnthropicClient) {
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_goal_tool_turn_context(&requests[2], false);
+    }
+}
+
 #[tokio::test]
 async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_source_before_next_request(
 ) {
@@ -891,17 +953,7 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
         successor.admitted.as_ref().unwrap().intent().execution,
         receipt.execution()
     );
-    {
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            requests[1].provider_replay.is_some(),
-            "successor observes the committed replay bundle"
-        );
-        for request in &requests[..2] {
-            assert_goal_tool_turn_context(request, true);
-        }
-    }
+    assert_same_turn_tool_context(&client);
     rt.process_llm_completion(successor).await.unwrap();
     let logical_successor = receive_automatic_response(&mut rt).await;
     assert_eq!(
@@ -919,11 +971,7 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
         receipt.execution()
     );
     assert_eq!(rt.active_direct_turn.as_deref(), Some(&start_owner));
-    {
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert_goal_tool_turn_context(&requests[2], false);
-    }
+    assert_logical_tool_successor_context(&client);
     rt.abort_external_effects_in_memory();
 }
 

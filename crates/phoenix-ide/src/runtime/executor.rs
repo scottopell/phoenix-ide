@@ -2450,6 +2450,25 @@ fn overload_recovery_deadline_for(state: &ConvState, now: DateTime<Utc>) -> Opti
     }
 }
 
+type OutcomeChannel<T> = (mpsc::Sender<T>, mpsc::Receiver<T>);
+
+type EffectOutcomeChannels = (
+    OutcomeChannel<LlmCompletion>,
+    OutcomeChannel<(u64, ToolExecOutcome)>,
+    OutcomeChannel<(u64, u32)>,
+);
+
+fn new_effect_outcome_channels() -> EffectOutcomeChannels {
+    let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<LlmCompletion>(64);
+    let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
+    let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
+    (
+        (llm_outcome_tx, llm_outcome_rx),
+        (tool_outcome_tx, tool_outcome_rx),
+        (retry_outcome_tx, retry_outcome_rx),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskApprovalExecution {
     Initial,
@@ -2484,9 +2503,7 @@ where
         // oneshot channels; forwarders stamp the dispatch generation and relay
         // them here, where the select loop discards superseded outcomes before
         // routing live ones into `process_outcome`.
-        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<LlmCompletion>(64);
-        let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
-        let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
+        let (llm_channel, tool_channel, retry_channel) = new_effect_outcome_channels();
 
         let tool_executor = Arc::new(tool_executor);
         let fence = crate::runtime::FatalLocalAuthorityFence::new();
@@ -2533,16 +2550,16 @@ where
             turn_trigger: super::TurnTriggerSlot::default(),
             retry_generation: 0,
             llm_request_generation: 0,
-            llm_outcome_tx,
-            llm_outcome_rx,
+            llm_outcome_tx: llm_channel.0,
+            llm_outcome_rx: llm_channel.1,
             pending_goal_request_checkpoint: None,
             terminal_transition_retry: None,
             terminal_settlement_attempt: TerminalSettlementAttempt::Initial,
             tool_request_generation: 0,
-            tool_outcome_tx,
-            tool_outcome_rx,
-            retry_outcome_tx,
-            retry_outcome_rx,
+            tool_outcome_tx: tool_channel.0,
+            tool_outcome_rx: tool_channel.1,
+            retry_outcome_tx: retry_channel.0,
+            retry_outcome_rx: retry_channel.1,
             parent_dispatch: None,
             spawn_tx: None,
             cancel_tx: None,
@@ -3509,28 +3526,36 @@ where
         generation != self.retry_generation
     }
 
-    /// Process a typed effect outcome from a background task.
-    ///
-    /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
-    /// are logged and discarded — state unchanged.
-    #[allow(clippy::large_futures)]
-    async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
-        if let EffectOutcome::Llm(LlmOutcome::Response { request_id, .. }) = &outcome {
+    async fn validate_goal_start_response_receipt(
+        &self,
+        outcome: &EffectOutcome,
+    ) -> Result<(), String> {
+        if let EffectOutcome::Llm(LlmOutcome::Response { request_id, .. }) = outcome {
             if matches!(
                 self.storage
                     .load_active_direct_turn(&self.context.conversation_id)
                     .await?,
                 Some(crate::runtime::traits::LoadedActiveDirectTurn::GoalStart { .. })
-            ) && !self
+            ) && self
                 .pending_goal_request_checkpoint
                 .as_ref()
-                .is_some_and(|pending| pending.admitted.intent().id.as_str() == request_id)
+                .is_none_or(|pending| pending.admitted.intent().id.as_str() != request_id)
             {
                 return Err(
                     "Start response has no matching actual-dispatch checkpoint receipt".into(),
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Process a typed effect outcome from a background task.
+    ///
+    /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
+    /// are logged and discarded — state unchanged.
+    #[allow(clippy::large_futures)]
+    async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        self.validate_goal_start_response_receipt(&outcome).await?;
         let cancelled_llm = matches!(
             &outcome,
             EffectOutcome::Llm(LlmOutcome::Cancelled | LlmOutcome::GoalControlRevoked)
@@ -9108,7 +9133,7 @@ where
             llm_rx,
             dispatch_generation,
             llm_outcome_tx,
-            goal_request_context.map(|context| context.into_admitted()),
+            goal_request_context.map(phoenix_db::GoalStartRequestContext::into_admitted),
         ));
 
         Ok(None)
@@ -10315,155 +10340,158 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                let conv_id = self.context.conversation_id.clone();
-
-                // Build the assistant message row.
-                //
-                // `created_at` carries the exact value the eager broadcast
-                // (`Effect::BroadcastAssistantMessage`) already delivered for
-                // this `message_id`, so a reconnect that lands during persistence
-                // never sees a shifted timestamp on the message the UI displays.
-                let (reserved_broadcast_range, reserved_seqs) = self
-                    .broadcast_tx
-                    .persisted_message_reservation_authority()
+                self.persist_checkpoint_tool_round(assistant_message, tool_results, admitted)
                     .await
-                    .reserve_next_range(1 + tool_results.len())
-                    .expect("executor holds exclusive persisted-message reservation authority");
-                let _reserved_broadcast_range = reserved_broadcast_range;
-
-                let agent_content = MessageContent::agent(assistant_message.content);
-                let agent_seq = reserved_seqs[0];
-                let agent_msg = crate::db::Message {
-                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                    message_id: assistant_message.message_id.clone(),
-                    conversation_id: conv_id.clone(),
-                    sequence_id: agent_seq,
-                    message_type: agent_content.message_type(),
-                    content: agent_content,
-                    display_data: assistant_message.display_data.clone(),
-                    usage_data: assistant_message.usage.clone(),
-                    created_at: assistant_message.created_at,
-                };
-
-                let (tool_msgs, new_trusted_results) = if self
-                    .pending_goal_request_checkpoint
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending.admitted.intent().id.as_str() == agent_msg.message_id
-                    }) {
-                    let finalized: Vec<_> = tool_results
-                        .iter()
-                        .filter_map(|result| match result {
-                            ToolRoundResult::Finalized(result) => Some(result.clone()),
-                            ToolRoundResult::PendingGoalReport { .. }
-                            | ToolRoundResult::PendingGoalManagement { .. } => None,
-                        })
-                        .collect();
-                    let trusted = trusted_tool_results(&agent_msg.message_id, &finalized);
-                    let committed = self.commit_admitted_goal_request(&agent_msg,
-                        phoenix_db::conversation_goals::request_checkpoint::GoalRequestEvidence::Round { results: &tool_results },
-                    ).await?;
-                    self.publish_live_state_admitted();
-                    (committed.results, trusted)
-                } else {
-                    if contains_pending_goal_result(&tool_results) {
-                        return self
-                            .persist_pending_goal_round(
-                                agent_msg,
-                                tool_results,
-                                None,
-                                None,
-                                admitted,
-                            )
-                            .await;
-                    }
-                    let tool_results = finalized_round_results(&tool_results)?;
-                    let new_trusted_results =
-                        trusted_tool_results(&agent_msg.message_id, &tool_results);
-
-                    // Build all tool-result rows.
-                    let mut tool_msgs: Vec<crate::db::Message> =
-                        Vec::with_capacity(tool_results.len());
-                    for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1))
-                    {
-                        let tool_content = tool_result_message_content(result);
-                        let merged_display = merge_duration_into_display_data(
-                            result.display_data(),
-                            result.duration_ms,
-                        );
-                        tool_msgs.push(crate::db::Message {
-                            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                            message_id: tool_result_message_id(
-                                &agent_msg.message_id,
-                                &result.tool_use_id,
-                            ),
-                            conversation_id: conv_id.clone(),
-                            sequence_id: *tool_seq,
-                            message_type: tool_content.message_type(),
-                            content: tool_content,
-                            display_data: merged_display,
-                            usage_data: None,
-                            created_at: Utc::now(),
-                        });
-                    }
-
-                    // Persist the assistant message and every tool result in one
-                    // transaction: either the full round is durable or none of it
-                    // is. A partial write would leave an unpaired `tool_use` that
-                    // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                    if let Some(update) = self.pending_provider_replay_update.take() {
-                        self.storage
-                            .persist_tool_round_state_and_provider_replay(
-                                &conv_id,
-                                &agent_msg,
-                                &tool_msgs,
-                                &self.state,
-                                self.state_updated_at,
-                                &update,
-                            )
-                            .await?;
-                    } else {
-                        self.storage
-                            .persist_tool_round_and_state(
-                                &conv_id,
-                                &agent_msg,
-                                &tool_msgs,
-                                &self.state,
-                                self.state_updated_at,
-                            )
-                            .await?;
-                    }
-
-                    (tool_msgs, new_trusted_results)
-                };
-
-                merge_trusted_tool_results(
-                    &mut self.pending_trusted_tool_results,
-                    new_trusted_results,
-                );
-
-                // Broadcast the now-durable rows so connected clients render
-                // the assistant message and each tool result. Tool-result
-                // durations are already baked into each row's display_data by
-                // `merge_duration_into_display_data`; emitting separate
-                // `MessageUpdated { duration_ms }` events here would allocate
-                // sequence ids after the preallocated tool-message ids and can
-                // therefore leapfrog later tool-result messages in live
-                // delivery.
-                let _ = self
-                    .broadcast_tx
-                    .admitted_publication(admitted)
-                    .persisted_message(agent_msg);
-
-                for msg in tool_msgs {
-                    let _ = self
-                        .broadcast_tx
-                        .admitted_publication(admitted)
-                        .persisted_message(msg);
-                }
             }
         }
+    }
+
+    async fn persist_checkpoint_tool_round(
+        &mut self,
+        assistant_message: phoenix_core::domain::sm_state::AssistantMessage,
+        tool_results: Vec<ToolRoundResult>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        let conv_id = self.context.conversation_id.clone();
+
+        // Build the assistant message row.
+        //
+        // `created_at` carries the exact value the eager broadcast
+        // (`Effect::BroadcastAssistantMessage`) already delivered for
+        // this `message_id`, so a reconnect that lands during persistence
+        // never sees a shifted timestamp on the message the UI displays.
+        let (reserved_broadcast_range, reserved_seqs) = self
+            .broadcast_tx
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1 + tool_results.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
+        let _reserved_broadcast_range = reserved_broadcast_range;
+
+        let agent_content = MessageContent::agent(assistant_message.content);
+        let agent_seq = reserved_seqs[0];
+        let agent_msg = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+            message_id: assistant_message.message_id.clone(),
+            conversation_id: conv_id.clone(),
+            sequence_id: agent_seq,
+            message_type: agent_content.message_type(),
+            content: agent_content,
+            display_data: assistant_message.display_data.clone(),
+            usage_data: assistant_message.usage.clone(),
+            created_at: assistant_message.created_at,
+        };
+
+        let (tool_msgs, new_trusted_results) = if self
+            .pending_goal_request_checkpoint
+            .as_ref()
+            .is_some_and(|pending| pending.admitted.intent().id.as_str() == agent_msg.message_id)
+        {
+            let finalized: Vec<_> = tool_results
+                .iter()
+                .filter_map(|result| match result {
+                    ToolRoundResult::Finalized(result) => Some(result.clone()),
+                    ToolRoundResult::PendingGoalReport { .. }
+                    | ToolRoundResult::PendingGoalManagement { .. } => None,
+                })
+                .collect();
+            let trusted = trusted_tool_results(&agent_msg.message_id, &finalized);
+            let committed = self.commit_admitted_goal_request(&agent_msg,
+                phoenix_db::conversation_goals::request_checkpoint::GoalRequestEvidence::Round { results: &tool_results },
+            ).await?;
+            self.publish_live_state_admitted();
+            (committed.results, trusted)
+        } else {
+            if contains_pending_goal_result(&tool_results) {
+                return self
+                    .persist_pending_goal_round(agent_msg, tool_results, None, None, admitted)
+                    .await;
+            }
+            let tool_results = finalized_round_results(&tool_results)?;
+            let new_trusted_results = trusted_tool_results(&agent_msg.message_id, &tool_results);
+
+            let tool_msgs =
+                Self::checkpoint_tool_messages(&conv_id, &agent_msg, &tool_results, &reserved_seqs);
+
+            // Persist the assistant message and every tool result in one
+            // transaction: either the full round is durable or none of it
+            // is. A partial write would leave an unpaired `tool_use` that
+            // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
+            if let Some(update) = self.pending_provider_replay_update.take() {
+                self.storage
+                    .persist_tool_round_state_and_provider_replay(
+                        &conv_id,
+                        &agent_msg,
+                        &tool_msgs,
+                        &self.state,
+                        self.state_updated_at,
+                        &update,
+                    )
+                    .await?;
+            } else {
+                self.storage
+                    .persist_tool_round_and_state(
+                        &conv_id,
+                        &agent_msg,
+                        &tool_msgs,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await?;
+            }
+
+            (tool_msgs, new_trusted_results)
+        };
+
+        merge_trusted_tool_results(&mut self.pending_trusted_tool_results, new_trusted_results);
+
+        // Broadcast the now-durable rows so connected clients render
+        // the assistant message and each tool result. Tool-result
+        // durations are already baked into each row's display_data by
+        // `merge_duration_into_display_data`; emitting separate
+        // `MessageUpdated { duration_ms }` events here would allocate
+        // sequence ids after the preallocated tool-message ids and can
+        // therefore leapfrog later tool-result messages in live
+        // delivery.
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(agent_msg);
+
+        for msg in tool_msgs {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(msg);
+        }
         Ok(None)
+    }
+
+    fn checkpoint_tool_messages(
+        conv_id: &str,
+        agent_msg: &crate::db::Message,
+        tool_results: &[ToolResult],
+        reserved_seqs: &[i64],
+    ) -> Vec<crate::db::Message> {
+        // Build all tool-result rows.
+        let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
+        for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
+            let tool_content = tool_result_message_content(result);
+            let merged_display =
+                merge_duration_into_display_data(result.display_data(), result.duration_ms);
+            tool_msgs.push(crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
+                conversation_id: conv_id.to_owned(),
+                sequence_id: *tool_seq,
+                message_type: tool_content.message_type(),
+                content: tool_content,
+                display_data: merged_display,
+                usage_data: None,
+                created_at: Utc::now(),
+            });
+        }
+        tool_msgs
     }
 
     /// Persist a decoupled fork proposal atomically with the originating turn's

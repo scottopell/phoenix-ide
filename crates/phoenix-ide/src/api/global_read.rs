@@ -3092,8 +3092,8 @@ async fn resolve_message(
                 .ok_or_else(|| AppError::Internal("remote sender reference missing".to_string()))?;
             vec![sender.exact, sender.stable]
         }
-        phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. } => Vec::new(),
-        phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
+        phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. }
+        | phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
         | phoenix_core::domain::db_schema::InputOrigin::UserApi
         | phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
         | phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { .. } => Vec::new(),

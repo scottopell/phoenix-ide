@@ -15,7 +15,11 @@ use axum::{
 use chrono::Utc;
 use futures::StreamExt;
 use phoenix_core::domain::{
-    federation_subscription::*,
+    federation_subscription::{
+        SubscriptionAuthorization, SubscriptionCursor, SubscriptionDelivery, SubscriptionEnd,
+        SubscriptionReference, SubscriptionReplay, SubscriptionSnapshot, SubscriptionState,
+        REPLAY_BATCH,
+    },
     instance_identity::{InstanceId, InstanceSelector},
     product_conversation::ProductConversationId,
 };
@@ -89,9 +93,8 @@ async fn apply(
     request: SubscriptionRequest,
     operation: &'static str,
 ) -> Response {
-    let destination = match state.db.instance_id().await {
-        Ok(id) => id,
-        Err(_) => return rejected(StatusCode::INTERNAL_SERVER_ERROR),
+    let Ok(destination) = state.db.instance_id().await else {
+        return rejected(StatusCode::INTERNAL_SERVER_ERROR);
     };
     if request.caller_instance_id != peer.caller_instance_id
         || request.reference.instance_id != destination
@@ -168,7 +171,10 @@ async fn apply(
             )
             .await
             .map(|()| SubscriptionResult::Unsubscribed),
-        _ => return rejected(StatusCode::UNPROCESSABLE_ENTITY),
+        SubscriptionOperation::Create
+        | SubscriptionOperation::Replay { .. }
+        | SubscriptionOperation::Authorize { .. }
+        | SubscriptionOperation::Unsubscribe => return rejected(StatusCode::UNPROCESSABLE_ENTITY),
     };
     match result {
         Ok(result) => Json(SubscriptionResponse {
@@ -293,7 +299,9 @@ fn validate_response(
                     }
                     Ok(())
                 }
-                _ => Err(mismatch()),
+                SubscriptionReplay::Facts { .. } | SubscriptionReplay::Gap { .. } => {
+                    Err(mismatch())
+                }
             }
         }
         _ => Err(mismatch()),
@@ -850,13 +858,11 @@ pub async fn owner_unsubscribe(
     State(state): State<AppState>,
     Json(request): Json<OwnerSubscriptionRequest>,
 ) -> Response {
-    let selector = match InstanceSelector::parse(request.instance.clone()) {
-        Ok(value) => value,
-        Err(_) => return rejected(StatusCode::UNPROCESSABLE_ENTITY),
+    let Ok(selector) = InstanceSelector::parse(request.instance.clone()) else {
+        return rejected(StatusCode::UNPROCESSABLE_ENTITY);
     };
-    let peer = match state.db.resolve_federation_peer(&selector).await {
-        Ok(peer) => peer,
-        Err(_) => return rejected(StatusCode::NOT_FOUND),
+    let Ok(peer) = state.db.resolve_federation_peer(&selector).await else {
+        return rejected(StatusCode::NOT_FOUND);
     };
     let reference = SubscriptionReference {
         instance_id: peer.peer_instance_id,

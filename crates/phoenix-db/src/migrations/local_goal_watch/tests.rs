@@ -463,6 +463,10 @@ async fn another_pooled_connection_reparses_the_new_schema() {
     .fetch_all(&mut *retained)
     .await
     .unwrap();
+    assert_retained_connection_integrity(&mut retained).await;
+}
+
+async fn assert_retained_connection_integrity(retained: &mut sqlx::SqliteConnection) {
     assert_eq!(
         sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
             .fetch_one(&mut *retained)

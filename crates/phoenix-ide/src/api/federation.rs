@@ -341,13 +341,13 @@ pub async fn send_conversation_message(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let receipt = if request.destination_instance_id != destination {
+    let receipt = if request.destination_instance_id == destination {
+        admit_remote_message(&state, authenticated.caller_instance_id, &request).await
+    } else {
         RemoteSendReceipt::Rejected {
             code: RemoteSendRejectionCode::DestinationMismatch,
             message: "destination instance identity mismatch".into(),
         }
-    } else {
-        admit_remote_message(&state, authenticated.caller_instance_id, &request).await
     };
     Json(RemoteSendMessageResponse {
         destination_instance_id: destination,
@@ -449,7 +449,7 @@ async fn admit_remote_message(
 ) -> RemoteSendReceipt {
     use crate::send_chat_service::{
         MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatReplay,
-        SendChatRequest, SendChatServiceError,
+        SendChatRequest,
     };
     let target = match resolve_remote_send_target(state, &request.target, &request.sender).await {
         Ok(target) => target,
@@ -473,30 +473,7 @@ async fn admit_remote_message(
         .await;
     let (id, outcome, replay) = match admission {
         Ok(result) => result,
-        Err(error) => {
-            let code = match &error {
-                SendChatServiceError::IdempotencyConflict => {
-                    RemoteSendRejectionCode::IdempotencyConflict
-                }
-                SendChatServiceError::NotFound(_) => RemoteSendRejectionCode::TargetNotFound,
-                SendChatServiceError::Busy => RemoteSendRejectionCode::Busy,
-                SendChatServiceError::CloseAdmissionFenced
-                | SendChatServiceError::HistoryUnavailable => {
-                    RemoteSendRejectionCode::TargetUnavailable
-                }
-                SendChatServiceError::AttachmentValidation(_)
-                | SendChatServiceError::Expansion { .. } => {
-                    RemoteSendRejectionCode::AdmissionRejected
-                }
-                SendChatServiceError::Internal(_) | SendChatServiceError::Dispatch(_) => {
-                    RemoteSendRejectionCode::Internal
-                }
-            };
-            return RemoteSendReceipt::Rejected {
-                code,
-                message: bounded_send_diagnostic(&error.to_string()),
-            };
-        }
+        Err(error) => return remote_send_admission_rejection(&error),
     };
     if let SendChatOutcome::Rejected { message, .. } = outcome {
         return RemoteSendReceipt::Rejected {
@@ -576,6 +553,30 @@ fn accepting_message_id(
     match disposition {
         RemoteSendDisposition::Delivered => format!("{transcript}:{message_id}"),
         RemoteSendDisposition::Queued => message_id.to_string(),
+    }
+}
+
+fn remote_send_admission_rejection(
+    error: &crate::send_chat_service::SendChatServiceError,
+) -> RemoteSendReceipt {
+    use crate::send_chat_service::SendChatServiceError;
+    let code = match error {
+        SendChatServiceError::IdempotencyConflict => RemoteSendRejectionCode::IdempotencyConflict,
+        SendChatServiceError::NotFound(_) => RemoteSendRejectionCode::TargetNotFound,
+        SendChatServiceError::Busy => RemoteSendRejectionCode::Busy,
+        SendChatServiceError::CloseAdmissionFenced | SendChatServiceError::HistoryUnavailable => {
+            RemoteSendRejectionCode::TargetUnavailable
+        }
+        SendChatServiceError::AttachmentValidation(_) | SendChatServiceError::Expansion { .. } => {
+            RemoteSendRejectionCode::AdmissionRejected
+        }
+        SendChatServiceError::Internal(_) | SendChatServiceError::Dispatch(_) => {
+            RemoteSendRejectionCode::Internal
+        }
+    };
+    RemoteSendReceipt::Rejected {
+        code,
+        message: bounded_send_diagnostic(&error.to_string()),
     }
 }
 
@@ -1953,6 +1954,65 @@ mod tests {
         server.await.unwrap();
     }
 
+    async fn assert_remote_redirect_rejected(
+        state: &AppState,
+        peer: InstanceId,
+        send_message: bool,
+    ) {
+        let result = if send_message {
+            let connection = state
+                .db
+                .federation_peer_connection(peer)
+                .await
+                .unwrap()
+                .unwrap();
+            send_remote_conversation_message(
+                &state.db,
+                &connection,
+                &RemoteSendMessageRequest {
+                    destination_instance_id: peer,
+                    target: RemoteSendTarget::Coordinator {},
+                    message_id: uuid::Uuid::new_v4(),
+                    message: RemoteMessageText::parse("redirect test".into()).unwrap(),
+                    sender: RemoteSenderAttestation::RemoteApi {},
+                },
+            )
+            .await
+            .map(|_| ())
+        } else {
+            query_remote_database(&state.db, peer, "SELECT 1")
+                .await
+                .map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(FederationClientError::RemoteRejected(detail))
+                if detail.starts_with("HTTP 30")
+        ));
+    }
+
+    async fn save_redirect_peer(
+        state: &AppState,
+        peer: InstanceId,
+        source_address: std::net::SocketAddr,
+        token: &phoenix_core::domain::instance_identity::PeerBearerCredential,
+        trust: &PeerTlsTrust,
+    ) {
+        state
+            .db
+            .save_federation_peer_connection(
+                peer,
+                "peer",
+                &format!("https://localhost:{}", source_address.port())
+                    .parse()
+                    .unwrap(),
+                token,
+                trust,
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn authenticated_remote_query_and_send_do_not_follow_307_or_308() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -2041,50 +2101,9 @@ mod tests {
                     }
                 }
             });
-            state
-                .db
-                .save_federation_peer_connection(
-                    peer,
-                    "peer",
-                    &format!("https://localhost:{}", source_address.port())
-                        .parse()
-                        .unwrap(),
-                    &token,
-                    &trust,
-                )
-                .await
-                .unwrap();
+            save_redirect_peer(&state, peer, source_address, &token, &trust).await;
 
-            let result = if send_message {
-                let connection = state
-                    .db
-                    .federation_peer_connection(peer)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                send_remote_conversation_message(
-                    &state.db,
-                    &connection,
-                    &RemoteSendMessageRequest {
-                        destination_instance_id: peer,
-                        target: RemoteSendTarget::Coordinator {},
-                        message_id: uuid::Uuid::new_v4(),
-                        message: RemoteMessageText::parse("redirect test".into()).unwrap(),
-                        sender: RemoteSenderAttestation::RemoteApi {},
-                    },
-                )
-                .await
-                .map(|_| ())
-            } else {
-                query_remote_database(&state.db, peer, "SELECT 1")
-                    .await
-                    .map(|_| ())
-            };
-            assert!(matches!(
-                result,
-                Err(FederationClientError::RemoteRejected(detail))
-                    if detail.starts_with("HTTP 30")
-            ));
+            assert_remote_redirect_rejected(&state, peer, send_message).await;
             done_tx.send(()).unwrap();
             assert!(!server.await.unwrap(), "redirect target received a request");
         }

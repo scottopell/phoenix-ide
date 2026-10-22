@@ -767,9 +767,13 @@ async fn conversation_goal_control_factual_read_absent_zero_cas_stop_release_and
         response(&router, request(Method::POST, &path, Some(&release), true)).await,
         released
     );
-    let stale =
+    let outdated_stop =
         json!({"request_id":Uuid::new_v4(), "command":"stop", "expected_control_version":1});
-    let conflict = response(&router, request(Method::POST, &path, Some(&stale), true)).await;
+    let conflict = response(
+        &router,
+        request(Method::POST, &path, Some(&outdated_stop), true),
+    )
+    .await;
     assert_eq!(conflict.0, StatusCode::CONFLICT);
     assert_eq!(conflict.1["result"]["outcome"], "rejected_version");
     assert_eq!(
