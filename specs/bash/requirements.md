@@ -519,10 +519,10 @@ AND the kill path SHALL signal the entire process group via `kill(-pgid, signal)
 to catch immediate descendants
 
 WHEN Phoenix is shutting down (graceful or abnormal-but-handler-runnable)
-THE SYSTEM SHALL walk the live handle table and send `SIGKILL` to each
-handle's process group as a final cleanup pass before exit
-AND wait briefly (up to `SHUTDOWN_KILL_GRACE_SECONDS`, default 2) for those
-groups to exit before relinquishing control to the OS
+THE SYSTEM SHALL snapshot registered live handles and attempt `SIGKILL` through each handle's incarnation-bound signaling API, without holding registry locks during signaling
+AND SHALL use one global deadline, bounded by `SHUTDOWN_KILL_GRACE_SECONDS` (default 2), for registry snapshot, signal attempts, and available handle-exit observation
+AND SHALL report signaling errors, unsupported platforms, and deadline-incomplete work without claiming that a successful signal or leader exit proves descendant absence or complete process-group reaping
+AND SHALL NOT fall back to signaling a raw numeric PID or process-group ID
 
 THE SYSTEM SHALL NOT rely on parent-death cascades (SIGHUP-on-parent-exit) for
 child cleanup. SIGHUP delivers on controlling-terminal hangup, not on parent
@@ -536,8 +536,13 @@ wrong on Linux: SIGHUP is a TTY-hangup signal, not a parent-death signal, and
 Phoenix is not a controlling-terminal session leader. Without
 `PR_SET_CHILD_SUBREAPER`, double-forked daemons (`(cmd &) &`, `nohup`, programs
 that call `setsid`) and any descendant that resets its own pgid will outlive
-Phoenix and leak. With the subreaper bit set, escapees reparent to Phoenix
-rather than init, and the shutdown kill-tree pass cleans them up before exit.
+Phoenix and leak. With the subreaper bit set, escapees can reparent to Phoenix
+rather than init. Shutdown performs only bounded, incarnation-bound signal
+attempts for registered live handles; it cannot guarantee cleanup of unregistered
+descendants, prove that signaled processes exited, or prove complete
+process-group reaping. On platforms without an incarnation-bound signaling
+primitive, shutdown fails closed and logs the unsupported capability rather
+than using a raw process ID.
 
 `SIGKILL` at shutdown rather than `SIGTERM` because Phoenix is exiting anyway —
 no point waiting on graceful shutdown handlers when the parent is leaving.
@@ -1078,7 +1083,7 @@ already available.
 | `PARTIAL_IDLE_FLUSH_SECONDS` | 10 | Reader idle interval after which a non-empty partial line is flushed as a complete line |
 | `LIVE_HANDLE_CAP` | 8 | Per-WorkScope cap on `running` handles |
 | `KILL_RESPONSE_TIMEOUT_SECONDS` | 30 | After signal sent, wait this long for exit before returning `kill_pending_kernel` |
-| `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |
+| `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | One global shutdown budget for registered-handle snapshot, incarnation-bound SIGKILL attempts, and handle-exit observation |
 | `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in `final_tail` after exit demotion |
 | `DEFAULT_PEEK_LINES` | 200 | Lines returned when peek has no read modifier |
 | `MAX_LABEL_LENGTH` | 64 | Display bound on `label`; longer labels are deterministically shortened at the tool boundary |
