@@ -93,7 +93,7 @@ async fn https_send_requires_peer_auth_and_checks_destination_and_closed_body() 
             transcript_id: TranscriptConversationId::parse(target.id.clone()).unwrap(),
         },
     );
-    let endpoint = receiver.endpoint("api/federation/peer/send-conversation-message");
+    let endpoint = receiver.endpoint("/api/federation/peer/send-conversation-message");
     let response = receiver
         .client
         .post(&endpoint)
@@ -948,9 +948,14 @@ async fn shared_selectors_never_fall_back_on_unknown_tls_auth_or_unavailable_pee
         let tool = tools.iter().find(|tool| tool.name() == *name).unwrap();
         let local = tool.run(input.clone(), context(&caller, &source.id)).await;
         assert!(local.is_success(), "local {name}: {}", local.output());
+        let marker = if *name == "query_database" {
+            local_target.title.as_deref().unwrap()
+        } else {
+            "localsentinelmarker"
+        };
         assert!(
-            local.output().contains("localsentinelmarker"),
-            "local {name}: {}",
+            local.output().contains(marker),
+            "local {name} expected {marker:?}: {}",
             local.output()
         );
     }

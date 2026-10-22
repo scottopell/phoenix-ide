@@ -16,7 +16,7 @@ async fn real_router_rejects_unpaired_https_query_without_touching_production() 
     });
     let response = receiver
         .client
-        .post(receiver.endpoint("api/federation/peer/query-database"))
+        .post(receiver.endpoint("/api/federation/peer/query-database"))
         .json(&request)
         .send()
         .await
@@ -27,7 +27,7 @@ async fn real_router_rejects_unpaired_https_query_without_touching_production() 
     receiver.stop().await;
 }
 
-fn assert_authoritative_remote_hit(
+async fn assert_authoritative_remote_hit(
     hits: &[crate::api::global_read::QualifiedSearchHit],
     destination: InstanceId,
     receiver: &TestInstance,
@@ -64,11 +64,26 @@ fn assert_authoritative_remote_hit(
                         if product_conversation_id == &ordinary.product_conversation_id
                 )
     ));
-    assert!(matches!(
-        &hits[0].stable_navigation,
-        Some(crate::api::global_read::QualifiedSearchNavigation::Peer { url })
-            if url == &format!("{}c/{}", receiver.origin, ordinary.product_conversation_id)
-    ));
+    let product = receiver
+        .state
+        .db
+        .get_ordinary_product_conversation(&ordinary.product_conversation_id)
+        .await
+        .unwrap();
+    let stable_path = crate::api::product_conversations::product_route(
+        product.root.conversation.slug.as_deref(),
+        ordinary.product_conversation_id.as_str(),
+    );
+    let expected_navigation = receiver.endpoint(&stable_path);
+    assert!(
+        matches!(
+            &hits[0].stable_navigation,
+            Some(crate::api::global_read::QualifiedSearchNavigation::Peer { url })
+                if url == &expected_navigation
+        ),
+        "stable navigation {:?}, expected {expected_navigation}",
+        hits[0].stable_navigation
+    );
 }
 
 #[tokio::test]
@@ -124,7 +139,7 @@ async fn authenticated_https_search_returns_authoritative_identities() {
 
     let unauthenticated = receiver
         .client
-        .post(receiver.endpoint("api/federation/peer/search-conversations"))
+        .post(receiver.endpoint("/api/federation/peer/search-conversations"))
         .json(&crate::api::federation::RemoteSearchRequest {
             caller_instance_id: caller_id,
             destination_instance_id: destination,
@@ -143,7 +158,8 @@ async fn authenticated_https_search_returns_authoritative_identities() {
     )
     .await
     .unwrap();
-    assert_authoritative_remote_hit(&hits, destination, &receiver, &ordinary, &ordinary_message);
+    assert_authoritative_remote_hit(&hits, destination, &receiver, &ordinary, &ordinary_message)
+        .await;
     assert_ne!(caller_id, destination);
     caller.stop().await;
     receiver.stop().await;
@@ -158,7 +174,7 @@ async fn authenticated_https_search_preserves_index_unavailable_reason() {
     let credential = receiver.enroll(caller_id).await;
     let response = receiver
         .client
-        .post(receiver.endpoint("api/federation/peer/search-conversations"))
+        .post(receiver.endpoint("/api/federation/peer/search-conversations"))
         .bearer_auth(credential.expose())
         .json(&crate::api::federation::RemoteSearchRequest {
             caller_instance_id: caller_id,

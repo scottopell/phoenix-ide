@@ -852,6 +852,7 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
     ]);
     let completion = dispatch_response(&mut rt).await;
     let dispatch_generation = completion.generation;
+    assert!(!rt.llm_outcome_is_stale(dispatch_generation));
     assert_eq!(
         completion.admitted.as_ref().unwrap().intent().execution,
         receipt.execution()
@@ -882,7 +883,9 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
     assert!(rt.pending_goal_request_checkpoint.is_none());
     assert_goal_tool_checkpoint(&db, before, first_request).await;
     let successor = receive_automatic_response(&mut rt).await;
-    assert_eq!(successor.generation, dispatch_generation);
+    let tool_dispatch_generation = dispatch_generation.checked_add(1).unwrap();
+    assert_eq!(successor.generation, tool_dispatch_generation);
+    assert!(!rt.llm_outcome_is_stale(successor.generation));
     assert_eq!(rt.active_direct_turn.as_deref(), Some(&start_owner));
     assert_eq!(
         successor.admitted.as_ref().unwrap().intent().execution,
@@ -901,7 +904,11 @@ async fn conversation_goal_actual_tool_completion_checkpoints_persisted_tool_sou
     }
     rt.process_llm_completion(successor).await.unwrap();
     let logical_successor = receive_automatic_response(&mut rt).await;
-    assert_eq!(logical_successor.generation, dispatch_generation);
+    assert_eq!(
+        logical_successor.generation,
+        tool_dispatch_generation.checked_add(1).unwrap()
+    );
+    assert!(!rt.llm_outcome_is_stale(logical_successor.generation));
     assert_eq!(
         logical_successor
             .admitted

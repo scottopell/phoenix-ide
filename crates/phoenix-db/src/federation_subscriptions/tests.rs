@@ -798,28 +798,90 @@ async fn continuation_candidate(f: &Fixture) {
     tx.commit().await.unwrap();
     f.db.update_conversation_state(
         &f.source.id,
-        &ConvState::ContextExhausted {
-            summary: "source summary".into(),
+        &ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "federation-continuation".into(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
         },
     )
     .await
     .unwrap();
-    let summary =
-        f.db.add_message(
-            "federation-summary",
+    let content = crate::MessageContent::continuation("source summary");
+    let summary = crate::Message {
+        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+        message_id: "federation-summary".into(),
+        conversation_id: f.source.id.clone(),
+        sequence_id: 1,
+        message_type: content.message_type(),
+        content,
+        display_data: None,
+        usage_data: None,
+        created_at: chrono::Utc::now(),
+    };
+    assert_eq!(
+        f.db.commit_continuation(
             &f.source.id,
-            &crate::MessageContent::continuation("source summary"),
-            None,
-            None,
+            "federation-continuation",
+            &summary,
+            &ConvState::ContextExhausted {
+                summary: "source summary".into()
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap(),
+        crate::ContinuationCommitOutcome::Applied
+    );
+    assert!(f
+        .db
+        .automatic_continuation_admission(&f.source.id)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+async fn accept_continuation_opening(f: &Fixture) -> crate::Conversation {
+    let admission =
+        f.db.automatic_continuation_admission(&f.source.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let (outcome, _) =
+        f.db.continue_conversation_with_intent(
+            &f.source.id,
+            crate::NewContinuationDispatchIntent::generated_predecessor_context(
+                admission.first_message_id.clone(),
+                "source summary".into(),
+            ),
         )
         .await
         .unwrap();
-    sqlx::query("INSERT INTO automatic_continuation_admissions(predecessor_conversation_id,product_conversation_id,summary_message_id,operation_id,first_message_id,admitted_at_unix_micros,updated_at_unix_micros) VALUES (?1,?2,?3,'federation-continuation','federation-successor-first',1,1)").bind(&f.source.id).bind(f.source.product_conversation_id.as_str()).bind(summary.message_id).execute(f.db.pool()).await.unwrap();
+    let crate::ContinueOutcome::Created(successor) = outcome else {
+        panic!("successor required")
+    };
+    f.db.add_message(
+        admission.first_message_id.as_str(),
+        &successor.id,
+        &crate::MessageContent::continuation("source summary"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    successor
 }
 
 #[tokio::test]
 async fn continuation_candidate_is_hidden_then_released_when_handoff_fails() {
     let f = Fixture::new().await;
+    f.db.set_auto_continue_on_context_exhaustion(
+        &f.source.product_conversation_id,
+        phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
     continuation_candidate(&f).await;
     assert!(facts(f.replay(0, NOW).await).is_empty());
     sqlx::query("UPDATE automatic_continuation_admissions SET phase = 'failed', last_error = 'handoff failed' WHERE predecessor_conversation_id = ?1").bind(&f.source.id).execute(f.db.pool()).await.unwrap();
@@ -832,30 +894,15 @@ async fn continuation_candidate_is_hidden_then_released_when_handoff_fails() {
 #[tokio::test]
 async fn successful_handoff_suppresses_candidate_and_future_fact_keeps_exact_successor() {
     let f = Fixture::new().await;
-    continuation_candidate(&f).await;
-    assert!(facts(f.replay(0, NOW).await).is_empty());
-    let (outcome, _) =
-        f.db.continue_conversation_with_intent(
-            &f.source.id,
-            crate::NewContinuationDispatchIntent::generated_predecessor_context(
-                ClientTurnKey::new("federation-successor-first").unwrap(),
-                "source summary".into(),
-            ),
-        )
-        .await
-        .unwrap();
-    let crate::ContinueOutcome::Created(successor) = outcome else {
-        panic!("successor required")
-    };
-    f.db.add_message(
-        "federation-successor-first",
-        &successor.id,
-        &crate::MessageContent::continuation("source summary"),
-        None,
-        None,
+    f.db.set_auto_continue_on_context_exhaustion(
+        &f.source.product_conversation_id,
+        phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
     )
     .await
     .unwrap();
+    continuation_candidate(&f).await;
+    assert!(facts(f.replay(0, NOW).await).is_empty());
+    let successor = accept_continuation_opening(&f).await;
     assert!(facts(f.replay(0, NOW).await).is_empty());
     f.db.update_conversation_state(
         &successor.id,
@@ -2190,14 +2237,54 @@ async fn real_summary_failure_is_distinct_and_successful_handoff_suppresses_unco
         facts(f.replay(0, chrono::Utc::now().timestamp_micros()).await).len(),
         1
     );
-    f.db.update_conversation_state(
-        &f.source.id,
-        &ConvState::HandedOff {
-            successor_conv_id: "summary-successor".into(),
-        },
+    let summary_event: String = sqlx::query_scalar("SELECT i.event_id FROM federation_terminal_identities i JOIN federation_terminal_payloads p USING(event_id) WHERE i.occurrence_kind = 'continuation_summary' AND p.source_transcript_id = ?1")
+        .bind(&f.source.id).fetch_one(f.db.pool()).await.unwrap();
+    f.db.set_auto_continue_on_context_exhaustion(
+        &f.source.product_conversation_id,
+        phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
     )
     .await
     .unwrap();
+    continuation_candidate(&f).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT continuation_state FROM federation_terminal_identities WHERE event_id = ?1"
+        )
+        .bind(&summary_event)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        "suppressed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM federation_terminal_payloads WHERE event_id = ?1"
+        )
+        .bind(&summary_event)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM federation_terminal_occurrences WHERE occurrence_kind = 'continuation_summary'")
+        .fetch_one(f.db.pool()).await.unwrap(), 1);
+    let awaiting_event: String = sqlx::query_scalar("SELECT i.event_id FROM federation_terminal_identities i JOIN federation_terminal_payloads p USING(event_id) WHERE i.continuation_state = 'awaiting' AND p.source_transcript_id = ?1 AND p.outcome = 'failed' AND p.context_exhausted = 1")
+        .bind(&f.source.id).fetch_one(f.db.pool()).await.unwrap();
+    assert_ne!(summary_event, awaiting_event);
+    let successor = accept_continuation_opening(&f).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT continuation_state FROM federation_terminal_identities WHERE event_id = ?1"
+        )
+        .bind(&awaiting_event)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap(),
+        "suppressed"
+    );
+    let completed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM completed_continuation_handoffs WHERE predecessor_conversation_id = ?1 AND successor_conversation_id = ?2")
+        .bind(&f.source.id).bind(&successor.id).fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(completed, 1);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM federation_terminal_payloads")
             .fetch_one(f.db.pool())

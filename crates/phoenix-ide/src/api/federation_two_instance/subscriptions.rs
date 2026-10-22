@@ -5,6 +5,25 @@ use phoenix_core::domain::{
 };
 use uuid::Uuid;
 
+async fn peer_failure_diagnostic(response: &mut reqwest::Response) -> String {
+    let url = response.url().clone();
+    let status = response.status();
+    let body = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut body = Vec::new();
+        while body.len() < 4096 {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(error) => return format!("body read failed: {error}"),
+            };
+            body.extend_from_slice(&chunk[..chunk.len().min(4096 - body.len())]);
+        }
+        String::from_utf8_lossy(&body).into_owned()
+    })
+    .await;
+    format!("url={url} status={status} body(first 4096 bytes)={body:?}")
+}
+
 async fn source(instance: &TestInstance) -> phoenix_db::Conversation {
     instance
         .state
@@ -142,7 +161,7 @@ async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and
         source.product_conversation_id.clone(),
         id,
     );
-    let create = b
+    let mut create = b
         .client
         .post(b.endpoint("/api/federation/peer/subscriptions/create"))
         .bearer_auth(connection.bearer_credential.expose())
@@ -150,7 +169,11 @@ async fn https_subscription_future_only_nonempty_idle_and_busy_admission_ack_and
         .send()
         .await
         .unwrap();
-    assert!(create.status().is_success());
+    assert!(
+        create.status().is_success(),
+        "{}",
+        peer_failure_diagnostic(&mut create).await
+    );
     let created: SubscriptionResponse = create.json().await.unwrap();
     assert_eq!(created.reference, req.reference);
     let mut replay = req.clone();
@@ -321,16 +344,19 @@ async fn peer_auth_owner_separation_caller_reference_body_bounds_and_unsubscribe
     );
     let mut mismatch = req.clone();
     mismatch.caller_instance_id = InstanceId::new();
+    let mut mismatched_caller = b
+        .client
+        .post(&endpoint)
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&mismatch)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
-        b.client
-            .post(&endpoint)
-            .bearer_auth(peer.bearer_credential.expose())
-            .json(&mismatch)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        mismatched_caller.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        peer_failure_diagnostic(&mut mismatched_caller).await
     );
     let mut mismatch = req.clone();
     mismatch.reference.instance_id = InstanceId::new();
@@ -478,7 +504,7 @@ async fn stage_one(
             after: remote.admitted_cursor,
         },
     };
-    let response = b
+    let mut response = b
         .client
         .post(b.endpoint("/api/federation/peer/subscriptions/replay"))
         .bearer_auth(peer.bearer_credential.expose())
@@ -486,7 +512,11 @@ async fn stage_one(
         .send()
         .await
         .unwrap();
-    assert!(response.status().is_success());
+    assert!(
+        response.status().is_success(),
+        "{}",
+        peer_failure_diagnostic(&mut response).await
+    );
     let response: SubscriptionResponse = response.json().await.unwrap();
     let SubscriptionResult::Replay {
         replay: SubscriptionReplay::Facts { events },

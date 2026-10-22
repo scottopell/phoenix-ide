@@ -23916,7 +23916,7 @@ mod tests {
                 .iter()
                 .map(|(_, message)| (message.message_id.clone(), message.origin.clone()))
                 .collect::<Vec<_>>(),
-            expected_messages
+            expected_messages.into_iter().rev().collect::<Vec<_>>()
         );
     }
 

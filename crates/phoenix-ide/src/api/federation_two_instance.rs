@@ -161,7 +161,11 @@ impl TestInstance {
     }
 
     fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.origin)
+        self.origin
+            .navigation_url(path)
+            .expect("test endpoint is a valid same-origin path")
+            .as_url()
+            .to_string()
     }
 
     async fn stop(self) {
