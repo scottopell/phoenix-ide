@@ -5177,6 +5177,13 @@ mod tests {
             state: conversation.state,
             state_updated_at: conversation.state_updated_at,
         };
+        let workflow_before: (i64, i64, String) = sqlx::query_as(
+            "SELECT version, generation, status FROM workflows WHERE workflow_id = ?1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         for terminal in [
             TurnTerminal::Completed,
             TurnTerminal::Failed {
@@ -5220,6 +5227,22 @@ mod tests {
             assert!(terminal_error
                 .to_string()
                 .contains("accepted user Stop drain"));
+            let obligations: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM direct_turn_terminal_obligations WHERE turn_id = ?1",
+            )
+            .bind(to_i64(turn_id.0, "turn_id").unwrap())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(obligations, 0);
+            let workflow_after: (i64, i64, String) = sqlx::query_as(
+                "SELECT version, generation, status FROM workflows WHERE workflow_id = ?1",
+            )
+            .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(workflow_after, workflow_before);
         }
         let owner: (i64, i64, Option<String>) = sqlx::query_as("SELECT generation, owns_conversation, terminal_kind FROM durable_turns WHERE turn_id = ?1")
             .bind(to_i64(turn_id.0, "turn_id").unwrap()).fetch_one(db.pool()).await.unwrap();
