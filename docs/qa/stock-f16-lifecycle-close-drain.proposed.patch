@@ -1,0 +1,13 @@
+diff --git a/ui/scripts/qualify-view-telemetry.mjs b/ui/scripts/qualify-view-telemetry.mjs
+--- a/ui/scripts/qualify-view-telemetry.mjs
++++ b/ui/scripts/qualify-view-telemetry.mjs
+@@ -781,6 +781,9 @@
+           if (ledgerFailure) throw ledgerFailure;
+           if (!trial.failure) {
+             if (trial.sampled === false) assert.equal(trial.reports.length, 0, 'unsampled lifecycle cannot emit late report');
++            const until = Math.min(deadline, Date.now() + 5000);
++            while (trial.statuses.length < trial.reports.length && Date.now() < until) await new Promise(resolveWait => setTimeout(resolveWait, 20));
++            assert.ok(trial.statuses.every(response => response.status === 204));
+             assert.equal(trial.statuses.length, trial.reports.length, 'final report-response drain');
+             assert.equal(new Set(trial.reports.map(report => report.open_id)).size, trial.reports.length);
+             if (trial.status === 'observed_bfcache_fresh_ready_report') assert.equal(trial.reports.length, 2);

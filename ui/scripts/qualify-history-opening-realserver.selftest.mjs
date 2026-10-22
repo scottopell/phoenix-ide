@@ -4,6 +4,9 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, chmodSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { assertBackgroundReport } from './qualify-view-telemetry.mjs';
+import { prepareJointFailureDiagnostic, TELEMETRY_MODULE_SHA256, TELEMETRY_DIAGNOSTICS_SHA256 } from './history-joint-telemetry.mjs';
 import { sameEdge, openingMatches, faultTarget, previewTransport, updateFault, ownedFile, releaseOnce, ipc, persistedMessageSelector, acceptedWireCursor, retainCleanupFailure } from './qualify-history-opening-realserver.mjs';
 
 test('fault remains active through acceptance and same-page reconnect, but new pin acquisition restores real transport', () => {
@@ -317,7 +320,8 @@ test('runtime seals before qualification, rechecks after cleanup and preserves f
   assert.match(script, /retainCleanupFailure\(result, 'browser_cleanup', error\); process\.exitCode = 1/);
 });
 
-test('outer runner retains primary when actual browser cleanup catches both fail (UNIT ONLY)', async () => {
+for (const failure of ['browser_close', 'finalizer', 'inventory']) for (const withPrimary of [true, false])
+test(`OFFLINE UNIT ONLY actual runner catch retains ${failure} secondary with primary=${withPrimary}`, async () => {
   const script = readFileSync(new URL('./qualify-history-opening-realserver.mjs', import.meta.url), 'utf8');
   const start = script.indexOf('  } catch (error) {\n    result.error = ', script.indexOf('async function run()'));
   const end = script.lastIndexOf('\n}\nif (process.argv');
@@ -326,25 +330,43 @@ test('outer runner retains primary when actual browser cleanup catches both fail
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const execute = new AsyncFunction('ctx', `
     const { primary, result, process, page, recorder, gate, command, releaseOnce, record,
-      jointTelemetry, finalizeHistoryTelemetry, historyTelemetry, updateFault, fault,
+      jointTelemetry, finalizeHistoryTelemetry, diagnoseHistoryFinalization, historyTelemetry, updateFault, fault,
       clearTimeout, hardStop, writeFileSync, resolve, output, retainCleanupFailure } = ctx;
     let browser = ctx.browser;
-    try { throw primary;
+    try { if (primary) throw primary; result.status = 'passed_assertions';
     ${tail}
   `);
-  const primary = new Error('ORIGINAL_DONOR_FAILURE'), result = { status: 'failed' }, writes = [];
+  const primary = withPrimary ? new Error('ORIGINAL_DONOR_FAILURE') : null, result = { status: 'failed' }, writes = [];
+  const modulePath = fileURLToPath(new URL('./qualify-view-telemetry.mjs', import.meta.url));
+  const helper = fileURLToPath(new URL('./view-telemetry-diagnostics.mjs', import.meta.url));
+  const diagnose = prepareJointFailureDiagnostic({ modulePath, dependencies: {
+    [modulePath]: TELEMETRY_MODULE_SHA256, [helper]: TELEMETRY_DIAGNOSTICS_SHA256 } });
+  let actualError; try { assertBackgroundReport({}, {}); } catch (error) { actualError = error; }
+  assert.ok(actualError instanceof Error);
   const process = { exitCode: 0 };
   await execute({ primary, result, process, page: null, recorder: null, gate: { armed: false },
     command: async () => ({}), releaseOnce: async () => {}, record: () => {}, jointTelemetry: true,
-    browser: { close: async () => { throw new Error('OUTER_BROWSER_CLEANUP_FAILURE'); } },
-    finalizeHistoryTelemetry: null, historyTelemetry: null, updateFault: () => {}, fault: {},
+    browser: { close: async () => { if (failure === 'browser_close') throw new Error('OUTER_BROWSER_CLEANUP_FAILURE'); } },
+    finalizeHistoryTelemetry: () => { assert.equal(failure, 'finalizer'); throw actualError; },
+    diagnoseHistoryFinalization: error => { assert.equal(error, actualError); return diagnose(error, 'history_finalization'); },
+    historyTelemetry: { snapshot: () => { if (failure === 'inventory') throw actualError; return {}; } },
+    updateFault: () => {}, fault: {},
     clearTimeout: () => {}, hardStop: null, writeFileSync: (path, body) => writes.push(JSON.parse(body)),
     resolve: (...parts) => parts.join('/'), output: '/UNIT_ONLY', retainCleanupFailure });
-  assert.equal(result.error, primary.stack);
+  assert.equal(result.error, primary?.stack);
   assert.equal(process.exitCode, 1);
   assert.equal(result.status, 'failed');
-  assert.deepEqual(result.cleanup_failures.map(f => f.stage), ['joint_browser_cleanup', 'browser_cleanup']);
-  assert.equal(writes[0].error, primary.stack);
+  assert.deepEqual(result.cleanup_failures.map(f => f.stage), failure === 'browser_close'
+    ? ['joint_browser_cleanup', 'browser_cleanup'] : ['joint_browser_cleanup']);
+  assert.equal(writes[0].error, primary?.stack);
+  const secondary = result.cleanup_failures[0];
+  if (failure === 'finalizer') {
+    assert.equal(secondary.error, actualError.stack.slice(0, 2048));
+    assert.deepEqual(secondary.diagnostic, diagnose(actualError, 'history_finalization'));
+    assert.equal(secondary.diagnostic.resolution, 'verified_assertion_site');
+    assert.equal(secondary.diagnostic.line, 530);
+    assert.equal(writes[0].cleanup_failures[0].diagnostic.phase, 'history_finalization');
+  } else assert.equal(secondary.diagnostic, undefined);
 });
 
 test('cleanup-only runner failures fail closed and remain bounded (UNIT ONLY)', () => {

@@ -357,6 +357,85 @@ export async function authenticateOwnedContext(context, baseURL, env = process.e
   return `phoenix-auth=${cookies[0].value}`;
 }
 
+const FAILURE_PHASES = new Set(['runtime_import', 'export_admission', 'context_acquisition',
+  'session_authentication', 'page_acquisition', 'module_checks', 'result_validation',
+  'context_cleanup', 'dependency_verification', 'history_finalization']);
+
+// Explicit call sites in the two SHA256-pinned f16 sources; never discover sites in prose.
+const F16_ASSERTION_SITES = {
+  'qualify-view-telemetry.mjs': `
+    43:10 44:10 45:10 46:10 51:10 53:10 85:16 92:14 103:14 106:14
+    107:14 121:16 132:10 133:10 134:10 153:12 157:10 164:10 165:10 201:16
+    215:16 288:16 292:16 294:18 301:18 302:18 303:18 305:18 306:18 308:18
+    311:42 326:16 327:16 330:18 331:18 333:16 335:18 336:18 378:12 379:12
+    401:10 404:10 405:10 406:10 437:14 441:51 442:14 460:14 464:14 465:14
+    468:14 475:14 476:14 482:14 483:14 484:14 497:10 512:12 513:12 521:12
+    522:12 530:10 531:10 532:10 533:10 535:12 537:10 543:10 544:47 546:12
+    547:12 548:12 557:10 558:10 560:12 561:12 564:10 566:10 571:10 572:10
+    574:10 575:10 576:10 611:12 615:10 622:10 625:10 644:16 659:18 673:18
+    675:18 678:18 680:18 688:24 715:20 719:20 726:20 735:22 737:22 750:26
+    751:26 752:26 753:26 754:26 755:26 756:26 757:26 758:26 759:136 768:18
+    769:18 783:49 784:20 785:20 786:80 825:10 826:10 827:10 828:10 829:10
+    830:10 831:10 834:12 838:10 851:12 866:16 936:18 941:18 945:18 953:20
+    954:20 956:20 959:20 960:20 961:20 962:20 963:20 964:20 965:20 966:20
+    967:20 968:20 969:20 971:20 972:20 979:20 980:20 986:18 995:20 996:20
+    997:20 998:20 1004:14`,
+  'view-telemetry-diagnostics.mjs': `
+    5:10 7:10 8:10 9:42 10:37 11:40 12:36 13:39 14:41 15:43
+    20:10 21:10 22:10`,
+};
+
+export function prepareJointFailureDiagnostic(config) {
+  const sources = new Map();
+  for (const [relative, expected] of [[TELEMETRY_RELATIVE_MODULE, TELEMETRY_MODULE_SHA256],
+    [TELEMETRY_DIAGNOSTICS_RELATIVE_MODULE, TELEMETRY_DIAGNOSTICS_SHA256]]) {
+    const path = resolve(dirname(config.modulePath), relative.split('/').at(-1));
+    try {
+      const info = lstatSync(path);
+      if (config.dependencies[path] !== expected || realpathSync(path) !== path || !info.isFile() || info.size > 128 * 1024) continue;
+      const bytes = readFileSync(path);
+      if (sha256(bytes) !== expected) continue;
+      const basename = relative.split('/').at(-1), sites = new Map();
+      const lines = bytes.toString('utf8').split('\n');
+      for (const position of F16_ASSERTION_SITES[basename].trim().split(/\s+/)) {
+        const [line, column] = position.split(':').map(Number);
+        if (!/^assert\.(?:equal|notEqual|deepEqual|ok|match)\(/.test(lines[line - 1]?.slice(column - 8) ?? '')) continue;
+        sites.set(position, `f16-${basename.slice(0, -4)}-L${line}-C${column}`);
+      }
+      const source = { basename, expected, sites };
+      sources.set(path, source); sources.set(pathToFileURL(path).href, source);
+    } catch { /* Unavailable or changed source cannot identify an assertion. */ }
+  }
+  return (error, phase) => {
+    const out = { schema_version: 1, phase: FAILURE_PHASES.has(phase) ? phase : 'unknown',
+      error_code: 'unknown', resolution: 'unknown' };
+    try {
+      if (!(error instanceof Error) || error.code !== 'ERR_ASSERTION') return out;
+      out.error_code = 'ERR_ASSERTION';
+      if (!FAILURE_PHASES.has(phase)) return out;
+      const stack = error.stack, message = error.message, name = error.name;
+      if (typeof stack !== 'string' || stack.length > 32768 || typeof message !== 'string' || message.length > 8192
+          || typeof name !== 'string' || name.length > 80) return out;
+      // Exclude the complete message, including embedded fake stack frames.
+      const header = [`${name} [ERR_ASSERTION]: ${message}\n`, `${name}: ${message}\n`].find(value => stack.startsWith(value));
+      if (!header) return out;
+      for (const frame of stack.slice(header.length).split('\n').slice(0, 64)) {
+        if (!frame.startsWith('    at ')) continue;
+        const body = frame.slice(7);
+        const location = body.endsWith(')') && body.includes(' (') ? body.slice(body.lastIndexOf(' (') + 2, -1) : body;
+        if (location.startsWith('node:')) continue;
+        const match = /^(.+):([1-9]\d{0,4}):([1-9]\d{0,4})$/.exec(location);
+        const source = match && sources.get(match[1]);
+        const site = source?.sites.get(`${match[2]}:${match[3]}`);
+        if (!site) return out; // Never attribute a caller beneath an unknown first frame.
+        return { ...out, resolution: 'verified_assertion_site', module_basename: source.basename,
+          module_sha256: source.expected, line: Number(match[2]), column: Number(match[3]), assertion_site_id: site };
+      }
+    } catch { /* Diagnostic extraction must not replace the thrown error. */ }
+    return out;
+  };
+}
+
 export async function runJointTelemetryStage({ config, browser, baseURL, outputDir, historyPhysical, harnessPath, historyGlobalOwnedGetCount, UNIT }) {
   if (config === null) return null;
   assert.equal(config.unitOnly, UNIT !== undefined, 'UNIT dependency injection cannot become fixture proof');
@@ -367,6 +446,8 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
   const before = config.unitOnly ? config.dependencies : dependencyManifest();
   assert.deepEqual(before, config.dependencies, 'telemetry dependency changed before runtime import');
   const load = UNIT?.importModule ?? (url => import(url));
+  const diagnose = prepareJointFailureDiagnostic(config);
+  let primaryDiagnostic = null;
   let context = null, primaryError = null, phase = 'runtime_import';
   try {
     const module = await load(pathToFileURL(config.modulePath).href);
@@ -398,26 +479,31 @@ export async function runJointTelemetryStage({ config, browser, baseURL, outputD
         history_global_cache_zero_get_is_history_evidence_not_telemetry_cold_start: historyGlobalOwnedGetCount === 0 },
       ready_report_oracle: readyReportOracle };
     let finalized = false;
-    return { receipt, finalizeHistory(inventory) {
+    return { receipt, diagnoseHistoryFinalization: error => diagnose(error, 'history_finalization'), finalizeHistory(inventory) {
       assert.equal(finalized, false, 'history inventory finalizes once after browser closure'); finalized = true;
       appendObservedHistory(result, inventory, config.input.fixtures.identity, module, config.input.fixtures);
       writeFileSync(resolve(outputDir, 'telemetry/telemetry-browser-result.json'), JSON.stringify(result, null, 2));
       receipt.additional_history = result.additional_history;
     } };
-  } catch (error) { primaryError = error; throw error; }
+  } catch (error) { primaryError = error; primaryDiagnostic = diagnose(error, phase); throw error; }
   finally {
-    const cleanupErrors = [];
-    try { if (context) await context.close(); } catch (error) { cleanupErrors.push(error); }
+    const cleanupErrors = [], secondaryDiagnostics = [];
+    try { if (context) await context.close(); } catch (error) {
+      cleanupErrors.push(error); secondaryDiagnostics.push(diagnose(error, 'context_cleanup'));
+    }
     let after = null;
     try {
       after = config.unitOnly ? config.dependencies : dependencyManifest();
       assert.deepEqual(after, before, 'telemetry dependency changed before context drain completed');
-    } catch (error) { cleanupErrors.push(error); }
+    } catch (error) {
+      cleanupErrors.push(error); secondaryDiagnostics.push(diagnose(error, 'dependency_verification'));
+    }
     try {
       writeFileSync(resolve(outputDir, 'joint-telemetry-dependency-manifest.json'), JSON.stringify({
         evidence_class: config.unitOnly ? 'UNIT_ONLY_not_runtime' : 'runtime_dependency_bytes_not_acceptance',
         before, after, primary_failure: primaryError ? String(primaryError.message).slice(0, 1024) : null,
         failure_phase: primaryError ? phase : null, context_acquired: context !== null,
+        primary_diagnostic: primaryDiagnostic, secondary_diagnostics: secondaryDiagnostics,
         authentication_response_cleanup_failure: primaryError?.owned_auth_cleanup_failure ?? null,
         cleanup_failures: cleanupErrors.map(error => String(error.message).slice(0, 1024)),
       }, null, 2));

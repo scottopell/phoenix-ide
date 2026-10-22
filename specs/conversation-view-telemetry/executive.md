@@ -2,6 +2,34 @@
 
 Task 32005 is user-commissioned, independently owned telemetry work. Global retains merge/deploy admission; this is not an implicit release blocker.
 
+## Current bounded checkpoint — retained results, not acceptance
+
+The [primary diagnostic and disposition](../../docs/qa/stock-f16-primary-diagnostic.md)
+and [current preparation boundary](../../tests/e2e/history-stock-prepare.md) are the
+navigation entrypoints for this checkpoint. The historical stock failure remains
+**INCONCLUSIVE_MISSING_EVIDENCE**: neither its first primary nor a cleanup-only
+cause can be reconstructed from the retained publication.
+
+- [Stage 1 actual result](../../docs/qa/results/context-close-39146439582/README.md):
+  bounded bare-Playwright schedules did not reproduce a response after successful
+  context-close resolution. The conditional close-drain patch remains unvalidated
+  and unapplied.
+- [Stage 2 actual result](../../docs/qa/results/reporter-pagehide-39148822485/README.md):
+  the actual reporter reached the synthetic receiver with matching bodies and
+  server-finished 204s, but no matching client 204 was observed; the positive
+  functional gate failed. This is an observation/qualification boundary, not a
+  production collector/export invariant violation or historical causal closure.
+- [Exact-main geometry source integration](../../docs/qa/finalization-geometry-integration.md)
+  is discoverable source only. Exact-successor hosted geometry qualification is
+  **NOT DONE**. Publication is **BLOCKED**: the benchmark-only offline label does
+  not suppress the inherited geometry browser job, and the parent's no-new-browser
+  policy gate is unresolved. Neither workflow nor execution policy changes here.
+
+No real-candidate collector/export/full-inventory/normal-drain acceptance, full
+acceptance, or overhead clearance is granted. All normative requirements remain
+unchanged. The incremental records below retain their historical scope; old
+preparation/pending-result statements do not supersede this bounded checkpoint.
+
 ## Implemented source increment
 
 - `ConversationViewJourney`: first-once monotonic marks, signed readiness difference, null missing marks, canceled/failed/incomplete outcomes, censored five-minute saturation, sixteen observed correlations and drop counters, bounded background and observer counters. Presentation evidence is `commit_frame_estimate`, not pixel proof.

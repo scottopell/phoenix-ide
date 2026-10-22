@@ -52,6 +52,22 @@ Harness-local receipts are retained under `.phoenix/disclosure-spike/frozen-*-re
 
 An inherited downstream limitation remains unresolved: both the native control and v6 prototype failed native HAST conversion at **4,096 nested blockquotes** with `RangeError: Maximum call stack size exceeded` (`v6-hast-depth.jsonl`). Successful native compilation and iterative application walks do not resolve or qualify that renderer-depth limitation. Extension traversal/submission counters do not count every native speculative read and must not be promoted to a native linear-time or arbitrary-depth safety claim.
 
+## Assistant Finalization Geometry Qualification
+
+REQ-CONV-019's streaming-to-finalized transition is covered by the shared
+`AssistantMessageChrome`, contained streaming-table rendering, and Ladle fixtures
+for full/compact prose, tables, and transcript reader ownership. The
+`check-finalization-geometry` CI job checks out the PR head (or push SHA) and runs
+the four committed capture entrypoints, including the sub-agent task-details
+fixture. `history_stock_prepare.test.py` has source-only regressions for committed
+resource completeness and matching workflow checkout authority; those checks do
+not launch the captures.
+
+The [source integration audit](../../docs/qa/finalization-geometry-integration.md)
+records resource discovery, validation boundaries, and the unchanged automatic
+browser gate. Source integration does not establish a new rendered acceptance
+result or resolve the separate historical stock telemetry incident.
+
 ## Status Summary
 
 | Requirement | Status | Notes |

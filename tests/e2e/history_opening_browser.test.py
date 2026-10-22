@@ -247,9 +247,8 @@ class OpeningQualificationTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-latest", workflow[workflow.index("  qualify-history-realserver:"):start])
 
     def test_ui_command_is_accepted_by_exact_app_lane_resolver_not_ci_group_alias(self):
-        import ast, subprocess, sys, os
-        app = Path(os.environ.get("HISTORY_PINNED_SOURCE", os.environ.get("APP_ROOT", "target/history-hidden-geometry-repair")))
-        source = subprocess.check_output(["git", "-C", str(app), "show", f"{opening.PIN}:dev.py"], text=True)
+        import ast, re, subprocess, sys
+        source = subprocess.check_output(["git", "-C", str(Path(os.environ.get('APP_ROOT', opening.ROOT))), "show", f"{opening.PIN}:dev.py"], text=True)
         tree = ast.parse(source)
         selected = [node for node in tree.body if
                     isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in {"_LANE_DEFS", "_LANE_ALIASES"} for t in node.targets)
@@ -257,11 +256,15 @@ class OpeningQualificationTests(unittest.TestCase):
         scope = {"sys": sys}
         exec(compile(ast.Module(body=selected, type_ignores=[]), "exact-app-lane-resolver", "exec"), scope)
         scope["_all_lanes"] = lambda: {lane[0] for lane in scope["_LANE_DEFS"]}
-        active, skipped = scope["_resolve_check_lanes"](gate=False, lanes="tsc,ui-lint,vitest")
+        workflow = (opening.ROOT / '.github/workflows/ci.yml').read_text()
+        step = workflow.split('      - name: Full UI source qualification', 1)[1].split('      - name:', 1)[0]
+        lanes = re.findall(r'./dev.py check --lanes ([a-z,-]+)', step)
+        self.assertEqual(set(lanes), {'tsc,ui-lint,vitest'})
+        active, skipped = scope["_resolve_check_lanes"](gate=False, lanes=lanes[0])
         self.assertEqual(active, {"tsc", "ui-lint", "vitest"})
         self.assertEqual(skipped, {})
-        with self.assertRaises(SystemExit):
-            scope["_resolve_check_lanes"](gate=False, lanes="ui")
+        self.assertNotIn('--lanes ui\n', step)
+        self.assertNotIn('blocked_existing_driver', workflow)
 
     def test_owned_home_fixture_is_executed_not_only_compiled_by_codegen(self):
         workflow = (opening.ROOT / ".github/workflows/ci.yml").read_text()

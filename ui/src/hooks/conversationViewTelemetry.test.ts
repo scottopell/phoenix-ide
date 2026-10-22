@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ViewJourneyReporter, type ViewIdentity } from './conversationViewTelemetry';
+import { ConversationViewJourney } from './conversationViewJourney';
+import * as uuid from '../utils/uuid';
 const identity: ViewIdentity = {
   product_conversation_id: crypto.randomUUID(), segment_id: crypto.randomUUID(),
   route: 'ordinary', trigger: 'navigation', standalone: false, platform: 'desktop',
@@ -9,7 +11,10 @@ const identity: ViewIdentity = {
 };
 
 describe('ViewJourneyReporter', () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
 
   it('samples before outcome, retains failed/canceled denominators and creates unique IDs', async () => {
     const send = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
@@ -23,6 +28,55 @@ describe('ViewJourneyReporter', () => {
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
     const payload = JSON.parse(send.mock.calls[0]![1]!.body as string);
     expect(payload).toMatchObject({ outcome: 'failed', admitted_count: 3, sampled_count: 2, sample_rate: 0.25 });
+  });
+
+  it('uses the default 0.25 boundary on every draw, including sixteen false admissions after sampled ones', () => {
+    const draws = [0, 0.25 - Number.EPSILON, 0.25, ...Array<number>(15).fill(0.9), 0];
+    const random = vi.fn<() => number>();
+    draws.forEach(draw => random.mockReturnValueOnce(draw));
+    const send = vi.fn<typeof fetch>();
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+    const reporter = new ViewJourneyReporter({ random, send });
+    const attempts = draws.map(() => reporter.begin(identity));
+    const decisions = [true, true, ...Array<boolean>(16).fill(false), true];
+
+    expect(attempts.map(attempt => attempt !== null)).toEqual(decisions);
+    expect(random).toHaveBeenCalledTimes(draws.length);
+    expect(dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail)).toEqual(
+      decisions.map((sampled, index) => ({
+        version: 1, kind: 'admission', route: 'ordinary', sampled,
+        open_id: attempts[index]?.openId ?? null,
+      })),
+    );
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('returns false admission before identity cleaning, visibility, clock or per-open UUID work', () => {
+    const cleanRead = vi.fn(() => { throw new Error('identity cleaning reached'); });
+    const visibleRead = vi.fn(() => { throw new Error('visibility read reached'); });
+    const guarded = {
+      ...identity,
+      get product_conversation_id(): string { return cleanRead(); },
+      get visible(): boolean { return visibleRead(); },
+    };
+    const generateUUID = vi.spyOn(uuid, 'generateUUID');
+    const visibility = vi.spyOn(ConversationViewJourney.prototype, 'visibility');
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+    const clock = vi.fn(() => 0);
+    const send = vi.fn<typeof fetch>();
+    const random = vi.fn(() => 0.25);
+    const reporter = new ViewJourneyReporter({ random, send });
+    expect(generateUUID).toHaveBeenCalledTimes(1); // Constructor reporter ID, not an open ID.
+    generateUUID.mockClear();
+
+    expect(reporter.begin(guarded, clock)).toBeNull();
+    expect(random).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls.map(([event]) => (event as CustomEvent).detail)).toEqual([
+      { version: 1, kind: 'admission', route: 'ordinary', open_id: null, sampled: false },
+    ]);
+    for (const untouched of [cleanRead, visibleRead, visibility, clock, generateUUID, send]) {
+      expect(untouched).not.toHaveBeenCalled();
+    }
   });
 
   it('drops concurrent reports, does not queue offline work, and aborts a single bounded attempt', async () => {

@@ -1,0 +1,291 @@
+{
+  "version": 1,
+  "runId": "b507fc5b-a61f-4100-b68e-6efa43576c5e",
+  "provenance": {
+    "node": "v26.12.0",
+    "playwright": "1.61.0",
+    "lockSha256": "42552207bd7922e4bc35f75f18fc3091c3f8917d8d996a6206e533f4514dedd0",
+    "browserRevision": "1228",
+    "sourceCommit": "0b4bc78aef2fa3382de5729d186f5d8b25981435"
+  },
+  "cases": [
+    {
+      "case": "before",
+      "runId": "b507fc5b-a61f-4100-b68e-6efa43576c5e",
+      "caseId": "510c0de9-bc39-4ddb-8eff-8e93875313a6",
+      "primaryError": null,
+      "cleanupErrors": [],
+      "events": [
+        {
+          "kind": "collector_received",
+          "atMs": 786.7845069999998
+        },
+        {
+          "kind": "request_emit",
+          "atMs": 787.950756
+        },
+        {
+          "kind": "response_release",
+          "atMs": 788.093513
+        },
+        {
+          "kind": "response_end_attempt",
+          "atMs": 788.126444
+        },
+        {
+          "kind": "response_end_callback",
+          "atMs": 788.421486
+        },
+        {
+          "kind": "server_response_finish",
+          "atMs": 788.5153209999999
+        },
+        {
+          "kind": "server_response_close",
+          "atMs": 788.5576599999999
+        },
+        {
+          "kind": "client_response",
+          "atMs": 789.9796509999999
+        },
+        {
+          "kind": "page_response",
+          "atMs": 789.9970229999999
+        },
+        {
+          "kind": "close_begin",
+          "atMs": 790.0431289999999
+        },
+        {
+          "kind": "request_failed",
+          "atMs": 791.593216
+        },
+        {
+          "kind": "close_resolve",
+          "atMs": 795.611965
+        },
+        {
+          "kind": "browser_close_resolve",
+          "atMs": 823.6200669999998
+        }
+      ],
+      "facts": {
+        "postCount": 1,
+        "requestOwned": true,
+        "collectorOwned": true,
+        "responseJoined": true,
+        "pageResponseJoined": true,
+        "failureJoined": true,
+        "clientStatus": 204,
+        "pageStatus": 204,
+        "releaseWhileClosePending": false,
+        "browserClosed": true,
+        "responseEndAttempted": true,
+        "responseEndCallback": true,
+        "responseEndCallbackError": false,
+        "writeAvailable": true,
+        "serverFinished": true,
+        "serverClosed": true,
+        "forcedSocketDisposal": false
+      },
+      "outcome": "response_before_close_resolve"
+    },
+    {
+      "case": "during",
+      "runId": "b507fc5b-a61f-4100-b68e-6efa43576c5e",
+      "caseId": "d9288efa-bb34-40e9-909d-11e3eea581b6",
+      "primaryError": null,
+      "cleanupErrors": [],
+      "events": [
+        {
+          "kind": "collector_received",
+          "atMs": 121.11378000000013
+        },
+        {
+          "kind": "request_emit",
+          "atMs": 121.68897500000003
+        },
+        {
+          "kind": "close_begin",
+          "atMs": 121.73354800000016
+        },
+        {
+          "kind": "response_release",
+          "atMs": 121.88708500000007
+        },
+        {
+          "kind": "response_end_attempt",
+          "atMs": 121.89363700000013
+        },
+        {
+          "kind": "response_end_callback",
+          "atMs": 122.49174500000004
+        },
+        {
+          "kind": "server_response_finish",
+          "atMs": 122.53043700000012
+        },
+        {
+          "kind": "server_response_close",
+          "atMs": 122.56722600000012
+        },
+        {
+          "kind": "client_response",
+          "atMs": 123.5045070000001
+        },
+        {
+          "kind": "page_response",
+          "atMs": 123.5139650000001
+        },
+        {
+          "kind": "request_failed",
+          "atMs": 123.63647400000013
+        },
+        {
+          "kind": "close_resolve",
+          "atMs": 127.17416400000002
+        },
+        {
+          "kind": "browser_close_resolve",
+          "atMs": 152.1507680000002
+        }
+      ],
+      "facts": {
+        "postCount": 1,
+        "requestOwned": true,
+        "collectorOwned": true,
+        "responseJoined": true,
+        "pageResponseJoined": true,
+        "failureJoined": true,
+        "clientStatus": 204,
+        "pageStatus": 204,
+        "releaseWhileClosePending": true,
+        "browserClosed": true,
+        "responseEndAttempted": true,
+        "responseEndCallback": true,
+        "responseEndCallbackError": false,
+        "writeAvailable": true,
+        "serverFinished": true,
+        "serverClosed": true,
+        "forcedSocketDisposal": false
+      },
+      "outcome": "response_before_close_resolve"
+    },
+    {
+      "case": "after",
+      "runId": "b507fc5b-a61f-4100-b68e-6efa43576c5e",
+      "caseId": "26da39c2-c462-4b16-b1d5-bc65ec85beaf",
+      "primaryError": null,
+      "cleanupErrors": [],
+      "events": [
+        {
+          "kind": "collector_received",
+          "atMs": 122.6965990000001
+        },
+        {
+          "kind": "request_emit",
+          "atMs": 123.18242600000008
+        },
+        {
+          "kind": "close_begin",
+          "atMs": 123.22141899999997
+        },
+        {
+          "kind": "server_response_close",
+          "atMs": 127.10879999999997
+        },
+        {
+          "kind": "close_resolve",
+          "atMs": 127.51406799999995
+        },
+        {
+          "kind": "response_release",
+          "atMs": 127.5200890000001
+        },
+        {
+          "kind": "response_end_attempt",
+          "atMs": 127.52198199999998
+        },
+        {
+          "kind": "browser_close_resolve",
+          "atMs": 151.055026
+        }
+      ],
+      "facts": {
+        "postCount": 1,
+        "requestOwned": true,
+        "collectorOwned": true,
+        "responseJoined": false,
+        "pageResponseJoined": false,
+        "failureJoined": false,
+        "clientStatus": null,
+        "pageStatus": null,
+        "releaseWhileClosePending": false,
+        "browserClosed": true,
+        "responseEndAttempted": true,
+        "responseEndCallback": false,
+        "responseEndCallbackError": null,
+        "writeAvailable": false,
+        "serverFinished": false,
+        "serverClosed": true,
+        "forcedSocketDisposal": false
+      },
+      "outcome": "no_response_observed"
+    },
+    {
+      "case": "never",
+      "runId": "b507fc5b-a61f-4100-b68e-6efa43576c5e",
+      "caseId": "17da72e2-ea23-4a57-8558-959be32beb5d",
+      "primaryError": null,
+      "cleanupErrors": [],
+      "events": [
+        {
+          "kind": "collector_received",
+          "atMs": 143.2608069999999
+        },
+        {
+          "kind": "request_emit",
+          "atMs": 143.88520399999993
+        },
+        {
+          "kind": "close_begin",
+          "atMs": 143.9551449999999
+        },
+        {
+          "kind": "server_response_close",
+          "atMs": 149.811197
+        },
+        {
+          "kind": "close_resolve",
+          "atMs": 150.17724099999987
+        },
+        {
+          "kind": "browser_close_resolve",
+          "atMs": 174.04019799999992
+        }
+      ],
+      "facts": {
+        "postCount": 1,
+        "requestOwned": true,
+        "collectorOwned": true,
+        "responseJoined": false,
+        "pageResponseJoined": false,
+        "failureJoined": false,
+        "clientStatus": null,
+        "pageStatus": null,
+        "releaseWhileClosePending": false,
+        "browserClosed": true,
+        "responseEndAttempted": false,
+        "responseEndCallback": false,
+        "responseEndCallbackError": null,
+        "writeAvailable": null,
+        "serverFinished": false,
+        "serverClosed": true,
+        "forcedSocketDisposal": true
+      },
+      "outcome": "no_response_observed"
+    }
+  ],
+  "suiteError": null,
+  "cleanupErrors": []
+}
