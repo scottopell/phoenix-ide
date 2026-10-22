@@ -16299,17 +16299,24 @@ mod authoritative_user_message_effect_tests {
             .await
             .established()
             .unwrap();
-        assert!(matches!(
-            materialized,
-            phoenix_db::workflow::MaterializeAuthoritativeTurnOutcome::Materialized(_)
-        ));
-        assert_eq!(
-            db.get_message_by_id("stop-input")
-                .await
-                .unwrap()
-                .sequence_id,
-            1
-        );
+        let phoenix_db::workflow::MaterializeAuthoritativeTurnOutcome::Materialized(materialized) =
+            materialized
+        else {
+            panic!("expected fresh canonical materialization");
+        };
+        assert_eq!(materialized.turn_id, turn_id);
+        assert_eq!(materialized.generation, 0);
+        assert_eq!(materialized.message.message_id, "conv-direct:stop-input");
+        assert_eq!(materialized.message.sequence_id, 1);
+        let persisted_input = db
+            .get_message_by_id(&materialized.message.message_id)
+            .await
+            .unwrap();
+        assert_eq!(persisted_input.message_id, materialized.message.message_id);
+        assert_eq!(persisted_input.conversation_id, "conv-direct");
+        assert_eq!(persisted_input.sequence_id, 1);
+        assert_eq!(persisted_input.content, materialized.message.content);
+        assert_eq!(persisted_input.origin, materialized.message.origin);
         use phoenix_core::domain::provider_replay::{
             AnthropicPrivateBlock, AnthropicResponseIdentity, AnthropicResponseSet, ContentIndex,
         };
