@@ -51,10 +51,13 @@ jobs:
           cargo test -p phoenix-tools bash::launch_protocol::tests -- --show-output
           cargo test -p phoenix-tools bash::ring::tests -- --show-output
           cargo test -p phoenix-tools bash::registry::tests -- --show-output
-          cargo test -p phoenix_ide browser_retirement -- --show-output
-          cargo test -p phoenix_ide coordinator_bash_executes_owned_home_with_zero_ordinary_conversations -- --show-output
-          cargo test -p phoenix_ide real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay -- --show-output
-          cargo test -p phoenix_ide conversation_runtime_dispatches_real_zero_and_normal_bash_waits -- --show-output
+          # One libtest invocation preserves all filters without recompiling the
+          # large IDE test harness for each filter. Keep its cases serial.
+          cargo test -p phoenix_ide --lib -- --show-output --test-threads=1 \
+            browser_retirement \
+            coordinator_bash_executes_owned_home_with_zero_ordinary_conversations \
+            real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay \
+            conversation_runtime_dispatches_real_zero_and_normal_bash_waits
       - uses: actions/upload-artifact@v4
         if: always()
         with:
