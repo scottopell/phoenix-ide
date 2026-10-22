@@ -167,7 +167,7 @@ fn process_start_time(_pid: u32) -> Result<u128, IdentityObservationFailure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessIdentity, current_process_identity, process_identity_matches};
+    use super::{current_process_identity, process_identity_matches, ProcessIdentity};
 
     #[test]
     fn bsdinfo_short_denied_and_missing_results_have_typed_causes() {

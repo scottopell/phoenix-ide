@@ -28,12 +28,12 @@ use super::handle::{
     BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState,
     KillSignal, BASH_LAUNCH_UUID_ENV_VAR, TOMBSTONE_TAIL_LINES,
 };
-use super::ValidatedBashSpawnTarget;
 use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary, SpawnReservation};
 use super::ring::RingBuffer;
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
+use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
@@ -139,6 +139,10 @@ pub enum BashError {
         provided: i64,
         max: u64,
     },
+    LaunchReleaseUnknown {
+        handle: String,
+        error_message: String,
+    },
     SpawnFailed {
         error_message: String,
     },
@@ -201,6 +205,13 @@ impl BashError {
                     max_wait_seconds: max,
                 }
             }
+            BashError::LaunchReleaseUnknown {
+                handle,
+                error_message,
+            } => BashErrorResponse::LaunchReleaseUnknown {
+                handle,
+                error_message,
+            },
             BashError::SpawnFailed { error_message } => {
                 BashErrorResponse::SpawnFailed { error_message }
             }
@@ -538,7 +549,7 @@ async fn run_run(
     spawn_context: &SpawnContext,
     spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
-    run_run_with_identity_probe(
+    run_run_with_identity_probe_mode(
         cmd,
         label,
         wait_seconds,
@@ -546,6 +557,7 @@ async fn run_run(
         ctx,
         spawn_context,
         spawn_mode,
+        if cfg!(test) { SpawnProtocol::Legacy } else { SpawnProtocol::Gated },
         |pid| match phoenix_core::process_identity::observe_process_identity(pid) {
             Ok(identity) => Some(identity),
             Err(cause) => {
@@ -563,7 +575,13 @@ async fn run_run(
     .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnProtocol {
+    Legacy,
+    Gated,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_run_with_identity_probe(
     cmd: &str,
     label: Option<String>,
@@ -572,6 +590,32 @@ async fn run_run_with_identity_probe(
     ctx: &ToolContext,
     spawn_context: &SpawnContext,
     spawn_mode: BashSpawnMode,
+    probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
+) -> ToolOutput {
+    run_run_with_identity_probe_mode(
+        cmd,
+        label,
+        wait_seconds,
+        read_args,
+        ctx,
+        spawn_context,
+        spawn_mode,
+        SpawnProtocol::Legacy,
+        probe,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_run_with_identity_probe_mode(
+    cmd: &str,
+    label: Option<String>,
+    wait_seconds: u64,
+    read_args: ReadArgs,
+    ctx: &ToolContext,
+    spawn_context: &SpawnContext,
+    spawn_mode: BashSpawnMode,
+    protocol: SpawnProtocol,
     probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
 ) -> ToolOutput {
     // REQ-BASH-011: command safety is enforced upstream by the permission seam
@@ -608,23 +652,25 @@ async fn run_run_with_identity_probe(
     };
 
     let ring_bytes_cap = registry.ring_bytes_cap();
-    let launched = spawn_child_with_identity_probe(
+    let launched = spawn_child_with_identity_probe_protocol(
         cmd,
         label.clone(),
         ctx,
         spawn_context,
-        reservation.handle_id().clone(),
+        reservation.handle_id().to_string(),
         ring_bytes_cap,
         &spawn_mode,
+        protocol,
         probe,
     )
     .map(|(handle, spawned)| {
         let started_at = spawned.started_at;
-        let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
+        let (child, launch_gate, sandbox_scratch_dir) = spawned.into_waiter_parts();
         (
             handle,
             UnregisteredChild {
                 child,
+                launch_gate,
                 sandbox_scratch_dir,
                 started_at,
             },
@@ -645,11 +691,19 @@ async fn run_run_with_identity_probe(
         let ctx = &ctx;
         match launched {
             Ok((handle, spawned)) => {
-                let Ok(Ok(inserted)) = tokio::time::timeout(
-                    REGISTRATION_TIMEOUT,
-                    registry.commit_spawn(&mut reservation, handle.clone()),
-                )
-                .await
+                let gated_launch = spawned.launch_gate.is_some();
+                let commit = async {
+                    if gated_launch {
+                        registry
+                            .commit_spawn_gated(&mut reservation, handle.clone())
+                            .await
+                    } else {
+                        registry
+                            .commit_spawn(&mut reservation, handle.clone())
+                            .await
+                    }
+                };
+                let Ok(Ok(inserted)) = tokio::time::timeout(REGISTRATION_TIMEOUT, commit).await
                 else {
                     return settle_unregistered_run(
                         spawned,
@@ -681,6 +735,7 @@ async fn run_run_with_identity_probe(
                     .map(|reporter| LiveBashProgressLease(reporter.clone()));
                 let UnregisteredChild {
                     child,
+                    mut launch_gate,
                     sandbox_scratch_dir,
                     ..
                 } = spawned;
@@ -693,6 +748,18 @@ async fn run_run_with_identity_probe(
                     sandbox_scratch_dir,
                     progress_reporter.clone(),
                 );
+                if let Some(gate) = launch_gate.take() {
+                    if let Err(error) = gate.release().await {
+                        reservation.mark_unregistered();
+                        tracing::error!(%error, handle = %handle.handle_id, "registered bash launch gate release failed; command execution may have started and outcome is uncertain");
+                        registry.abort_spawn(reservation);
+                        return BashError::LaunchReleaseUnknown {
+                            handle: handle.handle_id.to_string(),
+                            error_message: format!("bash launch release failed ({error}); command execution may have started. Do not retry automatically; the command may have executed."),
+                        }.into_tool_output();
+                    }
+                    registry.abort_spawn(reservation);
+                }
                 race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
             Err(SpawnChildError::NotSpawned(error_message)) => {
@@ -747,11 +814,43 @@ impl From<String> for SpawnChildError {
 #[derive(Debug)]
 struct UnregisteredChild {
     child: tokio::process::Child,
+    launch_gate: Option<LaunchGate>,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
     started_at: Instant,
 }
 
+#[derive(Debug)]
+struct LaunchGate {
+    writer: tokio::process::ChildStdin,
+    payload: Vec<u8>,
+}
+
+impl LaunchGate {
+    async fn release(self) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = self.writer;
+        match tokio::time::timeout(LAUNCH_RELEASE_TIMEOUT, async {
+            writer
+                .write_all(&self.payload)
+                .await
+                .map_err(|error| format!("failed to write bash launch payload: {error}"))?;
+            writer
+                .shutdown()
+                .await
+                .map_err(|error| format!("failed to close bash launch gate: {error}"))
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "bash launch payload write/close exceeded {LAUNCH_RELEASE_TIMEOUT:?}"
+            )),
+        }
+    }
+}
+
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(1);
+const LAUNCH_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const UNREGISTERED_SETTLEMENT_TIMEOUT: Duration = Duration::from_millis(250);
 const DIRECT_CHILD_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -847,6 +946,7 @@ fn settle_unregistered_run(
     read_args: &ReadArgs,
     launch_error: BashLaunchError,
 ) -> impl std::future::Future<Output = ToolOutput> + Send + 'static {
+    drop(unregistered.launch_gate.take());
     let started = unregistered.started_at;
     let cmd = cmd.to_string();
     let read_args = read_args.clone();
@@ -930,6 +1030,7 @@ fn unregistered_tool_output(run: BashUnregisteredRun, cause: Option<&FinalCause>
 
 struct SpawnedProcessGroup {
     child: Option<tokio::process::Child>,
+    launch_gate: Option<LaunchGate>,
     started_at: Instant,
     pgid: i32,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
@@ -937,25 +1038,41 @@ struct SpawnedProcessGroup {
 
 impl SpawnedProcessGroup {
     fn new(
-        child: tokio::process::Child,
+        mut child: tokio::process::Child,
         pgid: i32,
         sandbox_scratch_dir: Option<std::path::PathBuf>,
         started_at: Instant,
+        payload: Option<Vec<u8>>,
     ) -> Self {
+        let launch_gate = payload.map(|payload| LaunchGate {
+            writer: child.stdin.take().expect("gated launcher stdin is piped"),
+            payload,
+        });
         Self {
             child: Some(child),
+            launch_gate,
             started_at,
             pgid,
             sandbox_scratch_dir,
         }
     }
 
-    fn into_waiter_parts(mut self) -> (tokio::process::Child, Option<std::path::PathBuf>) {
+    fn into_waiter_parts(
+        mut self,
+    ) -> (
+        tokio::process::Child,
+        Option<LaunchGate>,
+        Option<std::path::PathBuf>,
+    ) {
         let child = self
             .child
             .take()
             .expect("spawned child already transferred");
-        (child, self.sandbox_scratch_dir.take())
+        (
+            child,
+            self.launch_gate.take(),
+            self.sandbox_scratch_dir.take(),
+        )
     }
 
     #[cfg(test)]
@@ -1024,6 +1141,31 @@ fn spawn_child_with_identity_probe(
     spawn_mode: &BashSpawnMode,
     probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
 ) -> Result<(Arc<Handle>, SpawnedProcessGroup), SpawnChildError> {
+    spawn_child_with_identity_probe_protocol(
+        cmd,
+        label,
+        ctx,
+        spawn_context,
+        handle_id,
+        ring_bytes_cap,
+        spawn_mode,
+        SpawnProtocol::Legacy,
+        probe,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_child_with_identity_probe_protocol(
+    cmd: &str,
+    label: Option<String>,
+    ctx: &ToolContext,
+    spawn_context: &SpawnContext,
+    handle_id: HandleId,
+    ring_bytes_cap: usize,
+    spawn_mode: &BashSpawnMode,
+    protocol: SpawnProtocol,
+    probe: impl FnOnce(u32) -> Option<phoenix_core::process_identity::ProcessIdentity>,
+) -> Result<(Arc<Handle>, SpawnedProcessGroup), SpawnChildError> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
@@ -1044,8 +1186,80 @@ fn spawn_child_with_identity_probe(
     // so that `kill(-pgid, sig)` reaches the user's processes.
     let mut sandbox_scratch_dir = None;
     let launch_uuid = uuid::Uuid::new_v4().to_string();
-    let mut command = match spawn_mode {
-        BashSpawnMode::Direct | BashSpawnMode::ExplicitTarget(_) => {
+    let use_gate = protocol == SpawnProtocol::Gated;
+    let payload = if use_gate {
+        #[cfg(unix)]
+        {
+            #[cfg(test)]
+            let executable = std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| {
+                    "PHOENIX_BASH_LAUNCH_TEST_EXE must name the native phoenix_ide binary"
+                        .to_string()
+                })?;
+            #[cfg(not(test))]
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("failed to resolve phoenix executable: {error}"))?;
+            let (mode, working_dir, mut environment) = match spawn_mode {
+                BashSpawnMode::ExploreReadOnly => {
+                    let sandbox = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
+                    sandbox_scratch_dir = Some(sandbox.scratch_dir);
+                    let working_dir = sandbox
+                        .command
+                        .get_current_dir()
+                        .ok_or_else(|| {
+                            "Explore sandbox launcher omitted its working directory".to_string()
+                        })?
+                        .to_path_buf();
+                    let environment = sandbox
+                        .command
+                        .get_envs()
+                        .filter_map(|(key, value)| {
+                            value.map(|value| (key.to_os_string(), value.to_os_string()))
+                        })
+                        .collect();
+                    (
+                        super::launch_protocol::BashLaunchMode::ExploreReadOnly,
+                        working_dir,
+                        environment,
+                    )
+                }
+                BashSpawnMode::Direct | BashSpawnMode::ExplicitTarget(_) => (
+                    super::launch_protocol::BashLaunchMode::Direct,
+                    spawn_context.working_dir.clone(),
+                    std::env::vars_os().collect(),
+                ),
+            };
+            environment.retain(|(key, _)| key != BASH_LAUNCH_UUID_ENV_VAR);
+            environment.push((BASH_LAUNCH_UUID_ENV_VAR.into(), launch_uuid.clone().into()));
+            let payload = super::launch_protocol::BashLaunchPayload {
+                mode,
+                command: cmd.into(),
+                working_dir,
+                environment,
+            }
+            .encode()?;
+            Some((executable, payload))
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(SpawnChildError::NotSpawned(
+                "gated bash launcher requires Unix exec".into(),
+            ));
+        }
+    } else {
+        None
+    };
+    let mut command = match (spawn_mode, payload.as_ref()) {
+        (_, Some((executable, _))) => {
+            let mut command = Command::new(executable);
+            command
+                .arg("--bash-launch-v1")
+                .current_dir(&spawn_context.working_dir)
+                .env_clear();
+            command
+        }
+        (BashSpawnMode::Direct | BashSpawnMode::ExplicitTarget(_), None) => {
             let mut command = Command::new("bash");
             command
                 .arg("-c")
@@ -1053,17 +1267,23 @@ fn spawn_child_with_identity_probe(
                 .current_dir(&spawn_context.working_dir);
             command
         }
-        BashSpawnMode::ExploreReadOnly => {
+        (BashSpawnMode::ExploreReadOnly, _) => {
             let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
         }
     };
     command
-        .stdin(Stdio::null())
+        .stdin(if use_gate {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.env(BASH_LAUNCH_UUID_ENV_VAR, &launch_uuid);
+    if !use_gate {
+        command.env(BASH_LAUNCH_UUID_ENV_VAR, &launch_uuid);
+    }
 
     command.kill_on_drop(true);
 
@@ -1082,7 +1302,7 @@ fn spawn_child_with_identity_probe(
     }
 
     let started_at = Instant::now();
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             if let Some(dir) = &sandbox_scratch_dir {
@@ -1099,6 +1319,10 @@ fn spawn_child_with_identity_probe(
         .and_then(|pid| probe(pid).map(|identity| (pid, identity)))
     else {
         return Err(SpawnChildError::Unregistered(Box::new(UnregisteredChild {
+            launch_gate: payload.map(|(_, payload)| LaunchGate {
+                writer: child.stdin.take().expect("gated launcher stdin is piped"),
+                payload,
+            }),
             child,
             sandbox_scratch_dir,
             started_at,
@@ -1126,7 +1350,13 @@ fn spawn_child_with_identity_probe(
     );
     Ok((
         handle,
-        SpawnedProcessGroup::new(child, pgid, sandbox_scratch_dir, started_at),
+        SpawnedProcessGroup::new(
+            child,
+            pgid,
+            sandbox_scratch_dir,
+            started_at,
+            payload.map(|(_, payload)| payload),
+        ),
     ))
 }
 
@@ -2304,7 +2534,7 @@ fn display_label(handle: &Arc<Handle>, kind: ResponseKind) -> String {
 mod tests {
     use super::*;
     use crate::bash::handle::{Handle, HandleId};
-    use crate::bash::registry::BashLifecyclePhase;
+    use crate::bash::registry::{BashHandleRegistry, BashLifecyclePhase};
     use crate::bash::ring::{PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
     use phoenix_core::work_scope::ResourceScopeKey;
     use std::future::Future;
@@ -2353,6 +2583,389 @@ mod tests {
     #[cfg(unix)]
     fn response_json(output: &ToolOutput) -> Value {
         serde_json::from_str(output.output()).expect("response JSON")
+    }
+
+    #[cfg(unix)]
+    fn native_launcher_available() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(executable) = std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE") else {
+            if std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_REQUIRED").is_some() {
+                panic!("PHOENIX_BASH_LAUNCH_TEST_EXE is required but unset");
+            }
+            eprintln!(
+                "explicitly skipping native launcher test: PHOENIX_BASH_LAUNCH_TEST_EXE is unset"
+            );
+            return false;
+        };
+        let executable = std::path::PathBuf::from(executable);
+        let metadata = std::fs::metadata(&executable)
+            .unwrap_or_else(|error| panic!("PHOENIX_BASH_LAUNCH_TEST_EXE is invalid: {error}"));
+        assert!(metadata.is_file(), "native launcher path is not a file");
+        assert_ne!(
+            metadata.permissions().mode() & 0o111,
+            0,
+            "native launcher is not executable"
+        );
+        true
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_raw_launcher_rejects_empty_truncated_and_oversized_eof_payloads() {
+        if !native_launcher_available() {
+            return;
+        }
+        let executable =
+            std::path::PathBuf::from(std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE").unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("empty", Vec::new()),
+            ("truncated", b"PHXB\\x01\\x00\\x00".to_vec()),
+            (
+                "oversized",
+                vec![b'x'; super::super::launch_protocol::MAX_PAYLOAD + 1],
+            ),
+        ] {
+            let marker = dir.path().join(format!("{name}.marker"));
+            let mut child = tokio::process::Command::new(&executable)
+                .arg("--bash-launch-v1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            if !bytes.is_empty() {
+                use tokio::io::AsyncWriteExt;
+                child.stdin.take().unwrap().write_all(&bytes).await.unwrap();
+            }
+            drop(child.stdin.take());
+            let status = child.wait().await.unwrap();
+            assert_eq!(status.code(), Some(126), "{name} payload must be refused");
+            assert!(!marker.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_gate_release_reports_closed_child_stdin() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn helper child");
+        let writer = child.stdin.take().expect("piped child stdin");
+        let status = child.wait().await.expect("wait for child exit");
+        assert!(status.success());
+
+        let error = LaunchGate {
+            writer,
+            payload: b"launch payload".to_vec(),
+        }
+        .release()
+        .await
+        .expect_err("writing to a completed child must fail");
+        assert!(error.contains("failed to write bash launch payload"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_raw_launcher_waits_for_eof_and_exec_preserves_process_identity() {
+        if !native_launcher_available() {
+            return;
+        }
+        use phoenix_core::process_identity::observe_process_identity;
+        use tokio::io::AsyncWriteExt;
+        let executable =
+            std::path::PathBuf::from(std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_EXE").unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("release");
+        let pid_file = dir.path().join("pid");
+        let command = format!(
+            "printf '%s' $$ > {}; while [ ! -e {} ]; do sleep 0.01; done; printf executed > {}",
+            pid_file.display(),
+            marker.display(),
+            dir.path().join("executed").display()
+        );
+        let payload = super::super::launch_protocol::BashLaunchPayload {
+            mode: super::super::launch_protocol::BashLaunchMode::Direct,
+            command: command.into(),
+            working_dir: dir.path().to_path_buf(),
+            environment: std::env::vars_os().collect(),
+        }
+        .encode()
+        .unwrap();
+        let mut child = tokio::process::Command::new(&executable)
+            .env_clear()
+            .arg("--bash-launch-v1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().expect("launcher child pid");
+        let before = observe_process_identity(pid).expect("launcher identity");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&payload).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !pid_file.exists(),
+            "complete payload must not execute before EOF"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "launcher must remain alive behind the gate"
+        );
+        drop(stdin);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !pid_file.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("command did not start after EOF");
+        let recorded_pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        assert_eq!(recorded_pid, pid, "exec must preserve PID");
+        assert_eq!(
+            observe_process_identity(pid),
+            Ok(before),
+            "exec must preserve birth identity"
+        );
+        std::fs::write(marker, "").unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .expect("launcher command did not exit")
+            .unwrap();
+        assert!(status.success());
+        assert!(dir.path().join("executed").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gated_delayed_probe_runs_fast_command_with_direct_process_contract() {
+        if !native_launcher_available() {
+            return;
+        }
+        use phoenix_core::process_identity::observe_process_identity;
+
+        let ctx = test_context(&scope("native-gated-delayed-probe"));
+        let dir = tempfile::tempdir().unwrap();
+        let context = {
+            let mut context = spawn_context_for(&ctx);
+            context.working_dir = dir.path().to_path_buf();
+            context
+        };
+        let command = "pwd > cwd.txt; printf '%s' \"$PATH\" > path.txt; test -c /dev/fd/0 && printf char > stdin.txt; printf native-fast";
+        let output = run_run_with_identity_probe_mode(
+            command,
+            None,
+            2,
+            ReadArgs::default(),
+            &ctx,
+            &context,
+            BashSpawnMode::Direct,
+            SpawnProtocol::Gated,
+            |pid| {
+                std::thread::sleep(Duration::from_millis(75));
+                observe_process_identity(pid).ok()
+            },
+        )
+        .await;
+        let response = response_json(&output);
+        assert_eq!(response["status"], "exited");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cwd.txt")).unwrap(),
+            format!("{}\n", dir.path().display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("path.txt")).unwrap(),
+            std::env::var("PATH").unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap(),
+            "char"
+        );
+        assert_eq!(response["lines"][0]["bytes"], "native-fast");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gated_identity_denial_never_executes_payload() {
+        if !native_launcher_available() {
+            return;
+        }
+        let ctx = test_context(&scope("native-gated-identity-denial"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = spawn_context_for(&ctx);
+        context.working_dir = dir.path().to_path_buf();
+        let output = run_run_with_identity_probe_mode(
+            "printf executed > side-effect.txt",
+            None,
+            2,
+            ReadArgs::default(),
+            &ctx,
+            &context,
+            BashSpawnMode::Direct,
+            SpawnProtocol::Gated,
+            |_| None,
+        )
+        .await;
+        let response = response_json(&output);
+        assert_eq!(response["launch_error"], "identity_unavailable");
+        assert!(!dir.path().join("side-effect.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_gated_foreign_registry_denial_settles_without_executing_command() {
+        if !native_launcher_available() {
+            return;
+        }
+        use phoenix_core::process_identity::observe_process_identity;
+        let scope = scope("native-foreign-registry-denial");
+        let ctx = test_context(&scope);
+        let foreign = BashHandleRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+        let command = "printf executed > side-effect.txt";
+        let mut context = spawn_context_for(&ctx);
+        context.working_dir = dir.path().to_path_buf();
+        let reservation = ctx
+            .bash_handle_registry()
+            .reserve_spawn(&scope)
+            .await
+            .unwrap();
+        let (handle, spawned) = spawn_child_with_identity_probe_protocol(
+            command,
+            None,
+            &ctx,
+            &context,
+            reservation.handle_id().clone(),
+            RING_BUFFER_BYTES,
+            &BashSpawnMode::Direct,
+            SpawnProtocol::Gated,
+            |pid| observe_process_identity(pid).ok(),
+        )
+        .expect("native gated child should launch with verified identity");
+        let mut reservation = reservation;
+        assert!(matches!(
+            foreign.commit_spawn_gated(&mut reservation, handle).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        reservation.mark_unregistered();
+        let (child, launch_gate, sandbox_scratch_dir) = spawned.into_waiter_parts();
+        let output = settle_unregistered_run(
+            UnregisteredChild {
+                child,
+                launch_gate,
+                sandbox_scratch_dir,
+                started_at: Instant::now(),
+            },
+            reservation,
+            command,
+            None,
+            RING_BUFFER_BYTES,
+            &ReadArgs::default(),
+            BashLaunchError::RegistrationFailed,
+        )
+        .await;
+        let response = response_json(&output);
+        assert_eq!(response["launch_error"], "registration_failed");
+        assert!(matches!(
+            response["status"].as_str(),
+            Some("unregistered_killed" | "unregistered_exited")
+        ));
+        assert!(!dir.path().join("side-effect.txt").exists());
+        let table = ctx
+            .bash_handle_registry()
+            .get_existing(&scope)
+            .await
+            .unwrap();
+        assert!(table
+            .read()
+            .await
+            .admission
+            .unverified_launch
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn require_native_explore_test_support() -> bool {
+        if !ExploreSandboxLauncher::supported() {
+            if std::env::var_os("PHOENIX_BASH_LAUNCH_TEST_REQUIRED").is_some() {
+                panic!("required native Explore launch test is unsupported on this host");
+            }
+            eprintln!(
+                "explicitly skipping native Explore launch test: host sandbox is unsupported"
+            );
+            return false;
+        }
+        native_launcher_available()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn native_gated_explore_rejects_repository_write_after_release() {
+        if !require_native_explore_test_support() {
+            return;
+        }
+        use phoenix_core::process_identity::observe_process_identity;
+
+        let ctx = test_context(&scope("native-gated-explore-write-denied"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = spawn_context_for(&ctx);
+        context.working_dir = dir.path().to_path_buf();
+        let output = run_run_with_identity_probe_mode(
+            "printf explore-ok; printf denied > forbidden.txt; exit 7",
+            None,
+            2,
+            ReadArgs::default(),
+            &ctx,
+            &context,
+            BashSpawnMode::ExploreReadOnly,
+            SpawnProtocol::Gated,
+            |pid| {
+                std::thread::sleep(Duration::from_millis(75));
+                observe_process_identity(pid).ok()
+            },
+        )
+        .await;
+        let response = response_json(&output);
+        assert_eq!(response["status"], "exited");
+        assert_eq!(response["exit_code"], 7);
+        assert_eq!(response["lines"][0]["bytes"], "explore-ok");
+        assert!(!dir.path().join("forbidden.txt").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn native_gated_explore_identity_denial_never_executes_payload() {
+        if !require_native_explore_test_support() {
+            return;
+        }
+        let ctx = test_context(&scope("native-gated-explore-identity-denial"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = spawn_context_for(&ctx);
+        context.working_dir = dir.path().to_path_buf();
+        let output = run_run_with_identity_probe_mode(
+            "printf executed > forbidden.txt",
+            None,
+            2,
+            ReadArgs::default(),
+            &ctx,
+            &context,
+            BashSpawnMode::ExploreReadOnly,
+            SpawnProtocol::Gated,
+            |_| None,
+        )
+        .await;
+        assert_eq!(
+            response_json(&output)["launch_error"],
+            "identity_unavailable"
+        );
+        assert!(!dir.path().join("forbidden.txt").exists());
     }
 
     #[cfg(unix)]
@@ -2477,6 +3090,7 @@ mod tests {
         let mut release = process.stdin.take().unwrap();
         let child = UnregisteredChild {
             child: process,
+            launch_gate: None,
             sandbox_scratch_dir: None,
             started_at: Instant::now(),
         };
@@ -2795,12 +3409,13 @@ mod tests {
             .commit_spawn(&mut reservation, handle)
             .await
             .is_err());
-        let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
+        let (child, _launch_gate, sandbox_scratch_dir) = spawned.into_waiter_parts();
         std::fs::write(dir.path().join("release"), "").unwrap();
         let response = response_json(
             &settle_unregistered_run(
                 UnregisteredChild {
                     child,
+                    launch_gate: None,
                     sandbox_scratch_dir,
                     started_at: Instant::now(),
                 },
@@ -2912,7 +3527,8 @@ mod tests {
             &BashSpawnMode::Direct,
         )
         .expect("spawn child");
-        let (mut child, scratch_dir) = spawned.into_waiter_parts();
+        let (mut child, launch_gate, scratch_dir) = spawned.into_waiter_parts();
+        drop(launch_gate);
         assert!(scratch_dir.is_none());
 
         let mut stdout = child.stdout.take().expect("child stdout");
