@@ -3728,19 +3728,22 @@ where
                     .record_execution_cancel(&self.context.conversation_id)
                     .await?;
             }
-            if let Some((receipt, projection)) = accepted_direct_turn_stop.take() {
-                let target = self.active_direct_turn.as_ref().ok_or_else(|| {
-                    "accepted Stop lost its exact runtime turn before install".to_string()
-                })?;
-                if !receipt.matches(target.turn_id, target.generation)
-                    || projection.state != result.new_state
-                {
-                    return Err(
-                        "accepted Stop projection does not match reducer result".to_string()
-                    );
-                }
-                self.install_live_state(projection.state, projection.state_updated_at, false)?;
-            }
+            let committed_projection =
+                if let Some((receipt, projection)) = accepted_direct_turn_stop.take() {
+                    let target = self.active_direct_turn.as_ref().ok_or_else(|| {
+                        "accepted Stop lost its exact runtime turn before install".to_string()
+                    })?;
+                    if !receipt.matches(target.turn_id, target.generation)
+                        || projection.state != result.new_state
+                    {
+                        return Err(
+                            "accepted Stop projection does not match reducer result".to_string()
+                        );
+                    }
+                    Some(projection)
+                } else {
+                    None
+                };
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             self.pending_sub_agent_acceptance
                 .clone_from(&accepted_sub_agent);
@@ -3749,7 +3752,11 @@ where
                 _ => None,
             };
             let generated = match self
-                .apply_transition_result_with_input(result, ordinary_input_id)
+                .apply_transition_result_with_projection(
+                    result,
+                    ordinary_input_id,
+                    committed_projection.as_ref(),
+                )
                 .await
             {
                 Ok(generated) => generated,
@@ -3872,6 +3879,19 @@ where
         result: crate::state_machine::transition::TransitionResult,
         ordinary_input_id: Option<&str>,
     ) -> Result<Vec<Event>, String> {
+        self.apply_transition_result_with_projection(result, ordinary_input_id, None)
+            .await
+    }
+
+    async fn apply_transition_result_with_projection(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        ordinary_input_id: Option<&str>,
+        committed_projection: Option<&phoenix_db::workflow::PersistedConversationProjection>,
+    ) -> Result<Vec<Event>, String> {
+        if committed_projection.is_some_and(|projection| projection.state != result.new_state) {
+            return Err("committed Stop projection does not match reducer target".to_string());
+        }
         let remaining = self.bash_wait_transition_remaining(&result.new_state);
         if let Some(remaining) = remaining {
             let dispatch_index = result.effects.iter().position(|effect| {
@@ -3892,7 +3912,7 @@ where
                 tokio::select! {
                     biased;
                     () = &mut cutoff => None,
-                    applied = Box::pin(self.apply_transition_result_inner(settlement, ordinary_input_id)) => Some(applied?),
+                    applied = Box::pin(self.apply_transition_result_inner(settlement, ordinary_input_id, committed_projection)) => Some(applied?),
                 }
             };
             let Some(mut generated) = generated.take() else {
@@ -3915,7 +3935,12 @@ where
             }
             return Ok(generated);
         }
-        Box::pin(self.apply_transition_result_inner(result, ordinary_input_id)).await
+        Box::pin(self.apply_transition_result_inner(
+            result,
+            ordinary_input_id,
+            committed_projection,
+        ))
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3924,6 +3949,7 @@ where
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
         ordinary_input_id: Option<&str>,
+        committed_projection: Option<&phoenix_db::workflow::PersistedConversationProjection>,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
@@ -4015,7 +4041,9 @@ where
                     ..
                 }
             );
-            let next_state_updated_at = if state_changed && !retry_has_durable_fact {
+            let next_state_updated_at = if let Some(projection) = committed_projection {
+                projection.state_updated_at
+            } else if state_changed && !retry_has_durable_fact {
                 self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
             } else {
                 self.state_updated_at
