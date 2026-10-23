@@ -260,7 +260,10 @@ pub(crate) enum RuntimeCommand {
     Event(Event),
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "Private terminal-stop command has no production ingress")
+        expect(
+            dead_code,
+            reason = "Private terminal-stop command has no production ingress"
+        )
     )]
     StandaloneTerminalStop(phoenix_db::StandaloneStopTarget),
 }

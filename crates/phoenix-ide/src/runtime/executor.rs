@@ -14456,7 +14456,9 @@ mod standalone_terminal_stop_tests {
         let (db, target) = real_target("retiring-stop").await;
         let (event_tx, event_rx) = mpsc::channel(8);
         let (ack_tx, ack_rx) = mpsc::channel(8);
-        let broadcaster = SseBroadcaster::new(128, 0);
+        let last_sequence = db.get_last_sequence_id("retiring-stop").await.unwrap();
+        assert_eq!(last_sequence, 1);
+        let broadcaster = SseBroadcaster::new(128, last_sequence);
         let mut broadcasts = broadcaster.subscribe();
         let mut runtime = ConversationRuntime::new(
             ConvContext::new(
@@ -14540,7 +14542,9 @@ mod standalone_terminal_stop_tests {
         sqlx::query("CREATE TRIGGER reject_runtime_idle_rewrite BEFORE UPDATE OF state ON conversations WHEN OLD.id = 'committed-stop' AND OLD.state_kind = 'idle' AND NEW.state_kind = 'idle' BEGIN SELECT RAISE(ABORT, 'injected postaccept runtime persistence failure'); END").execute(db.pool()).await.unwrap();
         let (event_tx, event_rx) = mpsc::channel(8);
         let (ack_tx, ack_rx) = mpsc::channel(8);
-        let broadcaster = SseBroadcaster::new(128, 0);
+        let last_sequence = db.get_last_sequence_id("committed-stop").await.unwrap();
+        assert_eq!(last_sequence, 1);
+        let broadcaster = SseBroadcaster::new(128, last_sequence);
         let mut broadcasts = broadcaster.subscribe();
         let mut runtime = ConversationRuntime::new(
             ConvContext::new(
@@ -14642,6 +14646,13 @@ mod standalone_terminal_stop_tests {
         );
         let replay: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id = 'committed-stop'").fetch_one(db.pool()).await.unwrap();
         assert_eq!(replay, 0);
+        let message_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = 'committed-stop'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(message_count, 2);
         assert_eq!(
             db.pending_coordinator_watch_events(8).await.unwrap().len(),
             1
