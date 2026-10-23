@@ -66,10 +66,10 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    # 5 setup/network + 12 native + 72 check + 10 musl + 2 evidence + 4 post-actions.
+    # 5 setup/network + 20 native + 72 check + 10 musl + 2 evidence + 4 post-actions.
     # Setup/network and musl are planning estimates, not completion guarantees.
     # Check: 60.5 Rust watchdog + 10 normal fmt + 1.5 probes/teardown/report.
-    timeout-minutes: 105
+    timeout-minutes: 113
     env:
       PYTHONUNBUFFERED: "1"
       PHOENIX_DEV_TRACE_ENDPOINT: "off"
@@ -122,7 +122,7 @@ jobs:
         timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build native bash launcher fixture
-        timeout-minutes: 12
+        timeout-minutes: 20
         run: |
           python3 scripts/check_profile_command.py --output-dir "$RUST_EVIDENCE_DIR/native" \
             --identity step:ci:native-launcher -- cargo build -j 1 -p phoenix_ide --bin phoenix_ide
