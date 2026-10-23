@@ -330,7 +330,7 @@ impl MessageExecutionSource {
         }
     }
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Steering => "steering",
             Self::SeededFork => "seeded_fork",
@@ -583,7 +583,9 @@ async fn record_watch_event_with_authority_tx(
     if category == "completed" && context_exhausted {
         return Ok(());
     }
-    let mut insert = String::from("INSERT INTO coordinator_watch_events
+    macro_rules! terminal_event_insert_sql {
+        () => {
+            "INSERT INTO coordinator_watch_events
         (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
          occurred_at_us, continuation_state)
@@ -597,11 +599,14 @@ async fn record_watch_event_with_authority_tx(
         WHERE c.id = ?8 AND c.parent_conversation_id IS NULL AND p.kind = 'ordinary'
           AND p.ordinary_lifecycle = 'open'
           AND (?5 != 'completed' OR c.state_kind IN ('idle', 'terminal'))
-          AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')");
-    if matches!(authority, WatchTerminalAuthority::LegacyObservation) {
-        insert.push_str(" ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING");
+          AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')"
+        };
     }
-    sqlx::query(&insert)
+    let insert: &'static str = match authority {
+        WatchTerminalAuthority::LegacyObservation => concat!(terminal_event_insert_sql!(), " ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING"),
+        WatchTerminalAuthority::ExactAuthoritative => terminal_event_insert_sql!(),
+    };
+    sqlx::query(insert)
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(occurrence_kind)
         .bind(occurrence_id)
