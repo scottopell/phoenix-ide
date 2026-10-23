@@ -129,3 +129,9 @@ References: [Anthropic models](https://platform.claude.com/docs/en/models/overvi
 [Sonnet 4.6](https://platform.claude.com/docs/en/models/sonnet-4-6/overview), and
 [Haiku 4.5](https://platform.claude.com/docs/en/models/haiku-4-5/overview).
 OpenAI built-in output ceilings retain their 128,000-token catalog declarations.
+
+Pre-dispatch fitting accounts for system instructions, tool declarations, history,
+and the output reservation using the existing local estimator. This is a planning
+limit, not a claim that the provider rejected the prompt. Completed responses
+retain the independent 90% continuation threshold in REQ-BED-019; a future output
+reservation cannot retroactively reject a successful terminal reply.

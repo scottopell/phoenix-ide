@@ -289,6 +289,13 @@ WHEN the input plus the preferred reserved output budget does not fit the contex
 THE SYSTEM SHALL first trim or compact available input to recover room for the preferred output budget rather than silently shrinking the request to a tiny output budget
 AND SHALL, when a fixed prompt plus the reserved output budget still cannot fit, surface the condition through the context-management policy rather than dispatching a request whose output budget exceeds the model or context limit
 
+WHEN fitting an ordinary request before dispatch
+THE SYSTEM SHALL account for its system prompt, tool declarations, rendered history, and output reservation
+AND SHALL attempt permitted stale-tool-result clearing before reporting a planned-capacity failure
+AND SHALL distinguish conservative local planning from authoritative provider token counts
+
+The completed-response continuation threshold remains governed by `specs/bedrock/requirements.md` REQ-BED-019; reserved future output SHALL NOT lower that threshold or reject an otherwise acceptable completed response.
+
 **Rationale:** The model's capability ceiling is the right default request budget; a smaller Phoenix-internal allowance tied to reasoning effort starved reasoning-heavy turns and produced output-exhaustion failures before any visible answer. One resolved value keeps the sent limit and the reserved headroom from diverging, while context fitting protects input rather than quietly collapsing the output budget.
 
 ---

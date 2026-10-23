@@ -3007,11 +3007,7 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                if should_trigger_continuation(
-                    &usage_data,
-                    context.context_window,
-                    context.output_budget,
-                ) {
+                if should_trigger_continuation(&usage_data, context.context_window) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -3229,11 +3225,7 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(
-                &usage_data,
-                context.context_window,
-                context.output_budget,
-            ) {
+            if should_trigger_continuation(&usage_data, context.context_window) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3322,10 +3314,13 @@ pub fn transition_parent(
             // carry provider-specific strings and is persisted for the UI
             // banner / clipboard / seed-draft, so it is logged separately
             // rather than interpolated into user-facing text.
+            // `message` may describe either an authoritative provider rejection
+            // or a locally classified planned-capacity limit (REQ-LLM-004f
+            // preflight fit check) — both converge here because neither has a
+            // partial response to build a continuation summary from.
             tracing::warn!(
-                backend_message = %message,
-                "backend rejected request with context_length_exceeded; \
-                converging parent to ContextExhausted"
+                detail = %message,
+                "request classified as context-window exhausted; converging parent to ContextExhausted"
             );
             let summary = "Context limit reached before the turn could complete. \
                 Continue to compact and resume, or start a new conversation."
@@ -3827,11 +3822,7 @@ pub fn transition_sub_agent(
         ) => {
             let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(
-                &usage_data,
-                context.context_window,
-                context.output_budget,
-            ) {
+            if should_trigger_continuation(&usage_data, context.context_window) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -4306,22 +4297,23 @@ fn current_attempt(state: &ConvState) -> u32 {
 /// Threshold as fraction of context window for triggering continuation (REQ-BED-019)
 const CONTINUATION_THRESHOLD: f64 = 0.90;
 
-/// Check if context usage has exceeded the continuation threshold (REQ-BED-019)
+/// Check if context usage has exceeded the continuation threshold (REQ-BED-019).
+///
+/// This is the sole trigger for a *completed* response (text-only, or a
+/// terminal `submit_result`/`submit_error`/`propose_task`/`ask_user_question`
+/// tool call): REQ-BED-019 is independent of the model's output-token
+/// budget. A declared output budget is reserved before *dispatch* — see
+/// `ConvContext::output_budget` and REQ-LLM-004f in `specs/llm/requirements.md`
+/// — not by lowering this post-response threshold, which would otherwise
+/// fail a successful response whose own usage is far below 90%.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
-fn should_trigger_continuation(
-    usage: &UsageData,
-    context_window: usize,
-    output_budget: usize,
-) -> bool {
+fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool {
     let used = usage.context_window_used();
-    let proportional_threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    let reservation_threshold =
-        u64::try_from(context_window.saturating_sub(output_budget)).unwrap_or(u64::MAX);
-    let threshold = proportional_threshold.min(reservation_threshold);
+    let threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
     used >= threshold
 }
 
@@ -6865,31 +6857,29 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            // A zero output reservation leaves the 90% proportional bound as
-            // the only trigger, so 89.9% must not fire.
-            !should_trigger_continuation(&usage, 100_000, 0),
+            !should_trigger_continuation(&usage, 100_000),
             "89.9% should not trigger continuation"
         );
     }
 
     #[test]
-    fn context_threshold_reserves_declared_output_budget() {
-        // REQ-LLM-004f, ADR-144: the reserved output budget, not an
-        // effort-keyed heuristic, pulls the continuation trigger earlier than
-        // the 90% proportional bound. With a 400k window the proportional
-        // bound is 360k, but a 68k output reservation lowers the effective
-        // trigger to 332k, so 336k of input must fire.
+    fn context_threshold_ignores_output_budget_for_completed_response() {
+        // PR #972 review finding 4363009774: a Codex-routed built-in with a
+        // 272k context and 128k output budget must not fail a successful,
+        // far-below-90% response as context-exhausted. REQ-BED-019's 90%
+        // threshold is independent of the output budget; 144k of usage here
+        // is ~53% of the 272k window — nowhere near the 90% bound — even
+        // though `context_window - output_budget` (144k) would have
+        // incorrectly fired under the superseded reservation-based check.
         let usage = UsageData {
-            input_tokens: 336_000,
+            input_tokens: 144_000,
             output_tokens: 0,
             reasoning_tokens: None,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
         };
 
-        assert!(should_trigger_continuation(&usage, 400_000, 68_000));
-        // Without that reservation the same input stays below the 90% bound.
-        assert!(!should_trigger_continuation(&usage, 400_000, 0));
+        assert!(!should_trigger_continuation(&usage, 272_000));
     }
 
     #[test]
@@ -6903,7 +6893,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, 0),
+            should_trigger_continuation(&usage, 100_000),
             "90% should trigger continuation"
         );
     }
@@ -6919,7 +6909,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, 0),
+            should_trigger_continuation(&usage, 100_000),
             "90.1% should trigger continuation"
         );
     }
@@ -6935,7 +6925,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, 0),
+            should_trigger_continuation(&usage, 100_000),
             "Combined tokens should count toward threshold"
         );
     }

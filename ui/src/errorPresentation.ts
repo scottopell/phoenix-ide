@@ -21,9 +21,6 @@ export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation |
     case 'usage_limit_reached':
     case 'prompt_rejected':
     case 'invalid_request':
-    // output_tokens_exhausted: the model stopped at its output-token budget.
-    // Not auto-retried (an unchanged request exhausts again), but the user can
-    // free output room with a revised message or settings.
     case 'output_tokens_exhausted':
       return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
     case 'cancelled':
