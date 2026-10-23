@@ -69,30 +69,24 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.current_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
-        source = self.current_registry.read_text()
-        registry_match = re.search(
-            r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)",
-            source,
-            re.DOTALL,
+        historical_registry = subprocess.check_output(
+            [
+                "git",
+                "show",
+                f"{helper.PREPARED_SOURCE128_COMMIT}:crates/phoenix-db/src/migrations.rs",
+            ],
+            cwd=ROOT,
         )
-        self.assertIsNotNone(registry_match)
-        entries = registry_match.group(2)
-        suffix_boundaries = list(re.finditer(
-            rf"^    Migration\s*\{{\s*version:\s*{QUALIFIED_TARGET + 1},",
-            entries,
-            flags=re.MULTILINE,
-        ))
-        self.assertEqual(
-            len(suffix_boundaries), 1,
-            "historical registry fixture requires exactly one successor boundary",
-        )
-        historical_entries = entries[:suffix_boundaries[0].start()]
         self.registry = self.root / "qualified-128-migrations.rs"
-        self.registry.write_text(
-            source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
+        self.registry.write_bytes(historical_registry)
+        self.assertEqual(
+            helper.sha256(self.registry),
+            helper.PREPARED_SOURCE128_REGISTRY_SHA256,
         )
-        # Synthetic unit fixture: this registry models the historical v128
-        # candidate independently of the exact source-114 release artifact.
+        self.assertEqual(
+            helper.migration_registry(self.registry, qualified_source128=True)[-1],
+            (QUALIFIED_TARGET, "single_conversation_name_and_route_projection"),
+        )
         self.prepared_registry_pin = helper.sha256(self.registry)
         registry_pin = mock.patch.object(
             helper, "PREPARED_SOURCE114_REGISTRY_SHA256", self.prepared_registry_pin,
@@ -3496,7 +3490,7 @@ class ExactSource128To129Tests(unittest.TestCase):
         base = self.manifest(database)
         current = base.current_schema_upgrade
         registry = Path(current.migration_registry_path)
-        registry.write_bytes(self.current_registry.read_bytes())
+        registry.write_bytes(self.registry.read_bytes())
         qualified = helper.PreparedSource128Upgrade(
             **{**dataclasses.asdict(current), "migration_registry_sha256": helper.sha256(registry)},
             prepared_source_baseline=128,
@@ -3540,7 +3534,7 @@ sys.exit({7 if failure else 0})
         return reservation
 
     def test_exact_source128_only_and_target129_only(self) -> None:
-        self.assertEqual(helper.PREPARED_SOURCE128_REGISTRY_SHA256, helper.sha256(self.current_registry))
+        self.assertEqual(helper.PREPARED_SOURCE128_REGISTRY_SHA256, helper.sha256(self.registry))
         for through in range(113, 130):
             with self.subTest(through=through):
                 db = self.database(through=through)
@@ -3556,10 +3550,10 @@ sys.exit({7 if failure else 0})
                 else:
                     with self.assertRaises(helper.ActivationError):
                         helper.validate_current_schema_database(db, registry, manifest=manifest, migrated=True)
-        self.assertEqual(helper.migration_registry(self.current_registry, qualified_source128=True)[-1],
+        self.assertEqual(helper.migration_registry(self.registry, qualified_source128=True)[-1],
                          (129, "single_conversation_name_and_route_projection"))
         with self.assertRaises(helper.ActivationError):
-            helper.migration_registry(self.current_registry)
+            helper.migration_registry(self.registry)
 
     def test_source128_typed_manifest_and_pin_mismatches_fail_before_disruption(self) -> None:
         manifest = self.prepared128_manifest(self.database(through=128))
