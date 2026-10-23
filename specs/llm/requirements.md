@@ -68,7 +68,12 @@ AND SHALL require the mapped replacement to be available instead of falling back
 THE SYSTEM SHALL preserve the original model identity on historical turns and requests or runtimes whose model was already resolved
 AND SHALL NOT use catalog family or version ordering to infer orchestration qualification for an unlisted model
 
-**Rationale:** Opportunistic discovery from exact endpoint overrides validates configured models without making model listing mandatory. Explicit compatibility mappings keep live pins deterministic while leaving historical attribution, in-flight work, and operator-defined routes authoritative.
+WHEN a model specification describes its output capability
+THE SYSTEM SHALL treat the model's declared supported output maximum as the authoritative source of its output budget (REQ-LLM-004f)
+AND SHALL require that maximum to be a verified catalog fact for every built-in model
+AND SHALL reject an operator-configured model on a compatible HTTP backend that carries no declared output maximum with a clear configuration error rather than substituting an invented numeric default
+
+**Rationale:** Opportunistic discovery from exact endpoint overrides validates configured models without making model listing mandatory. Explicit compatibility mappings keep live pins deterministic while leaving historical attribution, in-flight work, and operator-defined routes authoritative. The declared output maximum is what sets each request's budget, so an unknown maximum must fail honestly instead of silently manufacturing one.
 
 ---
 
@@ -269,19 +274,22 @@ THE SYSTEM SHALL compose it with the rest of the provider request shape rather t
 
 ---
 
-### REQ-LLM-004f: Output Headroom Reservation
+### REQ-LLM-004f: Output Budget Resolution and Reservation
 
 WHEN Phoenix prepares a request for a model with a bounded output budget
-THE SYSTEM SHALL reserve output headroom separately from input-context accounting
-AND SHALL apply reasoning-effort-dependent output headroom defaults before dispatch
-
-WHEN an explicit reasoning-effort selection changes the model's expected output budget
-THE SYSTEM SHALL recompute reserved output headroom from that effective selection
+THE SYSTEM SHALL resolve one output-token budget equal to the model's declared supported output maximum
+AND SHALL clamp that budget only by the output room the context window leaves after the input
+AND SHALL use that single resolved budget both as the value sent in the provider's output-limit field and as the output headroom the context planner reserves
+AND SHALL NOT derive the budget from reasoning effort, a continuation-versus-normal distinction, or a Phoenix-internal fixed allowance
 
 WHEN reporting context-window usage
-THE SYSTEM SHALL distinguish consumed context from reserved output headroom rather than treating reserved output capacity as already-consumed input context
+THE SYSTEM SHALL distinguish consumed input context from reserved output budget rather than treating reserved output capacity as already-consumed input context
 
-**Rationale:** Input history and reserved completion budget are different quantities. Reasoning effort can change how much output space Phoenix must reserve, so the reservation has to be explicit and recomputable.
+WHEN the input plus the preferred reserved output budget does not fit the context window
+THE SYSTEM SHALL first trim or compact available input to recover room for the preferred output budget rather than silently shrinking the request to a tiny output budget
+AND SHALL, when a fixed prompt plus the reserved output budget still cannot fit, surface the condition through the context-management policy rather than dispatching a request whose output budget exceeds the model or context limit
+
+**Rationale:** The model's capability ceiling is the right default request budget; a smaller Phoenix-internal allowance tied to reasoning effort starved reasoning-heavy turns and produced output-exhaustion failures before any visible answer. One resolved value keeps the sent limit and the reserved headroom from diverging, while context fitting protects input rather than quietly collapsing the output budget.
 
 ---
 
@@ -489,6 +497,31 @@ THE SYSTEM SHALL use the request's single overload loop
 AND SHALL NOT create another overload loop at the continuation-opening boundary
 
 **Rationale:** Selected-model capacity is transient enough to merit bounded same-model retry, but it must not silently change the user's routing choice or outlive its accepted logical operation. Stable jitter prevents synchronized retries without making restart renew the wait. Persisted phase and absolute time bounds make process recovery deterministic, while target-specific terminal states preserve continuation identity.
+
+---
+
+### REQ-LLM-006c: Output-Token Exhaustion Classification
+
+WHEN a provider response terminates because the model reached the request's output-token budget (Chat Completions `finish_reason` length, Responses `incomplete` with reason `max_output_tokens`, or Anthropic `stop_reason` max_tokens)
+THE SYSTEM SHALL classify the outcome as a dedicated output-token-exhaustion category distinct from context-window exhaustion and from the malformed-response category
+AND SHALL NOT automatically retry the identical request, because repeating unchanged parameters does not correct the budget limit
+AND SHALL classify the persisted error as user-resumable so a revised message or revised settings that free output room can recover within the same conversation
+
+WHEN an output-token-exhausted response carries a partial or truncated tool call
+THE SYSTEM SHALL discard that tool call and SHALL NOT dispatch it
+
+WHEN visible content was already streamed to the user before the output budget was reached
+THE SYSTEM SHALL preserve that already-visible content under the existing streaming-buffer policy
+AND SHALL NOT persist the truncated turn as a completed assistant turn
+
+WHEN the input plus reserved output cannot fit the context window
+THE SYSTEM SHALL classify that condition as context-window exhaustion rather than output-token exhaustion
+
+The native Codex transport keeps its existing output-limit field handling and official terminal reasons unchanged; a provider response whose shape is malformed rather than budget-limited remains in the malformed-response category with its existing retry behavior.
+
+This classification reuses the existing persisted request-outcome value for token-budget exhaustion; it introduces no new persisted outcome value and therefore requires no outcome-schema migration. Missing failed-attempt usage SHALL NOT be interpreted as zero billing; extending failed-attempt usage capture is outside this contract.
+
+**Rationale:** An output budget stop is a well-formed provider response, not a transport fault, so retrying the identical request only wastes attempts and private reasoning. Users recover by freeing output room, so the error is terminal for automatic retry but resumable by the user. Keeping it separate from context-window exhaustion preserves distinct recovery guidance, and never dispatching a truncated tool call prevents a partial, structurally invalid call from executing.
 
 ---
 

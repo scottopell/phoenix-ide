@@ -178,6 +178,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
 | [142](142_ordinary-skill-catalog-is-executor-turn-local.md) | Ordinary skill catalog advertisement is executor-turn-local | Accepted | REQ-SK-007, REQ-SK-008, REQ-SK-009 |
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
+| [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
 
 ## For agents: which decisions bind your task
 
