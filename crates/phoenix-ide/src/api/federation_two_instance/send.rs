@@ -507,13 +507,97 @@ async fn https_only_remote_coordinator_may_message_coordinator_and_archive_still
         coordinator_id
     );
     assert_coordinator_has_no_history_lifecycle(&receiver, &coordinator_id).await;
-    let history_target = ordinary(&receiver, "remote-history-target").await;
-    receiver
+    let history_id = format!("remote-history-target-{}", uuid::Uuid::new_v4());
+    let history_target = receiver
         .state
         .db
-        .set_legacy_conversation_archived(&history_target.id)
+        .create_conversation(
+            &history_id,
+            "remote-history-target",
+            receiver.tempdir.path().to_str().unwrap(),
+            true,
+            None,
+            None,
+        )
         .await
         .unwrap();
+    assert!(matches!(history_target.state, crate::db::ConvState::Idle));
+    assert!(matches!(
+        history_target.conv_mode,
+        phoenix_core::domain::db_schema::ConvMode::Explore {
+            worktree_path: None,
+            ..
+        }
+    ));
+    let history_scope = history_target.attached_work_scope_id.as_ref().unwrap();
+    assert_eq!(
+        receiver
+            .state
+            .db
+            .get_work_scope_legacy_conversation_id(history_scope)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(history_target.id.as_str()),
+    );
+    let tmux_dir = receiver
+        .state
+        .runtime
+        .tmux_registry()
+        .socket_dir()
+        .to_path_buf();
+    for endpoint in [
+        phoenix_tools::tmux::registry::socket_path_for_worktree(
+            &tmux_dir,
+            std::path::Path::new(history_scope.as_str()),
+        ),
+        phoenix_tools::tmux::registry::socket_path_for(&tmux_dir, &history_target.id),
+    ] {
+        assert!(
+            matches!(std::fs::symlink_metadata(endpoint), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+    {
+        let admission = receiver
+            .state
+            .runtime
+            .mutation_admission(&history_target.id)
+            .await
+            .unwrap();
+        let _admission_guard = admission.lock().await;
+        crate::api::lifecycle_handlers::close_legacy_compat(
+            &receiver.state,
+            &history_target.id,
+            "archive",
+        )
+        .await
+        .expect("canonical Close completes the fixture-owned idle ordinary product");
+    }
+    let history = receiver
+        .state
+        .db
+        .get_ordinary_product_conversation(&history_target.product_conversation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        history.product_conversation.id(),
+        &history_target.product_conversation_id
+    );
+    assert_eq!(
+        history.product_conversation.ordinary_lifecycle(),
+        Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History)
+    );
+    assert_eq!(history.root.conversation.id, history_target.id);
+    assert_eq!(
+        history.root.conversation.product_conversation_id,
+        history_target.product_conversation_id
+    );
+    assert_eq!(history.latest_transcript_row_id, history_target.id);
+    assert_eq!(history.segments.len(), 1);
+    assert_eq!(
+        history.segments[0].transcript_row.conversation.id,
+        history_target.id
+    );
     let before = receiver
         .state
         .db
