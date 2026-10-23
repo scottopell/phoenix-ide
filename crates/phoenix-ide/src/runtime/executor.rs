@@ -14501,7 +14501,14 @@ mod authoritative_user_message_effect_tests {
                 AuthoritativeUserMessageMaterialization::StaleAuthority,
             );
             rt.context.is_coordinator = coordinator;
+            // Bounded-handoff retention under a small context: the declared
+            // output budget must leave room for the fixed prompt plus the
+            // accepted handoff. Reserving the fixture's wide 16_384 budget
+            // against a 20_000 window would leave no headroom, so set an
+            // explicit small budget alongside the small window rather than
+            // relying on any Phoenix-internal fallback.
             rt.context.context_window = 20_000;
+            rt.context.output_budget = 4_096;
             let conv = rt.context.conversation_id.clone();
             let seed = "Edited handoff: Crick paused until Friday; Phoenix owns worker A. No deployment permission.";
             storage
@@ -14690,6 +14697,39 @@ mod authoritative_user_message_effect_tests {
                 ..
             }] if operation_id == &request.operation_id
         ));
+    }
+
+    #[tokio::test]
+    async fn declared_budget_is_shared_by_ordinary_and_continuation_requests() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.context.output_budget = 131_072;
+        rt.context.context_window = 1_048_576;
+        let (tx, rx) = mpsc::channel(16);
+        rt.event_tx = tx;
+        rt.event_rx = rx;
+        rt.execute_effect(Effect::RequestLlm).await.unwrap();
+        rt.llm_task_handle.take().unwrap().await.unwrap();
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "declared-output-budget".into(),
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        rt.execute_effect(Effect::RequestContinuation { request })
+            .await
+            .unwrap();
+        rt.llm_task_handle.take().unwrap().await.unwrap();
+        let calls = rt.llm_client.recorded_requests();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert_eq!(call.max_tokens, 131_072);
+            assert_eq!(call.reserved_output_tokens(), 131_072);
+        }
     }
 
     #[tokio::test]

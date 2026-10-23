@@ -699,19 +699,53 @@ pub fn legacy_model_replacement(model_id: &str) -> Option<&'static str> {
 }
 
 impl ModelRegistry {
-    /// Create an empty registry for testing purposes
+    /// Create a registry for testing purposes that declares the `test-model`
+    /// route's spec but wires no service.
+    ///
+    /// The spec supplies the explicit output-token maximum (REQ-LLM-004f) that
+    /// runtime fixtures resolve through this registry. There is no
+    /// Phoenix-internal fallback for a missing declared budget, so without the
+    /// spec every manager-path fixture resolving `test-model` would error.
+    ///
+    /// No service is registered: the registry stays behaviourally empty (no
+    /// live execution route), matching its historical shape, while still
+    /// declaring the authoritative budget.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn new_empty() -> Self {
+        let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
+        specs.insert("test-model".to_string(), Self::test_model_spec());
         Self {
             services: std::sync::RwLock::new(HashMap::new()),
-            specs: std::sync::RwLock::new(HashMap::new()),
+            specs: std::sync::RwLock::new(specs),
             default_model: std::sync::RwLock::new("test-model".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             current_codex_credential: std::sync::RwLock::new(None),
             codex_reload: tokio::sync::Mutex::new(()),
             config: Arc::new(LlmConfig::default()),
+        }
+    }
+
+    /// Spec for the `test-model` route used by `new_empty`. Declares a
+    /// 131072-token output ceiling so budget resolution has an authoritative
+    /// value; the context window is irrelevant without a wired service and
+    /// resolves to the deployment default.
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_model_spec() -> super::ModelSpec {
+        super::ModelSpec {
+            id: "test-model".into(),
+            default_request_name: "test-model".into(),
+            backend: ModelBackend::Mock,
+            family: "Test".into(),
+            description: "In-process mock model for tests".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 131_072,
+            recommended: false,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: super::EffortCapabilities::Unknown,
+            service_tier_capabilities: crate::models::ServiceTierCapabilities::Unsupported,
         }
     }
 

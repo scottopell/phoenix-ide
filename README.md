@@ -227,7 +227,7 @@ values are `anthropic` (Anthropic Messages-compatible), `openai_responses`
 (OpenAI Responses-compatible), and `openai_chat_completions` (OpenAI Chat
 Completions-compatible). `family` controls the user-facing provider label and
 defaults from `backend`; set it when model ownership differs from wire format.
-`max_output_tokens` is optional and defaults to a context-safe cap.
+`max_output_tokens` is required and must be positive and smaller than `context_window`. Phoenix uses this declared maximum as the default output budget for ordinary and continuation requests, independently of reasoning effort. The same value is reserved during context planning. There is no extra 16k/64k cap or separate request-budget setting.
 
 Example Anthropic-compatible provider POC:
 
@@ -236,7 +236,7 @@ ANTHROPIC_API_KEY=provider-api-key
 ANTHROPIC_BASE_URL=https://provider.example/v1/messages
 LLM_CUSTOM_HEADERS=source: my-provider-poc
 DEFAULT_MODEL=example/provider-model
-PHOENIX_LLM_MODELS=[{"id":"example/provider-model","backend":"anthropic","description":"Example Anthropic-compatible POC","context_window":200000,"recommended":false,"supports_tool_search":false}]
+PHOENIX_LLM_MODELS=[{"id":"example/provider-model","backend":"anthropic","description":"Example Anthropic-compatible POC","context_window":200000,"max_output_tokens":64000,"recommended":false,"supports_tool_search":false}]
 ```
 
 Example Chat Completions-compatible provider POC:

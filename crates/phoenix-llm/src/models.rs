@@ -649,7 +649,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "Claude Opus 4.7 (legacy)".into(),
             context_window: 1_000_000,
             // Anthropic Messages API documented output ceiling for this legacy generation.
-            max_output_tokens: 64_000,
+            max_output_tokens: 128_000,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -664,7 +664,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 1_000_000,
             // Anthropic Messages API documented output ceiling for this legacy generation.
-            max_output_tokens: 64_000,
+            max_output_tokens: 128_000,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -708,7 +708,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             description: "Claude Sonnet 4.6 (legacy)".into(),
             context_window: 1_000_000,
             // Anthropic Messages API documented output ceiling for this legacy generation.
-            max_output_tokens: 64_000,
+            max_output_tokens: 128_000,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -862,6 +862,26 @@ pub fn all_models() -> Vec<ModelSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_output_maxima_are_explicit_and_fit_context() {
+        for model in all_models() {
+            let expected = if model.id == "claude-haiku-4-5" {
+                64_000
+            } else {
+                128_000
+            };
+            assert_eq!(model.output_token_limit(), expected, "{}", model.id);
+            assert!(usize::try_from(expected).unwrap() < model.context_window);
+        }
+    }
+
+    #[test]
+    fn external_glm_declares_its_full_output_budget_without_effort_metadata() {
+        let models = parse_external_models(r#"[{"id":"glm-5-3","backend":"openai_chat_completions","description":"GLM","context_window":1048576,"max_output_tokens":131072,"recommended":true,"supports_tool_search":false}]"#).unwrap();
+        assert_eq!(models[0].output_token_limit(), 131_072);
+        assert_eq!(models[0].effort_capabilities, EffortCapabilities::Unknown);
+    }
 
     #[test]
     fn parses_external_model_with_api_name_defaulting_to_id() {

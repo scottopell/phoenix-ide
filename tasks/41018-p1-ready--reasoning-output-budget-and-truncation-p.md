@@ -8,11 +8,14 @@ Executor chooses desired16384 tokens unless effective effort is Xhigh/Max, then6
 ## Failure model
 Model capability ceiling is not desired request budget. External reasoning model unknown native default falls into small-budget policy. Even known high still16384. Length classified InvalidResponse retries unchanged prompt/budget up to3 total attempts; private reasoning discarded as intended. Streaming returns on length before later usage trailer; error type carries no usage even when usage already present. Missing usage is unknown cost, not zero.
 
-## Proposed bounded work (policy decision needed)
-- Resolve desired output budget separately from capability ceiling/effort vocabulary; use identical resolved budget for request and context reservation. Decide per-model configured budget vs code policy; do not advertise unsupported xhigh just to get headroom, do not silently reinterpret max_output_tokens globally.
-- Give output exhaustion an explicit typed recovery policy rather than generic unchanged-budget retries (stop/actionable vs bounded escalation with cost/context constraints). Update normative ChatLengthFinishRejected rule before changing current specified InvalidResponse behavior.
-- Preserve provider usage available on failed attempts, boundedly consuming usage trailers without executing partial tool calls or exposing private reasoning. Retain unknown usage honestly.
-- Deterministic tests: budget/effort/ceiling table, external unknown effort serialization, SSE reasoning->length->usage/DONE (same and different buffers), usage missing, JSON length+usage, no partial tool execution, transient invalid response versus truncation retry behavior.
+## Approved implementation scope
+- Default ordinary and continuation requests to the declared model maximum; remove effort-keyed and 4k allowances. One concrete value drives requests and context reservation. No new budget override.
+- Require explicit external maxima; fill verified built-in model limits. Preserve native Codex wire omission.
+- Classify output exhaustion separately from context and malformed responses, with no automatic retry and user resumability. Never execute truncated tool calls.
+- Specs precede code (ADR-144, REQ-LLM-004f/006c, provider Allium). Deterministic budget, state-machine, JSON/SSE and partial-tool tests.
 
-## Scope boundaries
-No direct gateway field rename max_tokens->max_completion_tokens justified by evidence. No global effort assumption across logical provider routing. No user env or production changes during investigation. See runtime executor output budget, LlmRequest::reserved_output_tokens, registry external effort validation, ChatCompletionsAccumulator, retry policy.
+## Deferred
+Failed-attempt usage retention and bounded usage-trailer capture remain separate follow-up work. Existing absence of usage does not imply zero cost. No global wire-field rename or unverified effort default.
+
+## Qualification
+Core/LLM/state-machine suites and focused runtime suites; whole-repo check/CI and exact-head review must pass before merge. Production configuration/deployment is separate and is not changed by this task.

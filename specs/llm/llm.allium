@@ -199,15 +199,15 @@ value ToolDeclaration {
 -- context window leaves after the input. It does not depend on reasoning
 -- effort. The same resolved value is both sent to the provider's
 -- output-limit field and reserved by the context planner (REQ-LLM-004f).
--- It is null only on the native Codex transport, which owns its own
--- output-limit field and omits an explicit value by design; every other
--- route resolves a concrete budget before dispatch.
+-- Every internal request carries a concrete budget. Native Codex omits the
+-- output-limit field only at wire translation; its internal reservation remains
+-- concrete.
 value LlmRequest {
     system: List<SystemContent>
     messages: List<LlmMessage>
     tool_availability: ToolAvailability
     tool_count: tool_availability.declarations.count
-    max_tokens: Integer?
+    max_tokens: Integer
     effective_effort: EffectiveEffort
     cache_key: String
 }

@@ -7864,6 +7864,45 @@ mod tests {
     }
 
     #[test]
+    fn output_exhaustion_stops_first_attempt_but_malformed_responses_retry() {
+        for (kind, retries) in [
+            (ErrorKind::OutputTokensExhausted, false),
+            (ErrorKind::InvalidResponse, true),
+        ] {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                Event::LlmError {
+                    message: "provider stopped".into(),
+                    error_kind: kind,
+                    attempt: 1,
+                    recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
+                    resets_at: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ScheduleRetry { .. })),
+                retries
+            );
+            if !retries {
+                assert!(matches!(
+                    result.new_state,
+                    ConvState::Error {
+                        error_kind: ErrorKind::OutputTokensExhausted,
+                        ..
+                    }
+                ));
+                assert!(ErrorKind::OutputTokensExhausted.is_user_resumable());
+            }
+        }
+    }
+
+    #[test]
     fn exhausted_timed_out_attempt_reaches_terminal_parent_error() {
         let result = transition(
             &ConvState::LlmRequesting {

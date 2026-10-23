@@ -118,3 +118,14 @@ limit.
   (https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits);
   Baseten chat/reasoning reference
   (https://docs.baseten.co/reference/inference-api/chat-completions).
+
+### Catalog evidence
+
+Built-in Anthropic limits are decimal 128,000 for Opus 4.6/4.7/4.8/5.5 and
+Sonnet 4.6/5/5.5, and 64,000 for Haiku 4.5, excluding Batch API beta limits.
+References: [Anthropic models](https://platform.claude.com/docs/en/models/overview),
+[Opus 4.6](https://platform.claude.com/docs/en/models/opus-4-6/overview),
+[Opus 4.7](https://platform.claude.com/docs/en/models/opus-4-7/overview),
+[Sonnet 4.6](https://platform.claude.com/docs/en/models/sonnet-4-6/overview), and
+[Haiku 4.5](https://platform.claude.com/docs/en/models/haiku-4-5/overview).
+OpenAI built-in output ceilings retain their 128,000-token catalog declarations.
