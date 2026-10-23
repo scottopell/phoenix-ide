@@ -929,9 +929,7 @@ fn translate_request_with_tool_policy(
                 prefix_mismatch_behavior: "drop_block",
             },
         }),
-        max_tokens: request
-            .raised_output_token_ceiling()
-            .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
+        max_tokens: request.max_tokens,
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
@@ -1484,6 +1482,20 @@ fn normalize_response_with_diagnostics(
         return Err(LlmError::prompt_rejected(message));
     }
 
+    // stop_reason=max_tokens is a budget-limited stop (REQ-LLM-006c): the model
+    // reached the request's output-token budget. Terminal for auto-retry, user
+    // resumable, distinct from context_window_exceeded and from a retryable
+    // fault. Checked before any partial tool_use is parsed into a tool call, so
+    // a truncated tool call is discarded and never dispatched; already-streamed
+    // visible text stays in the ephemeral client buffer. The assembled
+    // streaming response carries the same stop_reason, so a max_tokens stream is
+    // governed here rather than by the SSE-error discard path.
+    if resp.stop_reason.as_deref() == Some("max_tokens") {
+        return Err(LlmError::output_tokens_exhausted(
+            "Anthropic stopped at its output token budget before finishing",
+        ));
+    }
+
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
     // Check if content has any client-actionable blocks. Server blocks
@@ -1564,14 +1576,6 @@ fn normalize_response_with_diagnostics(
     );
     response.provider_replay = provider_replay;
     Ok(response)
-}
-
-fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
-    if effort.is_some_and(ModelEffort::needs_extended_output_headroom) {
-        64_000
-    } else {
-        16_384
-    }
 }
 
 fn explicit_anthropic_effort(effort: ModelEffort) -> AnthropicOutputConfig {
@@ -1852,7 +1856,7 @@ mod tests {
             family: "Anthropic".into(),
             description: "test".into(),
             context_window: 200_000,
-            max_output_tokens: None,
+            max_output_tokens: 64_000,
             recommended: false,
             supports_tool_search,
             source: crate::models::ModelSource::BuiltIn,
@@ -1881,7 +1885,7 @@ mod tests {
                     defer_loading: true,
                 },
             ]),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -1896,7 +1900,7 @@ mod tests {
             provider_replay: None,
             responses_replay: vec![],
             tool_availability: ToolAvailability::all(vec![]),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -2352,7 +2356,7 @@ mod tests {
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Xhigh);
-        request.max_tokens = Some(16_384);
+        request.max_tokens = 16_384;
         let explicit =
             serde_json::to_value(translate_request(&spec, &request, false, true).unwrap()).unwrap();
         assert_eq!(explicit["output_config"]["effort"], "xhigh");
@@ -2620,7 +2624,7 @@ mod tests {
             provider_replay: None,
             responses_replay: vec![],
             tool_availability: ToolAvailability::all(vec![]),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,

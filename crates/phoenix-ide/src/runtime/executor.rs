@@ -8090,19 +8090,10 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let desired_output_tokens = if effective_effort.level().is_some_and(
-            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
-        ) {
-            64_000
-        } else {
-            16_384
-        };
         let request_output_tokens = self
             .llm_registry
             .output_token_limit(&model_id)
-            .map_or(desired_output_tokens, |limit| {
-                limit.min(desired_output_tokens)
-            });
+            .ok_or_else(|| format!("Model '{model_id}' has no declared output-token maximum"))?;
         let working_dir = self
             .context
             .execution_environment
@@ -8301,7 +8292,7 @@ where
             provider_replay,
             responses_replay,
             tool_availability,
-            max_tokens: Some(request_output_tokens),
+            max_tokens: request_output_tokens,
             effective_effort,
             service_tier: effective_service_tier,
             telemetry: Some(phoenix_llm::LlmRequestTelemetry {
@@ -9539,21 +9530,14 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let desired_continuation_output = if effective_effort.level().is_some_and(
-            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
-        ) {
-            64_000
-        } else {
-            CONTINUATION_OUTPUT_RESERVE_TOKENS
+        let Some(output_token_limit) = self.llm_registry.output_token_limit(&model_id) else {
+            return Ok(Some(Event::ContinuationFailed {
+                operation_id,
+                error: format!("Model '{model_id}' has no declared output-token maximum"),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+            }));
         };
-        let continuation_output_reserve = self.llm_registry.output_token_limit(&model_id).map_or(
-            desired_continuation_output,
-            |limit| {
-                usize::try_from(limit)
-                    .unwrap_or(usize::MAX)
-                    .min(desired_continuation_output)
-            },
-        );
+        let continuation_output_reserve = usize::try_from(output_token_limit).unwrap_or(usize::MAX);
 
         // Freeze the same persisted-only, generation-fenced projection used by
         // ordinary rounds before provider work can be scheduled. Continuation
@@ -9687,7 +9671,7 @@ where
             ), // No tools for continuation
             // Handoff quality favors completeness; cap high enough that a
             // thorough summary is not truncated mid-thought.
-            max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
+            max_tokens: output_token_limit,
             effective_effort,
             service_tier: effective_service_tier,
             telemetry: Some(phoenix_llm::LlmRequestTelemetry {

@@ -72,7 +72,7 @@ pub use retry_guidance::RetryAfter;
 // accessed via the `rate_limit` submodule.
 pub use models::{
     all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
-    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
+    ModelInfo, ModelSource, ModelSpec, NativeDefault,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
@@ -373,8 +373,7 @@ impl LoggingService {
                 // Output-token exhaustion reuses the existing token-budget
                 // outcome (REQ-LLM-006c): no new persisted outcome value, no
                 // outcome-schema migration owed.
-                LlmErrorKind::ContextWindowExceeded
-                | LlmErrorKind::OutputTokensExhausted => {
+                LlmErrorKind::ContextWindowExceeded | LlmErrorKind::OutputTokensExhausted => {
                     LlmAttemptOutcome::TokenBudgetExceeded
                 }
                 LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,

@@ -565,6 +565,15 @@ impl ResponsesStreamAccumulator {
                         super::LlmErrorKind::ContentFilter,
                         format!("Response incomplete: {reason}"),
                     )
+                } else if reason == "max_output_tokens" {
+                    // Budget-limited stop, not a transport fault: terminal for
+                    // auto-retry, user-resumable. Any partial tool call in the
+                    // truncated response is discarded (we return Err rather than
+                    // assembling a response), and already-streamed visible text
+                    // stays in the ephemeral client buffer (REQ-LLM-006c).
+                    LlmError::output_tokens_exhausted(
+                        "Response stopped at its output token budget before finishing",
+                    )
                 } else {
                     LlmError::server_error(format!("Response incomplete: {reason}"))
                 });
@@ -1911,14 +1920,14 @@ fn translate_to_responses_request_for_model(
         input: input_items,
         instructions,
         tools,
+        // REQ-LLM-004f: Phoenix always resolves a concrete output-token
+        // budget; the codex backend forbids the field on the wire, so it is
+        // omitted here by design even though the request still carries the
+        // resolved budget for context planning.
         max_output_tokens: if use_codex_backend {
             None
         } else {
-            Some(
-                request
-                    .raised_output_token_ceiling()
-                    .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
-            )
+            Some(request.max_tokens)
         },
         stream: None,
         store: if use_codex_backend || official_openai_route {
@@ -2147,14 +2156,6 @@ fn validate_responses_replay(request: &LlmRequest, api_name: &str) -> Result<(),
         }
     }
     Ok(())
-}
-
-fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
-    if effort.is_some_and(ModelEffort::needs_extended_output_headroom) {
-        64_000
-    } else {
-        16_384
-    }
 }
 
 fn platform_reasoning(effort: ModelEffort) -> ResponsesApiReasoning {
@@ -3605,7 +3606,7 @@ fn translate_to_chat_request_with_route(
         model: api_name.to_string(),
         messages,
         tools,
-        max_tokens: request.max_tokens,
+        max_tokens: Some(request.max_tokens),
         reasoning_effort: request.effective_effort.explicit_level(),
         stream: None,
         stream_options: None,
@@ -3645,10 +3646,14 @@ fn normalize_chat_response(
                 model,
                 resp.usage.as_ref().and_then(ChatUsage::reasoning_tokens),
             );
-            return Err(LlmError::invalid_response(
-                "Chat completions hit the output token limit before finishing. \
-                 Try again with a larger max_tokens value or a model with a higher output budget."
-                    .to_string(),
+            // finish_reason=length is a budget-limited stop, not a transport
+            // fault: terminal for auto-retry (an unchanged request exhausts
+            // again) and user-resumable. Any partial tool call in the truncated
+            // choice is discarded (we return Err rather than assembling a
+            // response); already-streamed visible text stays in the ephemeral
+            // client buffer (REQ-LLM-006c).
+            return Err(LlmError::output_tokens_exhausted(
+                "Chat completion stopped at its output token budget before finishing",
             ));
         }
         Some("content_filter") => {
@@ -3897,10 +3902,12 @@ impl ChatStreamAccumulator {
                             "<streaming-chat-completions>",
                             reasoning_tokens,
                         );
-                        return Err(LlmError::invalid_response(
-                            "Chat completions hit the output token limit before finishing. \
-                             Try again with a larger max_tokens value or a model with a higher output budget."
-                                .to_string(),
+                        // Budget-limited stop (REQ-LLM-006c): terminal for
+                        // auto-retry, user-resumable. Returning Err discards any
+                        // partial tool call accumulated so far; already-streamed
+                        // visible text stays in the ephemeral client buffer.
+                        return Err(LlmError::output_tokens_exhausted(
+                            "Chat completion stopped at its output token budget before finishing",
                         ));
                     }
                     "content_filter" => {
@@ -4507,7 +4514,7 @@ mod tests {
             family: "OpenAI".into(),
             description: String::new(),
             context_window: 100_000,
-            max_output_tokens: Some(crate::DEFAULT_MAX_OUTPUT_TOKENS),
+            max_output_tokens: 16_384,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -4532,7 +4539,7 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -5166,7 +5173,7 @@ mod tests {
         // A cache-relevant property change also sends a full create on the same
         // live connection rather than applying stale continuation metadata.
         let mut property_changed = request_with(&[("changed", MessageRole::User)]);
-        property_changed.max_tokens = Some(42);
+        property_changed.max_tokens = 42;
         call(property_changed).await.unwrap();
         let requests = state.ws_requests.lock().await.clone();
         assert!(requests[3].1.get("previous_response_id").is_none());
@@ -5861,7 +5868,7 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -6149,7 +6156,7 @@ mod tests {
     #[test]
     fn explicit_effort_serializes_on_platform_and_native_default_omits_reasoning() {
         let mut request = empty_request();
-        request.max_tokens = Some(16_384);
+        request.max_tokens = 16_384;
 
         let native = serde_json::to_value(translate_to_responses_request(
             "gpt-5.6-sol",
@@ -7127,7 +7134,7 @@ mod tests {
             .process_event("response.incomplete", data, &tx)
             .await
             .unwrap_err();
-        assert_eq!(err.kind, LlmErrorKind::ServerError);
+        assert_eq!(err.kind, LlmErrorKind::OutputTokensExhausted);
     }
 
     /// When the stream lacks `response.output_item.done` events but
