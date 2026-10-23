@@ -14228,6 +14228,16 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
+    async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
+        let connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn current_schema_controller_accepts_compiled_123_and_128_shapes() {
         let directory = tempfile::tempdir().unwrap();
@@ -14281,6 +14291,7 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap();
         db.pool().close().await;
         drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
 
         validate_current_schema_with_controller(&path, false);
 
@@ -14314,6 +14325,7 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap();
         db.pool().close().await;
         drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
 
         validate_current_schema_with_controller(&path, false);
         validate_current_schema_with_controller(&path, true);
