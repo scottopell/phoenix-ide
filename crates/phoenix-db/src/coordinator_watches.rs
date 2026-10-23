@@ -604,7 +604,7 @@ async fn record_watch_event_with_authority_tx(
     }
     let insert: &'static str = match authority {
         WatchTerminalAuthority::LegacyObservation => concat!(terminal_event_insert_sql!(), " ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING"),
-        WatchTerminalAuthority::ExactAuthoritative => terminal_event_insert_sql!(),
+        WatchTerminalAuthority::ExactOccurrence => terminal_event_insert_sql!(),
     };
     sqlx::query(insert)
         .bind(uuid::Uuid::new_v4().to_string())
