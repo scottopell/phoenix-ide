@@ -84,7 +84,7 @@ async fn backlog() -> Backlog {
                 ),
                 instruction: String::new(),
                 context: "fixture".into(),
-                observed_at: chrono::Utc::now().timestamp_micros(),
+                observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
                 kind: phoenix_db::SlackRequestKind::Briefing,
             }
         })

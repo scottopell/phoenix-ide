@@ -80,8 +80,8 @@ pub(crate) async fn status(db: &crate::db::Database) -> Result<serde_json::Value
             serde_json::json!({"config":null,"status":"disabled","requests":[],"returns":[]}),
         );
     };
-    let account=sqlx::query("SELECT status,last_scan_at,last_error,baseline_complete,calls_last_pass,pages_last_pass,retry_at_us FROM slack_gateway_accounts WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).fetch_optional(db.pool()).await.map_err(|e|e.to_string())?;
-    let scan=account.map(|r|serde_json::json!({"status":r.get::<String,_>("status"),"last_scan_at_unix_micros":r.get::<Option<i64>,_>("last_scan_at"),"last_error":r.get::<Option<String>,_>("last_error"),"baseline_complete":r.get::<bool,_>("baseline_complete"),"calls_last_pass":r.get::<i64,_>("calls_last_pass"),"pages_last_pass":r.get::<i64,_>("pages_last_pass"),"retry_at_us":r.get::<Option<i64>,_>("retry_at_us")}));
+    let account=sqlx::query("SELECT status,last_scan_at_unix_micros,last_error,baseline_complete,calls_last_pass,pages_last_pass,retry_at_us FROM slack_gateway_accounts WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).fetch_optional(db.pool()).await.map_err(|e|e.to_string())?;
+    let scan=account.map(|r|serde_json::json!({"status":r.get::<String,_>("status"),"last_scan_at_unix_micros":r.get::<Option<i64>,_>("last_scan_at_unix_micros"),"last_error":r.get::<Option<String>,_>("last_error"),"baseline_complete":r.get::<bool,_>("baseline_complete"),"calls_last_pass":r.get::<i64,_>("calls_last_pass"),"pages_last_pass":r.get::<i64,_>("pages_last_pass"),"retry_at_us":r.get::<Option<i64>,_>("retry_at_us")}));
     Ok(
         serde_json::json!({"config":c,"scan":scan,"requests":db.slack_requests(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?,"returns":db.slack_returns(&c.workspace,&c.owner).await.map_err(|e|e.to_string())?}),
     )

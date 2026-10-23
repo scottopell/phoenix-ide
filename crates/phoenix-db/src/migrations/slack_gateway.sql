@@ -26,7 +26,7 @@ WHEN (NEW.origin_kind = 'slack_gateway') != (NEW.origin_slack_request_id IS NOT 
 BEGIN SELECT RAISE(ABORT, 'invalid Slack origin'); END;
 CREATE TABLE slack_gateway_accounts (
  workspace TEXT NOT NULL, owner TEXT NOT NULL, baseline_complete INTEGER NOT NULL DEFAULT 0 CHECK(baseline_complete IN (0,1)),
- status TEXT NOT NULL DEFAULT 'initializing', last_scan_at INTEGER, last_error TEXT,
+ status TEXT NOT NULL DEFAULT 'initializing', last_scan_at_unix_micros INTEGER CHECK(last_scan_at_unix_micros IS NULL OR (typeof(last_scan_at_unix_micros)='integer' AND last_scan_at_unix_micros>=0)), last_error TEXT,
  PRIMARY KEY(workspace,owner)
 );
 CREATE TABLE slack_gateway_bindings (
@@ -38,7 +38,7 @@ CREATE TABLE slack_gateway_requests (
  request_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL, message_ts TEXT NOT NULL,
  thread_ts TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('baseline','briefing','explicit')),
  instruction TEXT NOT NULL, context TEXT NOT NULL, source_url TEXT NOT NULL, binding_id TEXT REFERENCES slack_gateway_bindings(binding_id),
- accepted_at INTEGER NOT NULL, eyes_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(eyes_confirmed IN (0,1)),
+ accepted_at_unix_micros INTEGER NOT NULL CHECK(typeof(accepted_at_unix_micros)='integer' AND accepted_at_unix_micros>=0), eyes_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(eyes_confirmed IN (0,1)),
  admission_state TEXT NOT NULL DEFAULT 'accepted' CHECK(admission_state IN ('accepted','admitted','rejected')),
  input_id TEXT NOT NULL UNIQUE, transcript_id TEXT, failure TEXT,
  UNIQUE(workspace,owner,channel,message_ts),
@@ -50,8 +50,10 @@ CREATE TABLE slack_gateway_returns (
  text TEXT NOT NULL, native_message_id TEXT,
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','attempting','submitted','confirmed','known_unsent','uncertain','failed')),
  attempt_id TEXT, delivery_proof TEXT, notification_receipt TEXT, failure TEXT,
- notification_command TEXT, created_at INTEGER NOT NULL, UNIQUE(binding_id,occurrence_key,destination),
- CHECK((state='confirmed') = (delivery_proof IS NOT NULL))
+ notification_command TEXT CHECK(notification_command IS NULL OR (json_valid(notification_command) AND json_type(notification_command)='array' AND json_array_length(notification_command) BETWEEN 1 AND 16)),
+ created_at_unix_micros INTEGER NOT NULL CHECK(typeof(created_at_unix_micros)='integer' AND created_at_unix_micros>=0), UNIQUE(binding_id,occurrence_key,destination),
+ CHECK((state='confirmed') = (delivery_proof IS NOT NULL)),
+ CHECK(state<>'submitted' OR (destination='private' AND notification_receipt IS NOT NULL AND length(trim(notification_receipt))>0 AND notification_command IS NOT NULL))
 );
 CREATE TABLE slack_gateway_return_coverage (
  return_id TEXT NOT NULL REFERENCES slack_gateway_returns(return_id),
@@ -87,12 +89,12 @@ ALTER TABLE slack_gateway_requests ADD COLUMN question_transcript TEXT;
 
 CREATE UNIQUE INDEX slack_gateway_explicit_thread ON slack_gateway_bindings(workspace,owner,channel,thread_ts) WHERE kind='explicit';
 CREATE INDEX slack_gateway_binding_product ON slack_gateway_bindings(product_id);
-CREATE INDEX slack_gateway_return_dispatch ON slack_gateway_returns(state,created_at);
-CREATE INDEX slack_gateway_request_account ON slack_gateway_requests(workspace,owner,accepted_at);
+CREATE INDEX slack_gateway_return_dispatch ON slack_gateway_returns(state,created_at_unix_micros);
+CREATE INDEX slack_gateway_request_account ON slack_gateway_requests(workspace,owner,accepted_at_unix_micros);
 ALTER TABLE slack_gateway_accounts ADD COLUMN calls_last_pass INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE slack_gateway_accounts ADD COLUMN pages_last_pass INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE slack_gateway_accounts ADD COLUMN retry_at_us INTEGER;
-ALTER TABLE slack_gateway_requests ADD COLUMN observed_at INTEGER NOT NULL DEFAULT 0 CHECK(observed_at>=0);
+ALTER TABLE slack_gateway_accounts ADD COLUMN retry_at_us INTEGER CHECK(retry_at_us IS NULL OR (typeof(retry_at_us)='integer' AND retry_at_us>=0));
+ALTER TABLE slack_gateway_requests ADD COLUMN observed_at_unix_micros INTEGER NOT NULL DEFAULT 0 CHECK(typeof(observed_at_unix_micros)='integer' AND observed_at_unix_micros>=0);
 
 -- Native context exhaustion may transfer the same request to a successor.
 ALTER TABLE slack_gateway_native_outcomes ADD COLUMN context_exhausted INTEGER NOT NULL DEFAULT 0 CHECK(context_exhausted IN (0,1));

@@ -29,7 +29,7 @@ pub struct SlackSource {
     pub source_url: String,
     pub instruction: String,
     pub context: String,
-    pub observed_at: i64,
+    pub observed_at_unix_micros: i64,
     pub kind: SlackRequestKind,
 }
 /// Evidence needed before a discovery page can advance past a verified source.
@@ -127,7 +127,7 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
         product_id: r.try_get("product_id")?,
         transcript_id: r.try_get("transcript_id")?,
         admitted: r.try_get::<String, _>("admission_state")? == "admitted",
-        accepted_at_us: r.try_get("accepted_at")?,
+        accepted_at_us: r.try_get("accepted_at_unix_micros")?,
         eyes_confirmed: r.try_get("eyes_confirmed")?,
         failure: r.try_get("failure")?,
         question_id: r.try_get("question_id")?,
@@ -141,7 +141,7 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
             source_url: r.try_get("source_url")?,
             instruction: r.try_get("instruction")?,
             context: r.try_get("context")?,
-            observed_at: r.try_get("observed_at")?,
+            observed_at_unix_micros: r.try_get("observed_at_unix_micros")?,
             kind: if r.try_get::<String, _>("kind")? == "explicit" {
                 SlackRequestKind::Explicit
             } else {
@@ -183,7 +183,7 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> DbResult<()> {
-        sqlx::query("UPDATE slack_gateway_accounts SET baseline_complete=MAX(baseline_complete,?3),status=?4,last_error=?5,last_scan_at=CASE WHEN ?3 THEN ?6 ELSE last_scan_at END WHERE workspace=?1 AND owner=?2")
+        sqlx::query("UPDATE slack_gateway_accounts SET baseline_complete=MAX(baseline_complete,?3),status=?4,last_error=?5,last_scan_at_unix_micros=CASE WHEN ?3 THEN ?6 ELSE last_scan_at_unix_micros END WHERE workspace=?1 AND owner=?2")
             .bind(workspace).bind(owner).bind(complete).bind(status).bind(error).bind(chrono::Utc::now().timestamp_micros()).execute(self.pool()).await?;
         Ok(())
     }
@@ -229,8 +229,8 @@ impl Database {
             sqlx::query("INSERT INTO slack_gateway_bindings(binding_id,workspace,owner,channel,thread_ts,kind,creation_id) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(binding_id) DO NOTHING")
                 .bind(&binding).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.thread_ts).bind(source.kind.as_str()).bind(uuid::Uuid::new_v4().to_string()).execute(&mut *tx).await?;
         }
-        sqlx::query("INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,source_url,binding_id,accepted_at,input_id,context,observed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)")
-            .bind(&request).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(&source.thread_ts).bind(if baseline {"baseline"}else{source.kind.as_str()}).bind(&source.instruction).bind(&source.source_url).bind(if baseline {None}else{Some(&binding)}).bind(chrono::Utc::now().timestamp_micros()).bind(uuid::Uuid::new_v4().to_string()).bind(&source.context).bind(source.observed_at).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,source_url,binding_id,accepted_at_unix_micros,input_id,context,observed_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)")
+            .bind(&request).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(&source.thread_ts).bind(if baseline {"baseline"}else{source.kind.as_str()}).bind(&source.instruction).bind(&source.source_url).bind(if baseline {None}else{Some(&binding)}).bind(chrono::Utc::now().timestamp_micros()).bind(uuid::Uuid::new_v4().to_string()).bind(&source.context).bind(source.observed_at_unix_micros).execute(&mut *tx).await?;
         if !baseline && source.kind == SlackRequestKind::Explicit {
             let candidates=sqlx::query("SELECT DISTINCT q.question_id,q.transcript_id,o.delivery_proof FROM slack_gateway_questions q JOIN slack_gateway_returns o USING(return_id) WHERE o.binding_id=?1 AND o.state='confirmed' AND q.answered_by IS NULL AND q.retired_reason IS NULL").bind(&binding).fetch_all(&mut *tx).await?;
             let mut targets = std::collections::BTreeSet::new();
@@ -268,7 +268,7 @@ impl Database {
         workspace: &str,
         owner: &str,
     ) -> DbResult<Vec<SlackRequest>> {
-        Ok(sqlx::query("SELECT r.*, b.creation_id, b.product_id FROM slack_gateway_requests r JOIN slack_gateway_bindings b USING(binding_id) WHERE r.workspace=?1 AND r.owner=?2 ORDER BY r.accepted_at")
+        Ok(sqlx::query("SELECT r.*, b.creation_id, b.product_id FROM slack_gateway_requests r JOIN slack_gateway_bindings b USING(binding_id) WHERE r.workspace=?1 AND r.owner=?2 ORDER BY r.accepted_at_unix_micros")
             .bind(workspace).bind(owner).try_map(|r| request_row(&r)).fetch_all(self.pool()).await?)
     }
     pub async fn slack_bind_product(&self, binding: &str, product: &str) -> DbResult<()> {
@@ -371,7 +371,7 @@ impl Database {
                 ));
             }
         }
-        let inserted=sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,native_message_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(binding_id,occurrence_key,destination) DO NOTHING")
+        let inserted=sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,native_message_id,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(binding_id,occurrence_key,destination) DO NOTHING")
             .bind(&id).bind(&binding).bind(&occurrence).bind(destination).bind(text).bind(source_message).bind(chrono::Utc::now().timestamp_micros()).execute(&mut *tx).await?;
         let actual:String=sqlx::query_scalar("SELECT return_id FROM slack_gateway_returns WHERE binding_id=?1 AND occurrence_key=?2 AND destination=?3 AND text=?4").bind(&binding).bind(&occurrence).bind(destination).bind(text).fetch_one(&mut *tx).await?;
         if inserted.rows_affected() > 0 {
@@ -394,7 +394,7 @@ impl Database {
         Ok(actual)
     }
     pub async fn slack_returns(&self, workspace: &str, owner: &str) -> DbResult<Vec<SlackReturn>> {
-        Ok(sqlx::query("SELECT o.*,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p WHERE p.id=b.product_id)) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at")
+        Ok(sqlx::query("SELECT o.*,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p WHERE p.id=b.product_id)) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")
             .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
     }
     pub async fn slack_begin_return(&self, id: &str, attempt: &str) -> DbResult<bool> {
@@ -455,7 +455,7 @@ impl Database {
         let changed=sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure=?3 WHERE return_id=?1 AND attempt_id=?2 AND state='attempting' AND destination='thread'").bind(id).bind(attempt).bind(reason).execute(&mut *tx).await?;
         if changed.rows_affected() == 1 {
             let notice = uuid::Uuid::new_v4().to_string();
-            sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at) SELECT ?2,binding_id,?3,'private','Phoenix could not reply in the source Slack thread; open Phoenix for the recorded delivery failure.','notice',?4 FROM slack_gateway_returns WHERE return_id=?1")
+            sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) SELECT ?2,binding_id,?3,'private','Phoenix could not reply in the source Slack thread; open Phoenix for the recorded delivery failure.','notice',?4 FROM slack_gateway_returns WHERE return_id=?1")
                 .bind(id).bind(&notice).bind(format!("delivery-failed:{id}")).bind(chrono::Utc::now().timestamp_micros()).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) SELECT ?2,request_id FROM slack_gateway_return_coverage WHERE return_id=?1").bind(id).bind(&notice).execute(&mut *tx).await?;
         }
@@ -651,7 +651,7 @@ impl Database {
                 };
                 let binding: String = event.try_get("binding_id")?;
                 let destination = if private { "private" } else { "thread" };
-                sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING")
+                sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING")
                     .bind(uuid::Uuid::new_v4().to_string()).bind(&binding).bind(&occurrence).bind(destination).bind(&text).bind(if kind=="question" {"clarification"}else if private {"notice"}else{"failure"}).bind(chrono::Utc::now().timestamp_micros()).execute(&mut *tx).await?;
                 let id: String = sqlx::query_scalar("SELECT return_id FROM slack_gateway_returns WHERE binding_id=?1 AND occurrence_key=?2 AND destination=?3")
                     .bind(&binding).bind(&occurrence).bind(destination).fetch_one(&mut *tx).await?;
@@ -715,7 +715,7 @@ async fn reject_slack_request_tx(
     if let Some(r) = row {
         sqlx::query("UPDATE slack_gateway_requests SET admission_state='rejected',failure=?2 WHERE request_id=?1").bind(request).bind(reason).execute(&mut **tx).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at) VALUES (?1,?2,?3,?4,?5,'failure',?6)").bind(&id).bind(r.try_get::<String,_>("binding_id")?).bind(format!("rejected:{request}")).bind(if r.try_get::<String,_>("kind")?=="briefing" {"private"}else{"thread"}).bind("Phoenix could not admit this request. Open Phoenix for the recorded reason; send a new message after resolving it.").bind(chrono::Utc::now().timestamp_micros()).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,'failure',?6)").bind(&id).bind(r.try_get::<String,_>("binding_id")?).bind(format!("rejected:{request}")).bind(if r.try_get::<String,_>("kind")?=="briefing" {"private"}else{"thread"}).bind("Phoenix could not admit this request. Open Phoenix for the recorded reason; send a new message after resolving it.").bind(chrono::Utc::now().timestamp_micros()).execute(&mut **tx).await?;
         sqlx::query(
             "INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES (?1,?2)",
         )
@@ -731,6 +731,42 @@ async fn reject_slack_request_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn gateway_timestamps_reject_negative_and_noninteger_values() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = source("100.000", SlackRequestKind::Briefing);
+        db.slack_baseline_complete(&source.workspace, &source.owner)
+            .await
+            .unwrap();
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.fail_slack_before_admission(&request.request_id, "fixture refusal")
+            .await
+            .unwrap();
+        for (table, column) in [
+            ("slack_gateway_requests", "accepted_at_unix_micros"),
+            ("slack_gateway_requests", "observed_at_unix_micros"),
+            ("slack_gateway_returns", "created_at_unix_micros"),
+            ("slack_gateway_accounts", "last_scan_at_unix_micros"),
+            ("slack_gateway_accounts", "retry_at_us"),
+        ] {
+            for invalid in ["-1", "1.5", "'not a timestamp'"] {
+                assert!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "UPDATE {table} SET {column}={invalid}"
+                    )))
+                    .execute(db.pool())
+                    .await
+                    .is_err(),
+                    "{table}.{column} accepted {invalid}"
+                );
+            }
+        }
+    }
     #[tokio::test]
     async fn notification_submission_freezes_command_and_reconciles_without_resending() {
         let db = Database::open_in_memory().await.unwrap();
@@ -883,7 +919,7 @@ mod tests {
             ),
             instruction: "investigate".into(),
             context: "quoted source".into(),
-            observed_at: chrono::Utc::now().timestamp_micros(),
+            observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
             kind,
         }
     }
@@ -1128,7 +1164,7 @@ mod tests {
             .await
             .unwrap();
         for id in ["q1", "q2"] {
-            sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at) VALUES (?1,?2,?1,'thread','Question','clarification','confirmed','{\"message_ts\":\"101.000\"}',1)").bind(id).bind(&first.binding_id).execute(db.pool()).await.unwrap();
+            sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at_unix_micros) VALUES (?1,?2,?1,'thread','Question','clarification','confirmed','{\"message_ts\":\"101.000\"}',1)").bind(id).bind(&first.binding_id).execute(db.pool()).await.unwrap();
             sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id) VALUES (?1,?1,?2)").bind(id).bind(&conv.id).execute(db.pool()).await.unwrap();
         }
         db.accept_slack_source(&source("102.000", SlackRequestKind::Explicit), false)
@@ -1187,7 +1223,7 @@ mod tests {
         db.slack_bind_product(&first.binding_id, conv.product_conversation_id.as_str())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at) VALUES ('question-return',?1,'question','thread','Which label?','clarification','confirmed','{\"message_ts\":\"101.000\"}',1)")
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at_unix_micros) VALUES ('question-return',?1,'question','thread','Which label?','clarification','confirmed','{\"message_ts\":\"101.000\"}',1)")
             .bind(&first.binding_id).execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('question-return',?1)").bind(&first.request_id).execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id) VALUES ('question-return','exact-question',?1)").bind(&conv.id).execute(db.pool()).await.unwrap();

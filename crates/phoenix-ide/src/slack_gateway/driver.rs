@@ -870,7 +870,7 @@ mod tests {
                 ),
                 instruction: "Investigate this fixture".into(),
                 context: "Quoted fixture source".into(),
-                observed_at: chrono::Utc::now().timestamp_micros(),
+                observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
                 kind: SlackRequestKind::Explicit,
             };
             state.db.accept_slack_source(&source, false).await.unwrap();
@@ -1068,7 +1068,7 @@ mod tests {
             ),
             instruction: "My answer".into(),
             context: "quoted context".into(),
-            observed_at: chrono::Utc::now().timestamp_micros(),
+            observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
             kind: SlackRequestKind::Explicit,
         };
         let original = source("100.000000");
@@ -1111,7 +1111,7 @@ mod tests {
         }])
         .unwrap();
         sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body,processed) VALUES (?1,'q1','question',?2,?3,?4,1)").bind(&first.request_id).bind(&conv.id).bind(&q1id).bind(questions).execute(state.db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at) VALUES ('posted-q1',?1,'q1','thread','Old question','clarification','confirmed','{\"message_ts\":\"101.000000\"}',1)").bind(&first.binding_id).execute(state.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at_unix_micros) VALUES ('posted-q1',?1,'q1','thread','Old question','clarification','confirmed','{\"message_ts\":\"101.000000\"}',1)").bind(&first.binding_id).execute(state.db.pool()).await.unwrap();
         sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id) VALUES ('posted-q1',?1,?2)").bind(&q1id).bind(&conv.id).execute(state.db.pool()).await.unwrap();
         state
             .db

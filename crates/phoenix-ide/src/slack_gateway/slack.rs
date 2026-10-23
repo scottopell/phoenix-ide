@@ -28,7 +28,7 @@ pub(super) struct Hit {
     pub root: String,
     pub url: String,
     pub text: String,
-    pub observed_at: i64,
+    pub observed_at_unix_micros: i64,
 }
 pub(super) struct Page {
     pub hits: Vec<Hit>,
@@ -229,7 +229,7 @@ impl Slack {
             message_ts: hit.ts.clone(),
             thread_ts: hit.root.clone(),
             source_url: hit.url.clone(),
-            observed_at: hit.observed_at,
+            observed_at_unix_micros: hit.observed_at_unix_micros,
             instruction,
             context: format!(
                 "Bounded Slack discussion; coverage: {coverage}; gateway character truncation: {truncated}\n{}",
@@ -436,7 +436,7 @@ fn parse_page(v: &Value, c: &Config) -> Result<Page, String> {
             ts: ts.into(),
             root,
             url: url.into(),
-            observed_at: chrono::Utc::now().timestamp_micros(),
+            observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
             text: part
                 .split_once("\nText:")
                 .ok_or("Missing source text")?
