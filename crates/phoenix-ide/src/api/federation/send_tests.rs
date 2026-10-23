@@ -19,6 +19,79 @@ fn request() -> RemoteSendMessageRequest {
 }
 
 #[test]
+fn remote_rejected_outcome_preserves_only_known_target_unavailable_code() {
+    for (code, message, expected) in [
+        (
+            "target_unavailable",
+            "unrelated diagnostic",
+            RemoteSendRejectionCode::TargetUnavailable,
+        ),
+        (
+            "unknown",
+            "Conversation is archived and unavailable for messaging.",
+            RemoteSendRejectionCode::AdmissionRejected,
+        ),
+        ("", "empty code", RemoteSendRejectionCode::AdmissionRejected),
+        (
+            "invalid_state",
+            "ordinary rejection",
+            RemoteSendRejectionCode::AdmissionRejected,
+        ),
+        (
+            "steering_queue_full",
+            "full queue",
+            RemoteSendRejectionCode::AdmissionRejected,
+        ),
+        (
+            "close_admission_fenced",
+            "closing",
+            RemoteSendRejectionCode::AdmissionRejected,
+        ),
+        (
+            "target_unavailable ",
+            "noncanonical code",
+            RemoteSendRejectionCode::AdmissionRejected,
+        ),
+    ] {
+        match remote_send_outcome_rejection(message, code) {
+            RemoteSendReceipt::Rejected {
+                code: actual,
+                message: diagnostic,
+            } => {
+                assert_eq!(actual, expected);
+                assert_eq!(diagnostic, message);
+            }
+            receipt => panic!("unexpected non-rejection receipt: {receipt:?}"),
+        }
+    }
+}
+
+#[test]
+fn remote_rejected_outcome_keeps_the_existing_512_unicode_scalar_diagnostic_bound() {
+    let message = "\u{1f980}".repeat(513);
+    for (code, expected) in [
+        (
+            "target_unavailable",
+            RemoteSendRejectionCode::TargetUnavailable,
+        ),
+        ("unknown", RemoteSendRejectionCode::AdmissionRejected),
+    ] {
+        match remote_send_outcome_rejection(&message, code) {
+            RemoteSendReceipt::Rejected {
+                code: actual,
+                message: diagnostic,
+            } => {
+                assert_eq!(actual, expected);
+                assert_eq!(diagnostic, "\u{1f980}".repeat(512));
+                assert_eq!(diagnostic.chars().count(), 512);
+                assert_eq!(diagnostic.len(), 2048);
+            }
+            receipt => panic!("unexpected non-rejection receipt: {receipt:?}"),
+        }
+    }
+}
+
+#[test]
 fn send_request_is_closed_and_does_not_accept_a_source_instance() {
     let wire = serde_json::to_value(request()).unwrap();
     for field in [

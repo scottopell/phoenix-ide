@@ -475,11 +475,8 @@ async fn admit_remote_message(
         Ok(result) => result,
         Err(error) => return remote_send_admission_rejection(&error),
     };
-    if let SendChatOutcome::Rejected { message, .. } = outcome {
-        return RemoteSendReceipt::Rejected {
-            code: RemoteSendRejectionCode::AdmissionRejected,
-            message: bounded_send_diagnostic(&message),
-        };
+    if let SendChatOutcome::Rejected { message, code } = outcome {
+        return remote_send_outcome_rejection(&message, code);
     }
     let conversation = match state.db.get_conversation(&id).await {
         Ok(conversation) => conversation,
@@ -577,6 +574,16 @@ fn remote_send_admission_rejection(
     RemoteSendReceipt::Rejected {
         code,
         message: bounded_send_diagnostic(&error.to_string()),
+    }
+}
+
+fn remote_send_outcome_rejection(message: &str, code: &str) -> RemoteSendReceipt {
+    RemoteSendReceipt::Rejected {
+        code: match code {
+            "target_unavailable" => RemoteSendRejectionCode::TargetUnavailable,
+            _ => RemoteSendRejectionCode::AdmissionRejected,
+        },
+        message: bounded_send_diagnostic(message),
     }
 }
 
