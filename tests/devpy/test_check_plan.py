@@ -358,7 +358,7 @@ class CheckPlanTests(unittest.TestCase):
     def test_goal_qualification_helper_only_change_runs_spec_shape(self):
         changed = {"scripts/goal_qualification.py"}
         self.assertEqual(self.dev._categorize_changed_paths(changed), {"SPECS"})
-        with mock.patch.object(self.dev, "_changed_paths_vs_base", return_value=changed):
+        with mock.patch.dict(os.environ, GATED_CI_ENV), mock.patch.object(self.dev, "_changed_paths_vs_base", return_value=changed):
             active, _ = self.dev._gate_lanes()
         self.assertIn("spec-shape", active)
         self.assertNotIn("rust", active)
