@@ -469,7 +469,7 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Err(prepared_semantics_changed(&input.prepared));
         }
-        if input.disposition == AcceptedDisposition::Runtime {
+        let active_runtime_owner = if input.disposition == AcceptedDisposition::Runtime {
             if let Some(owner) = sqlx::query_scalar::<_, i64>(
                 "SELECT turn_id FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1",
             )
@@ -482,17 +482,32 @@ impl WorkflowRepository {
                     owner: TurnAuthorityId(to_u64(owner, "turn_id")?),
                 }));
             }
-        } else if let Some(owner) =
-            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, input.conversation()).await?
-        {
-            if owner.conversation != *input.conversation() {
-                tx.rollback().await?;
-                return Err(DbError::Serialization(
-                    "active runtime owner rehydrated under wrong conversation".to_string(),
-                ));
+            None
+        } else {
+            let owner =
+                load_active_runtime_turn_tx(&self.pool, &mut tx.tx, input.conversation()).await?;
+            if let Some(owner) = owner.as_ref() {
+                if owner.conversation != *input.conversation() {
+                    tx.rollback().await?;
+                    return Err(DbError::Serialization(
+                        "active runtime owner rehydrated under wrong conversation".to_string(),
+                    ));
+                }
             }
-        }
+            owner
+        };
+        let mut model = phoenix_workflow::DurableTurnModel::from_turns(active_runtime_owner)
+            .map_err(conflict)?;
         let turn_id = next_direct_turn_id_tx(&mut tx).await?;
+        let step = model
+            .apply(TurnCommand::Accept {
+                turn_id,
+                conversation: input.conversation().clone(),
+                client_key: input.client_key.clone(),
+                prepared: input.prepared.clone(),
+                disposition: input.disposition,
+            })
+            .map_err(conflict)?;
         let workflow_id = super::next_global_workflow_id_tx(&mut tx).await?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
@@ -537,16 +552,7 @@ impl WorkflowRepository {
         if cut == TransactionCut::AfterCommit {
             return Err(injected_cut(cut));
         }
-        let mut model = phoenix_workflow::DurableTurnModel::default();
-        model
-            .apply(TurnCommand::Accept {
-                turn_id,
-                conversation: input.conversation().clone(),
-                client_key: input.client_key.clone(),
-                prepared: input.prepared.clone(),
-                disposition: input.disposition,
-            })
-            .map_err(conflict)
+        Ok(step)
     }
 
     pub async fn exact_turn_retired(
@@ -4910,6 +4916,26 @@ mod tests {
             };
             let repo = db.workflow_repository();
             let steering_anchor = if disposition == AcceptedDisposition::Steering {
+                let before: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM durable_turns), (SELECT COUNT(*) FROM workflows), (SELECT COUNT(*) FROM messages), (SELECT COALESCE(SUM(next_value), 0) FROM workflow_global_sequences)").fetch_one(&repo.pool).await.unwrap();
+                let rejected = repo
+                    .accept_authoritative_turn(&input_with_disposition(
+                        "conv-a",
+                        "steering-without-owner",
+                        208,
+                        AcceptedDisposition::Steering,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    rejected,
+                    DbError::DirectTurnConflict(TurnConflict::CorruptAggregate(_))
+                ));
+                let after: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM durable_turns), (SELECT COUNT(*) FROM workflows), (SELECT COUNT(*) FROM messages), (SELECT COALESCE(SUM(next_value), 0) FROM workflow_global_sequences)").fetch_one(&repo.pool).await.unwrap();
+                assert_eq!(after, before);
+                assert_eq!(
+                    db.capture_stop_target("conv-a").await.unwrap(),
+                    CapturedStopTarget::Standalone(captured.clone())
+                );
                 let (turn_id, _) = created_turn(&repo, "steering-runtime-anchor", 209).await;
                 Some(turn_id)
             } else {
@@ -5031,6 +5057,7 @@ mod tests {
             assert_eq!(captured.message_id(), "standalone-input");
             assert_eq!(captured.source(), crate::MessageExecutionSource::Steering);
         }
+        assert_steering_rehydrates_active_owner_before_commit().await;
     }
 
     fn drain_projection() -> UserRequestedDrainProjection {
@@ -9659,6 +9686,10 @@ mod tests {
 
     #[tokio::test]
     async fn steering_accept_rehydrates_active_owner_before_commit() {
+        assert_steering_rehydrates_active_owner_before_commit().await;
+    }
+
+    async fn assert_steering_rehydrates_active_owner_before_commit() {
         let repo = repo().await;
         let runtime = input("conv-a", "runtime-owner", 80);
         repo.accept_authoritative_turn(&runtime).await.unwrap();
@@ -9677,11 +9708,14 @@ mod tests {
             81,
             AcceptedDisposition::Steering,
         );
+        let before: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM durable_turns), (SELECT COUNT(*) FROM workflows), (SELECT COUNT(*) FROM messages), (SELECT COALESCE(SUM(next_value), 0) FROM workflow_global_sequences)").fetch_one(&repo.pool).await.unwrap();
         let err = repo.accept_authoritative_turn(&steering).await.unwrap_err();
         assert!(matches!(
             err,
             DbError::DirectTurnConflict(TurnConflict::CorruptAggregate(_))
         ));
+        let after: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM durable_turns), (SELECT COUNT(*) FROM workflows), (SELECT COUNT(*) FROM messages), (SELECT COALESCE(SUM(next_value), 0) FROM workflow_global_sequences)").fetch_one(&repo.pool).await.unwrap();
+        assert_eq!(after, before);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM durable_turns WHERE client_turn_key = 'steering-corrupt-owner'"
