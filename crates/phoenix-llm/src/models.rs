@@ -460,10 +460,7 @@ pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
 
     let mut parsed = Vec::new();
     for (index, value) in specs.into_iter().enumerate() {
-        match serde_json::from_value::<ExternalModelSpec>(value)
-            .map_err(|_| format!("model at index {index} has invalid shape"))
-            .and_then(|spec| external_model_spec_from_config(index, spec))
-        {
+        match parse_external_model_entry(index, value) {
             Ok(spec) => parsed.push(spec),
             Err(error) => {
                 tracing::warn!(error = %error, "ignoring invalid PHOENIX_LLM_MODELS entry");
@@ -471,6 +468,18 @@ pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
         }
     }
     Ok(parsed)
+}
+
+fn parse_external_model_entry(index: usize, value: serde_json::Value) -> Result<ModelSpec, String> {
+    let model_id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing id>")
+        .to_owned();
+    let spec = serde_json::from_value::<ExternalModelSpec>(value).map_err(|error| {
+        format!("model '{model_id}' at index {index} has invalid shape: {error}")
+    })?;
+    external_model_spec_from_config(index, spec)
 }
 
 fn validate_external_effort_capabilities(
@@ -1065,6 +1074,22 @@ mod tests {
         )
         .expect("top-level external model array parses");
         assert_eq!(models.len(), 1);
+    }
+
+    #[test]
+    fn missing_output_limit_diagnostic_names_the_model_and_field() {
+        let error = parse_external_model_entry(
+            3,
+            serde_json::json!({
+                "id": "legacy-glm", "backend": "openai_chat_completions",
+                "description": "Legacy entry", "context_window": 1048576,
+                "recommended": false, "supports_tool_search": false,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy-glm"), "{error}");
+        assert!(error.contains("max_output_tokens"), "{error}");
+        assert!(error.contains("missing field"), "{error}");
     }
 
     #[test]

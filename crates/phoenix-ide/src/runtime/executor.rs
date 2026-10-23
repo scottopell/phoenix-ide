@@ -11031,6 +11031,9 @@ fn estimate_message_tokens(msg: &LlmMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+            ContentBlock::ToolResult { images, .. } => {
+                estimate_text_tokens(&block.render_text()) + images.len() * IMAGE_TOKEN_ESTIMATE
+            }
             other => estimate_text_tokens(&other.render_text()),
         })
         .sum();
@@ -13737,6 +13740,46 @@ mod dispatch_context_budget_tests {
                 assert!(runtime.llm_task_handle.is_none());
             }
         }
+    }
+
+    #[test]
+    fn predispatch_planning_counts_images_nested_in_tool_results() {
+        let tool_message = |images| LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "capture".into(),
+                content: "screenshot".into(),
+                is_error: false,
+                images,
+            }],
+        };
+        let text_only = tool_message(vec![]);
+        let with_images = tool_message(vec![
+            phoenix_core::domain::llm_types::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AA==".into(),
+            };
+            2
+        ]);
+        let text_tokens = estimate_message_tokens(&text_only);
+        assert_eq!(
+            estimate_message_tokens(&with_images),
+            text_tokens + 2 * IMAGE_TOKEN_ESTIMATE
+        );
+        let context = text_tokens + 1_000;
+        assert!(!dispatch_estimate_exceeds_context(
+            0,
+            &[text_only],
+            1_000,
+            context
+        ));
+        assert!(dispatch_estimate_exceeds_context(
+            0,
+            &[with_images],
+            1_000,
+            context
+        ));
     }
 
     #[test]

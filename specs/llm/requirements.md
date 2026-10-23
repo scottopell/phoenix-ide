@@ -276,7 +276,7 @@ THE SYSTEM SHALL compose it with the rest of the provider request shape rather t
 
 ### REQ-LLM-004f: Output Budget Resolution and Reservation
 
-WHEN Phoenix prepares a request for a model with a bounded output budget
+WHEN Phoenix prepares an ordinary or continuation agent-turn request for a model with a bounded output budget
 THE SYSTEM SHALL resolve one output-token budget equal to the model's declared supported output maximum
 AND SHALL clamp that budget only by the output room the context window leaves after the input
 AND SHALL use that single resolved budget both as the value sent in the provider's output-limit field and as the output headroom the context planner reserves
@@ -288,6 +288,8 @@ THE SYSTEM SHALL distinguish consumed input context from reserved output budget 
 WHEN the input plus the preferred reserved output budget does not fit the context window
 THE SYSTEM SHALL first trim or compact available input to recover room for the preferred output budget rather than silently shrinking the request to a tiny output budget
 AND SHALL, when a fixed prompt plus the reserved output budget still cannot fit, surface the condition through the context-management policy rather than dispatching a request whose output budget exceeds the model or context limit
+
+Bounded utility requests such as titles, command suggestions, search interpretation, and structured QA MAY declare a smaller output limit for their specific contract. They SHALL use that same explicit limit for their own request accounting and SHALL NOT change the ordinary or continuation agent-turn default.
 
 WHEN fitting an ordinary request before dispatch
 THE SYSTEM SHALL account for its system prompt, tool declarations, rendered history, and output reservation

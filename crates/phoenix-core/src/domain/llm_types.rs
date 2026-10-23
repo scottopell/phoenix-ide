@@ -644,14 +644,8 @@ pub struct LlmRequest {
     pub provider_replay: Option<super::provider_replay::AnthropicReplayPayload>,
     pub responses_replay: Vec<super::responses_replay::ResponsesResponseSet>,
     pub tool_availability: super::tool_availability::ToolAvailability,
-    /// The one resolved output-token budget for this request (REQ-LLM-004f):
-    /// the model's declared supported output maximum, clamped only by what
-    /// the context window leaves after the input. It does not depend on
-    /// reasoning effort or on a normal-versus-continuation distinction. The
-    /// same resolved value is both sent to the provider's output-limit field
-    /// and reserved by the context planner. Providers that forbid the field
-    /// on the wire (the native Codex transport) still resolve and reserve
-    /// this budget; they just never place it on the wire.
+    /// Concrete output limit, also used for input-capacity reservation.
+    /// Agent-turn defaults and bounded utility calls follow REQ-LLM-004f.
     pub max_tokens: u32,
     pub effective_effort: EffectiveEffort,
     pub service_tier: EffectiveServiceTier,

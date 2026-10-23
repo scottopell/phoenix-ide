@@ -194,11 +194,9 @@ value ToolDeclaration {
 -- id (PromptCacheKey) — mandatory on the typed request; consumed by the
 -- Responses API as `prompt_cache_key`, ignored by Anthropic.
 --
--- `max_tokens` is the one resolved output-token budget for this request:
--- the model's declared supported output maximum, clamped only by what the
--- context window leaves after the input. It does not depend on reasoning
--- effort. The same resolved value is both sent to the provider's
--- output-limit field and reserved by the context planner (REQ-LLM-004f).
+-- `max_tokens` is the concrete output budget (REQ-LLM-004f). Ordinary and
+-- continuation agent turns default to the declared model maximum; bounded
+-- utility requests carry their smaller explicit contract limit.
 -- Every internal request carries a concrete budget. Native Codex omits the
 -- output-limit field only at wire translation; its internal reservation remains
 -- concrete.
