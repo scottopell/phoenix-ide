@@ -4909,6 +4909,12 @@ mod tests {
                 panic!("expected initial occurrence");
             };
             let repo = db.workflow_repository();
+            let steering_anchor = if disposition == AcceptedDisposition::Steering {
+                let (turn_id, _) = created_turn(&repo, "steering-runtime-anchor", 209).await;
+                Some(turn_id)
+            } else {
+                None
+            };
             let accepted = repo
                 .accept_authoritative_turn(&input_with_disposition(
                     "conv-a",
@@ -4921,6 +4927,26 @@ mod tests {
             let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
                 panic!("expected live owner");
             };
+            if let Some(anchor_id) = steering_anchor {
+                assert_eq!(
+                    db.capture_stop_target("conv-a").await.unwrap(),
+                    CapturedStopTarget::DirectTurn {
+                        turn_id: anchor_id,
+                        generation: 0
+                    }
+                );
+                repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+                    command: TurnCommand::Complete {
+                        turn_id: anchor_id,
+                        expected_generation: 0,
+                    },
+                    projection: Some(stop_projection()),
+                    provider_replay_settlement:
+                        phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+                })
+                .await
+                .unwrap();
+            }
             assert_eq!(
                 db.capture_stop_target("conv-a").await.unwrap(),
                 match disposition {
