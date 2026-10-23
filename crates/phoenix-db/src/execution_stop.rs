@@ -403,6 +403,9 @@ async fn exact_terminal_replay_tx(
          AND NOT EXISTS (SELECT 1 FROM durable_turns t WHERE t.conversation_id = c.id AND t.owns_conversation = 1 AND t.terminal_kind IS NULL)
          AND NOT EXISTS (SELECT 1 FROM steering_execution_occurrences o WHERE o.conversation_id = c.id)
          AND NOT EXISTS (SELECT 1 FROM active_provider_replay_state r WHERE r.conversation_id = c.id)
+         AND NOT EXISTS (SELECT 1 FROM coordinator_watch_events e
+             WHERE e.source_occurrence_kind = ?2 AND e.source_occurrence_id = ?3
+               AND e.source_generation = 0 AND e.terminal_kind <> 'cancelled')
          AND EXISTS (SELECT 1 FROM coordinator_watch_events e WHERE e.source_transcript_id = c.id
              AND e.source_occurrence_kind = ?2 AND e.source_occurrence_id = ?3
              AND e.source_generation = 0 AND e.terminal_kind = 'cancelled')",

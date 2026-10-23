@@ -30,7 +30,7 @@ jobs:
           printf '%s\n' 'EXCLUDED EXPECTED RED: authoritative_settlement_is_not_reclassified_by_legacy_cancel_observation; publisher override remains unfixed. This is slice qualification, not full-branch CI or merge readiness.' > qualification-evidence/remaining-failure.txt
           git rev-parse HEAD | tee qualification-evidence/head.txt
           printf '%s\n' 'source-parent=ff9bd30f87527d1484eb8768aed9761d4fb84435' > qualification-evidence/source-parent.txt
-      - name: Four-package all-target check and nineteen exact named regressions
+      - name: Four-package all-target check and twenty-eight exact named regressions
         shell: bash
         run: |
           set -euo pipefail
@@ -55,10 +55,19 @@ jobs:
           phoenix-db|tests::reset_preserves_standalone_user_child_drain_as_cancel_action
           phoenix-db|tests::reset_retains_user_tool_drain_cancel_direction_without_fan_in
           phoenix-db|workflow::direct_turn::tests::startup_exact_cancel_action_fences_both_terminal_sinks_for_real_owner
+          phoenix-db|execution_stop::tests::stop_snapshot_captures_only_supported_exact_occurrence_sources
+          phoenix-db|workflow::direct_turn::tests::stop_capture_prioritizes_runtime_owner_but_not_nonowning_steering
+          phoenix-db|execution_stop::tests::standalone_drain_acceptance_fences_same_message_source_replacement
+          phoenix-db|execution_stop::tests::standalone_terminal_stop_is_exact_deferred_and_independent_of_legacy_marker
+          phoenix-db|execution_stop::tests::standalone_stop_rejects_inconsistent_prior_terminal_before_mutation
+          phoenix-db|tests::terminal_steering_identity_cannot_be_readopted_by_real_writers
+          phoenix-db|tests::terminal_seeded_fork_identity_is_not_readopted_on_resolution_retry
+          phoenix-db|execution_stop::tests::terminal_interaction_identity_cannot_be_readopted_by_message_writer
+          phoenix-db|execution_stop::tests::standalone_stop_commit_cuts_preserve_uncertainty_without_a_watch
           CASES
-          test "$(wc -l < "$OUT/named-cases.txt")" -eq 19
-          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sort -u | wc -l)" -eq 19
-          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sed 's/.*:://' | sort -u | wc -l)" -eq 19
+          test "$(wc -l < "$OUT/named-cases.txt")" -eq 28
+          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sort -u | wc -l)" -eq 28
+          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sed 's/.*:://' | sort -u | wc -l)" -eq 28
           while IFS='|' read -r pkg fullname; do
             printf '%s\n' 'NOT RUN (compile gate not passed)' > "$OUT/${fullname##*::}.disposition"
           done < "$OUT/named-cases.txt"
