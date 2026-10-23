@@ -15,7 +15,8 @@ def load_devpy():
     spec = importlib.util.spec_from_file_location("devpy_cache_under_test", ROOT / "dev.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    with mock.patch.dict(sys.modules, {spec.name: module}):
+        spec.loader.exec_module(module)
     return module
 
 

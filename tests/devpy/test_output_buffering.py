@@ -15,10 +15,12 @@ class OutputBufferingTests(unittest.TestCase):
         source = textwrap.dedent("""
             import importlib.util
             import sys
+            from unittest import mock
 
             spec = importlib.util.spec_from_file_location("devpy", sys.argv[1])
             dev = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(dev)
+            with mock.patch.dict(sys.modules, {spec.name: dev}):
+                spec.loader.exec_module(dev)
 
             def command(args):
                 print("Starting command")
