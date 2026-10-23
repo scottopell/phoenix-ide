@@ -61,7 +61,10 @@ fn remote_rejected_outcome_preserves_only_known_target_unavailable_code() {
                 assert_eq!(actual, expected);
                 assert_eq!(diagnostic, message);
             }
-            receipt => panic!("unexpected non-rejection receipt: {receipt:?}"),
+            receipt @ RemoteSendReceipt::Accepted { .. }
+            | receipt @ RemoteSendReceipt::Duplicate { .. } => {
+                panic!("unexpected non-rejection receipt: {receipt:?}")
+            }
         }
     }
 }
@@ -86,7 +89,10 @@ fn remote_rejected_outcome_keeps_the_existing_512_unicode_scalar_diagnostic_boun
                 assert_eq!(diagnostic.chars().count(), 512);
                 assert_eq!(diagnostic.len(), 2048);
             }
-            receipt => panic!("unexpected non-rejection receipt: {receipt:?}"),
+            receipt @ RemoteSendReceipt::Accepted { .. }
+            | receipt @ RemoteSendReceipt::Duplicate { .. } => {
+                panic!("unexpected non-rejection receipt: {receipt:?}")
+            }
         }
     }
 }
