@@ -119,13 +119,13 @@ pub async fn shutdown_kill_tree_until(
                     tracing::debug!(handle_id = %handle.handle_id, "shutdown_kill_tree: handle exit observed after signal");
                 }
                 Ok(Ok(())) => {
-                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: exit notification changed without terminal state")
+                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: exit notification changed without terminal state");
                 }
                 Ok(Err(_)) => {
-                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: handle exit observer closed before terminal state")
+                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: handle exit observer closed before terminal state");
                 }
                 Err(_) => {
-                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: global deadline expired before handle exit was observed")
+                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: global deadline expired before handle exit was observed");
                 }
             }
         }
