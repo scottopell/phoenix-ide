@@ -203,7 +203,7 @@ async fn pass_metrics_exclude_calls_already_charged_to_the_window() {
         if method.contains("read_user_profile") {
             Ok(json!({"result":"User ID: UOWNER\nBot: No"}))
         } else {
-            Ok(json!({"results":"", "pagination_info":"End of results"}))
+            Ok(json!({"results":"No results found", "pagination_info":"End of results"}))
         }
     }));
     driver::tick(
