@@ -178,10 +178,10 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [123](123_retain-pre-session-browser-authority.md) | Retain pre-session browser authority and distinguish CLI profile lifetimes | Accepted | REQ-BCLI-006a, REQ-BROWSER-WS-001 |
 | [142](142_ordinary-skill-catalog-is-executor-turn-local.md) | Ordinary skill catalog advertisement is executor-turn-local | Accepted | REQ-SK-007, REQ-SK-008, REQ-SK-009 |
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
-| [144](144_slack_gateway_uses_native_conversation_services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
-| [145](145_slack_owner_gestures_bind_intentional_returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
-| [146](146_bound_discovery_and_refresh_new_explicit_requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
-| [147](147_private_notifications_use_an_owner_command.md) | Private notifications use an owner command | Accepted | REQ-SG-015 |
+| [144](144_slack-gateway-uses-native-conversation-services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
+| [145](145_slack-owner-gestures-bind-intentional-returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
+| [146](146_bound-discovery-and-refresh-new-explicit-requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
+| [147](147_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Accepted | REQ-SG-015 |
 
 ## For agents: which decisions bind your task
 
