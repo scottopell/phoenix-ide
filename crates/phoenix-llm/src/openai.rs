@@ -732,6 +732,7 @@ impl ResponsesStreamAccumulator {
                 id: self.response_id,
                 model: self.model,
                 status: "completed".to_string(),
+                incomplete_details: None,
                 output: self.output_items.into_values().collect(),
                 usage: ResponsesApiUsage {
                     input_tokens: self.input_tokens,
@@ -2396,6 +2397,26 @@ fn validate_responses_terminal_content(
     )))
 }
 
+/// Budget-limited stop (REQ-LLM-006c), checked before any output item is
+/// parsed so a truncated function-call argument never reaches JSON parsing:
+/// terminal for auto-retry, user-resumable. Mirrors the SSE
+/// `response.incomplete` + `max_output_tokens` handling for the
+/// non-streaming Responses API path.
+fn check_responses_output_budget(resp: &ResponsesApiResponse) -> Result<(), LlmError> {
+    if resp.status == "incomplete"
+        && resp
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            == Some("max_output_tokens")
+    {
+        return Err(LlmError::output_tokens_exhausted(
+            "Response stopped at its output token budget before finishing",
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
     normalize_responses_api_response_with_evidence(resp, false)
@@ -2405,6 +2426,8 @@ fn normalize_responses_api_response_with_evidence(
     resp: ResponsesApiResponse,
     observed_non_reasoning_output: bool,
 ) -> Result<LlmResponse, LlmError> {
+    check_responses_output_budget(&resp)?;
+
     let output_items: Vec<serde_json::Value> =
         resp.output.iter().map(|item| item.0.clone()).collect();
     let mut content = Vec::new();
@@ -2976,8 +2999,16 @@ pub(crate) struct ResponsesApiResponse {
     #[serde(default)]
     pub(crate) model: String,
     pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) incomplete_details: Option<ResponsesIncompleteDetails>,
     pub(crate) output: Vec<ResponsesApiOutput>,
     pub(crate) usage: ResponsesApiUsage,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -7137,6 +7168,44 @@ mod tests {
         assert_eq!(err.kind, LlmErrorKind::OutputTokensExhausted);
     }
 
+    /// The non-streaming Responses API reports the same budget-limited stop
+    /// via top-level `status`/`incomplete_details`, not an SSE event. A
+    /// truncated function-call argument string must never reach JSON
+    /// parsing — the exhaustion check must classify first.
+    #[test]
+    fn normalize_responses_json_incomplete_max_output_tokens_is_exhausted_not_invalid() {
+        let resp = ResponsesApiResponse {
+            id: "resp-truncated".to_string(),
+            model: "gpt-test".to_string(),
+            status: "incomplete".to_string(),
+            incomplete_details: Some(ResponsesIncompleteDetails {
+                reason: Some("max_output_tokens".to_string()),
+            }),
+            output: vec![ResponsesApiOutput(serde_json::json!({
+                "type": "function_call",
+                "name": "bash",
+                "call_id": "call-1",
+                "arguments": "{\"cmd\": \"ls -la /very/long/pa",
+            }))],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 4096,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                output_tokens_details: None,
+            },
+        };
+        let err = normalize_responses_api_response(resp).unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::LlmErrorKind::OutputTokensExhausted,
+            "status=incomplete with reason=max_output_tokens must classify as exhausted, \
+             not fall through to a parsed (or malformed-tool) success/invalid-response"
+        );
+    }
+
     /// When the stream lacks `response.output_item.done` events but
     /// `response.completed` carries `/response/output: [...]`, the terminal
     /// payload is authoritative — fall back to it instead of dropping the
@@ -7228,6 +7297,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: acc.output_items.into_values().collect(),
             usage: ResponsesApiUsage {
                 input_tokens: acc.input_tokens,
@@ -7411,6 +7481,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![],
             usage,
         })
@@ -7430,6 +7501,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -7455,6 +7527,7 @@ mod tests {
             id: "resp-reasoning-only".to_string(),
             model: "gpt-test".to_string(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![ResponsesApiOutput(serde_json::json!({
                 "type": "reasoning",
                 "id": "reasoning-1",
@@ -7612,6 +7685,7 @@ mod tests {
             id: "resp-reasoning-fixture".to_string(),
             model: "gpt-test".to_string(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: output.into_iter().map(ResponsesApiOutput).collect(),
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -8106,6 +8180,7 @@ mod tests {
         let resp = normalize_responses_api_response(ResponsesApiResponse {
             id: String::new(), model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![ResponsesApiOutput(serde_json::json!({"type":"message", "content":[{"type":"refusal", "refusal":"I can't help with that."}]}))],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -8423,6 +8498,39 @@ mod tests {
         );
     }
 
+    /// `finish_reason="length"` must classify as exhausted before a partial
+    /// tool call's malformed JSON arguments are ever parsed, so a truncated
+    /// response never surfaces as "malformed tool arguments" instead of the
+    /// budget-limited stop it actually is.
+    #[test]
+    fn chat_json_length_with_malformed_tool_call_is_exhausted_not_invalid() {
+        let truncated = ChatCompletionsResponse {
+            choices: vec![ChatChoice {
+                message: ChatResponseMessage {
+                    reasoning_content: None,
+                    content: None,
+                    refusal: None,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call-1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "bash".to_string(),
+                            arguments: "{\"cmd\": \"ls -la /very/long/pa".to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("length".to_string()),
+            }],
+            usage: None,
+        };
+        assert_eq!(
+            normalize_chat_response(truncated, "compatible-chat-model")
+                .unwrap_err()
+                .kind,
+            crate::LlmErrorKind::OutputTokensExhausted
+        );
+    }
+
     #[tokio::test]
     async fn chat_stream_rejects_multiple_choices_and_invalid_tool_indices() {
         let request = empty_request();
@@ -8509,6 +8617,31 @@ mod tests {
             acc.into_response().unwrap_err().kind,
             crate::LlmErrorKind::InvalidResponse
         );
+    }
+
+    /// A partial tool-call delta followed by `finish_reason="length"` must
+    /// classify as exhausted without ever reaching `into_response`'s tool
+    /// argument JSON parse — the malformed, truncated arguments accumulated
+    /// so far must not surface as an unrelated "malformed tool" error.
+    #[tokio::test]
+    async fn chat_stream_partial_tool_then_length_is_exhausted_not_invalid() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-9","function":{"name":"bash","arguments":"{\"cmd\": \"ls -la /very/long/pa"}}]}}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        let error = acc
+            .process_event(
+                r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+                &tx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::OutputTokensExhausted);
     }
 
     #[tokio::test]

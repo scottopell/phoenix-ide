@@ -3032,6 +3032,79 @@ mod tests {
         assert!(response.provider_replay.is_none());
     }
 
+    /// `stop_reason="max_tokens"` must classify as exhausted even when a
+    /// (fully-formed, since Anthropic's `input` field is parsed JSON, not a
+    /// raw string) `tool_use` block is present — the truncated call must be
+    /// discarded, not dispatched.
+    #[test]
+    fn normalize_response_max_tokens_stop_reason_discards_tool_use() {
+        let error = normalize_response(AnthropicResponse {
+            id: "msg_truncated".into(),
+            model: "claude-opus-5-5".into(),
+            content: vec![AnthropicContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"cmd": "ls"}),
+            }],
+            stop_reason: Some("max_tokens".into()),
+            stop_details: None,
+            usage: AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 4096,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                speed: None,
+            },
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::OutputTokensExhausted);
+    }
+
+    /// Streaming equivalent: a `tool_use` block that never receives
+    /// `content_block_stop` (truncated mid-argument) followed by
+    /// `stop_reason="max_tokens"` must classify as exhausted, not fall back
+    /// to assembling a tool call from the partial/invalid JSON accumulated
+    /// so far (the partial-json parser falls back to `{}` on parse failure,
+    /// which would otherwise look like a legitimate empty-input tool call).
+    #[tokio::test]
+    async fn streaming_partial_tool_use_then_max_tokens_is_exhausted() {
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        acc.process_event(
+            "message_start",
+            r#"{"message":{"id":"msg_trunc","model":"claude-opus-5-5","usage":{"input_tokens":10}}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"tool_use","id":"tu1","name":"bash"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        // No content_block_stop — the block is still open when the budget runs out.
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("message_stop", "{}", &tx).await.unwrap();
+
+        let error = acc.into_response_with_diagnostics(None).unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::OutputTokensExhausted);
+    }
+
     #[test]
     fn refusal_is_non_retryable_prompt_rejection_even_with_partial_content() {
         let error = normalize_response(AnthropicResponse {
