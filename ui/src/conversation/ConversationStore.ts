@@ -338,6 +338,10 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     return [...byId.values()];
   }
 
+  peekSnapshot(key: string): ConversationAtom | undefined {
+    return this.atomByKey(key);
+  }
+
   /**
    * Reverse lookup: which slug owns a given `Conversation.id`? Returns
    * undefined if the id has not been observed via upsert or SSE init.

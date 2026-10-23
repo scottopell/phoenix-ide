@@ -1,0 +1,51 @@
+# Executable candidate TEXT, external only. Deployment requires exact publication admission.
+name: Bounded full-message serial rig
+on:
+  push:
+    branches: [qualification/full-message-serial-once]
+permissions:
+  contents: read
+concurrency:
+  group: full-message-serial-once
+  cancel-in-progress: false
+jobs:
+  rig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 26.8.2
+      - name: Validate exact publication files
+        timeout-minutes: 1
+        env:
+          RIG_EXPECTED_COMMIT: ${{ github.sha }}
+        run: node ci/full-message/validate.mjs
+      - name: Bounded dependency and browser setup
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=5s 285s node ci/full-message/setup.mjs
+      - name: Detector prerequisite then unchanged stable-natural
+        timeout-minutes: 6
+        env:
+          RIG_EXPECTED_COMMIT: ${{ github.sha }}
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/rig-setup/browsers
+        run: |
+          export RIG_CAPTURE_DEADLINE_MS="$(node -e 'console.log(Date.now()+300000)')"
+          timeout --signal=TERM --kill-after=5s 305s node ci/full-message/capture-wrapper.mjs
+      - name: Preserve ordinary failure evidence
+        if: ${{ always() }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: full-message-serial-rig
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/rig-evidence/**/*.json
+            ${{ runner.temp }}/rig-evidence/**/*.jsonl
+            ${{ runner.temp }}/rig-evidence/**/*.log
+            ${{ runner.temp }}/rig-setup-evidence/*.json

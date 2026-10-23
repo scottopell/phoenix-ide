@@ -947,6 +947,158 @@ describe('VirtualTranscript', () => {
     }
   });
 
+  it.each([400, GESTURE_STALE_MS + 500])('stationary held contact preserves modeled reading position on resize after %sms', delay => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      render(<VirtualTranscript ariaLabel="Transcript" ref={ref} items={makeItems(30, 20)}
+        getKey={item => item.id} estimatedExtent={20} overscan={200} initialTail={false}
+        renderItem={renderRow} scrollerRef={element => { scroller = element; }} />);
+      act(() => ref.current!.scrollToIndex(20, 'start'));
+      const anchor = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      expect(anchor?.isConnected).toBe(true);
+      expect(above?.isConnected).toBe(true);
+      const viewportOffset = () => {
+        const current = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
+        let top = 0;
+        for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+          top += sibling.classList.contains('virtual-transcript__spacer')
+            ? Number.parseFloat((sibling as HTMLElement).style.height) || 0 : heightFromElement(sibling);
+        }
+        if (!scroller) throw new Error('Mounted scroller missing');
+        return top - scroller.scrollTop;
+      };
+      act(() => fireEvent.touchStart(anchor, {
+        touches: [{ identifier: 31, clientX: 20, clientY: 10 }],
+        changedTouches: [{ identifier: 31, clientX: 20, clientY: 10 }],
+      }));
+      const baseline = viewportOffset();
+      act(() => vi.advanceTimersByTime(delay));
+      expect(viewportOffset()).toBe(baseline);
+      const beforeControl = scroller!.scrollTop;
+      scroller!.scrollTop = beforeControl + 12;
+      expect(viewportOffset() - baseline).toBe(-12);
+      scroller!.scrollTop = beforeControl;
+      expect(viewportOffset()).toBe(baseline);
+      expect(document.querySelectorAll('[data-virtual-key="item-20"]')).toHaveLength(1);
+      expect(anchor.isConnected).toBe(true);
+      act(() => {
+        above.querySelector('[data-height]')!.setAttribute('data-height', '50');
+        resizeObservers[0]!.triggerEntries([[above, 50]]);
+      });
+      expect(document.querySelectorAll('[data-virtual-key="item-20"]')).toHaveLength(1);
+      expect(document.querySelector('[data-virtual-key="item-20"]')).toBe(anchor);
+      expect(anchor.isConnected).toBe(true);
+      expect(viewportOffset()).toBe(baseline);
+      act(() => vi.advanceTimersByTime(GESTURE_STALE_MS + 500));
+      expect(document.querySelectorAll('[data-virtual-key="item-20"]')).toHaveLength(1);
+      expect(document.querySelector('[data-virtual-key="item-20"]')).toBe(anchor);
+      expect(anchor.isConnected).toBe(true);
+      expect(viewportOffset()).toBe(baseline);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([200, 2000])('held reading position survives repeated growth across spacer capacity with overscan %s', overscan => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      render(<VirtualTranscript ariaLabel="Transcript" ref={ref} items={makeItems(30, 20)}
+        getKey={item => item.id} estimatedExtent={20} overscan={overscan} initialTail={false}
+        renderItem={renderRow} scrollerRef={element => { scroller = element; }} />);
+      act(() => ref.current!.scrollToIndex(20, 'start'));
+      const anchor = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
+      const readPosition = () => {
+        expect(document.querySelectorAll('[data-virtual-key="item-20"]')).toHaveLength(1);
+        expect(document.querySelector('[data-virtual-key="item-20"]')).toBe(anchor);
+        expect(anchor.isConnected).toBe(true);
+        if (!scroller) throw new Error('Mounted scroller missing');
+        let top = 0;
+        for (let n = anchor.previousElementSibling; n; n = n.previousElementSibling) {
+          top += n.classList.contains('virtual-transcript__spacer')
+            ? Number.parseFloat((n as HTMLElement).style.height) || 0 : heightFromElement(n);
+        }
+        return top - scroller.scrollTop;
+      };
+      act(() => fireEvent.touchStart(anchor, {
+        touches: [{ identifier: 41, clientX: 20, clientY: 10 }],
+        changedTouches: [{ identifier: 41, clientX: 20, clientY: 10 }],
+      }));
+      const baseline = readPosition();
+      const originalTop = scroller!.scrollTop;
+      scroller!.scrollTop = originalTop + 12;
+      expect(readPosition() - baseline).toBe(-12);
+      scroller!.scrollTop = originalTop;
+      expect(readPosition()).toBe(baseline);
+      for (const height of [50, 280, 20]) {
+        const above = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+        expect(above?.isConnected).toBe(true);
+        act(() => {
+          above.querySelector('[data-height]')!.setAttribute('data-height', String(height));
+          resizeObservers[0]!.triggerEntries([[above, height]]);
+        });
+        expect(readPosition()).toBe(baseline);
+        act(() => vi.advanceTimersByTime(200));
+        expect(readPosition()).toBe(baseline);
+      }
+      act(() => vi.advanceTimersByTime(GESTURE_STALE_MS + 500));
+      expect(readPosition()).toBe(baseline);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('preserves held anchor with observed zero leading room and immediate compensation write', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      render(<VirtualTranscript ariaLabel="Transcript" ref={ref} items={makeItems(30, 20)}
+        getKey={item => item.id} estimatedExtent={20} overscan={2000} initialTail={false}
+        renderItem={renderRow} scrollerRef={element => { scroller = element; }} />);
+      act(() => ref.current!.scrollToIndex(20, 'start'));
+      const anchor = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      const leading = scroller!.querySelector<HTMLElement>('.virtual-transcript__spacer')!;
+      expect(leading).not.toBeNull();
+      expect(Number.parseFloat(leading.style.height)).toBe(0);
+      expect(document.querySelectorAll('[data-virtual-key]')).toHaveLength(30);
+      expect(above.isConnected).toBe(true);
+      const position = () => {
+        expect(document.querySelectorAll('[data-virtual-key="item-20"]')).toHaveLength(1);
+        expect(document.querySelector('[data-virtual-key="item-20"]')).toBe(anchor);
+        expect(anchor.isConnected).toBe(true);
+        if (!scroller) throw new Error('Missing scroller');
+        let top = 0;
+        for (let n = anchor.previousElementSibling; n; n = n.previousElementSibling)
+          top += n.classList.contains('virtual-transcript__spacer')
+            ? Number.parseFloat((n as HTMLElement).style.height) || 0 : heightFromElement(n);
+        return top - scroller.scrollTop;
+      };
+      act(() => fireEvent.touchStart(anchor, {
+        touches: [{ identifier: 51, clientX: 20, clientY: 10 }],
+        changedTouches: [{ identifier: 51, clientX: 20, clientY: 10 }],
+      }));
+      const baseline = position(), before = scroller!.scrollTop;
+      expect(position()).toBe(baseline);
+      scroller!.scrollTop = before + 12;
+      expect(position() - baseline).toBe(-12);
+      scroller!.scrollTop = before;
+      expect(position()).toBe(baseline);
+      act(() => {
+        above.querySelector('[data-height]')!.setAttribute('data-height', '50');
+        resizeObservers[0]!.triggerEntries([[above, 50]]);
+      });
+      expect(leading.isConnected).toBe(true);
+      expect(scroller!.querySelector('.virtual-transcript__spacer')).toBe(leading);
+      expect(Number.parseFloat(leading.style.height)).toBe(0);
+      expect(scroller!.scrollTop - before).toBe(30);
+      expect(position()).toBe(baseline);
+      act(() => vi.advanceTimersByTime(GESTURE_STALE_MS + 500));
+      expect(position()).toBe(baseline);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('reconciles within the stale bound when a touch lift is unobservable', () => {
     vi.useFakeTimers();
     try {

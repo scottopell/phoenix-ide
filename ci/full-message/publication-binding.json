@@ -1,0 +1,227 @@
+{
+  "authority": "EXACT_REVIEWED_PUBLICATION",
+  "status": "PROPOSED_ONLY_NOT_RELEASED",
+  "baseCommit": "aeebe5b5d80a64114c186f8ac3fc81e982070d11",
+  "files": [
+    {
+      "path": "ui/package.json",
+      "sha256": "7200f84837fbaf0dfa7d2f0353d443af8d5f86a50ab2ce2cd78fee13139883e6"
+    },
+    {
+      "path": "ui/pnpm-lock.yaml",
+      "sha256": "42552207bd7922e4bc35f75f18fc3091c3f8917d8d996a6206e533f4514dedd0"
+    },
+    {
+      "path": "ui/scripts/capture-full-message.mjs",
+      "sha256": "6e0d6a95e8491629fbe2833ef382d71304dcf0e45852f76d6391923c7e678bed"
+    },
+    {
+      "path": "ui/src/components/VirtualTranscript.test.tsx",
+      "sha256": "42da7aadc4659dda57948a2a3262e8de1dfcb709fb9380feb8b5c55e229e0d4b"
+    },
+    {
+      "path": "ui/src/conversation/ConversationStore.ts",
+      "sha256": "758f58e794ef0e8e0318d1616467d7de3870839ce1d38cf806227eeed6ef2553"
+    },
+    {
+      "path": "ui/src/fixtures/productConversation/renderFixture.tsx",
+      "sha256": "1fe5aa5b88443ad8764f01e6098930fa251748b4bdbc2d8a0a490c4aa0c62255"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/ConsumptionObserver.tsx",
+      "sha256": "53fe50cb933693d7de116873880adc86c3be3fab3383945344fe5f46c7c5df5d"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/README.md",
+      "sha256": "3137167854edd18a4d980b4dd912715142310d65fb488c30420334dbceff208d"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/TouchReadingFixture.tsx",
+      "sha256": "cd2d6c05814d6fb5c52e69e5b35ef08bf432e5a89f54af2860f5198a06555215"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/browserProbe.mjs",
+      "sha256": "1e4ea5a2f743c42a3313dde9452c75e048ddb13820e8f2e1eede7d6edc8ac034"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/browserProbe.owner.test.mjs",
+      "sha256": "25736c0389923a635e9153d06097ff9ec071eb70a953d9ba33aeb65727a6bed7"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/continuationTarget.test.ts",
+      "sha256": "5c376ddcff73f625507e49214adf5d0dccc38c4b17b2028f8e30bf263a7ac999"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/continuationTarget.ts",
+      "sha256": "e98570753dd90a4fe274d6fabe2e05414e2b8b5d18b6ea17f8cd27b890e3150e"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/controllerInvalidIdentity.test.ts",
+      "sha256": "1ac60ab7631a60a3c46ea2d69d5e2875875283ef9b541f19d90e2008f3481c33"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/controllerRealStore.test.ts",
+      "sha256": "f20008a53eb0a7587150ed62c89858cadad739fda8e91deaf05407d066e803fb"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/entry.tsx",
+      "sha256": "0d69de83d0f9c78c59c9815a82970687dbd987b9de7f9ce3745fd79595acb94e"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/fullMessageProbe.mjs",
+      "sha256": "70909d96e2bb61e867ccdcdcb43e5a6fd69b6ae549d0e33117735df4ec94559c"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/fullMessageScrollControl.mjs",
+      "sha256": "8d765e7add2be11167eabae1db988f66095071eafc3ca02b2454cb4f97a6bb04"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/fullMessageScrollControl.test.mjs",
+      "sha256": "8ac045730019b2a1fcd57254c09a1879deca22160acfdd841f153ddae931defb"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/index.html",
+      "sha256": "06dd5b2eea78527186ad4702b3188ad43ca1b56aca1cc4374c73186ee001c972"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/initialWatermark.test.ts",
+      "sha256": "a1f9e1a58674a00a6755717037a1faa5fd2355a4f0e0281128a9ecde72dbc063"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/initialWatermark.ts",
+      "sha256": "48f130248d33dc97e2897437d9069b79bb6a69c3d596574b9bfe4f7eff324410"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/inputCorrespondence.mjs",
+      "sha256": "44919c4b1dd716196220c34d1f41ffb543152ccd17b2afeaab8d1149d00dd958"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/inputCorrespondence.test.mjs",
+      "sha256": "52d27fed5df9e56aa1bb968498b04599caedb180c033a6c97be0329a79a88e93"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/observeConsumption.test.ts",
+      "sha256": "5cb86ea13bedd2f02909e7fd05c90b9b0a8e4773b660ab0ee86a75795eaf211c"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/observeConsumption.ts",
+      "sha256": "47f3268167cd4a6591aab2031ed7271fa6ec337c70e0064be51aef2906a11946"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/oracle.mjs",
+      "sha256": "569443efa04b244bcb35d0568b98ca640f1d1486e80aa38ee605e685980d913d"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/oracle.test.mjs",
+      "sha256": "d81467a7c5dc66d30d27823da3e1c467e945c56c9b99579bd8e4f7568c7a44e8"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/ownerDiagnostic.test.ts",
+      "sha256": "21e5bc34bbf86781e185d6d0ae7f1ba05873d447a602ac4bf2d5e1fb745b8e9b"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/peekSnapshot.test.ts",
+      "sha256": "593da3abd90065a6a76bb69a3f6bb8263ff933685fe4d086f65d94713c7d95f8"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/refreshRoute.test.ts",
+      "sha256": "db22dc464ba4cdc70b0a466df59122699afcf76c1c9657349660bd70c278c85e"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/refreshRoute.ts",
+      "sha256": "158236428ac761eb25d37a99888490c61fd11f9e258e8b21fac65c89413d8291"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabAccuracy.mjs",
+      "sha256": "24f449bbd7284c6ec930ced7ba09bdac22b4cc6a5efb5b3a251250580193c9f7"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabAccuracy.test.mjs",
+      "sha256": "2a1e7ee66246a4a271c0c03003b93966d083d9132f0a64b44fcf471a61a700a1"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabJourney.mjs",
+      "sha256": "274390dc1b0eca64953fdd294b0f2043d52052998b2b49ae6c8113cf1fc8f20a"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabJourney.test.mjs",
+      "sha256": "4081455282737a6a1d8dc1f931dc6a5f0c17e79e558bc7131aa9e44d81947013"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabObserver.mjs",
+      "sha256": "fc8ec844eb4539b05c69baeb47f93c6d03f8080108b3519b27528e6240888366"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabObserver.test.mjs",
+      "sha256": "f82b9c6a9039abfb82877ab9033268d1dac1d06fb561808a9f2aab544c1fbac3"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabProbe.mjs",
+      "sha256": "770879cca3f564dbe4aeee836425717bbd92aee4c31a06c1031e9daae92c87fd"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/regrabProbe.test.mjs",
+      "sha256": "2c14f43bb2de4a0a0584d8ffd766106324a1177d3d92b0fca50b527d00d26981"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/scenario.ts",
+      "sha256": "e8581fd405aecc04cabb025963110f45dc4a200e0d1540f7208bfef1adb2fad8"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/schedule.mjs",
+      "sha256": "25328a013eecd353f7afbbb7064a6f07570a01eb70865f07ebad0a1ccb3e8b4f"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/seedDiagnostic.mjs",
+      "sha256": "802dbbdb95d52901d4c3162552e64600155f4575201f7e5b9a4eb6693130448b"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/seedDiagnostic.test.mjs",
+      "sha256": "a444c0509554909e1ff03c00cfcc80bbb07f3296c22b0397853d3b6c5b32c3f5"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/semanticAnchor.mjs",
+      "sha256": "c0fa907d3e0bde489b142d49da9f718b4982287285b3fafa54e5c8bbbd329d3f"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/streamOwner.test.ts",
+      "sha256": "0b19aa384aca9e1460fe443775791c808181743ab199cce1464b63dbf8811b70"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/streamOwner.ts",
+      "sha256": "27c58c745b32c72da4b1ad121c8f2b0c79a0f95a74ae06a0758096eda45ca5a8"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/textContact.mjs",
+      "sha256": "23ae58f48376353b2e1d6832b3b91bd0a89f1fa317ca048ead7722917d989176"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/textContact.test.mjs",
+      "sha256": "dc2159f9abf0f916c22967f4deb9255a2d15c23339db9fb15ab44c786475e756"
+    },
+    {
+      "path": "ui/src/fixtures/touchReading/touch-reading.stories.tsx",
+      "sha256": "d7988910464c3d0a9526e2feb8ea6e95b1de89fc5667b046099913230891997d"
+    },
+    {
+      "path": "ci/full-message/capture-wrapper.mjs",
+      "sha256": "bb7b6a46c1abaab33bc8495e27b068ef0616811a788f4bb40296abab22ba3720"
+    },
+    {
+      "path": "ci/full-message/setup.mjs",
+      "sha256": "21d8f23bd87a4ca592f44eae468dc096145f1a8eb3eaeb36321426016c3f79d0"
+    },
+    {
+      "path": "ci/full-message/validate.mjs",
+      "sha256": "0414819e74da06995e9027854be57fef6222ea06c76522e599145acb492a0e88"
+    },
+    {
+      "path": "ci/full-message/vite.config.mjs",
+      "sha256": "4860a97fd36bd54b50c0d00b7f4f5ca55bca0f8bd2f7b5a977e96f94fc9f6640"
+    },
+    {
+      "path": ".github/workflows/full-message-serial.yml",
+      "sha256": "97787e351cb73820b918a94b73d15eeca752476b5611b2cf9b5d28d967b2770b"
+    }
+  ]
+}
