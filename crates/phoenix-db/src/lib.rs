@@ -9,6 +9,9 @@ use phoenix_core::domain::tool_result_identity::{
 mod close_foundation;
 mod coordinator_query;
 mod coordinator_watches;
+mod execution_stop;
+pub use coordinator_watches::MessageExecutionSource;
+pub use execution_stop::{CapturedStopTarget, StandaloneStopTarget};
 mod coordinator_work_scope;
 mod federation_enrollment;
 mod federation_peers;

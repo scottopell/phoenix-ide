@@ -311,8 +311,8 @@ pub(crate) async fn record_terminal_event_tx(
     .await
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum MessageExecutionSource {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageExecutionSource {
     Steering,
     SeededFork,
     InteractionResponse,
