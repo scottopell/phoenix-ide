@@ -12640,6 +12640,9 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
         phoenix_llm::LlmErrorKind::ServerOverloaded => crate::db::ErrorKind::ServerOverloaded,
         phoenix_llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
         phoenix_llm::LlmErrorKind::ContextWindowExceeded => crate::db::ErrorKind::ContextExhausted,
+        phoenix_llm::LlmErrorKind::OutputTokensExhausted => {
+            crate::db::ErrorKind::OutputTokensExhausted
+        }
     }
 }
 
@@ -12727,6 +12730,9 @@ fn llm_error_to_outcome(
             message: error.message,
         },
         LlmErrorKind::PromptRejected => LlmOutcome::PromptRejected {
+            message: error.message,
+        },
+        LlmErrorKind::OutputTokensExhausted => LlmOutcome::OutputTokensExhausted {
             message: error.message,
         },
     }

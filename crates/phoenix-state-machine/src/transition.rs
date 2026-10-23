@@ -259,6 +259,7 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         | ErrorKind::Cancelled
         | ErrorKind::SubAgentError
         | ErrorKind::ContextExhausted
+        | ErrorKind::OutputTokensExhausted
         | ErrorKind::TurnLimitExhausted
         | ErrorKind::ContentFilter => {
             tracing::error!(
@@ -4214,6 +4215,17 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::OutputTokensExhausted { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::OutputTokensExhausted,
+                attempt,
+                recovery_in_progress: false,
+                observed_at,
+                resets_at: None,
+            }
+        }
         LlmOutcome::Cancelled => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -4512,6 +4524,9 @@ pub fn llm_error_to_db_error(
         }
         phoenix_core::domain::llm_error_kind::LlmErrorKind::ContextWindowExceeded => {
             ErrorKind::ContextExhausted
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::OutputTokensExhausted => {
+            ErrorKind::OutputTokensExhausted
         }
     }
 }

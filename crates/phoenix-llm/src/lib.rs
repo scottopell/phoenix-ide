@@ -370,7 +370,13 @@ impl LoggingService {
                 LlmErrorKind::ServerOverloaded => LlmAttemptOutcome::ServerOverloaded,
                 LlmErrorKind::Network => LlmAttemptOutcome::NetworkError,
                 LlmErrorKind::TimedOut => LlmAttemptOutcome::TimedOut,
-                LlmErrorKind::ContextWindowExceeded => LlmAttemptOutcome::TokenBudgetExceeded,
+                // Output-token exhaustion reuses the existing token-budget
+                // outcome (REQ-LLM-006c): no new persisted outcome value, no
+                // outcome-schema migration owed.
+                LlmErrorKind::ContextWindowExceeded
+                | LlmErrorKind::OutputTokensExhausted => {
+                    LlmAttemptOutcome::TokenBudgetExceeded
+                }
                 LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,
                 LlmErrorKind::InvalidRequest
                 | LlmErrorKind::PromptRejected

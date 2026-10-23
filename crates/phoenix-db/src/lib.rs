@@ -12184,6 +12184,7 @@ impl Database {
                                 | ErrorKind::ServerError
                                 | ErrorKind::ServerOverloaded
                                 | ErrorKind::TimedOut
+                                | ErrorKind::OutputTokensExhausted
                                 | ErrorKind::ContentFilter => "runtime_failure",
                             },
                         });
@@ -12384,6 +12385,7 @@ impl Database {
                     | ErrorKind::ServerError
                     | ErrorKind::ServerOverloaded
                     | ErrorKind::TimedOut
+                    | ErrorKind::OutputTokensExhausted
                     | ErrorKind::ContentFilter => "runtime_failure",
                 },
             };
