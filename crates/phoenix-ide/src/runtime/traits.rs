@@ -1582,11 +1582,26 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct DatabaseStorage {
     db: Database,
+    #[cfg(test)]
+    update_state_failure_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl DatabaseStorage {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            #[cfg(test)]
+            update_state_failure_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_update_state_failure_probe(
+        mut self,
+        probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.update_state_failure_probe = Some(probe);
+        self
     }
 
     #[allow(dead_code)] // Useful for tests
@@ -2509,6 +2524,11 @@ impl StateStore for DatabaseStorage {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(probe) = &self.update_state_failure_probe {
+            probe.store(true, std::sync::atomic::Ordering::Release);
+            return Err("injected explicit postaccept state persistence failure".into());
+        }
         self.db
             .update_conversation_state_at(conv_id, state, state_updated_at)
             .await

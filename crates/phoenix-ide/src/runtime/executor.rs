@@ -2953,16 +2953,26 @@ where
                         let _ = acknowledgement.send(result);
                         return self.fatal_local_authority_exit();
                     }
-                    let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
-                    if terminal {
+                    let standalone_terminal = matches!(
+                        &result,
+                        Ok(AcknowledgedEventOutcome::StandaloneTerminalStop(
+                            crate::runtime::StandaloneTerminalStopOutcome::Accepted
+                        ))
+                    );
+                    let state_terminal =
+                        matches!(self.state.step_result(), StepResult::Terminal(_));
+                    if standalone_terminal || state_terminal {
                         self.emit_terminal_lifecycle_event().await;
                     }
                     let _ = acknowledgement.send(result);
+                    if standalone_terminal {
+                        return RuntimeExitDisposition::Terminal;
+                    }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         let _ = retirement.await;
                         return RuntimeExitDisposition::Interrupted;
                     }
-                    if terminal {
+                    if state_terminal {
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
@@ -14349,18 +14359,25 @@ mod standalone_terminal_stop_tests {
     async fn acknowledged_preaccept_outcomes_preserve_fatal_and_nonfatal_continuation() {
         use crate::runtime::testing::{InMemoryStorage, StandaloneTerminalStopTestOutcome};
         use tokio::sync::{mpsc, oneshot};
-        for case in 0..3 {
+        for case in 0..4 {
             let (_db, target) = real_target("scripted-stop").await;
             let storage = Arc::new(InMemoryStorage::new());
             storage.queue_standalone_terminal_stop_outcome(match case {
                 0 => {
                     StandaloneTerminalStopTestOutcome::KnownError("known storage rejection".into())
                 }
-                1 => StandaloneTerminalStopTestOutcome::NotAccepted,
+                1 | 3 => StandaloneTerminalStopTestOutcome::NotAccepted,
                 _ => StandaloneTerminalStopTestOutcome::Unclassified,
             });
             let (event_tx, event_rx) = mpsc::channel(8);
             let (ack_tx, ack_rx) = mpsc::channel(8);
+            let broadcaster = SseBroadcaster::new(128, 0);
+            let mut broadcasts = broadcaster.subscribe();
+            let initial_state = if case == 3 {
+                ConvState::Idle
+            } else {
+                waiting_state()
+            };
             let runtime = ConversationRuntime::new(
                 ConvContext::new(
                     "scripted-stop",
@@ -14368,7 +14385,7 @@ mod standalone_terminal_stop_tests {
                     "test-model",
                     200_000,
                 ),
-                waiting_state(),
+                initial_state,
                 storage,
                 Arc::new(MockLlmClient::new("test-model")),
                 Arc::new(MockToolExecutor::new()),
@@ -14379,7 +14396,7 @@ mod standalone_terminal_stop_tests {
                 crate::terminal::ActiveTerminals::new(),
                 event_rx,
                 event_tx.clone(),
-                SseBroadcaster::new(128, 0),
+                broadcaster,
             )
             .with_acknowledged_event_receiver(ack_rx);
             let fence = runtime.fatal_local_authority_fence.clone();
@@ -14410,6 +14427,7 @@ mod standalone_terminal_stop_tests {
                 .unwrap();
             if case == 2 {
                 assert!(first.is_err());
+                assert!(fence.is_closed());
                 let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task)
                     .await
                     .unwrap()
@@ -14447,11 +14465,19 @@ mod standalone_terminal_stop_tests {
                     RuntimeExitDisposition::FatalLocalAuthorityLoss
                 ));
             }
+            while let Ok(event) = broadcasts.try_recv() {
+                assert!(!matches!(event, SseEvent::ConversationBecameTerminal { .. }));
+            }
         }
     }
 
     #[tokio::test]
     async fn acknowledged_success_emits_terminal_and_exits_without_retirement_wait() {
+        assert_acknowledged_success_without_retirement_wait(false).await;
+        assert_acknowledged_success_without_retirement_wait(true).await;
+    }
+
+    async fn assert_acknowledged_success_without_retirement_wait(stale_authority: bool) {
         use tokio::sync::{mpsc, oneshot};
         let (db, target) = real_target("retiring-stop").await;
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -14482,6 +14508,9 @@ mod standalone_terminal_stop_tests {
         );
         runtime.state_updated_at = DateTime::from_timestamp_micros(100).unwrap();
         runtime = runtime.with_acknowledged_event_receiver(ack_rx);
+        if stale_authority {
+            runtime.creation_settlement_disposition = CreationSettlementDisposition::StaleAuthority;
+        }
         let (first_tx, first_rx) = oneshot::channel();
         let (retirement_tx, retirement_rx) = oneshot::channel();
         ack_tx
@@ -14519,7 +14548,12 @@ mod standalone_terminal_stop_tests {
             .unwrap()
             .unwrap();
         assert_eq!(exit, RuntimeExitDisposition::Terminal);
-        assert!(second_rx.await.is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), second_rx)
+                .await
+                .unwrap()
+                .is_err()
+        );
         let mut terminal_events = 0;
         while let Ok(event) = broadcasts.try_recv() {
             if matches!(event, SseEvent::ConversationBecameTerminal { .. }) {
@@ -14539,7 +14573,9 @@ mod standalone_terminal_stop_tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('committed-stop', 'anthropic', 'test', 'replay', '{}')").execute(db.pool()).await.unwrap();
-        sqlx::query("CREATE TRIGGER reject_runtime_idle_rewrite BEFORE UPDATE OF state ON conversations WHEN OLD.id = 'committed-stop' AND OLD.state_kind = 'idle' AND NEW.state_kind = 'idle' BEGIN SELECT RAISE(ABORT, 'injected postaccept runtime persistence failure'); END").execute(db.pool()).await.unwrap();
+        let state_write_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storage = DatabaseStorage::new(db.clone())
+            .with_update_state_failure_probe(state_write_reached.clone());
         let (event_tx, event_rx) = mpsc::channel(8);
         let (ack_tx, ack_rx) = mpsc::channel(8);
         let last_sequence = db.get_last_sequence_id("committed-stop").await.unwrap();
@@ -14554,7 +14590,7 @@ mod standalone_terminal_stop_tests {
                 200_000,
             ),
             waiting_state(),
-            Arc::new(DatabaseStorage::new(db.clone())),
+            Arc::new(storage),
             Arc::new(MockLlmClient::new("test-model")),
             Arc::new(MockToolExecutor::new()),
             Arc::new(crate::tools::BrowserSessionManager::default()),
@@ -14646,6 +14682,7 @@ mod standalone_terminal_stop_tests {
         );
         let replay: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id = 'committed-stop'").fetch_one(db.pool()).await.unwrap();
         assert_eq!(replay, 0);
+        assert!(state_write_reached.load(std::sync::atomic::Ordering::Acquire));
         let message_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM messages WHERE conversation_id = 'committed-stop'",
         )
