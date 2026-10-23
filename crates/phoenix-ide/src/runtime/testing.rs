@@ -715,8 +715,14 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
-    pub fn queue_standalone_terminal_stop_outcome(&self, outcome: StandaloneTerminalStopTestOutcome) {
-        self.standalone_terminal_stop_outcomes.lock().unwrap().push_back(outcome);
+    pub fn queue_standalone_terminal_stop_outcome(
+        &self,
+        outcome: StandaloneTerminalStopTestOutcome,
+    ) {
+        self.standalone_terminal_stop_outcomes
+            .lock()
+            .unwrap()
+            .push_back(outcome);
     }
 
     pub fn pending_standalone_terminal_stop_outcomes(&self) -> usize {
@@ -2100,13 +2106,30 @@ impl StateStore for InMemoryStorage {
         _target: &phoenix_db::StandaloneStopTarget,
         _source: &phoenix_db::workflow::PersistedConversationProjection,
         _projection: &phoenix_db::workflow::PersistedConversationProjection,
-    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>> {
+    ) -> phoenix_db::workflow::LocalAuthorityResult<
+        Result<phoenix_db::StandaloneTerminalAcceptance, String>,
+    > {
         use phoenix_db::workflow::LocalAuthorityResult;
-        match self.standalone_terminal_stop_outcomes.lock().unwrap().pop_front() {
-            Some(StandaloneTerminalStopTestOutcome::NotAccepted) => LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::StandaloneTerminalAcceptance::NotAccepted)),
-            Some(StandaloneTerminalStopTestOutcome::Unclassified) => LocalAuthorityResult::DurableFactUnclassified,
-            Some(StandaloneTerminalStopTestOutcome::KnownError(error)) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
-            None => LocalAuthorityResult::DurableFactEstablished(Err("in-memory storage has no durable standalone terminal authority".into())),
+        match self
+            .standalone_terminal_stop_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+        {
+            Some(StandaloneTerminalStopTestOutcome::NotAccepted) => {
+                LocalAuthorityResult::DurableFactEstablished(Ok(
+                    phoenix_db::StandaloneTerminalAcceptance::NotAccepted,
+                ))
+            }
+            Some(StandaloneTerminalStopTestOutcome::Unclassified) => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
+            Some(StandaloneTerminalStopTestOutcome::KnownError(error)) => {
+                LocalAuthorityResult::DurableFactEstablished(Err(error))
+            }
+            None => LocalAuthorityResult::DurableFactEstablished(Err(
+                "in-memory storage has no durable standalone terminal authority".into(),
+            )),
         }
     }
 

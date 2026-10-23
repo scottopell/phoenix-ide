@@ -3411,8 +3411,12 @@ where
         command: crate::runtime::RuntimeCommand,
     ) -> Result<AcknowledgedEventOutcome, String> {
         match command {
-            crate::runtime::RuntimeCommand::Event(event) => self.process_acknowledged_event_body(event).await,
-            crate::runtime::RuntimeCommand::StandaloneTerminalStop(target) => self.process_standalone_terminal_stop(target).await,
+            crate::runtime::RuntimeCommand::Event(event) => {
+                self.process_acknowledged_event_body(event).await
+            }
+            crate::runtime::RuntimeCommand::StandaloneTerminalStop(target) => {
+                self.process_standalone_terminal_stop(target).await
+            }
         }
     }
 
@@ -3426,12 +3430,15 @@ where
         &mut self,
         target: phoenix_db::StandaloneStopTarget,
     ) -> Result<AcknowledgedEventOutcome, String> {
-        use phoenix_db::workflow::LocalAuthorityResult;
         use crate::runtime::StandaloneTerminalStopOutcome;
-        if self.context.is_sub_agent || self.active_direct_turn.is_some()
+        use phoenix_db::workflow::LocalAuthorityResult;
+        if self.context.is_sub_agent
+            || self.active_direct_turn.is_some()
             || target.conversation_id() != self.context.conversation_id
         {
-            return Ok(AcknowledgedEventOutcome::StandaloneTerminalStop(StandaloneTerminalStopOutcome::NotAccepted));
+            return Ok(AcknowledgedEventOutcome::StandaloneTerminalStop(
+                StandaloneTerminalStopOutcome::NotAccepted,
+            ));
         }
         if self.local_terminal_authority == LocalTerminalAuthority::Fatal
             || self.fatal_local_authority_fence.is_closed()
@@ -3442,34 +3449,64 @@ where
             reason: None,
             cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
         };
-        let preview = transition(&self.state, &self.context, event.clone()).map_err(|error| error.to_string())?;
+        let preview = transition(&self.state, &self.context, event.clone())
+            .map_err(|error| error.to_string())?;
         if !matches!(preview.new_state, ConvState::Idle) {
             return Err("standalone terminal Stop does not support a drain projection".into());
         }
         let source = phoenix_db::workflow::PersistedConversationProjection {
-            state: self.state.clone(), state_updated_at: self.state_updated_at,
+            state: self.state.clone(),
+            state_updated_at: self.state_updated_at,
         };
         let projection = phoenix_db::workflow::PersistedConversationProjection {
-            state: preview.new_state, state_updated_at: Utc::now(),
+            state: preview.new_state,
+            state_updated_at: Utc::now(),
         };
-        let receipt = match self.storage.accept_standalone_terminal_stop(&target, &source, &projection).await {
-            LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::StandaloneTerminalAcceptance::Accepted(receipt))) => receipt,
-            LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::StandaloneTerminalAcceptance::NotAccepted)) => {
-                return Ok(AcknowledgedEventOutcome::StandaloneTerminalStop(StandaloneTerminalStopOutcome::NotAccepted));
+        let receipt = match self
+            .storage
+            .accept_standalone_terminal_stop(&target, &source, &projection)
+            .await
+        {
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                phoenix_db::StandaloneTerminalAcceptance::Accepted(receipt),
+            )) => receipt,
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                phoenix_db::StandaloneTerminalAcceptance::NotAccepted,
+            )) => {
+                return Ok(AcknowledgedEventOutcome::StandaloneTerminalStop(
+                    StandaloneTerminalStopOutcome::NotAccepted,
+                ));
             }
             LocalAuthorityResult::DurableFactEstablished(Err(error)) => return Err(error),
             LocalAuthorityResult::DurableFactUnclassified => {
-                return Err(self.fail_standalone_terminal_authority("standalone_terminal_stop_unclassified"));
+                return Err(self
+                    .fail_standalone_terminal_authority("standalone_terminal_stop_unclassified"));
             }
         };
-        if !standalone_terminal_receipt_matches(&target, &projection, receipt.target(), receipt.projection()) {
-            return Err(self.fail_standalone_terminal_authority("standalone_terminal_stop_receipt_mismatch"));
+        if !standalone_terminal_receipt_matches(
+            &target,
+            &projection,
+            receipt.target(),
+            receipt.projection(),
+        ) {
+            return Err(self
+                .fail_standalone_terminal_authority("standalone_terminal_stop_receipt_mismatch"));
         }
-        if let Err(error) = self.process_event_with_accepted_stop(event, Some(AcceptedTargetedStop::StandaloneTerminal(receipt))).await {
+        if let Err(error) = self
+            .process_event_with_accepted_stop(
+                event,
+                Some(AcceptedTargetedStop::StandaloneTerminal(receipt)),
+            )
+            .await
+        {
             tracing::error!(%error, "standalone terminal application failed after durable acceptance");
-            return Err(self.fail_standalone_terminal_authority("standalone_terminal_stop_application_failed"));
+            return Err(self.fail_standalone_terminal_authority(
+                "standalone_terminal_stop_application_failed",
+            ));
         }
-        Ok(AcknowledgedEventOutcome::StandaloneTerminalStop(StandaloneTerminalStopOutcome::Accepted))
+        Ok(AcknowledgedEventOutcome::StandaloneTerminalStop(
+            StandaloneTerminalStopOutcome::Accepted,
+        ))
     }
 
     async fn process_acknowledged_event_body(
@@ -3879,10 +3916,12 @@ where
                         self.active_direct_turn.is_none()
                             && receipt.target().conversation_id() == self.context.conversation_id
                     }
-                    _ => self.active_direct_turn.as_ref().is_some_and(|target| accepted.matches(target.turn_id, target.generation)),
+                    _ => self
+                        .active_direct_turn
+                        .as_ref()
+                        .is_some_and(|target| accepted.matches(target.turn_id, target.generation)),
                 };
-                if !identity_matches || accepted.projection().state != result.new_state
-                {
+                if !identity_matches || accepted.projection().state != result.new_state {
                     return Err(
                         "accepted Stop projection does not match reducer result".to_string()
                     );
@@ -14278,14 +14317,29 @@ mod standalone_terminal_stop_tests {
         }
     }
 
-    async fn real_target(conversation: &str) -> (crate::db::Database, phoenix_db::StandaloneStopTarget) {
+    async fn real_target(
+        conversation: &str,
+    ) -> (crate::db::Database, phoenix_db::StandaloneStopTarget) {
         let db = crate::db::Database::open_in_memory().await.unwrap();
-        db.create_conversation(conversation, conversation, "/tmp", true, None, None).await.unwrap();
+        db.create_conversation(conversation, conversation, "/tmp", true, None, None)
+            .await
+            .unwrap();
         db.add_message_and_clear_provider_replay_with_origin(
-            &format!("{conversation}-input"), conversation, 1, &crate::db::MessageContent::user("input"),
-            None, None, &InputOrigin::UserApi, &waiting_state(), DateTime::from_timestamp_micros(100).unwrap(),
-        ).await.unwrap();
-        let phoenix_db::CapturedStopTarget::Standalone(target) = db.capture_stop_target(conversation).await.unwrap() else {
+            &format!("{conversation}-input"),
+            conversation,
+            1,
+            &crate::db::MessageContent::user("input"),
+            None,
+            None,
+            &InputOrigin::UserApi,
+            &waiting_state(),
+            DateTime::from_timestamp_micros(100).unwrap(),
+        )
+        .await
+        .unwrap();
+        let phoenix_db::CapturedStopTarget::Standalone(target) =
+            db.capture_stop_target(conversation).await.unwrap()
+        else {
             panic!("expected actual interaction-response occurrence");
         };
         (db, target)
@@ -14299,52 +14353,99 @@ mod standalone_terminal_stop_tests {
             let (_db, target) = real_target("scripted-stop").await;
             let storage = Arc::new(InMemoryStorage::new());
             storage.queue_standalone_terminal_stop_outcome(match case {
-                0 => StandaloneTerminalStopTestOutcome::KnownError("known storage rejection".into()),
+                0 => {
+                    StandaloneTerminalStopTestOutcome::KnownError("known storage rejection".into())
+                }
                 1 => StandaloneTerminalStopTestOutcome::NotAccepted,
                 _ => StandaloneTerminalStopTestOutcome::Unclassified,
             });
             let (event_tx, event_rx) = mpsc::channel(8);
             let (ack_tx, ack_rx) = mpsc::channel(8);
-            let mut runtime = ConversationRuntime::new(
-                ConvContext::new("scripted-stop", std::path::PathBuf::from("/tmp"), "test-model", 200_000),
-                waiting_state(), storage, Arc::new(MockLlmClient::new("test-model")),
-                Arc::new(MockToolExecutor::new()), Arc::new(crate::tools::BrowserSessionManager::default()),
-                Arc::new(crate::tools::BashHandleRegistry::new()), Arc::new(crate::tools::TmuxRegistry::new()),
-                Arc::new(phoenix_llm::ModelRegistry::new_empty()), crate::terminal::ActiveTerminals::new(),
-                event_rx, event_tx.clone(), SseBroadcaster::new(128, 0),
-            );
-            runtime.set_acknowledged_event_receiver(ack_rx);
+            let runtime = ConversationRuntime::new(
+                ConvContext::new(
+                    "scripted-stop",
+                    std::path::PathBuf::from("/tmp"),
+                    "test-model",
+                    200_000,
+                ),
+                waiting_state(),
+                storage,
+                Arc::new(MockLlmClient::new("test-model")),
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(crate::tools::BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx.clone(),
+                SseBroadcaster::new(128, 0),
+            )
+            .with_acknowledged_event_receiver(ack_rx);
             let fence = runtime.fatal_local_authority_fence.clone();
             let (first_tx, first_rx) = oneshot::channel();
             let (_first_retirement_tx, first_retirement_rx) = oneshot::channel();
-            ack_tx.send(crate::runtime::AcknowledgedEventRequest {
-                event: RuntimeCommand::StandaloneTerminalStop(target), acknowledgement: first_tx, retirement: first_retirement_rx,
-            }).await.unwrap();
+            ack_tx
+                .send(crate::runtime::AcknowledgedEventRequest {
+                    event: RuntimeCommand::StandaloneTerminalStop(target),
+                    acknowledgement: first_tx,
+                    retirement: first_retirement_rx,
+                })
+                .await
+                .unwrap();
             let (second_tx, second_rx) = oneshot::channel();
             let (_second_retirement_tx, second_retirement_rx) = oneshot::channel();
-            ack_tx.send(crate::runtime::AcknowledgedEventRequest {
-                event: RuntimeCommand::Event(Event::SteeringQueueChanged), acknowledgement: second_tx, retirement: second_retirement_rx,
-            }).await.unwrap();
+            ack_tx
+                .send(crate::runtime::AcknowledgedEventRequest {
+                    event: RuntimeCommand::Event(Event::SteeringQueueChanged),
+                    acknowledgement: second_tx,
+                    retirement: second_retirement_rx,
+                })
+                .await
+                .unwrap();
             let task = tokio::spawn(runtime.run());
-            let first = tokio::time::timeout(std::time::Duration::from_secs(30), first_rx).await.unwrap().unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(30), first_rx)
+                .await
+                .unwrap()
+                .unwrap();
             if case == 2 {
                 assert!(first.is_err());
-                let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task).await.unwrap().unwrap();
-                assert!(matches!(exit, RuntimeExitDisposition::FatalLocalAuthorityLoss));
+                let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    exit,
+                    RuntimeExitDisposition::FatalLocalAuthorityLoss
+                ));
                 assert!(fence.is_closed());
                 assert!(second_rx.await.is_err());
             } else {
                 if case == 0 {
                     assert_eq!(first.unwrap_err(), "known storage rejection");
                 } else {
-                    assert_eq!(first.unwrap(), AcknowledgedEventOutcome::StandaloneTerminalStop(StandaloneTerminalStopOutcome::NotAccepted));
+                    assert_eq!(
+                        first.unwrap(),
+                        AcknowledgedEventOutcome::StandaloneTerminalStop(
+                            StandaloneTerminalStopOutcome::NotAccepted
+                        )
+                    );
                 }
-                let second = tokio::time::timeout(std::time::Duration::from_secs(30), second_rx).await.unwrap().unwrap();
+                let second = tokio::time::timeout(std::time::Duration::from_secs(30), second_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert!(second.is_ok());
                 assert!(!fence.is_closed());
                 event_tx.send(Event::Shutdown).await.unwrap();
-                let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task).await.unwrap().unwrap();
-                assert!(!matches!(exit, RuntimeExitDisposition::FatalLocalAuthorityLoss));
+                let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!matches!(
+                    exit,
+                    RuntimeExitDisposition::FatalLocalAuthorityLoss
+                ));
             }
         }
     }
@@ -14358,34 +14459,70 @@ mod standalone_terminal_stop_tests {
         let broadcaster = SseBroadcaster::new(128, 0);
         let mut broadcasts = broadcaster.subscribe();
         let mut runtime = ConversationRuntime::new(
-            ConvContext::new("retiring-stop", std::path::PathBuf::from("/tmp"), "test-model", 200_000),
-            waiting_state(), Arc::new(DatabaseStorage::new(db)), Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()), Arc::new(crate::tools::BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()), Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(phoenix_llm::ModelRegistry::new_empty()), crate::terminal::ActiveTerminals::new(),
-            event_rx, event_tx, broadcaster,
+            ConvContext::new(
+                "retiring-stop",
+                std::path::PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+            ),
+            waiting_state(),
+            Arc::new(DatabaseStorage::new(db)),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            broadcaster,
         );
         runtime.state_updated_at = DateTime::from_timestamp_micros(100).unwrap();
-        runtime.set_acknowledged_event_receiver(ack_rx);
+        runtime = runtime.with_acknowledged_event_receiver(ack_rx);
         let (first_tx, first_rx) = oneshot::channel();
         let (retirement_tx, retirement_rx) = oneshot::channel();
-        ack_tx.send(crate::runtime::AcknowledgedEventRequest {
-            event: RuntimeCommand::StandaloneTerminalStop(target), acknowledgement: first_tx, retirement: retirement_rx,
-        }).await.unwrap();
+        ack_tx
+            .send(crate::runtime::AcknowledgedEventRequest {
+                event: RuntimeCommand::StandaloneTerminalStop(target),
+                acknowledgement: first_tx,
+                retirement: retirement_rx,
+            })
+            .await
+            .unwrap();
         let (second_tx, second_rx) = oneshot::channel();
         let (_second_retirement_tx, second_retirement_rx) = oneshot::channel();
-        ack_tx.send(crate::runtime::AcknowledgedEventRequest {
-            event: RuntimeCommand::Event(Event::SteeringQueueChanged), acknowledgement: second_tx, retirement: second_retirement_rx,
-        }).await.unwrap();
+        ack_tx
+            .send(crate::runtime::AcknowledgedEventRequest {
+                event: RuntimeCommand::Event(Event::SteeringQueueChanged),
+                acknowledgement: second_tx,
+                retirement: second_retirement_rx,
+            })
+            .await
+            .unwrap();
         let task = tokio::spawn(runtime.run());
-        let first = tokio::time::timeout(std::time::Duration::from_secs(30), first_rx).await.unwrap().unwrap().unwrap();
-        assert_eq!(first, AcknowledgedEventOutcome::StandaloneTerminalStop(StandaloneTerminalStopOutcome::Accepted));
-        let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task).await.unwrap().unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(30), first_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first,
+            AcknowledgedEventOutcome::StandaloneTerminalStop(
+                StandaloneTerminalStopOutcome::Accepted
+            )
+        );
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(exit, RuntimeExitDisposition::Terminal);
         assert!(second_rx.await.is_err());
         let mut terminal_events = 0;
         while let Ok(event) = broadcasts.try_recv() {
-            if matches!(event, SseEvent::ConversationBecameTerminal { .. }) { terminal_events += 1; }
+            if matches!(event, SseEvent::ConversationBecameTerminal { .. }) {
+                terminal_events += 1;
+            }
         }
         assert_eq!(terminal_events, 1);
         drop(retirement_tx);
@@ -14396,7 +14533,9 @@ mod standalone_terminal_stop_tests {
         use tokio::sync::{mpsc, oneshot};
         let (db, target) = real_target("committed-stop").await;
         let conversation = db.get_conversation("committed-stop").await.unwrap();
-        db.watch_product_conversation(&conversation.product_conversation_id).await.unwrap();
+        db.watch_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('committed-stop', 'anthropic', 'test', 'replay', '{}')").execute(db.pool()).await.unwrap();
         sqlx::query("CREATE TRIGGER reject_runtime_idle_rewrite BEFORE UPDATE OF state ON conversations WHEN OLD.id = 'committed-stop' AND OLD.state_kind = 'idle' AND NEW.state_kind = 'idle' BEGIN SELECT RAISE(ABORT, 'injected postaccept runtime persistence failure'); END").execute(db.pool()).await.unwrap();
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -14404,80 +14543,156 @@ mod standalone_terminal_stop_tests {
         let broadcaster = SseBroadcaster::new(128, 0);
         let mut broadcasts = broadcaster.subscribe();
         let mut runtime = ConversationRuntime::new(
-            ConvContext::new("committed-stop", std::path::PathBuf::from("/tmp"), "test-model", 200_000),
-            waiting_state(), Arc::new(DatabaseStorage::new(db.clone())), Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()), Arc::new(crate::tools::BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()), Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(phoenix_llm::ModelRegistry::new_empty()), crate::terminal::ActiveTerminals::new(),
-            event_rx, event_tx, broadcaster,
+            ConvContext::new(
+                "committed-stop",
+                std::path::PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+            ),
+            waiting_state(),
+            Arc::new(DatabaseStorage::new(db.clone())),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            broadcaster,
         );
         runtime.state_updated_at = DateTime::from_timestamp_micros(100).unwrap();
-        runtime.set_acknowledged_event_receiver(ack_rx);
+        runtime = runtime.with_acknowledged_event_receiver(ack_rx);
         let fence = runtime.fatal_local_authority_fence.clone();
         struct EffectDropped(Option<oneshot::Sender<()>>);
         impl Drop for EffectDropped {
             fn drop(&mut self) {
-                if let Some(sender) = self.0.take() { let _ = sender.send(()); }
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
             }
         }
         let (dropped_tx, dropped_rx) = oneshot::channel();
         let effect_guard = EffectDropped(Some(dropped_tx));
-        runtime.retry_timer_handle = Some(tokio::spawn(async move {
+        let effect_task = tokio::spawn(async move {
             let _guard = effect_guard;
             std::future::pending::<()>().await;
-        }));
+        });
+        runtime.retry_timer_handle = Some(effect_task.abort_handle());
         let (first_tx, first_rx) = oneshot::channel();
         let (_first_retirement_tx, first_retirement_rx) = oneshot::channel();
-        ack_tx.send(crate::runtime::AcknowledgedEventRequest {
-            event: RuntimeCommand::StandaloneTerminalStop(target), acknowledgement: first_tx, retirement: first_retirement_rx,
-        }).await.unwrap();
+        ack_tx
+            .send(crate::runtime::AcknowledgedEventRequest {
+                event: RuntimeCommand::StandaloneTerminalStop(target),
+                acknowledgement: first_tx,
+                retirement: first_retirement_rx,
+            })
+            .await
+            .unwrap();
         let (second_tx, second_rx) = oneshot::channel();
         let (_second_retirement_tx, second_retirement_rx) = oneshot::channel();
-        ack_tx.send(crate::runtime::AcknowledgedEventRequest {
-            event: RuntimeCommand::Event(Event::SteeringQueueChanged), acknowledgement: second_tx, retirement: second_retirement_rx,
-        }).await.unwrap();
+        ack_tx
+            .send(crate::runtime::AcknowledgedEventRequest {
+                event: RuntimeCommand::Event(Event::SteeringQueueChanged),
+                acknowledgement: second_tx,
+                retirement: second_retirement_rx,
+            })
+            .await
+            .unwrap();
         let task = tokio::spawn(runtime.run());
-        let first = tokio::time::timeout(std::time::Duration::from_secs(30), first_rx).await.unwrap().unwrap();
-        assert!(first.unwrap_err().contains("standalone_terminal_stop_application_failed"));
-        let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task).await.unwrap().unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(30), first_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first
+            .unwrap_err()
+            .contains("standalone_terminal_stop_application_failed"));
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(exit, RuntimeExitDisposition::FatalLocalAuthorityLoss);
         assert!(fence.is_closed());
-        tokio::time::timeout(std::time::Duration::from_secs(30), dropped_rx).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), effect_task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
         assert!(second_rx.await.is_err());
         while let Ok(event) = broadcasts.try_recv() {
-            assert!(!matches!(event, SseEvent::ConversationBecameTerminal { .. }));
+            assert!(!matches!(
+                event,
+                SseEvent::ConversationBecameTerminal { .. }
+            ));
         }
-        assert!(matches!(db.get_conversation("committed-stop").await.unwrap().state, ConvState::Idle));
-        assert_eq!(db.capture_stop_target("committed-stop").await.unwrap(), phoenix_db::CapturedStopTarget::Boundary);
+        assert!(matches!(
+            db.get_conversation("committed-stop").await.unwrap().state,
+            ConvState::Idle
+        ));
+        assert_eq!(
+            db.capture_stop_target("committed-stop").await.unwrap(),
+            phoenix_db::CapturedStopTarget::Boundary
+        );
         let replay: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id = 'committed-stop'").fetch_one(db.pool()).await.unwrap();
         assert_eq!(replay, 0);
-        assert_eq!(db.pending_coordinator_watch_events(8).await.unwrap().len(), 1);
+        assert_eq!(
+            db.pending_coordinator_watch_events(8).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn unsupported_drain_is_rejected_before_storage_or_effects_and_fatal_helper_closes_authority() {
+    async fn unsupported_drain_is_rejected_before_storage_or_effects_and_fatal_helper_closes_authority(
+    ) {
         use crate::runtime::testing::{InMemoryStorage, StandaloneTerminalStopTestOutcome};
         let (_db, target) = real_target("unsupported-drain").await;
         let storage = Arc::new(InMemoryStorage::new());
-        storage.queue_standalone_terminal_stop_outcome(StandaloneTerminalStopTestOutcome::KnownError("must not be consumed".into()));
+        storage.queue_standalone_terminal_stop_outcome(
+            StandaloneTerminalStopTestOutcome::KnownError("must not be consumed".into()),
+        );
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
         let state = ConvState::AwaitingSubAgents {
             pending: vec![phoenix_core::domain::sm_state::PendingSubAgent {
-                agent_id: "pending-preview-child".into(), task: "pending preview".into(),
+                agent_id: "pending-preview-child".into(),
+                task: "pending preview".into(),
                 mode: phoenix_core::domain::sm_state::SubAgentMode::Work,
             }],
-            completed_results: vec![], spawn_tool_id: None,
+            completed_results: vec![],
+            spawn_tool_id: None,
         };
         let llm = Arc::new(MockLlmClient::new("test-model"));
         let mut runtime = ConversationRuntime::new(
-            ConvContext::new("unsupported-drain", std::path::PathBuf::from("/tmp"), "test-model", 200_000),
-            state.clone(), storage.clone(), llm.clone(), Arc::new(MockToolExecutor::new()),
-            Arc::new(crate::tools::BrowserSessionManager::default()), Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()), Arc::new(phoenix_llm::ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(), event_rx, event_tx, SseBroadcaster::new(128, 0),
+            ConvContext::new(
+                "unsupported-drain",
+                std::path::PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+            ),
+            state.clone(),
+            storage.clone(),
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(128, 0),
         );
         let before = runtime.state_updated_at;
-        let error = runtime.process_acknowledged_event(RuntimeCommand::StandaloneTerminalStop(target)).await.unwrap_err();
+        let error = runtime
+            .process_acknowledged_event(RuntimeCommand::StandaloneTerminalStop(target))
+            .await
+            .unwrap_err();
         assert!(error.contains("does not support a drain projection"));
         assert_eq!(runtime.state, state);
         assert_eq!(runtime.state_updated_at, before);
@@ -14486,7 +14701,10 @@ mod standalone_terminal_stop_tests {
         assert!(!runtime.fatal_local_authority_fence.is_closed());
         let error = runtime.fail_standalone_terminal_authority("validator_mismatch_test");
         assert!(error.contains("validator_mismatch_test"));
-        assert_eq!(runtime.local_terminal_authority, LocalTerminalAuthority::Fatal);
+        assert_eq!(
+            runtime.local_terminal_authority,
+            LocalTerminalAuthority::Fatal
+        );
         assert!(runtime.fatal_local_authority_fence.is_closed());
     }
 
@@ -14495,75 +14713,156 @@ mod standalone_terminal_stop_tests {
         let (_first_db, first) = real_target("validator-first").await;
         let (_second_db, second) = real_target("validator-second").await;
         let expected = phoenix_db::workflow::PersistedConversationProjection {
-            state: ConvState::Idle, state_updated_at: DateTime::from_timestamp_micros(200).unwrap(),
+            state: ConvState::Idle,
+            state_updated_at: DateTime::from_timestamp_micros(200).unwrap(),
         };
-        assert!(standalone_terminal_receipt_matches(&first, &expected, &first, &expected));
-        assert!(!standalone_terminal_receipt_matches(&first, &expected, &second, &expected));
+        assert!(standalone_terminal_receipt_matches(
+            &first, &expected, &first, &expected
+        ));
+        assert!(!standalone_terminal_receipt_matches(
+            &first, &expected, &second, &expected
+        ));
         let wrong_state = phoenix_db::workflow::PersistedConversationProjection {
-            state: waiting_state(), state_updated_at: expected.state_updated_at,
+            state: waiting_state(),
+            state_updated_at: expected.state_updated_at,
         };
-        assert!(!standalone_terminal_receipt_matches(&first, &expected, &first, &wrong_state));
+        assert!(!standalone_terminal_receipt_matches(
+            &first,
+            &expected,
+            &first,
+            &wrong_state
+        ));
         let wrong_time = phoenix_db::workflow::PersistedConversationProjection {
-            state: ConvState::Idle, state_updated_at: DateTime::from_timestamp_micros(201).unwrap(),
+            state: ConvState::Idle,
+            state_updated_at: DateTime::from_timestamp_micros(201).unwrap(),
         };
-        assert!(!standalone_terminal_receipt_matches(&first, &expected, &first, &wrong_time));
+        assert!(!standalone_terminal_receipt_matches(
+            &first,
+            &expected,
+            &first,
+            &wrong_time
+        ));
     }
 
-    use crate::runtime::{RuntimeCommand, StandaloneTerminalStopOutcome};
     use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
     use crate::runtime::traits::DatabaseStorage;
+    use crate::runtime::{RuntimeCommand, StandaloneTerminalStopOutcome};
     use phoenix_core::domain::db_schema::InputOrigin;
 
     #[tokio::test]
     async fn private_terminal_receipt_applies_exact_projection_without_legacy_marker() {
         for replace_projection in [false, true] {
             let db = crate::db::Database::open_in_memory().await.unwrap();
-            let conversation = db.create_conversation("private-stop", "private-stop", "/tmp", true, None, None).await.unwrap();
-            db.watch_product_conversation(&conversation.product_conversation_id).await.unwrap();
+            let conversation = db
+                .create_conversation("private-stop", "private-stop", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.watch_product_conversation(&conversation.product_conversation_id)
+                .await
+                .unwrap();
             let source_state = ConvState::LlmRequesting { attempt: 0 };
             let source_time = DateTime::from_timestamp_micros(100).unwrap();
             db.add_message_and_clear_provider_replay_with_origin(
-                "private-stop-input", "private-stop", 1, &crate::db::MessageContent::user("input"),
-                None, None, &InputOrigin::UserApi, &source_state, source_time,
-            ).await.unwrap();
-            let phoenix_db::CapturedStopTarget::Standalone(target) = db.capture_stop_target("private-stop").await.unwrap() else {
+                "private-stop-input",
+                "private-stop",
+                1,
+                &crate::db::MessageContent::user("input"),
+                None,
+                None,
+                &InputOrigin::UserApi,
+                &source_state,
+                source_time,
+            )
+            .await
+            .unwrap();
+            let phoenix_db::CapturedStopTarget::Standalone(target) =
+                db.capture_stop_target("private-stop").await.unwrap()
+            else {
                 panic!("expected real adopted interaction occurrence");
             };
             if replace_projection {
-                db.update_state_and_replay("private-stop", &source_state, DateTime::from_timestamp_micros(101).unwrap(), &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear).await.unwrap();
+                db.update_state_and_replay(
+                    "private-stop",
+                    &source_state,
+                    DateTime::from_timestamp_micros(101).unwrap(),
+                    &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+                )
+                .await
+                .unwrap();
             }
             let (_event_tx, event_rx) = tokio::sync::mpsc::channel(8);
             let event_tx_dup = tokio::sync::mpsc::channel::<Event>(1).0;
             let llm = Arc::new(MockLlmClient::new("test-model"));
             let mut runtime = ConversationRuntime::new(
-                ConvContext::new("private-stop", std::path::PathBuf::from("/tmp"), "test-model", 200_000),
-                source_state.clone(), Arc::new(DatabaseStorage::new(db.clone())), llm.clone(),
-                Arc::new(MockToolExecutor::new()), Arc::new(crate::tools::BrowserSessionManager::default()),
-                Arc::new(crate::tools::BashHandleRegistry::new()), Arc::new(crate::tools::TmuxRegistry::new()),
-                Arc::new(phoenix_llm::ModelRegistry::new_empty()), crate::terminal::ActiveTerminals::new(),
-                event_rx, event_tx_dup, SseBroadcaster::new(128, 0),
+                ConvContext::new(
+                    "private-stop",
+                    std::path::PathBuf::from("/tmp"),
+                    "test-model",
+                    200_000,
+                ),
+                source_state.clone(),
+                Arc::new(DatabaseStorage::new(db.clone())),
+                llm.clone(),
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(crate::tools::BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx_dup,
+                SseBroadcaster::new(128, 0),
             );
             runtime.state_updated_at = source_time;
-            let result = runtime.process_acknowledged_event(RuntimeCommand::StandaloneTerminalStop(target)).await.unwrap();
-            let expected = if replace_projection { StandaloneTerminalStopOutcome::NotAccepted } else { StandaloneTerminalStopOutcome::Accepted };
-            assert_eq!(result, AcknowledgedEventOutcome::StandaloneTerminalStop(expected));
+            let result = runtime
+                .process_acknowledged_event(RuntimeCommand::StandaloneTerminalStop(target))
+                .await
+                .unwrap();
+            let expected = if replace_projection {
+                StandaloneTerminalStopOutcome::NotAccepted
+            } else {
+                StandaloneTerminalStopOutcome::Accepted
+            };
+            assert_eq!(
+                result,
+                AcknowledgedEventOutcome::StandaloneTerminalStop(expected)
+            );
             let persisted = db.get_conversation("private-stop").await.unwrap();
             if replace_projection {
                 assert_eq!(runtime.state, source_state);
                 assert_eq!(persisted.state_updated_at.timestamp_micros(), 101);
-                assert!(matches!(db.capture_stop_target("private-stop").await.unwrap(), phoenix_db::CapturedStopTarget::Standalone(_)));
-                assert!(db.pending_coordinator_watch_events(8).await.unwrap().is_empty());
+                assert!(matches!(
+                    db.capture_stop_target("private-stop").await.unwrap(),
+                    phoenix_db::CapturedStopTarget::Standalone(_)
+                ));
+                assert!(db
+                    .pending_coordinator_watch_events(8)
+                    .await
+                    .unwrap()
+                    .is_empty());
             } else {
                 assert!(matches!(runtime.state, ConvState::Idle));
                 assert_eq!(persisted.state, runtime.state);
-                assert_eq!(persisted.state_updated_at.timestamp_micros(), runtime.state_updated_at.timestamp_micros());
-                assert_eq!(db.capture_stop_target("private-stop").await.unwrap(), phoenix_db::CapturedStopTarget::Boundary);
-                assert_eq!(db.pending_coordinator_watch_events(8).await.unwrap().len(), 1);
+                assert_eq!(
+                    persisted.state_updated_at.timestamp_micros(),
+                    runtime.state_updated_at.timestamp_micros()
+                );
+                assert_eq!(
+                    db.capture_stop_target("private-stop").await.unwrap(),
+                    phoenix_db::CapturedStopTarget::Boundary
+                );
+                assert_eq!(
+                    db.pending_coordinator_watch_events(8).await.unwrap().len(),
+                    1
+                );
             }
             let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_cancel_observations WHERE conversation_id = 'private-stop'").fetch_one(db.pool()).await.unwrap();
             assert_eq!(markers, 0);
             assert!(llm.recorded_requests().is_empty());
-            assert_ne!(runtime.local_terminal_authority, LocalTerminalAuthority::Fatal);
+            assert_ne!(
+                runtime.local_terminal_authority,
+                LocalTerminalAuthority::Fatal
+            );
         }
     }
 }

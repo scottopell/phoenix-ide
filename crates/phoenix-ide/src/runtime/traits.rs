@@ -461,7 +461,9 @@ pub trait StateStore: Send + Sync {
         target: &phoenix_db::StandaloneStopTarget,
         source: &phoenix_db::workflow::PersistedConversationProjection,
         projection: &phoenix_db::workflow::PersistedConversationProjection,
-    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>>;
+    ) -> phoenix_db::workflow::LocalAuthorityResult<
+        Result<phoenix_db::StandaloneTerminalAcceptance, String>,
+    >;
 
     async fn accept_direct_turn_stop(
         &self,
@@ -1155,8 +1157,12 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         target: &phoenix_db::StandaloneStopTarget,
         source: &phoenix_db::workflow::PersistedConversationProjection,
         projection: &phoenix_db::workflow::PersistedConversationProjection,
-    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>> {
-        (**self).accept_standalone_terminal_stop(target, source, projection).await
+    ) -> phoenix_db::workflow::LocalAuthorityResult<
+        Result<phoenix_db::StandaloneTerminalAcceptance, String>,
+    > {
+        (**self)
+            .accept_standalone_terminal_stop(target, source, projection)
+            .await
     }
 
     async fn accept_direct_turn_stop(
@@ -2432,13 +2438,23 @@ impl StateStore for DatabaseStorage {
         target: &phoenix_db::StandaloneStopTarget,
         source: &phoenix_db::workflow::PersistedConversationProjection,
         projection: &phoenix_db::workflow::PersistedConversationProjection,
-    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>> {
+    ) -> phoenix_db::workflow::LocalAuthorityResult<
+        Result<phoenix_db::StandaloneTerminalAcceptance, String>,
+    > {
         use phoenix_db::workflow::LocalAuthorityResult;
-        match self.db.accept_standalone_stop_terminal(target, source, projection).await {
+        match self
+            .db
+            .accept_standalone_stop_terminal(target, source, projection)
+            .await
+        {
             LocalAuthorityResult::DurableFactEstablished(result) => {
-                LocalAuthorityResult::DurableFactEstablished(result.map_err(|error| error.to_string()))
+                LocalAuthorityResult::DurableFactEstablished(
+                    result.map_err(|error| error.to_string()),
+                )
             }
-            LocalAuthorityResult::DurableFactUnclassified => LocalAuthorityResult::DurableFactUnclassified,
+            LocalAuthorityResult::DurableFactUnclassified => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
         }
     }
 
