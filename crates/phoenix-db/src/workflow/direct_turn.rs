@@ -4884,7 +4884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_capture_and_standalone_acceptance_prioritize_every_live_owner() {
+    async fn stop_capture_prioritizes_runtime_owner_but_not_nonowning_steering() {
         use crate::{CapturedStopTarget, StandaloneDrainAcceptance};
         for disposition in [AcceptedDisposition::Runtime, AcceptedDisposition::Steering] {
             let db = crate::Database::open_in_memory().await.unwrap();
@@ -4928,10 +4928,28 @@ mod tests {
                         turn_id,
                         generation: 0
                     },
-                    AcceptedDisposition::Steering => CapturedStopTarget::Boundary,
+                    AcceptedDisposition::Steering =>
+                        CapturedStopTarget::Standalone(captured.clone()),
                 }
             );
             let source = seed_drain_source(&repo).await;
+            if disposition == AcceptedDisposition::Steering {
+                let owns: i64 = sqlx::query_scalar(
+                    "SELECT owns_conversation FROM durable_turns WHERE turn_id = ?1",
+                )
+                .bind(to_i64(turn_id.0, "turn_id").unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(owns, 0);
+                assert!(matches!(
+                    db.accept_standalone_stop_drain(&captured, &source, &drain_projection())
+                        .await
+                        .unwrap(),
+                    StandaloneDrainAcceptance::Accepted(_)
+                ));
+                continue;
+            }
             assert!(matches!(
                 db.accept_standalone_stop_drain(&captured, &source, &drain_projection())
                     .await
