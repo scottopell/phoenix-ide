@@ -11,7 +11,9 @@ mod coordinator_query;
 mod coordinator_watches;
 mod execution_stop;
 pub use coordinator_watches::MessageExecutionSource;
-pub use execution_stop::{CapturedStopTarget, StandaloneStopTarget};
+pub use execution_stop::{
+    AcceptedStandaloneDrain, CapturedStopTarget, StandaloneDrainAcceptance, StandaloneStopTarget,
+};
 mod coordinator_work_scope;
 mod federation_enrollment;
 mod federation_peers;

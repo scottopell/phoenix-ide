@@ -4883,6 +4883,106 @@ mod tests {
             .is_err());
     }
 
+    #[tokio::test]
+    async fn stop_capture_and_standalone_acceptance_prioritize_every_live_owner() {
+        use crate::{CapturedStopTarget, StandaloneDrainAcceptance};
+        for disposition in [AcceptedDisposition::Runtime, AcceptedDisposition::Steering] {
+            let db = crate::Database::open_in_memory().await.unwrap();
+            db.create_conversation("conv-a", "owner", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.add_message_with_seq(
+                "standalone-input",
+                "conv-a",
+                1,
+                &MessageContent::user("standalone"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES ('conv-a', 'standalone-input', 'steering')")
+                .execute(db.pool()).await.unwrap();
+            let CapturedStopTarget::Standalone(captured) =
+                db.capture_stop_target("conv-a").await.unwrap()
+            else {
+                panic!("expected initial occurrence");
+            };
+            let repo = db.workflow_repository();
+            let accepted = repo
+                .accept_authoritative_turn(&input_with_disposition(
+                    "conv-a",
+                    "owner",
+                    disposition,
+                    210,
+                ))
+                .await
+                .unwrap();
+            let AcceptAuthoritativeTurnOutcome::Created { turn_id, .. } = accepted else {
+                panic!("expected live owner");
+            };
+            assert_eq!(
+                db.capture_stop_target("conv-a").await.unwrap(),
+                match disposition {
+                    AcceptedDisposition::Runtime => CapturedStopTarget::DirectTurn {
+                        turn_id,
+                        generation: 0
+                    },
+                    AcceptedDisposition::Steering => CapturedStopTarget::Boundary,
+                }
+            );
+            let source = seed_drain_source(&repo).await;
+            assert!(matches!(
+                db.accept_standalone_stop_drain(&captured, &source, &drain_projection())
+                    .await
+                    .unwrap(),
+                StandaloneDrainAcceptance::NotAccepted
+            ));
+            repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+                command: TurnCommand::Complete {
+                    turn_id,
+                    expected_generation: 0,
+                },
+                projection: Some(stop_projection()),
+                provider_replay_settlement:
+                    phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                db.capture_stop_target("conv-a").await.unwrap(),
+                CapturedStopTarget::Standalone(captured.clone())
+            );
+            let replacement = repo
+                .accept_authoritative_turn(&input("conv-a", "replacement-owner", 211))
+                .await
+                .unwrap();
+            let AcceptAuthoritativeTurnOutcome::Created {
+                turn_id: replacement_id,
+                ..
+            } = replacement
+            else {
+                panic!("expected replacement owner");
+            };
+            assert_ne!(replacement_id, turn_id);
+            assert_eq!(
+                db.capture_stop_target("conv-a").await.unwrap(),
+                CapturedStopTarget::DirectTurn {
+                    turn_id: replacement_id,
+                    generation: 0
+                }
+            );
+            assert!(matches!(
+                db.accept_standalone_stop_drain(&captured, &source, &drain_projection())
+                    .await
+                    .unwrap(),
+                StandaloneDrainAcceptance::NotAccepted
+            ));
+            assert_eq!(captured.message_id(), "standalone-input");
+            assert_eq!(captured.source(), crate::MessageExecutionSource::Steering);
+        }
+    }
+
     fn drain_projection() -> UserRequestedDrainProjection {
         UserRequestedDrainProjection::new(PersistedConversationProjection {
             state: ConvState::CancellingSubAgents {
