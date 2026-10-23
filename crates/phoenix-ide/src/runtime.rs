@@ -247,10 +247,22 @@ pub(crate) enum AcknowledgedEventOutcome {
     Settled,
     StaleAuthority,
     SteeringWake(SteeringWakeOutcome),
+    StandaloneTerminalStop(StandaloneTerminalStopOutcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandaloneTerminalStopOutcome {
+    Accepted,
+    NotAccepted,
+}
+
+pub(crate) enum RuntimeCommand {
+    Event(Event),
+    StandaloneTerminalStop(phoenix_db::StandaloneStopTarget),
 }
 
 pub(crate) struct AcknowledgedEventRequest {
-    pub event: Event,
+    pub event: RuntimeCommand,
     pub acknowledgement: tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
     pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
@@ -6629,7 +6641,7 @@ impl RuntimeManager {
         handle
             .acknowledged_event_tx
             .send(AcknowledgedEventRequest {
-                event,
+                event: RuntimeCommand::Event(event),
                 acknowledgement: ack_tx,
                 retirement: retirement_rx,
             })
@@ -6707,7 +6719,7 @@ impl RuntimeManager {
         handle
             .acknowledged_event_tx
             .send(AcknowledgedEventRequest {
-                event: Event::UserTriggerContinuation { operation_id },
+                event: RuntimeCommand::Event(Event::UserTriggerContinuation { operation_id }),
                 acknowledgement: ack_tx,
                 retirement: retirement_rx,
             })

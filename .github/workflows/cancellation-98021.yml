@@ -10,17 +10,26 @@ concurrency:
 jobs:
   focused:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
     env:
       CARGO_BUILD_JOBS: "2"
       RUST_TEST_THREADS: "2"
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "-D warnings"
     steps:
+      - name: Establish original deadline
+        shell: bash
+        run: |
+          start=$(date +%s)
+          echo "QUAL_STARTED=$start" >> "$GITHUB_ENV"
+          echo "QUAL_WORK_END=$((start+22*60))" >> "$GITHUB_ENV"
+          echo "QUAL_END=$((start+25*60))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+        timeout-minutes: 1
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        timeout-minutes: 1
         with:
           cache: false
       - name: Exact source and command evidence
@@ -29,11 +38,18 @@ jobs:
           mkdir -p qualification-evidence
           printf '%s\n' 'EXCLUDED EXPECTED RED: authoritative_settlement_is_not_reclassified_by_legacy_cancel_observation; publisher override remains unfixed. This is slice qualification, not full-branch CI or merge readiness.' > qualification-evidence/remaining-failure.txt
           git rev-parse HEAD | tee qualification-evidence/head.txt
-          printf '%s\n' 'source-parent=ff9bd30f87527d1484eb8768aed9761d4fb84435' > qualification-evidence/source-parent.txt
-      - name: Four-package all-target check and twenty-eight exact named regressions
+          git rev-parse HEAD^{tree} > qualification-evidence/tree.txt
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          printf 'QUAL_STARTED=%s QUAL_WORK_END=%s QUAL_END=%s\n' "$QUAL_STARTED" "$QUAL_WORK_END" "$QUAL_END" > qualification-evidence/deadline.txt
+      - name: One all-target test build and thirty-four exact binary cases
+        timeout-minutes: 22
         shell: bash
         run: |
           set -euo pipefail
+          main_entry=$(date +%s)
+          MAIN_END=$((main_entry+22*60-15))
+          if ((MAIN_END>QUAL_WORK_END)); then MAIN_END=$QUAL_WORK_END; fi
+          printf 'main_entry=%s effective_main_end=%s\n' "$main_entry" "$MAIN_END" > qualification-evidence/main-deadline.txt
           OUT=qualification-evidence
           cat > "$OUT/named-cases.txt" <<'CASES'
           phoenix-db|workflow::direct_turn::tests::accepted_direct_turn_stop_replays_exact_command_not_replacement_generation
@@ -64,46 +80,116 @@ jobs:
           phoenix-db|tests::terminal_seeded_fork_identity_is_not_readopted_on_resolution_retry
           phoenix-db|execution_stop::tests::terminal_interaction_identity_cannot_be_readopted_by_message_writer
           phoenix-db|execution_stop::tests::standalone_stop_commit_cuts_preserve_uncertainty_without_a_watch
+          phoenix_ide|runtime::executor::standalone_terminal_stop_tests::acknowledged_preaccept_outcomes_preserve_fatal_and_nonfatal_continuation
+          phoenix_ide|runtime::executor::standalone_terminal_stop_tests::acknowledged_success_emits_terminal_and_exits_without_retirement_wait
+          phoenix_ide|runtime::executor::standalone_terminal_stop_tests::acknowledged_postaccept_persistence_failure_exits_fatal_without_terminal_signal
+          phoenix_ide|runtime::executor::standalone_terminal_stop_tests::unsupported_drain_is_rejected_before_storage_or_effects_and_fatal_helper_closes_authority
+          phoenix_ide|runtime::executor::standalone_terminal_stop_tests::terminal_receipt_validator_rejects_target_state_and_microsecond_mismatch
+          phoenix_ide|runtime::executor::standalone_terminal_stop_tests::private_terminal_receipt_applies_exact_projection_without_legacy_marker
           CASES
-          test "$(wc -l < "$OUT/named-cases.txt")" -eq 28
-          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sort -u | wc -l)" -eq 28
-          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sed 's/.*:://' | sort -u | wc -l)" -eq 28
+          test "$(wc -l < "$OUT/named-cases.txt")" -eq 34
+          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sort -u | wc -l)" -eq 34
+          test "$(cut -d'|' -f2 "$OUT/named-cases.txt" | sed 's/.*:://' | sort -u | wc -l)" -eq 34
           while IFS='|' read -r pkg fullname; do
             printf '%s\n' 'NOT RUN (compile gate not passed)' > "$OUT/${fullname##*::}.disposition"
           done < "$OUT/named-cases.txt"
-          printf '%s\n' 'cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide' > "$OUT/compile.command"
+          # Inline replacement after existing named-cases initialization; UNAPPLIED.
+          remaining() { echo "$(( $1 - $(date +%s) ))"; }
+          format_end=$((QUAL_STARTED+120)); if ((format_end>MAIN_END)); then format_end=$MAIN_END; fi
+          format_left=$(remaining "$format_end")
+          python_left=$format_left; if ((python_left>5)); then python_left=5; fi
+          test "$python_left" -gt 2
+          timeout --signal=TERM --kill-after=1s "$((python_left-1))s" python3 -c 'import sys; assert sys.version_info >= (3,11); print(sys.version)' > "$OUT/python-version.txt"
+          format_left=$(remaining "$format_end")
+          test "$format_left" -gt 2
           set +e
-          cargo check --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide 2>&1 | tee "$OUT/compile.log"
-          code=${PIPESTATUS[0]}
+          timeout --signal=TERM --kill-after=1s "$((format_left-1))s" rustfmt --check --edition 2021 --config skip_children=true \
+            crates/phoenix-ide/src/runtime.rs crates/phoenix-ide/src/runtime/executor.rs \
+            crates/phoenix-ide/src/runtime/traits.rs crates/phoenix-ide/src/runtime/testing.rs \
+            crates/phoenix-ide/src/api/handlers.rs 2>&1 | tee "$OUT/format.log"
+          status=("${PIPESTATUS[@]}")
           set -e
-          printf '%s\n' "$code" > "$OUT/compile.exit"
-          if test "$code" -ne 0; then exit "$code"; fi
+          printf '%s\n' "${status[@]}" > "$OUT/format.pipeline-exits"
+          test "${status[0]}" -eq 0 && test "${status[1]}" -eq 0
+          left=$(remaining "$MAIN_END")
+          test "$left" -gt 192
+          build_limit=$((left-191)); if ((build_limit>1019)); then build_limit=1019; fi
+          printf '%s\n' 'cargo test --no-run --message-format=json --all-targets -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide' > "$OUT/compile.command"
+          set +e
+          timeout --signal=TERM --kill-after=1s "${build_limit}s" cargo test --no-run --message-format=json --all-targets \
+            -p phoenix-core -p phoenix-state-machine -p phoenix-db -p phoenix_ide \
+            2> "$OUT/compile.stderr.log" | tee "$OUT/compile.jsonl"
+          status=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${status[@]}" > "$OUT/compile.pipeline-exits"
+          printf '%s\n' "${status[0]}" > "$OUT/compile.exit"
+          test "${status[0]}" -eq 0 && test "${status[1]}" -eq 0
+          parse_left=$(remaining "$MAIN_END")
+          test "$parse_left" -gt 182
+          parse_limit=$((parse_left-181)); if ((parse_limit>9)); then parse_limit=9; fi
+          set +e
+          timeout --signal=TERM --kill-after=1s "${parse_limit}s" python3 - <<'PY' > "$OUT/parse.log" 2>&1
+          import json,pathlib,tomllib,os
+          out=pathlib.Path('qualification-evidence'); root=pathlib.Path.cwd().resolve()
+          expected={}
+          for directory,name in [('phoenix-db','phoenix-db'),('phoenix-ide','phoenix_ide')]:
+              manifest=(root/'crates'/directory/'Cargo.toml').resolve()
+              assert tomllib.loads(manifest.read_text())['package']['name']==name
+              expected[str(manifest)]=name
+          selected={name:set() for name in expected.values()}; facts=[]; finished=[]
+          for line in (out/'compile.jsonl').open():
+              item=json.loads(line)
+              if item.get('reason')=='build-finished': finished.append(item.get('success'))
+              if item.get('reason')!='compiler-artifact': continue
+              manifest=str(pathlib.Path(item['manifest_path']).resolve())
+              if manifest not in expected or not item.get('profile',{}).get('test') or item['target']['kind']!=['lib']: continue
+              executable=item.get('executable')
+              if not executable: continue
+              path=pathlib.Path(executable).resolve()
+              assert path.is_relative_to(pathlib.Path(os.environ['CARGO_TARGET_DIR']).resolve()) and path.is_file() and os.access(path,os.X_OK)
+              name=expected[manifest]
+              selected[name].add((item['package_id'],str(path)))
+              facts.append({key:item[key] for key in ['package_id','manifest_path','target','profile','executable']})
+          assert finished==[True] and all(len(values)==1 for values in selected.values())
+          (out/'binary-targets.json').write_text(json.dumps(facts,indent=2))
+          (out/'binary-map.tsv').write_text(''.join(name+'\t'+next(iter(values))[1]+'\n' for name,values in selected.items()))
+          PY
+          parse_code=$?
+          set -e
+          printf '%s\n' "$parse_code" > "$OUT/parse.exit"
+          test "$parse_code" -eq 0
           result=0
+          tests_end=$(( $(date +%s)+180 )); if ((tests_end>MAIN_END)); then tests_end=$MAIN_END; fi
           while IFS='|' read -r pkg fullname; do
             name=${fullname##*::}
             case "$pkg" in phoenix-db|phoenix_ide) ;; *) exit 1 ;; esac
-            printf 'cargo test -p %s --lib %s -- --exact --nocapture\n' "$pkg" "$fullname" > "$OUT/$name.command"
-            printf '%s\n' 'RUNNING' > "$OUT/$name.disposition"
+            left=$(remaining "$tests_end")
+            if ((left<=2)); then result=1; break; fi
+            limit=$((left-1)); if ((limit>29)); then limit=29; fi
+            binary=$(awk -F '\t' -v p="$pkg" '$1==p {print $2}' "$OUT/binary-map.tsv")
+            test -n "$binary" && test -x "$binary"
+            printf '%q %q --exact --nocapture\n' "$binary" "$fullname" > "$OUT/$name.command"
+            printf '%s\n' RUNNING > "$OUT/$name.disposition"
             set +e
-            cargo test -p "$pkg" --lib "$fullname" -- --exact --nocapture 2>&1 | tee "$OUT/$name.log"
-            code=${PIPESTATUS[0]}
+            timeout --signal=TERM --kill-after=1s "${limit}s" "$binary" "$fullname" --exact --nocapture 2>&1 | tee "$OUT/$name.log"
+            status=("${PIPESTATUS[@]}")
             set -e
-            printf '%s\n' "$code" > "$OUT/$name.exit"
+            printf '%s\n' "${status[@]}" > "$OUT/$name.pipeline-exits"
+            code=${status[0]}; printf '%s\n' "$code" > "$OUT/$name.exit"
             cases=$(grep -Ec '^test .* \.\.\. (ok|FAILED|ignored)$' "$OUT/$name.log" || true)
             named_pass=$(grep -Fxc "test $fullname ... ok" "$OUT/$name.log" || true)
             summary=$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in ' "$OUT/$name.log" || true)
             verification=0
-            if test "$code" -ne 0 || test "$cases" -ne 1 || test "$named_pass" -ne 1 || test "$summary" -ne 1; then
-              verification=1
-              result=1
-            fi
+            if test "$code" -ne 0 || test "${status[1]}" -ne 0 || test "$cases" -ne 1 || test "$named_pass" -ne 1 || test "$summary" -ne 1; then verification=1; result=1; fi
             printf '%s\n' "$verification" > "$OUT/$name.verification.exit"
             printf '%s cases=%s exact_named_pass=%s one_pass_summary=%s command_exit=%s verification_exit=%s\n' "$fullname" "$cases" "$named_pass" "$summary" "$code" "$verification" >> "$OUT/test-counts.txt"
             if test "$verification" -eq 0; then verdict=PASS; else verdict=FAIL; fi
             printf '%s\n' "$verdict" > "$OUT/$name.disposition"
           done < "$OUT/named-cases.txt"
+          test "$(wc -l < "$OUT/test-counts.txt")" -eq 34 || result=1
           exit "$result"
       - name: Retain qualification evidence
+        timeout-minutes: 2
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -111,8 +197,10 @@ jobs:
           path: qualification-evidence/
           if-no-files-found: error
       - name: Remove runner-owned target
+        timeout-minutes: 1
         if: always()
         shell: bash
         run: |
           test "$CARGO_TARGET_DIR" = "$RUNNER_TEMP/cancellation-98021-target"
-          rm -rf -- "$CARGO_TARGET_DIR"
+          left=$((QUAL_END-$(date +%s))); test "$left" -gt 0
+          timeout --signal=TERM --kill-after=1s "$((left>1?left-1:1))s" rm -rf -- "$CARGO_TARGET_DIR"

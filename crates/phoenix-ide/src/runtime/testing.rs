@@ -613,9 +613,16 @@ type StoredSvgArtifacts = HashMap<
     (crate::tools::present_svg::SvgArtifactReference, Vec<u8>),
 >;
 
+pub enum StandaloneTerminalStopTestOutcome {
+    KnownError(String),
+    NotAccepted,
+    Unclassified,
+}
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    standalone_terminal_stop_outcomes: Mutex<VecDeque<StandaloneTerminalStopTestOutcome>>,
     svg_artifacts: Mutex<StoredSvgArtifacts>,
     tool_admission_policies:
         Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
@@ -708,6 +715,14 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
+    pub fn queue_standalone_terminal_stop_outcome(&self, outcome: StandaloneTerminalStopTestOutcome) {
+        self.standalone_terminal_stop_outcomes.lock().unwrap().push_back(outcome);
+    }
+
+    pub fn pending_standalone_terminal_stop_outcomes(&self) -> usize {
+        self.standalone_terminal_stop_outcomes.lock().unwrap().len()
+    }
+
     pub fn seed_tool_admission_policy(
         &self,
         conversation_id: &str,
@@ -788,6 +803,7 @@ impl InMemoryStorage {
             metrics_written: tokio::sync::Notify::new(),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
+            standalone_terminal_stop_outcomes: Mutex::new(VecDeque::new()),
             continuation_start_recovery_error: Mutex::new(false),
             continuation_commit_error_once: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
@@ -2079,6 +2095,21 @@ impl MessageStore for InMemoryStorage {
 
 #[async_trait]
 impl StateStore for InMemoryStorage {
+    async fn accept_standalone_terminal_stop(
+        &self,
+        _target: &phoenix_db::StandaloneStopTarget,
+        _source: &phoenix_db::workflow::PersistedConversationProjection,
+        _projection: &phoenix_db::workflow::PersistedConversationProjection,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>> {
+        use phoenix_db::workflow::LocalAuthorityResult;
+        match self.standalone_terminal_stop_outcomes.lock().unwrap().pop_front() {
+            Some(StandaloneTerminalStopTestOutcome::NotAccepted) => LocalAuthorityResult::DurableFactEstablished(Ok(phoenix_db::StandaloneTerminalAcceptance::NotAccepted)),
+            Some(StandaloneTerminalStopTestOutcome::Unclassified) => LocalAuthorityResult::DurableFactUnclassified,
+            Some(StandaloneTerminalStopTestOutcome::KnownError(error)) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+            None => LocalAuthorityResult::DurableFactEstablished(Err("in-memory storage has no durable standalone terminal authority".into())),
+        }
+    }
+
     async fn accept_direct_turn_stop(
         &self,
         _target: &crate::runtime::traits::ActiveDirectTurn,

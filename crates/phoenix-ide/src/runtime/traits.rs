@@ -456,6 +456,13 @@ pub struct PersistedStateSnapshot {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    async fn accept_standalone_terminal_stop(
+        &self,
+        target: &phoenix_db::StandaloneStopTarget,
+        source: &phoenix_db::workflow::PersistedConversationProjection,
+        projection: &phoenix_db::workflow::PersistedConversationProjection,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>>;
+
     async fn accept_direct_turn_stop(
         &self,
         target: &ActiveDirectTurn,
@@ -1143,6 +1150,15 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
+    async fn accept_standalone_terminal_stop(
+        &self,
+        target: &phoenix_db::StandaloneStopTarget,
+        source: &phoenix_db::workflow::PersistedConversationProjection,
+        projection: &phoenix_db::workflow::PersistedConversationProjection,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>> {
+        (**self).accept_standalone_terminal_stop(target, source, projection).await
+    }
+
     async fn accept_direct_turn_stop(
         &self,
         target: &ActiveDirectTurn,
@@ -2411,6 +2427,21 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn accept_standalone_terminal_stop(
+        &self,
+        target: &phoenix_db::StandaloneStopTarget,
+        source: &phoenix_db::workflow::PersistedConversationProjection,
+        projection: &phoenix_db::workflow::PersistedConversationProjection,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<Result<phoenix_db::StandaloneTerminalAcceptance, String>> {
+        use phoenix_db::workflow::LocalAuthorityResult;
+        match self.db.accept_standalone_stop_terminal(target, source, projection).await {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                LocalAuthorityResult::DurableFactEstablished(result.map_err(|error| error.to_string()))
+            }
+            LocalAuthorityResult::DurableFactUnclassified => LocalAuthorityResult::DurableFactUnclassified,
+        }
+    }
+
     async fn accept_direct_turn_stop(
         &self,
         target: &ActiveDirectTurn,

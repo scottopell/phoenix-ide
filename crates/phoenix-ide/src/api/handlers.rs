@@ -14119,7 +14119,7 @@ pub(crate) mod hard_delete_cascade_tests {
         handle
             .acknowledged_event_tx
             .send(crate::runtime::AcknowledgedEventRequest {
-                event: Event::SteerMessage {
+                event: crate::runtime::RuntimeCommand::Event(Event::SteerMessage {
                     origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
                     text: entry.text.clone(),
                     llm_text: entry.llm_text.clone(),
@@ -14128,7 +14128,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     message_id: entry.message_id.clone(),
                     user_agent: entry.user_agent.clone(),
                     skill_invocation: entry.skill_invocation.clone(),
-                },
+                }),
                 acknowledgement: ack_tx,
                 retirement: retirement_rx,
             })
