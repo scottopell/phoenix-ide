@@ -1082,7 +1082,7 @@ mod tests {
             3,
             serde_json::json!({
                 "id": "legacy-glm", "backend": "openai_chat_completions",
-                "description": "Legacy entry", "context_window": 1048576,
+                "description": "Legacy entry", "context_window": 1_048_576,
                 "recommended": false, "supports_tool_search": false,
             }),
         )
