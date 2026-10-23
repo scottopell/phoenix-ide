@@ -14380,7 +14380,11 @@ mod standalone_terminal_stop_tests {
             };
             let runtime = ConversationRuntime::new(
                 ConvContext::new(
-                    "scripted-stop",
+                    if case == 3 {
+                        "idle-stop"
+                    } else {
+                        "scripted-stop"
+                    },
                     std::path::PathBuf::from("/tmp"),
                     "test-model",
                     200_000,
@@ -14466,7 +14470,10 @@ mod standalone_terminal_stop_tests {
                 ));
             }
             while let Ok(event) = broadcasts.try_recv() {
-                assert!(!matches!(event, SseEvent::ConversationBecameTerminal { .. }));
+                assert!(!matches!(
+                    event,
+                    SseEvent::ConversationBecameTerminal { .. }
+                ));
             }
         }
     }
