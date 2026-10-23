@@ -27,7 +27,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransactionCut {
+pub(crate) enum TransactionCut {
     None,
     BeforeCommit,
     AfterCommit,
@@ -4945,6 +4945,8 @@ mod tests {
                 assert!(matches!(
                     db.accept_standalone_stop_drain(&captured, &source, &drain_projection())
                         .await
+                        .established()
+                        .expect("classified standalone command")
                         .unwrap(),
                     StandaloneDrainAcceptance::Accepted(_)
                 ));
@@ -4953,6 +4955,8 @@ mod tests {
             assert!(matches!(
                 db.accept_standalone_stop_drain(&captured, &source, &drain_projection())
                     .await
+                    .established()
+                    .expect("classified standalone command")
                     .unwrap(),
                 StandaloneDrainAcceptance::NotAccepted
             ));
@@ -4993,6 +4997,8 @@ mod tests {
             assert!(matches!(
                 db.accept_standalone_stop_drain(&captured, &source, &drain_projection())
                     .await
+                    .established()
+                    .expect("classified standalone command")
                     .unwrap(),
                 StandaloneDrainAcceptance::NotAccepted
             ));

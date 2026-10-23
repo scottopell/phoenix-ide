@@ -365,6 +365,19 @@ pub(crate) async fn record_exact_execution_terminal_tx(
     target: &crate::StandaloneStopTarget,
     terminal: &crate::ExecutionOccurrenceTerminal,
 ) -> DbResult<()> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM coordinator_watch_events
+         WHERE source_occurrence_kind = ?1 AND source_occurrence_id = ?2 AND source_generation = 0)",
+    )
+    .bind(target.source().as_str())
+    .bind(target.message_id())
+    .fetch_one(&mut **tx)
+    .await?;
+    if exists {
+        return Err(DbError::Serialization(
+            "exact execution publication conflicts with an established terminal fact".into(),
+        ));
+    }
     let (category, reason) = match terminal {
         crate::ExecutionOccurrenceTerminal::Completed => ("Completed", None),
         crate::ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
@@ -570,7 +583,7 @@ async fn record_watch_event_with_authority_tx(
     if category == "completed" && context_exhausted {
         return Ok(());
     }
-    sqlx::query("INSERT INTO coordinator_watch_events
+    let mut insert = String::from("INSERT INTO coordinator_watch_events
         (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
          occurred_at_us, continuation_state)
@@ -584,16 +597,29 @@ async fn record_watch_event_with_authority_tx(
         WHERE c.id = ?8 AND c.parent_conversation_id IS NULL AND p.kind = 'ordinary'
           AND p.ordinary_lifecycle = 'open'
           AND (?5 != 'completed' OR c.state_kind IN ('idle', 'terminal'))
-          AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')
-        ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id)
-        DO NOTHING")
+          AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')");
+    if matches!(authority, WatchTerminalAuthority::LegacyObservation) {
+        insert.push_str(" ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING");
+    }
+    sqlx::query(&insert)
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(occurrence_kind)
         .bind(occurrence_id)
-        .bind(i64::try_from(generation).map_err(|_| DbError::Serialization("generation overflow".into()))?)
-        .bind(category).bind(if context_exhausted && category == "failed" { Some("context exhausted") } else { reason.or((category == "failed").then_some("turn failed")) })
+        .bind(
+            i64::try_from(generation)
+                .map_err(|_| DbError::Serialization("generation overflow".into()))?,
+        )
+        .bind(category)
+        .bind(if context_exhausted && category == "failed" {
+            Some("context exhausted")
+        } else {
+            reason.or((category == "failed").then_some("turn failed"))
+        })
         .bind(Utc::now().timestamp_micros())
-        .bind(transcript_id).bind(context_exhausted).execute(&mut **tx).await?;
+        .bind(transcript_id)
+        .bind(context_exhausted)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 

@@ -24139,6 +24139,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_steering_identity_cannot_be_readopted_by_real_writers() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("once", "once", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let entry = steering_entry("once-input");
+        db.append_steering_entry("once", &entry, "once-fingerprint")
+            .await
+            .unwrap();
+        let message = steering_drain_message("once", "once-input", 1);
+        db.commit_steering_drain(
+            "once",
+            &[message.clone()],
+            &ConvState::LlmRequesting { attempt: 0 },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let crate::CapturedStopTarget::Standalone(target) =
+            db.capture_stop_target("once").await.unwrap()
+        else {
+            panic!("expected adopted steering occurrence");
+        };
+        let conversation = db.get_conversation("once").await.unwrap();
+        let source = crate::workflow::PersistedConversationProjection {
+            state: conversation.state,
+            state_updated_at: conversation.state_updated_at,
+        };
+        let projection = crate::workflow::PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+        };
+        assert!(matches!(
+            db.accept_standalone_stop_terminal(&target, &source, &projection)
+                .await
+                .established()
+                .expect("classified standalone command")
+                .unwrap(),
+            crate::StandaloneTerminalAcceptance::Accepted(_)
+        ));
+        // No subscription: the synchronous commit, not a watch row, proves acceptance.
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .append_steering_entry("once", &entry, "once-fingerprint")
+            .await
+            .is_err());
+        assert!(db
+            .commit_steering_drain(
+                "once",
+                &[message],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now()
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            db.capture_stop_target("once").await.unwrap(),
+            crate::CapturedStopTarget::Boundary
+        );
+        assert_eq!(
+            db.get_conversation("once").await.unwrap().state,
+            ConvState::Idle
+        );
+        assert_eq!(db.steering_queue_depth("once").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn steering_drain_commits_fifo_messages_state_and_exact_queue_ids() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("drain-ok", "drain-ok", "/tmp", true, None, None)
@@ -30751,6 +30822,63 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(orphan_scopes, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_seeded_fork_identity_is_not_readopted_on_resolution_retry() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("once-origin", "once-origin", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("once-proposal", "once-origin"))
+            .await
+            .unwrap();
+        let mut child = child_conv_fixture(&db, "once-fork", "once-origin").await;
+        let seeds = vec![seed_msg("once-fork")];
+        child.state = ConvState::SeededLlmRequesting {
+            seed_message_id: seeds[0].message_id.clone().into(),
+            attempt: 0,
+        };
+        db.resolve_fork_proposal_spawned("once-proposal", &child, &seeds)
+            .await
+            .unwrap();
+        let crate::CapturedStopTarget::Standalone(target) =
+            db.capture_stop_target("once-fork").await.unwrap()
+        else {
+            panic!("expected seeded occurrence");
+        };
+        assert_eq!(target.source(), crate::MessageExecutionSource::SeededFork);
+        let actual = db.get_conversation("once-fork").await.unwrap();
+        let source = crate::workflow::PersistedConversationProjection {
+            state: actual.state,
+            state_updated_at: actual.state_updated_at,
+        };
+        let projection = crate::workflow::PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+        };
+        assert!(matches!(
+            db.accept_standalone_stop_terminal(&target, &source, &projection)
+                .await
+                .established()
+                .expect("classified standalone command")
+                .unwrap(),
+            crate::StandaloneTerminalAcceptance::Accepted(_)
+        ));
+        db.resolve_fork_proposal_spawned("once-proposal", &child, &seeds)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.capture_stop_target("once-fork").await.unwrap(),
+            crate::CapturedStopTarget::Boundary
+        );
+        let actual = db.get_conversation("once-fork").await.unwrap();
+        assert_eq!(actual.state, projection.state);
+        assert_eq!(
+            actual.state_updated_at.timestamp_micros(),
+            projection.state_updated_at.timestamp_micros()
+        );
+        assert_eq!(db.get_messages("once-fork").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

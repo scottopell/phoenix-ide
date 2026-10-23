@@ -1,7 +1,8 @@
+use crate::workflow::direct_turn::TransactionCut;
 use phoenix_workflow::TurnAuthorityId;
 use sqlx::{Connection, Row};
 
-use crate::{Database, DbError, DbResult, MessageExecutionSource};
+use crate::{workflow::LocalAuthorityResult, Database, DbError, DbResult, MessageExecutionSource};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneStopTarget {
@@ -91,7 +92,44 @@ impl Database {
         target: &StandaloneStopTarget,
         source: &crate::workflow::PersistedConversationProjection,
         projection: &crate::workflow::PersistedConversationProjection,
-    ) -> DbResult<StandaloneTerminalAcceptance> {
+    ) -> LocalAuthorityResult<DbResult<StandaloneTerminalAcceptance>> {
+        self.accept_standalone_stop_terminal_at_cut(
+            target,
+            source,
+            projection,
+            TransactionCut::None,
+        )
+        .await
+    }
+
+    async fn accept_standalone_stop_terminal_at_cut(
+        &self,
+        target: &StandaloneStopTarget,
+        source: &crate::workflow::PersistedConversationProjection,
+        projection: &crate::workflow::PersistedConversationProjection,
+        cut: TransactionCut,
+    ) -> LocalAuthorityResult<DbResult<StandaloneTerminalAcceptance>> {
+        match self
+            .accept_standalone_stop_terminal_command(target, source, projection, cut)
+            .await
+        {
+            Ok(LocalAuthorityResult::DurableFactEstablished(result)) => {
+                LocalAuthorityResult::DurableFactEstablished(Ok(result))
+            }
+            Ok(LocalAuthorityResult::DurableFactUnclassified) => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
+            Err(error) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        }
+    }
+
+    async fn accept_standalone_stop_terminal_command(
+        &self,
+        target: &StandaloneStopTarget,
+        source: &crate::workflow::PersistedConversationProjection,
+        projection: &crate::workflow::PersistedConversationProjection,
+        cut: TransactionCut,
+    ) -> DbResult<LocalAuthorityResult<StandaloneTerminalAcceptance>> {
         if !matches!(
             projection.state,
             phoenix_core::domain::sm_state::ConvState::Idle
@@ -105,17 +143,19 @@ impl Database {
         let Some(actual) = exact_standalone_projection_tx(&mut tx, target).await? else {
             let replay = exact_terminal_replay_tx(&mut tx, target, projection).await?;
             tx.commit().await?;
-            return Ok(if replay {
+            return Ok(LocalAuthorityResult::DurableFactEstablished(if replay {
                 StandaloneTerminalAcceptance::Accepted(AcceptedStandaloneTerminal {
                     target: target.clone(),
                     projection: projection.clone(),
                 })
             } else {
                 StandaloneTerminalAcceptance::NotAccepted
-            });
+            }));
         };
         if !same_projection(&actual, source) {
-            return Ok(StandaloneTerminalAcceptance::NotAccepted);
+            return Ok(LocalAuthorityResult::DurableFactEstablished(
+                StandaloneTerminalAcceptance::NotAccepted,
+            ));
         }
         sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
             .bind(serde_json::to_string(&projection.state).map_err(|error| DbError::Serialization(error.to_string()))?)
@@ -141,22 +181,40 @@ impl Database {
             &crate::ExecutionOccurrenceTerminal::Cancelled,
         )
         .await?;
+        if cut == TransactionCut::BeforeCommit {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "injected standalone Stop before commit".into(),
+            ));
+        }
         let result = tx.commit().await;
+        let result = if result.is_ok() && cut == TransactionCut::AfterCommit {
+            Err(sqlx::Error::Protocol(
+                "injected standalone Stop acknowledgement loss".into(),
+            ))
+        } else {
+            result
+        };
         drop(connection);
         if let Err(original) = result {
-            let mut connection = self.pool.acquire().await?;
-            let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
-            let established = exact_terminal_replay_tx(&mut tx, target, projection).await?;
-            tx.commit().await?;
-            if !established {
-                return Err(DbError::Sqlx(original));
+            let classified: DbResult<bool> = async {
+                let mut connection = self.pool.acquire().await?;
+                let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+                let established = exact_terminal_replay_tx(&mut tx, target, projection).await?;
+                tx.commit().await?;
+                Ok(established)
+            }
+            .await;
+            if !matches!(classified, Ok(true)) {
+                tracing::error!(conversation_id = target.conversation_id(), message_id = target.message_id(), error = %original, classification = ?classified, "standalone terminal Stop commit remains unclassified; effects must not be replayed");
+                return Ok(LocalAuthorityResult::DurableFactUnclassified);
             }
         }
-        Ok(StandaloneTerminalAcceptance::Accepted(
-            AcceptedStandaloneTerminal {
+        Ok(LocalAuthorityResult::DurableFactEstablished(
+            StandaloneTerminalAcceptance::Accepted(AcceptedStandaloneTerminal {
                 target: target.clone(),
                 projection: projection.clone(),
-            },
+            }),
         ))
     }
 
@@ -165,14 +223,50 @@ impl Database {
         target: &StandaloneStopTarget,
         source: &crate::workflow::PersistedConversationProjection,
         projection: &crate::workflow::UserRequestedDrainProjection,
-    ) -> DbResult<StandaloneDrainAcceptance> {
+    ) -> LocalAuthorityResult<DbResult<StandaloneDrainAcceptance>> {
+        self.accept_standalone_stop_drain_at_cut(target, source, projection, TransactionCut::None)
+            .await
+    }
+
+    async fn accept_standalone_stop_drain_at_cut(
+        &self,
+        target: &StandaloneStopTarget,
+        source: &crate::workflow::PersistedConversationProjection,
+        projection: &crate::workflow::UserRequestedDrainProjection,
+        cut: TransactionCut,
+    ) -> LocalAuthorityResult<DbResult<StandaloneDrainAcceptance>> {
+        match self
+            .accept_standalone_stop_drain_command(target, source, projection, cut)
+            .await
+        {
+            Ok(LocalAuthorityResult::DurableFactEstablished(result)) => {
+                LocalAuthorityResult::DurableFactEstablished(Ok(result))
+            }
+            Ok(LocalAuthorityResult::DurableFactUnclassified) => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
+            Err(error) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        }
+    }
+
+    async fn accept_standalone_stop_drain_command(
+        &self,
+        target: &StandaloneStopTarget,
+        source: &crate::workflow::PersistedConversationProjection,
+        projection: &crate::workflow::UserRequestedDrainProjection,
+        cut: TransactionCut,
+    ) -> DbResult<LocalAuthorityResult<StandaloneDrainAcceptance>> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let Some(actual) = exact_standalone_projection_tx(&mut tx, target).await? else {
-            return Ok(StandaloneDrainAcceptance::NotAccepted);
+            return Ok(LocalAuthorityResult::DurableFactEstablished(
+                StandaloneDrainAcceptance::NotAccepted,
+            ));
         };
         if !same_projection(&actual, source) && !same_projection(&actual, projection.projection()) {
-            return Ok(StandaloneDrainAcceptance::NotAccepted);
+            return Ok(LocalAuthorityResult::DurableFactEstablished(
+                StandaloneDrainAcceptance::NotAccepted,
+            ));
         }
         let committed = projection.projection();
         sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
@@ -182,24 +276,42 @@ impl Database {
             .bind(target.conversation_id())
             .execute(&mut *tx)
             .await?;
+        if cut == TransactionCut::BeforeCommit {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "injected standalone Stop before commit".into(),
+            ));
+        }
         let result = tx.commit().await;
+        let result = if result.is_ok() && cut == TransactionCut::AfterCommit {
+            Err(sqlx::Error::Protocol(
+                "injected standalone Stop acknowledgement loss".into(),
+            ))
+        } else {
+            result
+        };
         drop(connection);
         if let Err(original) = result {
-            let mut connection = self.pool.acquire().await?;
-            let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
-            let established = exact_standalone_projection_tx(&mut tx, target)
-                .await?
-                .is_some_and(|actual| same_projection(&actual, projection.projection()));
-            tx.commit().await?;
-            if !established {
-                return Err(DbError::Sqlx(original));
+            let classified: DbResult<bool> = async {
+                let mut connection = self.pool.acquire().await?;
+                let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+                let established = exact_standalone_projection_tx(&mut tx, target)
+                    .await?
+                    .is_some_and(|actual| same_projection(&actual, projection.projection()));
+                tx.commit().await?;
+                Ok(established)
+            }
+            .await;
+            if !matches!(classified, Ok(true)) {
+                tracing::error!(conversation_id = target.conversation_id(), message_id = target.message_id(), error = %original, classification = ?classified, "standalone drain Stop commit remains unclassified; effects must not be replayed");
+                return Ok(LocalAuthorityResult::DurableFactUnclassified);
             }
         }
-        Ok(StandaloneDrainAcceptance::Accepted(
-            AcceptedStandaloneDrain {
+        Ok(LocalAuthorityResult::DurableFactEstablished(
+            StandaloneDrainAcceptance::Accepted(AcceptedStandaloneDrain {
                 target: target.clone(),
                 projection: projection.clone(),
-            },
+            }),
         ))
     }
 
@@ -257,6 +369,8 @@ async fn exact_standalone_projection_tx(
         "SELECT c.state, c.state_updated_at FROM conversations c
          JOIN steering_execution_occurrences o ON o.conversation_id = c.id
          WHERE c.id = ?1 AND o.message_id = ?2 AND o.source_kind = ?3
+           AND NOT EXISTS (SELECT 1 FROM coordinator_watch_events e
+               WHERE e.source_occurrence_kind = o.source_kind AND e.source_occurrence_id = o.message_id AND e.source_generation = 0)
            AND NOT EXISTS (SELECT 1 FROM durable_turns t
                WHERE t.conversation_id = c.id AND t.owns_conversation = 1 AND t.terminal_kind IS NULL)",
     )
@@ -323,6 +437,353 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn standalone_stop_commit_cuts_preserve_uncertainty_without_a_watch() {
+        use crate::workflow::{PersistedConversationProjection, UserRequestedDrainProjection};
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, MessageContent},
+            sm_event::CancelCause,
+            sm_state::ConvState,
+        };
+        for watched in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conversation = db
+                .create_conversation("cuts", "cuts", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            if watched {
+                db.watch_product_conversation(&conversation.product_conversation_id)
+                    .await
+                    .unwrap();
+            }
+            let source = PersistedConversationProjection {
+                state: ConvState::CancellingSubAgents {
+                    pending: vec![],
+                    completed_results: vec![],
+                    cause: CancelCause::Timeout,
+                    spawn_tool_id: None,
+                },
+                state_updated_at: chrono::DateTime::from_timestamp_micros(20).unwrap(),
+            };
+            db.add_message_and_clear_provider_replay_with_origin(
+                "cuts-answer",
+                "cuts",
+                1,
+                &MessageContent::user("answer"),
+                None,
+                None,
+                &InputOrigin::UserApi,
+                &source.state,
+                source.state_updated_at,
+            )
+            .await
+            .unwrap();
+            let CapturedStopTarget::Standalone(target) =
+                db.capture_stop_target("cuts").await.unwrap()
+            else {
+                panic!("expected response occurrence");
+            };
+            let drain = UserRequestedDrainProjection::new(PersistedConversationProjection {
+                state: ConvState::CancellingSubAgents {
+                    pending: vec![],
+                    completed_results: vec![],
+                    cause: CancelCause::UserRequested,
+                    spawn_tool_id: None,
+                },
+                state_updated_at: chrono::DateTime::from_timestamp_micros(21).unwrap(),
+            })
+            .unwrap();
+            assert!(matches!(
+                db.accept_standalone_stop_drain_at_cut(
+                    &target,
+                    &source,
+                    &drain,
+                    TransactionCut::BeforeCommit
+                )
+                .await,
+                LocalAuthorityResult::DurableFactEstablished(Err(_))
+            ));
+            let actual = db.get_conversation("cuts").await.unwrap();
+            assert_eq!(actual.state, source.state);
+            assert_eq!(
+                actual.state_updated_at.timestamp_micros(),
+                source.state_updated_at.timestamp_micros()
+            );
+            assert!(matches!(
+                db.accept_standalone_stop_drain_at_cut(
+                    &target,
+                    &source,
+                    &drain,
+                    TransactionCut::AfterCommit
+                )
+                .await,
+                LocalAuthorityResult::DurableFactEstablished(Ok(
+                    StandaloneDrainAcceptance::Accepted(_)
+                ))
+            ));
+            assert!(db
+                .pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.capture_stop_target("cuts").await.unwrap(),
+                CapturedStopTarget::Standalone(target.clone())
+            );
+            sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('cuts', 'anthropic', 'test', 'replay', '{}')").execute(db.pool()).await.unwrap();
+            let idle = PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: chrono::DateTime::from_timestamp_micros(22).unwrap(),
+            };
+            assert!(matches!(
+                db.accept_standalone_stop_terminal_at_cut(
+                    &target,
+                    drain.projection(),
+                    &idle,
+                    TransactionCut::BeforeCommit
+                )
+                .await,
+                LocalAuthorityResult::DurableFactEstablished(Err(_))
+            ));
+            let actual = db.get_conversation("cuts").await.unwrap();
+            assert_eq!(actual.state, drain.projection().state);
+            assert_eq!(
+                actual.state_updated_at.timestamp_micros(),
+                drain.projection().state_updated_at.timestamp_micros()
+            );
+            let retained: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM steering_execution_occurrences WHERE conversation_id = 'cuts'), (SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id = 'cuts')").fetch_one(db.pool()).await.unwrap();
+            assert_eq!(retained, (1, 1));
+            assert!(db
+                .pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .is_empty());
+            let result = db
+                .accept_standalone_stop_terminal_at_cut(
+                    &target,
+                    drain.projection(),
+                    &idle,
+                    TransactionCut::AfterCommit,
+                )
+                .await;
+            if watched {
+                assert!(matches!(
+                    result,
+                    LocalAuthorityResult::DurableFactEstablished(Ok(
+                        StandaloneTerminalAcceptance::Accepted(_)
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    LocalAuthorityResult::DurableFactUnclassified
+                ));
+            }
+            // Test-only observer knows the injected cut; the caller must not infer it.
+            let actual = db.get_conversation("cuts").await.unwrap();
+            assert_eq!(actual.state, idle.state);
+            assert_eq!(
+                actual.state_updated_at.timestamp_micros(),
+                idle.state_updated_at.timestamp_micros()
+            );
+            let retained: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM steering_execution_occurrences WHERE conversation_id = 'cuts'), (SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id = 'cuts')").fetch_one(db.pool()).await.unwrap();
+            assert_eq!(retained, (0, 0));
+            assert_eq!(
+                db.pending_coordinator_watch_events(16).await.unwrap().len(),
+                usize::from(watched)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_interaction_identity_cannot_be_readopted_by_message_writer() {
+        use crate::workflow::PersistedConversationProjection;
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, MessageContent},
+            sm_state::ConvState,
+        };
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("once-response", "once-response", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let state = ConvState::LlmRequesting { attempt: 0 };
+        let timestamp = chrono::Utc::now();
+        db.add_message_and_clear_provider_replay_with_origin(
+            "once-answer",
+            "once-response",
+            1,
+            &MessageContent::user("answer"),
+            None,
+            None,
+            &InputOrigin::UserApi,
+            &state,
+            timestamp,
+        )
+        .await
+        .unwrap();
+        let CapturedStopTarget::Standalone(target) =
+            db.capture_stop_target("once-response").await.unwrap()
+        else {
+            panic!("expected response occurrence");
+        };
+        assert_eq!(target.source(), MessageExecutionSource::InteractionResponse);
+        let source = PersistedConversationProjection {
+            state: state.clone(),
+            state_updated_at: timestamp,
+        };
+        let projection = PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: chrono::Utc::now(),
+        };
+        assert!(matches!(
+            db.accept_standalone_stop_terminal(&target, &source, &projection)
+                .await
+                .established()
+                .expect("classified standalone command")
+                .unwrap(),
+            StandaloneTerminalAcceptance::Accepted(_)
+        ));
+        assert!(db
+            .add_message_and_clear_provider_replay_with_origin(
+                "once-answer",
+                "once-response",
+                2,
+                &MessageContent::user("answer"),
+                None,
+                None,
+                &InputOrigin::UserApi,
+                &state,
+                chrono::Utc::now()
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            db.capture_stop_target("once-response").await.unwrap(),
+            CapturedStopTarget::Boundary
+        );
+        let actual = db.get_conversation("once-response").await.unwrap();
+        assert_eq!(actual.state, projection.state);
+        assert_eq!(
+            actual.state_updated_at.timestamp_micros(),
+            projection.state_updated_at.timestamp_micros()
+        );
+        assert_eq!(db.get_messages("once-response").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn standalone_stop_rejects_inconsistent_prior_terminal_before_mutation() {
+        use crate::workflow::{PersistedConversationProjection, UserRequestedDrainProjection};
+        use phoenix_core::domain::{
+            db_schema::MessageContent, sm_event::CancelCause, sm_state::ConvState,
+        };
+        for terminal in [
+            crate::ExecutionOccurrenceTerminal::Completed,
+            crate::ExecutionOccurrenceTerminal::Failed {
+                reason: "real failure".into(),
+            },
+            crate::ExecutionOccurrenceTerminal::Cancelled,
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conversation = db
+                .create_conversation("conflict", "conflict", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.watch_product_conversation(&conversation.product_conversation_id)
+                .await
+                .unwrap();
+            db.add_message_with_seq(
+                "conflict-input",
+                "conflict",
+                1,
+                &MessageContent::user("input"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            // Deliberately inconsistent state: real once-only writers cannot create this history.
+            sqlx::query("INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES ('conflict', 'conflict-input', 'steering')").execute(db.pool()).await.unwrap();
+            let CapturedStopTarget::Standalone(target) =
+                db.capture_stop_target("conflict").await.unwrap()
+            else {
+                panic!("expected occurrence");
+            };
+            let mut tx = db.pool().begin().await.unwrap();
+            crate::coordinator_watches::record_exact_execution_terminal_tx(
+                &mut tx, &target, &terminal,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            let source = PersistedConversationProjection {
+                state: ConvState::CancellingSubAgents {
+                    pending: vec![],
+                    completed_results: vec![],
+                    cause: CancelCause::Timeout,
+                    spawn_tool_id: None,
+                },
+                state_updated_at: chrono::DateTime::from_timestamp_micros(10).unwrap(),
+            };
+            db.update_state_and_replay(
+                "conflict",
+                &source.state,
+                source.state_updated_at,
+                &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('conflict', 'anthropic', 'test', 'replay', '{}')").execute(db.pool()).await.unwrap();
+            let drain = UserRequestedDrainProjection::new(PersistedConversationProjection {
+                state: ConvState::CancellingSubAgents {
+                    pending: vec![],
+                    completed_results: vec![],
+                    cause: CancelCause::UserRequested,
+                    spawn_tool_id: None,
+                },
+                state_updated_at: chrono::DateTime::from_timestamp_micros(11).unwrap(),
+            })
+            .unwrap();
+            let idle = PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: chrono::DateTime::from_timestamp_micros(12).unwrap(),
+            };
+            assert!(matches!(
+                db.accept_standalone_stop_drain(&target, &source, &drain)
+                    .await
+                    .established()
+                    .expect("classified standalone command")
+                    .unwrap(),
+                StandaloneDrainAcceptance::NotAccepted
+            ));
+            assert!(matches!(
+                db.accept_standalone_stop_terminal(&target, &source, &idle)
+                    .await
+                    .established()
+                    .expect("classified standalone command")
+                    .unwrap(),
+                StandaloneTerminalAcceptance::NotAccepted
+            ));
+            let mut tx = db.pool().begin().await.unwrap();
+            let error = crate::coordinator_watches::record_exact_execution_terminal_tx(
+                &mut tx,
+                &target,
+                &crate::ExecutionOccurrenceTerminal::Cancelled,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("established terminal fact"));
+            tx.rollback().await.unwrap();
+            let actual = db.get_conversation("conflict").await.unwrap();
+            assert_eq!(actual.state, source.state);
+            assert_eq!(
+                actual.state_updated_at.timestamp_micros(),
+                source.state_updated_at.timestamp_micros()
+            );
+            let retained: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM steering_execution_occurrences WHERE conversation_id = 'conflict' AND message_id = 'conflict-input' AND source_kind = 'steering'), (SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id = 'conflict'), (SELECT COUNT(*) FROM coordinator_watch_events WHERE source_transcript_id = 'conflict')").fetch_one(db.pool()).await.unwrap();
+            assert_eq!(retained, (1, 1, 1));
+        }
+    }
+
+    #[tokio::test]
     async fn standalone_terminal_stop_is_exact_deferred_and_independent_of_legacy_marker() {
         use crate::workflow::PersistedConversationProjection;
         use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
@@ -385,6 +846,8 @@ mod tests {
         assert!(matches!(
             db.accept_standalone_stop_terminal(&stale, &source, &projection)
                 .await
+                .established()
+                .expect("classified standalone command")
                 .unwrap(),
             StandaloneTerminalAcceptance::NotAccepted
         ));
@@ -398,6 +861,8 @@ mod tests {
         let StandaloneTerminalAcceptance::Accepted(receipt) = db
             .accept_standalone_stop_terminal(&target, &source, &projection)
             .await
+            .established()
+            .expect("classified standalone command")
             .unwrap()
         else {
             panic!("expected terminal acceptance");
@@ -424,6 +889,8 @@ mod tests {
         assert!(matches!(
             db.accept_standalone_stop_terminal(&target, &source, &projection)
                 .await
+                .established()
+                .expect("classified standalone command")
                 .unwrap(),
             StandaloneTerminalAcceptance::Accepted(_)
         ));
@@ -432,6 +899,8 @@ mod tests {
         assert!(matches!(
             db.accept_standalone_stop_terminal(&target, &source, &wrong_projection)
                 .await
+                .established()
+                .expect("classified standalone command")
                 .unwrap(),
             StandaloneTerminalAcceptance::NotAccepted
         ));
@@ -444,6 +913,8 @@ mod tests {
         assert!(matches!(
             db.accept_standalone_stop_terminal(&target, &source, &projection)
                 .await
+                .established()
+                .expect("classified standalone command")
                 .unwrap(),
             StandaloneTerminalAcceptance::NotAccepted
         ));
@@ -516,6 +987,8 @@ mod tests {
         assert!(matches!(
             db.accept_standalone_stop_drain(&old_target, &source, &target_projection)
                 .await
+                .established()
+                .expect("classified standalone command")
                 .unwrap(),
             StandaloneDrainAcceptance::NotAccepted
         ));
@@ -535,12 +1008,16 @@ mod tests {
         assert!(matches!(
             db.accept_standalone_stop_drain(&target, &stale_source, &target_projection)
                 .await
+                .established()
+                .expect("classified standalone command")
                 .unwrap(),
             StandaloneDrainAcceptance::NotAccepted
         ));
         let StandaloneDrainAcceptance::Accepted(receipt) = db
             .accept_standalone_stop_drain(&target, &source, &target_projection)
             .await
+            .established()
+            .expect("classified standalone command")
             .unwrap()
         else {
             panic!("expected accepted drain");
@@ -559,6 +1036,8 @@ mod tests {
         assert!(matches!(
             db.accept_standalone_stop_drain(&target, &source, &target_projection)
                 .await
+                .established()
+                .expect("classified standalone command")
                 .unwrap(),
             StandaloneDrainAcceptance::Accepted(_)
         ));
