@@ -360,6 +360,30 @@ pub(crate) async fn record_steering_event_tx(
     .await
 }
 
+pub(crate) async fn record_exact_execution_terminal_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    target: &crate::StandaloneStopTarget,
+    terminal: &crate::ExecutionOccurrenceTerminal,
+) -> DbResult<()> {
+    let (category, reason) = match terminal {
+        crate::ExecutionOccurrenceTerminal::Completed => ("Completed", None),
+        crate::ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
+        crate::ExecutionOccurrenceTerminal::Cancelled => ("Cancelled", None),
+    };
+    record_watch_event_with_authority_tx(
+        tx,
+        target.source().as_str(),
+        target.message_id(),
+        0,
+        target.conversation_id(),
+        category,
+        reason,
+        reason == Some("context exhausted"),
+        WatchTerminalAuthority::ExactOccurrence,
+    )
+    .await
+}
+
 pub(crate) async fn record_wait_entry_tx(
     tx: &mut Transaction<'_, Sqlite>,
     transcript_id: &str,
@@ -479,7 +503,13 @@ pub(crate) async fn record_creation_event_tx(
     .await
 }
 
-#[allow(clippy::too_many_arguments)] // One transaction binds the complete source occurrence and terminal fact.
+#[derive(Clone, Copy)]
+enum WatchTerminalAuthority {
+    LegacyObservation,
+    ExactOccurrence,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn record_watch_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
     occurrence_kind: &str,
@@ -490,13 +520,43 @@ async fn record_watch_event_tx(
     reason: Option<&str>,
     context_exhausted: bool,
 ) -> DbResult<()> {
-    let cancelled =
-        sqlx::query("DELETE FROM execution_cancel_observations WHERE conversation_id = ?1")
-            .bind(transcript_id)
-            .execute(&mut **tx)
-            .await?
-            .rows_affected()
-            > 0;
+    record_watch_event_with_authority_tx(
+        tx,
+        occurrence_kind,
+        occurrence_id,
+        generation,
+        transcript_id,
+        terminal_kind,
+        reason,
+        context_exhausted,
+        WatchTerminalAuthority::LegacyObservation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_watch_event_with_authority_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    occurrence_kind: &str,
+    occurrence_id: &str,
+    generation: u64,
+    transcript_id: &str,
+    terminal_kind: &str,
+    reason: Option<&str>,
+    context_exhausted: bool,
+    authority: WatchTerminalAuthority,
+) -> DbResult<()> {
+    let cancelled = match authority {
+        WatchTerminalAuthority::LegacyObservation => {
+            sqlx::query("DELETE FROM execution_cancel_observations WHERE conversation_id = ?1")
+                .bind(transcript_id)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+                > 0
+        }
+        WatchTerminalAuthority::ExactOccurrence => false,
+    };
     let category = match if cancelled {
         "Cancelled"
     } else {

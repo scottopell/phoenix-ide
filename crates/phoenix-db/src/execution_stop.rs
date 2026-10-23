@@ -51,6 +51,30 @@ pub enum StandaloneDrainAcceptance {
     NotAccepted,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcceptedStandaloneTerminal {
+    target: StandaloneStopTarget,
+    projection: crate::workflow::PersistedConversationProjection,
+}
+
+impl AcceptedStandaloneTerminal {
+    #[must_use]
+    pub fn target(&self) -> &StandaloneStopTarget {
+        &self.target
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> &crate::workflow::PersistedConversationProjection {
+        &self.projection
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StandaloneTerminalAcceptance {
+    Accepted(AcceptedStandaloneTerminal),
+    NotAccepted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedStopTarget {
     DirectTurn {
@@ -62,6 +86,80 @@ pub enum CapturedStopTarget {
 }
 
 impl Database {
+    pub async fn accept_standalone_stop_terminal(
+        &self,
+        target: &StandaloneStopTarget,
+        source: &crate::workflow::PersistedConversationProjection,
+        projection: &crate::workflow::PersistedConversationProjection,
+    ) -> DbResult<StandaloneTerminalAcceptance> {
+        if !matches!(
+            projection.state,
+            phoenix_core::domain::sm_state::ConvState::Idle
+        ) {
+            return Err(DbError::Serialization(
+                "terminal standalone Stop must project Idle".into(),
+            ));
+        }
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let Some(actual) = exact_standalone_projection_tx(&mut tx, target).await? else {
+            let replay = exact_terminal_replay_tx(&mut tx, target, projection).await?;
+            tx.commit().await?;
+            return Ok(if replay {
+                StandaloneTerminalAcceptance::Accepted(AcceptedStandaloneTerminal {
+                    target: target.clone(),
+                    projection: projection.clone(),
+                })
+            } else {
+                StandaloneTerminalAcceptance::NotAccepted
+            });
+        };
+        if !same_projection(&actual, source) {
+            return Ok(StandaloneTerminalAcceptance::NotAccepted);
+        }
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
+            .bind(serde_json::to_string(&projection.state).map_err(|error| DbError::Serialization(error.to_string()))?)
+            .bind(crate::conv_state_kind(&projection.state))
+            .bind(projection.state_updated_at.to_rfc3339())
+            .bind(target.conversation_id())
+            .execute(&mut *tx).await?;
+        let deleted = sqlx::query("DELETE FROM steering_execution_occurrences WHERE conversation_id = ?1 AND message_id = ?2 AND source_kind = ?3")
+            .bind(target.conversation_id()).bind(target.message_id()).bind(target.source().as_str())
+            .execute(&mut *tx).await?;
+        if deleted.rows_affected() != 1 {
+            return Err(DbError::Serialization(
+                "accepted standalone Stop lost its exact occurrence".into(),
+            ));
+        }
+        sqlx::query("DELETE FROM active_provider_replay_state WHERE conversation_id = ?1")
+            .bind(target.conversation_id())
+            .execute(&mut *tx)
+            .await?;
+        crate::coordinator_watches::record_exact_execution_terminal_tx(
+            &mut tx,
+            target,
+            &crate::ExecutionOccurrenceTerminal::Cancelled,
+        )
+        .await?;
+        let result = tx.commit().await;
+        drop(connection);
+        if let Err(original) = result {
+            let mut connection = self.pool.acquire().await?;
+            let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+            let established = exact_terminal_replay_tx(&mut tx, target, projection).await?;
+            tx.commit().await?;
+            if !established {
+                return Err(DbError::Sqlx(original));
+            }
+        }
+        Ok(StandaloneTerminalAcceptance::Accepted(
+            AcceptedStandaloneTerminal {
+                target: target.clone(),
+                projection: projection.clone(),
+            },
+        ))
+    }
+
     pub async fn accept_standalone_stop_drain(
         &self,
         target: &StandaloneStopTarget,
@@ -181,6 +279,37 @@ async fn exact_standalone_projection_tx(
     .transpose()
 }
 
+async fn exact_terminal_replay_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    target: &StandaloneStopTarget,
+    projection: &crate::workflow::PersistedConversationProjection,
+) -> DbResult<bool> {
+    let row = sqlx::query(
+        "SELECT c.state, c.state_updated_at FROM conversations c WHERE c.id = ?1
+         AND NOT EXISTS (SELECT 1 FROM durable_turns t WHERE t.conversation_id = c.id AND t.owns_conversation = 1 AND t.terminal_kind IS NULL)
+         AND NOT EXISTS (SELECT 1 FROM steering_execution_occurrences o WHERE o.conversation_id = c.id)
+         AND NOT EXISTS (SELECT 1 FROM active_provider_replay_state r WHERE r.conversation_id = c.id)
+         AND EXISTS (SELECT 1 FROM coordinator_watch_events e WHERE e.source_transcript_id = c.id
+             AND e.source_occurrence_kind = ?2 AND e.source_occurrence_id = ?3
+             AND e.source_generation = 0 AND e.terminal_kind = 'cancelled')",
+    )
+    .bind(target.conversation_id()).bind(target.source().as_str()).bind(target.message_id())
+    .fetch_optional(&mut **tx).await?;
+    row.map(|row| {
+        let actual = crate::workflow::PersistedConversationProjection {
+            state: serde_json::from_str(row.get::<&str, _>("state"))
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            state_updated_at: chrono::DateTime::parse_from_rfc3339(
+                row.get::<&str, _>("state_updated_at"),
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?
+            .with_timezone(&chrono::Utc),
+        };
+        Ok(same_projection(&actual, projection))
+    })
+    .unwrap_or(Ok(false))
+}
+
 fn same_projection(
     left: &crate::workflow::PersistedConversationProjection,
     right: &crate::workflow::PersistedConversationProjection,
@@ -192,6 +321,136 @@ fn same_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn standalone_terminal_stop_is_exact_deferred_and_independent_of_legacy_marker() {
+        use crate::workflow::PersistedConversationProjection;
+        use phoenix_core::domain::{db_schema::MessageContent, sm_state::ConvState};
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("terminal", "terminal", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.watch_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "terminal-input",
+            "terminal",
+            1,
+            &MessageContent::user("input"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES ('terminal', 'terminal-input', 'steering')")
+            .execute(db.pool()).await.unwrap();
+        let CapturedStopTarget::Standalone(stale) =
+            db.capture_stop_target("terminal").await.unwrap()
+        else {
+            panic!("expected occurrence");
+        };
+        sqlx::query("UPDATE steering_execution_occurrences SET source_kind = 'interaction_response' WHERE conversation_id = 'terminal'")
+            .execute(db.pool()).await.unwrap();
+        let CapturedStopTarget::Standalone(target) =
+            db.capture_stop_target("terminal").await.unwrap()
+        else {
+            panic!("expected replacement occurrence");
+        };
+        let source = PersistedConversationProjection {
+            state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: chrono::DateTime::from_timestamp_micros(7).unwrap(),
+        };
+        db.update_state_and_replay(
+            "terminal",
+            &source.state,
+            source.state_updated_at,
+            &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO active_provider_replay_state (conversation_id, provider, model, response_id, payload) VALUES ('terminal', 'anthropic', 'test', 'replay', '{}')")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO execution_cancel_observations(conversation_id) VALUES ('terminal')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let projection = PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: chrono::DateTime::from_timestamp_micros(8).unwrap(),
+        };
+        assert!(matches!(
+            db.accept_standalone_stop_terminal(&stale, &source, &projection)
+                .await
+                .unwrap(),
+            StandaloneTerminalAcceptance::NotAccepted
+        ));
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            0
+        );
+        let source_kind: String = sqlx::query_scalar("SELECT source_kind FROM steering_execution_occurrences WHERE conversation_id = 'terminal'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(source_kind, "interaction_response");
+        let StandaloneTerminalAcceptance::Accepted(receipt) = db
+            .accept_standalone_stop_terminal(&target, &source, &projection)
+            .await
+            .unwrap()
+        else {
+            panic!("expected terminal acceptance");
+        };
+        assert_eq!(receipt.target(), &target);
+        assert_eq!(receipt.projection(), &projection);
+        assert_eq!(
+            db.get_conversation("terminal").await.unwrap().state,
+            ConvState::Idle
+        );
+        let adjuncts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM steering_execution_occurrences WHERE conversation_id = 'terminal'), (SELECT COUNT(*) FROM active_provider_replay_state WHERE conversation_id = 'terminal'), (SELECT COUNT(*) FROM execution_cancel_observations WHERE conversation_id = 'terminal')")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(adjuncts, (0, 0, 1));
+        let events: Vec<(String, String, String)> = sqlx::query_as("SELECT source_occurrence_kind, source_occurrence_id, terminal_kind FROM coordinator_watch_events WHERE source_transcript_id = 'terminal'")
+            .fetch_all(db.pool()).await.unwrap();
+        assert_eq!(
+            events,
+            vec![(
+                "interaction_response".into(),
+                "terminal-input".into(),
+                "cancelled".into()
+            )]
+        );
+        assert!(matches!(
+            db.accept_standalone_stop_terminal(&target, &source, &projection)
+                .await
+                .unwrap(),
+            StandaloneTerminalAcceptance::Accepted(_)
+        ));
+        let mut wrong_projection = projection.clone();
+        wrong_projection.state_updated_at = chrono::DateTime::from_timestamp_micros(9).unwrap();
+        assert!(matches!(
+            db.accept_standalone_stop_terminal(&target, &source, &wrong_projection)
+                .await
+                .unwrap(),
+            StandaloneTerminalAcceptance::NotAccepted
+        ));
+        assert_eq!(
+            db.pending_coordinator_watch_events(16).await.unwrap().len(),
+            1
+        );
+        sqlx::query("INSERT INTO steering_execution_occurrences (conversation_id, message_id, source_kind) VALUES ('terminal', 'terminal-input', 'seeded_fork')")
+            .execute(db.pool()).await.unwrap();
+        assert!(matches!(
+            db.accept_standalone_stop_terminal(&target, &source, &projection)
+                .await
+                .unwrap(),
+            StandaloneTerminalAcceptance::NotAccepted
+        ));
+        let source_kind: String = sqlx::query_scalar("SELECT source_kind FROM steering_execution_occurrences WHERE conversation_id = 'terminal'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(source_kind, "seeded_fork");
+    }
 
     #[tokio::test]
     async fn standalone_drain_acceptance_fences_same_message_source_replacement() {

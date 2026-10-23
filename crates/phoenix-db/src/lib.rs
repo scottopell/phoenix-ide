@@ -12,7 +12,8 @@ mod coordinator_watches;
 mod execution_stop;
 pub use coordinator_watches::MessageExecutionSource;
 pub use execution_stop::{
-    AcceptedStandaloneDrain, CapturedStopTarget, StandaloneDrainAcceptance, StandaloneStopTarget,
+    AcceptedStandaloneDrain, AcceptedStandaloneTerminal, CapturedStopTarget,
+    StandaloneDrainAcceptance, StandaloneStopTarget, StandaloneTerminalAcceptance,
 };
 mod coordinator_work_scope;
 mod federation_enrollment;
@@ -649,6 +650,7 @@ pub enum CreationClaimOutcome {
 pub enum ExecutionOccurrenceTerminal {
     Completed,
     Failed { reason: String },
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7991,6 +7993,7 @@ impl Database {
             crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
         let (terminal_kind, terminal_reason) = match terminal {
             ExecutionOccurrenceTerminal::Completed => ("Completed", None),
+            ExecutionOccurrenceTerminal::Cancelled => ("Cancelled", None),
             ExecutionOccurrenceTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
         };
         crate::coordinator_watches::record_steering_event_tx(
