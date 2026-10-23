@@ -53,3 +53,19 @@ feature executive summary. A failed probe may leave other saved pages able to
 progress; a throttled probe prevents further Slack calls until the deadline.
 The probe deliberately ignores its next cursor. Additional new messages and
 late indexing remain the full sweep's responsibility.
+
+## Local production pilot
+
+Two sequential explicit requests in one private thread produced exact intentional
+replies in 34.277 and 10.364 seconds from Slack's posted timestamps. Each had
+one native input and one return; both reused the same native conversation.
+A managed restart retained their identities and confirmed returns without
+duplicate work. The provider-neutral notifier also established delivery to the
+configured owner; human alert confirmation and the reaction-triggered briefing
+are separate acceptance checks.
+
+These are two end-to-end observations with different polling phases, not a
+matched performance comparison, percentile or response-time guarantee. Source
+identifiers, private provider receipts and deployment evidence remain outside
+the repository. Per-pass call metrics exclude calls charged earlier to the
+shared fixed window.

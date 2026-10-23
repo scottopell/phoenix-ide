@@ -55,19 +55,44 @@ adversarial author review found and fixed inactive acceptance being mistaken
 for recorded evidence and acknowledgment throttling losing its backoff status.
 These author reviews are not independent sign-off or a formal liveness proof.
 
-The public candidate updates against current upstream, adds one migration after
-its existing registry, replaces the personal notification implementation with a
-provider-neutral command, and adds bounded newest-prefix refresh. Qualification
-of these changes and the exact installed production transition is in progress.
-A new feature migration does not implicitly qualify deployment or rollback.
+The public candidate adds migration 130 after upstream's migration 129, replaces
+the personal notifier with a provider-neutral command, and adds bounded
+newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
+Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
+checks have passed. The complete native Rust regression run is still in progress.
+
+The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
+passed online-backup and stopped-snapshot rehearsals from the installed complete
+127 ledger to its exact complete 130 registry. Integrity, foreign keys,
+conversation/message/product identities and message contents were preserved.
+An explicitly approved manual offline cutover installed that candidate while
+preserving installed configuration except the version value. This operator
+pilot does not expand any automated deployment controller's qualified intervals,
+provide automatic database rollback or qualify a generic 127-to-130 route.
+
+Production initialization completed without executing historical triggers. Two
+sequential explicit private-thread requests each produced exactly one native
+input and confirmed reply, reused one conversation and survived a managed
+restart without duplicates. Generic notification delivery was established;
+human alert confirmation and reaction-triggered private briefing acceptance
+remain pending. Only production discovery is enabled; the former dev watcher
+is paused. Private operational evidence is retained outside the repository.
+
+The native client recognizes Slack origins and source links, with version-2
+transcript caches and a bounded version-1 migration. Local wire-model type
+checking/round-trip execution and Swift parsing passed. Full native-client
+build/test execution requires CI because this host lacks the iOS platform SDK
+and simulator runtime. Client-only follow-up changes do not alter the pinned
+server candidate's source.
 
 ## Activation checklist
 
 1. Pass focused scheduling, notification-protocol and native integration checks;
    validate Allium, formatting, Clippy and UI contracts.
 2. Reconcile residual regression failures with the current candidate rather than
-   treating historical failures as current evidence. The read-only controller
-   integrity-check failure needs a reproduced disposition.
+   treating historical failures as current evidence. The reproduced controller
+   fixture failure is resolved by sealing its offline snapshot before the
+   unchanged read-only controller checks it; unqualified targets still reject.
 3. Establish the actual installed complete ledger, qualify the exact transition
    on disposable SQLite copies, and preserve the protected deployment contract.
 4. Deploy the exact reviewed local candidate with discovery disabled and verify
@@ -80,8 +105,8 @@ A new feature migration does not implicitly qualify deployment or rollback.
 Live automatic continuation and longer soak coverage remain unqualified until
 exercised. They are follow-up confidence work rather than an invented unlimited
 SLO for a bounded personal pilot. External shared-channel send limitations remain.
-No live Slack write, production activation or public review is claimed by this
-status document before it actually completes.
+Public PR review and native-client CI have not started; publication follows
+completion of the separately approved local acceptance sequence.
 
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.
