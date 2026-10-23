@@ -389,6 +389,41 @@ class GoalQualificationTests(unittest.TestCase):
         self.assertIn("        timeout-minutes: 72\n", rust_job)
         self.assertEqual(600 - 540 - 10, 50)  # Arithmetic only; no claim the allowance was measured.
 
+    def test_focused_workflow_propagates_canonical_exit_through_tee(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("      - name: Focused goal qualification (fresh profile, same binaries)\n", 1)[1]
+        body = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
+        script = "\n".join(line.removeprefix("          ") for line in body.splitlines())
+        bash = shutil.which("bash", path=os.defpath)
+        self.assertIsNotNone(bash)
+        evidence = self.root / "evidence"
+        evidence.mkdir()
+        self.directory.mkdir()
+        (self.directory / "ready.json").write_text("{}")
+        tools = self.root / "tools"
+        tools.mkdir()
+        deadline_python = tools / "python3"
+        deadline_python.write_text("#!/bin/sh\nprintf '123\\n'\n")
+        deadline_python.chmod(0o700)
+        command = self.root / "dev.py"
+        command.write_text(
+            '#!/bin/sh\n'
+            'printf \'%s\\n\' "$FIXTURE_STATUS" > "$RUST_EVIDENCE_DIR/canonical-exit"\n'
+            'printf \'synthetic qualification result %s\\n\' "$FIXTURE_STATUS"\n'
+            'exit "$FIXTURE_STATUS"\n'
+        )
+        command.chmod(0o700)
+        for status in (0, 100):
+            with self.subTest(status=status):
+                env = dict(os.environ, PATH=str(tools) + os.pathsep + os.defpath,
+                           RUST_EVIDENCE_DIR=str(evidence), FIXTURE_STATUS=str(status))
+                result = subprocess.run([bash, "-e", "-c", script], cwd=self.root, env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual((evidence / "canonical-exit").read_text(), f"{status}\n")
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertIn(f"synthetic qualification result {status}\n",
+                              (evidence / "goals.log").read_text())
+
     def test_workflow_reuse_setup_rejects_missing_inputs_and_multiline_without_claiming(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         setup = workflow.split("      - name: Initialize Rust evidence\n", 1)[1].split("      - name:", 1)[0]
