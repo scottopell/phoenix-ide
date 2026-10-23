@@ -420,10 +420,10 @@ class QualificationOutputTests(unittest.TestCase):
         self.assertFalse((self.directory / "cargo-clippy.full.log").exists())
 
     def test_python_diagnostics_capture_full_headers_and_preserve_failure_and_cap(self):
-        diagnostic_dir = self.directory / "python-diagnostics"
         payload = b"ERROR: first_python_identity\n" + b"retained output\n" * 400
         for cap, footer in ((None, b"payload COMPLETE"), (2048, b"payload INCOMPLETE")):
             with self.subTest(cap=cap):
+                diagnostic_dir = self.directory / f"python-diagnostics-{cap}"
                 process = mock.Mock(pid=12345, stdout=io.BytesIO(payload), returncode=1)
                 process.wait.return_value = 1
                 limit = mock.patch.object(self.dev._QualificationOutputLog, "MAX_BYTES", cap or 64 * 1024 * 1024)

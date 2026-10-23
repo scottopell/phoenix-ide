@@ -613,14 +613,28 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired'));
     const citation = screen.getByRole('link', { name: 'Exact chapter' });
     expect(citation).toHaveAttribute('href', '/transcript?source_transcript=row-1');
+    let releaseAlias!: () => void;
+    const aliasResolution = new Promise<void>(resolve => { releaseAlias = resolve; });
+    vi.mocked(api.resolveCoordinatorRoute).mockImplementationOnce(async () => {
+      await aliasResolution;
+      return { coordinator_id: null };
+    });
     fireEvent.click(citation);
-    await waitFor(() => expect(screen.getByTestId('product-conversation-page')).toBeVisible());
+    await waitFor(() => expect(api.resolveCoordinatorRoute).toHaveBeenCalledWith('row-1'));
+    expect(screen.getByTestId('history-location').textContent).toBe('/transcript?source_transcript=row-1');
+    expect(screen.getByTestId('product-conversation-page')).toBe(owner);
+    expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
+    await act(async () => { releaseAlias(); await aliasResolution; });
+    await waitFor(() => expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1?source_transcript=row-1'));
+    expect(screen.getByTestId('product-conversation-page')).toBeVisible();
     expect(screen.getByTestId('product-conversation-page')).toBe(owner);
     expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1?source_transcript=row-1');
     expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
     for (const direction of ['history back', 'history forward']) {
       fireEvent.click(screen.getByRole('button', { name: direction }));
-      await waitFor(() => expect(owner).toBeVisible());
+      const expectedRoute = direction === 'history back' ? '/c/pc-1' : '/c/pc-1?source_transcript=row-1';
+      await waitFor(() => expect(screen.getByTestId('history-location').textContent).toBe(expectedRoute));
+      expect(owner).toBeVisible();
       expect(screen.getByTestId('product-conversation-page')).toBe(owner);
       expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
     }
