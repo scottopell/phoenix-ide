@@ -77,14 +77,41 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             ],
             cwd=ROOT,
         )
-        self.registry = self.root / "qualified-128-migrations.rs"
-        self.registry.write_bytes(historical_registry)
+        self.source128_registry = self.root / "exact-source128-migrations.rs"
+        self.source128_registry.write_bytes(historical_registry)
         self.assertEqual(
-            helper.sha256(self.registry),
+            helper.sha256(self.source128_registry),
             helper.PREPARED_SOURCE128_REGISTRY_SHA256,
         )
+        self.source128_ledger = helper.migration_registry(
+            self.source128_registry, qualified_source128=True,
+        )
+        self.assertEqual(self.source128_ledger[-1], helper.PREPARED_SOURCE128_TARGET)
+        self.assertEqual(helper.PREPARED_SOURCE128_TARGET[0], QUALIFIED_TARGET + 1)
+        source = self.source128_registry.read_text()
+        registry_match = re.search(
+            r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(registry_match)
+        entries = registry_match.group(2)
+        suffix_boundaries = list(re.finditer(
+            rf"^    Migration\s*\{{\s*version:\s*{QUALIFIED_TARGET + 1},",
+            entries,
+            flags=re.MULTILINE,
+        ))
         self.assertEqual(
-            helper.migration_registry(self.registry, qualified_source128=True)[-1],
+            len(suffix_boundaries), 1,
+            "historical registry fixture requires exactly one successor boundary",
+        )
+        historical_entries = entries[:suffix_boundaries[0].start()]
+        self.registry = self.root / "qualified-128-migrations.rs"
+        self.registry.write_text(
+            source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
+        )
+        self.assertEqual(
+            helper.migration_registry(self.registry)[-1],
             (QUALIFIED_TARGET, "single_conversation_name_and_route_projection"),
         )
         self.prepared_registry_pin = helper.sha256(self.registry)
@@ -3175,7 +3202,7 @@ class ExactSchema129RefreshTests(unittest.TestCase):
         base = self.manifest(database)
         current = base.current_schema_upgrade
         registry = Path(current.migration_registry_path)
-        registry.write_bytes(self.current_registry.read_bytes())
+        registry.write_bytes(self.source128_registry.read_bytes())
         candidate = Path(base.candidate_binary)
         candidate.write_bytes(b"signed refresh candidate fixture")
         candidate.chmod(0o755)
@@ -3237,7 +3264,7 @@ class ExactSchema129RefreshTests(unittest.TestCase):
         path = self.root / "manifest.json"
         helper.atomic_write(path, json.dumps(dataclasses.asdict(manifest)).encode())
         self.assertIsInstance(helper.Manifest.load(path).current_schema_upgrade, helper.PreparedSchema129Refresh)
-        self.assertEqual(helper.validate_current_schema_database(database, Path(manifest.current_schema_upgrade.migration_registry_path), manifest=manifest), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.validate_current_schema_database(database, Path(manifest.current_schema_upgrade.migration_registry_path), manifest=manifest), tuple(self.source128_ledger))
         for altered in (
             dataclasses.replace(manifest, source_kind="published_release"),
             dataclasses.replace(manifest, current_schema_upgrade=dataclasses.replace(manifest.current_schema_upgrade, prepared_source_baseline=128)),
@@ -3288,7 +3315,7 @@ class ExactSchema129RefreshTests(unittest.TestCase):
         self.assertEqual(calls, [reservation.restore_path])
         self.assertEqual(helper.database_logical_digest(database), original)
         self.assertTrue(reservation.backup_path.exists())
-        self.assertEqual(helper._snapshot_proof(manifest)["rehearsal_ledger"], [list(row) for row in compiled_ledger(None)])
+        self.assertEqual(helper._snapshot_proof(manifest)["rehearsal_ledger"], [list(row) for row in self.source128_ledger])
         with self.assertRaisesRegex(helper.ActivationError, "never invoke migrate-only"):
             helper.run_current_schema_migration(manifest, reservation)
 
@@ -3398,7 +3425,7 @@ class ExactSchema129RefreshTests(unittest.TestCase):
         helper.write_status(manifest, "activating")
         with self.assertRaisesRegex(helper.ActivationError, "post-marker"):
             helper.restore(manifest, mock.Mock())
-        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.database_ledger(database), tuple(self.source128_ledger))
 
     def test_marker_write_failure_before_durability_recovers_predecessor(self):
         _database, manifest, reservation = self.activated_fixture()
@@ -3472,7 +3499,7 @@ class ExactSchema129RefreshTests(unittest.TestCase):
              mock.patch.object(helper, "run_current_schema_migration", side_effect=AssertionError("live migration forbidden")), \
              mock.patch.object(helper, "restore_database", side_effect=AssertionError("backup replay forbidden")):
             self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
-        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.database_ledger(database), tuple(self.source128_ledger))
         self.assertFalse(Path(manifest.active_path).exists())
         self.assertFalse(reservation.restore_path.exists())
         self.assertTrue(reservation.backup_path.exists())
@@ -3490,7 +3517,7 @@ class ExactSource128To129Tests(unittest.TestCase):
         base = self.manifest(database)
         current = base.current_schema_upgrade
         registry = Path(current.migration_registry_path)
-        registry.write_bytes(self.registry.read_bytes())
+        registry.write_bytes(self.source128_registry.read_bytes())
         qualified = helper.PreparedSource128Upgrade(
             **{**dataclasses.asdict(current), "migration_registry_sha256": helper.sha256(registry)},
             prepared_source_baseline=128,
@@ -3504,7 +3531,7 @@ class ExactSource128To129Tests(unittest.TestCase):
 
     def install_migration129_script(self, manifest: helper.Manifest, *, failure: bool = False, growth: int = 0) -> None:
         target = Path(manifest.candidate_binary)
-        migration = compiled_ledger(None)[-1]
+        migration = self.source128_ledger[-1]
         target.write_text(f"""#!/usr/bin/env python3
 import os, sqlite3, sys
 with sqlite3.connect(os.environ['PHOENIX_DB_PATH']) as db:
@@ -3534,7 +3561,7 @@ sys.exit({7 if failure else 0})
         return reservation
 
     def test_exact_source128_only_and_target129_only(self) -> None:
-        self.assertEqual(helper.PREPARED_SOURCE128_REGISTRY_SHA256, helper.sha256(self.registry))
+        self.assertEqual(helper.PREPARED_SOURCE128_REGISTRY_SHA256, helper.sha256(self.source128_registry))
         for through in range(113, 130):
             with self.subTest(through=through):
                 db = self.database(through=through)
@@ -3546,14 +3573,14 @@ sys.exit({7 if failure else 0})
                     with self.assertRaises(helper.ActivationError):
                         helper.validate_current_schema_database(db, registry, manifest=manifest)
                 if through == 129:
-                    self.assertEqual(helper.validate_current_schema_database(db, registry, manifest=manifest, migrated=True), tuple(compiled_ledger(None)))
+                    self.assertEqual(helper.validate_current_schema_database(db, registry, manifest=manifest, migrated=True), tuple(self.source128_ledger))
                 else:
                     with self.assertRaises(helper.ActivationError):
                         helper.validate_current_schema_database(db, registry, manifest=manifest, migrated=True)
-        self.assertEqual(helper.migration_registry(self.registry, qualified_source128=True)[-1],
+        self.assertEqual(helper.migration_registry(self.source128_registry, qualified_source128=True)[-1],
                          (129, "single_conversation_name_and_route_projection"))
         with self.assertRaises(helper.ActivationError):
-            helper.migration_registry(self.registry)
+            helper.migration_registry(self.source128_registry)
 
     def test_source128_typed_manifest_and_pin_mismatches_fail_before_disruption(self) -> None:
         manifest = self.prepared128_manifest(self.database(through=128))
@@ -3600,7 +3627,7 @@ sys.exit({7 if failure else 0})
         with self.assertRaises(helper.ActivationError):
             helper.database_ledger(reservation.restore_path)
         proof = helper._snapshot_proof(manifest)
-        self.assertEqual(proof["rehearsal_ledger"], [list(row) for row in compiled_ledger(None)])
+        self.assertEqual(proof["rehearsal_ledger"], [list(row) for row in self.source128_ledger])
         self.assertEqual(proof["rehearsal_backup_sha256"], backup_sha)
         with mock.patch.object(helper, "assert_database_exclusive"), self.assertRaisesRegex(helper.ActivationError, "already been attempted"):
             helper.rehearse_prepared_source128(manifest, reservation)
@@ -3684,7 +3711,7 @@ sys.exit({7 if failure else 0})
             self.assertEqual(helper.finalize_paired(manifest, current_schema=True), "committed")
         proof = helper._snapshot_proof(manifest)
         self.assertEqual(proof["migrated_logical_digest"], helper.database_logical_digest(database))
-        self.assertEqual(proof["migrated_ledger"], [list(row) for row in compiled_ledger(None)])
+        self.assertEqual(proof["migrated_ledger"], [list(row) for row in self.source128_ledger])
 
     def test_finalize_target129_rechecks_capacity_before_start(self) -> None:
         _database, manifest, _reservation = self.source128_finalization_fixture(
@@ -3765,7 +3792,7 @@ sys.exit({7 if failure else 0})
         self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_database_committed")
         self.assertTrue(Path(manifest.active_path).exists())
         self.assertFalse(Path(manifest.target_plist).exists())
-        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.database_ledger(database), tuple(self.source128_ledger))
         launchctl.stop.assert_called_once()
 
     def test_finalize_refuses_persistent_plist_before_private_start(self) -> None:
@@ -3786,7 +3813,7 @@ sys.exit({7 if failure else 0})
         launchctl.stop.assert_called_once()
         self.assertFalse(Path(manifest.target_plist).exists())
         self.assertTrue(Path(manifest.active_path).exists())
-        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.database_ledger(database), tuple(self.source128_ledger))
 
     def test_source128_activation_isolates_target_before_and_after_stop_and_absence(self) -> None:
         _database, manifest, reservation = self.activation128_fixture()
@@ -4113,7 +4140,7 @@ sys.exit({7 if failure else 0})
         def private_start(_old_pid, *, plist_path):
             self.assertEqual(plist_path, manifest.candidate_plist)
             self.assertFalse(os.path.lexists(manifest.target_plist))
-            self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+            self.assertEqual(helper.database_ledger(database), tuple(self.source128_ledger))
         launchctl.start.side_effect = private_start
         with mock.patch.object(helper, "__file__", manifest.current_schema_upgrade.controller_helper_path), \
              mock.patch.object(helper, "Launchctl", return_value=launchctl), \
@@ -4124,7 +4151,7 @@ sys.exit({7 if failure else 0})
              mock.patch.object(helper, "restore_database", side_effect=AssertionError("backup replay forbidden")):
             self.assertEqual(helper.activate(manifest), "committed")
         loaded.assert_called_once_with(manifest, launchctl, Path(manifest.candidate_plist))
-        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.database_ledger(database), tuple(self.source128_ledger))
         self.assertEqual(helper.read_status(manifest)["state"], "committed")
         self.assertFalse(helper.read_status(manifest)["finalization_pending"])
         self.assertFalse(Path(manifest.active_path).exists())
@@ -4196,7 +4223,7 @@ sys.exit({7 if failure else 0})
              mock.patch.object(helper, "publish_source128_plist", side_effect=publish_phase), \
              mock.patch.object(helper, "restore", side_effect=AssertionError("rollback forbidden")):
             self.assertEqual(helper.activate(manifest), "activation_failed_database_committed")
-        self.assertEqual(helper.database_ledger(database), tuple(compiled_ledger(None)))
+        self.assertEqual(helper.database_ledger(database), tuple(self.source128_ledger))
         self.assertGreaterEqual(launchctl.stop.call_count, 2)
         self.assertEqual(helper.read_status(manifest)["state"], "activation_failed_database_committed")
         self.assertTrue(Path(manifest.active_path).exists())

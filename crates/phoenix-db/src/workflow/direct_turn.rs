@@ -932,7 +932,7 @@ impl WorkflowRepository {
         input: &ClaimAuthoritativeTurnInput,
         cut: TransactionCut,
     ) -> ClaimAuthoritativeTurnEstablishment {
-        let mut tx = match self.begin_tx().await {
+        let mut tx = match self.begin_immediate_tx().await {
             Ok(tx) => tx,
             Err(error) => {
                 return ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(error.to_string());
@@ -1026,7 +1026,7 @@ impl WorkflowRepository {
         &self,
         input: &ClaimAuthoritativeTurnInput,
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
-        let mut tx = self.begin_tx().await?;
+        let mut tx = self.begin_immediate_tx().await?;
         let result = self.claim_authoritative_turn_in_tx(&mut tx, input).await?;
         if result.outcome == ClaimOutcome::Started {
             tx.commit().await?;
@@ -4460,6 +4460,123 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    async fn assert_claim_wrapper_reserves_writer_before_read_only_refusal(establish: bool) {
+        let (directory, setup, _) = open_workflow_repo_pair().await;
+        let (turn_id, workflow_id) = created_turn(&setup, "claim-write-intent", 20).await;
+        let path = directory.path().join("direct-turn.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                    .unwrap()
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let contender = WorkflowRepository::new(pool);
+        let absent = claim_input(workflow_id, TurnAuthorityId(0), 30);
+        assert_ne!(turn_id, absent.turn_id);
+        let claim = claim_input(workflow_id, turn_id, 30);
+        let mut writer = setup.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let mut read_only = contender.begin_tx().await.unwrap();
+        let refused = contender
+            .claim_authoritative_turn_in_tx(&mut read_only, &absent)
+            .await
+            .unwrap();
+        assert_eq!(refused.outcome, ClaimOutcome::Ineligible);
+        assert!(refused.canonical_turn.is_none());
+        read_only.rollback().await.unwrap();
+
+        let acquisition_error = match contender.begin_immediate_tx().await {
+            Err(error) => error,
+            Ok(_) => panic!("a held writer must deny immediate acquisition"),
+        };
+        let DbError::Sqlx(sqlite_error) = &acquisition_error else {
+            panic!("expected SQLite writer contention: {acquisition_error}");
+        };
+        assert_eq!(
+            sqlite_error.as_database_error().unwrap().code().as_deref(),
+            Some("5"),
+        );
+        if establish {
+            let observed = contender.establish_authoritative_turn_claim(&absent).await;
+            assert_eq!(
+                observed,
+                ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(
+                    acquisition_error.to_string(),
+                ),
+            );
+        } else {
+            let observed = contender.claim_authoritative_turn(&absent).await.unwrap_err();
+            let DbError::Sqlx(sqlite_error) = &observed else {
+                panic!("expected acquisition error, not read-only refusal: {observed}");
+            };
+            assert_eq!(
+                sqlite_error.as_database_error().unwrap().code().as_deref(),
+                Some("5"),
+            );
+            assert_eq!(observed.to_string(), acquisition_error.to_string());
+        }
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        drop(writer);
+
+        let refused = if establish {
+            match contender.establish_authoritative_turn_claim(&absent).await {
+                ClaimAuthoritativeTurnEstablishment::Established(result) => *result,
+                other => panic!("unlocked refusal must be classified: {other:?}"),
+            }
+        } else {
+            contender.claim_authoritative_turn(&absent).await.unwrap()
+        };
+        assert_eq!(refused.outcome, ClaimOutcome::Ineligible);
+        assert!(refused.authority.is_none());
+        let claimed = if establish {
+            match contender.establish_authoritative_turn_claim(&claim).await {
+                ClaimAuthoritativeTurnEstablishment::Established(result) => *result,
+                other => panic!("unlocked valid claim must establish: {other:?}"),
+            }
+        } else {
+            contender.claim_authoritative_turn(&claim).await.unwrap()
+        };
+        assert_eq!(claimed.outcome, ClaimOutcome::Started);
+        assert!(claimed.authority.is_some());
+        assert!(claimed.canonical_turn.is_some());
+        let refused_live = if establish {
+            match contender.establish_authoritative_turn_claim(&claim).await {
+                ClaimAuthoritativeTurnEstablishment::Established(result) => *result,
+                other => panic!("live-authority refusal must be classified: {other:?}"),
+            }
+        } else {
+            contender.claim_authoritative_turn(&claim).await.unwrap()
+        };
+        assert_eq!(refused_live.outcome, ClaimOutcome::AuthorityConflict);
+        assert!(refused_live.authority.is_none());
+        assert_eq!(
+            contender
+                .list_attempts(workflow_id, EffectId(DIRECT_TURN_EFFECT_ID))
+                .await
+                .unwrap()
+                .len(),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_claim_reserves_write_intent_before_read_only_ineligible_branch() {
+        assert_claim_wrapper_reserves_writer_before_read_only_refusal(false).await;
+    }
+
+    #[tokio::test]
+    async fn claim_establishment_reserves_write_intent_before_read_only_ineligible_branch() {
+        assert_claim_wrapper_reserves_writer_before_read_only_refusal(true).await;
     }
 
     #[tokio::test]
