@@ -4385,6 +4385,7 @@ def _categorize_changed_paths(paths) -> set:
             "scripts/check_profile_command.py",
             "scripts/check_profile_report.py",
             "scripts/python_unittest_profile.py",
+            "scripts/goal_qualification.py",
         }:
             cats.add("SPECS")
         if p.startswith("ast-grep-rules/"):

@@ -313,6 +313,16 @@ class CheckPlanTests(unittest.TestCase):
                 self.assertIn("ast-grep", active)
                 self.assertIn("spec-shape", active)
 
+    def test_goal_qualification_helper_only_change_runs_spec_shape(self):
+        changed = {"scripts/goal_qualification.py"}
+        self.assertEqual(self.dev._categorize_changed_paths(changed), {"SPECS"})
+        with mock.patch.object(self.dev, "_changed_paths_vs_base", return_value=changed):
+            active, _ = self.dev._gate_lanes()
+        self.assertIn("spec-shape", active)
+        self.assertNotIn("rust", active)
+        self.assertNotIn("vitest", active)
+        self.assertNotIn("e2e", active)
+
     def test_check_profile_scripts_run_their_devpy_unit_tests(self):
         for path in (
             "scripts/check_profile_command.py",
