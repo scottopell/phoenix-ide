@@ -370,6 +370,7 @@ fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
             .into_iter()
             .collect::<std::collections::HashMap<String, String>>();
         Event::UserQuestionResponse {
+            source: None,
             request_id: Some(
                 QuestionRequestAuthority::new()
                     .request_id()

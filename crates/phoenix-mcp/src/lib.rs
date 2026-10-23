@@ -1664,32 +1664,31 @@ async fn bind_loopback_listeners(port: u16) -> std::io::Result<Vec<tokio::net::T
 /// loopback `listeners`) to Phoenix's real callback route under `target_base`
 /// (REQ-MCP-020). Accepts in a loop so a retry after a failed token exchange —
 /// which leaves the flow pending — is still received, until the flow resolves
-/// (the listener is aborted) or the 5-minute flow window elapses.
+/// (the listener is aborted) or the local sign-in window expires.
 async fn run_loopback_redirect(
     server: String,
     listeners: Vec<tokio::net::TcpListener>,
     target_base: String,
 ) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(5);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25 * 60);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
-            return;
-        }
         let accepts = listeners
             .iter()
             .map(|l| Box::pin(l.accept()))
             .collect::<Vec<_>>();
         match tokio::time::timeout(remaining, futures::future::select_all(accepts)).await {
-            Ok((Ok((stream, _)), _, _)) => bounce_loopback_callback(stream, &target_base).await,
+            Ok((Ok((stream, _)), _, _)) => {
+                let _ =
+                    tokio::time::timeout(remaining, bounce_loopback_callback(stream, &target_base))
+                        .await;
+            }
             Ok((Err(e), _, _)) => {
                 tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
-            }
-            Err(_) => {
-                tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
+                // A persistent accept failure cannot receive another callback.
                 return;
             }
+            Err(_) => return,
         }
     }
 }
@@ -1700,7 +1699,11 @@ async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
+    let Ok(Ok(n)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await
+    else {
+        return;
+    };
     let request = String::from_utf8_lossy(&buf[..n]);
     let query = callback_request_query(&request);
     let location = format!(
@@ -1717,7 +1720,7 @@ async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
-    tracing::debug!("OAuth loopback callback bounced to {location}");
+    tracing::debug!(target_base, "OAuth loopback callback bounced to Phoenix");
 }
 
 #[allow(clippy::too_many_lines)] // One ordered sequence: discover, acquire client, bind callback, publish.
@@ -2156,6 +2159,7 @@ impl McpClientManager {
         code: &str,
         iss: Option<&str>,
     ) -> Result<String, String> {
+        self.expire_finished_oauth_listeners().await;
         // The state nonce binds the callback to exactly one pending flow
         // (callback_state_matches): a code injected by another tab, server,
         // or a cancelled flow matches nothing and is rejected before any
@@ -3227,7 +3231,23 @@ impl McpClientManager {
         })
     }
 
+    async fn expire_finished_oauth_listeners(&self) {
+        let expired: Vec<String> = {
+            let listeners = self.oauth.loopback_listeners.lock().unwrap();
+            let pending = self.oauth.pending.lock().unwrap();
+            listeners
+                .iter()
+                .filter(|(_, handle)| handle.is_finished())
+                .filter_map(|(name, _)| pending.get(name).map(|flow| flow.state_nonce.clone()))
+                .collect()
+        };
+        for nonce in expired {
+            self.fail_oauth_authorization(&nonce, "Local OAuth callback window expired after 25 minutes or its listener stopped. Reload MCP to start a new sign-in.").await;
+        }
+    }
+
     pub async fn status(&self) -> Vec<McpServerStatus> {
+        self.expire_finished_oauth_listeners().await;
         let handles: Vec<(String, SupervisorHandle)> = self
             .servers
             .read()
@@ -3378,6 +3398,48 @@ impl McpClientManager {
                 }
                 McpToolCallError::Failed(message) => message,
             })
+    }
+
+    /// Call at most once after ready-state resolution. In contrast to ordinary
+    /// tool execution this never replays a dispatched call after a transport or
+    /// authentication error. Durable outboxes must reconcile ambiguous writes.
+    /// # Errors
+    /// Returns cancellation, stale schema, unavailability, or an uncertain call error.
+    pub async fn call_tool_once(
+        self: &Arc<Self>,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Value,
+        expected_schema: Value,
+    ) -> Result<String, McpToolCallError> {
+        if self.disabled_servers.read().await.contains(server_name) {
+            return Err(McpToolCallError::Failed(format!(
+                "MCP server '{server_name}' is disabled"
+            )));
+        }
+        let handle = self
+            .servers
+            .read()
+            .await
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| {
+                McpToolCallError::Failed(format!("MCP server '{server_name}' is not connected"))
+            })?;
+        let config = handle.snapshot().config;
+        let outcome = self
+            .call_actor_when_ready(
+                &handle,
+                &config,
+                tool_name,
+                arguments,
+                CancellationToken::new(),
+                Some(expected_schema),
+            )
+            .await?;
+        outcome
+            .result
+            .map_err(|e| McpToolCallError::Failed(e.into_message(server_name)))
     }
 
     /// # Errors
@@ -5788,6 +5850,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_attempt_does_not_replay_a_dispatched_write() {
+        let (server, requests, _) = fake_server(vec![exchange(Err(TransportError::Disconnected(
+            "response lost after write".into(),
+        )))]);
+        let schema = serde_json::json!({"type":"object"});
+        *server.tools.write().unwrap() = vec![McpToolDef {
+            name: "post".into(),
+            description: String::new(),
+            input_schema: schema.clone(),
+        }];
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".into(), server_handle(server));
+        assert!(manager
+            .call_tool_once("fake", "post", serde_json::json!({}), schema)
+            .await
+            .is_err());
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "an uncertain write must not be replayed during recovery"
+        );
+    }
+
+    #[tokio::test]
     async fn call_tool_surfaces_is_error_result_as_tool_error() {
         let (server, _, _) = fake_server(vec![exchange(Ok(serde_json::json!({
             "isError": true,
@@ -5856,6 +5946,129 @@ mod tests {
             *tool_call_timeout = Duration::from_secs(900);
         }
         assert_ne!(base, changed);
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_listener_outlives_five_minutes_and_accepts_retries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::time::pause();
+        let task = tokio::spawn(run_loopback_redirect(
+            "fixture".into(),
+            vec![listener],
+            "https://localhost:8021".into(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(301)).await;
+        assert!(
+            !task.is_finished(),
+            "a published sign-in must retain its callback listener"
+        );
+        tokio::time::resume();
+        for query in [
+            "code=fixture%2Bcode&state=fixture",
+            "code=retry&state=fixture",
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET /callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 302 Found"));
+            assert!(response.contains(&format!(
+                "Location: https://localhost:8021/api/mcp/oauth/callback?{query}\r\n"
+            )));
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(25 * 60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "the 25-minute local sign-in window is bounded"
+        );
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn expired_callback_listener_clears_sign_in_url_and_preserves_reload_retry() {
+        let manager = Arc::new(McpClientManager::new());
+        let (server, _, _) = fake_server(vec![]);
+        let config = server.config.clone();
+        let owner = server_handle(server);
+        let RecoveryClaim::Leader(permit) = owner.claim_oauth_recovery(0).await else {
+            panic!("recovery owner")
+        };
+        assert!(
+            owner
+                .await_oauth(
+                    permit.epoch,
+                    "https://auth.example/authorize".into(),
+                    "sign in".into()
+                )
+                .await
+        );
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fixture".into(), owner.clone());
+        manager
+            .pending_oauth_urls
+            .write()
+            .await
+            .insert("fixture".into(), "https://auth.example/authorize".into());
+        manager.oauth.pending.lock().unwrap().insert(
+            "fixture".into(),
+            PendingAuthFlow {
+                www_authenticate: None,
+                owner: Some(OAuthFlowOwner::Reconnect(owner, permit.epoch)),
+                config,
+                state_nonce: "fixture-nonce".into(),
+                pkce_verifier: "fixture-verifier".into(),
+                redirect_uri: "http://localhost:3118/callback".into(),
+                token_endpoint: "https://auth.example/token".into(),
+                issuer: "https://auth.example".into(),
+                iss_required: false,
+                registration: OAuthRegistrationRecord {
+                    auth_server: "https://auth.example".into(),
+                    client_id: "fixture".into(),
+                    client_secret: None,
+                    token_endpoint_auth_method: "none".into(),
+                    redirect_uri: None,
+                },
+                resource: "https://mcp.example".into(),
+                scopes: vec!["mcp.read".into()],
+            },
+        );
+        let listener = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+        assert!(listener.is_finished());
+        manager
+            .oauth
+            .loopback_listeners
+            .lock()
+            .unwrap()
+            .insert("fixture".into(), listener);
+        let status = manager.status().await;
+        let fixture = status.iter().find(|s| s.name == "fixture").unwrap();
+        assert!(fixture.pending_oauth_url.is_none());
+        assert_eq!(fixture.state, McpConnState::Failed);
+        assert!(fixture
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("25 minutes"));
+        assert!(manager.oauth.pending.lock().unwrap().is_empty());
+        assert!(manager.pending_oauth_urls.read().await.is_empty());
+        assert!(manager
+            .complete_oauth_authorization("fixture-nonce", "unexchanged", None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

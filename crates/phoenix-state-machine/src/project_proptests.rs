@@ -897,6 +897,7 @@ mod random_walk {
                             })
                             .collect();
                         Event::UserQuestionResponse {
+                            source: None,
                             request_id: None,
                             answers,
                             annotations: None,

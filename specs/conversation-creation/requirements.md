@@ -50,6 +50,7 @@ conversation mode and write permissions.
 ### REQ-PROJ-001: Open a Git Repository as a Hidden Conversation Repository
 
 WHEN the user creates a new conversation by providing a directory path
+AND the request is not the explicit gateway Direct/no-repository intent defined by [Slack gateway](../slack-gateway/requirements.md) REQ-SG-008
 THE SYSTEM SHALL detect whether the directory is inside a git repository
 AND create the conversation as an Open Git-backed conversation without asking the user to choose Explore, Work, Managed, or Branch lifecycle modes
 AND resolve any existing hidden `GitRepository` into typed pre-scope provisioning evidence
@@ -61,6 +62,11 @@ AND start that worktree at detached `HEAD`
 WHEN the directory is NOT inside a git repository
 THE SYSTEM SHALL create the conversation in Direct mode (REQ-PROJ-018)
 AND leave any `WorkScope.repository` attachment empty
+
+WHEN the trusted Slack gateway supplies its explicit Direct/no-repository creation intent
+THE SYSTEM SHALL create an ordinary Direct conversation at the server home directory without Git discovery changing the requested shape or attaching a hidden `GitRepository`
+AND SHALL retain ordinary durable creation, root-floor validation, model defaults, and permission behavior
+AND SHALL NOT expose this exception as a new mode picker for ordinary directory-based creation
 
 **Rationale:** Users think in terms of codebases, not raw directories. Phoenix may normalize that codebase to a hidden GitRepository record, but conversation creation remains a user-facing vertical slice that starts from one disposable Phoenix-owned workspace rather than asking the user to pick repository lifecycle variants up front.
 

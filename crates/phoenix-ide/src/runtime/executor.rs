@@ -216,6 +216,7 @@ impl ClassifiedEffect {
                 origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
             })),
             Effect::PersistUserInputMessage {
+                origin,
                 content,
                 message_id,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::PersistMessage {
@@ -224,7 +225,7 @@ impl ClassifiedEffect {
                 usage_data: None,
                 message_id,
                 idempotent: false,
-                origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
+                origin,
             })),
             Effect::PersistAuthoritativeUserMessage {
                 payload,
@@ -1505,6 +1506,9 @@ fn render_messages<'a>(
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => {
                         format!("[Conversation event {event_id}]\n{}", user_content.llm_text())
                     }
+                    phoenix_core::domain::db_schema::InputOrigin::SlackGateway { request_id } => {
+                        format!("[Owner instruction via Slack gateway, request {request_id}]\n{}", user_content.llm_text())
+                    }
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => {
                         format!("[System-generated input]\n{}", user_content.llm_text())
                     }
@@ -1586,6 +1590,7 @@ fn render_messages<'a>(
                 let source = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
                     phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::SlackGateway { request_id } => format!("[Slack gateway request {request_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "[System-generated input]".to_string(),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => format!("[Conversation event {event_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical => "[Input of unknown historical origin]".to_string(),
@@ -22104,6 +22109,7 @@ mod steer_drain_detector_tests {
             vec![],
         );
         rt.execute_effect(Effect::PersistUserInputMessage {
+            origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
             content: MessageContent::user("answer"),
             message_id: "answer-1".to_string(),
         })

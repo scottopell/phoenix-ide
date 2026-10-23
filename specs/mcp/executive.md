@@ -39,6 +39,12 @@ natively, without the `mcp-remote` subprocess bridge.
 
 ## Milestones
 
+The fixed-port local sign-in window is 25 minutes. Callback/status handling
+expires stopped listeners, clears their authorization URLs, and retains the
+supervisor's reload retry plan. Regression tests cover callbacks after five
+minutes, retries within the window, expiry, and removal of dead sign-in links.
+This deadline does not alter provider code or token expiry.
+
 This spec set is M0 of the native HTTP MCP build-out. The milestones:
 
 - **M1** (done) -- Extract the `McpTransport` trait; turn `McpServerConfig`

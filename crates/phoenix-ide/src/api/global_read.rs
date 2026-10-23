@@ -1469,6 +1469,7 @@ pub(crate) fn attributed_role(
         MessageType::User => match origin {
             InputOrigin::UserApi => "User API",
             InputOrigin::InternalConversation { .. } => "Conversation",
+            InputOrigin::SlackGateway { .. } => "Slack request",
             InputOrigin::SystemGenerated => "System input",
             InputOrigin::SubscriptionEvent { .. } => "Conversation event",
             InputOrigin::UnknownHistorical => "Unknown input",
@@ -1481,6 +1482,7 @@ pub(crate) fn attributed_role(
         MessageType::Skill => match origin {
             InputOrigin::UserApi => "Skill · User API",
             InputOrigin::InternalConversation { .. } => "Skill · Conversation",
+            InputOrigin::SlackGateway { .. } => "Skill · Slack request",
             InputOrigin::SystemGenerated => "Skill · System input",
             InputOrigin::SubscriptionEvent { .. } => "Skill · Conversation event",
             InputOrigin::UnknownHistorical => "Skill · Unknown input",
@@ -1500,6 +1502,7 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
         ),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
+        | InputOrigin::SlackGateway { .. }
         | InputOrigin::SystemGenerated
         | InputOrigin::SubscriptionEvent { .. } => String::new(),
     }
@@ -1550,6 +1553,7 @@ async fn attributed_sender_with_cache(
         }
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
+        | InputOrigin::SlackGateway { .. }
         | InputOrigin::SystemGenerated
         | InputOrigin::SubscriptionEvent { .. } => Ok(String::new()),
     }

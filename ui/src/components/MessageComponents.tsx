@@ -366,6 +366,9 @@ function FileChips({
 }
 
 function InputSender({ origin }: { origin: InputOrigin | undefined }) {
+  if (origin?.kind === 'slack_gateway') {
+    return <span className="message-sender"><a href={'/api/slack-gateway/requests/' + encodeURIComponent(origin.request_id) + '/source'} target="_blank" rel="noreferrer">Slack request</a></span>;
+  }
   if (origin?.kind !== 'internal_conversation') {
     return <span className="message-sender">{inputOriginPresentation(origin).label}</span>;
   }

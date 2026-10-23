@@ -1,0 +1,490 @@
+-- allium: 3
+-- Scope: accepted-source identity, request-bound native admission, and return delivery.
+-- Includes: duplicate gestures, durable acknowledgment, restart reconciliation,
+-- request-scoped publication, and ambiguous external outcomes.
+-- Discovery scheduling and baseline cutover are owned by discovery.allium, which
+-- produces the verified observations consumed here using this source identity.
+-- Excludes: search transport, context selection, conversation provisioning internals,
+-- native questions/permissions, and UI layout; requirements.md owns those obligations.
+-- A shared explicit reply records every covered request and exact native input.
+-- Context selection and audience curation remain assignment-level obligations.
+-- Traceability: REQ-SG-001/002/004/005/006/007/009/011/012/013/014/015.
+
+use "../conversation-creation/conversation-creation.allium" as creation
+use "../conversation_atom/conversation_atom.allium" as native
+
+enum RequestKind { briefing | explicit_request }
+enum RequestState { accepted | admitted | rejected }
+enum AcknowledgmentState { pending | confirmed }
+enum ReturnKind { thread_reply | private_notice }
+enum ReturnState { pending | attempting | submitted | confirmed | known_unsent | uncertain | failed }
+enum BindingState { reserved | ready | failed | closed }
+
+external entity NativeAdmission {
+    request_key: String
+    product_id: String
+    input_id: String
+}
+
+external entity NativeOutcome {
+    covered_admissions: Set<NativeAdmission>
+    occurrence_key: String
+    kind: answer | clarification | failure | briefing_ready | cancelled | empty_completion
+    public_response: String
+}
+
+-- A verified observation is produced by the trusted Slack boundary, never by a model.
+-- Its key includes workspace, owner, channel, and exact Slack message timestamp.
+-- binding_key is request-specific for a briefing; for an explicit request it includes
+-- workspace, owner, channel, and root thread. Prefix and reaction use the same key.
+external entity VerifiedObservation {
+    source_key: String
+    workspace: String
+    actor: String
+    author: String
+    kind: RequestKind
+    binding_key: String
+    instruction: String
+    eligible: Boolean
+    app_authored: Boolean
+    gateway_authored: Boolean
+}
+
+entity Gateway {
+    workspace: String
+    owner: String
+    enabled: Boolean
+    baseline_complete: Boolean
+    handled_sources: Set<String>
+    requests: AcceptedRequest with gateway = this
+    returns: ReturnObligation with request.gateway = this
+    bindings: ConversationBinding with gateway = this
+}
+
+-- Provisioning and continuation are owned by the native creation/lifecycle specs.
+-- This entity holds only the gateway's stable association, not a runtime mirror.
+entity ConversationBinding {
+    gateway: Gateway
+    key: String
+    status: BindingState
+    product_id: String when status = ready | closed
+    unavailable_reason: String when status = failed | closed
+
+    transitions status {
+        reserved -> ready
+        reserved -> failed
+        ready -> closed
+        terminal: failed, closed
+    }
+}
+
+-- The existence of this duty, created with acceptance, does not depend on a
+-- native turn having been admitted successfully.
+entity ResponseDuty {
+    request: AcceptedRequest
+    destination: ReturnKind
+}
+
+entity AcceptedRequest {
+    gateway: Gateway
+    observation: VerifiedObservation
+    binding_key: String
+    instruction_snapshot: String
+    status: RequestState
+    acknowledgment: AcknowledgmentState
+    admission: NativeAdmission when status = admitted
+    rejection_reason: String when status = rejected
+    duty: ResponseDuty with request = this
+
+    transitions status {
+        accepted -> admitted
+        accepted -> rejected
+        terminal: admitted, rejected
+    }
+
+    invariant OwnerOnly {
+        observation.workspace = gateway.workspace
+        and observation.actor = gateway.owner
+        and (observation.kind = briefing or (not observation.app_authored and not observation.gateway_authored))
+    }
+
+    invariant AdmissionIdentity {
+        status = admitted implies admission.request_key = observation.source_key
+    }
+
+    invariant BoundProductIdentity {
+        status = admitted implies
+            ConversationBinding{gateway: gateway, key: binding_key}.status in {ready, closed}
+            and admission.product_id = ConversationBinding{gateway: gateway, key: binding_key}.product_id
+    }
+
+    invariant ExplicitInstructionAuthorship {
+        observation.kind = explicit_request implies observation.author = gateway.owner
+    }
+}
+
+-- request anchors delivery ownership; covered_requests is the authoritative set
+-- of response duties covered by this one external operation.
+entity ReturnObligation {
+    request: AcceptedRequest
+    covered_requests: Set<AcceptedRequest>
+    native_outcome: NativeOutcome?
+    occurrence_key: String
+    kind: ReturnKind
+    destination_key: String
+    text: String
+    state: ReturnState
+    attempt_key: String?
+    notification_receipt: String?
+    delivery_proof: String when state = confirmed
+    failure_reason: String when state = failed
+
+    invariant NonemptyCoverage {
+        request in covered_requests
+    }
+
+    transitions state {
+        pending -> attempting
+        pending -> failed
+        attempting -> submitted
+        attempting -> confirmed
+        attempting -> known_unsent
+        attempting -> uncertain
+        attempting -> failed
+        submitted -> confirmed
+        submitted -> failed
+        submitted -> uncertain
+        known_unsent -> attempting
+        known_unsent -> failed
+        uncertain -> confirmed
+        uncertain -> known_unsent
+        uncertain -> failed
+        terminal: confirmed, failed
+    }
+}
+
+-- REQ-SG-001/002/004/005. Baseline completion and eligibility are preconditions,
+-- not outcomes inferred from an incomplete search. Rule application is atomic.
+rule AcceptVerifiedSource {
+    when: EligibleSourceObserved(gateway, observation)
+    requires: gateway.enabled
+    requires: gateway.baseline_complete
+    requires: observation.eligible
+    requires: observation.workspace = gateway.workspace
+    requires: observation.actor = gateway.owner
+    requires: observation.kind = briefing or (not observation.app_authored and not observation.gateway_authored)
+    requires: observation.source_key not in gateway.handled_sources
+    ensures: gateway.handled_sources = gateway.handled_sources + {observation.source_key}
+    ensures: AcceptedRequest.created(
+        gateway: gateway,
+        observation: observation,
+        binding_key: observation.binding_key,
+        instruction_snapshot: observation.instruction,
+        status: accepted,
+        acknowledgment: pending
+    )
+    ensures: ResponseDuty.created(
+        request: AcceptedRequest{gateway: gateway, observation: observation},
+        destination: if observation.kind = briefing: private_notice else: thread_reply
+    )
+}
+
+-- REQ-SG-006. The acknowledgment is independent of admission or return delivery.
+rule EyesConfirmed {
+    when: EyesReactionConfirmed(request)
+    requires: request.acknowledgment = pending
+    ensures: request.acknowledgment = confirmed
+}
+
+-- REQ-SG-007/011. The existing native service owns creation and admission.
+-- Reconciliation asks for the same source-key admission; it does not recreate it.
+rule ReserveConversationBinding {
+    when: EnsureRequestBinding(request)
+    requires: request.status = accepted
+    requires: not ConversationBinding.exists(gateway: request.gateway, key: request.binding_key)
+    ensures: ConversationBinding.created(
+        gateway: request.gateway,
+        key: request.binding_key,
+        status: reserved
+    )
+}
+
+rule RecordPublishedProduct {
+    when: NativeConversationPublished(binding, product_id)
+    requires: binding.status = reserved
+    ensures: binding.status = ready
+    ensures: binding.product_id = product_id
+}
+
+rule RecordFailedBindingCreation {
+    when: BindingCreationFailed(binding, reason)
+    requires: binding.status = reserved
+    ensures: binding.status = failed
+    ensures: binding.unavailable_reason = reason
+}
+
+rule RetainClosedProductBinding {
+    when: BoundProductClosed(binding, reason)
+    requires: binding.status = ready
+    ensures: binding.status = closed
+    ensures: binding.unavailable_reason = reason
+}
+
+rule RecordNativeAdmission {
+    -- This records verified prior native acceptance, not permission to submit a
+    -- new turn. Reconciliation can find that acceptance after the product closes;
+    -- fresh admission to a closed product remains the native service's refusal.
+    when: NativeInputAccepted(request, admission)
+    requires: request.status = accepted
+    requires: admission.request_key = request.observation.source_key
+    requires: ConversationBinding.exists(gateway: request.gateway, key: request.binding_key)
+    let binding = ConversationBinding{gateway: request.gateway, key: request.binding_key}
+    requires: binding.status in {ready, closed}
+    requires: admission.product_id = binding.product_id
+    requires: admission.input_id != ""
+    ensures: request.status = admitted
+    ensures: request.admission = admission
+}
+
+-- Includes failed creation, unavailable source/target, cancellation before input
+-- acceptance, and native admission rejection. No NativeAdmission is required.
+-- response is a suitable brief explanation, not raw diagnostic/private text.
+rule RecordBeforeAdmissionFailure {
+    when: RequestFailedBeforeAdmission(request, reason, response)
+    requires: request.status = accepted
+    ensures: request.status = rejected
+    ensures: request.rejection_reason = reason
+    ensures: ReturnObligation.created(
+        request: request,
+        covered_requests: {request},
+        native_outcome: null,
+        occurrence_key: request.observation.source_key,
+        kind: if request.observation.kind = briefing: private_notice else: thread_reply,
+        destination_key: if request.observation.kind = briefing: request.gateway.owner else: request.binding_key,
+        text: response,
+        state: pending,
+        attempt_key: null,
+        notification_receipt: null
+    )
+}
+
+-- REQ-SG-012/013. Only explicitly covered admissions can owe a Slack reply.
+-- public_response is an intentional request-scoped response, not an arbitrary
+-- transcript tail. Ordinary native inputs do not emit this stimulus.
+rule OweExplicitResponse {
+    when: RequestOutcomeObserved(request, outcome)
+    requires: request.status = admitted
+    requires: request.observation.kind = explicit_request
+    requires: request.admission in outcome.covered_admissions
+    requires: outcome.kind in {answer, clarification, failure, cancelled, empty_completion}
+    let covered = request.gateway.requests where status = admitted and observation.kind = explicit_request and binding_key = request.binding_key and admission in outcome.covered_admissions
+    requires: covered.count = outcome.covered_admissions.count
+    requires: not request.gateway.returns.any(r => r.kind = thread_reply and r.destination_key = request.binding_key and r.occurrence_key = outcome.occurrence_key)
+    ensures: ReturnObligation.created(
+        request: request,
+        covered_requests: covered,
+        native_outcome: outcome,
+        occurrence_key: outcome.occurrence_key,
+        kind: thread_reply,
+        destination_key: request.binding_key,
+        text: outcome.public_response,
+        state: pending,
+        attempt_key: null,
+        notification_receipt: null
+    )
+}
+
+-- REQ-SG-010/015. A private notice links to the briefing, not its private text.
+rule OweBriefingNotice {
+    when: BriefingOutcomeObserved(request, outcome, notice)
+    requires: request.status = admitted
+    requires: request.observation.kind = briefing
+    requires: outcome.covered_admissions = {request.admission}
+    requires: outcome.kind in {briefing_ready, clarification, failure, cancelled, empty_completion}
+    requires: not request.gateway.returns.any(r => r.request = request and r.occurrence_key = outcome.occurrence_key)
+    ensures: ReturnObligation.created(
+        request: request,
+        covered_requests: {request},
+        native_outcome: outcome,
+        occurrence_key: outcome.occurrence_key,
+        kind: private_notice,
+        destination_key: request.gateway.owner,
+        text: notice,
+        state: pending,
+        attempt_key: null,
+        notification_receipt: null
+    )
+}
+
+-- REQ-SG-013. Record attempt identity before the external operation.
+rule BeginReturnAttempt {
+    when: DispatchReturn(obligation, attempt)
+    requires: obligation.state in {pending, known_unsent}
+    ensures: obligation.state = attempting
+    ensures: obligation.attempt_key = attempt
+}
+
+rule ConfirmSlackReply {
+    when: SlackReplyConfirmed(obligation, attempt, message_identity)
+    requires: obligation.state = attempting
+    requires: obligation.kind = thread_reply
+    requires: obligation.attempt_key = attempt
+    ensures: obligation.state = confirmed
+    ensures: obligation.delivery_proof = message_identity
+}
+
+-- REQ-SG-015. A notification receipt proves submission, not Slack delivery.
+rule RecordNotificationSubmission {
+    when: NotificationSubmissionConfirmed(obligation, attempt, instance)
+    requires: obligation.state = attempting
+    requires: obligation.kind = private_notice
+    requires: obligation.attempt_key = attempt
+    ensures: obligation.state = submitted
+    ensures: obligation.notification_receipt = instance
+}
+
+rule ConfirmNotificationDelivery {
+    when: NotificationDeliveryConfirmed(obligation, instance, delivery_proof)
+    requires: obligation.state = submitted
+    requires: obligation.kind = private_notice
+    requires: obligation.notification_receipt = instance
+    ensures: obligation.state = confirmed
+    ensures: obligation.delivery_proof = delivery_proof
+}
+
+rule RecordKnownUnsent {
+    when: ExternalOperationNotSent(obligation, attempt)
+    requires: obligation.state = attempting
+    requires: obligation.attempt_key = attempt
+    ensures: obligation.state = known_unsent
+}
+
+rule RecordUncertainReturn {
+    when: ExternalOutcomeUnknown(obligation, attempt)
+    requires: obligation.state = attempting
+    requires: obligation.attempt_key = attempt
+    ensures: obligation.state = uncertain
+}
+
+rule InterruptedExternalAttempt {
+    when: RecoverInterruptedReturn(obligation)
+    requires: obligation.state = attempting
+    ensures: obligation.state = uncertain
+}
+
+-- Positive readback evidence, not a timeout, resolves an uncertain attempt.
+rule ReconcileConfirmedReturn {
+    when: MatchingExternalDeliveryFound(obligation, delivery_proof)
+    requires: obligation.state = uncertain
+    ensures: obligation.state = confirmed
+    ensures: obligation.delivery_proof = delivery_proof
+}
+
+-- REQ-SG-014/015. Failure to reach the source gets a separate private notice,
+-- not a replacement public destination or an agent rerun.
+rule ReportUnavailableThread {
+    when: ThreadDestinationUnavailable(obligation, reason, notice_key, notice)
+    requires: obligation.kind = thread_reply
+    requires: obligation.state in {pending, known_unsent, uncertain}
+    requires: not obligation.request.gateway.returns.any(r => r.kind = private_notice and r.occurrence_key = notice_key)
+    ensures: obligation.state = failed
+    ensures: obligation.failure_reason = reason
+    ensures: ReturnObligation.created(
+        request: obligation.request,
+        covered_requests: obligation.covered_requests,
+        native_outcome: null,
+        occurrence_key: notice_key,
+        kind: private_notice,
+        destination_key: obligation.request.gateway.owner,
+        text: notice,
+        state: pending,
+        attempt_key: null,
+        notification_receipt: null
+    )
+}
+
+rule ReconcileUnsentReturn {
+    when: ExternalNonDeliveryProven(obligation)
+    requires: obligation.state = uncertain
+    ensures: obligation.state = known_unsent
+}
+
+rule RecordReturnFailure {
+    when: ReturnPermanentlyFailed(obligation, reason)
+    requires: obligation.state in {attempting, submitted, known_unsent, uncertain}
+    ensures: obligation.state = failed
+    ensures: obligation.failure_reason = reason
+}
+
+invariant OneRequestPerSource {
+    for gateway in Gateways:
+        for request in gateway.requests:
+            (gateway.requests where observation.source_key = request.observation.source_key).count = 1
+}
+
+invariant SharedReplySameThread {
+    for gateway in Gateways:
+        for reply in gateway.returns:
+            for covered in reply.covered_requests:
+                reply.kind = thread_reply implies
+                    covered.gateway = gateway
+                    and covered.observation.kind = explicit_request
+                    and covered.binding_key = reply.destination_key
+}
+
+invariant OneProductBindingPerKey {
+    for gateway in Gateways:
+        for binding in gateway.bindings:
+            (gateway.bindings where key = binding.key).count = 1
+}
+
+-- There is no uncertain -> attempting transition. A retry requires positive
+-- evidence of non-delivery, not merely absence from a partial readback.
+
+contract NativeRuntimePort {
+    accepted_input: (request: AcceptedRequest) -> NativeAdmission
+    read_outcome: (admission: NativeAdmission) -> NativeOutcome
+
+    @invariant ExactNativeCorrelation
+        -- accepted_input resolves the same immutable request identity on retry.
+        -- read_outcome returns an intentional outcome with an explicit set of exact
+        -- covered admissions, never coverage inferred from transcript order.
+        -- Shared coverage is one thread, with a unique outcome occurrence key
+        -- across its covered admissions; replay through any member creates one
+        -- ReturnObligation. Its delivery state applies to every covered request.
+        -- Clarification follow-ups include the original admission only when the
+        -- selected response explicitly covers that original request as well.
+        -- A request omitted from that set retains its separate response duty.
+        -- Positive external readback identifies the exact return obligation and
+        -- attempt; notification proof also matches its retained instance identity.
+}
+
+surface GatewayBoundary {
+    facing gateway: Gateway
+
+    contracts:
+        demands NativeRuntimePort
+
+    provides:
+        EligibleSourceObserved(gateway, observation)
+        EyesReactionConfirmed(request)
+        NativeInputAccepted(request, admission)
+        EnsureRequestBinding(request)
+        NativeConversationPublished(binding, product_id)
+        BindingCreationFailed(binding, reason)
+        BoundProductClosed(binding, reason)
+        RequestFailedBeforeAdmission(request, reason, response)
+        RequestOutcomeObserved(request, outcome)
+        BriefingOutcomeObserved(request, outcome, notice)
+        DispatchReturn(obligation, attempt)
+        SlackReplyConfirmed(obligation, attempt, message_identity)
+        NotificationSubmissionConfirmed(obligation, attempt, instance)
+        NotificationDeliveryConfirmed(obligation, instance, delivery_proof)
+        ExternalOperationNotSent(obligation, attempt)
+        ExternalOutcomeUnknown(obligation, attempt)
+        RecoverInterruptedReturn(obligation)
+        MatchingExternalDeliveryFound(obligation, delivery_proof)
+        ExternalNonDeliveryProven(obligation)
+        ReturnPermanentlyFailed(obligation, reason)
+        ThreadDestinationUnavailable(obligation, reason, notice_key, notice)
+}

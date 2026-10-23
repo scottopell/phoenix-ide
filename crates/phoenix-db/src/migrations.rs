@@ -661,6 +661,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "single_conversation_name_and_route_projection",
         sql: "",
     },
+    Migration {
+        version: 130,
+        name: "slack_gateway",
+        sql: include_str!("migrations/slack_gateway.sql"),
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
