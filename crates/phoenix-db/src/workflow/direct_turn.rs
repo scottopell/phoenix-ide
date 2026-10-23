@@ -4913,12 +4913,12 @@ mod tests {
                 .accept_authoritative_turn(&input_with_disposition(
                     "conv-a",
                     "owner",
-                    disposition,
                     210,
+                    disposition,
                 ))
                 .await
                 .unwrap();
-            let AcceptAuthoritativeTurnOutcome::Created { turn_id, .. } = accepted else {
+            let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
                 panic!("expected live owner");
             };
             assert_eq!(
@@ -4979,10 +4979,10 @@ mod tests {
                 .accept_authoritative_turn(&input("conv-a", "replacement-owner", 211))
                 .await
                 .unwrap();
-            let AcceptAuthoritativeTurnOutcome::Created {
+            let TurnOutcome::Created {
                 turn_id: replacement_id,
                 ..
-            } = replacement
+            } = replacement.outcome
             else {
                 panic!("expected replacement owner");
             };
