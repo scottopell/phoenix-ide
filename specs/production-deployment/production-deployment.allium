@@ -5,7 +5,7 @@
 -- and bare Linux, with backend-specific activation ownership.
 -- This module owns shared guarantees. Platform-specific launchd mechanics
 -- are cumulative refinements in specs/launchd-deployment/launchd-deployment.allium.
--- Requirement traceability: REQ-PD-001 through REQ-PD-029. Runtime lifecycle
+-- Requirement traceability: REQ-PD-001 through REQ-PD-030. Runtime lifecycle
 -- rules model REQ-PD-002 through REQ-PD-014; backend selection, operator
 -- syntax, bare-Linux reboot integration, disposable test isolation, and
 -- release asset publication are interface/build obligations in requirements.md.
@@ -74,6 +74,7 @@ entity DeployTransaction {
     backend: BackendKind
     kind: LocalHeadDeployment | PublishedReleaseDeployment | PreparedArtifactDeployment
         | ProtectedSystemdReleaseDeployment | ProtectedSystemdPreparedDeployment
+        | ProtectedLaunchdRefreshDeployment
     source_commit: String
     expected: RuntimeIdentity
     previous: RuntimeIdentity?
@@ -138,6 +139,31 @@ variant ProtectedSystemdPreparedDeployment : DeployTransaction {
     controller_source_commit: String
     controller_helper_hash: String
     database_path: String
+}
+
+enum ProtectedLaunchdRefreshPhase {
+    prepared | backup_verified | rehearsal_verified | marker_written
+    | candidate_started | failed_stopped | committed
+}
+
+value ProtectedLaunchdRefreshProof {
+    candidate_sha: String
+    receipt_digest: String
+    registry_digest: String
+    source_ledger: String
+    target_ledger: String
+    registry_version: Integer
+    controller_source_commit: String
+    controller_helper_hash: String
+    backup_proof: String
+    rehearsal_proof: String
+}
+
+-- REQ-PD-030 / REQ-LDD-027 / REQ-COMP-018: same-ledger private refresh.
+variant ProtectedLaunchdRefreshDeployment : DeployTransaction {
+    refresh_phase: ProtectedLaunchdRefreshPhase
+    refresh_proof: ProtectedLaunchdRefreshProof
+    migration_started: Boolean
 }
 
 variant PreparedArtifactDeployment : DeployTransaction {
@@ -286,6 +312,27 @@ variant BareLinuxHandoff : DeploymentHandoff {
 --   Partial/extra/wrong evidence rejects before stop; snapshot proof binds it for
 --   recovery/finalization. No other candidate/baseline/source kind gains admission.
 --   RC4 registry semantics and protected lifecycle/invocation boundary are unchanged.
+-- claim_available(transaction) -> Boolean
+-- protected_launchd_refresh_admission_is_valid(transaction) -> Boolean
+--   Private native launchd refresh only: source and target are the exact complete
+--   migration-129 registry (registry_version = 129), with one dynamically selected
+--   full candidate SHA, an independently authenticated receipt digest, separate clean
+--   controller/helper identities, canonical database path, and transaction identity.
+--   The complete registry/ledger proof and all identities are immutable per transaction
+--   and re-verified at every destructive, recovery, and finalization boundary.
+-- launchd_refresh_backup_and_rehearsal_valid(transaction) -> Boolean
+--   Native SQLite backup-API proof, integrity/FK proof, exclusive database/WAL/SHM
+--   ownership, retained backup capacity, and one sequential rehearsal against the
+--   restore-slot copy are complete. The production database has not been migrated or
+--   reconciled; equal source and target ledgers do not waive these proofs.
+-- launchd_refresh_phase_authority_is_valid(transaction) -> Boolean
+--   Durable phase and immutable backup/rehearsal proofs, not equal ledger values, are
+--   authoritative. The migration_started marker is written immediately before exact
+--   candidate startup; before it only an unchanged predecessor may restart, and after
+--   it recovery is stopped and candidate-only.
+-- launchd_refresh_evidence_retained(transaction) -> Boolean
+--   Successful backup/proof evidence and every unresolved failure retain the private
+--   transaction, claim, stopped fence, candidate, receipt, registry, and helper evidence.
 -- claim_available(transaction) -> Boolean
 --   No active or unresolved transaction owns the host deployment claim. A
 --   markerless status is resolved only when it positively names a nonempty
@@ -705,6 +752,101 @@ rule AbandonInterruptedPreparation {
     @guidance
         -- Release only the matching claim after terminal status; runtime/database
         -- remain untouched. Missing evidence or a live/reused PID refuses recovery.
+}
+
+rule AdmitProtectedLaunchdRefresh {
+    when: CandidatePreparationCompleted(transaction)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.backend = launchd
+    requires: protected_launchd_refresh_admission_is_valid(transaction)
+    requires: transaction.refresh_proof.registry_version = 129
+    requires: transaction.refresh_proof.source_ledger = transaction.refresh_proof.target_ledger
+    requires: transaction.refresh_phase = prepared
+    requires: not transaction.migration_started
+    ensures: transaction.state = prepared
+}
+
+rule VerifyProtectedLaunchdRefreshBackup {
+    when: ProtectedLaunchdRefreshBackupCompleted(transaction)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: protected_launchd_refresh_admission_is_valid(transaction)
+    requires: transaction.refresh_proof.registry_version = 129
+    requires: transaction.refresh_phase = prepared
+    ensures: transaction.refresh_phase = backup_verified
+}
+
+rule VerifyProtectedLaunchdRefreshRehearsal {
+    when: ProtectedLaunchdRefreshRehearsalCompleted(transaction)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: launchd_refresh_backup_and_rehearsal_valid(transaction)
+    requires: transaction.refresh_proof.source_ledger = transaction.refresh_proof.target_ledger
+    requires: transaction.refresh_phase = backup_verified
+    ensures: transaction.refresh_phase = rehearsal_verified
+}
+
+rule MarkProtectedLaunchdRefreshCandidateStart {
+    when: ProtectedLaunchdRefreshCandidateStartRequested(transaction)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: transaction.refresh_phase = rehearsal_verified
+    requires: launchd_refresh_backup_and_rehearsal_valid(transaction)
+    requires: not transaction.migration_started
+    ensures: transaction.migration_started
+    ensures: transaction.refresh_phase = marker_written
+}
+
+rule StartProtectedLaunchdRefreshCandidate {
+    when: ProtectedLaunchdRefreshCandidateStarted(transaction)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: transaction.migration_started
+    requires: transaction.refresh_phase = marker_written
+    requires: launchd_refresh_phase_authority_is_valid(transaction)
+    ensures: transaction.refresh_phase = candidate_started
+}
+
+rule RecoverProtectedLaunchdRefreshBeforeMarker {
+    when: ProtectedLaunchdRefreshPreMarkerRecoveryRequested(transaction)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: not transaction.migration_started
+    requires: transaction.refresh_phase in { prepared, backup_verified, rehearsal_verified }
+    requires: launchd_refresh_phase_authority_is_valid(transaction)
+    ensures: paired_unchanged_predecessor_verified(transaction)
+    ensures: predecessor_start_authorized(transaction)
+}
+
+rule FailProtectedLaunchdRefreshAfterMarker {
+    when: ProtectedLaunchdRefreshPostMarkerFailure(transaction, failure)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.migration_started
+    requires: transaction.refresh_phase in { marker_written, candidate_started, failed_stopped }
+    requires: launchd_refresh_phase_authority_is_valid(transaction)
+    ensures: transaction.state = current_forward_failed
+    ensures: transaction.refresh_phase = failed_stopped
+    ensures: active_claim_retained(transaction)
+    ensures: launchd_refresh_evidence_retained(transaction)
+}
+
+rule FinalizeProtectedLaunchdRefresh {
+    when: ProtectedLaunchdRefreshFinalizationRequested(transaction)
+    requires: transaction.kind = ProtectedLaunchdRefreshDeployment
+    requires: transaction.state in { activating, current_forward_failed }
+    requires: transaction.migration_started
+    requires: current_claim_matches(transaction)
+    requires: launchd_refresh_phase_authority_is_valid(transaction)
+    requires: protected_launchd_refresh_admission_is_valid(transaction)
+    requires: transaction.refresh_proof.registry_version = 129
+    requires: transaction.refresh_proof.source_ledger = transaction.refresh_proof.target_ledger
+    ensures: transaction.refresh_phase = committed
+    ensures: launchd_refresh_evidence_retained(transaction)
 }
 
 rule CommitVerifiedCandidate {
@@ -1439,6 +1581,30 @@ invariant DisruptionRequiresPreparedIndependentOwner {
             preparation_complete(transaction)
             and transaction.state in { handed_off, activating, committed,
                 activation_failed_rolled_back, activation_failed_rollback_failed, current_forward_failed }
+}
+
+invariant ProtectedLaunchdRefreshIsExactAndPrivate {
+    for transaction in DeployTransactions:
+        transaction.kind = ProtectedLaunchdRefreshDeployment implies
+            transaction.backend = launchd
+            and protected_launchd_refresh_admission_is_valid(transaction)
+            and transaction.refresh_proof.registry_version = 129
+            and transaction.refresh_proof.source_ledger = transaction.refresh_proof.target_ledger
+}
+
+invariant ProtectedLaunchdRefreshMarkerForbidsPredecessorRecovery {
+    for transaction in DeployTransactions:
+        transaction.kind = ProtectedLaunchdRefreshDeployment
+        and transaction.migration_started implies
+            transaction.refresh_phase in { marker_written, candidate_started, failed_stopped, committed }
+            and launchd_refresh_phase_authority_is_valid(transaction)
+}
+
+invariant ProtectedLaunchdRefreshRetainsEvidence {
+    for transaction in DeployTransactions:
+        transaction.kind = ProtectedLaunchdRefreshDeployment
+        and (transaction.refresh_phase = failed_stopped or transaction.state = committed) implies
+            launchd_refresh_evidence_retained(transaction)
 }
 
 invariant ClaimReleaseRequiresMatchingDurableTerminalStatus {

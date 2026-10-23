@@ -51,6 +51,7 @@ jobs:
           cargo test -p phoenix-tools bash::launch_protocol::tests -- --show-output
           cargo test -p phoenix-tools bash::ring::tests -- --show-output
           cargo test -p phoenix-tools bash::registry::tests -- --show-output
+          cargo test -p phoenix-tools bash::reaper::tests -- --show-output
           # One libtest invocation preserves all filters without recompiling the
           # large IDE test harness for each filter. Keep its cases serial.
           cargo test -p phoenix_ide --lib -- --show-output --test-threads=1 \

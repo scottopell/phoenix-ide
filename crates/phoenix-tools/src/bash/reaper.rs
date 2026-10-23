@@ -1,16 +1,15 @@
 //! Child process reaper.
 //!
-//! REQ-BASH-007: at startup, set the subreaper bit so descendants whose
-//! parent dies (double-forks, setsid daemons) reparent to Phoenix rather
-//! than init. At shutdown, walk the live handle table and SIGKILL every
-//! process group as a final cleanup pass.
+//! REQ-BASH-007: install the subreaper bit where supported. At shutdown,
+//! attempt bounded, incarnation-bound SIGKILL for registered live handles;
+//! this cannot guarantee descendant absence or complete tree reaping.
 
 use std::time::Duration;
 
 use super::registry::BashHandleRegistry;
 
-/// Time Phoenix waits at shutdown for SIGKILL'd groups to exit before
-/// returning control (REQ-BASH-007: `SHUTDOWN_KILL_GRACE_SECONDS`).
+/// Shared shutdown budget for snapshot, incarnation-bound signal attempts,
+/// and handle-exit observation (REQ-BASH-007: `SHUTDOWN_KILL_GRACE_SECONDS`).
 pub const SHUTDOWN_KILL_GRACE_SECONDS: u64 = 2;
 
 /// Set `PR_SET_CHILD_SUBREAPER` on Linux; log-and-degrade elsewhere.
@@ -46,40 +45,96 @@ pub fn install_reaper() {
     }
 }
 
-/// Walk the live handle table and SIGKILL every process group, then wait
-/// briefly (up to [`SHUTDOWN_KILL_GRACE_SECONDS`]) for the kernel to
-/// deliver before returning.
-///
-/// SIGKILL rather than SIGTERM (REQ-BASH-007 rationale): Phoenix is
-/// exiting, so graceful-shutdown handlers in children would race with
-/// Phoenix's own exit. Reaping is the goal; courtesy is not.
+/// Attempt incarnation-bound SIGKILL for each live handle within one global
+/// deadline, then observe handle exits while time remains. This best-effort
+/// pass cannot prove descendant absence or that process groups were reaped.
 pub async fn shutdown_kill_tree_until(
     deadline: tokio::time::Instant,
     registry: &BashHandleRegistry,
 ) {
     let teardown = async {
-        let pgids = registry.snapshot_live_pgids().await;
-        if pgids.is_empty() {
+        let handles = registry.snapshot_handles_for_shutdown().await;
+        let mut live_handles = Vec::new();
+        for handle in handles {
+            if handle.state().await.is_live() {
+                live_handles.push(handle);
+            }
+        }
+        if live_handles.is_empty() {
             tracing::debug!("shutdown_kill_tree: no live bash handles");
             return;
         }
         tracing::info!(
-            count = pgids.len(),
-            "shutdown_kill_tree: SIGKILLing live bash process groups"
+            count = live_handles.len(),
+            "shutdown_kill_tree: attempting incarnation-bound SIGKILL for live bash handles"
         );
-        #[cfg(unix)]
-        for pgid in &pgids {
-            // SAFETY: kill(2) with negative pid signals the process group;
-            // no memory implications. Errors (ESRCH) are expected — the
-            // group may have exited between snapshot and signal — and we
-            // don't surface them.
-            unsafe {
-                let _ = libc::kill(-*pgid, libc::SIGKILL);
+
+        let mut signaled_handles = Vec::new();
+        for handle in live_handles {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    handle_id = %handle.handle_id,
+                    "shutdown_kill_tree: global deadline expired before signaling this handle"
+                );
+                break;
+            }
+            match tokio::time::timeout_at(deadline, handle.signal_live_incarnation(libc::SIGKILL))
+                .await
+            {
+                Ok(Ok(Some(_pgid))) => signaled_handles.push(handle),
+                Ok(Ok(None)) => tracing::warn!(
+                    handle_id = %handle.handle_id,
+                    "shutdown_kill_tree: no live incarnation remained to signal"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    handle_id = %handle.handle_id,
+                    error = %error,
+                    "shutdown_kill_tree: incarnation-bound signal failed; handle remains unverified"
+                ),
+                Err(_) => {
+                    tracing::warn!(
+                        handle_id = %handle.handle_id,
+                        "shutdown_kill_tree: global deadline expired during incarnation-bound signal"
+                    );
+                    break;
+                }
             }
         }
-        tokio::time::sleep(Duration::from_secs(SHUTDOWN_KILL_GRACE_SECONDS)).await;
+
+        for handle in signaled_handles {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    handle_id = %handle.handle_id,
+                    "shutdown_kill_tree: global deadline expired before handle exit observation"
+                );
+                break;
+            }
+            let mut exit = handle.exit_observer();
+            if exit.borrow().is_some() {
+                tracing::debug!(handle_id = %handle.handle_id, "shutdown_kill_tree: terminal handle exit observed");
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, exit.changed()).await {
+                Ok(Ok(())) if exit.borrow().is_some() => {
+                    tracing::debug!(handle_id = %handle.handle_id, "shutdown_kill_tree: handle exit observed after signal");
+                }
+                Ok(Ok(())) => {
+                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: exit notification changed without terminal state");
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: handle exit observer closed before terminal state");
+                }
+                Err(_) => {
+                    tracing::warn!(handle_id = %handle.handle_id, "shutdown_kill_tree: global deadline expired before handle exit was observed");
+                }
+            }
+        }
     };
-    let _ = tokio::time::timeout_at(deadline, teardown).await;
+    if tokio::time::timeout_at(deadline, teardown).await.is_err() {
+        tracing::warn!(
+            "shutdown_kill_tree: global deadline expired during registry snapshot or shutdown pass; remaining handles are unverified"
+        );
+    }
 }
 
 pub async fn shutdown_kill_tree(registry: &BashHandleRegistry) {
@@ -104,6 +159,63 @@ mod tests {
         shutdown_kill_tree(&registry).await;
         // The early-return path skips the sleep.
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_invalid_incarnation_retains_handle_and_unsettled_exit() {
+        use crate::bash::handle::{Handle, HandleId, HandleState};
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+
+        let registry = BashHandleRegistry::new();
+        let scope = ResourceScopeKey::Work(WorkScopeId::parse("shutdown-invalid").unwrap());
+        // An out-of-range PID fails before pidfd_open on Linux; other Unix
+        // platforms return Unsupported. Neither path may target a real process.
+        let handle = Handle::new_live(
+            scope.clone(),
+            HandleId::new("shutdown-invalid"),
+            "not spawned".into(),
+            None,
+            std::path::PathBuf::from("/tmp"),
+            i32::MAX,
+            u32::MAX,
+            1024,
+        );
+        let table = registry.get_or_create(&scope).await;
+        table.write().await.insert(handle.clone());
+        shutdown_kill_tree_until(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &registry,
+        )
+        .await;
+        assert!(matches!(
+            handle.state().await.as_ref(),
+            HandleState::Live(_)
+        ));
+        assert!(handle.exit_observer().borrow().is_none());
+        let retained = registry.snapshot_handles_for_shutdown().await;
+        assert_eq!(retained.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&retained[0], &handle));
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_bounds_snapshot_lock_wait() {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+
+        let registry = BashHandleRegistry::new();
+        let scope = ResourceScopeKey::Work(WorkScopeId::parse("shutdown-lock").unwrap());
+        let table = registry.get_or_create(&scope).await;
+        let _guard = table.write().await;
+        // Keep the lock held until shutdown returns. The inner deadline must
+        // cancel snapshot acquisition, not start a fresh per-handle budget.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            shutdown_kill_tree_until(
+                tokio::time::Instant::now() + Duration::from_millis(10),
+                &registry,
+            ),
+        )
+        .await
+        .expect("global shutdown deadline must bound snapshot lock acquisition");
     }
 
     #[test]
