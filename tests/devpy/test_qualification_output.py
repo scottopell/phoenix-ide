@@ -419,6 +419,32 @@ class QualificationOutputTests(unittest.TestCase):
         self.assertEqual(list(diagnostic_dir.iterdir()), [diagnostic_dir / "cargo-clippy.full.log"])
         self.assertFalse((self.directory / "cargo-clippy.full.log").exists())
 
+    def test_python_diagnostics_capture_full_headers_and_preserve_failure_and_cap(self):
+        diagnostic_dir = self.directory / "python-diagnostics"
+        payload = b"ERROR: first_python_identity\n" + b"retained output\n" * 400
+        for cap, footer in ((None, b"payload COMPLETE"), (2048, b"payload INCOMPLETE")):
+            with self.subTest(cap=cap):
+                process = mock.Mock(pid=12345, stdout=io.BytesIO(payload), returncode=1)
+                process.wait.return_value = 1
+                limit = mock.patch.object(self.dev._QualificationOutputLog, "MAX_BYTES", cap or 64 * 1024 * 1024)
+                with mock.patch.dict(os.environ, {"PHOENIX_CHECK_DIAGNOSTIC_DIR": str(diagnostic_dir)}, clear=True), \
+                     limit, mock.patch.object(self.dev.subprocess, "Popen", return_value=process) as launch, \
+                     mock.patch.object(self.dev.os, "killpg") as kill, \
+                     mock.patch.object(self.dev.select, "select", side_effect=lambda streams, *_: (streams, [], [])):
+                    command = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+                    self.assertEqual(self.run_step("dev.py unit tests", command), 1)
+                self.assertEqual(launch.call_args.args[0], command)
+                self.assertFalse(launch.call_args.kwargs["text"])
+                kill.assert_not_called()
+                raw = (diagnostic_dir / "python-unittest.full.log").read_bytes()
+                self.assertTrue(raw.startswith(b"ERROR: first_python_identity\n"))
+                self.assertIn(b"process_returncode=1 timed_out=False reader_complete=True", raw)
+                self.assertIn(footer, raw)
+                if cap:
+                    self.assertLessEqual(len(raw), cap)
+                else:
+                    self.assertTrue(raw.startswith(payload))
+
     def test_clippy_capture_cap_keeps_failure_and_marks_truncation(self):
         os.environ.pop("PHOENIX_CHECK_DIAGNOSTIC_DIR", None)
         diagnostic_dir = self.directory / "capped-diagnostics"
@@ -442,6 +468,9 @@ class QualificationOutputTests(unittest.TestCase):
         diagnostic = {"PHOENIX_CHECK_DIAGNOSTIC_DIR": str(self.directory)}
         self.assertEqual(self.dev._check_diagnostic_log_path("cargo clippy", diagnostic),
                          self.directory / "cargo-clippy.full.log")
+        self.assertEqual(self.dev._check_diagnostic_log_path("dev.py unit tests", diagnostic),
+                         self.directory / "python-unittest.full.log")
+        self.assertIsNone(self.dev._check_diagnostic_log_path("dev.py unit tests", {}))
         self.assertIsNone(self.dev._check_diagnostic_log_path("cargo test", diagnostic))
         self.assertIsNone(self.dev._check_diagnostic_log_path("cargo clippy", {"PHOENIX_GOAL_REUSE_DIR": str(self.directory)}))
 

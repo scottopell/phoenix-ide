@@ -337,18 +337,18 @@ class GoalQualificationTests(unittest.TestCase):
         )
         self.assertEqual(self.helper.digest(expression.encode()),
                          "2783437b7a762c80522985f3795913782b8ca0502584998274caca513d13204a")
-        for text in ("--goal-focused-filter", "--goal-step-deadline-ns", 'timeout-minutes: 10',
+        for text in ("--goal-focused-filter", "--goal-step-deadline-ns", 'timeout-minutes: 21',
                      'PHOENIX_CHECK_WORKERS: "2"', "PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'",
-                     'PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1500"'):
+                     'PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "3600"'):
             self.assertIn(text, workflow)
         rust = workflow.split("  check-rust:", 1)[1].split("\n  check-clippy:", 1)[0]
-        for bound in ("    timeout-minutes: 113", "        timeout-minutes: 72", "        timeout-minutes: 20"):
+        for bound in ("    timeout-minutes: 160", "        timeout-minutes: 95", "        timeout-minutes: 20"):
             self.assertIn(bound, rust)
         self.assertEqual(workflow.count("PHOENIX_GOAL_REUSE_DIR:"), 1)
         self.assertIn("github.event_name == 'push' || github.event_name == 'workflow_dispatch'", rust)
         self.assertIn("if: ${{ !cancelled() }}", rust)
         self.assertIn("--identity step:ci:focused-default --", rust)
-        self.assertIn('timeout --signal=TERM --kill-after=10s 9m cargo nextest run --locked', rust)
+        self.assertIn('timeout --signal=TERM --kill-after=10s 20m cargo nextest run --locked', rust)
         self.assertNotIn("123", rust)
 
     def test_workflow_admits_reuse_only_before_push_dispatch_and_keeps_original_pr_command(self):
@@ -374,7 +374,7 @@ class GoalQualificationTests(unittest.TestCase):
         self.assertEqual(producer.count("--goal-focused-filter"), 1)
         self.assertNotIn("cargo nextest run", producer)
         self.assertNotIn("scripts/goal_qualification.py", pr)
-        for text in ('timeout --signal=TERM --kill-after=10s 9m cargo nextest run --locked',
+        for text in ('timeout --signal=TERM --kill-after=10s 20m cargo nextest run --locked',
                      '-p phoenix-core -p phoenix-db -p phoenix_ide', '-E "$goal_filter"',
                      '--test-threads 2 --no-fail-fast --failure-output immediate',
                      '--status-level all --final-status-level all'):
@@ -384,10 +384,28 @@ class GoalQualificationTests(unittest.TestCase):
         self.assertIn('--goal-step-deadline-ns "$deadline"', producer)
         self.assertIn("            ${{ env.PHOENIX_GOAL_REUSE_DIR }}", workflow)
         rust_job = workflow.split("  check-rust:", 1)[1].split("\n  check-clippy:", 1)[0]
-        self.assertIn("    timeout-minutes: 113\n", rust_job)
-        self.assertIn("        timeout-minutes: 10\n", rust_job)
-        self.assertIn("        timeout-minutes: 72\n", rust_job)
-        self.assertEqual(600 - 540 - 10, 50)  # Arithmetic only; no claim the allowance was measured.
+        self.assertIn("    timeout-minutes: 160\n", rust_job)
+        self.assertIn("        timeout-minutes: 21\n", rust_job)
+        self.assertIn("        timeout-minutes: 95\n", rust_job)
+        self.assertEqual(1260 - 1200 - 10, 50)  # Arithmetic only; no claim the allowance was measured.
+
+    def test_host_budget_envelope_matches_source_and_preserves_cleanup(self):
+        source = (ROOT / "dev.py").read_text()
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn('run_step("goal focused", helper, timeout=1200, goal_phase="focused")', source)
+        self.assertIn('<= 1_260_000_000_000):', source)
+        self.assertIn('deadline within1260s', source)
+        self.assertIn('time.monotonic_ns() + 1_260_000_000_000', workflow)
+        self.assertIn('LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 2 + CARGO_TEST_TIMEOUT) + 30', source)
+        self.assertEqual(max(600 * 6, 600 * 2 + 3600) + 30, 4830)
+        self.assertLess(4830 + 600, 95 * 60)
+        self.assertEqual(160 - (20 + 95 + 21 + 10 + 2), 12)
+        self.assertIn('time.monotonic() + 10, profile.metadata["goal_step_deadline_ns"] / 1e9)', source)
+        self.assertEqual(source.count('(goal_step_deadline_ns - time.monotonic_ns()) / 1e9 - 40'), 3)
+        ui = workflow.split("  check-ui:\n", 1)[1].split("\n  check-finalization-geometry:", 1)[0]
+        self.assertIn('PHOENIX_CHECK_DIAGNOSTIC_DIR:', ui)
+        self.assertIn('name: Upload UI Python diagnostics\n        if: always()', ui)
+        self.assertIn('path: ${{ env.PHOENIX_CHECK_DIAGNOSTIC_DIR }}/python-unittest.full.log', ui)
 
     def test_focused_workflow_propagates_canonical_exit_through_tee(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

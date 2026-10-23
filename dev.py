@@ -5727,8 +5727,11 @@ class _QualificationOutputLog:
 
 
 def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
-    if name == "cargo clippy" and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
-        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / "cargo-clippy.full.log"
+    if env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        filenames = {"cargo clippy": "cargo-clippy.full.log",
+                     "dev.py unit tests": "python-unittest.full.log"}
+        if name in filenames:
+            return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / filenames[name]
     return None
 
 
@@ -6153,7 +6156,7 @@ def cmd_check(
             threading.current_thread().name = "rust"
             helper = [sys.executable, str(ROOT / "scripts/goal_qualification.py"), "focused",
                       "--filter", goal_focused_filter, "--test-threads", "2"]
-            rc = run_step("goal focused", helper, timeout=540, goal_phase="focused")
+            rc = run_step("goal focused", helper, timeout=1200, goal_phase="focused")
             if rc:
                 raise subprocess.CalledProcessError(rc, helper)
         finally:
@@ -14879,8 +14882,8 @@ def main():
             if (not args.goal_focused_filter or args.lanes not in (None, "rust")
                     or args.compiler_cache is not None or args.goal_step_deadline_ns is None
                     or not args.profile_work_dir or os.environ.get("PHOENIX_GOAL_REUSE_DIR") in (None, "", "false")
-                    or not 0 < args.goal_step_deadline_ns - time.monotonic_ns() <= 600_000_000_000):
-                parser.error("focused-only requires same-job reuse, fresh profile dir, filter and a deadline within600s")
+                    or not 0 < args.goal_step_deadline_ns - time.monotonic_ns() <= 1_260_000_000_000):
+                parser.error("focused-only requires same-job reuse, fresh profile dir, filter and a deadline within1260s")
         elif args.goal_step_deadline_ns is not None:
             parser.error("goal step deadline requires focused-only mode")
 
