@@ -26,7 +26,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def load_devpy():
     spec = importlib.util.spec_from_file_location("qualification_devpy", ROOT / "dev.py")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with mock.patch.dict(sys.modules, {spec.name: module}):
+        spec.loader.exec_module(module)
     return module
 
 

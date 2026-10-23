@@ -19,8 +19,50 @@ def load_devpy():
     spec = importlib.util.spec_from_file_location("devpy_under_test", ROOT / "dev.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    with mock.patch.dict(sys.modules, {spec.name: module}):
+        spec.loader.exec_module(module)
     return module
+
+
+class DevpyLoaderLifecycleTests(unittest.TestCase):
+    def test_load_devpy_registers_exact_module_during_real_exec_and_restores_registry(self):
+        name = "devpy_under_test"
+        for had_prior in (False, True):
+            for inject_failure in (False, True):
+                with self.subTest(had_prior=had_prior, inject_failure=inject_failure):
+                    spec = importlib.util.spec_from_file_location(name, ROOT / "dev.py")
+                    assert spec is not None and spec.loader is not None
+                    real_exec = spec.loader.exec_module
+                    prior = type(sys)("previous_devpy_fixture")
+                    observed = []
+                    injected = RuntimeError("injected loader failure after real module execution")
+                    def wrapped_exec(module):
+                        self.assertIs(sys.modules[name], module)
+                        self.assertIsNot(module, prior)
+                        observed.append(module)
+                        real_exec(module)
+                        self.assertTrue(hasattr(module, "CheckWorkProfile"))
+                        self.assertIs(sys.modules[name], module)
+                        if inject_failure:
+                            raise injected
+                    with mock.patch.dict(sys.modules):
+                        sys.modules.pop(name, None)
+                        if had_prior:
+                            sys.modules[name] = prior
+                        with mock.patch.object(importlib.util, "spec_from_file_location", return_value=spec), \
+                             mock.patch.object(spec.loader, "exec_module", side_effect=wrapped_exec):
+                            if inject_failure:
+                                with self.assertRaises(RuntimeError) as caught:
+                                    load_devpy()
+                                self.assertIs(caught.exception, injected)
+                            else:
+                                loaded = load_devpy()
+                                self.assertIs(loaded, observed[0])
+                        self.assertEqual(len(observed), 1)
+                        if had_prior:
+                            self.assertIs(sys.modules[name], prior)
+                        else:
+                            self.assertNotIn(name, sys.modules)
 
 
 class CheckPlanTests(unittest.TestCase):
