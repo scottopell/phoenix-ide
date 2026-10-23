@@ -77,7 +77,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
-      PHOENIX_GOAL_REUSE_DIR: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && format('{0}/goal-qualification-{1}-{2}-check-rust', runner.temp, github.run_id, github.run_attempt) || '' }}
+      PHOENIX_GOAL_REUSE_DIR: ''
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
       PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1500"
@@ -90,6 +90,17 @@ jobs:
       - name: Initialize Rust evidence
         timeout-minutes: 1
         run: |
+          case "$GITHUB_EVENT_NAME" in
+            push|workflow_dispatch)
+              : "${RUNNER_TEMP:?missing runner temp}" "${GITHUB_RUN_ID:?missing run id}" "${GITHUB_RUN_ATTEMPT:?missing run attempt}" "${GITHUB_ENV:?missing environment file}"
+              reuse_dir="$RUNNER_TEMP/goal-qualification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-check-rust"
+              case "$reuse_dir" in
+                *$'\n'*|*$'\r'*) echo 'invalid multiline reuse path' >&2; exit 1 ;;
+              esac
+              printf 'PHOENIX_GOAL_REUSE_DIR=%s\n' "$reuse_dir" >> "$GITHUB_ENV"
+              ;;
+            *) printf 'PHOENIX_GOAL_REUSE_DIR=\n' >> "$GITHUB_ENV" ;;
+          esac
           mkdir -p "$RUST_EVIDENCE_DIR"
           # The check profile directory must remain empty until dev.py claims it.
           printf 'run=%s attempt=%s sha=%s job=%s started=%s\n' \

@@ -354,9 +354,21 @@ class GoalQualificationTests(unittest.TestCase):
     def test_workflow_admits_reuse_only_before_push_dispatch_and_keeps_original_pr_command(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         admissions = [line for line in workflow.splitlines() if "PHOENIX_GOAL_REUSE_DIR:" in line]
-        self.assertEqual(len(admissions), 1)  # One job-level binding replaces three duplicated step envs.
-        self.assertIn("(github.event_name == 'push' || github.event_name == 'workflow_dispatch') && format(", admissions[0])
-        self.assertTrue(admissions[0].endswith("|| '' }}"))
+        self.assertEqual(admissions, ["      PHOENIX_GOAL_REUSE_DIR: ''"])
+        rust_job = workflow.split("  check-rust:", 1)[1].split("\n  check-clippy:", 1)[0]
+        job_env = rust_job.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertNotIn("runner.", job_env)
+        setup = rust_job.split("      - name: Initialize Rust evidence\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn('case "$GITHUB_EVENT_NAME" in\n            push|workflow_dispatch)', setup)
+        self.assertIn('reuse_dir="$RUNNER_TEMP/goal-qualification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-check-rust"', setup)
+        self.assertIn('printf \'PHOENIX_GOAL_REUSE_DIR=%s\\n\' "$reuse_dir" >> "$GITHUB_ENV"', setup)
+        self.assertIn('*) printf \'PHOENIX_GOAL_REUSE_DIR=\\n\' >> "$GITHUB_ENV" ;;', setup)
+        self.assertLess(setup.index('>> "$GITHUB_ENV"'), setup.index('mkdir -p "$RUST_EVIDENCE_DIR"'))
+        self.assertLess(rust_job.index("- name: Initialize Rust evidence"), rust_job.index("- name: ./dev.py check (rust,cargo-fmt)"))
+        self.assertLess(rust_job.index("- name: ./dev.py check (rust,cargo-fmt)"), rust_job.index("- name: Focused goal qualification"))
+        self.assertEqual(rust_job.count('reuse_dir="$RUNNER_TEMP/goal-qualification-'), 1)
+        self.assertEqual(rust_job.count("goal-qualification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-check-rust"), 1)
+        self.assertIn("    runs-on: ubuntu-latest", rust_job)
         script = workflow.split("goal_filter=", 1)[1].split("- name: Check production feature on musl", 1)[0]
         producer, pr = script.split("          else\n", 1)
         self.assertEqual(producer.count("--goal-focused-filter"), 1)
@@ -376,6 +388,24 @@ class GoalQualificationTests(unittest.TestCase):
         self.assertIn("        timeout-minutes: 10\n", rust_job)
         self.assertIn("        timeout-minutes: 72\n", rust_job)
         self.assertEqual(600 - 540 - 10, 50)  # Arithmetic only; no claim the allowance was measured.
+
+    def test_workflow_reuse_setup_rejects_missing_inputs_and_multiline_without_claiming(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        setup = workflow.split("      - name: Initialize Rust evidence\n", 1)[1].split("      - name:", 1)[0]
+        full_event = setup.split("            push|workflow_dispatch)\n", 1)[1].split("            *)", 1)[0]
+        for field, diagnostic in (("RUNNER_TEMP", "missing runner temp"),
+                                  ("GITHUB_RUN_ID", "missing run id"),
+                                  ("GITHUB_RUN_ATTEMPT", "missing run attempt"),
+                                  ("GITHUB_ENV", "missing environment file")):
+            guard = "${" + field + ":?" + diagnostic + "}"
+            self.assertIn(guard, full_event)
+            self.assertLess(full_event.index(guard), full_event.index("reuse_dir="))
+        self.assertIn("*$'\\n'*|*$'\\r'*) echo 'invalid multiline reuse path' >&2; exit 1 ;;", full_event)
+        self.assertLess(full_event.index("invalid multiline reuse path"), full_event.index('>> "$GITHUB_ENV"'))
+        for forbidden in ("mkdir", "goal_qualification.py", "ready.json", ".phoenix-profile-claim"):
+            self.assertNotIn(forbidden, full_event)
+        self.assertNotIn("${{", setup)
+        self.assertNotIn("export PHOENIX_GOAL_REUSE_DIR", setup)
 
     def test_clean_identity_binds_inputs_tools_flags_but_never_exports_credentials(self):
         (self.root / "Cargo.lock").write_text("lock fixture")
