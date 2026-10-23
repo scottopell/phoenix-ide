@@ -8090,10 +8090,9 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let request_output_tokens = self
-            .llm_registry
-            .output_token_limit(&model_id)
-            .ok_or_else(|| format!("Model '{model_id}' has no declared output-token maximum"))?;
+        let request_output_tokens = u32::try_from(self.context.output_budget).map_err(|_| {
+            "Resolved output budget cannot be represented by provider APIs".to_string()
+        })?;
         let working_dir = self
             .context
             .execution_environment
@@ -9530,14 +9529,10 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let Some(output_token_limit) = self.llm_registry.output_token_limit(&model_id) else {
-            return Ok(Some(Event::ContinuationFailed {
-                operation_id,
-                error: format!("Model '{model_id}' has no declared output-token maximum"),
-                error_kind: crate::db::ErrorKind::InvalidRequest,
-            }));
-        };
-        let continuation_output_reserve = usize::try_from(output_token_limit).unwrap_or(usize::MAX);
+        let output_token_limit = u32::try_from(self.context.output_budget).map_err(|_| {
+            "Resolved output budget cannot be represented by provider APIs".to_string()
+        })?;
+        let continuation_output_reserve = self.context.output_budget;
 
         // Freeze the same persisted-only, generation-fenced projection used by
         // ordinary rounds before provider work can be scheduled. Continuation
@@ -10824,10 +10819,6 @@ fn reread_reviewed_task_handoff_snapshot_at_exact_path(
 /// size is bounded separately by [`cap_messages_to_token_budget`].
 const CONTINUATION_BLOCK_CHAR_CAP: usize = 2000;
 
-/// Reserve (tokens) for the continuation reply — kept in lockstep with the
-/// `max_tokens` on the continuation request.
-const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
-
 /// Safety margin (tokens) against the chars/token estimate being optimistic.
 /// The prompt and system text are budgeted from their actual size separately,
 /// so this only covers estimate error, not their bulk.
@@ -11122,11 +11113,12 @@ fn summarize_continuation_pipeline(
     messages: Vec<LlmMessage>,
     rejected_tool_calls: &[ToolCall],
     context_window: usize,
+    output_budget: usize,
 ) -> ContinuationPipelineSummary {
     let continuation_prompt = build_continuation_prompt(rejected_tool_calls);
     let fixed_tokens = estimate_text_tokens(&continuation_prompt)
         + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
-        + CONTINUATION_OUTPUT_RESERVE_TOKENS
+        + output_budget
         + CONTINUATION_SAFETY_MARGIN_TOKENS;
     let input_budget = context_window.saturating_sub(fixed_tokens);
 
@@ -11575,7 +11567,7 @@ mod strip_tool_blocks_tests {
             }]));
         }
 
-        let summary = summarize_continuation_pipeline(msgs, &[], 20_000);
+        let summary = summarize_continuation_pipeline(msgs, &[], 20_000, 4_096);
         let rendered = summary
             .stages
             .iter()
@@ -11642,7 +11634,7 @@ mod strip_tool_blocks_tests {
             ))]));
         }
 
-        let summary = summarize_continuation_pipeline(msgs, &[], 40_000);
+        let summary = summarize_continuation_pipeline(msgs, &[], 40_000, 4_096);
         let headroom = summary
             .stages
             .iter()
@@ -11697,7 +11689,7 @@ mod strip_tool_blocks_tests {
         let limits = phoenix_llm::ContinuationRequestLimits::codex_bridge();
         let history_item_cap = limits.max_history_messages(1).expect("Codex item cap");
         let context_window = 272_000;
-        let fixed_tokens = CONTINUATION_OUTPUT_RESERVE_TOKENS
+        let fixed_tokens = 4_096
             + CONTINUATION_SAFETY_MARGIN_TOKENS
             + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT);
         assert!(
@@ -11751,7 +11743,7 @@ mod strip_tool_blocks_tests {
             .map(|i| user_text(&format!("small history message {i}")))
             .collect();
         let context_window = 272_000;
-        let fixed_tokens = CONTINUATION_OUTPUT_RESERVE_TOKENS
+        let fixed_tokens = 4_096
             + CONTINUATION_SAFETY_MARGIN_TOKENS
             + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT);
         let budget = plan_continuation_history(messages, context_window, fixed_tokens, None);
@@ -13058,6 +13050,7 @@ mod error_mapping_tests {
             std::path::PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         for (provider_kind, expected_kind, can_resume) in [
             (
@@ -13239,7 +13232,13 @@ mod dispatch_context_budget_tests {
     async fn request_rounds_use_one_snapshot_then_tails_and_rebuild_once_on_invalidation() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "bounded-projection-rounds";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         storage
             .add_message(
@@ -13334,7 +13333,13 @@ mod dispatch_context_budget_tests {
     async fn ordinary_new_turn_prompt_excludes_unadopted_historical_wake_results() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "historical-wake-prompt";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         for (id, text, display) in [
             (
@@ -13436,7 +13441,13 @@ mod dispatch_context_budget_tests {
     async fn ordinary_process_event_converts_projection_failure_to_typed_llm_error() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "projection-liveness";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         storage.set_fail_prompt_projection_load(true);
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -13484,8 +13495,13 @@ mod dispatch_context_budget_tests {
     async fn coordinator_dispatch_keeps_one_stable_system_block_as_evidence_changes() {
         let cwd = TempDir::new().unwrap();
         let conv_id = "coordinator-on-demand";
-        let mut context =
-            ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let mut context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         context.is_coordinator = true;
         let storage = Arc::new(InMemoryStorage::new());
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -13551,7 +13567,13 @@ mod dispatch_context_budget_tests {
     async fn conservative_prompt_estimate_cannot_short_circuit_provider_dispatch() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "large-estimate-still-dispatches";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         storage
             .add_message(
@@ -13752,6 +13774,7 @@ mod creation_completion_lifecycle_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (event_tx, event_rx) = mpsc::channel(32);
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -14068,7 +14091,13 @@ mod authoritative_user_message_effect_tests {
         let storage = Arc::new(InMemoryStorage::new());
         storage.queue_preflight_authoritative_user_message(preflight);
         storage.queue_materialize_authoritative_user_message(materialize);
-        let context = ConvContext::new("conv-direct", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "conv-direct",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -17125,6 +17154,7 @@ mod approved_explore_follow_up_tests {
             worktree.clone(),
             "test-model",
             200_000,
+            16_384,
         );
         context.mode_context = Some(ModeContext::Explore {
             next_taskmd_id_hint: None,
@@ -17590,7 +17620,8 @@ mod context_exhausted_preserves_worktree_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
         broadcast::Receiver<SseEvent>,
     ) {
-        let mut context = ConvContext::new(conv_id, working_dir.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, working_dir.clone(), "test-model", 200_000, 16_384);
         context.work_scope_worktree = Some(working_dir);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18558,7 +18589,8 @@ mod approve_task_failure_effect_tests {
         let task_filename = "12345-p2-ready--fresh-handoff.md";
         std::fs::write(tasks_dir.join(task_filename), "Plan\n").unwrap();
 
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000, 16_384);
         context.desired_base_branch = Some(base_branch.to_string());
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18626,7 +18658,8 @@ mod approve_task_failure_effect_tests {
         let task_filename = "12345-p2-ready--persist-failure.md";
         std::fs::write(tasks_dir.join(task_filename), "# Persist failure\n").unwrap();
 
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000, 16_384);
         context.desired_base_branch = Some(base_branch.to_string());
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18680,7 +18713,8 @@ mod approve_task_failure_effect_tests {
         std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
         std::fs::remove_file(tasks_dir.join(task_filename)).unwrap();
 
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000, 16_384);
         context.desired_base_branch = Some(base_branch.to_string());
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -19021,6 +19055,7 @@ mod explore_prompt_cache_shape_tests {
                 temp.path().to_path_buf(),
                 "test-model",
                 200_000,
+                16_384,
             ),
             ConvState::Idle,
             storage.clone(),
@@ -19216,8 +19251,13 @@ mod explore_prompt_cache_shape_tests {
             .to_string();
 
         let conv_id = "explore-cache-shape";
-        let mut context =
-            ConvContext::new(conv_id, temp.path().to_path_buf(), "test-model", 200_000);
+        let mut context = ConvContext::new(
+            conv_id,
+            temp.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         context.mode_context = Some(ModeContext::Explore {
             next_taskmd_id_hint: Some(hinted_id.clone()),
         });
@@ -19406,7 +19446,13 @@ mod steer_drain_detector_tests {
     ) {
         let storage = Arc::new(InMemoryStorage::new());
         storage.set_steering_queue(conv_id, queue.clone());
-        let context = ConvContext::new(conv_id, PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -19635,6 +19681,7 @@ mod steer_drain_detector_tests {
             temp.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         let setup_context = ToolContext::new_with_resource_scope(
             CancellationToken::new(),
@@ -19976,6 +20023,7 @@ mod steer_drain_detector_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -22174,6 +22222,7 @@ mod steer_drain_detector_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "parent-conv",
         );
         let (_event_tx, event_rx) = mpsc::channel(32);
@@ -23319,6 +23368,7 @@ mod subagent_grace_tool_surface_tests {
             cwd.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         context.is_sub_agent = true;
         context.max_turns = 1;
@@ -23391,6 +23441,7 @@ mod subagent_grace_tool_surface_tests {
             cwd.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         context.is_sub_agent = true;
         context.max_turns = 1;
@@ -23463,6 +23514,7 @@ mod subagent_grace_tool_surface_tests {
             cwd.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         context.is_sub_agent = true;
         context.max_turns = 1;
@@ -23550,6 +23602,7 @@ mod work_subagent_cwd_guard_tests {
             working_dir.to_path_buf(),
             "gpt-5.6-sol",
             200_000,
+            16_384,
         );
         context.resource_authority = match &mode_context {
             ModeContext::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
@@ -24719,10 +24772,17 @@ mod retry_timer_epoch_tests {
                 PathBuf::from("/tmp"),
                 "test-model",
                 200_000,
+                16_384,
                 "root-conv",
             )
         } else {
-            ConvContext::new("conv-retry", PathBuf::from("/tmp"), "test-model", 200_000)
+            ConvContext::new(
+                "conv-retry",
+                PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+                16_384,
+            )
         };
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -25470,7 +25530,13 @@ mod fork_proposal_persist_tests {
 
     fn runtime_in_dir(conv_id: &str, working_dir: &Path) -> (TestRuntime, Arc<InMemoryStorage>) {
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new(conv_id, working_dir.to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            working_dir.to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -26212,7 +26278,13 @@ mod llm_generation_guard_tests {
 
     fn runtime_requesting() -> TestRuntime {
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("conv-gen", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "conv-gen",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -26537,6 +26609,7 @@ mod tool_generation_guard_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;

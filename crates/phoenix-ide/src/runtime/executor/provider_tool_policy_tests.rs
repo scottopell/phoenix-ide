@@ -111,6 +111,7 @@ fn runtime(
         directory.to_path_buf(),
         "claude-opus-5-5",
         200_000,
+        16_384,
     );
     let (event_tx, event_rx) = mpsc::channel(8);
     ConversationRuntime::new(

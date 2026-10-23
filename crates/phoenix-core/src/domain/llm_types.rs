@@ -209,11 +209,6 @@ impl ModelEffort {
     ];
 
     #[must_use]
-    pub const fn needs_extended_output_headroom(self) -> bool {
-        matches!(self, Self::Xhigh | Self::Max)
-    }
-
-    #[must_use]
     pub const fn as_wire_name(self) -> &'static str {
         match self {
             Self::None => "none",

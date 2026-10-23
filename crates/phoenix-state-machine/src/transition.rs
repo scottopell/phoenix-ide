@@ -3010,7 +3010,7 @@ pub fn transition_parent(
                 if should_trigger_continuation(
                     &usage_data,
                     context.context_window,
-                    context.effective_effort.level(),
+                    context.output_budget,
                 ) {
                     let tr = handle_context_exhaustion(
                         context,
@@ -3232,7 +3232,7 @@ pub fn transition_parent(
             if should_trigger_continuation(
                 &usage_data,
                 context.context_window,
-                context.effective_effort.level(),
+                context.output_budget,
             ) {
                 let tr = handle_context_exhaustion(
                     context,
@@ -3830,7 +3830,7 @@ pub fn transition_sub_agent(
             if should_trigger_continuation(
                 &usage_data,
                 context.context_window,
-                context.effective_effort.level(),
+                context.output_budget,
             ) {
                 let tr = handle_context_exhaustion(
                     context,
@@ -4315,19 +4315,13 @@ const CONTINUATION_THRESHOLD: f64 = 0.90;
 fn should_trigger_continuation(
     usage: &UsageData,
     context_window: usize,
-    effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    output_budget: usize,
 ) -> bool {
     let used = usage.context_window_used();
     let proportional_threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    let threshold = if effort
-        .is_some_and(phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom)
-    {
-        let reservation_threshold =
-            u64::try_from(context_window.saturating_sub(64_000 + 4_096)).unwrap_or(u64::MAX);
-        proportional_threshold.min(reservation_threshold)
-    } else {
-        proportional_threshold
-    };
+    let reservation_threshold =
+        u64::try_from(context_window.saturating_sub(output_budget)).unwrap_or(u64::MAX);
+    let threshold = proportional_threshold.min(reservation_threshold);
     used >= threshold
 }
 
@@ -4539,7 +4533,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
-        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+        ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        )
     }
 
     #[test]
@@ -6865,13 +6865,20 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            !should_trigger_continuation(&usage, 100_000, None),
+            // A zero output reservation leaves the 90% proportional bound as
+            // the only trigger, so 89.9% must not fire.
+            !should_trigger_continuation(&usage, 100_000, 0),
             "89.9% should not trigger continuation"
         );
     }
 
     #[test]
-    fn context_threshold_reserves_extended_effort_output_headroom() {
+    fn context_threshold_reserves_declared_output_budget() {
+        // REQ-LLM-004f, ADR-144: the reserved output budget, not an
+        // effort-keyed heuristic, pulls the continuation trigger earlier than
+        // the 90% proportional bound. With a 400k window the proportional
+        // bound is 360k, but a 68k output reservation lowers the effective
+        // trigger to 332k, so 336k of input must fire.
         let usage = UsageData {
             input_tokens: 336_000,
             output_tokens: 0,
@@ -6880,11 +6887,9 @@ mod tests {
             cache_read_tokens: 0,
         };
 
-        assert!(should_trigger_continuation(
-            &usage,
-            400_000,
-            Some(phoenix_core::domain::llm_types::ModelEffort::Xhigh),
-        ));
+        assert!(should_trigger_continuation(&usage, 400_000, 68_000));
+        // Without that reservation the same input stays below the 90% bound.
+        assert!(!should_trigger_continuation(&usage, 400_000, 0));
     }
 
     #[test]
@@ -6898,7 +6903,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000, 0),
             "90% should trigger continuation"
         );
     }
@@ -6914,7 +6919,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000, 0),
             "90.1% should trigger continuation"
         );
     }
@@ -6930,7 +6935,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000, 0),
             "Combined tokens should count toward threshold"
         );
     }
@@ -6956,6 +6961,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 100_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7037,6 +7043,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 100_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7385,6 +7392,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7449,7 +7457,7 @@ mod tests {
     fn coordinator_text_only_response_persists_without_filesystem() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7477,7 +7485,7 @@ mod tests {
     fn coordinator_tool_response_checkpoints_without_filesystem() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7504,7 +7512,7 @@ mod tests {
         use crate::state::{ProposeTaskInput, ToolInput};
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7587,6 +7595,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7653,6 +7662,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7727,6 +7737,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -9160,6 +9171,7 @@ mod tests {
                 tmp.path().to_path_buf(),
                 "test-model",
                 200_000,
+                16_384,
             );
             ctx.mode = mode;
             ctx.mode_context = mode_context;
@@ -9689,7 +9701,13 @@ mod teardown_tests {
     use std::path::PathBuf;
 
     fn test_context() -> super::ConvContext {
-        super::ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+        super::ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        )
     }
 
     fn pending(id: &str) -> PendingSubAgent {
