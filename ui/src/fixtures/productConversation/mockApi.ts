@@ -1,4 +1,5 @@
 import { api, type Conversation, type Message } from '../../api';
+import type { GoalControl, GoalEntry } from '../../goalApi';
 import { coordinatorSnapshot } from './scenarios';
 import type { ProductConversationScenario } from './types';
 
@@ -245,6 +246,24 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       if (url === '/api/coordinator/bash/live') {
         record('LiveBashRequests', Number(document.documentElement.dataset['productConversationFixtureLiveBashRequests'] ?? '0') + 1);
         return Response.json([] satisfies Awaited<ReturnType<typeof api.listLiveCoordinatorBashHandles>>);
+      }
+    }
+    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    const goalRoot = scenario.kind !== 'coordinator' && scenario.snapshot
+      ? `/api/product-conversations/${encodeURIComponent(scenario.snapshot.product_conversation_id)}`
+      : null;
+    const requestUrl = new URL(url, location.href);
+    if (method === 'GET' && goalRoot) {
+      if (requestUrl.pathname === `${goalRoot}/goal` && !requestUrl.search) {
+        return Response.json(null satisfies GoalEntry | null);
+      }
+      if (requestUrl.pathname === `${goalRoot}/goal-control` && !requestUrl.search) {
+        return Response.json(null satisfies GoalControl | null);
+      }
+      if (requestUrl.pathname === `${goalRoot}/goal/history`
+        && /^\?after=(0|[1-9]\d*)$/.test(requestUrl.search)
+        && Number.isSafeInteger(Number(requestUrl.searchParams.get('after')))) {
+        return Response.json([] satisfies GoalEntry[]);
       }
     }
     if (new URL(url, location.href).pathname.startsWith('/api/')) throw new Error(`Unexpected fixture API request: ${url}`);

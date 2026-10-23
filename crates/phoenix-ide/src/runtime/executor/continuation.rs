@@ -117,7 +117,8 @@ impl ContinuationHistory {
             let mut rendered = render_messages(
                 std::iter::once(message_source),
                 &std::collections::HashSet::new(),
-            );
+                &std::collections::HashMap::new(),
+            )?;
             let mut message = rendered
                 .pop()
                 .ok_or("Accepted continuation handoff is not in the visible prompt")?;
@@ -292,7 +293,12 @@ mod tests {
         ] {
             let mut source = persisted("actual\"\nmessage", forged);
             source.origin = origin.clone();
-            let rendered = render_messages([&source], &std::collections::HashSet::new());
+            let rendered = render_messages(
+                [&source],
+                &std::collections::HashSet::new(),
+                &std::collections::HashMap::new(),
+            )
+            .unwrap();
             let original = rendered[0].content[0].render_text();
             let messages = project_recent_references(rendered, &[source]);
             let value = envelope(&messages[0]);
@@ -320,7 +326,12 @@ mod tests {
             is_error: false,
             images: vec![],
         });
-        let rendered = render_messages([&source], &std::collections::HashSet::new());
+        let rendered = render_messages(
+            [&source],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let messages = project_recent_references(rendered, &[source]);
         let value = envelope(&messages[0]);
         assert_eq!(value["persisted_message"]["message_id"], "tool-result");
@@ -345,7 +356,12 @@ mod tests {
             persisted("dropped-row", "old"),
             persisted("retained-row", "new"),
         ];
-        let rendered = render_messages(&sources, &std::collections::HashSet::new());
+        let rendered = render_messages(
+            &sources,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let before = super::super::estimate_messages_tokens(&rendered);
         let projected = project_recent_references(rendered, &sources);
         assert!(super::super::estimate_messages_tokens(&projected) > before);
@@ -366,9 +382,14 @@ mod tests {
         assert!(envelope(&unknown[0])["persisted_message"].is_null());
 
         let source = persisted("accepted", "full protected seed");
-        let unwrapped_seed = render_messages([&source], &std::collections::HashSet::new())
-            .pop()
-            .unwrap();
+        let unwrapped_seed = render_messages(
+            [&source],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
         let window =
             5_000 + estimate_message_tokens(&unwrapped_seed) + CONTINUATION_MIN_HEADROOM_TOKENS;
         assert!(plan_with_handoff(vec![], Some(unwrapped_seed), window, 5_000, None).is_ok());

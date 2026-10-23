@@ -1,6 +1,8 @@
+import ast
 import io
 import importlib.util
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -419,6 +421,102 @@ def workflow_order(group):
         "e2e": ["e2e"],
         "ui": ["tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"],
     }[group]
+
+
+class GoalQualificationCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def test_focused_only_parser_dispatch_and_no_compile_control_flow(self):
+        source = (ROOT / "dev.py").read_text()
+        self.assertIn('"--goal-focused-filter"', source)
+        self.assertIn('"--goal-step-deadline-ns"', source)
+        self.assertIn('goal_focused_filter=args.goal_focused_filter', source)
+        check = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "cmd_check")
+        branch = next(n for n in check.body if isinstance(n, ast.If) and ast.unparse(n.test) == "focused_only")
+        body = ast.unparse(branch)
+        self.assertIn("run_step('goal focused'", body)
+        self.assertNotIn("compile_cmd", body)
+        self.assertNotIn("codegen_cmd", body)
+        self.assertNotIn("_compiler_cache_subprocess_env", body)
+        self.assertIsInstance(branch.body[-1], ast.Return)
+
+    def test_foreign_profile_args_remain_rejected_without_blanket_profile_ban(self):
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PHOENIX_GOAL_REUSE_DIR": "/job/private"}, clear=True), \
+             mock.patch.object(self.dev, "_goal_active_execution", return_value={"kind": "fixture"}), \
+             mock.patch.object(self.dev, "_goal_helper") as helper:
+            helper.return_value.validate_execution.return_value = ["--config-file", "/owner/config", "--profile", "phoenix-cpu"]
+            with self.assertRaisesRegex(SystemExit, "foreign profile"):
+                self.dev._goal_qualification_commands(True, [], [], [], 2, ["--profile", "foreign"])
+
+    def test_closed_or_absent_in_process_profile_owner_cannot_authorize(self):
+        import types
+        for profile in (None, types.SimpleNamespace(artifacts_finalized=True, finalized_cpu=None),
+                        types.SimpleNamespace(artifacts_finalized=False, finalized_cpu={})):
+            with mock.patch.object(self.dev, "_CHECK_PROFILE", profile):
+                with self.assertRaisesRegex(ValueError, "open in-process"):
+                    self.dev._goal_active_execution("focused")
+
+    def test_non_opt_in_keeps_existing_commands_and_cpu_profile(self):
+        for opt_in in (None, "", "false"):
+            env = {} if opt_in is None else {"PHOENIX_GOAL_REUSE_DIR": opt_in}
+            with self.subTest(opt_in=opt_in), mock.patch.dict(os.environ, env, clear=True):
+                self.assertIsNone(self.dev._goal_qualification_commands(
+                    True, ["-p", "phoenix-db"], ["-p", "phoenix-db"], [], 3,
+                    ["--profile", "cpu-attribution"]))
+        _, broad, _ = self.dev._rust_check_commands(
+            True, [], [], [], 3, ["--profile", "cpu-attribution"])
+        self.assertEqual(broad, [
+            "cargo", "nextest", "--profile", "cpu-attribution", "run",
+            "-E", "not test(/export_bindings/)", "--test-threads", "3",
+        ])
+
+    def test_opt_in_replaces_compile_and_reuses_for_both_remaining_phases(self):
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PHOENIX_GOAL_REUSE_DIR": "/job/private"}, clear=True):
+            compile_cmd, broad_cmd, codegen_cmd = self.dev._goal_qualification_commands(
+                True, [], [], [], 3, [])
+        helper = [sys.executable, str(ROOT / "scripts/goal_qualification.py")]
+        self.assertEqual(compile_cmd, [*helper, "capture"])
+        self.assertEqual(broad_cmd, [*helper, "broad", "--test-threads", "3"])
+        self.assertEqual(codegen_cmd, [*helper, "codegen", "--test-threads", "3"])
+
+    def test_invalid_opt_in_scope_or_profile_fails_before_subprocess(self):
+        cases = [
+            (False, [], [], [], []),
+            (True, ["-p", "phoenix-db"], [], [], []),
+            (True, [], ["-p", "phoenix-db"], [], []),
+            (True, [], [], ["-p", "phoenix-db"], []),
+        ]
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "PHOENIX_GOAL_REUSE_DIR": "/job/private"}, clear=True), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            for has_nextest, compile_p, test_p, codegen_p, profile in cases:
+                with self.subTest(case=(has_nextest, compile_p, test_p, codegen_p, profile)):
+                    with self.assertRaisesRegex(SystemExit, "full-workspace nextest"):
+                        self.dev._goal_qualification_commands(has_nextest, compile_p, test_p, codegen_p, 3, profile)
+        run.assert_not_called()
+
+    def test_opt_in_source_preserves_timeout_group_cache_and_codegen_scratch(self):
+        source = (ROOT / "dev.py").read_text()
+        self.assertIn('compile_rc = run_step("cargo test compile", compile_cmd, env_extra=reuse_env, goal_phase=goal_phase)', source)
+        self.assertIn('if compile_rc != 0 and goal_reuse_commands is not None:\n            return', source)
+        self.assertIn('reuse_env = compiler_cache_env if goal_reuse_commands is not None else None', source)
+        self.assertIn('env_extra={**(reuse_env or {}), "TS_RS_EXPORT_DIR": str(codegen_export_base)}', source)
+        self.assertIn('run_step("cargo test", test_cmd, env_extra=reuse_env, timeout=CARGO_TEST_TIMEOUT, goal_phase=goal_phase)', source)
+        self.assertIn('text=output_log is None, env=env, start_new_session=True', source)
+        self.assertIn('bufsize=1 if output_log is None else 0', source)
+        self.assertIn('def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT, goal_phase=None):', source)
+        check = next(node for node in ast.parse(source).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "cmd_check")
+        timeout = next(node.value for node in check.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "CHECK_TIMEOUT"
+                               for target in node.targets))
+        self.assertEqual(ast.literal_eval(timeout), 600)
+        run_step = next(node for node in check.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "run_step")
+        self.assertEqual(run_step.args.kwonlyargs[0].arg, "timeout")
+        self.assertEqual(ast.dump(run_step.args.kw_defaults[0]),
+                         ast.dump(ast.Name(id="CHECK_TIMEOUT", ctx=ast.Load())))
 
 
 class CargoTestTimeoutTests(unittest.TestCase):

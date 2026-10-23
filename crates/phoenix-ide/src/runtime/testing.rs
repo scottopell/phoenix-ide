@@ -708,6 +708,31 @@ pub struct InMemoryStorage {
 
 #[allow(dead_code)]
 impl InMemoryStorage {
+    async fn persist_tool_round_messages(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+    ) -> Result<(), String> {
+        if *self.fail_tool_round_persist.lock().unwrap() {
+            return Err("injected tool round persist failure".to_string());
+        }
+        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.tool_round_persist_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let mut messages = self.messages.lock().unwrap();
+        let bucket = messages.entry(conv_id.to_string()).or_default();
+        bucket.push(assistant.clone());
+        for msg in tool_results {
+            bucket.push(msg.clone());
+        }
+        Ok(())
+    }
+
     pub fn seed_tool_admission_policy(
         &self,
         conversation_id: &str,
@@ -1256,6 +1281,73 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn admit_goal_start_request_context(
+        &self,
+        _conversation_id: &str,
+        _active: Option<&super::traits::ActiveDirectTurn>,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+        _operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
+        Ok(None)
+    }
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        _input: &super::traits::AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>
+    {
+        tracing::debug!("in-memory storage has no durable Start receipt or lease authority");
+        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+            phoenix_db::workflow::GoalStartAdoptionOutcome::Rejected,
+        )
+    }
+
+    async fn admit_goal_control_dispatch(
+        &self,
+        _conv_id: &str,
+        _active: Option<&super::traits::ActiveDirectTurn>,
+    ) -> Result<phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit, String> {
+        tracing::debug!("in-memory test storage has no installed durable goal control");
+        Ok(phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit::disabled())
+    }
+
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        Err("pending goal transactions require the SQLite test store".into())
+    }
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        Err("pending goal transactions require the SQLite test store".into())
+    }
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _proposal: &crate::db::ForkProposal,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        Err("pending goal transactions require the SQLite test store".into())
+    }
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> crate::runtime::traits::TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        crate::runtime::traits::TerminalMutationEstablishment::Unclassifiable(
+            "pending goal transactions require the SQLite test store".into(),
+        )
+    }
+
     async fn read_message_continuation_opening(
         &self,
         _message_id: &str,
@@ -1766,6 +1858,7 @@ impl MessageStore for InMemoryStorage {
         }
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
+            value: (),
         }
     }
 
@@ -1948,6 +2041,8 @@ impl MessageStore for InMemoryStorage {
         assistant: &Message,
         tool_results: &[Message],
         proposal: &crate::db::ForkProposal,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
         {
             let mut messages = self.messages.lock().unwrap();
@@ -1958,32 +2053,8 @@ impl MessageStore for InMemoryStorage {
             }
         }
         self.fork_proposals.lock().unwrap().push(proposal.clone());
-        Ok(())
-    }
-
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &Message,
-        tool_results: &[Message],
-    ) -> Result<(), String> {
-        if *self.fail_tool_round_persist.lock().unwrap() {
-            return Err("injected tool round persist failure".to_string());
-        }
-        if let Some(started) = self.tool_round_persist_started.lock().unwrap().take() {
-            let _ = started.send(());
-        }
-        let release = self.tool_round_persist_release.lock().unwrap().take();
-        if let Some(release) = release {
-            let _ = release.await;
-        }
-        let mut messages = self.messages.lock().unwrap();
-        let bucket = messages.entry(conv_id.to_string()).or_default();
-        bucket.push(assistant.clone());
-        for msg in tool_results {
-            bucket.push(msg.clone());
-        }
-        Ok(())
+        self.update_state(origin_conv_id, state, state_updated_at)
+            .await
     }
 
     async fn persist_tool_round_and_state(
@@ -1994,7 +2065,7 @@ impl MessageStore for InMemoryStorage {
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
-        self.persist_tool_round(conv_id, assistant, tool_results)
+        self.persist_tool_round_messages(conv_id, assistant, tool_results)
             .await?;
         self.update_state(conv_id, state, state_updated_at).await
     }
@@ -2017,13 +2088,14 @@ impl MessageStore for InMemoryStorage {
             establishment => return establishment,
         }
         if let Err(error) = self
-            .persist_tool_round(conv_id, assistant, tool_results)
+            .persist_tool_round_messages(conv_id, assistant, tool_results)
             .await
         {
             return crate::runtime::traits::TerminalMutationEstablishment::Unclassifiable(error);
         }
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
+            value: (),
         }
     }
 
@@ -2049,6 +2121,7 @@ impl MessageStore for InMemoryStorage {
                     .push(message.clone());
                 crate::runtime::traits::TerminalMutationEstablishment::Established {
                     transcript_generation: None,
+                    value: (),
                 }
             }
             crate::runtime::traits::TerminalSubAgentEvidence::Update {
@@ -2071,6 +2144,7 @@ impl MessageStore for InMemoryStorage {
                 message.display_data = Some(display_data.clone());
                 crate::runtime::traits::TerminalMutationEstablishment::Established {
                     transcript_generation: Some(1),
+                    value: (),
                 }
             }
         }
@@ -2079,6 +2153,16 @@ impl MessageStore for InMemoryStorage {
 
 #[async_trait]
 impl StateStore for InMemoryStorage {
+    async fn subscription_goal_captures(
+        &self,
+        _event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    > {
+        Ok(std::collections::HashMap::new())
+    }
+
     async fn update_state(
         &self,
         conv_id: &str,
@@ -3839,7 +3923,9 @@ mod tests {
             let CheckpointData::ToolRound { tool_results, .. } = data;
             assert_eq!(tool_results.len(), 3, "Should have results for all 3 tools");
             assert!(
-                tool_results.iter().all(|r| !r.is_success()),
+                tool_results
+                    .iter()
+                    .all(|r| !r.finalized().unwrap().is_success()),
                 "All should be marked as failed/cancelled"
             );
         }

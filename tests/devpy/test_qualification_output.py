@@ -47,7 +47,7 @@ class QualificationOutputTests(unittest.TestCase):
         step = next(node for node in check.body if isinstance(node, ast.FunctionDef)
                     and node.name == "run_step")
         namespace = dict(vars(self.dev), CHECK_TIMEOUT=600, compiler_cache_env=None,
-                         worker_budget=1, profile_work=False,
+                         worker_budget=1, profile_work=False, focused_only=False, goal_reuse_commands=None,
                          reporter=self.reporter, results=self.results, results_lock=threading.Lock(),
                          _begin_dev_span=mock.Mock(return_value=None),
                          _finish_check_step_span=mock.Mock(),
@@ -76,6 +76,320 @@ class QualificationOutputTests(unittest.TestCase):
         else:
             kill.assert_not_called()
         return result, process
+
+    def test_goal_broad_log_route_does_not_replace_clippy_route(self):
+        self.namespace["goal_reuse_commands"] = ([], [], [])
+        os.environ["PHOENIX_GOAL_REUSE_DIR"] = str(self.directory)
+        process = mock.Mock(pid=12345, stdout=io.BytesIO(b"goal-broad-output\n"), returncode=0)
+        process.wait.return_value = 0
+        with mock.patch.object(self.dev.subprocess, "Popen", return_value=process), \
+             mock.patch.object(self.dev.select, "select", side_effect=lambda streams, *_: (streams, [], [])):
+            self.assertEqual(self.run_step("cargo test", ["fixture"]), 0)
+        self.assertIn(b"goal-broad-output", (self.directory / "cargo-tests.full.log").read_bytes())
+        self.assertFalse((self.directory / "cargo-clippy.full.log").exists())
+
+    def test_focused_timeout_uses_one_cleanup_cap_and_reaps_before_return(self):
+        import types
+        clock = [100.0]
+        root = mock.Mock(pid=12345, returncode=None, stdout=None)
+        def wait(*, timeout):
+            self.assertIsNone(root.returncode)
+            self.assertLessEqual(timeout, 2)
+            clock[0] += 1.5
+            root.returncode = -signal.SIGTERM
+            return root.returncode
+        root.wait.side_effect = wait
+        profile = types.SimpleNamespace(metadata={"goal_step_deadline_ns": 600_000_000_000},
+            goal_owned_process=root, goal_owned_reader=None, goal_reader_stop=None,
+            goal_owned_output=None, goal_owned_finisher=None, goal_capture_error="")
+        calls = []
+        def kill(pid, signum):
+            calls.append((pid, signum, root.returncode))
+            if signum == 0:
+                raise ProcessLookupError()
+            self.assertIsNone(root.returncode, "TERM/KILL requires actual unreaped custody")
+        with mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(self.dev.os, "killpg", side_effect=kill):
+            self.assertEqual(self.dev._goal_begin_cleanup(profile), 110)
+            self.dev._goal_reap_before_finalize(profile, terminate=True, timed_out=True)
+            clock[0] = 108
+            self.assertEqual(self.dev._goal_begin_cleanup(profile), 110)
+        self.assertEqual(calls, [(root.pid, signal.SIGTERM, None), (root.pid, 0, -signal.SIGTERM)])
+        self.assertIsNone(profile.goal_owned_process)
+
+
+    def test_reaped_root_is_not_signalled_again_from_a_remembered_pgid(self):
+        import types
+        proc = mock.Mock(pid=12345, returncode=0, stdout=None)
+        profile = types.SimpleNamespace(metadata={"goal_step_deadline_ns": time.monotonic_ns() + 600_000_000_000},
+            goal_owned_process=proc, goal_owned_reader=None, goal_reader_stop=None,
+            goal_owned_output=None, goal_owned_finisher=None, goal_capture_error="")
+        with mock.patch.object(self.dev.os, "killpg", side_effect=ProcessLookupError()) as kill:
+            self.dev._goal_reap_before_finalize(profile, terminate=True)
+        kill.assert_called_once_with(proc.pid, 0)  # Observation only, never TERM/KILL.
+        proc.wait.assert_not_called()
+        self.assertIsNone(profile.goal_owned_process)
+
+
+    def test_wait_sets_reaped_status_then_interrupts_preserves_error_without_signal(self):
+        import types
+        profile = types.SimpleNamespace(metadata={"goal_step_deadline_ns": time.monotonic_ns() + 600_000_000_000},
+            goal_owned_process=None, goal_owned_reader=None, goal_reader_stop=None,
+            goal_owned_output=None, goal_owned_finisher=None, goal_capture_error="")
+        self.namespace.update(focused_only=True, _CHECK_PROFILE=profile,
+                              goal_step_deadline_ns=profile.metadata["goal_step_deadline_ns"])
+        proc = mock.Mock(pid=12345, returncode=None, stdout=io.BytesIO(b"before interrupt\n"))
+        original = InterruptedError("deterministic post-reap handler gap")
+        def wait(*, timeout):
+            proc.returncode = 0
+            raise original
+        proc.wait.side_effect = wait
+        with mock.patch.object(self.dev.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(self.dev.os, "killpg", side_effect=ProcessLookupError()) as kill, \
+             mock.patch.object(self.dev.select, "select", side_effect=lambda streams, *_: (streams, [], [])):
+            with self.assertRaises(InterruptedError) as caught:
+                self.run_step("cargo clippy", ["fixture"], timeout=7)
+        self.assertIs(caught.exception, original)
+        self.assertEqual(kill.call_args_list, [mock.call(proc.pid, 0)])
+        self.assertEqual(proc.wait.call_count, 1)
+        self.assertIsNone(profile.goal_owned_process)
+        self.assertEqual(self.results, [])
+
+    def test_one_fake_clock_budget_covers_timeout_reap_drain_and_repeat_finalizer(self):
+        import types
+        clock = [200.0]
+        proc = mock.Mock(pid=12345, returncode=None, stdout=None)
+        def wait(*, timeout):
+            self.assertLessEqual(timeout, 2)
+            clock[0] += timeout
+            proc.returncode = -15
+        proc.wait.side_effect = wait
+        joined = []
+        reader = mock.Mock(ident=1)
+        reader.is_alive.return_value = True
+        def join(*, timeout):
+            joined.append(timeout)
+            self.assertLessEqual(timeout, max(0, 208 - clock[0]))
+            clock[0] += timeout
+        reader.join.side_effect = join
+        log = mock.Mock(DRAIN_SECONDS=5, error="")
+        profile = types.SimpleNamespace(artifacts_finalized=False,
+            metadata={"goal_step_deadline_ns": 208_000_000_000}, goal_owned_process=proc,
+            goal_owned_reader=reader, goal_reader_stop=threading.Event(), goal_owned_output=log,
+            goal_owned_finisher=None, goal_capture_error="")
+        def kill(pid, signum):
+            if signum == 0:
+                raise ProcessLookupError()
+            self.assertIsNone(proc.returncode)
+        with mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(self.dev.os, "killpg", side_effect=kill), \
+             mock.patch.object(self.dev, "_CHECK_PROFILE", profile), \
+             mock.patch.object(self.dev.subprocess, "run") as report:
+            self.dev._goal_begin_cleanup(profile)
+            with self.assertRaisesRegex(RuntimeError, "reader remains alive"):
+                self.dev._goal_reap_before_finalize(profile, terminate=True, timed_out=True)
+            self.assertEqual(profile.metadata["goal_cleanup_deadline"], 208)
+            self.assertEqual(clock[0], 208)
+            calls = list(joined)
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "incomplete focused closure"):
+                    self.dev._finalize_check_profile(None)
+            self.assertEqual(joined, calls)
+        self.assertEqual(joined, [5, 1])
+        log.settle_reader.assert_not_called()
+        log.finish.assert_not_called()
+        report.assert_not_called()
+        self.assertFalse(profile.artifacts_finalized)
+
+    def test_real_owned_reader_blocked_append_never_enters_finish_lock(self):
+        import types
+        for mode in ("normal", "timeout", "interrupt"):
+            with self.subTest(mode=mode):
+                log = self.dev._QualificationOutputLog(self.directory / (mode + ".log"))
+                entered, release = threading.Event(), threading.Event()
+                actual_output = log.output
+                class HeldWrite:
+                    closed = False
+                    def write(inner, data):
+                        entered.set()
+                        if not release.wait(timeout=2):
+                            raise RuntimeError("test failed to release held writer")
+                        return actual_output.write(data)
+                    def close(inner):
+                        inner.closed = True
+                        actual_output.close()
+                log.output = HeldWrite()
+                reader = threading.Thread(target=lambda: log.append(b"owned append\n"), daemon=True)
+                reader.start()
+                self.assertTrue(entered.wait(timeout=2))
+                clock = [300.0]
+                real_join = reader.join
+                joins = []
+                def virtual_join(*, timeout):
+                    self.assertLessEqual(timeout, max(0, 310 - clock[0]))
+                    joins.append(timeout)
+                    clock[0] += timeout
+                    real_join(timeout=0)
+                root = mock.Mock(pid=12345, returncode=0, stdout=None)
+                profile = types.SimpleNamespace(artifacts_finalized=False,
+                    metadata={"goal_step_deadline_ns": 900_000_000_000}, goal_owned_process=root,
+                    goal_owned_reader=reader, goal_reader_stop=threading.Event(), goal_owned_output=log,
+                    goal_owned_finisher=None, goal_capture_error="")
+                try:
+                    with mock.patch.object(reader, "join", side_effect=virtual_join), \
+                         mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: clock[0]), \
+                         mock.patch.object(self.dev.os, "killpg", side_effect=ProcessLookupError()) as signal_group, \
+                         mock.patch.object(log, "finish", wraps=log.finish) as finish, \
+                         mock.patch.object(self.dev, "_CHECK_PROFILE", profile), \
+                         mock.patch.object(self.dev.subprocess, "run") as report:
+                        self.assertEqual(self.dev._goal_begin_cleanup(profile), 310)
+                        with self.assertRaisesRegex(RuntimeError, "reader remains alive"):
+                            self.dev._goal_reap_before_finalize(profile,
+                                terminate=mode != "normal", timed_out=mode == "timeout")
+                        self.assertEqual(clock[0], 310)
+                        self.assertEqual(joins, [5, 5])
+                        finish.assert_not_called()
+                        for _ in range(2):
+                            with self.assertRaisesRegex(RuntimeError, "incomplete focused closure"):
+                                self.dev._finalize_check_profile(None)
+                        self.assertFalse(profile.artifacts_finalized)
+                        report.assert_not_called()
+                        signal_group.assert_called_once_with(root.pid, 0)
+                finally:
+                    release.set()
+                    real_join(timeout=2)
+                    self.assertFalse(reader.is_alive())
+                    if not actual_output.closed:
+                        actual_output.close()
+
+    def test_incomplete_finalizer_preserves_existing_interrupt_and_never_reports(self):
+        import types
+        original = InterruptedError("original interrupted wait")
+        profile = types.SimpleNamespace(artifacts_finalized=False,
+                                        metadata={"goal_cleanup_failed": "reader held"})
+        with mock.patch.object(self.dev, "_CHECK_PROFILE", profile), \
+             mock.patch.object(self.dev.subprocess, "run") as report:
+            self.assertIsNone(self.dev._finalize_check_profile(original))
+            self.assertIn("incomplete focused closure", original.__notes__[0])
+            with self.assertRaisesRegex(RuntimeError, "incomplete focused closure"):
+                self.dev._finalize_check_profile(None)
+        self.assertFalse(profile.artifacts_finalized)
+        report.assert_not_called()
+
+    def test_finish_blocked_write_is_owned_bounded_and_never_finalized(self):
+        import types
+        log = self.dev._QualificationOutputLog(self.directory / "blocked-footer.log")
+        entered, release = threading.Event(), threading.Event()
+        actual_output = log.output
+        class HeldFooter:
+            closed = False
+            def write(inner, data):
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise RuntimeError("test did not release footer")
+                return actual_output.write(data)
+            def close(inner):
+                inner.closed = True
+                actual_output.close()
+        log.output = HeldFooter()
+        root = mock.Mock(pid=12345, returncode=0, stdout=None)
+        reader = mock.Mock(ident=1)
+        reader.is_alive.return_value = False
+        clock = [350.0]
+        profile = types.SimpleNamespace(artifacts_finalized=False,
+            metadata={"goal_step_deadline_ns": 900_000_000_000}, goal_owned_process=root,
+            goal_owned_reader=reader, goal_reader_stop=threading.Event(), goal_owned_output=log,
+            goal_owned_finisher=None, goal_capture_error="")
+        actual_join = threading.Thread.join
+        def join_finisher(thread, *, timeout):
+            self.assertTrue(entered.wait(timeout=2))
+            self.assertLessEqual(timeout, 360 - clock[0])
+            clock[0] += timeout
+            actual_join(thread, timeout=0)
+        try:
+            with mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(self.dev.os, "killpg", side_effect=ProcessLookupError()), \
+                 mock.patch.object(threading.Thread, "join", autospec=True, side_effect=join_finisher), \
+                 mock.patch.object(self.dev, "_CHECK_PROFILE", profile), \
+                 mock.patch.object(self.dev.subprocess, "run") as report:
+                with self.assertRaisesRegex(RuntimeError, "capture finish remains alive"):
+                    self.dev._goal_reap_before_finalize(profile)
+                self.assertEqual(clock[0], 360)
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError, "incomplete focused closure"):
+                        self.dev._finalize_check_profile(None)
+                self.assertFalse(profile.artifacts_finalized)
+                report.assert_not_called()
+        finally:
+            release.set()
+            if profile.goal_owned_finisher is not None:
+                actual_join(profile.goal_owned_finisher, timeout=2)
+                self.assertFalse(profile.goal_owned_finisher.is_alive())
+            if not actual_output.closed:
+                actual_output.close()
+
+    def test_real_owned_pipe_normal_root_deadline_precedes_reader_drain(self):
+        import types
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", buffering=0)
+        log = self.dev._QualificationOutputLog(self.directory / "focused-held-pipe.log")
+        observed, stopped = threading.Event(), threading.Event()
+        os.write(write_fd, b"ready from owned pipe\n")
+        def read():
+            try:
+                log.read(stream, stopped, lambda _: observed.set())
+            finally:
+                stream.close()
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        self.assertTrue(observed.wait(timeout=2))
+        clock = [400.0]
+        joins = []
+        real_join = reader.join
+        def join(*, timeout):
+            self.assertLessEqual(timeout, max(0, 410 - clock[0]))
+            joins.append(timeout)
+            if len(joins) == 1:
+                clock[0] += timeout
+            else:
+                # Release the test-owned writer at the stop barrier; no sleep/poll surrogate.
+                os.close(write_fd)
+                real_join(timeout=min(2, timeout))
+        root = mock.Mock(pid=12345, returncode=0, stdout=stream)
+        profile = types.SimpleNamespace(metadata={"goal_step_deadline_ns": 900_000_000_000},
+            goal_owned_process=root, goal_owned_reader=reader, goal_reader_stop=stopped,
+            goal_owned_output=log, goal_owned_finisher=None, goal_capture_error="")
+        try:
+            with mock.patch.object(reader, "join", side_effect=join), \
+                 mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(self.dev.os, "killpg", side_effect=ProcessLookupError()):
+                self.dev._goal_begin_cleanup(profile)
+                error = self.dev._goal_reap_before_finalize(profile)
+            self.assertEqual(profile.metadata["goal_cleanup_deadline"], 410)
+            self.assertEqual(joins, [5, 5])
+            self.assertIn("writer ownership unresolved", error)
+            self.assertTrue(stream.closed)
+            self.assertIsNone(profile.goal_owned_process)
+            self.assertIn(b"payload INCOMPLETE", log.path.read_bytes())
+        finally:
+            stopped.set()
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+            real_join(timeout=2)
+            if not log.output.closed:
+                log.output.close()
+
+    def test_unreaped_focused_command_cannot_finalize_profile(self):
+        import types
+        profile = types.SimpleNamespace(artifacts_finalized=False, metadata={"goal_unreaped": True})
+        with mock.patch.object(self.dev, "_CHECK_PROFILE", profile), \
+             mock.patch.object(self.dev.subprocess, "run") as report:
+            with self.assertRaisesRegex(RuntimeError, "before focused command reap"):
+                self.dev._finalize_check_profile(None)
+        report.assert_not_called()
+        self.assertFalse(profile.artifacts_finalized)
 
     def test_clippy_diagnostics_capture_all_output_without_goal_reuse(self):
         os.environ.pop("PHOENIX_CHECK_DIAGNOSTIC_DIR", None)

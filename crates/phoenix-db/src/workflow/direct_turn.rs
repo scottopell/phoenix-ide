@@ -1,7 +1,13 @@
 use super::WorkflowRepository;
+mod goal_start;
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
 use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};
+pub(crate) use goal_start::insert_goal_start_turn_tx;
+pub use goal_start::{
+    AdmittedGoalRequest, GoalStartAdoptionInput, GoalStartAdoptionOutcome, GoalStartRecoveryInput,
+    GoalStartRecoveryOutcome, GoalStartRequestContext, RecoveredGoalStartRuntime,
+};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::db_schema::{
@@ -14,10 +20,10 @@ use phoenix_core::domain::sm_event::{
 use phoenix_workflow::{
     direct_turn_profile, AcceptedDisposition, AttemptId, AttemptStatus, AuthorityOutcome,
     CanonicalMessageId, ClaimOutcome, ClientTurnKey, ConversationAuthority, DeliveryId,
-    DurableTurn, EffectId, EffectRole, EffectStatus, ExecutionCapability, Generation, LeaseExpiry,
-    Materialization, PreparedTurn, ProcessIncarnation, ReceiptId, Timestamp, TurnAuthorityId,
-    TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
-    WorkflowId, WorkflowStatus,
+    DurableTurn, EffectId, EffectRole, EffectStatus, ExecutionCapability, Generation,
+    GoalStartReceiptId, LeaseExpiry, Materialization, PreparedTurn, ProcessIncarnation, ReceiptId,
+    Timestamp, TurnAuthorityId, TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep,
+    TurnTerminal, Version, WorkflowId, WorkflowStatus,
 };
 use sqlx::{Connection, Row};
 
@@ -169,6 +175,11 @@ pub enum ScopedDirectTurnReplayLookup {
     },
 }
 
+struct LocalMaterializationCheck<'a> {
+    authority: &'a super::LocalAttemptAuthority,
+    now: Timestamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightDirectTurnMaterializationInput {
     pub turn_id: TurnAuthorityId,
@@ -261,6 +272,11 @@ pub enum TerminalEvidenceExpectation {
         conversation_id: String,
     },
     Messages(Vec<Message>),
+    GoalRound {
+        assistant: Box<Message>,
+        execution: phoenix_core::domain::conversation_goal::GoalExecution,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+    },
     MessageMutation {
         conversation_id: String,
         message_id: String,
@@ -362,15 +378,19 @@ impl WorkflowRepository {
             return Err(error);
         }
 
-        let submitted_message_id =
-            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-                .map_err(|_| {
-                    conflict(TurnConflict::CorruptAggregate(
-                        "prepared payload decode failed",
-                    ))
-                })?
-                .message_id()
-                .to_string();
+        let submitted_message_id = PreparedDirectTurnPayload::from_exact_bytes(
+            input
+                .prepared
+                .message_payload()
+                .map_err(DbError::DirectTurnConflict)?,
+        )
+        .map_err(|_| {
+            conflict(TurnConflict::CorruptAggregate(
+                "prepared payload decode failed",
+            ))
+        })?
+        .message_id()
+        .to_string();
         let legacy_message_exists = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(
                  SELECT 1 FROM messages
@@ -386,7 +406,7 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Err(prepared_semantics_changed(&input.prepared));
         }
-        if input.disposition == AcceptedDisposition::Runtime {
+        let active_owner = if input.disposition == AcceptedDisposition::Runtime {
             if let Some(owner) = sqlx::query_scalar::<_, i64>(
                 "SELECT turn_id FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1",
             )
@@ -399,30 +419,50 @@ impl WorkflowRepository {
                     owner: TurnAuthorityId(to_u64(owner, "turn_id")?),
                 }));
             }
-        } else if let Some(owner) =
-            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, input.conversation()).await?
-        {
-            if owner.conversation != *input.conversation() {
+            None
+        } else {
+            let owner =
+                load_active_runtime_turn_tx(&self.pool, &mut tx.tx, input.conversation()).await?;
+            if owner
+                .as_ref()
+                .is_some_and(|owner| owner.conversation != *input.conversation())
+            {
                 tx.rollback().await?;
                 return Err(DbError::Serialization(
                     "active runtime owner rehydrated under wrong conversation".to_string(),
                 ));
             }
-        }
+            owner
+        };
         let turn_id = next_direct_turn_id_tx(&mut tx).await?;
         let workflow_id = super::next_global_workflow_id_tx(&mut tx).await?;
+        let mut model =
+            phoenix_workflow::DurableTurnModel::from_turns(active_owner).map_err(conflict)?;
+        let step = model
+            .apply(TurnCommand::Accept {
+                turn_id,
+                conversation: input.conversation().clone(),
+                client_key: input.client_key.clone(),
+                prepared: input.prepared.clone(),
+                disposition: input.disposition,
+            })
+            .map_err(conflict)?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
-        let prepared_payload =
-            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-                .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let prepared_payload = PreparedDirectTurnPayload::from_exact_bytes(
+            input
+                .prepared
+                .message_payload()
+                .map_err(DbError::DirectTurnConflict)?,
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
             "INSERT INTO durable_turns (
                 turn_id, conversation_id, client_turn_key, prepared_fingerprint,
                 prepared_payload, disposition, generation, terminal_kind,
                 terminal_reason, owns_conversation, canonical_message_id, workflow_id,
-                origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(&input.conversation().0)
@@ -440,12 +480,28 @@ impl WorkflowRepository {
         .bind(prepared_payload.submitted.origin.db_parts().1)
         .bind(prepared_payload.submitted.origin.db_parts().2)
         .bind(prepared_payload.submitted.origin.db_parts().3)
+        .bind(prepared_payload.submitted.origin.db_parts().4)
     .bind(prepared_payload.submitted.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(prepared_payload.submitted.origin.source_call().map(|call| call.tool_use_id.as_str()))
         .execute(&mut *tx.tx)
         .await
         .map_err(map_constraint)?;
         insert_prepared_turn_attachments_tx(&mut tx.tx, turn_id, &prepared_payload).await?;
+        if input.disposition == AcceptedDisposition::Runtime {
+            let execution = phoenix_core::domain::conversation_goal::GoalExecution::parse(
+                to_i64(workflow_id.0, "workflow_id")?,
+                to_i64(turn_id.0, "turn_id")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx.tx, execution).await?;
+            crate::conversation_goals::control::capture_runtime_control_tx(
+                &mut tx.tx,
+                execution,
+                self.goal_control_installation,
+            )
+            .await
+            .map_err(crate::conversation_goals::control::db_error)?;
+        }
         if cut == TransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(injected_cut(cut));
@@ -454,16 +510,7 @@ impl WorkflowRepository {
         if cut == TransactionCut::AfterCommit {
             return Err(injected_cut(cut));
         }
-        let mut model = phoenix_workflow::DurableTurnModel::default();
-        model
-            .apply(TurnCommand::Accept {
-                turn_id,
-                conversation: input.conversation().clone(),
-                client_key: input.client_key.clone(),
-                prepared: input.prepared.clone(),
-                disposition: input.disposition,
-            })
-            .map_err(conflict)
+        Ok(step)
     }
 
     pub async fn exact_turn_retired(
@@ -532,7 +579,10 @@ impl WorkflowRepository {
         PreparedTurn::rehydrate(
             &turn.conversation,
             turn.prepared.fingerprint().to_string(),
-            turn.prepared.payload().to_vec(),
+            turn.prepared
+                .message_payload()
+                .map_err(DbError::DirectTurnConflict)?
+                .to_vec(),
         )
         .map_err(DbError::DirectTurnConflict)?;
         if !stored.submitted_identity_matches(submitted) {
@@ -755,7 +805,7 @@ impl WorkflowRepository {
              SET generation = ?2, terminal_kind = NULL, terminal_reason = NULL,
                  owns_conversation = 1
              WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NOT NULL
-               AND disposition = 'Runtime' AND canonical_message_id IS NULL
+               AND disposition = 'Runtime' AND materialized = 0
                AND NOT EXISTS (
                    SELECT 1 FROM durable_turns owner
                    WHERE owner.conversation_id = durable_turns.conversation_id
@@ -1223,7 +1273,8 @@ impl WorkflowRepository {
         let rows = sqlx::query(
             "SELECT durable_turns.turn_id, durable_turns.workflow_id,
                     durable_turns.conversation_id, durable_turns.prepared_fingerprint,
-                    durable_turns.prepared_payload
+                    durable_turns.prepared_payload, durable_turns.input_kind,
+                    durable_turns.materialized, durable_turns.goal_start_id, durable_turns.canonical_message_id
              FROM durable_turns
              JOIN conversations ON conversations.id = durable_turns.conversation_id
              JOIN product_conversations product
@@ -1245,7 +1296,7 @@ impl WorkflowRepository {
                  OR (product.kind <> 'ordinary' AND conversations.archived = 0)
                )
                AND terminal_kind IS NULL
-               AND canonical_message_id IS NULL
+               AND materialized = 0
                AND workflow_id IS NOT NULL
                AND (durable_turns.turn_id > ?1 OR (durable_turns.turn_id = ?1 AND durable_turns.workflow_id > ?2))
              ORDER BY durable_turns.turn_id, durable_turns.workflow_id
@@ -1371,6 +1422,20 @@ impl WorkflowRepository {
             return Ok(DirectTurnMaterializationEligibility::ExactReplay);
         }
 
+        Self::preflight_local_materialization_authority_tx(
+            tx,
+            &LocalMaterializationCheck {
+                authority: &input.authority,
+                now: input.now,
+            },
+        )
+        .await
+    }
+
+    async fn preflight_local_materialization_authority_tx(
+        tx: &mut super::WorkflowTx<'_>,
+        input: &LocalMaterializationCheck<'_>,
+    ) -> DbResult<DirectTurnMaterializationEligibility> {
         let Some(authority_row) = sqlx::query(
             "SELECT e.status AS effect_status, a.status AS attempt_status, l.lease_until
              FROM workflow_effects e
@@ -1518,7 +1583,7 @@ impl WorkflowRepository {
                     ) AS materialization_committed,
                     m.message_id, m.sequence_id, m.message_type, m.content,
                     m.display_data, m.usage_data, m.created_at,
-                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_message_id, m.origin_source_tool_use_id
+                    m.origin_kind, m.origin_product_conversation_id, m.origin_transcript_id, m.origin_subscription_event_id, m.origin_source_instance_id, m.origin_source_message_id, m.origin_source_tool_use_id
              FROM durable_turns dt
              JOIN conversations c ON c.id = dt.conversation_id
              LEFT JOIN messages m ON m.message_id = dt.canonical_message_id
@@ -1712,9 +1777,9 @@ impl WorkflowRepository {
         )
         .await?;
         let updated = sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1
                  WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NULL
-                   AND canonical_message_id IS NULL AND workflow_id = ?4",
+                   AND input_kind = 'message' AND materialized = 0 AND workflow_id = ?4",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(&message.message_id)
@@ -2134,6 +2199,28 @@ impl WorkflowRepository {
         persist_terminal_obligation_tx(tx, input).await
     }
 
+    pub(crate) async fn terminal_obligation_matches_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        expected: &DirectTurnTerminalObligationInput,
+    ) -> DbResult<bool> {
+        let row = sqlx::query(
+            "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
+                    target_state, target_state_updated_at_us, response_message_id
+             FROM direct_turn_terminal_obligations WHERE turn_id=?",
+        )
+        .bind(to_i64(expected.turn_id.0, "turn_id")?)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let actual = parse_terminal_obligation_row(&row)?;
+        Ok(actual.expected_generation == expected.expected_generation
+            && actual.terminal == expected.terminal
+            && projections_match(&actual.projection, &expected.projection)
+            && actual.response_message_id == expected.response_message_id)
+    }
+
     pub async fn load_active_terminal_obligation(
         &self,
         conversation: &ConversationAuthority,
@@ -2205,15 +2292,27 @@ impl WorkflowRepository {
                     matches &= actual.as_ref().is_some_and(|actual| {
                         actual.conversation_id == expected_message.conversation_id
                             && (identity_only
-                                || (actual.sequence_id == expected_message.sequence_id
-                                    && actual.message_type == expected_message.message_type
-                                    && actual.content == expected_message.content
-                                    && actual.display_data == expected_message.display_data
-                                    && actual.usage_data == expected_message.usage_data
-                                    && actual.created_at == expected_message.created_at))
+                                || crate::message_payload_matches(actual, expected_message))
                     });
                 }
                 matches
+            }
+            TerminalEvidenceExpectation::GoalRound {
+                assistant,
+                execution,
+                results,
+            } => {
+                let checkpoint = crate::conversation_goals::round::GoalRoundCheckpoint {
+                    assistant,
+                    execution: *execution,
+                    results,
+                    state: &expected.projection.state,
+                    state_updated_at: expected.projection.state_updated_at,
+                };
+                crate::conversation_goals::round::retained_round_tx(&mut tx, &checkpoint)
+                    .await
+                    .map_err(crate::conversation_goals::round::db_error)?
+                    .is_some()
             }
             TerminalEvidenceExpectation::MessageMutation {
                 conversation_id,
@@ -2459,6 +2558,7 @@ impl WorkflowRepository {
                     &mut tx.tx,
                     occurrence.expect("guarded occurrence"),
                     &terminal,
+                    self.goal_control_installation,
                 )
                 .await?;
                 telemetry
@@ -2476,7 +2576,13 @@ impl WorkflowRepository {
                     "terminal command produced nonterminal outcome".to_string(),
                 ));
             };
-            settle_captured_execution_occurrence_tx(&mut tx.tx, occurrence, terminal).await?;
+            settle_captured_execution_occurrence_tx(
+                &mut tx.tx,
+                occurrence,
+                terminal,
+                self.goal_control_installation,
+            )
+            .await?;
         }
         if cut == TransactionCut::BeforeCommit {
             telemetry
@@ -2513,7 +2619,7 @@ impl WorkflowRepository {
         Ok(())
     }
 
-    async fn terminalize_authoritative_turn_in_tx(
+    pub(crate) async fn terminalize_authoritative_turn_in_tx(
         &self,
         tx: &mut super::WorkflowTx<'_>,
         input: &TerminalizeAuthoritativeTurnInput,
@@ -2643,8 +2749,10 @@ impl WorkflowRepository {
         }
         crate::coordinator_watches::record_terminal_event_tx(
             &mut tx.tx,
-            turn_id.0,
-            expected_generation,
+            crate::coordinator_watches::TerminalEventSource {
+                turn_id: turn_id.0,
+                generation: expected_generation,
+            },
             &turn.conversation.0,
             terminal_kind,
             reason,
@@ -2655,6 +2763,7 @@ impl WorkflowRepository {
                     .map(|projection| &projection.state),
                 Some(ConvState::ContextExhausted { .. })
             ),
+            self.goal_control_installation,
         )
         .await?;
         sqlx::query("DELETE FROM direct_turn_terminal_obligations WHERE turn_id = ?1")
@@ -2821,7 +2930,7 @@ async fn load_exact_rearmed_turn_tx(
                AND (
                    (w.status = 'Active' AND t.terminal_kind IS NULL
                     AND e.status IN ('Eligible', 'Executing'))
-                   OR t.canonical_message_id IS NOT NULL
+                   OR t.materialized = 1
                    OR e.status = 'Completed'
                )
          )",
@@ -3016,6 +3125,7 @@ fn expected_conversation_id(evidence: &TerminalEvidenceExpectation) -> &str {
         TerminalEvidenceExpectation::Messages(messages) => messages
             .first()
             .map_or("", |message| message.conversation_id.as_str()),
+        TerminalEvidenceExpectation::GoalRound { assistant, .. } => &assistant.conversation_id,
         TerminalEvidenceExpectation::ObligationOnly { conversation_id }
         | TerminalEvidenceExpectation::MessageMutation {
             conversation_id, ..
@@ -3157,6 +3267,7 @@ async fn settle_captured_execution_occurrence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     occurrence: CapturedExecutionOccurrence,
     terminal: &TurnTerminal,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     let (terminal_kind, terminal_reason) = match terminal {
         TurnTerminal::Completed => ("Completed", None),
@@ -3172,6 +3283,7 @@ async fn settle_captured_execution_occurrence_tx(
         &occurrence.conversation_id,
         terminal_kind,
         terminal_reason,
+        installation,
     )
     .await?;
     sqlx::query("DELETE FROM steering_execution_occurrences WHERE message_id = ?1")
@@ -3204,6 +3316,7 @@ fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u
         )),
         TurnCommand::Accept { .. }
         | TurnCommand::Materialize { .. }
+        | TurnCommand::MaterializeGoalStart { .. }
         | TurnCommand::Rearm { .. } => Err(DbError::Serialization(
             "terminal repository command required".to_string(),
         )),
@@ -3328,6 +3441,13 @@ async fn load_prepared_turn_from_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> DbResult<PreparedTurn> {
     let conversation = ConversationAuthority(row.get("conversation_id"));
+    if let Some(start) = prepared_goal_start(
+        &conversation,
+        &row.try_get::<String, _>("prepared_fingerprint")?,
+        &row_materialization(row)?,
+    )? {
+        return Ok(start);
+    }
     let payload = load_prepared_payload_pool(
         pool,
         TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
@@ -3387,7 +3507,7 @@ async fn load_prepared_payload_pool(
     pool: &sqlx::SqlitePool,
     turn_id: TurnAuthorityId,
 ) -> DbResult<PreparedDirectTurnPayload> {
-    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id FROM durable_turns WHERE turn_id = ?1")
+    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id FROM durable_turns WHERE turn_id = ?1")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .fetch_one(pool)
         .await?;
@@ -3411,7 +3531,7 @@ async fn load_prepared_payload_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn_id: TurnAuthorityId,
 ) -> DbResult<PreparedDirectTurnPayload> {
-    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id FROM durable_turns WHERE turn_id = ?1")
+    let row = sqlx::query("SELECT prepared_payload, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id FROM durable_turns WHERE turn_id = ?1")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .fetch_one(&mut **tx)
         .await?;
@@ -3647,8 +3767,8 @@ async fn insert_canonical_message_tx(
     sqlx::query(
         "INSERT INTO messages (
             message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at,
-            origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )
     .bind(&canonical_message_id.0)
     .bind(&turn.conversation.0)
@@ -3661,6 +3781,7 @@ async fn insert_canonical_message_tx(
     .bind(prepared.submitted.origin.db_parts().1)
     .bind(prepared.submitted.origin.db_parts().2)
     .bind(prepared.submitted.origin.db_parts().3)
+    .bind(prepared.submitted.origin.db_parts().4)
     .bind(prepared.submitted.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(prepared.submitted.origin.source_call().map(|call| call.tool_use_id.as_str()))
     .execute(&mut *tx.tx)
@@ -3728,7 +3849,7 @@ async fn load_message_by_id_tx(
     message_id: &str,
 ) -> DbResult<Message> {
     let row = sqlx::query(
-        "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
+        "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id
          FROM messages WHERE message_id = ?1",
     )
     .bind(message_id)
@@ -3981,7 +4102,7 @@ fn row_to_turn_stub(
         other => {
             return Err(DbError::Serialization(format!(
                 "unknown disposition {other}"
-            )))
+            )));
         }
     };
     let terminal_kind = row.get::<Option<String>, _>("terminal_kind");
@@ -4029,7 +4150,7 @@ fn row_to_turn_stub(
         Some(other) => {
             return Err(DbError::Serialization(format!(
                 "unknown terminal kind {other}"
-            )))
+            )));
         }
     };
     let expected_owns_conversation = matches!(
@@ -4050,13 +4171,51 @@ fn row_to_turn_stub(
             .map_err(|e| DbError::Serialization(e.to_string()))?,
         to_u64(row.get("generation"), "generation")?,
         lifecycle,
-        row.get::<Option<String>, _>("canonical_message_id").map_or(
-            Materialization::Unmaterialized,
-            |message_id| Materialization::Materialized {
-                message_id: CanonicalMessageId(message_id),
-            },
-        ),
+        row_materialization(&row)?,
     ))
+}
+
+fn row_materialization(row: &sqlx::sqlite::SqliteRow) -> DbResult<Materialization> {
+    let kind: String = row.try_get("input_kind")?;
+    let materialized: i64 = row.try_get("materialized")?;
+    let message: Option<String> = row.try_get("canonical_message_id")?;
+    let start: Option<i64> = row.try_get("goal_start_id")?;
+    match (kind.as_str(), materialized, message, start) {
+        ("message", 0, None, None) => Ok(Materialization::Unmaterialized),
+        ("message", 1, Some(message), None) => Ok(Materialization::Materialized {
+            message_id: CanonicalMessageId(message),
+        }),
+        ("goal_start", value @ (0 | 1), None, Some(start)) => {
+            let receipt = GoalStartReceiptId::new(to_u64(start, "goal_start_id")?)
+                .ok_or_else(|| conflict(TurnConflict::CorruptAggregate("invalid Start receipt")))?;
+            Ok(if value == 0 {
+                Materialization::UnmaterializedGoalStart { receipt }
+            } else {
+                Materialization::MaterializedGoalStart { receipt }
+            })
+        }
+        _ => Err(conflict(TurnConflict::CorruptAggregate(
+            "canonical input materialization truth table",
+        ))),
+    }
+}
+
+fn prepared_goal_start(
+    conversation: &ConversationAuthority,
+    fingerprint: &str,
+    materialization: &Materialization,
+) -> DbResult<Option<PreparedTurn>> {
+    match materialization {
+        Materialization::UnmaterializedGoalStart { receipt }
+        | Materialization::MaterializedGoalStart { receipt } => {
+            let prepared = PreparedTurn::from_goal_start(conversation, *receipt);
+            if prepared.fingerprint() != fingerprint {
+                return Err(prepared_semantics_changed(&prepared));
+            }
+            Ok(Some(prepared))
+        }
+        Materialization::Unmaterialized | Materialization::Materialized { .. } => Ok(None),
+    }
 }
 
 async fn row_to_turn_tx(
@@ -4066,12 +4225,19 @@ async fn row_to_turn_tx(
     let fingerprint: String = row.get("prepared_fingerprint");
     let (id, conversation, client_key, generation, lifecycle, materialization) =
         row_to_turn_stub(row)?;
-    let prepared = load_prepared_payload_tx(tx, id).await?;
+    let prepared = match prepared_goal_start(&conversation, &fingerprint, &materialization)? {
+        Some(start) => start,
+        None => rehydrate_prepared_from_parts(
+            fingerprint,
+            &conversation,
+            &load_prepared_payload_tx(tx, id).await?,
+        )?,
+    };
     Ok(DurableTurn {
         id,
         conversation: conversation.clone(),
         client_key,
-        prepared: rehydrate_prepared_from_parts(fingerprint, &conversation, &prepared)?,
+        prepared,
         generation,
         lifecycle,
         materialization,
@@ -4089,16 +4255,20 @@ async fn row_to_turn_pool(
             .bind(to_i64(id.0, "turn_id")?)
             .fetch_one(pool)
             .await?;
-    let prepared = load_prepared_payload_pool(pool, id).await?;
+    let fingerprint: String = fingerprint_row.try_get("prepared_fingerprint")?;
+    let prepared = match prepared_goal_start(&conversation, &fingerprint, &materialization)? {
+        Some(start) => start,
+        None => rehydrate_prepared_from_parts(
+            fingerprint,
+            &conversation,
+            &load_prepared_payload_pool(pool, id).await?,
+        )?,
+    };
     Ok(DurableTurn {
         id,
         conversation: conversation.clone(),
         client_key,
-        prepared: rehydrate_prepared_from_parts(
-            fingerprint_row.get("prepared_fingerprint"),
-            &conversation,
-            &prepared,
-        )?,
+        prepared,
         generation,
         lifecycle,
         materialization,
@@ -4211,6 +4381,8 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod goal_capture;
     use crate::migrations::run_pending_migrations;
     use crate::sqlite_telemetry::test_support::EventCapture;
     use crate::Database;
@@ -6877,6 +7049,7 @@ mod tests {
                 },
                 TurnCommand::Accept { .. }
                 | TurnCommand::Materialize { .. }
+                | TurnCommand::MaterializeGoalStart { .. }
                 | TurnCommand::Rearm { .. } => unreachable!(),
             };
             let step = repo.terminate_authoritative_turn(command).await.unwrap();
@@ -7214,7 +7387,7 @@ mod tests {
         .await
         .unwrap();
         assert!(sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2 WHERE turn_id = ?1",
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1 WHERE turn_id = ?1",
         )
         .bind(i64::try_from(turn_id.0).unwrap())
         .bind(canonical_message_id("conv-b", "foreign-message"))
@@ -8011,7 +8184,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.prepared.payload(), historical);
+        assert_eq!(loaded.prepared.message_payload().unwrap(), historical);
         assert_eq!(loaded.prepared.fingerprint(), original_fingerprint);
         let mut retry = payload.submitted.clone();
         if let InputOrigin::InternalConversation { source_call, .. } = &mut retry.origin {
@@ -8045,6 +8218,177 @@ mod tests {
             .await
             .unwrap();
         assert!(repo.load_authoritative_turn(turn_id).await.is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn remote_turns_restart_replay_and_materialize_after_peer_deletion() {
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, SourceToolCall},
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("remote-turns.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        let instance_id = InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections (peer_instance_id, peer_display_name, domain_or_ipv4_host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'sender', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(instance_id.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(db.pool()).await.unwrap();
+        let mut accepted = Vec::new();
+        for index in 0..3 {
+            let conversation = ConversationAuthority(format!("remote-{index}"));
+            db.create_conversation(&conversation.0, &conversation.0, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let mut payload = prepared_payload_with_attachments(&format!("remote-message-{index}"));
+            let product_conversation_id = ProductConversationId::parse("remote-product").unwrap();
+            let transcript_id = "remote-transcript".to_string();
+            let source_call = Some(Box::new(SourceToolCall {
+                message_id: "remote-assistant".into(),
+                tool_use_id: "remote-call".into(),
+            }));
+            payload.submitted.origin = match index {
+                0 => InputOrigin::RemoteApi { instance_id },
+                1 => InputOrigin::RemoteConversation {
+                    instance_id,
+                    product_conversation_id,
+                    transcript_id,
+                    source_call,
+                },
+                _ => InputOrigin::RemoteCoordinator {
+                    instance_id,
+                    product_conversation_id,
+                    transcript_id,
+                    source_call,
+                },
+            };
+            let input = AcceptAuthoritativeTurn {
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                client_key: ClientTurnKey::new("remote-key").unwrap(),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(77),
+            };
+            let created = db
+                .workflow_repository()
+                .accept_authoritative_turn(&input)
+                .await
+                .unwrap();
+            let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+                panic!("expected accepted turn")
+            };
+            accepted.push((input, turn_id, payload));
+        }
+        sqlx::query("DELETE FROM federation_peer_connections WHERE peer_instance_id = ?1")
+            .bind(instance_id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+
+        let restarted = Database::open(path.to_str().unwrap()).await.unwrap();
+        let repo = restarted.workflow_repository();
+        let candidates = repo
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .unwrap()
+            .candidates;
+        for (input, turn_id, payload) in accepted {
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.turn_id == turn_id));
+            let loaded = repo
+                .load_authoritative_turn(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.prepared, input.prepared);
+            let mut retry = payload.submitted.clone();
+            match &mut retry.origin {
+                InputOrigin::RemoteConversation { source_call, .. }
+                | InputOrigin::RemoteCoordinator { source_call, .. } => {
+                    *source_call = Some(Box::new(SourceToolCall {
+                        message_id: "retry-message".into(),
+                        tool_use_id: "retry-call".into(),
+                    }));
+                }
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated
+                | InputOrigin::RemoteApi { .. }
+                | InputOrigin::SubscriptionEvent { .. } => {}
+            }
+            let replay = repo
+                .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &retry)
+                .await
+                .unwrap();
+            let ScopedDirectTurnReplayLookup::Exact { prepared, .. } = replay else {
+                panic!("expected original remote admission")
+            };
+            assert_eq!(prepared.submitted.origin, payload.submitted.origin);
+            match &mut retry.origin {
+                InputOrigin::RemoteApi { instance_id }
+                | InputOrigin::RemoteConversation { instance_id, .. }
+                | InputOrigin::RemoteCoordinator { instance_id, .. } => {
+                    *instance_id = InstanceId::new();
+                }
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated
+                | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
+            }
+            assert!(matches!(
+                repo.lookup_scoped_direct_turn_replay(
+                    input.conversation(),
+                    &input.client_key,
+                    &retry
+                )
+                .await,
+                Err(ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. })
+            ));
+            let workflow = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+            let authority = repo
+                .claim_authoritative_turn(&claim_input(workflow, turn_id, 90))
+                .await
+                .unwrap()
+                .authority
+                .unwrap();
+            let mut materialize = materialize_input(
+                turn_id,
+                authority,
+                90,
+                90,
+                &payload.submitted.message_id,
+                90,
+            );
+            materialize.prepared = payload.clone();
+            let crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(materialized),
+            ) = repo.materialize_authoritative_turn(&materialize).await
+            else {
+                panic!("expected remote materialization")
+            };
+            assert_eq!(materialized.message.origin, payload.submitted.origin);
+            assert_eq!(
+                restarted
+                    .get_messages(&input.conversation().0)
+                    .await
+                    .unwrap()[0]
+                    .origin,
+                payload.submitted.origin
+            );
+        }
     }
 
     #[tokio::test]
@@ -8306,6 +8650,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_acceptance_returns_the_committed_step_and_exact_replay() {
+        let repo = repo().await;
+        let runtime = repo
+            .accept_authoritative_turn(&input("conv-a", "runtime-owner", 80))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: owner_id, ..
+        } = runtime.outcome
+        else {
+            panic!("expected runtime ownership");
+        };
+        let owner = repo
+            .load_authoritative_turn(owner_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let steering = input_with_disposition(
+            "conv-a",
+            "steering-created",
+            81,
+            AcceptedDisposition::Steering,
+        );
+        let created = repo.accept_authoritative_turn(&steering).await.unwrap();
+        let TurnOutcome::Created {
+            turn_id,
+            disposition: AcceptedDisposition::Steering,
+        } = created.outcome
+        else {
+            panic!("committed steering must return its created step");
+        };
+        assert!(repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            repo.load_authoritative_turn(owner_id).await.unwrap(),
+            Some(owner)
+        );
+        let replay = repo.accept_authoritative_turn(&steering).await.unwrap();
+        assert_eq!(
+            replay.outcome,
+            TurnOutcome::ExactReplay {
+                turn_id,
+                disposition: AcceptedDisposition::Steering,
+            }
+        );
+        assert!(replay.owed_effects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_acceptance_commit_cuts_reconcile_without_replacing_the_owner() {
+        for cut in [TransactionCut::BeforeCommit, TransactionCut::AfterCommit] {
+            let repo = repo().await;
+            let runtime = repo
+                .accept_authoritative_turn(&input("conv-a", "runtime-owner", 82))
+                .await
+                .unwrap();
+            let TurnOutcome::Created {
+                turn_id: owner_id, ..
+            } = runtime.outcome
+            else {
+                panic!("expected runtime ownership");
+            };
+            let owner = repo
+                .load_authoritative_turn(owner_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let steering =
+                input_with_disposition("conv-a", "steering-cut", 83, AcceptedDisposition::Steering);
+            assert!(repo
+                .accept_authoritative_turn_at_cut(&steering, cut)
+                .await
+                .is_err());
+            let before_retry: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM durable_turns WHERE conversation_id='conv-a' AND client_turn_key='steering-cut'",
+            ).fetch_one(&repo.pool).await.unwrap();
+            assert_eq!(before_retry, i64::from(cut == TransactionCut::AfterCommit));
+            let retry = repo.accept_authoritative_turn(&steering).await.unwrap();
+            match (cut, retry.outcome) {
+                (
+                    TransactionCut::BeforeCommit,
+                    TurnOutcome::Created {
+                        disposition: AcceptedDisposition::Steering,
+                        ..
+                    },
+                )
+                | (
+                    TransactionCut::AfterCommit,
+                    TurnOutcome::ExactReplay {
+                        disposition: AcceptedDisposition::Steering,
+                        ..
+                    },
+                ) => {}
+                other => panic!("unexpected cut reconciliation: {other:?}"),
+            }
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM durable_turns WHERE conversation_id='conv-a' AND client_turn_key='steering-cut'",
+            ).fetch_one(&repo.pool).await.unwrap();
+            assert_eq!(rows, 1);
+            assert_eq!(
+                repo.load_authoritative_turn(owner_id).await.unwrap(),
+                Some(owner)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_acceptance_requires_a_real_owner_before_any_workflow_write() {
+        let repo = repo().await;
+        let steering = input_with_disposition(
+            "conv-a",
+            "steering-without-owner",
+            84,
+            AcceptedDisposition::Steering,
+        );
+        assert!(matches!(
+            repo.accept_authoritative_turn(&steering).await,
+            Err(DbError::DirectTurnConflict(TurnConflict::CorruptAggregate(
+                "steering requires an active runtime owner"
+            )))
+        ));
+        let turns: i64 = sqlx::query_scalar("SELECT count(*) FROM durable_turns")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        let workflows: i64 = sqlx::query_scalar("SELECT count(*) FROM workflows")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!((turns, workflows), (0, 0));
+    }
+
+    #[tokio::test]
     async fn steering_accept_rehydrates_active_owner_before_commit() {
         let repo = repo().await;
         let runtime = input("conv-a", "runtime-owner", 80);
@@ -8347,7 +8827,8 @@ mod tests {
         let input = input("conv-replay", "client", 31);
         repo.accept_authoritative_turn(&input).await.unwrap();
         let mut changed_delivery =
-            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload()).unwrap();
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap();
         changed_delivery.delivery.llm_text = Some("changed expansion".to_string());
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
@@ -8367,9 +8848,10 @@ mod tests {
         let repo = repo().await;
         let input = input("conv-replay", "legacy-client", 31);
         repo.accept_authoritative_turn(&input).await.unwrap();
-        let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-            .unwrap()
-            .submitted;
+        let mut submitted =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap()
+                .submitted;
         assert_eq!(submitted.origin, InputOrigin::UnknownHistorical);
         submitted.origin = InputOrigin::UserApi;
         let replay = repo
@@ -8392,9 +8874,10 @@ mod tests {
         let repo = repo().await;
         let input = input("conv-replay", "conflict", 32);
         repo.accept_authoritative_turn(&input).await.unwrap();
-        let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-            .unwrap()
-            .submitted;
+        let mut submitted =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap()
+                .submitted;
         submitted.text.push_str(" changed");
         let err = repo
             .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
@@ -8413,12 +8896,16 @@ mod tests {
         let input_b = input("conv-b-scope", "same-key", 34);
         repo.accept_authoritative_turn(&input_a).await.unwrap();
         repo.accept_authoritative_turn(&input_b).await.unwrap();
-        let submitted_a = PreparedDirectTurnPayload::from_exact_bytes(input_a.prepared.payload())
-            .unwrap()
-            .submitted;
-        let submitted_b = PreparedDirectTurnPayload::from_exact_bytes(input_b.prepared.payload())
-            .unwrap()
-            .submitted;
+        let submitted_a = PreparedDirectTurnPayload::from_exact_bytes(
+            input_a.prepared.message_payload().unwrap(),
+        )
+        .unwrap()
+        .submitted;
+        let submitted_b = PreparedDirectTurnPayload::from_exact_bytes(
+            input_b.prepared.message_payload().unwrap(),
+        )
+        .unwrap()
+        .submitted;
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
                 input_a.conversation(),
@@ -8462,9 +8949,10 @@ mod tests {
             .execute(&repo.pool)
             .await
             .unwrap();
-        let submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
-            .unwrap()
-            .submitted;
+        let submitted =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.message_payload().unwrap())
+                .unwrap()
+                .submitted;
         let err = repo
             .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
             .await

@@ -1382,14 +1382,18 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         registry_source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
         registry_match = re.search(r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)", registry_source, re.DOTALL)
         self.assertIsNotNone(registry_match)
-        historical_entries, removed = re.subn(
-            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
-            "",
-            registry_match.group(2),
-            count=1,
-            flags=re.DOTALL,
+        entries = registry_match.group(2)
+        qualified_target = max(helper.REQUIRED_MIGRATIONS)
+        suffix_boundaries = list(re.finditer(
+            rf"^    Migration\s*\{{\s*version:\s*{qualified_target + 1},",
+            entries,
+            flags=re.MULTILINE,
+        ))
+        self.assertEqual(
+            len(suffix_boundaries), 1,
+            "historical registry fixture requires exactly one successor boundary",
         )
-        self.assertEqual(1, removed, "synthetic qualified-128 fixture requires current migration 129")
+        historical_entries = entries[:suffix_boundaries[0].start()]
         historical_registry = self.transaction / "qualified-128-migrations.rs"
         historical_registry.write_text(
             registry_source[:registry_match.start(2)] + historical_entries + registry_source[registry_match.end(2):]
@@ -1425,6 +1429,7 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.write_manifest()
         manifest = self.manifest()
         self.registry = helper.candidate_registry(manifest)
+        self.assertEqual(self.registry[-1], (128, "product_creation_provisioning_stage"))
         self.database = Path(manifest.database_path)
         import sqlite3
         self.database.unlink(missing_ok=True)
@@ -2295,6 +2300,25 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
                 with self.assertRaises((helper.ActivationError, helper.ValidationError)):
                     helper.activate(mutated, ctl)
                 self.assertNotIn("stop", ctl.events)
+
+    def test_actual_registry137_named_sql_parses_only_as_ordinary_target(self):
+        manifest = self.protected()
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        artifact = helper.Artifact(str(actual_registry), digest(actual_registry))
+        ordinary = dataclasses.replace(
+            manifest, mode="ordinary", manifest_version=1, controller_source_commit=None,
+            controller_helper=None, release_asset_name=None, release_asset_sha256=None,
+            registry=artifact,
+        )
+        ledger = helper.candidate_registry(ordinary)
+        self.assertIn((134, "durable_conversation_goal_user_control"), ledger)
+        self.assertIn((135, "local_watch_goal_capture"), ledger)
+        self.assertEqual(ledger[-2], (136, "per_goal_execution_requests"))
+        self.assertEqual(ledger[-1], (137, "goal_start_materialization_witness"))
+        protected = dataclasses.replace(manifest, registry=artifact)
+        with mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", artifact.sha256):
+            with self.assertRaisesRegex(helper.ActivationError, "exact qualified target128"):
+                helper.candidate_registry(protected)
 
     def test_actual_registry_with_migration129_is_rejected_by_protected_fixture(self):
         manifest = self.protected()

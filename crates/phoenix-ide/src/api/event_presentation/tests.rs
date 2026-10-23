@@ -54,6 +54,48 @@ pub(crate) async fn fixture(count: usize) -> (Database, Vec<Message>) {
 }
 
 #[tokio::test]
+async fn remote_origins_never_receive_local_subscription_presentation() {
+    use phoenix_core::domain::{
+        instance_identity::InstanceId, product_conversation::ProductConversationId,
+    };
+    let (db, local) = fixture(1).await;
+    let mut remote = local[0].clone();
+    let instance_id = InstanceId::new();
+    let product_conversation_id = ProductConversationId::parse("event-0").unwrap();
+    let presentations = EventPresentations::load(&db, &local).await;
+    assert!(matches!(
+        presentations.for_message(&local[0]),
+        Some(EventPresentation::Available(_))
+    ));
+    db.pool().close().await;
+    for origin in [
+        InputOrigin::RemoteApi { instance_id },
+        InputOrigin::RemoteConversation {
+            instance_id,
+            product_conversation_id: product_conversation_id.clone(),
+            transcript_id: "event-0".into(),
+            source_call: None,
+        },
+        InputOrigin::RemoteCoordinator {
+            instance_id,
+            product_conversation_id,
+            transcript_id: "event-0".into(),
+            source_call: None,
+        },
+    ] {
+        remote.origin = origin;
+        assert!(presentations.for_message(&remote).is_none());
+        let remote_only = EventPresentations::load(&db, [&remote]).await;
+        assert!(remote_only.events.is_empty());
+        assert!(matches!(
+            remote_only.fallback,
+            EventPresentationUnavailableReason::Missing
+        ));
+        assert!(remote_only.for_message(&remote).is_none());
+    }
+}
+
+#[tokio::test]
 async fn caller_projects_every_event_across_400_boundary_and_historical_delivery_states() {
     let (db, messages) = fixture(401).await;
     for count in [400, 401] {
@@ -141,6 +183,7 @@ fn ordinary_message_serializes_explicit_null_and_all_outcomes_preserve_reasons()
         (WatchOutcome::AwaitingTaskApproval, "awaiting_task_approval"),
     ] {
         let event = WatchEventPresentation {
+            goal_capture: None,
             event_id: "event".into(),
             product_conversation_id:
                 phoenix_core::domain::product_conversation::ProductConversationId::parse("product")
@@ -162,4 +205,51 @@ fn ordinary_message_serializes_explicit_null_and_all_outcomes_preserve_reasons()
         assert_eq!(value["display_name"], serde_json::Value::Null);
         assert_eq!(value["provenance"], "mandatory_close_failure");
     }
+}
+
+#[test]
+fn local_saved_goal_wire_facts_do_not_relabel_execution_and_have_no_current_lookup() {
+    use phoenix_core::domain::watch_goal::{WatchGoalCapture, WatchGoalState, WatchGoalUsage};
+    let capture = WatchGoalCapture::CapturedSavedGoal {
+        owner_id: "owner".into(),
+        goal_id: "immutable-goal".into(),
+        objective: "  exact objective  ".into(),
+        owner_version: 4,
+        state: WatchGoalState::Blocked {
+            reason: "  saved reason  ".into(),
+        },
+        usage: WatchGoalUsage::UnavailableNotCaptured,
+    };
+    let event = WatchEventPresentation {
+        goal_capture: Some(capture),
+        display_name: None,
+        event_id: "event".into(),
+        product_conversation_id:
+            phoenix_core::domain::product_conversation::ProductConversationId::parse("owner")
+                .unwrap(),
+        source_transcript_id: "source".into(),
+        source_occurrence_kind: "turn".into(),
+        source_occurrence_id: "occurrence".into(),
+        source_generation: 1,
+        outcome: WatchOutcome::Completed,
+        occurred_at_us: 123,
+        provenance: WatchEventProvenance::Subscription,
+    };
+    let json = serde_json::to_value(EventPresentationPayload::from(event.clone())).unwrap();
+    assert_eq!(json["outcome"]["kind"], "turn_finished");
+    assert_eq!(json["goal_capture"]["state"]["kind"], "blocked");
+    assert_eq!(json["goal_capture"]["state"]["reason"], "  saved reason  ");
+    assert_eq!(json["goal_capture"]["objective"], "  exact objective  ");
+    assert_eq!(json["goal_capture"]["usage"], "unavailable_not_captured");
+    let changed = WatchEventPresentation {
+        outcome: WatchOutcome::GoalChanged,
+        source_occurrence_kind: "goal_change".into(),
+        source_occurrence_id: "owner".into(),
+        source_generation: 4,
+        ..event
+    };
+    assert_eq!(
+        serde_json::to_value(EventPresentationPayload::from(changed)).unwrap()["outcome"]["kind"],
+        "goal_changed"
+    );
 }

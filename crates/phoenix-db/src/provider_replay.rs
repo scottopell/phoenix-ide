@@ -7,10 +7,247 @@
 //! derived from the last response set in the payload on write.
 
 use crate::{Database, DbError, DbResult};
-use phoenix_core::domain::provider_replay::AnthropicReplayPayload;
+use phoenix_core::domain::{db_schema::Message, provider_replay::AnthropicReplayPayload};
 use sqlx::Row;
 
+pub(crate) fn validate_goal_round_replay(
+    assistant: &Message,
+    update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+) -> DbResult<()> {
+    use phoenix_core::domain::{db_schema::MessageContent, provider_replay::ProviderReplayUpdate};
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        return Err(DbError::Serialization("goal round replay assistant".into()));
+    };
+    let source_matches = match update {
+        ProviderReplayUpdate::Anthropic(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
+        ProviderReplayUpdate::Responses(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
+        ProviderReplayUpdate::Clear => true,
+    };
+    if !source_matches {
+        return Err(DbError::Serialization(
+            "goal round replay owner differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CanonicalCommitCut {
+    None,
+    #[cfg(test)]
+    BeforeCommit,
+    #[cfg(test)]
+    AfterCommit,
+}
+
+pub(crate) enum CanonicalWriteOutcome {
+    Committed(Box<crate::conversation_goals::round::CommittedGoalRound>),
+    Superseded,
+}
+
 impl Database {
+    pub(crate) async fn persist_canonical_checkpoint(
+        &self,
+        command: &crate::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+        cut: CanonicalCommitCut,
+    ) -> DbResult<CanonicalWriteOutcome> {
+        use crate::conversation_goals::{
+            request_checkpoint::GoalRequestEvidence, round::ToolRoundWrite,
+        };
+        let input = match &command.evidence {
+            GoalRequestEvidence::Response => None,
+            GoalRequestEvidence::Round { results } => Some(ToolRoundWrite::Pending {
+                execution: command.admitted.intent().execution,
+                results,
+            }),
+        };
+        self.persist_canonical_state_and_replay_input(
+            command.assistant,
+            input,
+            command.state,
+            command.state_updated_at,
+            command.provider_replay,
+            Some(
+                crate::conversation_goals::request_checkpoint::GoalAccounting {
+                    admitted: command.admitted,
+                    source: command.source,
+                    source_updated_at: command.source_updated_at,
+                },
+            ),
+            cut,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) async fn persist_canonical_state_and_replay_input(
+        &self,
+        assistant: &phoenix_core::domain::db_schema::Message,
+        input: Option<crate::conversation_goals::round::ToolRoundWrite<'_>>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        accounting: Option<crate::conversation_goals::request_checkpoint::GoalAccounting<'_>>,
+        cut: CanonicalCommitCut,
+    ) -> DbResult<CanonicalWriteOutcome> {
+        use crate::conversation_goals::{
+            request_checkpoint::{self, AccountingAdmission},
+            round::{self, CommittedGoalRound},
+        };
+        let conversation_id = &assistant.conversation_id;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let accounting = accounting.as_ref().map(|witness| {
+            let evidence = match &input {
+                Some(round::ToolRoundWrite::Pending { results, .. }) => {
+                    request_checkpoint::GoalRequestEvidence::Round { results }
+                }
+                _ => request_checkpoint::GoalRequestEvidence::Response,
+            };
+            request_checkpoint::GoalRequestCheckpoint {
+                admitted: witness.admitted,
+                assistant,
+                source: witness.source,
+                source_updated_at: witness.source_updated_at,
+                state,
+                state_updated_at,
+                evidence,
+                provider_replay: replay,
+            }
+        });
+        let key = if let Some(command) = accounting.as_ref() {
+            match request_checkpoint::admit_accounting_tx(
+                &mut tx,
+                command,
+                self.goal_execution_installation,
+            )
+            .await?
+            {
+                AccountingAdmission::Ready(key) => Some(key),
+                AccountingAdmission::Retained(round) => {
+                    return Ok(CanonicalWriteOutcome::Committed(round))
+                }
+                AccountingAdmission::Refused => return Ok(CanonicalWriteOutcome::Superseded),
+            }
+        } else {
+            None
+        };
+        if accounting.is_some()
+            || matches!(
+                &input,
+                Some(
+                    round::ToolRoundWrite::Pending { .. }
+                        | round::ToolRoundWrite::Management { .. }
+                )
+            )
+        {
+            if let Some(update) = replay {
+                validate_goal_round_replay(assistant, update)?;
+            }
+        }
+        let (results, replayed) = if let Some(input) = input {
+            round::write_round_tx(
+                &mut tx,
+                conversation_id,
+                assistant,
+                input,
+                state,
+                state_updated_at,
+                self.goal_write_policies(),
+            )
+            .await?
+        } else {
+            crate::insert_message_tx(&mut tx, assistant).await?;
+            (Vec::new(), false)
+        };
+        if accounting.is_some() && replayed {
+            return Err(crate::DbError::Serialization(
+                "canonical round exists without request checkpoint".into(),
+            ));
+        }
+        let selected = if let Some(command) = accounting.as_ref() {
+            request_checkpoint::settle_request_boundary_tx(
+                &mut tx,
+                command,
+                Some(self.goal_write_policies()),
+            )
+            .await?
+        } else {
+            state.clone()
+        };
+        let terminal = accounting
+            .as_ref()
+            .map(|command| request_checkpoint::terminal_obligation(command, &selected))
+            .transpose()?
+            .flatten();
+        let (state, state_updated_at) = if let Some(obligation) = terminal.as_ref() {
+            crate::workflow::WorkflowRepository::persist_terminal_obligation_tx(
+                &mut tx, obligation,
+            )
+            .await?;
+            (selected, state_updated_at)
+        } else {
+            round::selected_state_tx(
+                &mut tx,
+                conversation_id,
+                &selected,
+                state_updated_at,
+                replayed,
+                self.goal_control_installation,
+            )
+            .await
+            .map_err(round::db_error)?
+        };
+        if !replayed {
+            if let Some(update) = replay {
+                apply_replay_tx(&mut tx, conversation_id, update).await?;
+            }
+        }
+        let committed = CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        };
+        let commit = match cut {
+            CanonicalCommitCut::None => tx.commit().await.map_err(crate::DbError::from),
+            #[cfg(test)]
+            CanonicalCommitCut::BeforeCommit => {
+                tx.rollback().await?;
+                Err(crate::DbError::Serialization(
+                    "injected before canonical request commit".into(),
+                ))
+            }
+            #[cfg(test)]
+            CanonicalCommitCut::AfterCommit => {
+                tx.commit().await?;
+                Err(crate::DbError::Serialization(
+                    "injected after canonical request commit".into(),
+                ))
+            }
+        };
+        if let Err(error) = commit {
+            if let (Some(command), Some(key)) = (accounting.as_ref(), key.as_ref()) {
+                let mut probe = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+                if let Some(round) = request_checkpoint::classify_accounting_tx(
+                    &mut probe,
+                    command,
+                    key,
+                    self.goal_execution_installation,
+                )
+                .await?
+                {
+                    return Ok(CanonicalWriteOutcome::Committed(Box::new(round)));
+                }
+            }
+            return Err(error);
+        }
+        Ok(CanonicalWriteOutcome::Committed(Box::new(committed)))
+    }
+
     #[cfg(test)]
     /// # Errors
     /// Returns errors from the atomic state and replay write.
@@ -119,7 +356,13 @@ impl Database {
                 .bind(conversation_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
+        crate::coordinator_watches::record_wait_entry_tx(
+            &mut tx,
+            conversation_id,
+            state,
+            self.goal_control_installation,
+        )
+        .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let result = sqlx::query(
@@ -136,7 +379,13 @@ impl Database {
             return Err(DbError::ConversationNotFound(conversation_id.to_string()));
         }
         if previous_kind != crate::conv_state_kind(state) {
-            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
+            crate::record_initial_execution_outcome_tx(
+                &mut tx,
+                conversation_id,
+                state,
+                self.goal_control_installation,
+            )
+            .await?;
         }
         apply_replay_tx(&mut tx, conversation_id, update).await?;
         tx.commit().await?;
@@ -158,25 +407,49 @@ impl Database {
         state_updated_at: chrono::DateTime<chrono::Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> DbResult<()> {
-        let mut tx = self.pool().begin().await?;
-        crate::insert_message_tx(&mut tx, assistant).await?;
-        for message in tool_results {
-            crate::insert_message_tx(&mut tx, message).await?;
+        self.persist_tool_round_state_and_replay_input(
+            conversation_id,
+            assistant,
+            crate::conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            state,
+            state_updated_at,
+            update,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn persist_tool_round_state_and_replay_input(
+        &self,
+        conversation_id: &str,
+        assistant: &phoenix_core::domain::db_schema::Message,
+        input: crate::conversation_goals::round::ToolRoundWrite<'_>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> DbResult<crate::conversation_goals::round::CommittedGoalRound> {
+        if assistant.conversation_id != conversation_id {
+            return Err(crate::DbError::Serialization(
+                "canonical round conversation mismatch".into(),
+            ));
         }
-        crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        sqlx::query("UPDATE conversations SET state=?1, state_kind=?2, state_updated_at=?3, updated_at=?4 WHERE id=?5")
-            .bind(state_json)
-            .bind(crate::conv_state_kind(state))
-            .bind(state_updated_at.to_rfc3339())
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        apply_replay_tx(&mut tx, conversation_id, update).await?;
-        tx.commit().await?;
-        Ok(())
+        match self
+            .persist_canonical_state_and_replay_input(
+                assistant,
+                Some(input),
+                state,
+                state_updated_at,
+                Some(update),
+                None,
+                CanonicalCommitCut::None,
+            )
+            .await?
+        {
+            CanonicalWriteOutcome::Committed(round) => Ok(*round),
+            CanonicalWriteOutcome::Superseded => Err(crate::DbError::Serialization(
+                "canonical round refused".into(),
+            )),
+        }
     }
 
     /// Atomically persist one public message and clear private replay state.
@@ -238,7 +511,7 @@ impl Database {
             .transpose()
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -252,6 +525,7 @@ impl Database {
         .bind(origin.db_parts().1)
         .bind(origin.db_parts().2)
         .bind(origin.db_parts().3)
+        .bind(origin.db_parts().4)
     .bind(origin.source_call().map(|call| call.message_id.as_str()))
     .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
         .execute(&mut *tx)
@@ -269,7 +543,13 @@ impl Database {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
-        crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
+        crate::coordinator_watches::record_wait_entry_tx(
+            &mut tx,
+            conversation_id,
+            state,
+            self.goal_control_installation,
+        )
+        .await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
@@ -371,7 +651,7 @@ impl Database {
     }
 }
 
-async fn apply_replay_tx(
+pub(super) async fn apply_replay_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conversation_id: &str,
     update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -432,6 +712,75 @@ async fn apply_replay_tx(
         }
     }
     Ok(())
+}
+
+pub(crate) async fn update_is_retained_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+) -> DbResult<bool> {
+    use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
+    match update {
+        ProviderReplayUpdate::Anthropic(expected) => {
+            let json: Option<String> = sqlx::query_scalar(
+                "SELECT payload FROM active_provider_replay_state WHERE conversation_id=?",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let Some(json) = json else {
+                return Ok(false);
+            };
+            let payload: AnthropicReplayPayload = serde_json::from_str(&json)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let expected = serde_json::to_value(expected)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            for set in payload.response_sets {
+                if serde_json::to_value(set)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?
+                    == expected
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ProviderReplayUpdate::Responses(expected) => {
+            let row: Option<(String,String,String)> = sqlx::query_as(
+                "SELECT model,owner_message_id,public_content FROM active_responses_replay_sets WHERE conversation_id=? AND response_id=?",
+            ).bind(conversation_id).bind(&expected.response_id).fetch_optional(&mut **tx).await?;
+            let Some((model, owner, public)) = row else {
+                return Ok(false);
+            };
+            let public: Vec<phoenix_core::domain::llm_types::ContentBlock> =
+                serde_json::from_str(&public)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT payload FROM active_responses_replay_items WHERE conversation_id=? AND response_id=? ORDER BY ordinal",
+            ).bind(conversation_id).bind(&expected.response_id).fetch_all(&mut **tx).await?;
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| serde_json::from_str(row))
+                .collect::<Result<_, _>>()
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            Ok(model == expected.model
+                && owner == expected.owner_message_id
+                && public == expected.public_content
+                && items == expected.output_items)
+        }
+        ProviderReplayUpdate::Clear => {
+            let retained: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                SELECT 1 FROM active_provider_replay_state WHERE conversation_id=?
+                UNION ALL SELECT 1 FROM active_responses_replay_sets WHERE conversation_id=?)",
+            )
+            .bind(conversation_id)
+            .bind(conversation_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            Ok(!retained)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +985,62 @@ mod tests {
             db.get_messages("source-replay").await.unwrap()[0].origin,
             origin
         );
+    }
+
+    #[tokio::test]
+    async fn remote_input_origin_and_provider_replay_clear_commit_together() {
+        use phoenix_core::domain::{db_schema::InputOrigin, instance_identity::InstanceId};
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("remote-clear", "remote-clear", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let instance = InstanceId::new().to_string();
+        for (index, kind) in ["remote_api", "remote_conversation", "remote_coordinator"]
+            .into_iter()
+            .enumerate()
+        {
+            let authored = kind != "remote_api";
+            let origin = InputOrigin::from_db_parts(
+                kind,
+                authored.then(|| "remote-product".into()),
+                authored.then(|| "remote-transcript".into()),
+                None,
+                Some(instance.clone()),
+            )
+            .unwrap()
+            .with_source_call_columns(
+                authored.then(|| "source-message".into()),
+                authored.then(|| "source-call".into()),
+            )
+            .unwrap();
+            db.store_provider_replay_state("remote-clear", &sample_payload())
+                .await
+                .unwrap();
+            let returned = db
+                .add_message_and_clear_provider_replay_with_origin(
+                    &format!("remote-{index}"),
+                    "remote-clear",
+                    i64::try_from(index + 1).unwrap(),
+                    &phoenix_core::domain::db_schema::MessageContent::user("remote input"),
+                    None,
+                    None,
+                    &origin,
+                    &phoenix_core::domain::sm_state::ConvState::Idle,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(returned.origin, origin);
+            assert_eq!(
+                db.get_messages("remote-clear").await.unwrap()[index].origin,
+                origin
+            );
+            assert!(db
+                .load_provider_replay_state("remote-clear")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]

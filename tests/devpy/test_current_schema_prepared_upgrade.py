@@ -77,14 +77,16 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         )
         self.assertIsNotNone(registry_match)
         entries = registry_match.group(2)
-        historical_entries, removed = re.subn(
-            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
-            "",
+        suffix_boundaries = list(re.finditer(
+            rf"^    Migration\s*\{{\s*version:\s*{QUALIFIED_TARGET + 1},",
             entries,
-            count=1,
-            flags=re.DOTALL,
+            flags=re.MULTILINE,
+        ))
+        self.assertEqual(
+            len(suffix_boundaries), 1,
+            "historical registry fixture requires exactly one successor boundary",
         )
-        self.assertEqual(removed, 1, "historical registry fixture requires migration 129")
+        historical_entries = entries[:suffix_boundaries[0].start()]
         self.registry = self.root / "qualified-128-migrations.rs"
         self.registry.write_text(
             source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
@@ -582,6 +584,17 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         ledger = helper.validate_current_schema_database(database, self.registry)
 
         self.assertEqual(ledger, tuple(compiled_ledger()))
+
+    def test_actual_registry137_named_sql_parses_without_qualifying_protected_target(self) -> None:
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        ledger = helper.migration_registry(actual_registry, qualified_current_target=False)
+        self.assertIn((134, "durable_conversation_goal_user_control"), ledger)
+        self.assertIn((135, "local_watch_goal_capture"), ledger)
+        self.assertEqual(ledger[-2], (136, "per_goal_execution_requests"))
+        self.assertEqual(ledger[-1], (137, "goal_start_materialization_witness"))
+        self.assertEqual(ledger, tuple(compiled_ledger(through=None)))
+        with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
+            helper.migration_registry(actual_registry)
 
     def test_candidate_registry_must_contain_qualified_source_baseline(self) -> None:
         for source_kind, baseline in (("prepared_artifact", 123), ("published_release", 114)):

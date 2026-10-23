@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api } from '../../api';
+import { goalApi } from '../../goalApi';
+import { restoreReactionRange } from '../../components/reactionRange';
 import { InlineReactionStore } from '../../conversation/InlineReactionStore';
 import { ProductConversationFixture } from './renderFixture';
 import { getProductConversationScenario } from './scenarios';
@@ -205,6 +207,54 @@ describe('ProductConversationFixture', () => {
     window.getSelection()?.removeAllRanges();
   });
 
+  it('serves declared empty Goal facts only for exact ordinary fixture GET requests', async () => {
+    const scenario = getProductConversationScenario('inline-message-reactions');
+    const originalFetch = globalThis.fetch;
+    const restore = installProductConversationFixtureApi(scenario);
+    try {
+      const owner = scenario.snapshot!.product_conversation_id;
+      const root = `/api/product-conversations/${encodeURIComponent(owner)}`;
+      expect(await goalApi.current(owner)).toBeNull();
+      expect(await goalApi.control(owner)).toBeNull();
+      expect(await goalApi.history(owner, 0)).toEqual([]);
+      expect(await goalApi.history(owner, Number.MAX_SAFE_INTEGER)).toEqual([]);
+      const post = new Request(new URL(`${root}/goal`, location.href), { method: 'POST' });
+      await expect(fetch(post)).rejects.toThrow('Unexpected fixture API request');
+      expect(await (await fetch(post, { method: 'GET' })).json()).toBeNull();
+      const get = new Request(new URL(`${root}/goal`, location.href));
+      expect(await (await fetch(get)).json()).toBeNull();
+      await expect(fetch(get, { method: 'POST' })).rejects.toThrow('Unexpected fixture API request');
+      for (const path of [
+        `${root}/goal?unexpected=1`, `${root}/goal-control?unexpected=1`,
+        `${root}/goal/history`, `${root}/goal/history?after=`, `${root}/goal/history?after=-1`,
+        `${root}/goal/history?after=1.5`, `${root}/goal/history?after=01`,
+        `${root}/goal/history?after=NaN`, `${root}/goal/history?after=9007199254740992`,
+        `${root}/goal/history?after=0&after=1`, `${root}/goal/history?after=0&extra=1`,
+        `${root}/goal/unexpected`, '/api/product-conversations/not-this-owner/goal',
+      ]) {
+        await expect(fetch(path)).rejects.toThrow('Unexpected fixture API request');
+      }
+      for (const suffix of ['/goal', '/goal-control', '/goal/history?after=0']) {
+        await expect(fetch(`${root}${suffix}`, { method: 'POST' })).rejects.toThrow('Unexpected fixture API request');
+      }
+    } finally {
+      restore();
+    }
+    expect(globalThis.fetch).toBe(originalFetch);
+    const globalScenario = getProductConversationScenario('global-lazy-history');
+    expect(globalScenario.kind).toBe('coordinator');
+    const restoreGlobal = installProductConversationFixtureApi(globalScenario);
+    try {
+      const owner = globalScenario.snapshot!.product_conversation_id;
+      await expect(goalApi.current(owner)).rejects.toThrow('Unexpected fixture API request');
+      await expect(goalApi.control(owner)).rejects.toThrow('Unexpected fixture API request');
+      await expect(goalApi.history(owner, 0)).rejects.toThrow('Unexpected fixture API request');
+    } finally {
+      restoreGlobal();
+    }
+    expect(globalThis.fetch).toBe(originalFetch);
+  });
+
   it('returns a retained reaction through the production older-history loader after the source cache is lost', async () => {
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
       return this.id === 'messages' ? 800 : 0;
@@ -251,7 +301,34 @@ describe('ProductConversationFixture', () => {
     await act(async () => { fireEvent.click(returnButton); });
     await waitFor(() => expect(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')).not.toBeNull());
     await act(async () => { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())); });
-    const input = await screen.findByRole('textbox', { name: 'Your reaction' });
+    const input = await screen.findByRole('textbox', { name: 'Your reaction' }).catch((error: unknown) => {
+      try {
+        const reaction = reactionStore.getSnapshot(snapshot.product_conversation_id);
+        const range = reaction ? restoreReactionRange(reaction.source, container) : null;
+        const rect = (value: DOMRect | null | undefined) => value
+          ? [value.x, value.y, value.width, value.height].map(n => Number.isFinite(n) ? n : null) : null;
+        const selection = window.getSelection();
+        console.error('Retained reaction return diagnostic', {
+          storeCount: observedStores.size,
+          reactionPresent: Boolean(reaction),
+          reactionFloating: reaction?.presentation === 'floating',
+          bodyLength: reaction?.body.length ?? 0,
+          bodyMatches: reaction?.body === 'Keep this guarantee.',
+          sourceMatches: reaction?.source.messageId === 'reaction-answer-older',
+          sourceMounted: Boolean(container.querySelector('[data-inline-reaction-message="reaction-answer-older"]')),
+          restoredRange: { present: Boolean(range), rect: rect(range?.getBoundingClientRect()) },
+          selection: { rangeCount: selection?.rangeCount ?? 0, quoteMatches: selection?.toString() === quote },
+          transcriptRect: rect(container.querySelector('#messages')?.getBoundingClientRect()),
+          docks: Array.from(container.querySelectorAll<HTMLElement>('.reaction-pill')).slice(0, 4)
+            .map(dock => ({ hidden: dock.hidden, reactionLabel: dock.getAttribute('aria-label') === 'Your reaction',
+              displayNone: getComputedStyle(dock).display === 'none', rect: rect(dock.getBoundingClientRect()) })),
+          reactionInputFocused: document.activeElement?.getAttribute('aria-label') === 'Your reaction',
+        });
+      } catch {
+        // Diagnostic reads must not replace the original assertion failure.
+      }
+      throw error;
+    });
     expect(input).toHaveValue('Keep this guarantee.');
     expect(input).not.toHaveFocus();
     expect(fetchSnapshot).toHaveBeenCalledWith('fixture-product-conversation', expect.objectContaining({ before: 'reaction-page' }));

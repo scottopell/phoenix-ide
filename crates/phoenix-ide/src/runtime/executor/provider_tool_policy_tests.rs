@@ -13,23 +13,52 @@ use phoenix_core::domain::provider_replay::{
 use phoenix_llm::{LlmError, LlmResponse};
 use std::sync::Mutex;
 
+#[path = "goal_round_tests.rs"]
+mod goal_round_tests;
+
 const CONVERSATION: &str = "provider-tool-withdrawal";
 const MCP_TOOL: &str = "mcp__slack__read_thread";
+
+#[derive(Default)]
+struct PendingExternalCall {
+    entered: tokio::sync::Notify,
+    dropped: tokio::sync::Notify,
+    cancel: Mutex<Option<CancellationToken>>,
+}
+
+struct PendingExternalDrop(Arc<PendingExternalCall>);
+
+impl Drop for PendingExternalDrop {
+    fn drop(&mut self) {
+        self.0.dropped.notify_one();
+    }
+}
 
 struct RenderingAnthropicClient {
     requests: Mutex<Vec<LlmRequest>>,
     wires: Mutex<Vec<serde_json::Value>>,
+    responses: Mutex<std::collections::VecDeque<LlmResponse>>,
+    streamed_text: Mutex<Option<String>>,
+    pending: Mutex<Option<Arc<PendingExternalCall>>>,
 }
 
-struct DeferredMcpCatalog(MockToolExecutor);
+struct DeferredMcpCatalog(MockToolExecutor, bool, Option<Arc<PendingExternalCall>>);
 
 impl DeferredMcpCatalog {
     fn new(available: bool) -> Self {
-        Self(if available {
-            MockToolExecutor::new().with_tool(MCP_TOOL, ToolOutput::error("Session expired"))
-        } else {
-            MockToolExecutor::new()
-        })
+        Self(
+            if available {
+                MockToolExecutor::new().with_tool(MCP_TOOL, ToolOutput::error("Session expired"))
+            } else {
+                MockToolExecutor::new()
+            },
+            false,
+            None,
+        )
+    }
+
+    fn with_proposals() -> Self {
+        Self(MockToolExecutor::new(), true, None)
     }
 
     fn recorded_executions(&self) -> Vec<(String, serde_json::Value)> {
@@ -44,11 +73,19 @@ impl ToolExecutor for DeferredMcpCatalog {
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
     ) -> Option<ToolOutput> {
+        if let Some(pending) = &self.2 {
+            *pending.cancel.lock().unwrap() = Some(ctx.cancel.clone());
+            let _output = self.0.execute(call, ctx).await;
+            let _drop = PendingExternalDrop(pending.clone());
+            pending.entered.notify_one();
+            return std::future::pending().await;
+        }
         self.0.execute(call, ctx).await
     }
 
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
-        self.0
+        let mut definitions: Vec<_> = self
+            .0
             .definitions()
             .await
             .into_iter()
@@ -56,15 +93,36 @@ impl ToolExecutor for DeferredMcpCatalog {
                 definition.defer_loading = true;
                 definition
             })
-            .collect()
+            .collect();
+        if self.1 {
+            use crate::tools::Tool;
+            let proposal = crate::tools::ProposeTaskTool;
+            definitions.push(phoenix_llm::ToolDefinition {
+                name: proposal.name().into(),
+                description: proposal.description(),
+                input_schema: proposal.input_schema(),
+                defer_loading: false,
+            });
+        }
+        definitions
     }
 }
 
 impl RenderingAnthropicClient {
+    fn scripted(responses: Vec<LlmResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+            ..Self::new()
+        }
+    }
+
     fn new() -> Self {
         Self {
             requests: Mutex::new(vec![]),
             wires: Mutex::new(vec![]),
+            responses: Mutex::new(std::collections::VecDeque::new()),
+            streamed_text: Mutex::new(None),
+            pending: Mutex::new(None),
         }
     }
 }
@@ -87,9 +145,38 @@ impl LlmClient for RenderingAnthropicClient {
         let wire = phoenix_llm::render_anthropic_request_for_test(&spec, request)?;
         self.requests.lock().unwrap().push(request.clone());
         self.wires.lock().unwrap().push(wire);
+        let pending = self.pending.lock().unwrap().clone();
+        if let Some(pending) = pending {
+            if let Some(telemetry) = &request.telemetry {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    "anthropic",
+                    "test-model",
+                    phoenix_core::domain::llm_types::LlmTransport::InProcess,
+                );
+            }
+            let _drop = PendingExternalDrop(pending.clone());
+            pending.entered.notify_one();
+            return std::future::pending().await;
+        }
+        if let Some(response) = self.responses.lock().unwrap().pop_front() {
+            return Ok(response);
+        }
         Err(LlmError::network(
             "Injected transport failure after local request rendering",
         ))
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let text = self.streamed_text.lock().unwrap().take();
+        if let Some(text) = text {
+            let _ = chunk_tx.send(phoenix_llm::TokenChunk::Text(text)).await;
+        }
+        self.complete(request).await
     }
 
     fn model_id(&self) -> &'static str {
@@ -112,6 +199,15 @@ fn runtime(
         "claude-opus-5-5",
         200_000,
     );
+    runtime_for_context(db, context, client, tools)
+}
+
+fn runtime_for_context(
+    db: Database,
+    context: ConvContext,
+    client: Arc<RenderingAnthropicClient>,
+    tools: Arc<DeferredMcpCatalog>,
+) -> TestRuntime {
     let (event_tx, event_rx) = mpsc::channel(8);
     ConversationRuntime::new(
         context,
@@ -335,7 +431,10 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
     ];
     let owner = saved_message("assistant-owner", 2, MessageContent::Agent(public.clone()));
     let result = saved_message(
-        "failed-result",
+        &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+            "assistant-owner",
+            "toolu_slack",
+        ),
         3,
         MessageContent::Tool(ToolContent {
             tool_use_id: "toolu_slack".into(),

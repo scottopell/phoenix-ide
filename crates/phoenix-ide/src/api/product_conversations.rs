@@ -51,6 +51,31 @@ const DEFAULT_MESSAGE_LIMIT: usize = 50;
 const MAX_MESSAGE_LIMIT: usize = 200;
 const PRODUCT_CONVERSATION_ROUTE_PREFIX: &str = "/c/";
 
+fn encoded_route_component(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+pub(crate) fn exact_transcript_route(
+    id: &phoenix_core::domain::close::TranscriptConversationId,
+) -> String {
+    let encoded = encoded_route_component(id.as_str());
+    format!("{PRODUCT_CONVERSATION_ROUTE_PREFIX}{encoded}?source_transcript={encoded}")
+}
+
+pub(crate) fn message_fragment(message_id: &str) -> String {
+    format!("#message-{}", encoded_route_component(message_id))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SnapshotQuery {
     pub before: Option<String>,
@@ -774,6 +799,31 @@ pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
         }
     }
     route
+}
+
+pub(super) fn canonical_product_route_shape(href: &str) -> bool {
+    let Some(component) = href.strip_prefix(PRODUCT_CONVERSATION_ROUTE_PREFIX) else {
+        return false;
+    };
+    if component.is_empty() || component.contains(['/', '?', '#']) {
+        return false;
+    }
+    let bytes = component.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') => {
+                index += 1;
+            }
+            b'%' if bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) =>
+            {
+                index += 3;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 pub(super) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
@@ -1603,6 +1653,35 @@ mod tests {
     use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
+
+    #[test]
+    fn canonical_route_shape_accepts_owner_generated_routes_only() {
+        for slug in [
+            None,
+            Some("renamed-conversation"),
+            Some("encoded/name and space"),
+        ] {
+            assert!(canonical_product_route_shape(&product_route(
+                slug,
+                "stable-uuid"
+            )));
+        }
+        for invalid in [
+            "/c/",
+            "/c/one/two",
+            "/c/one?token=secret",
+            "/c/one#message-evidence",
+            "/c/bad%2",
+            "/c/bad%xx",
+            "//other.invalid/c/one",
+            "https://other.invalid/c/one",
+        ] {
+            assert!(
+                !canonical_product_route_shape(invalid),
+                "accepted {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn routed_history_reads_export_initial_cursor_and_recovery_identity() {
@@ -3416,6 +3495,26 @@ mod tests {
             ProductConversationPresentationView::State { presentation_mode, .. }
                 if presentation_mode == "done"
         ));
+    }
+
+    #[test]
+    fn exact_route_helpers_preserve_immutable_evidence_identity() {
+        let transcript_id =
+            phoenix_core::domain::close::TranscriptConversationId::parse("transcript-id").unwrap();
+        assert_eq!(
+            super::exact_transcript_route(&transcript_id),
+            "/c/transcript-id?source_transcript=transcript-id"
+        );
+        let punctuated_transcript =
+            phoenix_core::domain::close::TranscriptConversationId::parse("transcript?#%").unwrap();
+        assert_eq!(
+            super::exact_transcript_route(&punctuated_transcript),
+            "/c/transcript%3F%23%25?source_transcript=transcript%3F%23%25"
+        );
+        assert_eq!(
+            super::message_fragment("message?#%"),
+            "#message-message%3F%23%25"
+        );
     }
 
     #[test]

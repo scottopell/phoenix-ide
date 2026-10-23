@@ -68,6 +68,17 @@ const TRANSIENT_ROUTE_SCOPES = new Set([
   'fork-proposal-review',
 ]);
 
+export function messageIdFromLocationHash(hash: string): string | undefined {
+  if (!hash.startsWith('#message-')) return undefined;
+  const encoded = hash.slice('#message-'.length);
+  if (!encoded) return undefined;
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return encoded;
+  }
+}
+
 export function decideRouteFocus(inputs: RouteFocusInputs): RouteFocusState {
   const { routeKey } = inputs;
   if (!routeKey) return { routeKey: null, decision: 'consumed' };

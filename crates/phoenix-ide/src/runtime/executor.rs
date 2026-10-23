@@ -26,7 +26,7 @@ use super::{
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
-    SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
+    AssistantMessage, SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
 };
 use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
@@ -37,6 +37,7 @@ use crate::system_prompt::{
 };
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::conversation_goal::ToolRoundResult;
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
@@ -48,11 +49,60 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod continuation;
+mod goal_request_checkpoint;
+use goal_request_checkpoint::{LlmCompletion, PendingGoalRequestCheckpoint};
 #[cfg(test)]
 mod provider_tool_policy_tests;
+#[cfg(test)]
+mod watch_goal_context_tests;
 use continuation::{
     plan_with_handoff, project_recent_references, CompactionPolicy, ContinuationHistory,
 };
+
+fn terminal_tool_messages(
+    agent_msg: &crate::db::Message,
+    tool_results: Vec<ToolResult>,
+    sequences: impl Iterator<Item = i64>,
+) -> Vec<crate::db::Message> {
+    tool_results
+        .into_iter()
+        .zip(sequences)
+        .map(|(result, sequence_id)| {
+            let content = tool_result_message_content(&result);
+            crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
+                conversation_id: agent_msg.conversation_id.clone(),
+                sequence_id,
+                message_type: content.message_type(),
+                content,
+                display_data: merge_duration_into_display_data(
+                    result.display_data(),
+                    result.duration_ms,
+                ),
+                usage_data: None,
+                created_at: Utc::now(),
+            }
+        })
+        .collect()
+}
+
+struct PreparedRevokedGoalToolRound {
+    _reservation: crate::runtime::ReservedBroadcastRange,
+    assistant: crate::db::Message,
+    results: RevokedGoalToolResults,
+    settlement: crate::runtime::traits::ActiveDirectTurnSettlement,
+    provider_replay: Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    trusted_results: Vec<PendingTrustedToolResult>,
+}
+
+enum RevokedGoalToolResults {
+    Finalized(Vec<crate::db::Message>),
+    Pending {
+        execution: phoenix_core::domain::conversation_goal::GoalExecution,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+    },
+}
 
 enum AuthoritativeEffect {
     BroadcastAssistantMessage {
@@ -67,9 +117,13 @@ enum AuthoritativeEffect {
         origin: phoenix_core::domain::db_schema::InputOrigin,
     },
     PersistAuthoritativeUserMessage {
-        payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        payload: Box<phoenix_core::domain::sm_event::PreparedDirectTurnPayload>,
         authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
         idempotent: bool,
+    },
+    PersistAuthoritativeGoalStart {
+        receipt: phoenix_core::domain::conversation_goal::GoalStartReceipt,
+        authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
     },
     PersistState,
     RequestLlm,
@@ -237,6 +291,9 @@ impl ClassifiedEffect {
                     idempotent,
                 },
             )),
+            Effect::PersistAuthoritativeGoalStart { receipt, authority } => Self::Authoritative(
+                Box::new(AuthoritativeEffect::PersistAuthoritativeGoalStart { receipt, authority }),
+            ),
             Effect::PersistState => {
                 Self::Authoritative(Box::new(AuthoritativeEffect::PersistState))
             }
@@ -640,19 +697,108 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
     }
 }
 
-fn tool_result_message_content(result: &ToolResult) -> MessageContent {
-    let persisted_output = match &result.outcome {
-        ToolOutcome::TrustedInstructions { .. } => {
-            "Authenticated built-in skill instructions were delivered for this live request."
+#[cfg(test)]
+#[derive(Default)]
+struct GoalDispatchTestBarrier {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl GoalDispatchTestBarrier {
+    async fn pause(&self) {
+        self.reached.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.resume.notified())
+            .await
+            .expect("goal dispatch test barrier was not resumed");
+    }
+}
+
+struct GoalReportEmitter {
+    binding: phoenix_core::domain::conversation_goal::GoalReportBinding,
+}
+
+impl GoalReportEmitter {
+    #[allow(clippy::unused_self)]
+    fn definition(&self) -> phoenix_core::domain::llm_types::ToolDefinition {
+        phoenix_core::domain::llm_types::ToolDefinition {
+            name: "goal_report".into(),
+            description: "Report the admitted goal outcome; this does not start another turn."
+                .into(),
+            defer_loading: false,
+            input_schema: serde_json::json!({"type":"object", "properties":{
+                "status":{"type":"string","enum":["complete","blocked","exhausted"]},
+                "reason":{"type":"string","minLength":1}
+            }, "required":["status","reason"], "additionalProperties":false}),
         }
-        _ => result.output(),
-    };
-    MessageContent::tool_with_images(
-        &result.tool_use_id,
-        persisted_output,
-        result.is_error(),
-        result.images().to_vec(),
-    )
+    }
+}
+
+fn cancelling_management_call(assistant: &AssistantMessage, tool_use_id: &str) -> Option<ToolCall> {
+    assistant.content.iter().find_map(|block| {
+        let phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, input } = block
+        else {
+            return None;
+        };
+        (id == tool_use_id && name == "goal_manage").then(|| {
+            ToolCall::new(
+                id.clone(),
+                ToolInput::from_name_and_value(name, input.clone()),
+            )
+        })
+    })
+}
+
+fn require_canonical_management_call(
+    assistant: &AssistantMessage,
+    tool_use_id: &str,
+    request: &phoenix_core::domain::conversation_goal::GoalManagementRequest,
+) -> Result<(), String> {
+    let input = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    let canonical = assistant.content.iter().any(|block| {
+        matches!(block,
+        phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, name, input: actual }
+        if id == tool_use_id && name == "goal_manage" && actual == &input)
+    });
+    if !canonical {
+        return Err("management replay owner differs from canonical assistant call".into());
+    }
+    Ok(())
+}
+
+fn contains_pending_goal_result(
+    results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+) -> bool {
+    results.iter().any(|result| {
+        matches!(
+            result,
+            phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { .. }
+                | phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement { .. }
+        )
+    })
+}
+
+fn finalized_round_results(
+    results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+) -> Result<Vec<ToolResult>, String> {
+    results
+        .iter()
+        .map(|result| match result {
+            phoenix_core::domain::conversation_goal::ToolRoundResult::Finalized(result) => {
+                Ok(result.clone())
+            }
+            phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport {
+                ..
+            }
+            | phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement {
+                ..
+            } => Err("pending goal result cannot be rendered before checkpoint commit".into()),
+        })
+        .collect()
+}
+
+fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    MessageContent::Tool(result.persisted_tool_content())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -797,6 +943,7 @@ async fn execute_tool_to_outcome<S, T>(
     checked: crate::runtime::deny_gate::CheckedToolCall,
     tool_ctx: ToolContext,
     cancel_token_check: &CancellationToken,
+    goal_dispatch: phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit,
     conv_id: String,
     root_conv_id: String,
     tool_name: String,
@@ -839,10 +986,20 @@ where
             error: "EUNAVAIL: tool is unavailable under the current conversation policy".into(),
         };
     }
-    let output = tool_executor
-        .execute(checked.with_input_schema(request_schema), tool_ctx)
-        .instrument(span.clone())
-        .await;
+    let Ok(output) = goal_dispatch
+        .run(
+            tool_executor
+                .execute(checked.with_input_schema(request_schema), tool_ctx)
+                .instrument(span.clone()),
+        )
+        .await
+    else {
+        cancel_token_check.cancel();
+        return ToolExecOutcome::Aborted {
+            tool_use_id,
+            reason: crate::state_machine::AbortReason::GoalControlRevoked,
+        };
+    };
 
     if cancel_token_check.is_cancelled() {
         span.record("outcome", "aborted");
@@ -1159,7 +1316,8 @@ mod grace_response_admission_tests {
 async fn forward_llm_outcome(
     llm_rx: oneshot::Receiver<LlmOutcome>,
     generation: u64,
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
+    llm_outcome_tx: mpsc::Sender<LlmCompletion>,
+    admitted: Option<phoenix_db::workflow::AdmittedGoalRequest>,
 ) {
     let llm_outcome = match llm_rx.await {
         Ok(llm_outcome) => llm_outcome,
@@ -1174,7 +1332,13 @@ async fn forward_llm_outcome(
             }
         }
     };
-    let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
+    let _ = llm_outcome_tx
+        .send(LlmCompletion {
+            generation,
+            outcome: llm_outcome,
+            admitted,
+        })
+        .await;
 }
 
 /// The outcome of planning a stale tool-result clearing sweep over one
@@ -1372,12 +1536,13 @@ async fn assemble_cleared_messages<S: StateStore>(
     clearable_names: &std::collections::HashSet<String>,
     context_window: usize,
     watermark_cache: &std::sync::Mutex<Option<i64>>,
-) -> Vec<LlmMessage> {
+) -> Result<Vec<LlmMessage>, String> {
     let included_messages = || {
         db_messages
             .iter()
             .filter(|message| Some(message.message_id.as_str()) != excluded_message_id)
     };
+    let captures = included_subscription_goal_captures(storage, included_messages()).await?;
     let prior_watermark = match storage.get_clear_watermark(conv_id).await {
         Ok(w) => {
             *watermark_cache.lock().unwrap() = Some(w);
@@ -1392,13 +1557,17 @@ async fn assemble_cleared_messages<S: StateStore>(
                 );
                 let cleared =
                     clearable_sequence_ids_through_watermark(db_messages, clearable_names, w);
-                render_messages(included_messages(), &cleared)
+                render_messages(included_messages(), &cleared, &captures)
             } else {
                 tracing::warn!(
                     conv_id = %conv_id, error = %e,
                     "failed to read clear watermark with none cached; sending uncleared history",
                 );
-                render_messages(included_messages(), &std::collections::HashSet::new())
+                render_messages(
+                    included_messages(),
+                    &std::collections::HashSet::new(),
+                    &captures,
+                )
             };
         }
     };
@@ -1454,7 +1623,58 @@ async fn assemble_cleared_messages<S: StateStore>(
         }
     };
 
-    render_messages(included_messages(), &cleared)
+    render_messages(included_messages(), &cleared, &captures)
+}
+
+async fn included_subscription_goal_captures<'a, S: StateStore>(
+    storage: &S,
+    messages: impl Iterator<Item = &'a crate::db::Message>,
+) -> Result<
+    std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+    String,
+> {
+    let event_ids = messages
+        .filter(|message| renders_user_message(message))
+        .filter_map(|message| match (&message.origin, &message.content) {
+            (
+                phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id },
+                MessageContent::User(_),
+            ) => Some(event_id.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let captures = if event_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        storage
+            .subscription_goal_captures(&event_ids)
+            .await
+            .map_err(|error| format!("failed to load subscription goal facts: {error}"))?
+    };
+    Ok(captures)
+}
+
+fn renders_user_message(message: &crate::db::Message) -> bool {
+    match &message.content {
+        MessageContent::User(user_content) => {
+            !(user_content.is_meta
+                && message
+                    .display_data
+                    .as_ref()
+                    .and_then(|data| data.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("wake_result")
+                && !message
+                    .display_data
+                    .as_ref()
+                    .and_then(|data| data.get("adopted"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false))
+        }
+        _ => false,
+    }
 }
 
 /// Fold persisted messages into the provider-agnostic LLM message list.
@@ -1469,7 +1689,11 @@ async fn assemble_cleared_messages<S: StateStore>(
 fn render_messages<'a>(
     db_messages: impl IntoIterator<Item = &'a crate::db::Message>,
     cleared_sequence_ids: &std::collections::HashSet<i64>,
-) -> Vec<LlmMessage> {
+    captures: &std::collections::HashMap<
+        String,
+        phoenix_core::domain::watch_goal::WatchGoalCapture,
+    >,
+) -> Result<Vec<LlmMessage>, String> {
     use crate::db::{MessageContent, ToolContent};
     use phoenix_llm::ImageSource;
 
@@ -1477,20 +1701,7 @@ fn render_messages<'a>(
     for msg in db_messages {
         match &msg.content {
             MessageContent::User(user_content) => {
-                if user_content.is_meta
-                    && msg
-                        .display_data
-                        .as_ref()
-                        .and_then(|data| data.get("type"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("wake_result")
-                    && !msg
-                        .display_data
-                        .as_ref()
-                        .and_then(|data| data.get("adopted"))
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                {
+                if !renders_user_message(msg) {
                     continue;
                 }
                 // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
@@ -1502,8 +1713,27 @@ fn render_messages<'a>(
                         "[Message from conversation {product_conversation_id}, transcript {transcript_id}]\n{}",
                         user_content.llm_text()
                     ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!(
+                        "[API-channel input from authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!(
+                        "[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!(
+                        "[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => {
-                        format!("[Conversation event {event_id}]\n{}", user_content.llm_text())
+                        let mut text = format!("[Conversation event {event_id}]\n{}", user_content.llm_text());
+                        if let Some(capture) = captures.get(event_id) {
+                            let facts = serde_json::to_string(capture)
+                                .map_err(|error| format!("failed to render subscription goal facts: {error}"))?;
+                            text.push_str("\nSaved goal facts (event transaction; no execution authority): ");
+                            text.push_str(&facts);
+                        }
+                        text
                     }
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => {
                         format!("[System-generated input]\n{}", user_content.llm_text())
@@ -1585,6 +1815,9 @@ fn render_messages<'a>(
             MessageContent::Skill(skill_content) => {
                 let source = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!("[API-channel input from authenticated instance {instance_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "[System-generated input]".to_string(),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => format!("[Conversation event {event_id}]"),
@@ -1619,7 +1852,7 @@ fn render_messages<'a>(
             MessageContent::System(_) | MessageContent::Error(_) => {}
         }
     }
-    messages
+    Ok(messages)
 }
 
 /// Render a human-readable summary of sub-agent outcomes for the LLM.
@@ -1908,10 +2141,15 @@ where
     /// request-local rendered clones; this projection never leaves the runtime.
     active_prompt_projection: Option<ActivePromptProjection>,
     pending_trusted_tool_results: Vec<PendingTrustedToolResult>,
+    prepared_revoked_goal_tool_round: Option<Box<PreparedRevokedGoalToolRound>>,
     /// Accepted provider-private replay mutation waiting for the reducer's
     /// authoritative persistence effect. Consumed by `PersistState`.
     pending_provider_replay_update:
         Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    goal_report_emitter: Option<GoalReportEmitter>,
+    goal_management: Option<Arc<crate::goal_service::management::GoalManagementService>>,
+    #[cfg(test)]
+    goal_dispatch_barrier: Option<Arc<GoalDispatchTestBarrier>>,
     pending_sub_agent_acceptance: Option<String>,
     pending_sub_agent_terminal: Option<phoenix_db::SubAgentTerminalCause>,
     pending_sub_agent_activation: Option<PendingSubAgentActivation>,
@@ -1982,8 +2220,9 @@ where
     /// outcome to `process_outcome` only when the generation is still current.
     /// The epoch tag stays executor-side and
     /// never leaks into the pure `EffectOutcome` type.
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
-    llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
+    llm_outcome_tx: mpsc::Sender<LlmCompletion>,
+    llm_outcome_rx: mpsc::Receiver<LlmCompletion>,
+    pending_goal_request_checkpoint: Option<PendingGoalRequestCheckpoint>,
     terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
     /// Generation/epoch tag for the in-flight tool task, mirroring
@@ -2211,6 +2450,25 @@ fn overload_recovery_deadline_for(state: &ConvState, now: DateTime<Utc>) -> Opti
     }
 }
 
+type OutcomeChannel<T> = (mpsc::Sender<T>, mpsc::Receiver<T>);
+
+type EffectOutcomeChannels = (
+    OutcomeChannel<LlmCompletion>,
+    OutcomeChannel<(u64, ToolExecOutcome)>,
+    OutcomeChannel<(u64, u32)>,
+);
+
+fn new_effect_outcome_channels() -> EffectOutcomeChannels {
+    let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<LlmCompletion>(64);
+    let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
+    let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
+    (
+        (llm_outcome_tx, llm_outcome_rx),
+        (tool_outcome_tx, tool_outcome_rx),
+        (retry_outcome_tx, retry_outcome_rx),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskApprovalExecution {
     Initial,
@@ -2245,14 +2503,10 @@ where
         // oneshot channels; forwarders stamp the dispatch generation and relay
         // them here, where the select loop discards superseded outcomes before
         // routing live ones into `process_outcome`.
-        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
-        let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
-        let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
-        let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
+        let (llm_channel, tool_channel, retry_channel) = new_effect_outcome_channels();
 
         let tool_executor = Arc::new(tool_executor);
-        let clearable_names = Arc::new(tool_executor.clearable_tool_names());
-        let fatal_local_authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
 
         Self {
             context,
@@ -2264,13 +2518,18 @@ where
             creation_settlement_disposition: CreationSettlementDisposition::Continue,
             storage,
             llm_client: Arc::new(llm_client),
+            clearable_names: Arc::new(tool_executor.clearable_tool_names()),
             tool_executor,
             previous_transcripts: None,
-            clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             pending_trusted_tool_results: Vec::new(),
+            prepared_revoked_goal_tool_round: None,
             pending_provider_replay_update: None,
+            goal_report_emitter: None,
+            goal_management: None,
+            #[cfg(test)]
+            goal_dispatch_barrier: None,
             pending_sub_agent_acceptance: None,
             pending_sub_agent_terminal: None,
             pending_sub_agent_activation: None,
@@ -2282,7 +2541,7 @@ where
             event_rx,
             event_tx,
             broadcast_tx,
-            acknowledged_event_rx,
+            acknowledged_event_rx: mpsc::channel(1).1,
             tool_cancel_token: None,
             llm_task_handle: None,
             active_llm_attempt: None,
@@ -2291,15 +2550,16 @@ where
             turn_trigger: super::TurnTriggerSlot::default(),
             retry_generation: 0,
             llm_request_generation: 0,
-            llm_outcome_tx,
-            llm_outcome_rx,
+            llm_outcome_tx: llm_channel.0,
+            llm_outcome_rx: llm_channel.1,
+            pending_goal_request_checkpoint: None,
             terminal_transition_retry: None,
             terminal_settlement_attempt: TerminalSettlementAttempt::Initial,
             tool_request_generation: 0,
-            tool_outcome_tx,
-            tool_outcome_rx,
-            retry_outcome_tx,
-            retry_outcome_rx,
+            tool_outcome_tx: tool_channel.0,
+            tool_outcome_rx: tool_channel.1,
+            retry_outcome_tx: retry_channel.0,
+            retry_outcome_rx: retry_channel.1,
             parent_dispatch: None,
             spawn_tx: None,
             cancel_tx: None,
@@ -2310,10 +2570,8 @@ where
             steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
-            fatal_local_authority_rx: Some(fatal_local_authority_fence.subscribe()),
-            fatal_external_effect_cancellation: Some(
-                fatal_local_authority_fence.external_effect_cancellation(),
-            ),
+            fatal_local_authority_rx: Some(fence.subscribe()),
+            fatal_external_effect_cancellation: Some(fence.external_effect_cancellation()),
             #[cfg(test)]
             external_effect_dispatch_barrier: None,
             #[cfg(test)]
@@ -2327,7 +2585,7 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
-            fatal_local_authority_fence,
+            fatal_local_authority_fence: fence,
             svg_publication_lifetime: super::svg_artifacts::SvgPublicationLifetime::new(),
             handoff_completion_authority: None,
             handoff_completion_timestamp: None,
@@ -2963,9 +3221,10 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
-                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
-                    self.process_generation_tagged_llm_outcome(generation, llm_outcome)
-                        .await;
+                Some(completion) = self.llm_outcome_rx.recv() => {
+                    if let Err(error) = self.process_llm_completion(completion).await {
+                        tracing::warn!(%error, "Outcome rejected by state machine");
+                    }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -3161,25 +3420,21 @@ where
     /// A later dispatch or abort supersedes the generation. Its stale outcome
     /// cannot clear the current request's task handle or metrics capture;
     /// current outcomes consume both before entering the state machine.
+    #[cfg(test)]
     #[allow(clippy::large_futures)]
     async fn process_generation_tagged_llm_outcome(
         &mut self,
         generation: u64,
         llm_outcome: LlmOutcome,
     ) {
-        if self.llm_outcome_is_stale(generation) {
-            tracing::debug!(
-                outcome_generation = generation,
-                current_generation = self.llm_request_generation,
-                state = self.state.variant_name(),
-                "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
-            );
-            return;
-        }
-
-        self.llm_task_handle = None;
-        self.active_llm_attempt = None;
-        if let Err(error) = self.process_outcome(EffectOutcome::Llm(llm_outcome)).await {
+        if let Err(error) = self
+            .process_llm_completion(LlmCompletion {
+                generation,
+                outcome: llm_outcome,
+                admitted: None,
+            })
+            .await
+        {
             tracing::warn!(%error, "Outcome rejected by state machine");
         }
     }
@@ -3271,12 +3526,48 @@ where
         generation != self.retry_generation
     }
 
+    async fn validate_goal_start_response_receipt(
+        &self,
+        outcome: &EffectOutcome,
+    ) -> Result<(), String> {
+        if let EffectOutcome::Llm(LlmOutcome::Response { request_id, .. }) = outcome {
+            if matches!(
+                self.storage
+                    .load_active_direct_turn(&self.context.conversation_id)
+                    .await?,
+                Some(crate::runtime::traits::LoadedActiveDirectTurn::GoalStart { .. })
+            ) && self
+                .pending_goal_request_checkpoint
+                .as_ref()
+                .is_none_or(|pending| pending.admitted.intent().id.as_str() != request_id)
+            {
+                return Err(
+                    "Start response has no matching actual-dispatch checkpoint receipt".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Process a typed effect outcome from a background task.
     ///
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
     #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        self.validate_goal_start_response_receipt(&outcome).await?;
+        let cancelled_llm = matches!(
+            &outcome,
+            EffectOutcome::Llm(LlmOutcome::Cancelled | LlmOutcome::GoalControlRevoked)
+        );
+        let revoked_llm = matches!(&outcome, EffectOutcome::Llm(LlmOutcome::GoalControlRevoked));
+        let revoked_tool = matches!((&outcome, &self.state), (
+            EffectOutcome::Tool(ToolExecOutcome::Aborted {
+                tool_use_id,
+                reason: crate::state_machine::AbortReason::GoalControlRevoked,
+            }),
+            ConvState::ToolExecuting { current_tool, .. },
+        ) if current_tool.id == *tool_use_id);
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
         // is the live timer firing. Its task has run to completion, leaving the
@@ -3326,10 +3617,12 @@ where
 
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => {
-                self.pending_provider_replay_update =
-                    replay_update.map(|(update, owner_message_id)| {
-                        update.with_owner_message_id(owner_message_id)
-                    });
+                if is_llm_outcome {
+                    self.pending_provider_replay_update =
+                        replay_update.map(|(update, owner_message_id)| {
+                            update.with_owner_message_id(owner_message_id)
+                        });
+                }
                 r
             }
             Err(invalid) => {
@@ -3351,7 +3644,18 @@ where
             self.pending_trusted_tool_results.clear();
         }
 
+        if revoked_tool || cancelled_llm {
+            self.direct_turn_cancellation_initiated = true;
+        }
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
+        if (revoked_tool || revoked_llm)
+            && self.active_direct_turn.is_some()
+            && matches!(result.new_state, ConvState::Idle)
+        {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::GoalControlRevoked,
+            ));
+        }
 
         let generated_events = self.apply_transition_result(result).await?;
         for event in generated_events.into_iter().rev() {
@@ -3408,6 +3712,17 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        if matches!(event, Event::ContinuationResponse { .. })
+            && matches!(
+                self.storage
+                    .load_active_direct_turn(&self.context.conversation_id)
+                    .await?,
+                Some(crate::runtime::traits::LoadedActiveDirectTurn::GoalStart { .. })
+            )
+        {
+            self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+            return Err("Start Summary completion is held until its canonical request checkpoint owner is integrated".into());
+        }
         if self.fatal_local_authority_fence.is_closed()
             && self.handoff_completion_authority.is_none()
             && !matches!(event, Event::Shutdown)
@@ -3601,8 +3916,10 @@ where
             }
             // Pure state transition
             let terminal_event = current_event.clone();
-            let authoritative_event =
-                matches!(current_event, Event::AuthoritativeUserMessage { .. });
+            let authoritative_event = matches!(
+                current_event,
+                Event::AuthoritativeUserMessage { .. } | Event::AuthoritativeGoalStart { .. }
+            );
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -3826,7 +4143,7 @@ where
     #[allow(clippy::large_futures)]
     async fn apply_transition_result_inner(
         &mut self,
-        result: crate::state_machine::transition::TransitionResult,
+        mut result: crate::state_machine::transition::TransitionResult,
         ordinary_input_id: Option<&str>,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
@@ -3843,7 +4160,28 @@ where
                 self.pending_sub_agent_terminal = Some(sub_agent_terminal_cause(outcome));
             }
         }
-        let terminal_direct_turn_transition = !self.context.is_sub_agent
+        let goal_checkpoint_transition = self.is_goal_checkpoint_transition(&result);
+        if self.pending_goal_request_checkpoint.is_some()
+            && matches!(result.new_state, ConvState::ToolExecuting { .. })
+            && !result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistState))
+        {
+            result.effects.insert(0, Effect::PersistState);
+        }
+        if goal_checkpoint_transition && matches!(result.new_state, ConvState::Idle) {
+            result.new_state = ConvState::LlmRequesting { attempt: 1 };
+            result.effects.push(Effect::RequestLlm);
+        }
+        if goal_checkpoint_transition {
+            if let Some(pending) = self.pending_goal_request_checkpoint.as_mut() {
+                pending.source = self.state.clone();
+                pending.source_updated_at = self.state_updated_at;
+            }
+        }
+        let terminal_direct_turn_transition = !goal_checkpoint_transition
+            && !self.context.is_sub_agent
             && self.active_direct_turn.is_some()
             && self.pending_direct_turn_terminal.is_some();
         let terminal_retry_transition = (terminal_subagent_transition
@@ -3865,10 +4203,13 @@ where
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
-        let is_direct_turn_adoption = result
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let is_direct_turn_adoption = result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::PersistAuthoritativeUserMessage { .. }
+                    | Effect::PersistAuthoritativeGoalStart { .. }
+            )
+        });
         let is_task_approval_adoption = result
             .effects
             .iter()
@@ -3919,11 +4260,12 @@ where
                     ..
                 }
             );
-            let next_state_updated_at = if state_changed && !retry_has_durable_fact {
-                self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
-            } else {
-                self.state_updated_at
-            };
+            let next_state_updated_at =
+                if (state_changed || goal_checkpoint_transition) && !retry_has_durable_fact {
+                    self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
+                } else {
+                    self.state_updated_at
+                };
             let will_drain_from_idle = matches!(result.new_state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
@@ -3938,6 +4280,7 @@ where
                 )
             });
             let publish = state_changed
+                && !goal_checkpoint_transition
                 && !will_drain_from_idle
                 && !will_commit_steering_drain
                 && !will_settle_creation
@@ -4089,7 +4432,8 @@ where
             ))
             .await?;
         } else {
-            let mut state_committed = false;
+            let mut committed_state: Option<(ConvState, DateTime<Utc>)> = None;
+            let mut persist_state_effect_satisfied = false;
             let mut new_turn_input_persisted = false;
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
                 let is_new_turn_input = match &effect {
@@ -4099,25 +4443,55 @@ where
                     }
                     _ => false,
                 };
-                let is_authoritative_persist =
-                    matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-                let checkpoint_commits_state = matches!(
+                let is_authoritative_persist = matches!(
+                    effect,
+                    Effect::PersistAuthoritativeUserMessage { .. }
+                        | Effect::PersistAuthoritativeGoalStart { .. }
+                );
+                let checkpoint_satisfies_persist_state = matches!(
                     effect,
                     Effect::PersistCheckpoint { .. }
                         if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
                             || (clears_pending_trusted_after_commit
                                 && !terminal_direct_turn_transition)
                 );
+                let checkpoint_commits_state = checkpoint_satisfies_persist_state
+                    || matches!(effect, Effect::PersistCheckpoint { .. } if !terminal_direct_turn_transition)
+                    || matches!(effect, Effect::PersistForkProposal { .. });
+                let has_specialized_state_work = self.pending_sub_agent_activation.is_some()
+                    || self.pending_sub_agent_terminal.is_some()
+                    || self.pending_sub_agent_acceptance.is_some()
+                    || self.pending_direct_turn_terminal.is_some()
+                    || self.pending_provider_replay_update.is_some();
                 let approval_commits_state = matches!(effect, Effect::ApproveTask { .. })
                     && task_approval_execution.is_some();
                 let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
-                    && (state_committed || approval_commits_state);
-                let is_state_persist = matches!(
+                    && !has_specialized_state_work
+                    && (persist_state_effect_satisfied || approval_commits_state);
+                let satisfies_persist_state = matches!(
                     effect,
                     Effect::PersistState
                         | Effect::CompleteCreation { .. }
                         | Effect::MaterializeCreation { .. }
-                ) || checkpoint_commits_state;
+                ) || (checkpoint_satisfies_persist_state
+                    && !has_specialized_state_work);
+                let is_state_persist = satisfies_persist_state || checkpoint_commits_state;
+                if goal_checkpoint_transition
+                    && matches!(effect, Effect::RequestLlm)
+                    && !matches!(self.state, ConvState::LlmRequesting { .. })
+                {
+                    continue;
+                }
+                if goal_checkpoint_transition && matches!(effect, Effect::PersistState) {
+                    if self.pending_goal_request_checkpoint.is_some() {
+                        return Err(
+                            "Goal state persistence preceded its canonical checkpoint".into()
+                        );
+                    }
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
+                    continue;
+                }
                 if redundant_approval_state_persist {
                     continue;
                 }
@@ -4125,9 +4499,12 @@ where
                     && self.handoff_completion_authority.is_some()
                     && matches!(self.state, ConvState::HandedOff { .. })
                 {
-                    state_committed = true;
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
                     continue;
                 }
+                let is_terminal_checkpoint = terminal_direct_turn_transition
+                    && matches!(&effect, Effect::PersistCheckpoint { .. });
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let is_sub_agent_result_persist =
                     matches!(effect, Effect::PersistSubAgentResults { .. });
@@ -4371,7 +4748,7 @@ where
                     )
                     .await
                 };
-                if state_committed
+                if committed_state.is_some()
                     && clears_pending_trusted_after_commit
                     && !pending_trusted_cleared
                 {
@@ -4384,7 +4761,10 @@ where
                         if is_state_persist && new_turn_input_persisted {
                             self.ordinary_turn_context = None;
                         }
-                        state_committed |= is_state_persist;
+                        if is_state_persist {
+                            committed_state = Some((self.state.clone(), self.state_updated_at));
+                        }
+                        persist_state_effect_satisfied |= satisfies_persist_state;
                         if is_state_persist && clears_pending_trusted_after_commit {
                             self.pending_trusted_tool_results.clear();
                             pending_trusted_cleared = true;
@@ -4400,19 +4780,26 @@ where
                             || is_sub_agent_result_persist
                             || ((terminal_subagent_transition
                                 || terminal_direct_turn_transition)
-                                && !state_committed) =>
+                                && committed_state.is_none()) =>
                     {
                         let failed_state = self.state.clone();
+                        let (retained_state, retained_timestamp) = committed_state
+                            .clone()
+                            .unwrap_or_else(|| (old_state.clone(), old_state_updated_at));
                         if terminal_direct_turn_transition {
-                            self.state = old_state.clone();
-                            self.state_updated_at = old_state_updated_at;
+                            self.state = retained_state;
+                            self.state_updated_at = retained_timestamp;
                             self.manage_deadline(&failed_state);
                         } else {
-                            self.install_live_state(old_state.clone(), old_state_updated_at, true)?;
+                            self.install_live_state(
+                                retained_state,
+                                retained_timestamp,
+                                !goal_checkpoint_transition,
+                            )?;
                             self.manage_deadline(&failed_state);
                         }
                         if (terminal_subagent_transition || terminal_direct_turn_transition)
-                            && !state_committed
+                            && committed_state.is_none()
                         {
                             self.schedule_terminal_transition_retry(
                                 terminal_subagent_transition,
@@ -4453,11 +4840,16 @@ where
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
                 }
-                if checkpoint_commits_state {
-                    state_committed = true;
+                if is_terminal_checkpoint
+                    && self.active_direct_turn.is_none()
+                    && self.pending_direct_turn_terminal.is_none()
+                {
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
                 }
                 if approval_commits_state {
-                    state_committed = true;
+                    committed_state = Some((self.state.clone(), self.state_updated_at));
+                    persist_state_effect_satisfied = true;
                 }
                 if self.creation_settlement_disposition
                     == CreationSettlementDisposition::StaleAuthority
@@ -4509,13 +4901,15 @@ where
         // the await inside `run_effects_with_inline_drain`, which would cause a
         // concurrent `POST /chat` to route a `UserMessage` before the drain has
         // advanced the state back to `LlmRequesting` (FM-7).
-        if terminal_direct_turn_transition {
-            let _admitted = terminal_unit_admission
-                .as_deref_mut()
-                .expect("terminal direct-turn transition is admitted");
-            self.publish_live_state_admitted();
-        } else {
-            self.publish_live_state()?;
+        if !goal_checkpoint_transition {
+            if terminal_direct_turn_transition {
+                let _admitted = terminal_unit_admission
+                    .as_deref_mut()
+                    .expect("terminal direct-turn transition is admitted");
+                self.publish_live_state_admitted();
+            } else {
+                self.publish_live_state()?;
+            }
         }
         Ok(generated_events)
     }
@@ -4568,8 +4962,11 @@ where
                     _ => {}
                 }
             }
-            let is_authoritative_persist =
-                matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
+            let is_authoritative_persist = matches!(
+                effect,
+                Effect::PersistAuthoritativeUserMessage { .. }
+                    | Effect::PersistAuthoritativeGoalStart { .. }
+            );
             let effect_result = Box::pin(self.execute_effect(effect)).await;
             let effect_result = match effect_result {
                 Ok(effect_result) => effect_result,
@@ -4701,7 +5098,7 @@ where
         ) {
             self.settle_pending_direct_turn(turn, Box::new(terminal))
                 .await?;
-        } else if let Some(update) = self.pending_provider_replay_update.take() {
+        } else if let Some(update) = self.take_state_progress_replay().await? {
             self.storage
                 .update_state_and_provider_replay(
                     &self.context.conversation_id,
@@ -6199,6 +6596,80 @@ where
             }
         }
         match effect {
+            AuthoritativeEffect::PersistAuthoritativeGoalStart { receipt, authority } => {
+                use phoenix_db::workflow::{
+                    GoalStartAdoptionOutcome as Outcome, LocalAuthorityResult,
+                };
+                let proposed = self
+                    .proposed_direct_turn_state
+                    .as_ref()
+                    .ok_or_else(|| "Start adoption has no proposed state".to_owned())?;
+                if proposed.state != (ConvState::LlmRequesting { attempt: 1 }) {
+                    return Err("Start adoption proposed a noninitial request state".into());
+                }
+                let input = crate::runtime::traits::AuthoritativeGoalStartInput {
+                    receipt,
+                    authority,
+                    state_updated_at: proposed.updated_at,
+                    now: phoenix_workflow::Timestamp(
+                        u64::try_from(Utc::now().timestamp())
+                            .map_err(|_| "Start adoption clock precedes epoch")?,
+                    ),
+                };
+                let storage = self.storage.clone();
+                let owner = admitted.transfer();
+                let task = tokio::spawn(async move {
+                    let outcome = storage.materialize_authoritative_goal_start(&input).await;
+                    if matches!(outcome, LocalAuthorityResult::DurableFactUnclassified) {
+                        owner.close("goal_start_materialization");
+                    }
+                    (outcome, owner)
+                });
+                let mut guard = AuthorityBoundaryConsumerGuard {
+                    fence: Some(self.fatal_local_authority_fence.clone()),
+                };
+                let (outcome, _owner) = task.await.map_err(|error| {
+                    tracing::error!(?error, "Start materialization authority owner disappeared");
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:goal_start_boundary_disappeared".to_owned()
+                })?;
+                guard.disarm();
+                match outcome {
+                    LocalAuthorityResult::DurableFactEstablished(
+                        Outcome::Committed {
+                            turn_id,
+                            generation,
+                        }
+                        | Outcome::ClassifiedCommitted {
+                            turn_id,
+                            generation,
+                        },
+                    ) => {
+                        let proposed = self
+                            .proposed_direct_turn_state
+                            .take()
+                            .ok_or_else(|| "committed Start has no proposed state".to_owned())?;
+                        self.state = proposed.state;
+                        self.state_updated_at = proposed.updated_at;
+                        self.active_direct_turn =
+                            Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                                turn_id,
+                                generation,
+                            }));
+                        self.ordinary_turn_context = None;
+                        self.publish_live_state_admitted();
+                        Ok(None)
+                    }
+                    LocalAuthorityResult::DurableFactEstablished(_) => {
+                        self.proposed_direct_turn_state = None;
+                        self.direct_turn_materialization_aborted = true;
+                        Ok(None)
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        self.proposed_direct_turn_state = None;
+                        Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:goal_start_materialization".into())
+                    }
+                }
+            }
             AuthoritativeEffect::PersistAuthoritativeUserMessage {
                 payload,
                 authority,
@@ -6233,7 +6704,7 @@ where
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
                     authority,
-                    payload,
+                    payload: *payload,
                     sequence_id: reserved_seqs[0],
                     created_at: phoenix_workflow::Timestamp(now),
                     accepted_state: self
@@ -6332,13 +6803,18 @@ where
                 idempotent,
                 origin,
             } => {
+                let goal_checkpoint = self
+                    .pending_goal_request_checkpoint
+                    .as_ref()
+                    .is_some_and(|pending| pending.admitted.intent().id.as_str() == message_id);
                 // Idempotent recovery paths skip an already-persisted identity;
                 // ordinary message effects avoid the extra existence query.
-                if (idempotent
-                    || matches!(
-                        self.terminal_settlement_attempt,
-                        TerminalSettlementAttempt::Retry { .. }
-                    ))
+                if !goal_checkpoint
+                    && (idempotent
+                        || matches!(
+                            self.terminal_settlement_attempt,
+                            TerminalSettlementAttempt::Retry { .. }
+                        ))
                     && self.storage.message_exists(&message_id).await?
                 {
                     tracing::debug!(
@@ -6348,8 +6824,39 @@ where
                     return Ok(None);
                 }
 
-                let seq = self.broadcast_tx.next_seq();
-                let msg = if matches!(
+                let reservation = if goal_checkpoint {
+                    Some(
+                        self.broadcast_tx
+                            .persisted_message_reservation_authority()
+                            .await
+                            .reserve_next_range(1)
+                            .expect("executor owns persisted-message reservation"),
+                    )
+                } else {
+                    None
+                };
+                let seq = reservation
+                    .as_ref()
+                    .map(|(_, sequences)| sequences[0])
+                    .unwrap_or_else(|| self.broadcast_tx.next_seq());
+                let msg = if goal_checkpoint {
+                    let message = crate::db::Message {
+                        message_type: content.message_type(),
+                        content,
+                        display_data,
+                        usage_data,
+                        message_id: message_id.clone(),
+                        origin,
+                        conversation_id: self.context.conversation_id.clone(),
+                        sequence_id: seq,
+                        created_at: Utc::now(),
+                    };
+                    self.commit_admitted_goal_request(
+                        &message, phoenix_db::conversation_goals::request_checkpoint::GoalRequestEvidence::Response,
+                    ).await?;
+                    self.publish_live_state_admitted();
+                    message
+                } else if matches!(
                     self.pending_provider_replay_update,
                     Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear)
                 ) {
@@ -6396,6 +6903,7 @@ where
                     .admitted_publication(admitted)
                     .persisted_opening_message(&self.storage, msg)
                     .await?;
+                drop(reservation);
                 Ok(None)
             }
 
@@ -7251,10 +7759,7 @@ where
                     )
                     .await?;
 
-                let _ = self
-                    .broadcast_tx
-                    .admitted_publication(admitted)
-                    .persisted_message(msg);
+                self.publish_canonical_rows(&msg, &[], admitted);
                 Ok(None)
             }
 
@@ -7838,6 +8343,32 @@ where
         &mut self,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        if self.pending_goal_request_checkpoint.is_some() {
+            self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+            return Err("admitted Goal response is not checkpointed".into());
+        }
+        let goal_request_context = self
+            .storage
+            .admit_goal_start_request_context(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+                self.state_updated_at,
+                phoenix_core::domain::conversation_goal::GoalRequestOperation::Normal {
+                    attempt: match &self.state {
+                        ConvState::LlmRequesting { attempt } => *attempt,
+                        ConvState::ServerOverloadRetrying { retry } => retry.attempt,
+                        _ => 1,
+                    },
+                },
+            )
+            .await?;
+        let goal_dispatch = self
+            .storage
+            .admit_goal_control_dispatch(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+            )
+            .await?;
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
         // only fires for parent conversations. The counter is reset at
@@ -8044,7 +8575,7 @@ where
                 .saturating_sub(trusted_token_reserve),
             &self.clear_watermark_cache,
         )
-        .await;
+        .await?;
 
         overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
 
@@ -8144,15 +8675,54 @@ where
         // Message, producing a phantom streaming buffer on the
         // client (the "repeated message" bug).
         let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
-        let request_id = overload_incident.as_ref().map_or_else(
-            || uuid::Uuid::new_v4().to_string(),
-            |(_, logical_request_id, _)| logical_request_id.clone(),
-        );
+        let request_id = match (goal_request_context.as_ref(), overload_incident.as_ref()) {
+            (Some(context), Some((_, retry_id, _)))
+                if context.request_id().as_str() != retry_id =>
+            {
+                return Err(
+                    "Start transport retry differs from the admitted logical request".into(),
+                );
+            }
+            (Some(context), _) => context.request_id().as_str().to_owned(),
+            (None, Some((_, retry_id, _))) => retry_id.clone(),
+            (None, None) => uuid::Uuid::new_v4().to_string(),
+        };
 
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // provider context are request authority, not task-local inputs.
         let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
+        let request_goal_report = goal_request_context
+            .as_ref()
+            .map(|context| context.admitted().report_binding())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .map(|binding| GoalReportEmitter { binding });
+        if let Some(emitter) = request_goal_report
+            .as_ref()
+            .or_else(|| self.parent_goal_report_emitter())
+        {
+            if available_tools
+                .iter()
+                .any(|definition| definition.name == "goal_report")
+            {
+                return Err("goal report declaration has two owners".into());
+            }
+            available_tools.push(emitter.definition());
+        }
+        if self.context.is_coordinator
+            && !self.context.is_sub_agent
+            && self.goal_management.is_some()
+        {
+            if available_tools
+                .iter()
+                .any(|definition| definition.name == "goal_manage")
+            {
+                return Err("goal management declaration has two owners".into());
+            }
+            available_tools
+                .push(crate::goal_service::management::GoalManagementService::definition());
+        }
         if let Some(tool) = available_tools
             .iter_mut()
             .find(|tool| tool.name == "spawn_agents")
@@ -8237,6 +8807,9 @@ where
                 system_prompt.push_str("\n\n");
                 system_prompt.push_str(&orientation);
             }
+        }
+        if let Some(context) = &goal_request_context {
+            system_prompt.push_str(&context.system_context());
         }
         let callable_names = request_tool_surface
             .callable_tools(available_tools.clone())
@@ -8336,18 +8909,23 @@ where
                             first_text_seen = true;
                             let observed_at = Utc::now();
                             *first_byte_at_for_fwd.lock().await = Some(observed_at);
-                            let request_id_for_first = request_id_for_fwd.clone();
-                            let _ =
-                                broadcast_tx_for_tokens.send_seq(|seq| SseEvent::LlmFirstByte {
-                                    sequence_id: seq,
-                                    request_id: request_id_for_first,
+                            {
+                                let request_id_for_first = request_id_for_fwd.clone();
+                                let _ = broadcast_tx_for_tokens.send_seq(|seq| {
+                                    SseEvent::LlmFirstByte {
+                                        sequence_id: seq,
+                                        request_id: request_id_for_first,
+                                    }
                                 });
+                            }
                         }
-                        let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
-                            sequence_id: seq,
-                            text,
-                            request_id: request_id_for_fwd.clone(),
-                        });
+                        {
+                            let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
+                                sequence_id: seq,
+                                text,
+                                request_id: request_id_for_fwd.clone(),
+                            });
+                        }
                     }
                     Some(phoenix_llm::TokenChunk::RateLimitSnapshot(snapshot)) => {
                         let _ =
@@ -8364,6 +8942,8 @@ where
         let forwarder_abort = forwarder_handle.abort_handle();
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
         let mut request_admission = admitted.reborrow();
+        #[cfg(test)]
+        let goal_dispatch_barrier = self.goal_dispatch_barrier.clone();
         let task_attempt_capture = attempt_capture.clone();
         let request_task = async move {
             let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
@@ -8387,8 +8967,13 @@ where
             // transcript, tool-registry, or prompt construction happens here.
             let attempt_capture = task_attempt_capture;
 
+            #[cfg(test)]
+            if let Some(barrier) = goal_dispatch_barrier {
+                barrier.pause().await;
+            }
+
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
-            let provider = llm_client.complete_streaming(&request, &chunk_tx);
+            let provider = goal_dispatch.run(llm_client.complete_streaming(&request, &chunk_tx));
             let result = if let Some(deadline) = overload_deadline {
                 let started_at = std::time::Instant::now();
                 let remaining = (deadline - Utc::now()).to_std().unwrap_or_default();
@@ -8396,15 +8981,19 @@ where
                     result
                 } else {
                     let _ = attempt_capture.finalize_timed_out(started_at.elapsed());
-                    Err(phoenix_llm::LlmError::server_overloaded(
+                    Ok(Err(phoenix_llm::LlmError::server_overloaded(
                         "Server overload retry deadline elapsed",
-                    ))
+                    )))
                 }
             } else {
                 provider.await
             };
             let llm_outcome = match result {
-                Ok(response) => {
+                Err(_) => {
+                    let _ = attempt_capture.finalize_cancelled();
+                    LlmOutcome::GoalControlRevoked
+                }
+                Ok(Ok(response)) => {
                     // Extract tool calls from content and convert to typed ToolCall
                     let tool_calls: Vec<ToolCall> = response
                         .tool_uses()
@@ -8440,7 +9029,7 @@ where
                         request_id: request_id.clone(),
                     }
                 }
-                Err(e) => llm_error_to_outcome(e, &request_id, &model_id),
+                Ok(Err(e)) => llm_error_to_outcome(e, &request_id, &model_id),
             };
 
             let finalized_metrics = attempt_capture.finalized();
@@ -8544,6 +9133,7 @@ where
             llm_rx,
             dispatch_generation,
             llm_outcome_tx,
+            goal_request_context.map(phoenix_db::GoalStartRequestContext::into_admitted),
         ));
 
         Ok(None)
@@ -8652,16 +9242,229 @@ where
         self.create_tool_llm_metrics_sink(admitted)
     }
 
+    async fn take_state_progress_replay(
+        &mut self,
+    ) -> Result<Option<phoenix_core::domain::provider_replay::ProviderReplayUpdate>, String> {
+        if self.pending_goal_request_checkpoint.is_some() {
+            return Ok(None);
+        }
+        if self.pending_provider_replay_update.is_some()
+            && Box::pin(self.management_checkpoint_owns_replay()).await?
+        {
+            return Ok(None);
+        }
+        Ok(self.pending_provider_replay_update.take())
+    }
+
+    async fn management_checkpoint_owns_replay(&self) -> Result<bool, String> {
+        use phoenix_core::domain::conversation_goal::{GoalManagementRequest, ToolRoundResult};
+        let Some(service) = &self.goal_management else {
+            return Ok(false);
+        };
+        if !self.context.is_coordinator || self.context.is_sub_agent {
+            return Ok(false);
+        }
+        let (assistant, calls, results) = match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message,
+                current_tool,
+                remaining_tools,
+                completed_results,
+                ..
+            } => (
+                assistant_message,
+                std::iter::once(current_tool)
+                    .chain(remaining_tools)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                completed_results,
+            ),
+            ConvState::CancellingTool {
+                assistant_message,
+                tool_use_id,
+                skipped_tools,
+                completed_results,
+                ..
+            } => (
+                assistant_message,
+                cancelling_management_call(assistant_message, tool_use_id)
+                    .into_iter()
+                    .chain(skipped_tools.iter().cloned())
+                    .collect(),
+                completed_results,
+            ),
+            _ => return Ok(false),
+        };
+        for entry in results {
+            if let ToolRoundResult::PendingGoalManagement { management, .. } = entry {
+                require_canonical_management_call(
+                    assistant,
+                    management.source().tool_use_id.as_str(),
+                    management.request(),
+                )?;
+                let verified = self
+                    .prepare_management_request(
+                        service,
+                        &assistant.message_id,
+                        management.source().tool_use_id.as_str(),
+                        management.request().clone(),
+                    )
+                    .await?;
+                if &verified != management {
+                    return Err("pending management replay owner differs from host source".into());
+                }
+                return Ok(true);
+            }
+        }
+        for call in calls {
+            if call.name() != "goal_manage" {
+                continue;
+            }
+            let Ok(request) =
+                serde_json::from_value::<GoalManagementRequest>(call.input.to_value())
+            else {
+                continue;
+            };
+            require_canonical_management_call(assistant, &call.id, &request)?;
+            self.prepare_management_request(service, &assistant.message_id, &call.id, request)
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn prepare_goal_management(&self, tool: &ToolCall) -> Result<Event, String> {
+        use phoenix_core::domain::conversation_goal::GoalManagementRequest;
+        if !self.context.is_coordinator || self.context.is_sub_agent {
+            return Err("goal management requires the parent Coordinator".into());
+        }
+        let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = &self.state
+        else {
+            return Err("goal management has no owning assistant round".into());
+        };
+        if current_tool.id != tool.id
+            || current_tool.name() != "goal_manage"
+            || current_tool.input != tool.input
+        {
+            return Err("goal management differs from executing call".into());
+        }
+        let request = match serde_json::from_value::<GoalManagementRequest>(tool.input.to_value()) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Event::ToolComplete {
+                    tool_use_id: tool.id.clone(),
+                    result: ToolResult::error(
+                        tool.id.clone(),
+                        format!("Invalid goal management: {error}"),
+                    ),
+                })
+            }
+        };
+        require_canonical_management_call(assistant_message, &tool.id, &request)?;
+        let service = self
+            .goal_management
+            .as_ref()
+            .ok_or("goal management is not installed")?;
+        let management = self
+            .prepare_management_request(service, &assistant_message.message_id, &tool.id, request)
+            .await?;
+        Ok(Event::GoalManagementPrepared {
+            management,
+            duration_ms: 0,
+        })
+    }
+
+    fn parent_goal_report_emitter(&self) -> Option<&GoalReportEmitter> {
+        if self.context.is_sub_agent || self.context.is_coordinator {
+            None
+        } else {
+            self.goal_report_emitter.as_ref()
+        }
+    }
+
+    fn prepare_goal_report(
+        &self,
+        tool: &ToolCall,
+        binding: phoenix_core::domain::conversation_goal::GoalReportBinding,
+        _admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Event, String> {
+        use phoenix_core::domain::conversation_goal::{
+            GoalPendingReport, GoalReportCall, GoalReportOutcome, GoalText,
+        };
+        let start = std::time::Instant::now();
+        let ConvState::ToolExecuting {
+            current_tool,
+            assistant_message,
+            ..
+        } = &self.state
+        else {
+            return Err("goal report has no owning assistant round".into());
+        };
+        if current_tool.id != tool.id {
+            return Err("goal report differs from the executing tool".into());
+        }
+        let outcome = match serde_json::from_value::<GoalReportOutcome>(tool.input.to_value()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(Event::ToolComplete {
+                    tool_use_id: tool.id.clone(),
+                    result: ToolResult::error(
+                        tool.id.clone(),
+                        format!("Invalid goal report: {error}"),
+                    ),
+                })
+            }
+        };
+        let report = GoalPendingReport::new(
+            binding,
+            GoalReportCall {
+                transcript_id: GoalText::parse(self.context.conversation_id.clone())
+                    .map_err(|error| error.to_string())?,
+                message_id: GoalText::parse(assistant_message.message_id.clone())
+                    .map_err(|error| error.to_string())?,
+                tool_use_id: GoalText::parse(tool.id.clone()).map_err(|error| error.to_string())?,
+            },
+            outcome,
+        );
+        if self
+            .active_direct_turn
+            .as_deref()
+            .and_then(|turn| i64::try_from(turn.turn_id.0).ok())
+            != Some(report.execution().turn_id())
+        {
+            return Err("goal report binding differs from the active admitted execution".into());
+        }
+        Ok(Event::GoalReportPrepared {
+            report,
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch_tool_execution(
         &mut self,
         tool: ToolCall,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        let goal_dispatch = self
+            .storage
+            .admit_goal_control_dispatch(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+            )
+            .await?;
         let request_policy = self
             .storage
             .load_tool_admission_policy(&self.context.conversation_id)
             .await?;
+        #[cfg(test)]
+        if let Some(barrier) = &self.goal_dispatch_barrier {
+            barrier.pause().await;
+        }
         let request_definition = request_policy.declarations().iter().find(|definition| {
             definition.name == tool.name() && request_policy.is_callable(tool.name())
         });
@@ -8692,6 +9495,50 @@ where
                 ),
             }));
         }
+        if tool.name() == "goal_report" {
+            let request_goal_report = self
+                .pending_goal_request_checkpoint
+                .as_ref()
+                .map(|pending| pending.admitted.report_binding())
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .map(|binding| GoalReportEmitter { binding });
+            if let Some(emitter) = request_goal_report
+                .as_ref()
+                .or_else(|| self.parent_goal_report_emitter())
+            {
+                if request_schema != emitter.definition().input_schema {
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id: tool.id.clone(),
+                        result: ToolResult::error(
+                            tool.id.clone(),
+                            "EUNAVAIL: goal report schema changed since the originating request"
+                                .into(),
+                        ),
+                    }));
+                }
+                return self
+                    .prepare_goal_report(&tool, emitter.binding.clone(), admitted)
+                    .map(Some);
+            }
+        }
+
+        if tool.name() == "goal_manage" {
+            if self.context.is_coordinator
+                && !self.context.is_sub_agent
+                && self.goal_management.is_some()
+            {
+                return self.prepare_goal_management(&tool).await.map(Some);
+            }
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id: tool.id.clone(),
+                result: ToolResult::error(
+                    tool.id.clone(),
+                    "EUNAVAIL: Coordinator goal management is not installed".into(),
+                ),
+            }));
+        }
+
         if tool.name() == "spawn_agents" {
             let advertised = self
                 .tool_executor
@@ -8718,6 +9565,9 @@ where
                 }));
             }
             self.spawn_catalog = Some(catalog);
+            goal_dispatch
+                .require_delegation_support()
+                .map_err(|error| error.to_string())?;
             return self.handle_spawn_agents_tool(tool).await;
         }
 
@@ -8886,6 +9736,7 @@ where
                 checked,
                 tool_ctx,
                 &cancel_token_check,
+                goal_dispatch,
                 conv_id,
                 root_conv_id,
                 tool_name,
@@ -8932,18 +9783,470 @@ where
         Ok(None)
     }
 
+    async fn persist_pending_goal_terminal(
+        &mut self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<Option<Vec<crate::db::Message>>, String> {
+        let obligation = crate::runtime::traits::terminal_obligation(settlement, None);
+        let checkpoint = phoenix_db::conversation_goals::round::GoalRoundCheckpoint {
+            assistant: checkpoint.assistant,
+            execution: checkpoint.execution,
+            results: checkpoint.results,
+            state: &settlement.state,
+            state_updated_at: settlement.state_updated_at,
+        };
+        let committed = match self
+            .storage
+            .persist_goal_terminal_tool_round(
+                &checkpoint,
+                &obligation,
+                self.pending_provider_replay_update.as_ref(),
+            )
+            .await
+        {
+            TerminalMutationEstablishment::Established { value, .. } => value,
+            TerminalMutationEstablishment::Retired => {
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                return Ok(None);
+            }
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+        };
+        self.pending_provider_replay_update = None;
+        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        Ok(Some(committed.results))
+    }
+
+    async fn persist_pending_management_round(
+        &mut self,
+        assistant: crate::db::Message,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+        proposal: Option<&crate::db::ForkProposal>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
+        use phoenix_db::conversation_goals::{
+            management::GoalManagementRoundKind, round::GoalRoundCheckpoint,
+        };
+        if !self.context.is_coordinator || self.context.is_sub_agent {
+            return Err("management checkpoint is not the parent Coordinator".into());
+        }
+        let service = self
+            .goal_management
+            .as_ref()
+            .ok_or("management checkpoint owner is not installed")?
+            .clone();
+        let execution = results
+            .iter()
+            .find_map(|result| match result {
+                ToolRoundResult::PendingGoalManagement { management, .. } => {
+                    Some(management.source().execution)
+                }
+                _ => None,
+            })
+            .ok_or("management checkpoint has no intent")?;
+        let active = self
+            .active_direct_turn
+            .as_deref()
+            .ok_or("management checkpoint has no active direct turn")?;
+        if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
+            return Err("management checkpoint differs from active direct turn".into());
+        }
+        if results.iter().any(|result| matches!(result,
+            ToolRoundResult::PendingGoalManagement { management, .. }
+                if management.source().execution != execution || management.generation() != active.generation
+        )) {
+            return Err("management checkpoint generation differs from active direct turn".into());
+        }
+        if let Some(settlement) = settlement {
+            if &settlement.turn != active {
+                return Err("management terminal authority differs".into());
+            }
+        }
+        let checkpoint = GoalRoundCheckpoint {
+            assistant: &assistant,
+            execution,
+            results: &results,
+            state: &self.state,
+            state_updated_at: self.state_updated_at,
+        };
+        let obligation = settlement
+            .map(|settlement| crate::runtime::traits::terminal_obligation(settlement, None));
+        let kind = if let Some(obligation) = &obligation {
+            GoalManagementRoundKind::Terminal(obligation)
+        } else if let Some(proposal) = proposal {
+            GoalManagementRoundKind::Fork(proposal)
+        } else {
+            GoalManagementRoundKind::Runtime
+        };
+        let committed = match service
+            .checkpoint(
+                &checkpoint,
+                kind,
+                self.pending_provider_replay_update.as_ref(),
+            )
+            .await
+        {
+            TerminalMutationEstablishment::Established { value, .. } => value,
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+            TerminalMutationEstablishment::Retired => {
+                return Err("management checkpoint retired".into())
+            }
+        };
+        self.pending_provider_replay_update = None;
+        let goal_request_committed = self.pending_goal_request_checkpoint.take().is_some();
+        self.install_live_state(committed.state, committed.state_updated_at, false)?;
+        if goal_request_committed {
+            self.publish_live_state_admitted();
+        }
+        if settlement.is_some() {
+            self.active_direct_turn = None;
+            self.pending_direct_turn_terminal = None;
+            self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+            self.direct_turn_cancellation_initiated = false;
+            self.settle_turn_span();
+        }
+        self.publish_management_round(assistant, &results, committed.results, settlement, admitted);
+        Ok(None)
+    }
+
+    fn publish_management_round(
+        &mut self,
+        assistant: crate::db::Message,
+        results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+        messages: Vec<crate::db::Message>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) {
+        let finalized = results
+            .iter()
+            .filter_map(|entry| entry.finalized().cloned())
+            .collect::<Vec<_>>();
+        merge_trusted_tool_results(
+            &mut self.pending_trusted_tool_results,
+            trusted_tool_results(&assistant.message_id, &finalized),
+        );
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(assistant);
+        for result in messages {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(result);
+        }
+        if settlement.is_some() {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .state_change(
+                    self.state.clone(),
+                    self.state.presentation_mode().into(),
+                    self.state_updated_at,
+                );
+        }
+    }
+
+    async fn restore_goal_assistant_sequence(
+        &self,
+        assistant: &mut crate::db::Message,
+    ) -> Result<(), String> {
+        if self.storage.message_exists(&assistant.message_id).await? {
+            assistant.sequence_id = self
+                .storage
+                .get_message_by_id(&assistant.message_id)
+                .await?
+                .sequence_id;
+        }
+        Ok(())
+    }
+
+    fn publish_canonical_rows(
+        &self,
+        assistant: &crate::db::Message,
+        results: &[crate::db::Message],
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) {
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(assistant.clone());
+        for result in results {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(result.clone());
+        }
+    }
+    async fn persist_pending_goal_round(
+        &mut self,
+        mut assistant: crate::db::Message,
+        results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+        proposal: Option<&crate::db::ForkProposal>,
+        settlement: Option<&ActiveDirectTurnSettlement>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        use phoenix_core::domain::conversation_goal::ToolRoundResult;
+        use phoenix_db::conversation_goals::round::GoalRoundCheckpoint;
+        self.restore_goal_assistant_sequence(&mut assistant).await?;
+        if results
+            .iter()
+            .any(|entry| matches!(entry, ToolRoundResult::PendingGoalManagement { .. }))
+        {
+            return Box::pin(self.persist_pending_management_round(
+                assistant, results, proposal, settlement, admitted,
+            ))
+            .await;
+        }
+        let execution = results
+            .iter()
+            .find_map(|entry| match entry {
+                ToolRoundResult::PendingGoalReport { report, .. } => Some(report.execution()),
+                ToolRoundResult::PendingGoalManagement { management, .. } => {
+                    Some(management.source().execution)
+                }
+                ToolRoundResult::Finalized(_) => None,
+            })
+            .ok_or("pending goal round has no report")?;
+        let active = self
+            .active_direct_turn
+            .as_deref()
+            .ok_or("pending goal round has no active direct turn")?;
+        if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
+            return Err("pending goal report execution differs from active direct turn".into());
+        }
+        let mut trusted = Vec::new();
+        for entry in &results {
+            match entry {
+                ToolRoundResult::Finalized(result) => trusted.extend(trusted_tool_results(
+                    &assistant.message_id,
+                    std::slice::from_ref(result),
+                )),
+                ToolRoundResult::PendingGoalReport { .. }
+                | ToolRoundResult::PendingGoalManagement { .. } => {}
+            }
+        }
+        let state = self.state.clone();
+        let checkpoint = GoalRoundCheckpoint {
+            assistant: &assistant,
+            execution,
+            results: &results,
+            state: &state,
+            state_updated_at: self.state_updated_at,
+        };
+        let messages = if let Some(settlement) = settlement {
+            if settlement.turn != *active {
+                return Err(
+                    "pending goal terminal settlement differs from active direct turn".into(),
+                );
+            }
+            let Some(messages) = self
+                .persist_pending_goal_terminal(&checkpoint, settlement)
+                .await?
+            else {
+                return Ok(None);
+            };
+            messages
+        } else {
+            let committed = if let Some(proposal) = proposal {
+                self.storage
+                    .persist_goal_fork_tool_round(
+                        &checkpoint,
+                        proposal,
+                        self.pending_provider_replay_update.as_ref(),
+                    )
+                    .await?
+            } else if let Some(update) = self.pending_provider_replay_update.as_ref() {
+                let committed = self
+                    .storage
+                    .persist_goal_tool_round_state_and_replay(&checkpoint, update)
+                    .await?;
+                committed
+            } else {
+                self.storage
+                    .persist_goal_tool_round_and_state(&checkpoint)
+                    .await?
+            };
+            self.pending_provider_replay_update = None;
+            self.install_live_state(committed.state, committed.state_updated_at, false)?;
+            committed.results
+        };
+        merge_trusted_tool_results(&mut self.pending_trusted_tool_results, trusted);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(assistant);
+        for message in messages {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(message);
+        }
+        Ok(None)
+    }
+
+    fn prepare_revoked_goal_tool_round(
+        &mut self,
+        agent_msg: crate::db::Message,
+        tool_results: Vec<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+        reservation: crate::runtime::ReservedBroadcastRange,
+        reserved_seqs: Vec<i64>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<(), String> {
+        let finalized: Vec<_> = tool_results
+            .iter()
+            .filter_map(|result| result.finalized().cloned())
+            .collect();
+        let trusted_results = trusted_tool_results(&agent_msg.message_id, &finalized);
+        let results = if contains_pending_goal_result(&tool_results) {
+            let execution = tool_results.iter().find_map(|entry| {
+                if let phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport { report, .. } = entry {
+                    Some(report.execution())
+                } else { None }
+            }).ok_or("revoked pending goal round has no report execution")?;
+            let active = self
+                .active_direct_turn
+                .as_deref()
+                .ok_or("revoked pending goal round has no active direct turn")?;
+            if i64::try_from(active.turn_id.0).ok() != Some(execution.turn_id()) {
+                return Err("revoked pending report differs from active direct turn".into());
+            }
+            RevokedGoalToolResults::Pending {
+                execution,
+                results: tool_results,
+            }
+        } else {
+            let finalized = finalized_round_results(&tool_results)?;
+            RevokedGoalToolResults::Finalized(terminal_tool_messages(
+                &agent_msg,
+                finalized,
+                reserved_seqs.into_iter().skip(1),
+            ))
+        };
+        self.prepared_revoked_goal_tool_round = Some(Box::new(PreparedRevokedGoalToolRound {
+            _reservation: reservation,
+            assistant: agent_msg,
+            results,
+            settlement: settlement.clone(),
+            provider_replay: self.pending_provider_replay_update.take(),
+            trusted_results,
+        }));
+        Ok(())
+    }
+
+    async fn persist_prepared_revoked_goal_tool_round(
+        &mut self,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        let command = self
+            .prepared_revoked_goal_tool_round
+            .as_ref()
+            .ok_or("revoked-goal checkpoint has no prepared command")?;
+        if self.state != command.settlement.state {
+            return Err("revoked-goal checkpoint target differs from the retained command".into());
+        }
+        let establishment = match &command.results {
+            RevokedGoalToolResults::Finalized(messages) => self
+                .storage
+                .persist_revoked_goal_tool_round(
+                    &command.assistant.conversation_id,
+                    &command.assistant,
+                    messages,
+                    &command.settlement,
+                    command.provider_replay.as_ref(),
+                )
+                .await
+                .map(|()| messages.clone()),
+            RevokedGoalToolResults::Pending { execution, results } => {
+                let checkpoint = phoenix_db::conversation_goals::round::GoalRoundCheckpoint {
+                    assistant: &command.assistant,
+                    execution: *execution,
+                    results,
+                    state: &command.settlement.state,
+                    state_updated_at: command.settlement.state_updated_at,
+                };
+                self.storage
+                    .persist_revoked_pending_goal_tool_round(
+                        &checkpoint,
+                        &command.settlement,
+                        command.provider_replay.as_ref(),
+                    )
+                    .await
+                    .map(|committed| committed.results)
+            }
+        };
+        let publication = match establishment {
+            TerminalMutationEstablishment::Established { value, .. } => Some(value),
+            TerminalMutationEstablishment::Retired => None,
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+        };
+        let command = self
+            .prepared_revoked_goal_tool_round
+            .take()
+            .expect("prepared command retained through settlement");
+        self.state_updated_at = command.settlement.state_updated_at;
+        self.pending_provider_replay_update = None;
+        self.active_direct_turn = None;
+        self.pending_direct_turn_terminal = None;
+        self.direct_turn_cancellation_initiated = false;
+        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        self.settle_turn_span();
+        if let Some(messages) = publication {
+            merge_trusted_tool_results(
+                &mut self.pending_trusted_tool_results,
+                command.trusted_results,
+            );
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(command.assistant);
+            for message in messages {
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(message);
+            }
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .state_change(
+                    self.state.clone(),
+                    self.state.presentation_mode().to_string(),
+                    self.state_updated_at,
+                );
+        }
+        Ok(None)
+    }
+
     async fn persist_checkpoint_with_terminal_obligation(
         &mut self,
         data: CheckpointData,
         settlement: &ActiveDirectTurnSettlement,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        if self.prepared_revoked_goal_tool_round.is_some() {
+            return self
+                .persist_prepared_revoked_goal_tool_round(admitted)
+                .await;
+        }
         let CheckpointData::ToolRound {
             assistant_message,
             tool_results,
         } = data;
-        let new_trusted_results =
-            trusted_tool_results(&assistant_message.message_id, &tool_results);
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
@@ -8951,7 +10254,6 @@ where
             .await
             .reserve_next_range(1 + tool_results.len())
             .expect("executor holds exclusive persisted-message reservation authority");
-        let _reserved_broadcast_range = reserved_broadcast_range;
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_msg = crate::db::Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
@@ -8964,34 +10266,42 @@ where
             usage_data: assistant_message.usage,
             created_at: assistant_message.created_at,
         };
-        let tool_msgs: Vec<crate::db::Message> = tool_results
-            .into_iter()
-            .zip(reserved_seqs.into_iter().skip(1))
-            .map(|(result, sequence_id)| {
-                let content = tool_result_message_content(&result);
-                crate::db::Message {
-                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                    message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
-                    conversation_id: conv_id.clone(),
-                    sequence_id,
-                    message_type: content.message_type(),
-                    content,
-                    display_data: merge_duration_into_display_data(
-                        result.display_data(),
-                        result.duration_ms,
-                    ),
-                    usage_data: None,
-                    created_at: Utc::now(),
-                }
-            })
-            .collect();
-        match self
+        if settlement.terminal
+            == crate::runtime::traits::ActiveDirectTurnTerminal::GoalControlRevoked
+        {
+            self.prepare_revoked_goal_tool_round(
+                agent_msg,
+                tool_results,
+                reserved_broadcast_range,
+                reserved_seqs,
+                settlement,
+            )?;
+            return self
+                .persist_prepared_revoked_goal_tool_round(admitted)
+                .await;
+        }
+        if contains_pending_goal_result(&tool_results) {
+            return self
+                .persist_pending_goal_round(
+                    agent_msg,
+                    tool_results,
+                    None,
+                    Some(settlement),
+                    admitted,
+                )
+                .await;
+        }
+        let tool_results = finalized_round_results(&tool_results)?;
+        let new_trusted_results = trusted_tool_results(&agent_msg.message_id, &tool_results);
+        let tool_msgs =
+            terminal_tool_messages(&agent_msg, tool_results, reserved_seqs.into_iter().skip(1));
+        let establishment = self
             .storage
             .persist_tool_round_with_terminal_obligation(
                 &conv_id, &agent_msg, &tool_msgs, settlement,
             )
-            .await
-        {
+            .await;
+        match establishment {
             TerminalMutationEstablishment::Established { .. } => {
                 self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
             }
@@ -9030,118 +10340,158 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                let new_trusted_results =
-                    trusted_tool_results(&assistant_message.message_id, &tool_results);
-                let conv_id = self.context.conversation_id.clone();
-
-                // Build the assistant message row.
-                //
-                // `created_at` carries the exact value the eager broadcast
-                // (`Effect::BroadcastAssistantMessage`) already delivered for
-                // this `message_id`, so a reconnect that lands during persistence
-                // never sees a shifted timestamp on the message the UI displays.
-                let (reserved_broadcast_range, reserved_seqs) = self
-                    .broadcast_tx
-                    .persisted_message_reservation_authority()
+                self.persist_checkpoint_tool_round(assistant_message, tool_results, admitted)
                     .await
-                    .reserve_next_range(1 + tool_results.len())
-                    .expect("executor holds exclusive persisted-message reservation authority");
-                let _reserved_broadcast_range = reserved_broadcast_range;
-
-                let agent_content = MessageContent::agent(assistant_message.content);
-                let agent_seq = reserved_seqs[0];
-                let agent_msg = crate::db::Message {
-                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                    message_id: assistant_message.message_id.clone(),
-                    conversation_id: conv_id.clone(),
-                    sequence_id: agent_seq,
-                    message_type: agent_content.message_type(),
-                    content: agent_content,
-                    display_data: assistant_message.display_data.clone(),
-                    usage_data: assistant_message.usage.clone(),
-                    created_at: assistant_message.created_at,
-                };
-
-                // Build all tool-result rows.
-                let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-                for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-                    let tool_content = tool_result_message_content(result);
-                    let merged_display =
-                        merge_duration_into_display_data(result.display_data(), result.duration_ms);
-                    tool_msgs.push(crate::db::Message {
-                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                        message_id: tool_result_message_id(
-                            &agent_msg.message_id,
-                            &result.tool_use_id,
-                        ),
-                        conversation_id: conv_id.clone(),
-                        sequence_id: *tool_seq,
-                        message_type: tool_content.message_type(),
-                        content: tool_content,
-                        display_data: merged_display,
-                        usage_data: None,
-                        created_at: Utc::now(),
-                    });
-                }
-
-                // Persist the assistant message and every tool result in one
-                // transaction: either the full round is durable or none of it
-                // is. A partial write would leave an unpaired `tool_use` that
-                // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                if let Some(update) = self.pending_provider_replay_update.take() {
-                    self.storage
-                        .persist_tool_round_state_and_provider_replay(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                            &update,
-                        )
-                        .await?;
-                } else if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
-                    self.storage
-                        .persist_tool_round_and_state(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                        )
-                        .await?;
-                } else {
-                    self.storage
-                        .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
-                        .await?;
-                }
-
-                merge_trusted_tool_results(
-                    &mut self.pending_trusted_tool_results,
-                    new_trusted_results,
-                );
-
-                // Broadcast the now-durable rows so connected clients render
-                // the assistant message and each tool result. Tool-result
-                // durations are already baked into each row's display_data by
-                // `merge_duration_into_display_data`; emitting separate
-                // `MessageUpdated { duration_ms }` events here would allocate
-                // sequence ids after the preallocated tool-message ids and can
-                // therefore leapfrog later tool-result messages in live
-                // delivery.
-                let _ = self
-                    .broadcast_tx
-                    .admitted_publication(admitted)
-                    .persisted_message(agent_msg);
-
-                for msg in tool_msgs {
-                    let _ = self
-                        .broadcast_tx
-                        .admitted_publication(admitted)
-                        .persisted_message(msg);
-                }
             }
         }
+    }
+
+    async fn persist_checkpoint_tool_round(
+        &mut self,
+        assistant_message: phoenix_core::domain::sm_state::AssistantMessage,
+        tool_results: Vec<ToolRoundResult>,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        let conv_id = self.context.conversation_id.clone();
+
+        // Build the assistant message row.
+        //
+        // `created_at` carries the exact value the eager broadcast
+        // (`Effect::BroadcastAssistantMessage`) already delivered for
+        // this `message_id`, so a reconnect that lands during persistence
+        // never sees a shifted timestamp on the message the UI displays.
+        let (reserved_broadcast_range, reserved_seqs) = self
+            .broadcast_tx
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1 + tool_results.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
+        let _reserved_broadcast_range = reserved_broadcast_range;
+
+        let agent_content = MessageContent::agent(assistant_message.content);
+        let agent_seq = reserved_seqs[0];
+        let agent_msg = crate::db::Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+            message_id: assistant_message.message_id.clone(),
+            conversation_id: conv_id.clone(),
+            sequence_id: agent_seq,
+            message_type: agent_content.message_type(),
+            content: agent_content,
+            display_data: assistant_message.display_data.clone(),
+            usage_data: assistant_message.usage.clone(),
+            created_at: assistant_message.created_at,
+        };
+
+        let (tool_msgs, new_trusted_results) = if self
+            .pending_goal_request_checkpoint
+            .as_ref()
+            .is_some_and(|pending| pending.admitted.intent().id.as_str() == agent_msg.message_id)
+        {
+            let finalized: Vec<_> = tool_results
+                .iter()
+                .filter_map(|result| match result {
+                    ToolRoundResult::Finalized(result) => Some(result.clone()),
+                    ToolRoundResult::PendingGoalReport { .. }
+                    | ToolRoundResult::PendingGoalManagement { .. } => None,
+                })
+                .collect();
+            let trusted = trusted_tool_results(&agent_msg.message_id, &finalized);
+            let committed = self.commit_admitted_goal_request(&agent_msg,
+                phoenix_db::conversation_goals::request_checkpoint::GoalRequestEvidence::Round { results: &tool_results },
+            ).await?;
+            self.publish_live_state_admitted();
+            (committed.results, trusted)
+        } else {
+            if contains_pending_goal_result(&tool_results) {
+                return self
+                    .persist_pending_goal_round(agent_msg, tool_results, None, None, admitted)
+                    .await;
+            }
+            let tool_results = finalized_round_results(&tool_results)?;
+            let new_trusted_results = trusted_tool_results(&agent_msg.message_id, &tool_results);
+
+            let tool_msgs =
+                Self::checkpoint_tool_messages(&conv_id, &agent_msg, &tool_results, &reserved_seqs);
+
+            // Persist the assistant message and every tool result in one
+            // transaction: either the full round is durable or none of it
+            // is. A partial write would leave an unpaired `tool_use` that
+            // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
+            if let Some(update) = self.pending_provider_replay_update.take() {
+                self.storage
+                    .persist_tool_round_state_and_provider_replay(
+                        &conv_id,
+                        &agent_msg,
+                        &tool_msgs,
+                        &self.state,
+                        self.state_updated_at,
+                        &update,
+                    )
+                    .await?;
+            } else {
+                self.storage
+                    .persist_tool_round_and_state(
+                        &conv_id,
+                        &agent_msg,
+                        &tool_msgs,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await?;
+            }
+
+            (tool_msgs, new_trusted_results)
+        };
+
+        merge_trusted_tool_results(&mut self.pending_trusted_tool_results, new_trusted_results);
+
+        // Broadcast the now-durable rows so connected clients render
+        // the assistant message and each tool result. Tool-result
+        // durations are already baked into each row's display_data by
+        // `merge_duration_into_display_data`; emitting separate
+        // `MessageUpdated { duration_ms }` events here would allocate
+        // sequence ids after the preallocated tool-message ids and can
+        // therefore leapfrog later tool-result messages in live
+        // delivery.
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(agent_msg);
+
+        for msg in tool_msgs {
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(msg);
+        }
         Ok(None)
+    }
+
+    fn checkpoint_tool_messages(
+        conv_id: &str,
+        agent_msg: &crate::db::Message,
+        tool_results: &[ToolResult],
+        reserved_seqs: &[i64],
+    ) -> Vec<crate::db::Message> {
+        // Build all tool-result rows.
+        let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
+        for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
+            let tool_content = tool_result_message_content(result);
+            let merged_display =
+                merge_duration_into_display_data(result.display_data(), result.duration_ms);
+            tool_msgs.push(crate::db::Message {
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
+                conversation_id: conv_id.to_owned(),
+                sequence_id: *tool_seq,
+                message_type: tool_content.message_type(),
+                content: tool_content,
+                display_data: merged_display,
+                usage_data: None,
+                created_at: Utc::now(),
+            });
+        }
+        tool_msgs
     }
 
     /// Persist a decoupled fork proposal atomically with the originating turn's
@@ -9200,6 +10550,33 @@ where
             created_at: assistant_message.created_at,
         };
 
+        let proposal = crate::db::ForkProposal {
+            id: proposal_id,
+            origin_conversation_id: conv_id.clone(),
+            task_file: normalized_task_file,
+            title,
+            priority: priority.as_str().to_string(),
+            body,
+            status: crate::db::ForkProposalStatus::Pending,
+            fork_conversation_id: None,
+            refinement_conversation_id: None,
+            created_at: agent_msg.created_at,
+            resolved_at: None,
+        };
+
+        if contains_pending_goal_result(&tool_results) {
+            return self
+                .persist_pending_goal_round(
+                    agent_msg,
+                    tool_results,
+                    Some(&proposal),
+                    None,
+                    admitted,
+                )
+                .await;
+        }
+        let tool_results = finalized_round_results(&tool_results)?;
+
         // Build the synthetic tool-result rows. The success ack carries the
         // `fork_proposal_id` in its display_data (UI-only) per the interception
         // contract; `merge_duration_into_display_data` preserves it.
@@ -9226,22 +10603,15 @@ where
             });
         }
 
-        let proposal = crate::db::ForkProposal {
-            id: proposal_id,
-            origin_conversation_id: conv_id.clone(),
-            task_file: normalized_task_file,
-            title,
-            priority: priority.as_str().to_string(),
-            body,
-            status: crate::db::ForkProposalStatus::Pending,
-            fork_conversation_id: None,
-            refinement_conversation_id: None,
-            created_at: Utc::now(),
-            resolved_at: None,
-        };
-
         self.storage
-            .persist_fork_proposal_with_tool_round(&conv_id, &agent_msg, &tool_msgs, &proposal)
+            .persist_fork_proposal_with_tool_round(
+                &conv_id,
+                &agent_msg,
+                &tool_msgs,
+                &proposal,
+                &self.state,
+                self.state_updated_at,
+            )
             .await?;
 
         // Broadcast the now-durable rows so connected clients render the
@@ -9446,6 +10816,7 @@ where
         let transcript_generation = match establishment {
             TerminalMutationEstablishment::Established {
                 transcript_generation,
+                ..
             } => transcript_generation,
             TerminalMutationEstablishment::Retired => {
                 self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
@@ -9487,6 +10858,20 @@ where
         request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
+        let goal_request_context = self
+            .storage
+            .admit_goal_start_request_context(
+                &self.context.conversation_id,
+                self.active_direct_turn.as_deref(),
+                self.state_updated_at,
+                phoenix_core::domain::conversation_goal::GoalRequestOperation::Summary {
+                    operation: phoenix_core::domain::conversation_goal::GoalText::parse(
+                        request.operation_id.clone(),
+                    )
+                    .map_err(|error| error.to_string())?,
+                },
+            )
+            .await?;
         let operation_id = request.operation_id;
         let rejected_tool_calls = request.rejected_tool_calls;
         let retry_attempt = request.attempt;
@@ -9506,16 +10891,23 @@ where
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
-        let request_id = match &self.state {
-            ConvState::ServerOverloadRetrying { retry }
-                if matches!(
-                    retry.phase,
-                    phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight
-                ) =>
+        let request_id = match (goal_request_context.as_ref(), &self.state) {
+            (context, ConvState::ServerOverloadRetrying { retry })
+                if retry.phase == phoenix_core::domain::sm_state::ServerOverloadPhase::InFlight =>
             {
+                if context.is_some_and(|context| {
+                    context.request_id().as_str() != retry.logical_request_id
+                }) {
+                    return Err(
+                        "Start summary retry differs from its admitted logical request".into(),
+                    );
+                }
                 retry.logical_request_id.clone()
             }
-            _ => continuation_request_identity(&self.context.conversation_id, &operation_id),
+            (Some(context), _) => context.request_id().as_str().to_owned(),
+            (None, _) => {
+                continuation_request_identity(&self.context.conversation_id, &operation_id)
+            }
         };
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
@@ -9608,7 +11000,7 @@ where
         let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
         let system_prompt = policy.system_prompt();
-        let frozen_messages = assemble_cleared_messages(
+        let frozen_messages = match assemble_cleared_messages(
             &self.storage,
             &conv_id,
             projection,
@@ -9620,7 +11012,17 @@ where
             context_window,
             &self.clear_watermark_cache,
         )
-        .await;
+        .await
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                return Ok(Some(Event::ContinuationFailed {
+                    operation_id,
+                    error,
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                }));
+            }
+        };
 
         let protected_handoff = history.handoff.is_some();
         let rendered_count = frozen_messages.len() + usize::from(protected_handoff);
@@ -9676,6 +11078,10 @@ where
             role: MessageRole::User,
             content: vec![ContentBlock::text(&continuation_prompt)],
         });
+        let system_prompt = goal_request_context.as_ref().map_or_else(
+            || system_prompt.to_owned(),
+            |context| format!("{system_prompt}{}", context.system_context()),
+        );
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let request = LlmRequest {
             messages,
@@ -13163,7 +14569,12 @@ mod dispatch_context_budget_tests {
         };
         let mut api = message("recipient", 2, "user request");
         api.origin = InputOrigin::UserApi;
-        let rendered = render_messages(&[internal, api], &std::collections::HashSet::new());
+        let rendered = render_messages(
+            &[internal, api],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(rendered.len(), 2);
         assert_eq!(rendered[0].role, phoenix_llm::MessageRole::User);
         assert!(
@@ -13172,6 +14583,43 @@ mod dispatch_context_budget_tests {
         assert!(
             matches!(&rendered[1].content[0], ContentBlock::Text { text } if text == "user request")
         );
+    }
+
+    #[test]
+    fn provider_context_preserves_authenticated_remote_origin_for_user_and_skill() {
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, SkillContent},
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("same-local-product").unwrap();
+        for (origin, expected) in [
+            (InputOrigin::RemoteApi { instance_id }, format!("[API-channel input from authenticated instance {instance_id}]")),
+            (InputOrigin::RemoteConversation {
+                instance_id, product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "same-local-transcript".into(), source_call: None,
+            }, format!("[Message from conversation {product_conversation_id}, transcript same-local-transcript, authenticated instance {instance_id}]")),
+            (InputOrigin::RemoteCoordinator {
+                instance_id, product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "same-local-transcript".into(), source_call: None,
+            }, format!("[Message from remote Coordinator {product_conversation_id}, transcript same-local-transcript, authenticated instance {instance_id}]")),
+        ] {
+            let mut user = message("recipient", 1, "body");
+            user.origin = origin.clone();
+            let mut skill = message("recipient", 2, "body");
+            skill.origin = origin;
+            skill.message_type = crate::db::MessageType::Skill;
+            skill.content = MessageContent::Skill(SkillContent {
+                name: "inspect".into(), body: "body".into(), trigger: "/inspect".into(), files: vec![],
+            });
+            let rendered = render_messages(&[user, skill], &std::collections::HashSet::new(), &std::collections::HashMap::new()).unwrap();
+            assert_eq!(rendered.len(), 2);
+            for rendered in rendered {
+                assert_eq!(rendered.role, phoenix_llm::MessageRole::User);
+                assert!(matches!(&rendered.content[0], ContentBlock::Text { text } if text == &format!("{expected}\nbody")));
+            }
+        }
     }
 
     fn message(conv_id: &str, sequence_id: i64, text: &str) -> crate::db::Message {
@@ -14114,7 +15562,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -14139,7 +15587,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -14174,7 +15622,7 @@ mod authoritative_user_message_effect_tests {
             updated_at: Utc::now(),
         });
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -16189,7 +17637,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16224,7 +17672,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16275,7 +17723,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16331,7 +17779,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16367,7 +17815,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16403,7 +17851,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             })
@@ -16436,7 +17884,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -16465,7 +17913,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -17056,7 +18504,7 @@ mod authoritative_user_message_effect_tests {
                     attempt: 1,
                 })
                 .with_effect(Effect::PersistAuthoritativeUserMessage {
-                    payload: payload("msg-direct"),
+                    payload: Box::new(payload("msg-direct")),
                     authority: authority(),
                     idempotent: false,
                 })
@@ -17092,7 +18540,7 @@ mod authoritative_user_message_effect_tests {
                 updated_at: Utc::now(),
             });
             rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: true,
             })
@@ -19072,7 +20520,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_event(user("first")))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -19113,7 +20565,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_outcome(EffectOutcome::Tool(outcome)))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -19152,7 +20608,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_event(user("second")))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -19187,7 +20647,11 @@ mod explore_prompt_cache_shape_tests {
         Box::pin(runtime.process_event(Event::SteerDrainedUserMessages { entries }))
             .await
             .unwrap();
-        let (_, outcome) = tokio::time::timeout(
+        let LlmCompletion {
+            generation: _,
+            outcome,
+            ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.llm_outcome_rx.recv(),
         )
@@ -21150,7 +22614,12 @@ mod steer_drain_detector_tests {
                 msgs[0].content.message_type()
             );
         };
-        let rendered = render_messages(&msgs, &std::collections::HashSet::new());
+        let rendered = render_messages(
+            &msgs,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(rendered.len(), 1, "the summary must reach LLM history");
         assert_eq!(
             rendered[0].role,
@@ -21912,11 +23381,14 @@ mod steer_drain_detector_tests {
             .expect("durable queue notification while first request is in flight");
         assert_eq!(storage.get_steering_queue(conversation_id).len(), 1);
 
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
-                .await
-                .expect("first provider response arrives")
-                .expect("LLM outcome channel remains open");
+        let LlmCompletion {
+            generation,
+            outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+            .await
+            .expect("first provider response arrives")
+            .expect("LLM outcome channel remains open");
         rt.process_generation_tagged_llm_outcome(generation, outcome)
             .await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
@@ -21936,11 +23408,14 @@ mod steer_drain_detector_tests {
             if content.text == literal && content.llm_text.is_none())
         );
 
-        let (generation, outcome) =
-            tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
-                .await
-                .expect("second provider response arrives")
-                .expect("LLM outcome channel remains open");
+        let LlmCompletion {
+            generation,
+            outcome,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(5), rt.llm_outcome_rx.recv())
+            .await
+            .expect("second provider response arrives")
+            .expect("LLM outcome channel remains open");
         let requests = rt.llm_client.recorded_requests();
         assert_eq!(requests.len(), 2, "one dispatch per turn");
         let latest_user = requests[1]
@@ -22382,7 +23857,12 @@ mod steer_drain_detector_tests {
         .await
         .expect("checkpoint tool round");
         let messages = storage.get_all_messages("conv-replay-owner");
-        let rendered = render_messages(&messages, &std::collections::HashSet::new());
+        let rendered = render_messages(
+            &messages,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let projected = rendered;
         assert_eq!(
             projected
@@ -23198,7 +24678,7 @@ mod steer_drain_detector_tests {
                 None,
                 None,
             ),
-            vec![],
+            Vec::<ToolResult>::new(),
         )
         .unwrap();
 
@@ -24672,14 +26152,19 @@ mod sender_drop_forwarder_tests {
     #[tokio::test]
     async fn llm_sender_drop_yields_network_error_outcome() {
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(4);
+        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<super::LlmCompletion>(4);
 
         drop(llm_tx);
 
-        forward_llm_outcome(llm_rx, 7, llm_outcome_tx).await;
+        forward_llm_outcome(llm_rx, 7, llm_outcome_tx, None).await;
 
         match llm_outcome_rx.try_recv() {
-            Ok((generation, LlmOutcome::NetworkError { message })) => {
+            Ok(super::LlmCompletion {
+                generation,
+                outcome: LlmOutcome::NetworkError { message },
+                admitted,
+            }) => {
+                assert!(admitted.is_none(), "ordinary sender-drop has no Goal receipt");
                 assert_eq!(
                     generation, 7,
                     "forwarder must stamp the dispatch generation"
@@ -24689,7 +26174,11 @@ mod sender_drop_forwarder_tests {
                     "message should explain the sender-drop, got: {message}"
                 );
             }
-            other => panic!("expected a NetworkError LLM outcome on sender-drop, got {other:?}"),
+            Ok(super::LlmCompletion { generation, outcome, admitted }) => panic!(
+                "expected a NetworkError LLM outcome on sender-drop, got generation={generation} outcome={outcome:?} goal_receipt={}",
+                admitted.is_some(),
+            ),
+            Err(error) => panic!("expected a NetworkError LLM outcome on sender-drop, got channel error {error:?}"),
         }
     }
 }
@@ -25553,6 +27042,76 @@ mod fork_proposal_persist_tests {
         );
     }
 
+    #[tokio::test]
+    async fn checkpoint_commit_survives_a_later_state_effect_failure() {
+        for kind in ["ordinary", "provider", "fork"] {
+            let (_tmp, root) = init_repo();
+            let (mut rt, storage) = runtime_in_dir("committed-state", &root);
+            let old_timestamp = Utc::now() - chrono::Duration::seconds(2);
+            rt.state_updated_at = old_timestamp;
+            storage
+                .update_state("committed-state", &rt.state, old_timestamp)
+                .await
+                .unwrap();
+            let (watch_tx, watch_rx) = watch::channel(rt.state.clone());
+            rt.state_watcher = Some(watch_tx);
+            if kind == "provider" {
+                rt.pending_provider_replay_update =
+                    Some(phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear);
+            }
+            let effect = if kind == "fork" {
+                fork_effect("committed-fork", "tasks/00042-p1-ready--fix-thing.md")
+            } else {
+                let assistant = AssistantMessage::new(
+                    "state-round".into(),
+                    vec![ContentBlock::tool_use(
+                        "state-tool",
+                        "bash",
+                        serde_json::json!({"command":"pwd"}),
+                    )],
+                    None,
+                    None,
+                );
+                let data = CheckpointData::tool_round(
+                    assistant,
+                    vec![ToolResult::success("state-tool".into(), "done".into())],
+                )
+                .unwrap();
+                Effect::PersistCheckpoint { data }
+            };
+            let selected = ConvState::LlmRequesting { attempt: 2 };
+            let transition =
+                crate::state_machine::transition::TransitionResult::new(selected.clone())
+                    .with_effect(effect)
+                    .with_effect(Effect::PersistState);
+            let (entered, release) = storage.gate_state_update();
+            let task = tokio::spawn(async move {
+                let result = rt.apply_transition_result(transition).await;
+                (rt, result)
+            });
+            entered.await.unwrap();
+            storage.set_fail_state_update(true);
+            release.send(()).unwrap();
+            let (rt, result) = task.await.unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("injected state update failure"),
+                "{kind}"
+            );
+            let persisted = storage.get_state_snapshot("committed-state").await.unwrap();
+            assert_eq!(persisted.state, selected, "{kind}");
+            assert_eq!(rt.state, selected, "{kind}");
+            assert_eq!(*watch_rx.borrow(), selected, "{kind}");
+            assert_eq!(rt.state_updated_at, persisted.state_updated_at, "{kind}");
+            assert!(persisted.state_updated_at > old_timestamp, "{kind}");
+            assert!(
+                !storage.get_all_messages("committed-state").is_empty(),
+                "{kind}"
+            );
+        }
+    }
+
     /// Worktree-top origin: `working_dir` IS the repo root, so the stored
     /// `task_file` equals the working-dir-relative path unchanged.
     #[tokio::test]
@@ -26029,7 +27588,8 @@ mod stale_tool_result_clearing_tests {
                 20_000,
                 &cache,
             )
-            .await;
+            .await
+            .unwrap();
             assert_eq!(messages.len(), 2);
             assert_eq!(
                 messages[0].content[0].render_text(),
@@ -26057,8 +27617,9 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             is_rendered_cleared(&messages, "old-tool"),
             "old round rendered as placeholder"
@@ -26085,8 +27646,9 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             !is_rendered_cleared(&messages, "old-tool"),
             "read failure with empty cache → nothing cleared this turn",
@@ -26110,15 +27672,17 @@ mod stale_tool_result_clearing_tests {
         let cache = std::sync::Mutex::new(None);
 
         // Turn 1: a real sweep advances and caches the watermark; `old` is cleared.
-        let first =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let first = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(is_rendered_cleared(&first, "old-tool"));
 
         // Turn 2: the watermark read fails, but the cache holds the advanced
         // value, so the previously-cleared result stays cleared.
         storage.set_fail_watermark_read(true);
-        let second =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let second = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             is_rendered_cleared(&second, "old-tool"),
             "read failure must preserve the cached cleared set, not un-clear it",
@@ -26141,8 +27705,9 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages =
-            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache)
+            .await
+            .unwrap();
         assert!(
             !is_rendered_cleared(&messages, "old-tool"),
             "write failure → prior (empty) cleared set rendered, not the failed advance",
@@ -26165,7 +27730,7 @@ mod stale_tool_result_clearing_tests {
 
         let db = storage.get_messages(conv).await.unwrap();
         let cleared: HashSet<i64> = std::iter::once(cleared_seq).collect();
-        let msgs = render_messages(&db, &cleared);
+        let msgs = render_messages(&db, &cleared, &std::collections::HashMap::new()).unwrap();
 
         let find = |id: &str| -> (String, usize) {
             for m in &msgs {

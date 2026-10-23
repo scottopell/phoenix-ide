@@ -808,11 +808,18 @@ class SystemdDeployCommandTests(unittest.TestCase):
             registry_source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
             registry_match = re.search(r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)", registry_source, re.DOTALL)
             self.assertIsNotNone(registry_match)
-            historical_entries, removed = re.subn(
-                r"    Migration\s*\{\s*version:\s*129,.*?\n    \},", "",
-                registry_match.group(2), count=1, flags=re.DOTALL,
+            entries = registry_match.group(2)
+            qualified_target = max(linux_helper.REQUIRED_MIGRATIONS)
+            suffix_boundaries = list(re.finditer(
+                rf"^    Migration\s*\{{\s*version:\s*{qualified_target + 1},",
+                entries,
+                flags=re.MULTILINE,
+            ))
+            self.assertEqual(
+                len(suffix_boundaries), 1,
+                "historical registry fixture requires exactly one successor boundary",
             )
-            self.assertEqual(removed, 1)
+            historical_entries = entries[:suffix_boundaries[0].start()]
             historical_registry = Path(registry_dir) / "qualified-128-migrations.rs"
             historical_registry.write_text(registry_source[:registry_match.start(2)] + historical_entries
                                            + registry_source[registry_match.end(2):])
