@@ -8254,52 +8254,6 @@ where
                 system_prompt.push_str(&orientation);
             }
         }
-        let fixed_tokens = estimate_fixed_request_tokens(&system_prompt, &available_tools);
-        if dispatch_estimate_exceeds_context(
-            fixed_tokens,
-            &frozen_messages,
-            self.context.output_budget,
-            self.context.context_window,
-        ) {
-            let input_budget = self
-                .context
-                .context_window
-                .saturating_sub(self.context.output_budget)
-                .saturating_sub(fixed_tokens)
-                .saturating_sub(trusted_token_reserve);
-            let pressure =
-                i64::try_from(estimate_messages_tokens(&frozen_messages)).unwrap_or(i64::MAX);
-            frozen_messages = assemble_cleared_messages_with_pressure(
-                &self.storage,
-                &self.context.conversation_id,
-                &self
-                    .active_prompt_projection
-                    .as_ref()
-                    .expect("projection refreshed above")
-                    .messages,
-                None,
-                &self.clearable_names,
-                input_budget,
-                &self.clear_watermark_cache,
-                Some(pressure),
-            )
-            .await;
-            overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
-            if dispatch_estimate_exceeds_context(
-                fixed_tokens,
-                &frozen_messages,
-                self.context.output_budget,
-                self.context.context_window,
-            ) {
-                return Ok(Some(Event::LlmError {
-                    message: "Planned prompt and declared output budget exceed context capacity after permitted tool-result clearing; compact or revise the input.".into(),
-                    error_kind: crate::db::ErrorKind::ContextExhausted,
-                    attempt: retry_attempt, recovery_in_progress: false,
-                    observed_at: Utc::now(), resets_at: None,
-                }));
-            }
-        }
-
         let callable_names = request_tool_surface
             .callable_tools(available_tools.clone())
             .into_iter()
@@ -8353,10 +8307,62 @@ where
                 &historical_tool_references,
             )
             .await?;
-        let messages = frozen_messages;
-        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let responses_replay = self.storage.load_responses_replay_state(&conv_id).await?;
+        let fixed_tokens = estimate_fixed_request_tokens(&system_prompt, &tool_availability)
+            .saturating_add(estimate_private_replay_overhead(
+                &frozen_messages,
+                provider_replay.as_ref(),
+                &responses_replay,
+            ));
+        if dispatch_estimate_exceeds_context(
+            fixed_tokens,
+            &frozen_messages,
+            self.context.output_budget,
+            self.context.context_window,
+        ) {
+            let input_budget = self
+                .context
+                .context_window
+                .saturating_sub(self.context.output_budget)
+                .saturating_sub(fixed_tokens)
+                .saturating_sub(trusted_token_reserve);
+            let pressure =
+                i64::try_from(estimate_messages_tokens(&frozen_messages)).unwrap_or(i64::MAX);
+            frozen_messages = assemble_cleared_messages_with_pressure(
+                &self.storage,
+                &self.context.conversation_id,
+                &self
+                    .active_prompt_projection
+                    .as_ref()
+                    .expect("projection refreshed above")
+                    .messages,
+                None,
+                &self.clearable_names,
+                input_budget,
+                &self.clear_watermark_cache,
+                Some(pressure),
+            )
+            .await;
+            overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
+            if dispatch_estimate_exceeds_context(
+                fixed_tokens,
+                &frozen_messages,
+                self.context.output_budget,
+                self.context.context_window,
+            ) {
+                return Ok(Some(Event::LlmError {
+                    message: "Planned prompt and declared output budget exceed context capacity after permitted tool-result clearing; compact or revise the input.".into(),
+                    error_kind: crate::db::ErrorKind::ContextExhausted,
+                    attempt: retry_attempt, recovery_in_progress: false,
+                    observed_at: Utc::now(), resets_at: None,
+                }));
+            }
+        }
+
+        let messages = frozen_messages;
+        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+
         let request = LlmRequest {
             system: vec![SystemContent::cached(&system_prompt)],
             messages,
@@ -11118,12 +11124,60 @@ fn estimate_messages_tokens(messages: &[LlmMessage]) -> usize {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+fn estimate_private_replay_overhead(
+    messages: &[LlmMessage],
+    anthropic: Option<&phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
+    responses: &[phoenix_core::domain::responses_replay::ResponsesResponseSet],
+) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .map(|message| {
+            let public_tokens = estimate_message_tokens(message);
+            let responses_extra = responses
+                .iter()
+                .find(|set| {
+                    message.source_message_id.as_deref() == Some(&set.owner_message_id)
+                        && message.content == set.public_content
+                })
+                .map_or(0, |set| {
+                    estimate_text_tokens(
+                        &serde_json::to_string(&set.output_items).expect("replay items serialize"),
+                    )
+                    .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+                    .saturating_sub(public_tokens)
+                });
+            let anthropic_extra = anthropic
+                .and_then(|payload| {
+                    payload.response_sets.iter().find(|set| {
+                        message.source_message_id.as_deref() == Some(&set.owner_message_id)
+                            && message.content == set.public_content
+                    })
+                })
+                .map_or(0, |set| {
+                    if set.private_blocks.is_empty() {
+                        0
+                    } else {
+                        estimate_text_tokens(
+                            &serde_json::to_string(&set.private_blocks)
+                                .expect("private blocks serialize"),
+                        )
+                    }
+                });
+            responses_extra.max(anthropic_extra)
+        })
+        .sum()
+}
+
 fn estimate_fixed_request_tokens(
     system_prompt: &str,
-    available_tools: &[phoenix_llm::ToolDefinition],
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
 ) -> usize {
     estimate_text_tokens(system_prompt)
-        + available_tools
+        + phoenix_llm::tool_availability_advisory_chars(availability)
+            .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+        + availability
+            .declarations()
             .iter()
             .map(|tool| {
                 estimate_text_tokens(&serde_json::to_string(tool).expect("tool schema serializes"))
@@ -13743,6 +13797,98 @@ mod dispatch_context_budget_tests {
     }
 
     #[test]
+    fn predispatch_planning_counts_only_replay_matching_the_retained_owner() {
+        use phoenix_core::domain::provider_replay::{
+            AnthropicPrivateBlock, AnthropicReplayPayload, AnthropicResponseIdentity,
+            AnthropicResponseSet, ContentIndex,
+        };
+        use phoenix_core::domain::responses_replay::ResponsesResponseSet;
+        let message = LlmMessage {
+            source_message_id: Some("owner".into()),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::text("short answer")],
+        };
+        let response = ResponsesResponseSet {
+            response_id: "r".into(),
+            model: "model".into(),
+            owner_message_id: "owner".into(),
+            public_content: message.content.clone(),
+            output_items: vec![
+                serde_json::json!({"type":"reasoning","encrypted_content":"x".repeat(8_000)}),
+            ],
+        };
+        let anthropic =
+            AnthropicReplayPayload::new(vec![AnthropicResponseSet::with_public_content(
+                AnthropicResponseIdentity {
+                    response_id: "a".into(),
+                    model: "model".into(),
+                },
+                message.content.clone(),
+                vec![AnthropicPrivateBlock::Thinking {
+                    index: ContentIndex(0),
+                    thinking: "t".repeat(8_000),
+                    signature: "sig".into(),
+                }],
+            )
+            .unwrap()
+            .with_owner_message_id("owner".into())])
+            .unwrap();
+        let responses_extra = estimate_private_replay_overhead(
+            std::slice::from_ref(&message),
+            None,
+            std::slice::from_ref(&response),
+        );
+        let anthropic_extra =
+            estimate_private_replay_overhead(std::slice::from_ref(&message), Some(&anthropic), &[]);
+        assert!(responses_extra >= 2_000);
+        assert!(anthropic_extra >= 2_000);
+        for extra in [responses_extra, anthropic_extra] {
+            assert!(dispatch_estimate_exceeds_context(
+                extra,
+                std::slice::from_ref(&message),
+                1_000,
+                2_000
+            ));
+        }
+        let mut other = message;
+        other.source_message_id = Some("another-owner".into());
+        assert_eq!(
+            estimate_private_replay_overhead(
+                std::slice::from_ref(&other),
+                Some(&anthropic),
+                std::slice::from_ref(&response)
+            ),
+            0
+        );
+        other.source_message_id = Some("owner".into());
+        other.content = vec![ContentBlock::text("rewritten")];
+        assert_eq!(
+            estimate_private_replay_overhead(&[other], Some(&anthropic), &[response]),
+            0
+        );
+    }
+
+    #[test]
+    fn predispatch_planning_counts_retained_noncallable_declarations_and_advisory() {
+        use phoenix_core::domain::tool_availability::ToolAvailability;
+        let retained = ToolAvailability::new(
+            vec![phoenix_llm::ToolDefinition {
+                name: "retired_tool".into(),
+                description: "retained".repeat(2_000),
+                input_schema: serde_json::json!({"type": "object"}),
+                defer_loading: false,
+            }],
+            std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+        let empty = ToolAvailability::all(vec![]);
+        let fixed = estimate_fixed_request_tokens("system", &retained);
+        assert!(fixed > estimate_fixed_request_tokens("system", &empty) + 1_000);
+        assert!(phoenix_llm::tool_availability_advisory_chars(&retained) > 0);
+        assert!(dispatch_estimate_exceeds_context(fixed, &[], 100, 1_000));
+    }
+
+    #[test]
     fn predispatch_planning_counts_images_nested_in_tool_results() {
         let tool_message = |images| LlmMessage {
             source_message_id: None,
@@ -13797,7 +13943,12 @@ mod dispatch_context_budget_tests {
         assert!(dispatch_estimate_exceeds_context(
             1, &messages, 1_000, context
         ));
-        assert!(estimate_fixed_request_tokens("system instructions", &[]) > 0);
+        assert!(
+            estimate_fixed_request_tokens(
+                "system instructions",
+                &phoenix_core::domain::tool_availability::ToolAvailability::all(vec![])
+            ) > 0
+        );
     }
 }
 

@@ -996,7 +996,7 @@ fn validate_tool_search_references(
     Ok(())
 }
 
-fn native_policy_needs_advisory(availability: &ToolAvailability) -> bool {
+pub(crate) fn native_policy_needs_advisory(availability: &ToolAvailability) -> bool {
     let mut offered: std::collections::BTreeSet<_> = availability
         .anthropic_initial_declarations()
         .iter()
@@ -1036,7 +1036,7 @@ fn uses_tool_search(spec: &ModelSpec, request: &LlmRequest, native: bool) -> boo
             }))
 }
 
-fn tool_advisory(availability: &ToolAvailability) -> String {
+pub(crate) fn tool_advisory(availability: &ToolAvailability) -> String {
     format!(
         "The currently callable client tools are: {}. Other declared tools are retained only for historical context and must not be called; execution will return an unavailable error.",
         serde_json::to_string(availability.callable_names()).expect("tool names serialize"),

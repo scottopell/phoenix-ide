@@ -292,7 +292,7 @@ AND SHALL, when a fixed prompt plus the reserved output budget still cannot fit,
 Bounded utility requests such as titles, command suggestions, search interpretation, and structured QA MAY declare a smaller output limit for their specific contract. They SHALL use that same explicit limit for their own request accounting and SHALL NOT change the ordinary or continuation agent-turn default.
 
 WHEN fitting an ordinary request before dispatch
-THE SYSTEM SHALL account for its system prompt, tool declarations, rendered history, and output reservation
+THE SYSTEM SHALL account for its system prompt, finalized retained tool declarations and restrictions, rendered history including nested images, matching provider-private replay, and output reservation
 AND SHALL attempt permitted stale-tool-result clearing before reporting a planned-capacity failure
 AND SHALL distinguish conservative local planning from authoritative provider token counts
 

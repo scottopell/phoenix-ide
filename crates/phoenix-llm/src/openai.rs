@@ -2087,28 +2087,31 @@ fn chat_tool_choice(request: &LlmRequest, supported: bool) -> Option<ChatToolCho
     }
 }
 
-fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
-    let unavailable: Vec<_> = request
-        .tool_availability
+pub(crate) fn tool_advisory_text(
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
+) -> Option<String> {
+    let unavailable: Vec<_> = availability
         .declarations()
         .iter()
-        .filter(|tool| !request.tool_availability.is_callable(&tool.name))
+        .filter(|tool| !availability.is_callable(&tool.name))
         .map(|tool| tool.name.as_str())
         .collect();
     if unavailable.is_empty() {
-        return;
+        return None;
     }
-    let text = instructions.get_or_insert_with(String::new);
-    text.push_str("\n\nThese tools are unavailable for new calls: ");
-    text.push_str(&unavailable.join(", "));
-    text.push_str(
-        ". Their definitions are retained for historical context. Choose available tools instead.",
-    );
-    tracing::debug!(
-        provider = "openai",
-        n = unavailable.len(),
-        "using advisory tool restriction on route without native support"
-    );
+    Some(format!("\n\nThese tools are unavailable for new calls: {}. Their definitions are retained for historical context. Choose available tools instead.", unavailable.join(", ")))
+}
+
+fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
+    if let Some(advisory) = tool_advisory_text(&request.tool_availability) {
+        instructions
+            .get_or_insert_with(String::new)
+            .push_str(&advisory);
+        tracing::debug!(
+            provider = "openai",
+            "using advisory tool restriction on route without native support"
+        );
+    }
 }
 
 fn bind_responses_model(

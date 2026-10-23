@@ -554,6 +554,21 @@ impl LlmService for LoggingService {
     }
 }
 
+/// Conservative character count for tool restrictions that a provider may append.
+#[must_use]
+pub fn tool_availability_advisory_chars(
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
+) -> usize {
+    let openai = openai::tool_advisory_text(availability);
+    if openai.is_some() || anthropic::native_policy_needs_advisory(availability) {
+        openai
+            .as_ref()
+            .map_or(0, |text| text.chars().count())
+            .max(anthropic::tool_advisory(availability).chars().count())
+    } else {
+        0
+    }
+}
 #[cfg(test)]
 mod logging_tests {
     use super::*;
