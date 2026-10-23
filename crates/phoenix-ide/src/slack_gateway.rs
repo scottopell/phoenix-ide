@@ -146,6 +146,7 @@ pub(crate) fn start(state: crate::api::AppState) {
                 }
             };
             let slack = slack::Slack::with_budget(state.mcp_manager.clone(), &c, budget.current());
+            let calls_before = slack.calls.load(std::sync::atomic::Ordering::Relaxed);
             let started = std::time::Instant::now();
             if let Err(error) = driver::tick(&state, &c, &slack, pass).await {
                 tracing::warn!(%error,"Slack gateway pass failed");
@@ -154,7 +155,10 @@ pub(crate) fn start(state: crate::api::AppState) {
                     .slack_scan_status(&c.workspace, &c.owner, false, "backing_off", Some(&error))
                     .await;
             }
-            let calls = slack.calls.load(std::sync::atomic::Ordering::Relaxed);
+            let calls = slack
+                .calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(calls_before);
             if calls > 0 {
                 tracing::info!(
                     discovery = matches!(pass, Pass::Discovery { .. }),

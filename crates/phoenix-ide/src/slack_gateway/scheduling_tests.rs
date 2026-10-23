@@ -193,6 +193,37 @@ async fn call_window_only_renews_after_sixty_seconds() {
     assert_eq!(window.current().load(Ordering::Relaxed), 0);
 }
 
+#[tokio::test]
+async fn pass_metrics_exclude_calls_already_charged_to_the_window() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = config();
+    let budget = Arc::new(std::sync::atomic::AtomicU32::new(6));
+    let mut slack = slack::Slack::with_budget(state.mcp_manager.clone(), &c, budget.clone());
+    slack.fixture = Some(Arc::new(|method, _| {
+        if method.contains("read_user_profile") {
+            Ok(json!({"result":"User ID: UOWNER\nBot: No"}))
+        } else {
+            Ok(json!({"results":"", "pagination_info":"End of results"}))
+        }
+    }));
+    driver::tick(
+        &state,
+        &c,
+        &slack,
+        Pass::Discovery {
+            reactions_first: false,
+        },
+    )
+    .await
+    .unwrap();
+    let calls: i64 = sqlx::query_scalar("SELECT calls_last_pass FROM slack_gateway_accounts")
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(calls, 3);
+    assert_eq!(budget.load(Ordering::Relaxed), 9);
+}
+
 // REQ-SG-003/004/017: exhaustion checkpoints a whole page and leaves delivery capacity.
 #[tokio::test]
 async fn budget_exhaustion_retains_cursor_and_resumes_without_source_reads() {

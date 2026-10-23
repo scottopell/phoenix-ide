@@ -22,6 +22,7 @@ pub(super) async fn tick(
     pass: Pass,
 ) -> Result<(), String> {
     c.validate()?;
+    let calls_before = slack.calls.load(std::sync::atomic::Ordering::Relaxed);
     let discovering = matches!(pass, Pass::Discovery { .. }) && c.enabled;
     let needs_slack = if discovering {
         true
@@ -93,7 +94,11 @@ pub(super) async fn tick(
     } else {
         None
     };
-    sqlx::query("UPDATE slack_gateway_accounts SET calls_last_pass=?3,pages_last_pass=?4,retry_at_us=COALESCE(?5,retry_at_us),status=CASE WHEN ?5 IS NOT NULL THEN 'backing_off' ELSE status END,last_error=CASE WHEN ?5 IS NOT NULL THEN COALESCE(last_error,'Slack requested a retry delay') ELSE last_error END WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).bind(i64::from(slack.calls.load(std::sync::atomic::Ordering::Relaxed))).bind(i64::from(slack.pages.load(std::sync::atomic::Ordering::Relaxed))).bind(retry).execute(state.db.pool()).await.map_err(err)?;
+    let pass_calls = slack
+        .calls
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_sub(calls_before);
+    sqlx::query("UPDATE slack_gateway_accounts SET calls_last_pass=?3,pages_last_pass=?4,retry_at_us=COALESCE(?5,retry_at_us),status=CASE WHEN ?5 IS NOT NULL THEN 'backing_off' ELSE status END,last_error=CASE WHEN ?5 IS NOT NULL THEN COALESCE(last_error,'Slack requested a retry delay') ELSE last_error END WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).bind(i64::from(pass_calls)).bind(i64::from(slack.pages.load(std::sync::atomic::Ordering::Relaxed))).bind(retry).execute(state.db.pool()).await.map_err(err)?;
     result
 }
 async fn reconciliation_work(state: &AppState, c: &Config) -> Result<Option<bool>, String> {
