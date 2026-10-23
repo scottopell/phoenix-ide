@@ -1053,7 +1053,7 @@ mod tests {
         // external model config that omits the declared maximum is rejected
         // at registration rather than silently defaulted.
         let models = parse_external_models(
-            r#"[{"id":"no-output-cap","backend":"openai_responses","description":"Missing cap","context_window":128000,"max_output_tokens":32768,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"no-output-cap","backend":"openai_responses","description":"Missing cap","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .expect("top-level external model array parses");
         assert!(models.is_empty());
