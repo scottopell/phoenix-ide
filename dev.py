@@ -9,6 +9,7 @@
 
 import argparse
 import base64
+import codecs
 import contextvars
 import contextlib
 import dataclasses
@@ -23,6 +24,7 @@ import platform
 import plistlib
 import re
 import resource
+import select
 import shutil
 import signal
 import stat
@@ -5345,7 +5347,7 @@ def _rust_check_commands(
         test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *test_p,
                     "-E", "not test(/export_bindings/)",
                     "--test-threads", str(test_threads)]
-        codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
+        codegen_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *codegen_p,
                        "-E", "test(/export_bindings/)",
                        "--test-threads", str(test_threads)]
     else:
@@ -5447,6 +5449,109 @@ def _finish_check_step_span(
     if artifact_attributes:
         attributes.update(artifact_attributes)
     _finish_dev_span(span, attributes, failed=returncode != 0, end_time=end_time)
+
+
+class _QualificationOutputLog:
+    MAX_BYTES = 64 * 1024 * 1024
+    FOOTER_BYTES = 1024
+    READ_BYTES = 64 * 1024
+    TAIL_BYTES = 128 * 1024
+    DRAIN_SECONDS = 5
+
+    def __init__(self, path):
+        self.path = path
+        self.output = path.open("xb", buffering=0)
+        self.remaining = self.MAX_BYTES - self.FOOTER_BYTES
+        self.error = ""
+        self.lock = threading.Lock()
+        self.tail = bytearray()
+        self.tail_truncated = False
+
+    def append(self, data):
+        with self.lock:
+            if self.output.closed:
+                return
+            self.tail.extend(data)
+            if len(self.tail) > self.TAIL_BYTES:
+                del self.tail[:-self.TAIL_BYTES]
+                self.tail_truncated = True
+            if self.error:
+                return
+            try:
+                retained = data[:self.remaining]
+                if self.output.write(retained) != len(retained):
+                    self.error = "short raw diagnostic write; payload INCOMPLETE"
+                elif len(data) > self.remaining:
+                    self.error = "64 MiB raw diagnostic limit exceeded; payload INCOMPLETE"
+                self.remaining = max(0, self.remaining - len(data))
+            except OSError as error:
+                self.error = f"raw diagnostic write failed: {error}; payload INCOMPLETE"
+
+    def read(self, stream, stop, observe):
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pending = ""
+        while not stop.is_set():
+            if not select.select([stream], [], [], 0.1)[0]:
+                continue
+            data = stream.read(self.READ_BYTES)
+            if not data:
+                break
+            self.append(data)
+            pending += decoder.decode(data)
+            while "\n" in pending or len(pending) >= self.READ_BYTES:
+                newline = pending.find("\n")
+                end = newline + 1 if 0 <= newline < self.READ_BYTES else self.READ_BYTES
+                observe(pending[:end])
+                pending = pending[end:]
+        pending += decoder.decode(b"", final=True)
+        if pending:
+            observe(pending)
+
+    def settle_reader(self, reader, stop):
+        reader.join(timeout=self.DRAIN_SECONDS)
+        if not reader.is_alive():
+            return
+        if not self.error:
+            self.error = "stdout remained open after root wait; payload INCOMPLETE; writer ownership unresolved"
+        stop.set()
+        reader.join(timeout=1)
+        if reader.is_alive():
+            self.error += "; reader cleanup did not finish"
+
+    def console_tail(self):
+        with self.lock:
+            lines = bytes(self.tail).decode("utf-8", errors="replace").splitlines()
+            truncated = self.tail_truncated or len(lines) > 200
+            text = "\n".join(lines[-200:])
+        return _CONTROL_SEQ_RE.sub("", text).replace("\x1b", "").strip(), truncated
+
+    def finish(self, returncode, timed_out, reader_complete):
+        with self.lock:
+            if returncode is None:
+                self.error = (self.error + "; " if self.error else "") + "root wait has no terminal status; payload INCOMPLETE; process ownership unresolved"
+            if not reader_complete and not self.error:
+                self.error = "output reader did not finish; payload INCOMPLETE"
+            footer = (f"\nQUALIFICATION_CAPTURE process_returncode={returncode} "
+                      f"timed_out={timed_out} reader_complete={reader_complete}\n"
+                      f"{self.error or 'payload COMPLETE'}\n")
+            try:
+                retained = footer.encode("utf-8")[:self.FOOTER_BYTES]
+                if self.output.write(retained) != len(retained):
+                    self.error = "short raw diagnostic footer; payload INCOMPLETE"
+            except OSError as error:
+                self.error = f"raw diagnostic footer failed: {error}; payload INCOMPLETE"
+            finally:
+                try:
+                    self.output.close()
+                except OSError as error:
+                    self.error = f"raw diagnostic close failed: {error}; payload INCOMPLETE"
+            return self.error
+
+
+def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
+    if name == "cargo clippy" and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / "cargo-clippy.full.log"
+    return None
 
 
 def _check_step_artifact_dir(lane: str, name: str, env: dict[str, str]) -> Path | None:
@@ -5613,32 +5718,56 @@ def cmd_check(
             env["PHOENIX_CHECK_PROFILE_LANE"] = lane
             env["PHOENIX_CHECK_PROFILE_STEP"] = name
 
-        proc = subprocess.Popen(
-            launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, env=env, start_new_session=True, bufsize=1,
-        )
+        output_log = None
+        if diagnostic_path := _check_diagnostic_log_path(name, env):
+            diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+            output_log = _QualificationOutputLog(diagnostic_path)
+        try:
+            proc = subprocess.Popen(
+                launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=output_log is None, env=env, start_new_session=True,
+                bufsize=1 if output_log is None else 0,
+            )
+        except BaseException:
+            if output_log is not None:
+                output_log.finish(None, False, False)
+            raise
 
         reader_cpu_ms = 0.0
+
+        stop_reader = threading.Event()
+
+        def observe_qualification(text):
+            clean = _CONTROL_SEQ_RE.sub("", text).replace("\x1b", "").rstrip("\n")
+            lock_timer.observe_line(clean, time.monotonic())
 
         def reader():
             nonlocal truncated, reader_cpu_ms
             started_reader_ns = time.thread_time_ns()
             try:
                 assert proc.stdout is not None
-                for line in proc.stdout:
-                    now = time.monotonic()
-                    if len(buf) == buf.maxlen:
-                        truncated = True
-                    # Strip terminal control sequences before buffering. The env
-                    # above disables color for tools that honour it, but rustfmt's
-                    # --check diff colours via the `term` crate keyed on $TERM and
-                    # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
-                    # tool-agnostic backstop so the reprinted buffer stays clean.
-                    clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
-                    lock_timer.observe_line(clean, now)
-                    buf.append(clean)
-                proc.stdout.close()
+                if output_log is not None:
+                    output_log.read(proc.stdout, stop_reader, observe_qualification)
+                else:
+                    for line in proc.stdout:
+                        now = time.monotonic()
+                        if len(buf) == buf.maxlen:
+                            truncated = True
+                        # Strip terminal control sequences before buffering. The env
+                        # above disables color for tools that honour it, but rustfmt's
+                        # --check diff colours via the `term` crate keyed on $TERM and
+                        # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
+                        # tool-agnostic backstop so the reprinted buffer stays clean.
+                        clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
+                        lock_timer.observe_line(clean, now)
+                        buf.append(clean)
+            except Exception as error:
+                if output_log is not None:
+                    output_log.error = f"output reader failed: {error}; payload INCOMPLETE"
+                raise
             finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
                 reader_cpu_ms = (time.thread_time_ns() - started_reader_ns) / 1_000_000.0
 
         rt = threading.Thread(target=reader, daemon=True)
@@ -5661,8 +5790,13 @@ def cmd_check(
                 except ProcessLookupError:
                     pass
                 rc = proc.wait(timeout=5)
-        # Reader exits when stdout closes (proc termination drops the pipe).
-        rt.join(timeout=5)
+        finally:
+            capture_error = ""
+            if output_log is not None:
+                output_log.settle_reader(rt, stop_reader)
+                capture_error = output_log.finish(proc.returncode, timed_out, not rt.is_alive())
+            else:
+                rt.join(timeout=5)
         finished_at = time.monotonic()
         finished_wall_ns = time.time_ns()
         elapsed = finished_at - t0
@@ -5674,15 +5808,24 @@ def cmd_check(
             )
 
         tail = "\n".join(buf).strip()
+        if output_log is not None:
+            tail, truncated = output_log.console_tail()
         if timed_out:
-            header = f"TIMEOUT after {timeout}s \u2014 last {len(buf)} lines of output"
+            retained = "200 lines / 128 KiB of output" if output_log is not None else f"{len(buf)} lines of output"
+            header = f"TIMEOUT after {timeout}s \u2014 last {retained}"
             if truncated:
                 header += " (earlier lines dropped)"
             output = header + ("\n" + tail if tail else "\n(no output captured before timeout)")
             rc = rc if rc != 0 else 1
         else:
-            output = tail
+            output = ("CONSOLE TRUNCATED to last 200 lines / 128 KiB\n" if output_log is not None and truncated else "") + tail
 
+        if output_log is not None:
+            output += f"\nFull qualification diagnostics: {output_log.path}\n"
+            if capture_error:
+                output += f"QUALIFICATION FAILED: {capture_error}\n"
+                if rc == 0:
+                    rc = 1
         with results_lock:
             results.append((name, rc, elapsed, output))
         reporter.step_done(lane, name, rc, elapsed)
