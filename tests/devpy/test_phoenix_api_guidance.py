@@ -21,6 +21,10 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
         cls.handler = cls.handlers.split("async fn respond_to_question(", 1)[1].split(
             "async fn dismiss_question(", 1
         )[0]
+        service = (ROOT / "crates/phoenix-ide/src/send_chat_service.rs").read_text()
+        cls.response_service = service.split("async fn respond_to_question(", 1)[1].split(
+            "\n    pub", 1
+        )[0]
 
     def test_question_json_matches_registered_route_and_payload(self):
         self.assertIn('"/api/conversations/:id/respond", post(respond_to_question)', self.handlers)
@@ -46,12 +50,14 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
         self.assertIn("conversation: conversation_to_json_with_seed", get)
 
     def test_freshness_contract_matches_admission_locked_server_checks(self):
-        guard = self.handler.index("let _admission_guard = admission.lock().await;")
-        read = self.handler.index(".get_conversation(&id)")
-        state = self.handler.index("ConvState::AwaitingUserResponse")
-        identity = self.handler.index("validate_question_request_identity(")
-        admission = self.handler.index("require_ordinary_mutation_admission(")
-        send = self.handler.index(".send_event(")
+        self.assertIn("SendChatApplicationService::new(", self.handler)
+        self.assertIn(".respond_to_question(&id, req.request_id, req.answers, req.annotations, None)", self.handler)
+        guard = self.response_service.index("let _admission_guard = admission.lock().await;")
+        read = self.response_service.index(".get_conversation(id)")
+        state = self.response_service.index("ConvState::AwaitingUserResponse")
+        identity = self.response_service.index("validate_question_request_identity(")
+        admission = self.response_service.index("map_ordinary_mutation_admission(")
+        send = self.response_service.index(".send_event(")
         self.assertEqual(sorted([guard, read, state, identity, admission, send]),
                          [guard, read, state, identity, admission, send])
         validator = self.handlers.split("fn validate_question_request_identity(", 1)[1].split(
