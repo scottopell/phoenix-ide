@@ -385,6 +385,7 @@ mod state_machine_props {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         )
     }
@@ -1069,6 +1070,7 @@ mod random_walk {
                 PathBuf::from("/tmp"),
                 "test-model",
                 200_000,
+                16_384,
                 "test-root",
             );
             let mut state = ConvState::Idle;
@@ -1101,6 +1103,7 @@ mod random_walk {
                 PathBuf::from("/tmp"),
                 "test-model",
                 200_000,
+                16_384,
             );
             ctx.mode = ModeKind::Direct;
             let mut state = ConvState::Idle;

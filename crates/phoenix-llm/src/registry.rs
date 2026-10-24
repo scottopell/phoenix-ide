@@ -699,19 +699,53 @@ pub fn legacy_model_replacement(model_id: &str) -> Option<&'static str> {
 }
 
 impl ModelRegistry {
-    /// Create an empty registry for testing purposes
+    /// Create a registry for testing purposes that declares the `test-model`
+    /// route's spec but wires no service.
+    ///
+    /// The spec supplies the explicit output-token maximum (REQ-LLM-004f) that
+    /// runtime fixtures resolve through this registry. There is no
+    /// Phoenix-internal fallback for a missing declared budget, so without the
+    /// spec every manager-path fixture resolving `test-model` would error.
+    ///
+    /// No service is registered: the registry stays behaviourally empty (no
+    /// live execution route), matching its historical shape, while still
+    /// declaring the authoritative budget.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn new_empty() -> Self {
+        let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
+        specs.insert("test-model".to_string(), Self::test_model_spec());
         Self {
             services: std::sync::RwLock::new(HashMap::new()),
-            specs: std::sync::RwLock::new(HashMap::new()),
+            specs: std::sync::RwLock::new(specs),
             default_model: std::sync::RwLock::new("test-model".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             current_codex_credential: std::sync::RwLock::new(None),
             codex_reload: tokio::sync::Mutex::new(()),
             config: Arc::new(LlmConfig::default()),
+        }
+    }
+
+    /// Spec for the `test-model` route used by `new_empty`. Declares a
+    /// 131072-token output ceiling so budget resolution has an authoritative
+    /// value; the context window is irrelevant without a wired service and
+    /// resolves to the deployment default.
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_model_spec() -> super::ModelSpec {
+        super::ModelSpec {
+            id: "test-model".into(),
+            default_request_name: "test-model".into(),
+            backend: ModelBackend::Mock,
+            family: "Test".into(),
+            description: "In-process mock model for tests".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 131_072,
+            recommended: false,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: super::EffortCapabilities::Unknown,
+            service_tier_capabilities: crate::models::ServiceTierCapabilities::Unsupported,
         }
     }
 
@@ -1337,7 +1371,7 @@ impl ModelRegistry {
             .read()
             .expect("specs lock poisoned")
             .get(model_id)
-            .and_then(super::ModelSpec::output_token_limit)
+            .map(super::ModelSpec::output_token_limit)
     }
 
     /// List all available model IDs
@@ -2120,7 +2154,7 @@ mod tests {
     #[test]
     fn custom_exact_route_precedes_legacy_model_mapping() {
         let custom = parse_external_models(
-            r#"[{"id":"gpt-5.5","api_name":"operator/gpt-5.5","backend":"openai_responses","description":"Operator-defined exact legacy ID","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"gpt-5.5","api_name":"operator/gpt-5.5","backend":"openai_responses","description":"Operator-defined exact legacy ID","context_window":128000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap()
         .into_iter()
@@ -2369,7 +2403,7 @@ mod tests {
 
     fn external_gateway_model() -> super::super::ModelSpec {
         parse_external_models(
-            r#"[{"id":"gateway-provider/example-org/Chat-Model","backend":"anthropic","description":"Gateway-hosted chat model POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"gateway-provider/example-org/Chat-Model","backend":"anthropic","description":"Gateway-hosted chat model POC","context_window":262000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap()
         .into_iter()
@@ -2596,7 +2630,7 @@ mod tests {
     #[test]
     fn duplicate_configured_model_does_not_override_builtin_registration() {
         let duplicate = parse_external_models(
-            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","backend":"anthropic","description":"Override attempt","context_window":123,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","backend":"anthropic","description":"Override attempt","context_window":123,"max_output_tokens":64,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap()
         .into_iter()
@@ -2921,7 +2955,7 @@ mod tests {
 
     fn external_openai_model() -> super::super::ModelSpec {
         parse_external_models(
-            r#"[{"id":"openai-compatible/custom","backend":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"openai-compatible/custom","backend":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap()
         .into_iter()
@@ -2931,7 +2965,7 @@ mod tests {
 
     fn external_chat_completions_model() -> super::super::ModelSpec {
         parse_external_models(
-            r#"[{"id":"gateway-provider/example-org/Code-Model","backend":"openai_chat_completions","description":"Code model via gateway","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"gateway-provider/example-org/Code-Model","backend":"openai_chat_completions","description":"Code model via gateway","context_window":128000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap()
         .into_iter()
@@ -3648,7 +3682,7 @@ mod tests {
 
     fn external_google_model() -> super::super::ModelSpec {
         parse_external_models(
-            r#"[{"id":"gateway/gemini-2.5-pro","backend":"openai_chat_completions","family":"Google","description":"Gemini 2.5 Pro via OpenAI-compatible gateway","context_window":1000000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"gateway/gemini-2.5-pro","backend":"openai_chat_completions","family":"Google","description":"Gemini 2.5 Pro via OpenAI-compatible gateway","context_window":1000000,"max_output_tokens":32000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap()
         .into_iter()
@@ -3721,7 +3755,7 @@ mod tests {
             .get("claude-haiku-4-5")
             .expect("haiku should be registered");
         assert!(
-            haiku.output_token_limit().is_none_or(|limit| limit > 0),
+            haiku.output_token_limit() > 0,
             "claude-haiku-4-5 must have nonzero max_output_tokens"
         );
     }

@@ -12190,6 +12190,7 @@ impl Database {
                                 | ErrorKind::ServerError
                                 | ErrorKind::ServerOverloaded
                                 | ErrorKind::TimedOut
+                                | ErrorKind::OutputTokensExhausted
                                 | ErrorKind::ContentFilter => "runtime_failure",
                             },
                         });
@@ -12390,6 +12391,7 @@ impl Database {
                     | ErrorKind::ServerError
                     | ErrorKind::ServerOverloaded
                     | ErrorKind::TimedOut
+                    | ErrorKind::OutputTokensExhausted
                     | ErrorKind::ContentFilter => "runtime_failure",
                 },
             };
@@ -20502,7 +20504,13 @@ mod tests {
             &ConvState::ServerOverloadRetrying {
                 retry: persisted_retry.clone(),
             },
-            &ConvContext::new(conversation_id, "/tmp".into(), "test-model", 200_000),
+            &ConvContext::new(
+                conversation_id,
+                "/tmp".into(),
+                "test-model",
+                200_000,
+                16_384,
+            ),
             Event::LlmResponse {
                 content: vec![ContentBlock::text("threshold response")],
                 tool_calls: Vec::new(),

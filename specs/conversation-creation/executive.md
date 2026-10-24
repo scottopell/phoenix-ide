@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Slack gateway REQ-SG-008 adds a trusted Direct/no-repository creation intent, including when the server home is Git-backed (ADR-144). The implementation has focused fixture coverage; production acceptance is tracked in `specs/slack-gateway/executive.md` and does not change the verification status of other creation paths below.
+Slack gateway REQ-SG-008 adds a trusted Direct/no-repository creation intent, including when the server home is Git-backed (ADR-148). The implementation has focused fixture coverage; production acceptance is tracked in `specs/slack-gateway/executive.md` and does not change the verification status of other creation paths below.
 
 Conversation creation accepts one durable job per request before filesystem, Git, attachment, or runtime work. Git-backed creation records one immutable starting pin and publishes the conversation only when its starting state is whole. Provisioning is governed by an exclusively claimed, restart-safe protocol whose behavior can be exercised under deterministic generated schedules.
 

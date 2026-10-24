@@ -323,6 +323,7 @@ const ERROR_KIND_OPTIONS = [
   'cancelled',
   'sub_agent_error',
   'context_exhausted',
+  'output_tokens_exhausted',
   'turn_limit_exhausted',
   'content_filter',
 ] as const satisfies readonly WireErrorKind[];
