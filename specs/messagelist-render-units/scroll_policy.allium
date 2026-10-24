@@ -603,8 +603,7 @@ rule GestureCancellationObservesItsOwnEndpoint {
     ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
 }
 
--- A gesture whose end event never arrives — the touch target unmounted
--- mid-drag, so touchend was dispatched at a detached node — is discovered
+-- A gesture whose end has not been observed by the policy is discovered
 -- when the next interaction begins, or when a finger reported down has gone
 -- longer than the gesture-staleness bound without an event of its own while
 -- other input drives the viewport. It cannot be resolved then: the
