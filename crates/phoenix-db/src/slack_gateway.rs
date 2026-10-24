@@ -151,6 +151,29 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
     })
 }
 impl Database {
+    pub async fn set_slack_configuration(&self, value: &str) -> DbResult<()> {
+        let config: serde_json::Value =
+            serde_json::from_str(value).map_err(|e| DbError::Serialization(e.to_string()))?;
+        let workspace = config
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| DbError::Serialization("Slack workspace is required".into()))?;
+        let owner = config
+            .get("owner")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| DbError::Serialization("Slack owner is required".into()))?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let outstanding: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND (r.eyes_confirmed=0 OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.response_kind<>'clarification' AND o.state IN ('confirmed','failed')))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
+        ).bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
+        if outstanding {
+            return Err(DbError::Serialization("Cannot change the Slack account while accepted work or return delivery is outstanding; finish that work using its original account first".into()));
+        }
+        sqlx::query("INSERT INTO app_settings(key,value) VALUES ('slack_gateway',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(value).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn slack_gateway_wakeup(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.slack_gateway_wakeup.clone()
@@ -680,7 +703,7 @@ impl Database {
         owner: &str,
         channel: &str,
         ts: &str,
-        text: &str,
+        exact_author_body: Option<(&str, &str)>,
     ) -> DbResult<bool> {
         let rows=sqlx::query("SELECT o.text,o.delivery_proof,o.state FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 AND b.channel=?3 AND o.destination='thread' AND o.state NOT IN ('pending','known_unsent')").bind(workspace).bind(owner).bind(channel).fetch_all(self.pool()).await?;
         for row in rows {
@@ -694,11 +717,12 @@ impl Database {
             {
                 return Ok(true);
             }
-            // An interrupted user-token send may have no returned timestamp.
-            // Conservatively exclude its exact generated body, never infer human
-            // authorship from the acting user identity alone.
             let generated = format!("Phoenix: {}", row.try_get::<String, _>("text")?);
-            if text.trim() == generated {
+            let state: String = row.try_get("state")?;
+            if matches!(state.as_str(), "attempting" | "uncertain")
+                && exact_author_body
+                    .is_some_and(|(author, text)| author == owner && text.trim() == generated)
+            {
                 return Ok(true);
             }
         }
@@ -731,6 +755,104 @@ async fn reject_slack_request_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn account_switch_cannot_orphan_accepted_work() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = source("100.000", SlackRequestKind::Briefing);
+        let original =
+            serde_json::json!({"workspace":source.workspace,"owner":source.owner,"enabled":true})
+                .to_string();
+        db.set_slack_configuration(&original).await.unwrap();
+        db.accept_slack_source(&source, false).await.unwrap();
+        db.set_slack_configuration(&original).await.unwrap();
+        let other =
+            serde_json::json!({"workspace":"other.slack.com","owner":"UOTHER","enabled":false})
+                .to_string();
+        assert!(db.set_slack_configuration(&other).await.is_err());
+        assert_eq!(
+            db.get_app_setting("slack_gateway").await.unwrap(),
+            Some(original)
+        );
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.fail_slack_before_admission(&request.request_id, "fixture failure")
+            .await
+            .unwrap();
+        db.slack_eyes_confirmed(&request.request_id).await.unwrap();
+        assert!(db.set_slack_configuration(&other).await.is_err());
+        sqlx::query(
+            "UPDATE slack_gateway_returns SET state='confirmed',delivery_proof='fixture proof'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.set_slack_configuration(&other).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_body_requires_exact_owner_and_an_ambiguous_send() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = source("100.000", SlackRequestKind::Explicit);
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,state,created_at_unix_micros) VALUES ('copy',?1,'copy','thread','same words','uncertain',1)").bind(&request.binding_id).execute(db.pool()).await.unwrap();
+        for (author, expected) in [("UOTHER", false), ("UOWNER", true)] {
+            assert_eq!(
+                db.is_gateway_slack_source(
+                    &source.workspace,
+                    &source.owner,
+                    &source.channel,
+                    "200.000",
+                    Some((author, "Phoenix: same words"))
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+        assert!(!db
+            .is_gateway_slack_source(
+                &source.workspace,
+                &source.owner,
+                &source.channel,
+                "200.000",
+                None
+            )
+            .await
+            .unwrap());
+        sqlx::query("UPDATE slack_gateway_returns SET state='failed' WHERE return_id='copy'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(!db
+            .is_gateway_slack_source(
+                &source.workspace,
+                &source.owner,
+                &source.channel,
+                "200.000",
+                Some(("UOWNER", "Phoenix: same words"))
+            )
+            .await
+            .unwrap());
+        sqlx::query("UPDATE slack_gateway_returns SET state='confirmed',delivery_proof='{\"message_ts\":\"200.000\"}' WHERE return_id='copy'").execute(db.pool()).await.unwrap();
+        assert!(db
+            .is_gateway_slack_source(
+                &source.workspace,
+                &source.owner,
+                &source.channel,
+                "200.000",
+                None
+            )
+            .await
+            .unwrap());
+    }
     #[tokio::test]
     async fn gateway_timestamps_reject_negative_and_noninteger_values() {
         let db = Database::open_in_memory().await.unwrap();

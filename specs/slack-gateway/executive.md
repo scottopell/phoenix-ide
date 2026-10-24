@@ -68,6 +68,15 @@ terminal-exit timeout remains a host qualification limit. The merged source's
 Historical developer-tool registry fixtures have focused regression coverage;
 the clean-environment full local run timed out, so hosted CI remains a gate.
 
+The first public Codex review identified five source-verification, return,
+question-recovery and configuration boundaries. Focused fixes use exact source
+bodies, typed pre-dispatch evidence, native execution-receipt recovery, verified
+authors for ambiguous echo matching and an atomic account-switch guard. The
+expanded 233-test MCP/gateway run passed 232 cases; its remaining schema-error
+assertion was updated to the new typed outcome and passed in isolation. Clippy,
+formatting, Allium and structural/timing checks pass. The next public review and
+full CI head remain qualification gates.
+
 The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
 passed online-backup and stopped-snapshot rehearsals from the installed complete
 127 ledger to its exact complete 130 registry. Integrity, foreign keys,

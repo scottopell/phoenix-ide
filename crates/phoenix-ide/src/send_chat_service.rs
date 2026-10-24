@@ -142,6 +142,12 @@ impl SendChatApplicationService {
             .map_err(crate::api::handlers::map_admission_db_error)?;
         crate::api::handlers::map_ordinary_mutation_admission(&target, "question response")?;
 
+        let gateway_answer = source.as_ref().is_some_and(|source| {
+            matches!(
+                source.origin,
+                phoenix_core::domain::db_schema::InputOrigin::SlackGateway { .. }
+            )
+        });
         self.runtime
             .send_event(
                 id,
@@ -153,7 +159,13 @@ impl SendChatApplicationService {
                 },
             )
             .await
-            .map_err(AppError::BadRequest)?;
+            .map_err(|error| {
+                if gateway_answer {
+                    AppError::Internal(error)
+                } else {
+                    AppError::BadRequest(error)
+                }
+            })?;
 
         Ok(())
     }

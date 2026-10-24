@@ -34,6 +34,8 @@ external entity NativeOutcome {
 }
 
 -- A verified observation is produced by the trusted Slack boundary, never by a model.
+-- Its trigger and instruction come from the exact source read, not search snippets.
+-- Matching an ambiguous gateway send requires exact owner authorship.
 -- Its key includes workspace, owner, channel, and exact Slack message timestamp.
 -- binding_key is request-specific for a briefing; for an explicit request it includes
 -- workspace, owner, channel, and root thread. Prefix and reaction use the same key.

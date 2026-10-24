@@ -14,9 +14,13 @@ pub(crate) async fn put(
 ) -> Result<Json<serde_json::Value>, AppError> {
     c.validate().map_err(AppError::BadRequest)?;
     let value = serde_json::to_string(&c).map_err(|e| AppError::Internal(e.to_string()))?;
-    s.db.set_app_setting("slack_gateway", &value)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    s.db.set_slack_configuration(&value).await.map_err(|e| {
+        if let phoenix_db::DbError::Serialization(message) = e {
+            AppError::BadRequest(message)
+        } else {
+            AppError::Internal(e.to_string())
+        }
+    })?;
     super::status(&s.db)
         .await
         .map(Json)

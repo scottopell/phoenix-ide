@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use phoenix_mcp::McpToolCallError;
-pub use phoenix_mcp::{oauth, McpClientManager};
+pub use phoenix_mcp::{oauth, McpClientManager, McpOneShotError};
 
 /// Wraps a single MCP tool as a Phoenix Tool.
 pub struct McpTool {

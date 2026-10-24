@@ -1,5 +1,6 @@
 use crate::{
-    CallContext, McpRequestError, McpServer, McpServerConfig, McpToolDef, OAuthRecoveryKind,
+    CallContext, McpOneShotError, McpRequestError, McpServer, McpServerConfig, McpToolDef,
+    OAuthRecoveryKind,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -197,6 +198,7 @@ impl SupervisorHandle {
     ) -> Result<CallOutcome, String> {
         self.call_for_config(self.snapshot().config, tool, arguments, cancel, None)
             .await
+            .map_err(|error| error.message().to_string())
     }
 
     pub(crate) async fn call_for_config(
@@ -206,11 +208,15 @@ impl SupervisorHandle {
         arguments: Value,
         cancel: CancellationToken,
         expected_schema: Option<Value>,
-    ) -> Result<CallOutcome, String> {
+    ) -> Result<CallOutcome, McpOneShotError> {
         let (reply, receive) = oneshot::channel();
         let deadline = tokio::time::Instant::now()
             .checked_add(self.snapshot().config.tool_call_timeout())
-            .ok_or_else(|| "MCP tool call timeout exceeds platform deadline range".to_string())?;
+            .ok_or_else(|| {
+                McpOneShotError::NotDispatched(
+                    "MCP tool call timeout exceeds platform deadline range".into(),
+                )
+            })?;
         let call_cancel = cancel.child_token();
         let command = Command::Call {
             config,
@@ -222,18 +228,18 @@ impl SupervisorHandle {
         };
         tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err("MCP tool call cancelled".to_string()),
+            () = cancel.cancelled() => return Err(McpOneShotError::NotDispatched("MCP tool call cancelled".into())),
             () = tokio::time::sleep_until(deadline) => {
-                return Err("MCP tool call timed out while enqueueing".to_string());
+                return Err(McpOneShotError::NotDispatched("MCP tool call timed out while enqueueing".into()));
             }
-            result = self.mailbox.send(command) => result.map_err(|_| stopped())?,
+            result = self.mailbox.send(command) => result.map_err(|_| McpOneShotError::NotDispatched(stopped()))?,
         }
         tokio::select! {
             biased;
-            result = receive => result.unwrap_or_else(|_| Err(stopped())),
+            result = receive => result.unwrap_or_else(|_| Err(McpOneShotError::Uncertain(stopped()))),
             () = tokio::time::sleep_until(deadline) => {
                 call_cancel.cancel();
-                Err("MCP tool call timed out".to_string())
+                Err(McpOneShotError::Uncertain("MCP tool call timed out".into()))
             }
         }
     }
@@ -641,7 +647,7 @@ struct QueuedCall {
     tool: String,
     arguments: Value,
     cancel: CancellationToken,
-    reply: oneshot::Sender<Result<CallOutcome, String>>,
+    reply: oneshot::Sender<Result<CallOutcome, McpOneShotError>>,
     cancellation_watch: tokio::task::JoinHandle<()>,
 }
 
@@ -701,14 +707,14 @@ enum Command {
         tool: String,
         arguments: Value,
         cancel: CancellationToken,
-        reply: oneshot::Sender<Result<CallOutcome, String>>,
+        reply: oneshot::Sender<Result<CallOutcome, McpOneShotError>>,
     },
     CallCompleted {
         call_id: u64,
         epoch: u64,
         context: CallContext,
         result: Result<String, McpRequestError>,
-        reply: oneshot::Sender<Result<CallOutcome, String>>,
+        reply: oneshot::Sender<Result<CallOutcome, McpOneShotError>>,
     },
     CancelQueued {
         call_id: u64,
@@ -1053,13 +1059,15 @@ impl Actor {
                 reply,
             } => {
                 if self.snapshot.config != config {
-                    let _ = reply.send(Err(
+                    let _ = reply.send(Err(McpOneShotError::NotDispatched(
                         "MCP tool invocation was superseded by a configuration change".to_owned(),
-                    ));
+                    )));
                     return;
                 }
                 let SupervisorState::Ready(server) = &self.state else {
-                    let _ = reply.send(Err(self.not_ready_message()));
+                    let _ = reply.send(Err(McpOneShotError::NotDispatched(
+                        self.not_ready_message(),
+                    )));
                     return;
                 };
                 let context = server.call_context();
@@ -1069,7 +1077,7 @@ impl Actor {
                 self.active_calls.insert(call_id, cancel.clone());
                 if context.is_http() {
                     let Some(mailbox) = self.mailbox.upgrade() else {
-                        let _ = reply.send(Err(stopped()));
+                        let _ = reply.send(Err(McpOneShotError::NotDispatched(stopped())));
                         return;
                     };
                     tokio::spawn(async move {
@@ -1092,14 +1100,14 @@ impl Actor {
                             .await
                         {
                             if let Command::CallCompleted { reply, .. } = error.0 {
-                                let _ = reply.send(Err(stopped()));
+                                let _ = reply.send(Err(McpOneShotError::Uncertain(stopped())));
                             }
                         }
                     });
                 } else {
                     let cancellation = cancel.clone();
                     let Some(mailbox) = self.mailbox.upgrade() else {
-                        let _ = reply.send(Err(stopped()));
+                        let _ = reply.send(Err(McpOneShotError::NotDispatched(stopped())));
                         return;
                     };
                     let cancellation_watch = tokio::spawn(async move {
@@ -1536,7 +1544,9 @@ impl Actor {
             call.cancellation_watch.abort();
             self.stdio_active = true;
             let Some(mailbox) = self.mailbox.upgrade() else {
-                let _ = call.reply.send(Err(stopped()));
+                let _ = call
+                    .reply
+                    .send(Err(McpOneShotError::NotDispatched(stopped())));
                 self.stdio_active = false;
                 continue;
             };
@@ -1561,7 +1571,7 @@ impl Actor {
                     .await
                 {
                     if let Command::CallCompleted { reply, .. } = error.0 {
-                        let _ = reply.send(Err(stopped()));
+                        let _ = reply.send(Err(McpOneShotError::Uncertain(stopped())));
                     }
                 }
             });
@@ -1900,7 +1910,7 @@ mod epoch_tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(result.result,Err(McpRequestError::Other(message)) if message.contains("EUNAVAIL"))
+            matches!(result.result,Err(McpRequestError::NotDispatched(message)) if message.contains("EUNAVAIL"))
         );
         assert!(started.try_recv().is_err());
         handle.remove().await.unwrap();

@@ -10,6 +10,9 @@ an existing MCP server, your Slack user ID, the exact workspace permalink host,
 your IANA timezone and the Phoenix URL. The read-access check verifies identity
 and source access without accepting requests or changing Slack.
 
+Finish outstanding work before switching the configured owner or workspace.
+Pausing discovery still lets accepted work and its deliveries finish.
+
 Optional private notifications use an owner-configured executable. Configure
 its absolute path in settings, or an executable-plus-arguments JSON array in
 `notification_command` through the settings API. Keep provider credentials and

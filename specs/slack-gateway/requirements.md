@@ -54,6 +54,8 @@ WHEN a verified trigger is accepted, THE SYSTEM SHALL durably retain its workspa
 
 WHEN discovery repeats the same source message, including both a prefix and an owner reaction, THE SYSTEM SHALL reuse the accepted request rather than create another conversation, turn, or reply obligation. Removing and re-adding a reaction SHALL NOT constitute a new request for an accepted source. Later source edits SHALL NOT silently change an accepted instruction; a different instruction requires a new source message.
 
+WHEN an owner or workspace change would leave another account's accepted work or delivery obligations outstanding, THE SYSTEM SHALL refuse that change until those obligations settle. Disabling discovery or repairing the same account's connection SHALL preserve and continue accepted work.
+
 **Rationale:** Polling, overlapping gestures, edits, and restarts must not execute the same request twice or change what was accepted.
 
 ### REQ-SG-006 — Acknowledge durable acceptance with eyes only

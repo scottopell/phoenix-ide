@@ -279,13 +279,28 @@ async fn accept_page_sources(
             .map_err(err)?
             || state
                 .db
-                .is_gateway_slack_source(&c.workspace, &c.owner, &hit.channel, &hit.ts, &hit.text)
+                .is_gateway_slack_source(&c.workspace, &c.owner, &hit.channel, &hit.ts, None)
                 .await
                 .map_err(err)?
         {
             continue;
         }
-        if let Some(source) = slack.source(c, hit, reactions).await? {
+        if let Some(verified) = slack.source(c, hit, reactions).await? {
+            if state
+                .db
+                .is_gateway_slack_source(
+                    &c.workspace,
+                    &c.owner,
+                    &hit.channel,
+                    &hit.ts,
+                    Some((&verified.author, &verified.body)),
+                )
+                .await
+                .map_err(err)?
+            {
+                continue;
+            }
+            let source = verified.source;
             if !super::config(&state.db).await?.is_some_and(|v| {
                 v.enabled
                     && v.owner == c.owner
@@ -348,6 +363,7 @@ async fn reconcile_work(
     dispatch_returns(state, c, slack, identity_verified).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_returns(
     state: &AppState,
     c: &Config,
@@ -399,20 +415,28 @@ async fn dispatch_returns(
                     )
                     .await
                     .map_err(err)?,
-                Err(e) if super::slack::destination_unavailable(&e) => state
-                    .db
-                    .slack_fail_return_with_notice(&output.return_id, &attempt, &e)
-                    .await
-                    .map_err(err)?,
+                Err(phoenix_tools::mcp::McpOneShotError::Uncertain(message))
+                    if super::slack::destination_unavailable(&message) =>
+                {
+                    state
+                        .db
+                        .slack_fail_return_with_notice(&output.return_id, &attempt, &message)
+                        .await
+                        .map_err(err)?;
+                }
                 Err(e) => state
                     .db
                     .slack_finish_return(
                         &output.return_id,
                         &attempt,
-                        phoenix_db::SlackReturnState::Uncertain,
+                        if matches!(e, phoenix_tools::mcp::McpOneShotError::NotDispatched(_)) {
+                            phoenix_db::SlackReturnState::KnownUnsent
+                        } else {
+                            phoenix_db::SlackReturnState::Uncertain
+                        },
                         None,
                         None,
-                        Some(&e),
+                        Some(e.message()),
                     )
                     .await
                     .map_err(err)?,
@@ -670,13 +694,12 @@ async fn admit(state: &AppState, request: &SlackRequest) -> Result<(), String> {
     Ok(())
 }
 
-async fn answer_question(
+async fn reconcile_recorded_question_answer(
     state: &AppState,
     request: &SlackRequest,
     question: &str,
     transcript: &str,
-) -> Result<(), String> {
-    // Reconcile a previously persisted answer before consulting current state.
+) -> Result<bool, String> {
     let prior: Option<String> = sqlx::query_scalar(
         "SELECT conversation_id FROM messages WHERE message_id=?1 AND origin_slack_request_id=?2",
     )
@@ -686,11 +709,45 @@ async fn answer_question(
     .await
     .map_err(err)?;
     if let Some(prior) = prior {
-        state
-            .db
-            .slack_mark_admitted(&request.request_id, &prior)
-            .await
-            .map_err(err)?;
+        if prior != transcript {
+            return Err("Clarification answer is bound to another transcript".into());
+        }
+        let mut native = state.db.get_conversation(transcript).await.map_err(err)?;
+        if matches!(&native.state, phoenix_core::domain::sm_state::ConvState::AwaitingUserResponse { request_authority, .. } if request_authority.request_id().is_some_and(|id| id.to_string()==question))
+        {
+            state.runtime.get_or_create(transcript).await?;
+            native = state.db.get_conversation(transcript).await.map_err(err)?;
+            if matches!(&native.state, phoenix_core::domain::sm_state::ConvState::AwaitingUserResponse { request_authority, .. } if request_authority.request_id().is_some_and(|id| id.to_string()==question))
+            {
+                return Err("Clarification transition recovery is pending".into());
+            }
+        }
+        let later_agent: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages source JOIN messages agent ON agent.conversation_id=source.conversation_id AND agent.sequence_id>source.sequence_id AND agent.message_type='agent' WHERE source.message_id=?1)").bind(&request.input_id).fetch_one(state.db.pool()).await.map_err(err)?;
+        if later_agent
+            || !matches!(
+                native.state,
+                phoenix_core::domain::sm_state::ConvState::AwaitingUserResponse { .. }
+            )
+        {
+            state
+                .db
+                .slack_mark_admitted(&request.request_id, &prior)
+                .await
+                .map_err(err)?;
+            sqlx::query("UPDATE slack_gateway_questions SET answered_by=?3 WHERE question_id=?1 AND transcript_id=?2 AND answered_by IS NULL").bind(question).bind(transcript).bind(&request.request_id).execute(state.db.pool()).await.map_err(err)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn answer_question(
+    state: &AppState,
+    request: &SlackRequest,
+    question: &str,
+    transcript: &str,
+) -> Result<(), String> {
+    if reconcile_recorded_question_answer(state, request, question, transcript).await? {
         return Ok(());
     }
     let snapshot:Option<String>=sqlx::query_scalar("SELECT question_body FROM slack_gateway_native_outcomes WHERE question_id=?1 AND transcript_id=?2 LIMIT 1").bind(question).bind(transcript).fetch_optional(state.db.pool()).await.map_err(err)?;
@@ -794,6 +851,173 @@ mod tests {
         ProviderStreamTelemetry, Usage,
     };
     use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    async fn undispatched_reply_retries_after_tool_readiness_recovers() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = Config {
+            enabled: false,
+            mcp_server: "fixture".into(),
+            owner: "UFIXTURE".into(),
+            workspace: "fixture.slack.com".into(),
+            timezone: "America/New_York".into(),
+            phoenix_url: "https://localhost:8043".into(),
+            notification_command: None,
+        };
+        let source = phoenix_db::SlackSource {
+            workspace: c.workspace.clone(),
+            owner: c.owner.clone(),
+            channel: "CFIXTURE".into(),
+            message_ts: "100.000001".into(),
+            thread_ts: "100.000000".into(),
+            source_url: "https://fixture.slack.com/archives/CFIXTURE/p100000001".into(),
+            instruction: "ask".into(),
+            context: "quoted".into(),
+            observed_at_unix_micros: 1,
+            kind: SlackRequestKind::Explicit,
+        };
+        state.db.accept_slack_source(&source, false).await.unwrap();
+        let request = state
+            .db
+            .slack_requests(&c.workspace, &c.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('retry',?1,'reply','thread','result',1)").bind(&request.binding_id).execute(state.db.pool()).await.unwrap();
+        let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+        dispatch_returns(&state, &c, &slack, true).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()[0]
+                .state,
+            phoenix_db::SlackReturnState::KnownUnsent
+        );
+        assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        slack.fixture = Some(Arc::new(|tool, _| {
+            assert_eq!(tool, "slack_send_message");
+            Ok(
+                serde_json::json!({"message_link":"https://fixture.slack.com/archives/CFIXTURE/p200000001?thread_ts=100.000000", "message_context":{"channel_id":"CFIXTURE","message_ts":"200.000001"}}),
+            )
+        }));
+        dispatch_returns(&state, &c, &slack, true).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()[0]
+                .state,
+            phoenix_db::SlackReturnState::Confirmed
+        );
+        assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn partial_answer_row_replays_the_same_question_transition() {
+        use phoenix_core::domain::{
+            db_schema::MessageContent,
+            sm_state::{ConvState, QuestionRequestAuthority, UserQuestion},
+        };
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let conv = state
+            .db
+            .create_conversation("partial-answer", "partial-answer", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let question = QuestionRequestAuthority::new();
+        let question_id = question.request_id().unwrap().to_string();
+        let source = phoenix_db::SlackSource {
+            workspace: "fixture.slack.com".into(),
+            owner: "UFIXTURE".into(),
+            channel: "CFIXTURE".into(),
+            message_ts: "100.000001".into(),
+            thread_ts: "100.000000".into(),
+            source_url: "https://fixture.slack.com/archives/CFIXTURE/p100000001".into(),
+            instruction: "yes".into(),
+            context: "quoted".into(),
+            observed_at_unix_micros: 1,
+            kind: SlackRequestKind::Explicit,
+        };
+        state.db.accept_slack_source(&source, false).await.unwrap();
+        let request = state
+            .db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        state
+            .db
+            .slack_bind_product(&request.binding_id, conv.product_conversation_id.as_str())
+            .await
+            .unwrap();
+        let questions = vec![UserQuestion {
+            header: "Choice".into(),
+            question: "Continue?".into(),
+            options: vec![],
+            multi_select: false,
+        }];
+        state
+            .db
+            .update_conversation_state(
+                &conv.id,
+                &ConvState::AwaitingUserResponse {
+                    questions: questions.clone(),
+                    tool_use_id: "question-tool".into(),
+                    request_authority: question,
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body,processed) VALUES (?1,'q','question',?2,?3,?4,1)").bind(&request.request_id).bind(&conv.id).bind(&question_id).bind(serde_json::to_string(&questions).unwrap()).execute(state.db.pool()).await.unwrap();
+        state
+            .db
+            .add_message_with_seq_and_origin(
+                &request.input_id,
+                &conv.id,
+                1,
+                &MessageContent::user("Here are my answers:\n\"Continue?\" = \"yes\""),
+                None,
+                None,
+                &InputOrigin::SlackGateway {
+                    request_id: request.request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if answer_question(&state, &request, &question_id, &conv.id)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native question recovery must settle the recorded answer");
+        assert!(!matches!(
+            state.db.get_conversation(&conv.id).await.unwrap().state,
+            ConvState::AwaitingUserResponse { .. }
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id=?1")
+            .bind(&request.input_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            state
+                .db
+                .slack_requests(&source.workspace, &source.owner)
+                .await
+                .unwrap()[0]
+                .admitted
+        );
+    }
     struct ReplyModel {
         requests: Arc<Mutex<Vec<String>>>,
     }

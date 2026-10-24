@@ -349,6 +349,8 @@ pub struct McpServerStatus {
 /// the variant rather than string-matching the message.
 #[derive(Debug)]
 pub enum McpRequestError {
+    /// Local schema validation stopped the request before transport dispatch.
+    NotDispatched(String),
     /// Classified by the transport. The detail is unprefixed; format with the
     /// server name via `into_message`.
     Transport(TransportError),
@@ -366,7 +368,7 @@ impl McpRequestError {
         match self {
             Self::Transport(e) => format!("MCP server '{server_name}': {e}"),
             Self::Cancelled => format!("MCP server '{server_name}': tool call cancelled"),
-            Self::Other(message) => message,
+            Self::Other(message) | Self::NotDispatched(message) => message,
         }
     }
 }
@@ -375,6 +377,23 @@ impl McpRequestError {
 pub enum McpToolCallError {
     Cancelled,
     Failed(String),
+}
+
+#[derive(Debug)]
+pub enum McpOneShotError {
+    /// No tool request was dispatched.
+    NotDispatched(String),
+    /// Dispatch may have occurred; another attempt could duplicate a write.
+    Uncertain(String),
+}
+
+impl McpOneShotError {
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotDispatched(message) | Self::Uncertain(message) => message,
+        }
+    }
 }
 
 impl From<String> for McpToolCallError {
@@ -499,7 +518,8 @@ impl HandshakeFailure {
             }
             other @ (McpRequestError::Transport(_)
             | McpRequestError::Cancelled
-            | McpRequestError::Other(_)) => Self::Other(other.into_message(server_name)),
+            | McpRequestError::Other(_)
+            | McpRequestError::NotDispatched(_)) => Self::Other(other.into_message(server_name)),
         }
     }
 }
@@ -1035,7 +1055,7 @@ impl CallContext {
     ) -> Result<String, McpRequestError> {
         if let Some(expected) = expected_schema {
             if self.tools_changed.load(Ordering::Acquire) {
-                return Err(McpRequestError::Other(
+                return Err(McpRequestError::NotDispatched(
                     "EUNAVAIL: MCP catalog changed before execution".into(),
                 ));
             }
@@ -1047,7 +1067,7 @@ impl CallContext {
                 .iter()
                 .any(|tool| tool.name == tool_name && tool.input_schema == *expected)
             {
-                return Err(McpRequestError::Other(format!(
+                return Err(McpRequestError::NotDispatched(format!(
                     "EUNAVAIL: MCP tool '{tool_name}' schema changed or is unavailable"
                 )));
             }
@@ -3400,20 +3420,19 @@ impl McpClientManager {
             })
     }
 
-    /// Call at most once after ready-state resolution. In contrast to ordinary
-    /// tool execution this never replays a dispatched call after a transport or
-    /// authentication error. Durable outboxes must reconcile ambiguous writes.
+    /// Call at most once, preserving whether local readiness prevented dispatch.
+    /// A dispatched call is never replayed after transport or authentication failure.
     /// # Errors
-    /// Returns cancellation, stale schema, unavailability, or an uncertain call error.
+    /// Returns `NotDispatched` for local setup refusal, otherwise `Uncertain`.
     pub async fn call_tool_once(
         self: &Arc<Self>,
         server_name: &str,
         tool_name: &str,
         arguments: Value,
         expected_schema: Value,
-    ) -> Result<String, McpToolCallError> {
+    ) -> Result<String, McpOneShotError> {
         if self.disabled_servers.read().await.contains(server_name) {
-            return Err(McpToolCallError::Failed(format!(
+            return Err(McpOneShotError::NotDispatched(format!(
                 "MCP server '{server_name}' is disabled"
             )));
         }
@@ -3424,22 +3443,28 @@ impl McpClientManager {
             .get(server_name)
             .cloned()
             .ok_or_else(|| {
-                McpToolCallError::Failed(format!("MCP server '{server_name}' is not connected"))
+                McpOneShotError::NotDispatched(format!(
+                    "MCP server '{server_name}' is not connected"
+                ))
             })?;
         let config = handle.snapshot().config;
-        let outcome = self
-            .call_actor_when_ready(
-                &handle,
-                &config,
-                tool_name,
+        let outcome = handle
+            .call_for_config(
+                config,
+                tool_name.to_string(),
                 arguments,
                 CancellationToken::new(),
                 Some(expected_schema),
             )
             .await?;
-        outcome
-            .result
-            .map_err(|e| McpToolCallError::Failed(e.into_message(server_name)))
+        outcome.result.map_err(|e| match e {
+            McpRequestError::NotDispatched(message) => McpOneShotError::NotDispatched(message),
+            other @ (McpRequestError::Transport(_)
+            | McpRequestError::Cancelled
+            | McpRequestError::Other(_)) => {
+                McpOneShotError::Uncertain(other.into_message(server_name))
+            }
+        })
     }
 
     /// # Errors
@@ -3658,10 +3683,10 @@ impl McpClientManager {
                         {
                             self.wait_for_ready(handle, &cancel).await?;
                         }
-                        Err(error) if error == "MCP tool call cancelled" => {
+                        Err(error) if error.message() == "MCP tool call cancelled" => {
                             return Err(McpToolCallError::Cancelled);
                         }
-                        Err(error) => return Err(McpToolCallError::Failed(error)),
+                        Err(error) => return Err(McpToolCallError::Failed(error.message().into())),
                     }
                 }
                 SupervisorState::Connecting | SupervisorState::Recovering => {
@@ -5866,15 +5891,49 @@ mod tests {
             .write()
             .await
             .insert("fake".into(), server_handle(server));
-        assert!(manager
-            .call_tool_once("fake", "post", serde_json::json!({}), schema)
-            .await
-            .is_err());
+        assert!(matches!(
+            manager
+                .call_tool_once("fake", "post", serde_json::json!({}), schema)
+                .await,
+            Err(McpOneShotError::Uncertain(_))
+        ));
         assert_eq!(
             requests.lock().unwrap().len(),
             1,
             "an uncertain write must not be replayed during recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn single_attempt_setup_failures_are_definitely_unsent() {
+        let manager = Arc::new(McpClientManager::new());
+        let schema = serde_json::json!({"type":"object"});
+        assert!(matches!(
+            manager
+                .call_tool_once("missing", "post", serde_json::json!({}), schema.clone())
+                .await,
+            Err(McpOneShotError::NotDispatched(_))
+        ));
+        let (server, requests, _) = fake_server(vec![]);
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".into(), server_handle(server));
+        assert!(matches!(
+            manager
+                .call_tool_once("fake", "post", serde_json::json!({}), schema.clone())
+                .await,
+            Err(McpOneShotError::NotDispatched(_))
+        ));
+        manager.disabled_servers.write().await.insert("fake".into());
+        assert!(matches!(
+            manager
+                .call_tool_once("fake", "post", serde_json::json!({}), schema)
+                .await,
+            Err(McpOneShotError::NotDispatched(_))
+        ));
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
