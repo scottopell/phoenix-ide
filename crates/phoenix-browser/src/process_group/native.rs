@@ -576,7 +576,11 @@ mod tests {
             "42 (Chrome) S 1",
             "42 (Chrome) S 1 invalid",
         ] {
-            for after in [Ok(0), Ok(99), Err(io::Error::from_raw_os_error(libc::ESRCH))] {
+            for after in [
+                Ok(0),
+                Ok(99),
+                Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            ] {
                 let mut observations = [Ok(42), after].into_iter();
                 let mut reads = 0;
                 let live = linux_process_is_live_member(
