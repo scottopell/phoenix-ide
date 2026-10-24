@@ -1706,3 +1706,121 @@ async fn expired_source_payload_replays_an_explicit_gap_with_current_snapshot_an
     a.stop().await;
     b.stop().await;
 }
+
+#[tokio::test]
+async fn local_stop_after_https_authorization_is_typed_and_never_accepts_a_late_fact() {
+    use crate::send_chat_service::{
+        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest, SendChatServiceError,
+    };
+    use phoenix_core::domain::db_schema::InputOrigin;
+    use phoenix_db::federation_subscriptions::RemoteAuthorizationOutcome;
+    let a = TestInstance::start().await;
+    let b = TestInstance::start().await;
+    let peer = a.connect_to(&b).await;
+    let source = source(&b).await;
+    let remote = create_saved_peer_subscription(
+        &a.state.db,
+        peer.peer_instance_id.to_string(),
+        source.product_conversation_id.clone(),
+        None,
+    )
+    .await
+    .unwrap()
+    .subscription;
+    commit_terminal(&b, &source, TerminalFactOutcome::Completed).await;
+    let note = stage_one(&a, &b, &peer, &remote).await;
+    assert_eq!(
+        a.state
+            .db
+            .request_remote_notification_authorization(&remote, &note.admission_id)
+            .await
+            .unwrap(),
+        RemoteAuthorizationOutcome::Ready
+    );
+    let response = request_peer(
+        &peer,
+        &SubscriptionRequest {
+            caller_instance_id: a.state.db.instance_id().await.unwrap(),
+            reference: remote.reference.clone(),
+            subscription_id: remote.subscription_id,
+            operation: SubscriptionOperation::Authorize {
+                delivery: note.content.clone(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let SubscriptionResult::Authorization {
+        authorization: SubscriptionAuthorization::Authorized { authorization_id },
+        navigation: Some(navigation),
+    } = response.result
+    else {
+        panic!("real source authorization required")
+    };
+    a.state
+        .db
+        .begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+        .await
+        .unwrap();
+    a.state
+        .db
+        .save_remote_notification_navigation(
+            &remote,
+            &note.admission_id,
+            &navigation.stable_path,
+            &navigation.source_path,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        a.state
+            .db
+            .confirm_remote_authorization(&remote, &note.admission_id, authorization_id)
+            .await
+            .unwrap(),
+        RemoteAuthorizationOutcome::LocallyStopped
+    );
+    let target = a
+        .state
+        .db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    let result = SendChatApplicationService::new(a.state.db.clone(), a.state.runtime.clone())
+        .send(SendChatRequest {
+            conversation_id: target.id.clone(),
+            origin: InputOrigin::SubscriptionEvent {
+                event_id: note.admission_id.clone(),
+            },
+            text: "late authorized fact".into(),
+            message_id: note.admission_id.clone(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            expansion_policy: MessageExpansionPolicy::LiteralText,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(SendChatServiceError::RemoteSubscriptionStopped)),
+        "{result:?}"
+    );
+    let history = a
+        .state
+        .db
+        .remote_notification_history(&remote, SubscriptionCursor::START)
+        .await
+        .unwrap();
+    assert!(matches!(
+        history[0].disposition,
+        phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Suppressed
+    ));
+    let receipts: (Option<String>, bool, Option<String>) = sqlx::query_as("SELECT authorization_id, authorization_requested, accepted_transcript_id FROM federation_remote_admissions WHERE admission_id = ?1").bind(&note.admission_id).fetch_one(a.state.db.pool()).await.unwrap();
+    assert_eq!(receipts, (Some(authorization_id.to_string()), true, None));
+    assert!(refreshed(&a, &remote).await.pending_unsubscribe);
+    assert_eq!(
+        refreshed(&a, &remote).await.admitted_cursor,
+        SubscriptionCursor::START
+    );
+    a.stop().await;
+    b.stop().await;
+}

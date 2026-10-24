@@ -422,6 +422,7 @@ impl Database {
 }
 
 mod authorization;
+pub use authorization::RemoteAuthorizationOutcome;
 mod consumer;
 mod presentation;
 pub use consumer::{RemoteNotification, RemoteNotificationContent, RemoteNotificationDisposition};

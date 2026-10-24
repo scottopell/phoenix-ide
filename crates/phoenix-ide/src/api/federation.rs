@@ -1,3 +1,5 @@
+mod owner;
+pub use owner::*;
 pub(crate) mod subscriptions;
 use axum::{
     extract::{Path, State},
@@ -561,7 +563,9 @@ fn remote_send_admission_rejection(
         SendChatServiceError::IdempotencyConflict => RemoteSendRejectionCode::IdempotencyConflict,
         SendChatServiceError::NotFound(_) => RemoteSendRejectionCode::TargetNotFound,
         SendChatServiceError::Busy => RemoteSendRejectionCode::Busy,
-        SendChatServiceError::CloseAdmissionFenced | SendChatServiceError::HistoryUnavailable => {
+        SendChatServiceError::CloseAdmissionFenced
+        | SendChatServiceError::HistoryUnavailable
+        | SendChatServiceError::RemoteSubscriptionStopped => {
             RemoteSendRejectionCode::TargetUnavailable
         }
         SendChatServiceError::AttachmentValidation(_) | SendChatServiceError::Expansion { .. } => {
@@ -983,6 +987,28 @@ fn decode_remote_resolve_response(
     })
 }
 
+fn read_source_href_matches(target: &ConversationReferenceTarget, href: &str) -> bool {
+    use crate::api::product_conversations::{exact_transcript_route, message_fragment};
+
+    match target {
+        ConversationReferenceTarget::Transcript { transcript_id } => {
+            href == exact_transcript_route(transcript_id)
+        }
+        ConversationReferenceTarget::Message {
+            transcript_id,
+            message_id,
+        } => {
+            href == format!(
+                "{}{}",
+                exact_transcript_route(transcript_id),
+                message_fragment(message_id.as_str())
+            )
+        }
+        ConversationReferenceTarget::ProductConversation { .. }
+        | ConversationReferenceTarget::Coordinator => false,
+    }
+}
+
 fn validate_remote_read_provenance(
     response: &RemoteReadConversationResponse,
     target: &ConversationReferenceTarget,
@@ -1042,6 +1068,9 @@ fn validate_remote_read_provenance(
         || response.read.requested.target != *target
         || response.read.resolved.instance_id != peer_instance_id
         || !resolved_matches_request
+        || !matches!(&response.read.source_navigation,
+            crate::api::global_read::QualifiedSearchNavigation::AppLocal { path }
+                if read_source_href_matches(&response.read.resolved.target, path))
     {
         return Err(FederationClientError::ReadProvenanceMismatch);
     }
@@ -1851,6 +1880,92 @@ mod send_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_read_navigation_must_match_exact_transcript_and_message_before_qualification() {
+        use crate::api::global_read::{QualifiedConversationRead, QualifiedSearchNavigation};
+        use phoenix_core::domain::conversation_reference::QualifiedConversationReference;
+        let peer = InstanceId::new();
+        let caller = InstanceId::new();
+        for (raw, valid, invalid) in [
+            (
+                "@transcript:exact-transcript",
+                "/c/exact-transcript?source_transcript=exact-transcript",
+                vec![
+                    "/c/other?source_transcript=other",
+                    "/c/readable-name",
+                    "/c/exact-transcript?source_transcript=other",
+                ],
+            ),
+            (
+                "@transcript:exact-transcript#message-msg",
+                "/c/exact-transcript?source_transcript=exact-transcript#message-msg",
+                vec![
+                    "/c/exact-transcript?source_transcript=exact-transcript",
+                    "/c/exact-transcript?source_transcript=exact-transcript#message-other",
+                    "/c/other?source_transcript=other#message-msg",
+                    "/c/other?source_transcript=exact-transcript#message-msg",
+                    "/c/exact-transcript?source_transcript=other#message-msg",
+                ],
+            ),
+            (
+                "@transcript:über",
+                "/c/%C3%BCber?source_transcript=%C3%BCber",
+                vec!["/c/other?source_transcript=other"],
+            ),
+            (
+                "@transcript:über#message-雪",
+                "/c/%C3%BCber?source_transcript=%C3%BCber#message-%E9%9B%AA",
+                vec![
+                    "/c/%C3%BCber?source_transcript=%C3%BCber",
+                    "/c/%C3%BCber?source_transcript=%C3%BCber#message-other",
+                    "/c/%C3%BCber?source_transcript=other#message-%E9%9B%AA",
+                ],
+            ),
+        ] {
+            let target =
+                crate::api::global_read::GlobalReadService::parse_read_target(raw).unwrap();
+            let reference = QualifiedConversationReference {
+                instance_id: peer,
+                target: target.clone(),
+            };
+            let mut response = RemoteReadConversationResponse {
+                destination_instance_id: peer,
+                caller_instance_id: caller,
+                read: QualifiedConversationRead {
+                    requested: reference.clone(),
+                    resolved: reference,
+                    stable_conversation: None,
+                    evidence: vec![],
+                    content: "read".into(),
+                    next_cursor: None,
+                    source_navigation: QualifiedSearchNavigation::AppLocal { path: valid.into() },
+                    stable_navigation: Some(QualifiedSearchNavigation::AppLocal {
+                        path: "/c/readable-stable-name".into(),
+                    }),
+                },
+            };
+            validate_remote_read_provenance(&response, &target, peer, caller).unwrap();
+            if let ConversationReferenceTarget::Message { transcript_id, .. } = &target {
+                let base = crate::api::product_conversations::exact_transcript_route(transcript_id);
+                assert!(resolved_reference_href_matches(&target, &base));
+                assert!(resolved_reference_href_matches(&target, valid));
+                assert!(!read_source_href_matches(&target, &base));
+            }
+            for path in invalid {
+                response.read.source_navigation =
+                    QualifiedSearchNavigation::AppLocal { path: path.into() };
+                assert!(matches!(
+                    validate_remote_read_provenance(&response, &target, peer, caller),
+                    Err(FederationClientError::ReadProvenanceMismatch)
+                ));
+            }
+            response.read.source_navigation = QualifiedSearchNavigation::Peer {
+                url: format!("https://peer.example{valid}"),
+            };
+            assert!(validate_remote_read_provenance(&response, &target, peer, caller).is_err());
+        }
+    }
 
     #[test]
     fn peer_tokens_are_prefixed_random_credentials() {

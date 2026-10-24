@@ -455,6 +455,24 @@ class PhoenixClientFederationTests(unittest.TestCase):
             with self.assertRaises(phoenix_client.PhoenixError):
                 self.client.get_openapi(self.PEER)
 
+    def test_owner_facade_contract_rejects_wrapped_peers_null_notes_and_openapi_alias(self):
+        self.responses['/api/federation/peers'] = {'peers': [self.summary]}
+        with self.assertRaises(phoenix_client.PhoenixError):
+            self.client.list_peer_connections()
+        self.responses['/api/federation/peers'] = [self.summary]
+        for notes in ('', 'opaque note'):
+            self.responses[f'/api/federation/peers/{self.PEER}/notes'] = {'notes': notes}
+            self.assertEqual(self.client.get_peer_notes(self.PEER), {'notes': notes})
+            self.assertEqual(self.client.set_peer_notes(notes, self.PEER), {'notes': notes})
+        self.responses[f'/api/federation/peers/{self.PEER}/notes'] = {'notes': None}
+        with self.assertRaises(phoenix_client.PhoenixError):
+            self.client.get_peer_notes(self.PEER)
+        self.responses['/api/federation/openapi'] = {
+            'destination_instance_id': self.PEER, 'openapi': self.openapi(),
+        }
+        with self.assertRaises(phoenix_client.PhoenixError):
+            self.client.get_openapi(self.PEER)
+
     def test_malformed_discriminants_identities_and_unknown_secret_fields_fail_closed(self):
         cases = [
             ('query-database', self.query_result(), lambda: self.client.remote_query_database('SELECT 1', self.PEER)),

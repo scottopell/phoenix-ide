@@ -92,7 +92,7 @@ impl Database {
     ) -> DbResult<RemoteNotificationPresentations> {
         let mut presentations = HashMap::new();
         for ids in admission_ids.chunks(400) {
-            let mut query = QueryBuilder::<Sqlite>::new("SELECT a.*, s.product_id, f.event_id, f.source_transcript_id AS fact_transcript, f.outcome, f.occurred_at_us, g.source_transcript_id AS gap_transcript, g.current_outcome, n.stable_path, n.source_path FROM federation_remote_admissions a JOIN federation_remote_subscriptions s USING(destination_instance_id,subscription_id) LEFT JOIN federation_received_facts f USING(admission_id) LEFT JOIN federation_received_gaps g USING(admission_id) LEFT JOIN federation_remote_navigation n USING(admission_id) WHERE a.admission_id IN (");
+            let mut query = QueryBuilder::<Sqlite>::new("SELECT a.*, s.product_id, s.state AS subscription_state, f.event_id, f.source_transcript_id AS fact_transcript, f.outcome, f.occurred_at_us, g.source_transcript_id AS gap_transcript, g.current_outcome, n.stable_path, n.source_path FROM federation_remote_admissions a JOIN federation_remote_subscriptions s USING(destination_instance_id,subscription_id) LEFT JOIN federation_received_facts f USING(admission_id) LEFT JOIN federation_received_gaps g USING(admission_id) LEFT JOIN federation_remote_navigation n USING(admission_id) WHERE a.admission_id IN (");
             let mut separated = query.separated(", ");
             for id in ids {
                 separated.push_bind(id);

@@ -164,7 +164,7 @@ impl Database {
         after: SubscriptionCursor,
         pending_only: bool,
     ) -> DbResult<Vec<RemoteNotification>> {
-        let rows = sqlx::query("SELECT a.*, s.product_id, f.event_id, f.source_transcript_id AS fact_transcript, f.outcome, f.occurred_at_us, g.source_transcript_id AS gap_transcript, g.current_outcome FROM federation_remote_admissions a JOIN federation_remote_subscriptions s USING(destination_instance_id,subscription_id) LEFT JOIN federation_received_facts f ON f.admission_id = a.admission_id LEFT JOIN federation_received_gaps g ON g.admission_id = a.admission_id WHERE a.destination_instance_id = ?1 AND a.subscription_id = ?2 AND a.through_cursor > ?4 AND (?5 = 0 OR ((s.state = 'active' OR a.authorization_requested = 1) AND a.accepted_transcript_id IS NULL AND a.suppressed = 0)) ORDER BY a.after_cursor, a.through_cursor LIMIT ?3")
+        let rows = sqlx::query("SELECT a.*, s.product_id, s.state AS subscription_state, f.event_id, f.source_transcript_id AS fact_transcript, f.outcome, f.occurred_at_us, g.source_transcript_id AS gap_transcript, g.current_outcome FROM federation_remote_admissions a JOIN federation_remote_subscriptions s USING(destination_instance_id,subscription_id) LEFT JOIN federation_received_facts f ON f.admission_id = a.admission_id LEFT JOIN federation_received_gaps g ON g.admission_id = a.admission_id WHERE a.destination_instance_id = ?1 AND a.subscription_id = ?2 AND a.through_cursor > ?4 AND (?5 = 0 OR (s.state = 'active' AND a.accepted_transcript_id IS NULL AND a.suppressed = 0)) ORDER BY a.after_cursor, a.through_cursor LIMIT ?3")
             .bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(i64::try_from(REPLAY_BATCH).expect("replay batch fits in SQLite integer")).bind(after.get()).bind(pending_only).fetch_all(&self.pool).await?;
         rows.iter().map(decode_notification).collect()
     }
@@ -213,7 +213,11 @@ pub(super) fn decode_notification(row: &sqlx::sqlite::SqliteRow) -> DbResult<Rem
             transcript_id: TranscriptConversationId::parse(transcript)
                 .map_err(|error| invalid(&error.to_string()))?,
         },
-        None if row.try_get::<bool, _>("suppressed")? => RemoteNotificationDisposition::Suppressed,
+        None if row.try_get::<bool, _>("suppressed")?
+            || row.try_get::<&str, _>("subscription_state")? != "active" =>
+        {
+            RemoteNotificationDisposition::Suppressed
+        }
         None => match row.try_get::<Option<String>, _>("authorization_id")? {
             Some(id) => RemoteNotificationDisposition::Authorized {
                 authorization_id: uuid(&id)?,

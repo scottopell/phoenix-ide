@@ -5,6 +5,25 @@ use super::{
     Transaction, Uuid,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteAuthorizationOutcome {
+    Ready,
+    LocallyStopped,
+}
+
+async fn remote_is_active(
+    tx: &mut Transaction<'_, Sqlite>,
+    remote: &RemoteSubscription,
+) -> DbResult<bool> {
+    sqlx::query_scalar::<_, bool>("SELECT state = 'active' FROM federation_remote_subscriptions WHERE destination_instance_id = ?1 AND subscription_id = ?2 AND product_id = ?3")
+        .bind(remote.reference.instance_id.to_string())
+        .bind(remote.subscription_id.to_string())
+        .bind(remote.reference.product_conversation_id.as_str())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| invalid("unknown remote subscription"))
+}
+
 impl Database {
     /// Serialize a delivery authorization against source Close, revoke, and unsubscribe.
     /// Exact unacknowledged receipts remain replayable after the subscription ends.
@@ -107,13 +126,19 @@ impl Database {
         &self,
         remote: &RemoteSubscription,
         admission_id: &str,
-    ) -> DbResult<()> {
-        let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_requested = 1 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND accepted_transcript_id IS NULL AND suppressed = 0 AND (authorization_requested = 1 OR EXISTS(SELECT 1 FROM federation_remote_subscriptions s WHERE s.destination_instance_id = federation_remote_admissions.destination_instance_id AND s.subscription_id = federation_remote_admissions.subscription_id AND s.state = 'active'))")
-            .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).execute(&self.pool).await?.rows_affected();
+    ) -> DbResult<RemoteAuthorizationOutcome> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if !remote_is_active(&mut tx, remote).await? {
+            tx.commit().await?;
+            return Ok(RemoteAuthorizationOutcome::LocallyStopped);
+        }
+        let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_requested = 1 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND accepted_transcript_id IS NULL AND suppressed = 0 AND EXISTS(SELECT 1 FROM federation_remote_subscriptions s WHERE s.destination_instance_id = federation_remote_admissions.destination_instance_id AND s.subscription_id = federation_remote_admissions.subscription_id AND s.state = 'active')")
+            .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(invalid("staged delivery no longer authorizable"));
         }
-        Ok(())
+        tx.commit().await?;
+        Ok(RemoteAuthorizationOutcome::Ready)
     }
 
     /// Confirm a source receipt after its source-generated navigation is durable.
@@ -125,15 +150,22 @@ impl Database {
         remote: &RemoteSubscription,
         admission_id: &str,
         authorization_id: Uuid,
-    ) -> DbResult<()> {
+    ) -> DbResult<RemoteAuthorizationOutcome> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let active = remote_is_active(&mut tx, remote).await?;
         let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_id = ?4 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND authorization_requested = 1 AND suppressed = 0 AND (authorization_id IS NULL OR authorization_id = ?4)")
-            .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(authorization_id.to_string()).execute(&self.pool).await?.rows_affected();
+            .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(authorization_id.to_string()).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(invalid(
                 "authorization receipt does not match staged delivery",
             ));
         }
-        Ok(())
+        tx.commit().await?;
+        Ok(if active {
+            RemoteAuthorizationOutcome::Ready
+        } else {
+            RemoteAuthorizationOutcome::LocallyStopped
+        })
     }
 
     /// Suppress/reset an unconfirmed attempt without advancing the admitted cursor.

@@ -783,6 +783,18 @@ jobs:
         run: node --test scripts/roadmap-issue-reducer.test.mjs
       - name: ./dev.py check (task)
         run: ./dev.py check --lanes task
+      - name: Client contract unit tests (declared client dependencies)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          requirements="$RUNNER_TEMP/phoenix-client.requirements.txt"
+          uv --version
+          uv export --script phoenix-client.py --format requirements-txt --output-file "$requirements"
+          sha256sum phoenix-client.py "$requirements"
+          cat "$requirements"
+          uv run --no-project --with-requirements "$requirements" python -m unittest discover \
+            -s tests -p test_phoenix_client.py -v 2>&1 | tee "$RUNNER_TEMP/phoenix-client-tests.log"
+
 
   notify-main-failure:
     name: Open issue on main CI failure

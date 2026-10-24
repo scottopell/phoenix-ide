@@ -1263,6 +1263,7 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::NotFound(_) => "target_not_found",
         SendChatServiceError::AttachmentValidation(_) => "attachment_validation_failed",
         SendChatServiceError::Expansion { .. } => "message_expansion_failed",
+        SendChatServiceError::RemoteSubscriptionStopped => "remote_subscription_stopped",
         SendChatServiceError::Internal(_) => "internal_error",
         SendChatServiceError::Dispatch(_) => "dispatch_failed",
         SendChatServiceError::IdempotencyConflict => "idempotency_conflict",

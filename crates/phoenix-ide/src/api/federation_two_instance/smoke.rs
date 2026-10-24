@@ -527,3 +527,231 @@ async fn authenticated_https_resolve_returns_destination_provenance() {
     caller.stop().await;
     receiver.stop().await;
 }
+
+#[tokio::test]
+async fn owner_https_facades_preserve_current_client_envelopes_and_auth_separation() {
+    use phoenix_core::domain::instance_identity::OwnerPassword;
+    let caller = TestInstance::start_with_router(true, |mut state| {
+        state.password = Some(OwnerPassword::parse("local-owner-password".into()).unwrap());
+        super::create_router(state)
+    })
+    .await;
+    let receiver = TestInstance::start_with_router(true, |mut state| {
+        state.password = Some(OwnerPassword::parse("remote-owner-password".into()).unwrap());
+        super::create_router(state)
+    })
+    .await;
+    let peer = caller.connect_to(&receiver).await;
+    let destination = peer.peer_instance_id;
+    let caller_id = caller.state.db.instance_id().await.unwrap();
+    let conversation = receiver
+        .state
+        .db
+        .create_conversation(
+            "owner-facade-transcript",
+            "owner-facade",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    receiver
+        .state
+        .db
+        .add_message(
+            "owner-facade-message",
+            &conversation.id,
+            &MessageContent::user("uniquefacademarker"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    receiver.state.db.fts_retriever().reconcile().await.unwrap();
+    let target = ConversationReferenceTarget::Transcript {
+        transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+            conversation.id.clone(),
+        )
+        .unwrap(),
+    };
+    for (operation, request) in [
+        (
+            "query-database",
+            serde_json::json!({"instance": destination, "sql": "SELECT 1 AS n"}),
+        ),
+        (
+            "search-conversations",
+            serde_json::json!({"instance": destination, "query": "uniquefacademarker"}),
+        ),
+        (
+            "read-conversation",
+            serde_json::json!({"instance": destination, "target": target, "cursor": 0}),
+        ),
+        (
+            "resolve-reference",
+            serde_json::json!({"instance": destination, "reference": format!("@transcript:{}", conversation.id)}),
+        ),
+        (
+            "send-conversation-message",
+            serde_json::json!({"instance": destination, "target": target, "message": "literal owner API message", "message_id": uuid::Uuid::new_v4()}),
+        ),
+        ("openapi", serde_json::json!({"instance": destination})),
+    ] {
+        let endpoint = caller.endpoint(&format!("/api/federation/{operation}"));
+        let rejected = caller
+            .client
+            .post(&endpoint)
+            .bearer_auth(peer.bearer_credential.expose())
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let response = caller
+            .client
+            .post(&endpoint)
+            .bearer_auth("local-owner-password")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{operation}: {}",
+            response.status()
+        );
+        let response: serde_json::Value = response.json().await.unwrap();
+        assert!(!response
+            .to_string()
+            .contains(peer.bearer_credential.expose()));
+        match operation {
+            "query-database" => {
+                assert_eq!(response["destination_instance_id"], destination.to_string());
+                assert_eq!(response["caller_instance_id"], caller_id.to_string());
+                for key in [
+                    "columns",
+                    "rows",
+                    "truncated",
+                    "row_limit",
+                    "byte_limit",
+                    "elapsed_ms",
+                ] {
+                    assert!(response["result"].get(key).is_some(), "{key}");
+                }
+            }
+            "search-conversations" => {
+                assert_eq!(response["destination_instance_id"], destination.to_string());
+                let hits = response["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 1);
+                for key in [
+                    "source",
+                    "source_navigation",
+                    "stable_conversation",
+                    "stable_navigation",
+                    "role",
+                    "sender",
+                    "created_at",
+                    "snippet",
+                ] {
+                    assert!(hits[0].get(key).is_some(), "{key}");
+                }
+                assert_eq!(hits[0]["source"]["instance_id"], destination.to_string());
+            }
+            "read-conversation" => {
+                assert_eq!(
+                    response["requested"]["instance_id"],
+                    destination.to_string()
+                );
+                assert_eq!(response["resolved"]["target"], request["target"]);
+                for key in [
+                    "stable_conversation",
+                    "evidence",
+                    "content",
+                    "next_cursor",
+                    "source_navigation",
+                    "stable_navigation",
+                ] {
+                    assert!(response.get(key).is_some(), "{key}");
+                }
+                assert!(response.get("read").is_none());
+            }
+            "resolve-reference" => {
+                for key in [
+                    "reference",
+                    "href",
+                    "title",
+                    "work_scope",
+                    "path_owner_instance_id",
+                    "related_references",
+                    "summary",
+                ] {
+                    assert!(response.get(key).is_some(), "{key}");
+                }
+            }
+            "send-conversation-message" => {
+                assert_eq!(response["destination_instance_id"], destination.to_string());
+                assert_eq!(response["caller_instance_id"], caller_id.to_string());
+                assert_eq!(response["target"], request["target"]);
+                assert_eq!(response["message_id"], request["message_id"]);
+                assert!(response.get("receipt").is_some());
+            }
+            "openapi" => {
+                assert_eq!(response["destination_instance_id"], destination.to_string());
+                assert_eq!(
+                    response["document"]["x-phoenix-instance-id"],
+                    destination.to_string()
+                );
+                assert_eq!(response["document"]["openapi"], "3.1.0");
+                assert!(response.get("openapi").is_none());
+                assert!(!response["document"]["paths"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty());
+            }
+            _ => unreachable!(),
+        }
+    }
+    let rejected = receiver
+        .client
+        .post(receiver.endpoint("/api/federation/peer/query-database"))
+        .bearer_auth("remote-owner-password")
+        .json(&serde_json::json!({"destination_instance_id": destination, "sql": "SELECT 1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+    caller.stop().await;
+    receiver.stop().await;
+}
+
+#[tokio::test]
+async fn owner_openapi_https_rejects_oversized_wrong_identity_malformed_and_redirect_documents() {
+    for bad in ["oversized", "identity", "malformed", "redirect"] {
+        let caller = TestInstance::start().await;
+        let receiver = TestInstance::start_with_router(false, move |state| {
+            axum::Router::new().route("/openapi.json", axum::routing::get(move || async move {
+                use axum::response::IntoResponse;
+                match bad {
+                    "oversized" => (axum::http::StatusCode::OK, "x".repeat(65537)).into_response(),
+                    "identity" => axum::Json(serde_json::json!({"openapi": "3.1.0", "x-phoenix-instance-id": InstanceId::new(), "info": {"title": "reference", "version": "1", "description": "reference"}, "paths": {"/openapi.json": {}}, "components": {"schemas": {}, "securitySchemes": {}}})).into_response(),
+                    "malformed" => axum::Json(serde_json::json!({"x-phoenix-instance-id": state.db.instance_id().await.unwrap()})).into_response(),
+                    "redirect" => (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, "https://external.invalid/openapi.json")]).into_response(),
+                    _ => unreachable!(),
+                }
+            }))
+        }).await;
+        let peer = caller.connect_to(&receiver).await;
+        let response = caller
+            .client
+            .post(caller.endpoint("/api/federation/openapi"))
+            .json(&serde_json::json!({"instance": peer.peer_instance_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY, "{bad}");
+        caller.stop().await;
+        receiver.stop().await;
+    }
+}

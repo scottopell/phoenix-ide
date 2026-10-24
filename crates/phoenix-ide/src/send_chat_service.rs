@@ -76,6 +76,8 @@ pub(crate) enum SendChatServiceError {
         error_type: &'static str,
         reference: String,
     },
+    #[error("remote subscription locally stopped")]
+    RemoteSubscriptionStopped,
     #[error("internal error: {0}")]
     Internal(String),
     #[error("dispatch failed: {0}")]
@@ -1171,6 +1173,13 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
 }
 
 fn map_db_internal_error(error: &crate::db::DbError) -> SendChatServiceError {
+    if let crate::db::DbError::Sqlx(sqlx::Error::Database(database)) = error {
+        if database.code().as_deref() == Some("1811")
+            && database.message() == "federation subscription locally stopped"
+        {
+            return SendChatServiceError::RemoteSubscriptionStopped;
+        }
+    }
     SendChatServiceError::Internal(error.to_string())
 }
 
@@ -1457,10 +1466,10 @@ mod tests {
         accepts_user_message_direct_or_steering, active_turn_fences_direct_acceptance,
         close_admission_fenced_outcome, expand_message, generated_predecessor_context_projection,
         lookup_durable_replay, lookup_durable_steering_replay, map_conversation_load_error,
-        map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
-        persisted_skill_matches, queued_retry_matches, should_enqueue_steering,
-        submitted_identity_from_request, DurableReplayOutcome, MessageExpansionPolicy,
-        SendChatOutcome, SendChatRequest, SendChatServiceError,
+        map_db_internal_error, map_direct_turn_accept_error,
+        pending_queue_fences_direct_acceptance, persisted_skill_matches, queued_retry_matches,
+        should_enqueue_steering, submitted_identity_from_request, DurableReplayOutcome,
+        MessageExpansionPolicy, SendChatOutcome, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use crate::db::SteeringAcceptanceFingerprint;
@@ -1489,6 +1498,35 @@ mod tests {
             user_agent: None,
             expansion_policy: MessageExpansionPolicy::ExpandReferences,
         }
+    }
+
+    #[tokio::test]
+    async fn only_owned_sqlite_trigger_stop_is_typed_as_remote_subscription_stopped() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        sqlx::raw_sql("CREATE TABLE stop_classifier_probe (value TEXT); CREATE TRIGGER stop_classifier_probe BEFORE INSERT ON stop_classifier_probe BEGIN SELECT RAISE(ABORT, 'federation subscription locally stopped'); END;")
+            .execute(db.pool()).await.unwrap();
+        let error = sqlx::query("INSERT INTO stop_classifier_probe VALUES ('probe')")
+            .execute(db.pool())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            map_db_internal_error(&crate::db::DbError::Sqlx(error)),
+            SendChatServiceError::RemoteSubscriptionStopped
+        ));
+        assert!(matches!(
+            map_db_internal_error(&crate::db::DbError::Serialization(
+                "federation subscription locally stopped".into()
+            )),
+            SendChatServiceError::Internal(_)
+        ));
+        let unrelated = sqlx::query("INSERT INTO missing_classifier_table VALUES (1)")
+            .execute(db.pool())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            map_db_internal_error(&crate::db::DbError::Sqlx(unrelated)),
+            SendChatServiceError::Internal(_)
+        ));
     }
 
     #[test]

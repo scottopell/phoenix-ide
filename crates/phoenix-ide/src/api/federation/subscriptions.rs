@@ -611,9 +611,14 @@ async fn drain_notifications(
             notification.disposition,
             RemoteNotificationDisposition::Authorized { .. }
         ) {
-            db.request_remote_notification_authorization(remote, &notification.admission_id)
+            if db
+                .request_remote_notification_authorization(remote, &notification.admission_id)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+                == phoenix_db::federation_subscriptions::RemoteAuthorizationOutcome::LocallyStopped
+            {
+                continue;
+            }
             let peer = peer
                 .ok_or_else(|| "saved peer unavailable for delivery authorization".to_string())?;
             let response = request_peer(
@@ -668,13 +673,17 @@ async fn drain_notifications(
                     )
                     .await
                     .map_err(|error| error.to_string())?;
-                    db.confirm_remote_authorization(
+                    if db.confirm_remote_authorization(
                         remote,
                         &notification.admission_id,
                         authorization_id,
                     )
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error.to_string())?
+                        == phoenix_db::federation_subscriptions::RemoteAuthorizationOutcome::LocallyStopped
+                    {
+                        continue;
+                    }
                 }
                 SubscriptionAuthorization::Refresh => {
                     db.suppress_remote_notification(remote, &notification.admission_id)
@@ -699,7 +708,7 @@ async fn drain_notifications(
             delivery: &notification.content,
         };
         let text = format!("Federated conversation subscription notification (terminal execution facts or an explicit retention gap; not task completion). {}", serde_json::to_string(&literal).map_err(|error| error.to_string())?);
-        let outcome = service
+        let outcome = match service
             .send(crate::send_chat_service::SendChatRequest {
                 conversation_id: target.clone(),
                 origin: phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent {
@@ -713,7 +722,13 @@ async fn drain_notifications(
                 expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
             })
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(outcome) => outcome,
+            Err(crate::send_chat_service::SendChatServiceError::RemoteSubscriptionStopped) => {
+                continue
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         match outcome {
             crate::send_chat_service::SendChatOutcome::Delivered
             | crate::send_chat_service::SendChatOutcome::AlreadyPersisted

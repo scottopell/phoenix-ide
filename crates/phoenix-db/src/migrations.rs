@@ -705,6 +705,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "goal_start_materialization_witness",
         sql: include_str!("conversation_goals/start_materialization_candidate.sql"),
     },
+    Migration {
+        version: 138,
+        name: "federation_local_stop_acceptance",
+        sql: include_str!("federation_subscriptions/local_stop_acceptance.sql"),
+    },
 ];
 
 const MIGRATION_136: &str = concat!(
@@ -14961,6 +14966,135 @@ with tempfile.TemporaryDirectory() as directory:
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn migration_138_preserves_137_receipts_history_cursors_and_pending_unsubscribe() {
+        use phoenix_core::domain::{
+            close::TranscriptConversationId,
+            federation_subscription::{
+                FederatedTerminalFact, SubscriptionCursor, SubscriptionReference,
+                SubscriptionReplay, TerminalFactOutcome,
+            },
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("subscription-upgrade.sqlite");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let through_137 = MIGRATIONS.partition_point(|migration| migration.version <= 137);
+        run_migration_list(db.pool(), &MIGRATIONS[..through_137])
+            .await
+            .unwrap();
+        let target = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let reference = SubscriptionReference {
+            instance_id: InstanceId::new(),
+            product_conversation_id: ProductConversationId::parse("upgrade-product").unwrap(),
+        };
+        let subscription = uuid::Uuid::new_v4();
+        db.save_remote_subscription(&reference, subscription)
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for sequence in 1..=2 {
+            let remote = db
+                .remote_subscription_for_product(&reference)
+                .await
+                .unwrap()
+                .unwrap();
+            let replay = SubscriptionReplay::Facts {
+                events: vec![FederatedTerminalFact {
+                    event_id: uuid::Uuid::new_v4(),
+                    sequence: SubscriptionCursor::try_from(sequence).unwrap(),
+                    source_transcript_id: TranscriptConversationId::parse("upgrade-source")
+                        .unwrap(),
+                    outcome: TerminalFactOutcome::Completed,
+                    occurred_at_us: sequence,
+                }],
+            };
+            db.stage_remote_replay(&remote, &replay).await.unwrap();
+            let note = db
+                .pending_remote_notifications(&remote)
+                .await
+                .unwrap()
+                .remove(0);
+            db.request_remote_notification_authorization(&remote, &note.admission_id)
+                .await
+                .unwrap();
+            db.save_remote_notification_navigation(
+                &remote,
+                &note.admission_id,
+                "/c/upgrade-product",
+                "/c/upgrade-source?source_transcript=upgrade-source",
+            )
+            .await
+            .unwrap();
+            db.confirm_remote_authorization(&remote, &note.admission_id, uuid::Uuid::new_v4())
+                .await
+                .unwrap();
+            if sequence == 1 {
+                sqlx::query("INSERT INTO steering_messages(message_id,conversation_id,ordinal,text,origin_kind,origin_subscription_event_id) VALUES (?1,?2,0,'accepted fact','subscription_event',?1)")
+                    .bind(&note.admission_id).bind(&target.id).execute(db.pool()).await.unwrap();
+            }
+            ids.push(note.admission_id);
+        }
+        db.begin_remote_unsubscribe(&reference, subscription)
+            .await
+            .unwrap();
+        let before: Vec<(String, Option<String>, bool, Option<String>, bool)> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
+        db.pool().close().await;
+        drop(db);
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        let after: Vec<(String, Option<String>, bool, Option<String>, bool)> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+        let saved = db
+            .remote_subscription_by_id(reference.instance_id, subscription)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.admitted_cursor.get(), 1);
+        assert!(saved.pending_unsubscribe);
+        let history = db
+            .remote_notification_history(&saved, SubscriptionCursor::START)
+            .await
+            .unwrap();
+        let presentations = db.remote_notification_presentations(&ids).await.unwrap();
+        use crate::federation_subscriptions::RemoteNotificationDisposition;
+        assert!(matches!(
+            history[0].disposition,
+            RemoteNotificationDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            history[1].disposition,
+            RemoteNotificationDisposition::Suppressed
+        ));
+        assert!(matches!(
+            presentations[&ids[0]].0.disposition,
+            RemoteNotificationDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            presentations[&ids[1]].0.disposition,
+            RemoteNotificationDisposition::Suppressed
+        ));
+        assert!(presentations
+            .values()
+            .all(|(_, navigation)| navigation.is_some()));
+        let error = sqlx::query("INSERT INTO steering_messages(message_id,conversation_id,ordinal,text,origin_kind,origin_subscription_event_id) VALUES (?1,?2,1,'late fact','subscription_event',?1)")
+            .bind(&ids[1]).bind(&target.id).execute(db.pool()).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("federation subscription locally stopped"));
+        let accepted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1")
+                .bind(&target.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(accepted, 1);
     }
 
     #[tokio::test]

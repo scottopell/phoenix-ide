@@ -566,6 +566,44 @@ pub fn create_router(state: AppState) -> Router {
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
+        .route("/api/federation/peers", get(super::federation::owner_peers))
+        .route(
+            "/api/federation/peers/:instance/notes",
+            get(super::federation::owner_get_notes)
+                .put(super::federation::owner_put_notes)
+                .layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/federation/query-database",
+            post(super::federation::owner_query)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/search-conversations",
+            post(super::federation::owner_search)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/read-conversation",
+            post(super::federation::owner_read)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/resolve-reference",
+            post(super::federation::owner_resolve)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/send-conversation-message",
+            post(super::federation::owner_send).layer(DefaultBodyLimit::max(
+                super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/openapi",
+            post(super::federation::owner_openapi)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
         .route(
             "/api/federation/subscriptions/notifications",
             get(super::federation::subscriptions::owner_notifications),
@@ -737,6 +775,7 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             super::auth::auth_middleware,
         ))
+        .route("/openapi.json", get(super::federation::federation_openapi))
         // HTTP access log + Datadog tracing: applied via `route_layer` so it
         // runs AFTER routing, making axum's `MatchedPath` (the route template,
         // e.g. `/api/conversations/:id/stream`) available in `make_span_with`.
@@ -5368,6 +5407,12 @@ async fn send_chat(
                 AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "message_id was already used for a different target or payload".to_string(),
                     "idempotency_conflict",
+                )))
+            }
+            crate::send_chat_service::SendChatServiceError::RemoteSubscriptionStopped => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Remote subscription locally stopped".to_string(),
+                    "remote_subscription_stopped",
                 )))
             }
             crate::send_chat_service::SendChatServiceError::Internal(message) => {

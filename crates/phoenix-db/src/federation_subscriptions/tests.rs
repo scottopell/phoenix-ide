@@ -548,6 +548,43 @@ async fn fixture_authorize(db: &Database, remote: &RemoteSubscription, id: &str)
         .await
         .unwrap();
 }
+async fn accept_notification_turn(db: &Database, target: &str, id: &str) -> DbResult<()> {
+    let payload = PreparedDirectTurnPayload::from_parts(
+        SubmittedDirectTurnIdentity {
+            message_id: id.into(),
+            origin: InputOrigin::SubscriptionEvent {
+                event_id: id.into(),
+            },
+            text: "fact".into(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+        },
+        PreparedDirectTurnDelivery {
+            text: "fact".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+        },
+    );
+    db.workflow_repository()
+        .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+            client_key: ClientTurnKey::new(id).unwrap(),
+            prepared: PreparedTurn::from_exact_payload(
+                &ConversationAuthority(target.into()),
+                payload.to_exact_bytes().unwrap(),
+            ),
+            disposition: AcceptedDisposition::Runtime,
+            accepted_at: Timestamp(1),
+        })
+        .await
+        .map(|_| ())
+}
+
 async fn steer(db: &Database, target: &str, id: &str) -> DbResult<()> {
     sqlx::query("INSERT INTO steering_messages(message_id,conversation_id,ordinal,text,origin_kind,origin_subscription_event_id) SELECT ?1,?2,COALESCE(MAX(ordinal),-1)+1,'typed remote fact','subscription_event',?1 FROM steering_messages WHERE conversation_id = ?2").bind(id).bind(target).execute(db.pool()).await?;
     Ok(())
@@ -638,38 +675,7 @@ async fn ordinary_durable_turn_admission_advances_cursor_in_accept_transaction()
         .unwrap()
         .remove(0);
     fixture_authorize(&db, &remote, &pending.admission_id).await;
-    let payload = PreparedDirectTurnPayload::from_parts(
-        SubmittedDirectTurnIdentity {
-            message_id: pending.admission_id.clone(),
-            origin: InputOrigin::SubscriptionEvent {
-                event_id: pending.admission_id.clone(),
-            },
-            text: "fact".into(),
-            images: vec![],
-            files: vec![],
-            user_agent: None,
-            skill_invocation: None,
-            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
-        },
-        PreparedDirectTurnDelivery {
-            text: "fact".into(),
-            llm_text: None,
-            images: vec![],
-            files: vec![],
-            user_agent: None,
-            skill_invocation: None,
-        },
-    );
-    db.workflow_repository()
-        .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-            client_key: ClientTurnKey::new(&pending.admission_id).unwrap(),
-            prepared: PreparedTurn::from_exact_payload(
-                &ConversationAuthority(target),
-                payload.to_exact_bytes().unwrap(),
-            ),
-            disposition: AcceptedDisposition::Runtime,
-            accepted_at: Timestamp(1),
-        })
+    accept_notification_turn(&db, &target, &pending.admission_id)
         .await
         .unwrap();
     assert_eq!(
@@ -1816,18 +1822,22 @@ async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply(
     .await
     .unwrap();
     assert_eq!(authorize_source(&f, &note.content).await, authorized);
-    assert!(matches!(
-        db.pending_remote_notifications(&remote).await.unwrap()[0].disposition,
-        RemoteNotificationDisposition::Authorizing
-    ));
+    assert!(db
+        .pending_remote_notifications(&remote)
+        .await
+        .unwrap()
+        .is_empty());
     let SubscriptionAuthorization::Authorized { authorization_id } = authorized else {
         panic!("source authorized")
     };
     fixture_navigation(&db, &remote, &note.admission_id).await;
-    db.confirm_remote_authorization(&remote, &note.admission_id, authorization_id)
-        .await
-        .unwrap();
-    steer(&db, &target, &note.admission_id).await.unwrap();
+    assert_eq!(
+        db.confirm_remote_authorization(&remote, &note.admission_id, authorization_id)
+            .await
+            .unwrap(),
+        RemoteAuthorizationOutcome::LocallyStopped
+    );
+    assert!(steer(&db, &target, &note.admission_id).await.is_err());
     db.complete_remote_unsubscribe(&remote.reference, remote.subscription_id)
         .await
         .unwrap();
@@ -1841,8 +1851,11 @@ async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply(
             .await
             .unwrap()[0]
             .disposition,
-        RemoteNotificationDisposition::Accepted { .. }
+        RemoteNotificationDisposition::Suppressed
     ));
+    let stored: (Option<String>, bool) = sqlx::query_as("SELECT authorization_id, authorization_requested FROM federation_remote_admissions WHERE admission_id = ?1")
+        .bind(&note.admission_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(stored, (Some(authorization_id.to_string()), true));
 }
 
 #[tokio::test]
@@ -2365,4 +2378,153 @@ async fn real_creation_wait_token_and_cancelled_cleanup_paths_never_add_terminal
         facts(cancelled.replay(0, now.timestamp_micros()).await).len(),
         1
     );
+}
+
+#[tokio::test]
+async fn local_stop_fences_both_acceptance_paths_and_preserves_both_history_decoders() {
+    for steering in [false, true] {
+        for stop_point in 0..4 {
+            let db = Database::open_in_memory().await.unwrap();
+            crate::run_pending_migrations(db.pool()).await.unwrap();
+            let target = coordinator(&db).await;
+            let remote = remote_fixture(&db).await;
+            db.stage_remote_replay(&remote, &single_fact())
+                .await
+                .unwrap();
+            let note = db
+                .pending_remote_notifications(&remote)
+                .await
+                .unwrap()
+                .remove(0);
+            let id = &note.admission_id;
+            let authorization = Uuid::new_v4();
+            if stop_point == 0 {
+                db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                db.request_remote_notification_authorization(&remote, id)
+                    .await
+                    .unwrap(),
+                if stop_point == 0 {
+                    RemoteAuthorizationOutcome::LocallyStopped
+                } else {
+                    RemoteAuthorizationOutcome::Ready
+                }
+            );
+            if stop_point == 1 {
+                db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+                    .await
+                    .unwrap();
+            }
+            if stop_point > 0 {
+                fixture_navigation(&db, &remote, id).await;
+                assert_eq!(
+                    db.confirm_remote_authorization(&remote, id, authorization)
+                        .await
+                        .unwrap(),
+                    if stop_point == 1 {
+                        RemoteAuthorizationOutcome::LocallyStopped
+                    } else {
+                        RemoteAuthorizationOutcome::Ready
+                    }
+                );
+            }
+            if stop_point == 2 {
+                db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+                    .await
+                    .unwrap();
+            }
+            let result = if steering {
+                steer(&db, &target, id).await
+            } else {
+                accept_notification_turn(&db, &target, id).await
+            };
+            if stop_point == 3 {
+                result.unwrap();
+                db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+                    .await
+                    .unwrap();
+            } else {
+                let error = result.unwrap_err();
+                let DbError::Sqlx(sqlx::Error::Database(error)) = error else {
+                    panic!("owned SQLite trigger error expected")
+                };
+                assert_eq!(error.code().as_deref(), Some("1811"));
+                assert_eq!(error.message(), "federation subscription locally stopped");
+            }
+            assert!(db
+                .pending_remote_notifications(&remote)
+                .await
+                .unwrap()
+                .is_empty());
+            let history = db
+                .remote_notification_history(&remote, SubscriptionCursor::START)
+                .await
+                .unwrap();
+            let presentations = db
+                .remote_notification_presentations(std::slice::from_ref(id))
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(presentations.len(), 1);
+            for stored in [&history[0], &presentations[id].0] {
+                assert_eq!(stored.admission_id, *id);
+                assert_eq!(
+                    matches!(
+                        stored.disposition,
+                        RemoteNotificationDisposition::Accepted { .. }
+                    ),
+                    stop_point == 3
+                );
+                assert_eq!(
+                    matches!(
+                        stored.disposition,
+                        RemoteNotificationDisposition::Suppressed
+                    ),
+                    stop_point != 3
+                );
+            }
+            let metadata: (Option<String>, bool, bool) = sqlx::query_as("SELECT authorization_id, authorization_requested, suppressed FROM federation_remote_admissions WHERE admission_id = ?1")
+                .bind(id).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                metadata,
+                (
+                    if stop_point == 0 {
+                        None
+                    } else {
+                        Some(authorization.to_string())
+                    },
+                    stop_point != 0,
+                    stop_point == 0
+                )
+            );
+            if stop_point > 0 {
+                assert!(presentations[id].1.is_some());
+            }
+            let saved = db
+                .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(saved.pending_unsubscribe);
+            assert_eq!(saved.admitted_cursor.get(), i64::from(stop_point == 3));
+            let turns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id = ?1",
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            let steers: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM steering_messages WHERE origin_subscription_event_id = ?1",
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(turns + steers, i64::from(stop_point == 3));
+        }
+    }
 }
