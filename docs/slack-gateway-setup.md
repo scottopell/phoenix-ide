@@ -48,6 +48,9 @@ allowance all affect latency. No fixed response deadline is promised. Reaction
 occurrence timestamps are unavailable, and reactions on out-of-window messages
 are not discoverable. External shared-channel sending depends on transport
 support; an unavailable destination is surfaced rather than silently replaced.
+Replies retry a rate limit only when structured evidence identifies rejection
+of `chat.postMessage`. An opaque error or failed later permalink lookup stays
+uncertain, since the post may already exist.
 
 ## Notification protocol
 

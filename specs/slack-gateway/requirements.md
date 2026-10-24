@@ -138,7 +138,7 @@ THE SYSTEM SHALL instruct the agent to return the invocation's automatic answer 
 
 THE SYSTEM SHALL retain each output's exact native source and Slack destination, distinguish queued, confirmed, failed, and uncertain delivery, and preserve output obligations across same-version restart. A known-unsent operation MAY be retried within a bounded retry policy. An operation whose external outcome is unknown SHALL be reconciled or exposed as uncertain rather than blindly resent or declared delivered. An unavailable destination SHALL NOT be replaced by a different public channel.
 
-An explicit structured send rejection proving rate-limit refusal MAY establish known-unsent status and SHALL retain its retry delay. A transport-level rate error, opaque tool error, or failure after a possible accepted post SHALL NOT establish that proof.
+An explicit structured send rejection proving rate-limit refusal MAY establish known-unsent status and SHALL retain its retry delay. The evidence SHALL identify rejection of the message-post operation itself. A transport-level rate error, opaque tool error, unqualified operation failure, or failure after a possible accepted post SHALL NOT establish that proof.
 
 **Rationale:** The owner needs intentional replies and truthful delivery state, not accidental transcript publication or duplicate posts after a lost network response.
 

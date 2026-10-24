@@ -527,10 +527,9 @@ pub(super) fn rate_rejection_proves_unsent(error: &McpOneShotError) -> bool {
             value.get("error").and_then(Value::as_str),
             Some("ratelimited" | "rate_limited")
         )
-        && value
-            .get("method")
-            .and_then(Value::as_str)
-            .is_none_or(|method| method == "chat.postMessage")
+        // A tool can perform a post followed by a permalink lookup. A generic
+        // rate error does not prove which operation was rejected.
+        && value.get("method").and_then(Value::as_str) == Some("chat.postMessage")
         && ["message_link", "message_context", "ts", "message_ts"]
             .iter()
             .all(|key| value.get(key).is_none_or(Value::is_null))
@@ -1070,12 +1069,15 @@ mod tests {
     #[test]
     fn only_explicit_rate_rejection_proves_a_send_was_not_accepted() {
         for code in ["ratelimited", "rate_limited"] {
-            let error =
-                decode_result(&json!({"ok":false,"error":code,"retry_after":120}).to_string())
-                    .unwrap_err();
+            let error = decode_result(
+                &json!({"ok":false,"error":code,"method":"chat.postMessage","retry_after":120})
+                    .to_string(),
+            )
+            .unwrap_err();
             assert!(rate_rejection_proves_unsent(&error));
         }
         for value in [
+            json!({"ok":false,"error":"ratelimited"}),
             json!({"ok":false,"error":"ratelimited","method":"chat.getPermalink"}),
             json!({"ok":false,"error":"ratelimited","ts":"123.456"}),
             json!({"error":"ratelimited"}),
@@ -1090,8 +1092,7 @@ mod tests {
         ] {
             assert!(!rate_rejection_proves_unsent(&error));
         }
-        let envelope =
-            json!({"isError":true,"content":[{"text":"{\"ok\":false,\"error\":\"ratelimited\"}"}]});
+        let envelope = json!({"isError":true,"content":[{"text":"{\"ok\":false,\"error\":\"ratelimited\",\"method\":\"chat.postMessage\"}"}]});
         assert!(rate_rejection_proves_unsent(
             &decode_result(&envelope.to_string()).unwrap_err()
         ));

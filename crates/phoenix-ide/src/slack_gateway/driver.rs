@@ -1009,7 +1009,9 @@ mod tests {
         assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
         slack.fixture = Some(Arc::new(|tool, _| {
             assert_eq!(tool, "slack_send_message");
-            Ok(serde_json::json!({"ok":false,"error":"ratelimited","retry_after":120}))
+            Ok(
+                serde_json::json!({"ok":false,"error":"ratelimited","method":"chat.postMessage","retry_after":120}),
+            )
         }));
         dispatch_returns(&state, &c, &slack, true).await.unwrap();
         assert_eq!(
