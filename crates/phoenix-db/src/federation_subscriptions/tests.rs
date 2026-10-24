@@ -1388,7 +1388,7 @@ async fn pre_enrollment_production_terminal_is_not_a_future_fact() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_uncommitted_bytes() {
+async fn real_history_close_preserves_accepted_but_suppresses_authorized_and_uncommitted_bytes() {
     let f = Fixture::new().await;
     for n in 0..3 {
         f.emit(
@@ -1449,13 +1449,44 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
     let SubscriptionAuthorization::Authorized { authorization_id } =
         authorize_source(&f, &pending[1].content).await
     else {
-        panic!("committed obligation must survive Close")
+        panic!("retained source receipt is not caller acceptance")
     };
     fixture_navigation(&a, &remote, &pending[1].admission_id).await;
-    a.confirm_remote_authorization(&remote, &pending[1].admission_id, authorization_id)
+    assert_eq!(
+        a.confirm_remote_authorization(&remote, &pending[1].admission_id, authorization_id)
+            .await
+            .unwrap(),
+        RemoteAuthorizationOutcome::LocallyStopped
+    );
+    for result in [
+        steer(&a, &target, &pending[1].admission_id).await,
+        accept_notification_turn(&a, &target, &pending[1].admission_id).await,
+    ] {
+        let DbError::Sqlx(sqlx::Error::Database(error)) = result.unwrap_err() else {
+            panic!("owned SQLite trigger error expected")
+        };
+        assert_eq!(error.code().as_deref(), Some("1811"));
+        assert_eq!(error.message(), "federation subscription locally stopped");
+    }
+    let receipt: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT authorization_id, accepted_transcript_id FROM federation_remote_admissions WHERE admission_id = ?1",
+    ).bind(&pending[1].admission_id).fetch_one(a.pool()).await.unwrap();
+    assert_eq!(receipt, (Some(authorization_id.to_string()), None));
+    let inserted: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id = ?1) + (SELECT COUNT(*) FROM steering_messages WHERE origin_subscription_event_id = ?1)",
+    ).bind(&pending[1].admission_id).fetch_one(a.pool()).await.unwrap();
+    assert_eq!(inserted, 0);
+    assert!(a
+        .pending_remote_notifications(&remote)
         .await
-        .unwrap();
-    steer(&a, &target, &pending[1].admission_id).await.unwrap();
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        a.request_remote_notification_authorization(&remote, &pending[2].admission_id)
+            .await
+            .unwrap(),
+        RemoteAuthorizationOutcome::LocallyStopped
+    );
     assert_eq!(
         authorize_source(&f, &pending[2].content).await,
         SubscriptionAuthorization::Rejected {
@@ -1477,8 +1508,16 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
                 RemoteNotificationDisposition::Accepted { .. }
             ))
             .count(),
-        2
+        1
     );
+    assert!(matches!(
+        &history[0].disposition,
+        RemoteNotificationDisposition::Accepted { transcript_id } if transcript_id.as_str() == target
+    ));
+    assert!(matches!(
+        history[1].disposition,
+        RemoteNotificationDisposition::Suppressed
+    ));
     assert!(matches!(
         history[2].disposition,
         RemoteNotificationDisposition::Suppressed
@@ -1490,10 +1529,10 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
             .unwrap()
             .admitted_cursor
             .get(),
-        2
+        1
     );
     assert!(matches!(
-        f.replay(2, NOW + 3).await,
+        f.replay(1, NOW + 3).await,
         SubscriptionReplay::Ended { .. }
     ));
     for table in [
@@ -1507,7 +1546,7 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
             .fetch_one(f.db.pool())
             .await
             .unwrap(),
-            0
+            1
         );
     }
     assert_eq!(
