@@ -59,11 +59,14 @@ The public candidate adds migration 130 after upstream's migration 129, replaces
 the personal notifier with a provider-neutral command, and adds bounded
 newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
 Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
-checks have passed. The broad native run passed 5,319 tests and failed 14;
-historical migration fixtures and host-sensitive shell/browser cases are being
-rechecked separately. The developer-tool test run also found historical
-qualification fixtures tied to the ambient registry and a shared-build-directory
-environment leak; these require clean-environment verification.
+checks have passed. The broad native run passed 5,319 tests and failed 14.
+All nine historical migration failures passed after isolating their fixtures;
+three shell runtime checks passed with the required native launcher fixture,
+and the browser lifecycle check passed with a fresh temporary profile. The local
+terminal-exit timeout remains a host qualification limit. The merged source's
+24 gateway tests, Clippy, formatting and structural/timing checks pass.
+Historical developer-tool registry fixtures have focused regression coverage;
+the clean-environment full local run timed out, so hosted CI remains a gate.
 
 The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
 passed online-backup and stopped-snapshot rehearsals from the installed complete
@@ -87,9 +90,10 @@ is paused. Private operational evidence is retained outside the repository.
 The native client recognizes Slack origins and source links, with version-2
 transcript caches and a bounded version-1 migration. Local wire-model type
 checking/round-trip execution and Swift parsing passed. Full native-client
-build/test execution requires CI because this host lacks the iOS platform SDK
-and simulator runtime. Client-only follow-up changes do not alter the pinned
-server candidate's source.
+build/test execution passed in hosted simulator CI. This host lacks the iOS
+platform SDK and simulator runtime. The pinned local server predates the
+publication branch's upstream integration; hosted checks qualify that integration
+separately from the bounded operator pilot.
 
 ## Activation checklist
 
@@ -111,8 +115,8 @@ server candidate's source.
 Live automatic continuation and longer soak coverage remain unqualified until
 exercised. They are follow-up confidence work rather than an invented unlimited
 SLO for a bounded personal pilot. External shared-channel send limitations remain.
-Public PR review and native-client CI remain publication gates. The separately
-approved bounded local acceptance sequence is complete.
+Public PR review and remaining full-suite CI are in progress. The separately
+approved bounded local acceptance sequence and native-client simulator CI passed.
 
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

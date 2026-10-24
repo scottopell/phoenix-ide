@@ -836,7 +836,7 @@ mod tests {
         let home = root.path().canonicalize().unwrap();
         // Home itself is a Git checkout: trusted Direct intent must not create
         // a worktree or attach a repository (REQ-SG-008).
-        std::process::Command::new("git")
+        phoenix_core::git::command()
             .args(["init", "-q"])
             .arg(&home)
             .status()
@@ -924,7 +924,7 @@ mod tests {
                         );
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    tokio::task::yield_now().await;
                 }
             })
             .await;

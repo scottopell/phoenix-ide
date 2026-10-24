@@ -19653,6 +19653,7 @@ with tempfile.TemporaryDirectory() as directory:
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_006_archives_partially_archived_chains() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;

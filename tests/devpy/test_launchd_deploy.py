@@ -6365,7 +6365,7 @@ class SameSchema129RefreshControllerTests(unittest.TestCase):
     def test_refresh_status_and_manual_recovery_route_to_current_schema(self):
         fixture = LaunchdControllerDurabilityTests()
         fixture.dev = self.dev
-        registry = subprocess.check_output(["git", "show", "HEAD:crates/phoenix-db/src/migrations.rs"], cwd=ROOT)
+        registry = subprocess.check_output(["git", "show", f"{self.dev.PREPARED_SOURCE128_COMMIT}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT)
         with fixture.deployment(refresh=True, registry_bytes=registry) as (staging, controller, _events), \
              mock.patch.object(self.dev.sys, "platform", "darwin"):
             self.dev.launchd_prod_deploy(controller=controller)
@@ -6390,7 +6390,7 @@ class SameSchema129RefreshControllerTests(unittest.TestCase):
     def test_refresh_manifest_routes_as_current_schema_and_binds_private_receipt(self):
         fixture = LaunchdControllerDurabilityTests()
         fixture.dev = self.dev
-        registry = subprocess.check_output(["git", "show", "HEAD:crates/phoenix-db/src/migrations.rs"], cwd=ROOT)
+        registry = subprocess.check_output(["git", "show", f"{self.dev.PREPARED_SOURCE128_COMMIT}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT)
         with fixture.deployment(refresh=True, candidate_commit="e" * 40, registry_bytes=registry) as (staging, controller, events), \
              mock.patch.object(self.dev.sys, "platform", "darwin"):
             self.dev.launchd_prod_deploy(controller=controller)

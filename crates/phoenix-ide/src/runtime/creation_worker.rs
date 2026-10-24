@@ -3154,6 +3154,7 @@ mod product_creation_delivery_replay_tests {
 
     fn initialized_product_repository() -> tempfile::TempDir {
         // Selected working directories reject symlink segments, including macOS /var.
+        // ast-grep-ignore: no-direct-temp-dir-reads -- test fixture uses the canonical host temp root.
         let repo = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         for args in [
             vec!["init", "--initial-branch=main"],
@@ -3364,6 +3365,7 @@ mod product_creation_delivery_replay_tests {
     async fn direct_product_creation_advances_noop_phases_in_sequence() {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
+        // ast-grep-ignore: no-direct-temp-dir-reads -- test fixture uses the canonical host temp root.
         let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         sqlx::raw_sql(
             "CREATE TABLE observed_creation_stages (stage TEXT NOT NULL);
