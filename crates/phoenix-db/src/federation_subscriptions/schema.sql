@@ -210,9 +210,17 @@ BEGIN SELECT RAISE(ABORT, 'ended remote subscription cannot reactivate'); END;
 CREATE TRIGGER federation_remote_end AFTER UPDATE OF state ON federation_remote_subscriptions
 WHEN NEW.state != 'active'
 BEGIN
-    UPDATE federation_remote_admissions SET suppressed = 1
-    WHERE destination_instance_id = NEW.destination_instance_id AND subscription_id = NEW.subscription_id
-      AND accepted_transcript_id IS NULL AND authorization_requested = 0;
+    DELETE FROM federation_remote_navigation
+    WHERE admission_id IN (
+        SELECT admission_id FROM federation_remote_admissions
+        WHERE destination_instance_id = NEW.destination_instance_id
+          AND subscription_id = NEW.subscription_id
+          AND accepted_transcript_id IS NULL);
+    UPDATE federation_remote_admissions
+    SET suppressed = 1, authorization_requested = 0, authorization_id = NULL
+    WHERE destination_instance_id = NEW.destination_instance_id
+      AND subscription_id = NEW.subscription_id
+      AND accepted_transcript_id IS NULL;
 END;
 DROP TRIGGER watch_event_accept_turn;
 DROP TRIGGER watch_event_accept_steering;
@@ -269,6 +277,7 @@ BEGIN
       AND EXISTS (SELECT 1 FROM federation_remote_subscriptions s
                   WHERE s.destination_instance_id = federation_remote_admissions.destination_instance_id
                     AND s.subscription_id = federation_remote_admissions.subscription_id
+                    AND s.state = 'active'
                     AND s.admitted_cursor = federation_remote_admissions.after_cursor)
       AND ((kind = 'fact' AND EXISTS (SELECT 1 FROM federation_received_facts f WHERE f.admission_id = federation_remote_admissions.admission_id))
         OR (kind = 'gap' AND EXISTS (SELECT 1 FROM federation_received_gaps g WHERE g.admission_id = federation_remote_admissions.admission_id)))
@@ -286,6 +295,7 @@ BEGIN
       AND EXISTS (SELECT 1 FROM federation_remote_subscriptions s
                   WHERE s.destination_instance_id = federation_remote_admissions.destination_instance_id
                     AND s.subscription_id = federation_remote_admissions.subscription_id
+                    AND s.state = 'active'
                     AND s.admitted_cursor = federation_remote_admissions.after_cursor)
       AND ((kind = 'fact' AND EXISTS (SELECT 1 FROM federation_received_facts f WHERE f.admission_id = federation_remote_admissions.admission_id))
         OR (kind = 'gap' AND EXISTS (SELECT 1 FROM federation_received_gaps g WHERE g.admission_id = federation_remote_admissions.admission_id)))

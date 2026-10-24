@@ -476,6 +476,16 @@ impl Database {
     ) -> DbResult<Option<RemoteSubscription>> {
         sqlx::query("SELECT *, EXISTS(SELECT 1 FROM federation_pending_unsubscribes u WHERE u.destination_instance_id = federation_remote_subscriptions.destination_instance_id AND u.subscription_id = federation_remote_subscriptions.subscription_id) AS pending_unsubscribe FROM federation_remote_subscriptions WHERE destination_instance_id = ?1 AND product_id = ?2 AND state = 'active'").bind(reference.instance_id.to_string()).bind(reference.product_conversation_id.as_str()).fetch_optional(&self.pool).await?.as_ref().map(decode_remote).transpose()
     }
+    /// Find the active or pending-unsubscribe subscription for exact management.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails or the binding cannot be decoded.
+    pub async fn remote_subscription_for_management(
+        &self,
+        reference: &SubscriptionReference,
+    ) -> DbResult<Option<RemoteSubscription>> {
+        sqlx::query("SELECT *, EXISTS(SELECT 1 FROM federation_pending_unsubscribes u WHERE u.destination_instance_id = federation_remote_subscriptions.destination_instance_id AND u.subscription_id = federation_remote_subscriptions.subscription_id) AS pending_unsubscribe FROM federation_remote_subscriptions WHERE destination_instance_id = ?1 AND product_id = ?2 AND (state = 'active' OR EXISTS (SELECT 1 FROM federation_pending_unsubscribes u WHERE u.destination_instance_id = federation_remote_subscriptions.destination_instance_id AND u.subscription_id = federation_remote_subscriptions.subscription_id)) ORDER BY pending_unsubscribe DESC, subscription_id DESC LIMIT 1").bind(reference.instance_id.to_string()).bind(reference.product_conversation_id.as_str()).fetch_optional(&self.pool).await?.as_ref().map(decode_remote).transpose()
+    }
     /// Select at most four subscriptions with active, unsubscribe, or authorization work.
     ///
     /// # Errors

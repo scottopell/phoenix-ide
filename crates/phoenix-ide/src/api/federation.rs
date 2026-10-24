@@ -1026,6 +1026,8 @@ pub enum FederationClientError {
     ResponseTooLarge(usize),
     #[error("remote query rejected: {0}")]
     RemoteRejected(String),
+    #[error("remote query response contains federation credentials")]
+    CredentialReflection,
     #[error("subscription enrollment authentication rejected")]
     SubscriptionAuthenticationRejected,
     #[error("invalid federation response: {0}")]
@@ -1425,9 +1427,10 @@ pub async fn query_remote_database(
     let caller_instance_id = db.instance_id().await?;
     let endpoint = peer.base_url.query_database_endpoint();
     let client = remote_query_client(&peer.tls_trust)?;
+    let bearer = peer.bearer_credential.expose();
     let response = client
         .post(endpoint.as_url().clone())
-        .bearer_auth(peer.bearer_credential.expose())
+        .bearer_auth(bearer)
         .json(&RemoteQueryDatabaseRequest {
             destination_instance_id: peer_instance_id,
             sql: sql.to_owned(),
@@ -1440,7 +1443,7 @@ pub async fn query_remote_database(
     while let Some(chunk) = stream.next().await {
         append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
     }
-    decode_remote_query_response(status, &bytes, peer_instance_id, caller_instance_id)
+    decode_remote_query_response(status, &bytes, peer_instance_id, caller_instance_id, bearer)
 }
 
 fn remote_query_client(tls_trust: &PeerTlsTrust) -> Result<reqwest::Client, FederationClientError> {
@@ -1476,6 +1479,7 @@ fn decode_remote_query_response(
     bytes: &[u8],
     expected_destination: InstanceId,
     expected_caller: InstanceId,
+    bearer: &str,
 ) -> Result<RemoteQueryDatabaseResponse, FederationClientError> {
     if !status.is_success() {
         let detail = serde_json::from_slice::<serde_json::Value>(bytes)
@@ -1494,6 +1498,11 @@ fn decode_remote_query_response(
     }
     if response.caller_instance_id != expected_caller {
         return Err(FederationClientError::CallerMismatch);
+    }
+    let rendered =
+        serde_json::to_string(&response.result).map_err(FederationClientError::InvalidResponse)?;
+    if rendered.contains(bearer) {
+        return Err(FederationClientError::CredentialReflection);
     }
     Ok(response)
 }
@@ -2767,9 +2776,113 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            decode_remote_query_response(StatusCode::OK, &body, destination, expected_caller),
+            decode_remote_query_response(
+                StatusCode::OK,
+                &body,
+                destination,
+                expected_caller,
+                "test-bearer",
+            ),
             Err(FederationClientError::CallerMismatch)
         ));
+    }
+
+    fn query_response_body(
+        destination: InstanceId,
+        caller: InstanceId,
+        columns: Vec<String>,
+        rows: serde_json::Value,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "destination_instance_id": destination,
+            "caller_instance_id": caller,
+            "result": {
+                "columns": columns,
+                "rows": rows,
+                "truncated": false,
+                "row_limit": 200,
+                "byte_limit": 64 * 1024,
+                "elapsed_ms": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_query_success_rejects_bearer_in_text_value() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let bearer = "phx_peer_reflected_value";
+        let body = query_response_body(
+            destination,
+            caller,
+            vec!["value".into()],
+            serde_json::json!([[{
+                "type": "text",
+                "value": format!("prefix-{bearer}-suffix")
+            }]]),
+        );
+
+        assert!(matches!(
+            decode_remote_query_response(StatusCode::OK, &body, destination, caller, bearer),
+            Err(FederationClientError::CredentialReflection)
+        ));
+    }
+
+    #[test]
+    fn remote_query_success_rejects_bearer_in_column_name() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let bearer = "phx_peer_reflected_column";
+        let body = query_response_body(
+            destination,
+            caller,
+            vec![format!("alias-{bearer}")],
+            serde_json::json!([[{"type": "integer", "value": 7}]]),
+        );
+
+        assert!(matches!(
+            decode_remote_query_response(StatusCode::OK, &body, destination, caller, bearer),
+            Err(FederationClientError::CredentialReflection)
+        ));
+    }
+
+    #[test]
+    fn remote_query_success_preserves_non_secret_data() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let body = query_response_body(
+            destination,
+            caller,
+            vec!["label".into(), "count".into()],
+            serde_json::json!([[
+                {"type": "text", "value": "ordinary remote data"},
+                {"type": "integer", "value": 7}
+            ]]),
+        );
+
+        let response = decode_remote_query_response(
+            StatusCode::OK,
+            &body,
+            destination,
+            caller,
+            "phx_peer_not_present",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(response.result).unwrap(),
+            serde_json::json!({
+                "columns": ["label", "count"],
+                "rows": [[
+                    {"type": "text", "value": "ordinary remote data"},
+                    {"type": "integer", "value": 7}
+                ]],
+                "truncated": false,
+                "row_limit": 200,
+                "byte_limit": 64 * 1024,
+                "elapsed_ms": 0
+            })
+        );
     }
 
     #[test]
@@ -2835,6 +2948,7 @@ mod tests {
             br#"{"error":"specific SQL diagnostic"}"#,
             expected_destination,
             InstanceId::new(),
+            "test-bearer",
         );
 
         assert!(matches!(

@@ -657,7 +657,7 @@ async fn actual_close_before_authorization_suppresses_a_staged_nonempty_replay()
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn actual_close_after_source_authorization_recovers_a_lost_receipt_and_finishes_once() {
+async fn actual_close_after_source_authorization_suppresses_unadmitted_fact() {
     let a = TestInstance::start().await;
     let b = TestInstance::start().await;
     let peer = a.connect_to(&b).await;
@@ -710,7 +710,7 @@ async fn actual_close_after_source_authorization_recovers_a_lost_receipt_and_fin
         .await
         .unwrap();
     let row = refreshed(&a, &remote).await;
-    assert_eq!(row.admitted_cursor.get(), 1);
+    assert_eq!(row.admitted_cursor, SubscriptionCursor::START);
     assert_eq!(row.state, SubscriptionState::SourceClosed);
     sync_once(&a.state.db, &a.state.runtime, &row)
         .await
@@ -723,35 +723,25 @@ async fn actual_close_after_source_authorization_recovers_a_lost_receipt_and_fin
         .fetch_one(a.state.db.pool())
         .await
         .unwrap(),
-        1
+        0
     );
-    let coordinator = a
+    assert!(a
         .state
         .db
-        .coordinator_conversation_id()
+        .pending_remote_notifications(&row)
         .await
         .unwrap()
+        .is_empty());
+    let history = a
+        .state
+        .db
+        .remote_notification_history(&row, SubscriptionCursor::START)
+        .await
         .unwrap();
-    let message = super::send::materialize_received(&a, &coordinator).await;
-    let presentation =
-        crate::api::event_presentation::EventPresentations::load(&a.state.db, [&message])
-            .await
-            .for_message(&message);
+    assert_eq!(history.len(), 1);
     assert!(matches!(
-        presentation,
-        Some(crate::api::event_presentation::EventPresentation::FederatedFact(_))
-    ));
-    let redacted =
-        crate::api::event_presentation::EventPresentations::redacted().for_message(&message);
-    assert!(matches!(
-        redacted,
-        Some(
-            crate::api::event_presentation::EventPresentation::Unavailable {
-                reason:
-                    crate::api::event_presentation::EventPresentationUnavailableReason::Redacted,
-                ..
-            }
-        )
+        history[0].disposition,
+        phoenix_db::federation_subscriptions::RemoteNotificationDisposition::Suppressed
     ));
     a.stop().await;
     b.stop().await;

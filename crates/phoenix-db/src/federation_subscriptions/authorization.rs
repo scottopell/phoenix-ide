@@ -7,7 +7,7 @@ use super::{
 
 impl Database {
     /// Serialize a delivery authorization against source Close, revoke, and unsubscribe.
-    /// Exact unacknowledged receipts remain replayable after the subscription ends.
+    /// Existing authorization identities do not outlive source Close.
     ///
     /// # Errors
     /// Returns an error for changed identities, invalid ranges, or failed persistence.
@@ -39,6 +39,12 @@ impl Database {
         };
         let existing = sqlx::query("SELECT authorization_id, event_id, gap_transcript_id, gap_outcome FROM federation_delivery_authorizations WHERE subscription_id = ?1 AND after_cursor = ?2 AND through_cursor = ?3 AND kind = ?4")
             .bind(subscription.to_string()).bind(after.get()).bind(through.get()).bind(kind).fetch_optional(&mut *tx).await?;
+        let state: &str = row.try_get("state")?;
+        if state == "source_closed" || row.try_get::<&str, _>("ordinary_lifecycle")? == "history" {
+            return Ok(SubscriptionAuthorization::Rejected {
+                reason: SubscriptionEnd::SourceClosed,
+            });
+        }
         if let Some(existing) = existing {
             if existing.try_get::<Option<String>, _>("event_id")? != event
                 || existing
@@ -61,13 +67,10 @@ impl Database {
                 authorization_id: uuid(existing.try_get("authorization_id")?)?,
             });
         }
-        let state: &str = row.try_get("state")?;
         let rejection = if state != "active" {
             Some(end(state)?)
         } else if row.try_get::<Option<i64>, _>("revoked_at_us")?.is_some() {
             Some(SubscriptionEnd::Revoked)
-        } else if row.try_get::<&str, _>("ordinary_lifecycle")? == "history" {
-            Some(SubscriptionEnd::SourceClosed)
         } else {
             None
         };
@@ -108,7 +111,7 @@ impl Database {
         remote: &RemoteSubscription,
         admission_id: &str,
     ) -> DbResult<()> {
-        let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_requested = 1 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND accepted_transcript_id IS NULL AND suppressed = 0 AND (authorization_requested = 1 OR EXISTS(SELECT 1 FROM federation_remote_subscriptions s WHERE s.destination_instance_id = federation_remote_admissions.destination_instance_id AND s.subscription_id = federation_remote_admissions.subscription_id AND s.state = 'active'))")
+        let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_requested = 1 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND accepted_transcript_id IS NULL AND suppressed = 0 AND EXISTS(SELECT 1 FROM federation_remote_subscriptions s WHERE s.destination_instance_id = federation_remote_admissions.destination_instance_id AND s.subscription_id = federation_remote_admissions.subscription_id AND s.state = 'active')")
             .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).execute(&self.pool).await?.rows_affected();
         if changed != 1 {
             return Err(invalid("staged delivery no longer authorizable"));
@@ -137,7 +140,7 @@ impl Database {
             source_path,
         )
         .await?;
-        let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_id = ?4 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND authorization_requested = 1 AND suppressed = 0 AND (authorization_id IS NULL OR authorization_id = ?4)")
+        let changed = sqlx::query("UPDATE federation_remote_admissions SET authorization_id = ?4 WHERE admission_id = ?1 AND destination_instance_id = ?2 AND subscription_id = ?3 AND authorization_requested = 1 AND suppressed = 0 AND (authorization_id IS NULL OR authorization_id = ?4) AND EXISTS(SELECT 1 FROM federation_remote_subscriptions s WHERE s.destination_instance_id = federation_remote_admissions.destination_instance_id AND s.subscription_id = federation_remote_admissions.subscription_id AND s.state = 'active')")
             .bind(admission_id).bind(remote.reference.instance_id.to_string()).bind(remote.subscription_id.to_string()).bind(authorization_id.to_string()).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(invalid(

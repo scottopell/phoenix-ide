@@ -430,21 +430,18 @@ pub(crate) async fn create_saved_peer_subscription(
         instance_id: peer.peer_instance_id,
         product_conversation_id: product,
     };
-    if db
-        .remote_subscriptions(Some(peer.peer_instance_id), 1024)
+    let existing = db
+        .remote_subscription_for_management(&reference)
         .await
-        .map_err(|error| error.to_string())?
-        .iter()
-        .any(|row| row.reference == reference && row.pending_unsubscribe)
+        .map_err(|error| error.to_string())?;
+    if existing
+        .as_ref()
+        .is_some_and(|subscription| subscription.pending_unsubscribe)
     {
         return Err(
             "remote unsubscribe remains unconfirmed; retry it before enrolling again".into(),
         );
     }
-    let existing = db
-        .remote_subscription_for_product(&reference)
-        .await
-        .map_err(|error| error.to_string())?;
     let id = existing.as_ref().map_or_else(
         || requested_id.unwrap_or_else(Uuid::new_v4),
         |row| row.subscription_id,
@@ -490,16 +487,14 @@ pub(crate) async fn unsubscribe_saved_peer(
         .resolve_federation_peer(&selector)
         .await
         .map_err(|error| error.to_string())?;
-    let rows = db
-        .remote_subscriptions(Some(peer.peer_instance_id), 1024)
+    let reference = SubscriptionReference {
+        instance_id: peer.peer_instance_id,
+        product_conversation_id: product,
+    };
+    let remote = db
+        .remote_subscription_for_management(&reference)
         .await
-        .map_err(|error| error.to_string())?;
-    let remote = rows
-        .into_iter()
-        .find(|row| {
-            row.reference.product_conversation_id == product
-                && (row.state == SubscriptionState::Active || row.pending_unsubscribe)
-        })
+        .map_err(|error| error.to_string())?
         .ok_or_else(|| "active or pending remote subscription not found".to_string())?;
     unsubscribe_remote(db, &peer, &remote).await
 }

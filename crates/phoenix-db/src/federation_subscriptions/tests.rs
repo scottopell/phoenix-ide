@@ -503,6 +503,61 @@ async fn remote_fixture(db: &Database) -> RemoteSubscription {
         .unwrap()
         .unwrap()
 }
+#[tokio::test]
+async fn exact_management_lookup_reaches_rows_beyond_bounded_listing() {
+    let db = Database::open_in_memory().await.unwrap();
+    let destination = InstanceId::new();
+    let target_reference = SubscriptionReference {
+        instance_id: destination,
+        product_conversation_id: ProductConversationId::parse("management-target").unwrap(),
+    };
+    let target_subscription = Uuid::from_u128(u128::MAX);
+    db.save_remote_subscription(&target_reference, target_subscription)
+        .await
+        .unwrap();
+
+    for ordinal in 1..=1024_u128 {
+        let reference = SubscriptionReference {
+            instance_id: destination,
+            product_conversation_id: ProductConversationId::parse(format!(
+                "management-filler-{ordinal}"
+            ))
+            .unwrap(),
+        };
+        db.save_remote_subscription(&reference, Uuid::from_u128(ordinal))
+            .await
+            .unwrap();
+    }
+
+    let bounded = db
+        .remote_subscriptions(Some(destination), 1024)
+        .await
+        .unwrap();
+    assert_eq!(bounded.len(), 1024);
+    assert!(bounded
+        .iter()
+        .all(|subscription| subscription.subscription_id != target_subscription));
+
+    let active = db
+        .remote_subscription_for_management(&target_reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.subscription_id, target_subscription);
+    assert!(!active.pending_unsubscribe);
+
+    db.begin_remote_unsubscribe(&target_reference, target_subscription)
+        .await
+        .unwrap();
+    let pending = db
+        .remote_subscription_for_management(&target_reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.subscription_id, target_subscription);
+    assert!(pending.pending_unsubscribe);
+}
+
 fn single_fact() -> SubscriptionReplay {
     SubscriptionReplay::Facts {
         events: vec![FederatedTerminalFact {
@@ -1342,7 +1397,7 @@ async fn pre_enrollment_production_terminal_is_not_a_future_fact() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_uncommitted_bytes() {
+async fn real_history_close_preserves_accepted_and_suppresses_every_unadmitted_fact() {
     let f = Fixture::new().await;
     for n in 0..3 {
         f.emit(
@@ -1406,31 +1461,20 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
             .unwrap(),
         1
     );
-    let SubscriptionAuthorization::Authorized { authorization_id } =
-        authorize_source(&f, &pending[1].content).await
-    else {
-        panic!("committed obligation must survive Close")
-    };
-    let (stable, source) = fixture_navigation(&a, &remote, &pending[1].admission_id).await;
-    a.confirm_remote_authorization(
-        &remote,
-        &pending[1].admission_id,
-        authorization_id,
-        &stable,
-        &source,
-    )
-    .await
-    .unwrap();
-    steer(&a, &target, &pending[1].admission_id).await.unwrap();
-    assert_eq!(
-        authorize_source(&f, &pending[2].content).await,
-        SubscriptionAuthorization::Rejected {
-            reason: SubscriptionEnd::SourceClosed
-        }
-    );
-    a.suppress_remote_notification(&remote, &pending[2].admission_id)
+    for note in pending.iter().skip(1) {
+        assert_eq!(
+            authorize_source(&f, &note.content).await,
+            SubscriptionAuthorization::Rejected {
+                reason: SubscriptionEnd::SourceClosed
+            }
+        );
+        assert!(steer(&a, &target, &note.admission_id).await.is_err());
+    }
+    assert!(a
+        .pending_remote_notifications(&remote)
         .await
-        .unwrap();
+        .unwrap()
+        .is_empty());
     let history = a
         .remote_notification_history(&remote, SubscriptionCursor::START)
         .await
@@ -1443,12 +1487,18 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
                 RemoteNotificationDisposition::Accepted { .. }
             ))
             .count(),
+        1
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|notification| matches!(
+                notification.disposition,
+                RemoteNotificationDisposition::Suppressed
+            ))
+            .count(),
         2
     );
-    assert!(matches!(
-        history[2].disposition,
-        RemoteNotificationDisposition::Suppressed
-    ));
     assert_eq!(
         a.remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
             .await
@@ -1456,10 +1506,10 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
             .unwrap()
             .admitted_cursor
             .get(),
-        2
+        1
     );
     assert!(matches!(
-        f.replay(2, NOW + 3).await,
+        f.replay(1, NOW + 3).await,
         SubscriptionReplay::Ended { .. }
     ));
     for table in [
@@ -1473,7 +1523,7 @@ async fn real_history_close_preserves_accepted_and_authorized_but_suppresses_unc
             .fetch_one(f.db.pool())
             .await
             .unwrap(),
-            0
+            1
         );
     }
     assert_eq!(
@@ -1538,6 +1588,109 @@ async fn revoke_and_unsubscribe_serialize_against_authorization_in_both_orders()
             );
         }
     }
+}
+
+#[tokio::test]
+async fn source_closed_suppression_survives_restart_and_preserves_admitted_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("source-closed.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let db = open_migrated(&path).await;
+    let remote = remote_fixture(&db).await;
+    let target = coordinator(&db).await;
+    let replay = SubscriptionReplay::Facts {
+        events: vec![
+            FederatedTerminalFact {
+                event_id: Uuid::new_v4(),
+                sequence: cursor(1).unwrap(),
+                source_transcript_id: TranscriptConversationId::parse("source-close-first")
+                    .unwrap(),
+                outcome: TerminalFactOutcome::Completed,
+                occurred_at_us: NOW,
+            },
+            FederatedTerminalFact {
+                event_id: Uuid::new_v4(),
+                sequence: cursor(2).unwrap(),
+                source_transcript_id: TranscriptConversationId::parse("source-close-second")
+                    .unwrap(),
+                outcome: TerminalFactOutcome::Failed,
+                occurred_at_us: NOW + 1,
+            },
+        ],
+    };
+    db.stage_remote_replay(&remote, &replay).await.unwrap();
+    let pending = db.pending_remote_notifications(&remote).await.unwrap();
+    assert_eq!(pending.len(), 2);
+
+    for notification in &pending {
+        db.request_remote_notification_authorization(&remote, &notification.admission_id)
+            .await
+            .unwrap();
+        let (stable, source) = fixture_navigation(&db, &remote, &notification.admission_id).await;
+        db.confirm_remote_authorization(
+            &remote,
+            &notification.admission_id,
+            Uuid::new_v4(),
+            &stable,
+            &source,
+        )
+        .await
+        .unwrap();
+    }
+    steer(&db, &target, &pending[0].admission_id).await.unwrap();
+    db.end_remote_subscription(
+        &remote.reference,
+        remote.subscription_id,
+        SubscriptionEnd::SourceClosed,
+    )
+    .await
+    .unwrap();
+    db.pool.close().await;
+
+    let db = open_migrated(&path).await;
+    let reopened = db
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.state, SubscriptionState::SourceClosed);
+    assert_eq!(reopened.admitted_cursor, cursor(1).unwrap());
+    assert!(db
+        .pending_remote_notifications(&reopened)
+        .await
+        .unwrap()
+        .is_empty());
+    let history = db
+        .remote_notification_history(&reopened, SubscriptionCursor::START)
+        .await
+        .unwrap();
+    assert!(matches!(
+        history[0].disposition,
+        RemoteNotificationDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        history[1].disposition,
+        RemoteNotificationDisposition::Suppressed
+    ));
+    assert!(db
+        .request_remote_notification_authorization(&reopened, &pending[1].admission_id)
+        .await
+        .is_err());
+    let (stable, source) = fixture_navigation(&db, &reopened, &pending[1].admission_id).await;
+    assert!(db
+        .confirm_remote_authorization(
+            &reopened,
+            &pending[1].admission_id,
+            Uuid::new_v4(),
+            &stable,
+            &source,
+        )
+        .await
+        .is_err());
+    assert!(steer(&db, &target, &pending[1].admission_id).await.is_err());
 }
 
 #[tokio::test]
