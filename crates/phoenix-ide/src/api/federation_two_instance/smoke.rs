@@ -530,18 +530,7 @@ async fn authenticated_https_resolve_returns_destination_provenance() {
 
 #[tokio::test]
 async fn owner_https_facades_preserve_current_client_envelopes_and_auth_separation() {
-    use phoenix_core::domain::instance_identity::OwnerPassword;
-    let caller = TestInstance::start_with_router(true, |mut state| {
-        state.password = Some(OwnerPassword::parse("local-owner-password".into()).unwrap());
-        super::create_router(state)
-    })
-    .await;
-    let receiver = TestInstance::start_with_router(true, |mut state| {
-        state.password = Some(OwnerPassword::parse("remote-owner-password".into()).unwrap());
-        super::create_router(state)
-    })
-    .await;
-    let peer = caller.connect_to(&receiver).await;
+    let (caller, receiver, peer) = owner_facade_instances().await;
     let destination = peer.peer_instance_id;
     let caller_id = caller.state.db.instance_id().await.unwrap();
     let conversation = receiver
@@ -639,6 +628,26 @@ async fn owner_https_facades_preserve_current_client_envelopes_and_auth_separati
     assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
     caller.stop().await;
     receiver.stop().await;
+}
+
+async fn owner_facade_instances() -> (
+    TestInstance,
+    TestInstance,
+    phoenix_db::FederationPeerConnection,
+) {
+    use phoenix_core::domain::instance_identity::OwnerPassword;
+    let caller = TestInstance::start_with_router(true, |mut state| {
+        state.password = Some(OwnerPassword::parse("local-owner-password".into()).unwrap());
+        super::create_router(state)
+    })
+    .await;
+    let receiver = TestInstance::start_with_router(true, |mut state| {
+        state.password = Some(OwnerPassword::parse("remote-owner-password".into()).unwrap());
+        super::create_router(state)
+    })
+    .await;
+    let peer = caller.connect_to(&receiver).await;
+    (caller, receiver, peer)
 }
 
 fn assert_owner_facade_response(

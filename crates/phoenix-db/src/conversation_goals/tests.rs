@@ -1155,16 +1155,57 @@ async fn prior_131_file(path: &std::path::Path) -> Database {
     db
 }
 
-async fn reopened_current_from_prior_131(path: &std::path::Path) -> Database {
-    let db = prior_131_file(path).await;
-    db.pool().close().await;
-    let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+async fn apply_historical_goals_then_federation_suffix(db: &Database) {
+    let source = || async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT message_id,content FROM messages ORDER BY message_id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+    };
+    let before = source().await;
     assert_eq!(
-        crate::migrations::run_pending_migrations(reopened.pool())
+        crate::migrations::run_through_goal_user_control_history_for_test(db.pool())
             .await
             .unwrap(),
         6
     );
+    let mut historical: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=132 ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        historical,
+        vec![
+            (132, "durable_conversation_goal_storage".into()),
+            (133, "opaque_federation_peer_notes".into()),
+            (134, "durable_conversation_goal_user_control".into()),
+            (135, "local_watch_goal_capture".into()),
+            (136, "per_goal_execution_requests".into()),
+            (137, "goal_start_materialization_witness".into()),
+        ]
+    );
+    assert_eq!(before, source().await);
+    let pending = || crate::migrations::run_pending_migrations(db.pool());
+    assert_eq!(pending().await.unwrap(), 1);
+    let current: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=132 ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    historical.push((138, "federation_local_stop_acceptance".into()));
+    assert_eq!(current, historical);
+    assert_eq!(before, source().await);
+    assert_eq!(pending().await.unwrap(), 0);
+}
+
+async fn reopened_current_from_prior_131(path: &std::path::Path) -> Database {
+    let db = prior_131_file(path).await;
+    db.pool().close().await;
+    let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+    apply_historical_goals_then_federation_suffix(&reopened).await;
     reopened
 }
 
@@ -1192,12 +1233,7 @@ async fn prior_schema_131_upgrade_applies_132_through_137_preserves_source_rows_
         .fetch_one(db.pool()).await.unwrap();
     db.pool().close().await;
     let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
-    assert_eq!(
-        crate::migrations::run_pending_migrations(reopened.pool())
-            .await
-            .unwrap(),
-        6
-    );
+    apply_historical_goals_then_federation_suffix(&reopened).await;
     let after: (String,String,String,String) = sqlx::query_as("SELECT c.id,c.product_conversation_id,m.message_id,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.id='upgrade-root'")
         .fetch_one(reopened.pool()).await.unwrap();
     assert_eq!(before, after);
