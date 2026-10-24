@@ -661,6 +661,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "single_conversation_name_and_route_projection",
         sql: "",
     },
+    Migration {
+        version: 130,
+        name: "slack_gateway",
+        sql: include_str!("migrations/slack_gateway.sql"),
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -14223,6 +14228,16 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
+    async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
+        let connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn current_schema_controller_accepts_compiled_123_and_128_shapes() {
         let directory = tempfile::tempdir().unwrap();
@@ -14276,6 +14291,7 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap();
         db.pool().close().await;
         drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
 
         validate_current_schema_with_controller(&path, false);
 
@@ -14309,6 +14325,7 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap();
         db.pool().close().await;
         drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
 
         validate_current_schema_with_controller(&path, false);
         validate_current_schema_with_controller(&path, true);
@@ -14378,6 +14395,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (130, "slack_gateway"),
             (129, "single_conversation_name_and_route_projection"),
             (128, "product_creation_provisioning_stage"),
             (127, "coordinator_owned_work_scope_home"),
@@ -19635,6 +19653,7 @@ with tempfile.TemporaryDirectory() as directory:
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_006_archives_partially_archived_chains() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
@@ -19703,7 +19722,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (126, 'temporarily_skip_wake_feature_retirement'),
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
-                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
+                    (130, 'temporarily_skip_slack_gateway')",
         )
         .execute(&pool)
         .await
@@ -20570,7 +20590,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (126, 'temporarily_skip_wake_feature_retirement'),
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
-                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
+                    (130, 'temporarily_skip_slack_gateway')",
         )
         .execute(pool)
         .await

@@ -95,6 +95,81 @@ pub(crate) struct SendChatApplicationService {
 }
 
 impl SendChatApplicationService {
+    pub(crate) async fn respond_to_question(
+        &self,
+        id: &str,
+        request_id: Option<phoenix_core::domain::sm_state::QuestionRequestId>,
+        answers: std::collections::HashMap<String, String>,
+        annotations: Option<
+            std::collections::HashMap<String, phoenix_core::domain::sm_state::QuestionAnnotation>,
+        >,
+        source: Option<phoenix_core::domain::sm_event::QuestionAnswerSource>,
+    ) -> Result<(), crate::api::handlers::AppError> {
+        use crate::api::handlers::AppError;
+        use crate::api::ConflictErrorResponse;
+        let admission = self
+            .runtime
+            .mutation_admission(id)
+            .await
+            .map_err(crate::api::handlers::map_admission_db_error)?;
+        let _admission_guard = admission.lock().await;
+
+        let conv = self
+            .runtime
+            .db()
+            .get_conversation(id)
+            .await
+            .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+        let ConvState::AwaitingUserResponse {
+            request_authority, ..
+        } = &conv.state
+        else {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is not awaiting a user response",
+                "wrong_state",
+            ))));
+        };
+        crate::api::handlers::validate_question_request_identity(
+            request_authority.request_id(),
+            request_id.as_ref(),
+        )?;
+
+        let target = self
+            .db
+            .message_target_admission(id)
+            .await
+            .map_err(crate::api::handlers::map_admission_db_error)?;
+        crate::api::handlers::map_ordinary_mutation_admission(&target, "question response")?;
+
+        let gateway_answer = source.as_ref().is_some_and(|source| {
+            matches!(
+                source.origin,
+                phoenix_core::domain::db_schema::InputOrigin::SlackGateway { .. }
+            )
+        });
+        self.runtime
+            .send_event(
+                id,
+                Event::UserQuestionResponse {
+                    source,
+                    request_id,
+                    answers,
+                    annotations,
+                },
+            )
+            .await
+            .map_err(|error| {
+                if gateway_answer {
+                    AppError::Internal(error)
+                } else {
+                    AppError::BadRequest(error)
+                }
+            })?;
+
+        Ok(())
+    }
+
     pub(crate) fn new(db: crate::db::Database, runtime: Arc<RuntimeManager>) -> Self {
         Self { db, runtime }
     }

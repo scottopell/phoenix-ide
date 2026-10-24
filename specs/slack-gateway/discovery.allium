@@ -1,0 +1,498 @@
+-- allium: 3
+-- Scope: bounded Slack discovery, page progress, and service opportunities.
+-- Includes: fixed-window call allowance, baseline cutover, serial scheduling,
+-- query fairness, partial pages, backoff, and retained-state restart.
+-- Excludes: connector formatting, candidate read algorithms, native execution,
+-- notification-provider call limits, and request/delivery lifecycles owned by the imported model.
+-- Traceability: REQ-SG-003/004/005/006/011/012/013/017.
+
+use "./slack-gateway.allium" as lifecycle
+
+external entity PageEvidence {
+    query: SearchProgress
+    search_call: SlackCall
+    position_read: String?
+    next_position: String?
+    observations: Set<lifecycle/VerifiedObservation>
+}
+
+external entity FreshPrefixEvidence {
+    controller: DiscoveryController
+    search_call: SlackCall
+    observations: Set<lifecycle/VerifiedObservation>
+}
+
+contract SlackDiscoveryPort {
+    read_page: (query: SearchProgress, position: String?) -> PageEvidence
+    verify_candidate: (source_key: String) -> lifecycle/VerifiedObservation?
+
+    @invariant CallAccounting
+        -- Every gateway Slack tool dispatch, including its owner-facing
+        -- read-access inspection, needs a distinct granted
+        -- SlackCall. Failed dispatches consume allowance too. This is a logical
+        -- tool-call limit, not a provider-wide or underlying HTTP-request quota.
+        -- Direct agent/manual MCP tools and notification-provider calls are outside
+        -- this allowance. A dispatched gateway tool call is not replayed by
+        -- MCP recovery; a later retry requires a new allowance grant. External
+        -- writes also follow the lifecycle's single-attempt/uncertainty contract.
+        -- An allowance grant is necessary, not sufficient, for a side effect:
+        -- acknowledgment needs an accepted request, and a thread send needs
+        -- a lifecycle-owned return attempt with its exact source/destination.
+        -- No SlackCall grants task authorization or delivery confirmation.
+
+    @invariant ConnectedIdentity
+        -- Actor and workspace evidence must both describe the same serving
+        -- connection. Operations retain that connection identity; replacement
+        -- before dispatch refuses the call rather than using the new account.
+        -- A workspace-only lookup may consume an owner_identity call but never
+        -- accepts candidates or advances trigger-search positions.
+
+    @invariant VerifiedPageBoundary
+        -- Evidence binds the exact query and position. Every returned candidate
+        -- is either already recorded, positively rejected, or represented by a
+        -- verified eligible observation. A positively established deleted or
+        -- inaccessible source is ineligible, without marking its identity handled.
+        -- Transient failures, partial reads, parser errors, and failed identity
+        -- verification cannot produce completed PageEvidence.
+        -- Before candidate context/reaction reads, consult the lifecycle's
+        -- recorded source identities (accepted and baseline) and own-output
+        -- evidence. Recorded sources are skipped without those extra reads.
+        -- The configured workspace, owner actor, exact message identity and
+        -- author are verified independently of untrusted message prose.
+        -- A source reply must also be observed under its claimed root; the
+        -- search permalink alone does not establish that return destination.
+        -- Eligibility uses the current and preceding three calendar dates in
+        -- the owner's timezone at source validation, not the scan's start date.
+        -- Source-message age cannot substitute for a reaction-add timestamp.
+        -- Candidate instruction evidence contains the exact source body, without
+        -- child replies. Reaction-shaped owner text is retained; stripping a
+        -- connector reaction trailer requires independent reaction evidence.
+
+    @invariant QueryBoundary
+        -- Prefix and owner-reaction searches cover the accessible eligible
+        -- window. Their search boundary is retained for each ongoing sweep;
+        -- source validation still rejects messages that have aged out.
+        -- Search observes current provider state, not a stable snapshot or an
+        -- event log. Completion proves pagination ended, not that later arrivals
+        -- or late indexing have been observed. Removed triggers may be missed.
+        -- Once an initial sweep has a retained boundary, timezone changes are
+        -- refused until initialization completes; pausing or repairing the same
+        -- timezone remains available. Inspection alone establishes no boundary.
+}
+
+contract NativeReconciliationPort {
+    reconcile: (gateway: lifecycle/Gateway) -> Boolean
+
+    @invariant AcceptedWorkFirst
+        -- Local admission/outcome reconciliation and ready return work receive
+        -- an opportunity before a discovery burst. The result reports success;
+        -- an error is recorded and does not authorize duplicate work. A failed
+        -- reconciliation attempt does not invalidate verified discovery evidence.
+        -- Local work does not require Slack authentication or an available call.
+        -- Slack acknowledgments and thread returns require owner verification
+        -- and the shared allowance/backoff. Private notification operations retain
+        -- their separate lifecycle and are outside the Slack allowance.
+        -- Ready returns receive their dispatch opportunity before acknowledgment
+        -- retries, so failed or throttled eyes cannot perpetually starve an answer.
+        -- Startup recovery errors remain visible and are retried before external
+        -- work; they do not permanently stop the gateway task.
+        -- An idle recovery opportunity performs no Slack calls or searches.
+
+    @invariant WakeupsAreHints
+        -- A durable intentional reply requests local reconciliation. Coalesced
+        -- or lost notifications do not lose the reply: periodic recovery and
+        -- retained-state restart inspect the same durable lifecycle state.
+        -- A delivery opportunity cannot start a trigger search or accept a new
+        -- source. Identity-only workspace evidence is independent of discovery.
+        -- Disabling discovery does not cancel or suppress accepted native work.
+}
+
+enum SearchKind { prefix | reaction }
+enum ServiceKind { discovery | delivery | inspection }
+enum ServicePhase { reconciling | searching | finished }
+enum CallPurpose { owner_identity | search_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply | inspection_read }
+enum CallState { in_flight | resolved }
+
+entity DiscoveryController {
+    gateway: lifecycle/Gateway
+    process_key: String
+    window_started_at: Timestamp
+    calls_used: Integer
+    retry_not_before: Timestamp?
+    last_completed_scan_at: Timestamp?
+    next_first_query: SearchKind
+    services: ServiceOpportunity with controller = this
+    searches: SearchProgress with controller = this
+    fresh_evidence: FreshPrefixEvidence with controller = this
+    active_services: services where phase != finished
+    has_slack_work: gateway.requests.any(r => r.acknowledgment = pending) or gateway.returns.any(r => r.kind = thread_reply and r.state in {pending, known_unsent})
+    remaining_calls: config.call_limit - calls_used
+    backoff_active: retry_not_before != null and retry_not_before > now
+
+    invariant AllowanceBounds {
+        calls_used >= 0 and calls_used <= config.call_limit
+    }
+
+    invariant SerialService {
+        active_services.count <= 1
+    }
+}
+
+entity ServiceOpportunity {
+    controller: DiscoveryController
+    kind: ServiceKind
+    phase: ServicePhase
+    owner_verified: Boolean
+    next_query: SearchKind
+    refresh_eligible: Boolean
+    refresh_attempted: Boolean
+    refresh_completed: Boolean
+    catchup_first: Boolean
+    catchup_opportunity_taken: Boolean
+    burst_deadline: Timestamp?
+    calls: SlackCall with service = this
+    in_flight_calls: calls where state = in_flight
+}
+
+entity SlackCall {
+    service: ServiceOpportunity
+    purpose: CallPurpose
+    state: CallState
+}
+-- resolved means the local dispatch is no longer in flight, not that an
+-- external write succeeded. The lifecycle alone owns delivery proof/uncertainty.
+
+entity SearchProgress {
+    controller: DiscoveryController
+    kind: SearchKind
+    position: String?
+    complete: Boolean
+    page_evidence: PageEvidence with query = this
+}
+
+config {
+    call_limit: Integer = 16
+    call_window: Duration = 60.seconds
+    discovery_interval: Duration = 60.seconds
+    recovery_interval: Duration = 2.seconds
+    burst_duration: Duration = 10.seconds
+    maximum_page_calls: Integer = 4
+    work_reserve: Integer = 4
+    maximum_refresh_calls: Integer = 4
+}
+
+-- REQ-SG-017. No token refill occurs inside a service opportunity. Renewal
+-- starts a new fixed window when service next checks an expired allowance.
+rule RenewExpiredAllowance {
+    when: CheckServiceAllowance(controller)
+    requires: controller.active_services.count = 0
+    requires: controller.window_started_at + config.call_window <= now
+    ensures: controller.window_started_at = now
+    ensures: controller.calls_used = 0
+}
+
+rule BeginServiceOpportunity {
+    when: ServiceRequested(controller, kind)
+    requires: controller.active_services.count = 0
+    requires: controller.window_started_at + config.call_window > now
+    ensures: ServiceOpportunity.created(
+        controller: controller, kind: kind, phase: reconciling,
+        owner_verified: false,
+        next_query: controller.next_first_query, burst_deadline: null,
+        refresh_eligible: controller.gateway.baseline_complete and controller.searches.any(q => q.kind = prefix and (q.position != null or q.complete)),
+        refresh_attempted: false, refresh_completed: false,
+        catchup_first: controller.next_first_query = reaction,
+        catchup_opportunity_taken: false
+    )
+    ensures:
+        if kind != inspection:
+            ReconcileAcceptedWork(controller.gateway)
+}
+
+rule OpenDiscoveryBurst {
+    when: AcceptedWorkReconciliationAttempted(service)
+    requires: service.phase = reconciling
+    requires: service.kind = discovery
+    requires: service.controller.gateway.enabled
+    requires: service.owner_verified
+    requires: not service.controller.backoff_active
+    ensures: service.phase = searching
+    ensures: service.burst_deadline = now + config.burst_duration
+}
+
+rule GrantSlackCall {
+    when: RequestSlackCall(service, purpose)
+    requires: service.phase != finished
+    requires: service.in_flight_calls.count = 0
+    requires: service.controller.remaining_calls > 0
+    requires: not service.controller.backoff_active
+    requires: purpose != owner_identity or (
+        (service.kind = discovery and service.controller.gateway.enabled)
+        or service.controller.has_slack_work
+        or service.kind = inspection
+    )
+    requires: purpose = owner_identity or service.owner_verified
+    requires: purpose != fresh_prefix_page
+    requires: service.kind != inspection or purpose in {owner_identity, inspection_read}
+    requires: purpose != inspection_read or service.kind = inspection
+    requires: purpose not in {search_page, candidate_read} or service.phase = searching
+    requires: purpose != search_page or (
+        service.kind = discovery and service.controller.gateway.enabled
+        and service.burst_deadline > now
+        and service.controller.remaining_calls >= config.maximum_page_calls + config.work_reserve
+    )
+    ensures: service.controller.calls_used = service.controller.calls_used + 1
+    ensures: SlackCall.created(service: service, purpose: purpose, state: in_flight)
+    ensures:
+        if purpose = search_page:
+            service.catchup_opportunity_taken = true
+}
+
+-- Freshness is a bounded head observation, not a replacement catch-up scan.
+-- Leave room for a complete saved page and the accepted-work reserve.
+rule GrantFreshPrefixCall {
+    when: RequestFreshPrefixCall(service)
+    requires: service.kind = discovery
+    requires: service.phase = searching
+    requires: service.owner_verified
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.baseline_complete
+    requires: service.refresh_eligible
+    requires: not service.refresh_attempted
+    requires: service.in_flight_calls.count = 0
+    requires: not service.controller.backoff_active
+    requires: service.burst_deadline > now
+    requires: not service.catchup_first or service.catchup_opportunity_taken or service.controller.searches.all(q => q.complete)
+    requires: service.controller.remaining_calls >= config.maximum_refresh_calls + config.maximum_page_calls + config.work_reserve
+    ensures: service.controller.calls_used = service.controller.calls_used + 1
+    ensures: service.refresh_attempted = true
+    ensures: SlackCall.created(service: service, purpose: fresh_prefix_page, state: in_flight)
+}
+
+rule RecordFreshPrefixEvidence {
+    when: FreshPrefixProcessed(service, evidence)
+    requires: service.phase = searching
+    requires: service.refresh_attempted
+    requires: evidence.controller = service.controller
+    requires: evidence in service.controller.fresh_evidence
+    requires: evidence.search_call.service = service
+    requires: evidence.search_call.purpose = fresh_prefix_page
+    requires: evidence.search_call.state = resolved
+    requires: evidence.observations.all(o => o.source_key in service.controller.gateway.handled_sources)
+    ensures: service.refresh_completed = true
+}
+
+rule ResolveSlackCall {
+    when: SlackCallFinished(call)
+    requires: call.state = in_flight
+    ensures: call.state = resolved
+}
+
+rule VerifyOwnerForService {
+    when: ConnectedOwnerVerified(service)
+    requires: service.phase != finished
+    ensures: service.owner_verified = true
+}
+
+-- A failed call is charged; the deadline blocks later service opportunities
+-- too. An exhausted allowance and a provider backoff are different conditions.
+-- The deadline belongs to this gateway's workspace/owner; retained historical
+-- accounts cannot impose backoff on a permitted different-account configuration.
+rule RetainProviderBackoff {
+    when: SlackCallThrottled(call, retry_deadline)
+    requires: call.state = in_flight
+    requires: retry_deadline > now
+    ensures: call.state = resolved
+    ensures: call.service.controller.retry_not_before = retry_deadline
+}
+
+rule ClearExpiredProviderBackoff {
+    when: UnthrottledServiceCompleted(service)
+    requires: service.controller.retry_not_before != null
+    requires: service.controller.retry_not_before <= now
+    requires: service.in_flight_calls.count = 0
+    ensures: service.controller.retry_not_before = null
+}
+
+-- Both query positions survive a partial burst. Completed queries remain
+-- complete until the whole sweep ends; completion is not a freshness promise.
+rule StartSweep {
+    when: EnsureSearchProgress(service)
+    requires: service.phase = searching
+    requires: service.controller.searches.count = 0
+    ensures: SearchProgress.created(controller: service.controller, kind: prefix, position: null, complete: false)
+    ensures: SearchProgress.created(controller: service.controller, kind: reaction, position: null, complete: false)
+}
+
+rule ObserveBaselineSource {
+    when: VerifiedCandidateObserved(service, observation)
+    requires: service.phase = searching
+    requires: service.controller.gateway.enabled
+    requires: not service.controller.gateway.baseline_complete
+    requires: observation.eligible
+    requires: observation.workspace = service.controller.gateway.workspace
+    requires: observation.actor = service.controller.gateway.owner
+    requires: observation.source_key not in service.controller.gateway.handled_sources
+    ensures: service.controller.gateway.handled_sources = service.controller.gateway.handled_sources + {observation.source_key}
+}
+
+rule SubmitReadySource {
+    when: VerifiedCandidateObserved(service, observation)
+    requires: service.phase = searching
+    requires: service.controller.gateway.enabled
+    requires: service.controller.gateway.baseline_complete
+    ensures: lifecycle/EligibleSourceObserved(service.controller.gateway, observation)
+}
+
+rule CheckpointCompletedPage {
+    when: PageProcessingCompleted(service, evidence)
+    requires: service.phase = searching
+    requires: evidence.query.controller = service.controller
+    requires: evidence in evidence.query.page_evidence
+    requires: evidence.search_call.service = service
+    requires: evidence.search_call.purpose = search_page
+    requires: evidence.search_call.state = resolved
+    requires: not evidence.query.complete
+    requires: evidence.query.position = evidence.position_read
+    requires: evidence.observations.all(o => o.source_key in service.controller.gateway.handled_sources)
+    ensures: evidence.query.position = evidence.next_position
+    ensures: evidence.query.complete = evidence.next_position = null
+    ensures:
+        if evidence.query.kind = prefix:
+            service.next_query = reaction
+        else:
+            service.next_query = prefix
+}
+
+rule CompleteSweep {
+    when: SweepExamined(service)
+    requires: service.phase = searching
+    requires: service.controller.searches.count = 2
+    requires: service.controller.searches.all(q => q.complete)
+    requires: service.in_flight_calls.count = 0
+    ensures: service.controller.gateway.baseline_complete = true
+    ensures: service.controller.last_completed_scan_at = now
+    ensures:
+        for query in service.controller.searches:
+            not exists query
+    ensures: service.phase = finished
+}
+
+rule FinishServiceOpportunity {
+    when: ServiceFinished(service)
+    requires: service.phase != finished
+    requires: service.in_flight_calls.count = 0
+    ensures: service.phase = finished
+}
+
+rule PreferReactionNextInterval {
+    when: DiscoveryIntervalElapsed(controller)
+    requires: controller.next_first_query = prefix
+    ensures: controller.next_first_query = reaction
+}
+
+rule PreferPrefixNextInterval {
+    when: DiscoveryIntervalElapsed(controller)
+    requires: controller.next_first_query = reaction
+    ensures: controller.next_first_query = prefix
+}
+
+-- Retained state survives; process-local allowance and hints do not. This
+-- does not expand same-version retained-state recovery into cross-host recovery.
+rule RestartGatewayProcess {
+    when: GatewayProcessRestarted(controller, new_process_key)
+    requires: new_process_key != controller.process_key
+    let interrupted_services = controller.active_services
+    let interrupted_calls = SlackCalls where service.controller = controller and state = in_flight
+    ensures: controller.process_key = new_process_key
+    ensures: controller.window_started_at = now
+    ensures: controller.calls_used = 0
+    ensures: controller.next_first_query = prefix
+    ensures:
+        for service in interrupted_services:
+            service.phase = finished
+        for call in interrupted_calls:
+            call.state = resolved
+}
+
+invariant OneControllerPerGateway {
+    for controller in DiscoveryControllers:
+        (DiscoveryControllers where gateway = controller.gateway).count = 1
+}
+
+invariant OneProgressPerQuery {
+    for controller in DiscoveryControllers:
+        for query in controller.searches:
+            (controller.searches where kind = query.kind).count = 1
+}
+
+invariant SearchNeedsDiscovery {
+    for service in ServiceOpportunities:
+        service.phase = searching implies service.kind = discovery
+}
+
+surface DiscoveryBoundary {
+    facing controller: DiscoveryController
+
+    contracts:
+        demands SlackDiscoveryPort
+        demands NativeReconciliationPort
+
+    provides:
+        CheckServiceAllowance(controller)
+        ServiceRequested(controller, kind)
+        AcceptedWorkReconciliationAttempted(service)
+        RequestSlackCall(service, purpose)
+        RequestFreshPrefixCall(service)
+        FreshPrefixProcessed(service, evidence)
+        SlackCallFinished(call)
+        ConnectedOwnerVerified(service)
+        SlackCallThrottled(call, retry_deadline)
+        EnsureSearchProgress(service)
+        VerifiedCandidateObserved(service, observation)
+        PageProcessingCompleted(service, evidence)
+        SweepExamined(service)
+        ServiceFinished(service)
+        DiscoveryIntervalElapsed(controller)
+        GatewayProcessRestarted(controller, new_process_key)
+        ReconcileAcceptedWork(gateway)
+
+    @guarantee SchedulingPolicy
+        -- Owner-facing read-access inspection shares serial service, allowance
+        -- and persisted provider backoff. Its reads cannot accept triggers,
+        -- change saved query positions or acknowledge requests.
+        -- Discovery opportunities occur on the configured discovery interval;
+        -- accepted work is reconciled before any page opportunity. Ready reply
+        -- commits request delivery opportunities; periodic recovery supplies
+        -- them even when hints are lost. At most one service runs at a time;
+        -- missed intervals are not replayed as a burst of concurrent services.
+        -- Check allowance expiry and apply the interval's first-query toggle
+        -- before beginning its service opportunity.
+        -- Delivery opportunities cannot renew unexpired allowance or create
+        -- searches. Any opportunity can check and renew an expired window.
+        -- Page opportunities alternate next_query, skipping a completed query;
+        -- the first query alternates between scheduled discovery opportunities.
+        -- Stop between pages at the burst deadline or below the page threshold.
+        -- An in-flight page/call may exceed the soft deadline. A new sweep waits
+        -- for a subsequent discovery opportunity after both queries complete.
+        -- Once ready, an already advanced/completed prefix query enables one
+        -- newest-prefix-page probe per discovery opportunity. Its evidence uses
+        -- the same verification and acceptance boundary as saved pages, but it
+        -- cannot advance saved positions, complete a sweep, or finish a baseline.
+        -- When catchup_first holds, offer the first unfinished saved query a page
+        -- before refreshing; skip refresh if allowance or time is insufficient.
+        -- Otherwise offer refresh first, then resume saved page opportunities.
+        -- Alternate first opportunity between these classes across intervals.
+        -- A failed fresh probe records its error while other saved pages may
+        -- progress; throttling still blocks all subsequent Slack calls.
+        -- The probe ignores its next cursor. It checks only the newest result;
+        -- additional messages and late indexing remain covered by full catch-up.
+        -- Authentication failure, backoff, exhaustion, or reconciliation error
+        -- can end service without changing unseen source identities or cursors.
+        -- Fair progress is conditional on recurring opportunities, available
+        -- allowance, usable pagination, a finite backlog, and eventually
+        -- successful verification or positive rejection of each candidate.
+        -- Repeated failed verification retains its page; alternating query
+        -- opportunities do not guarantee completion of an unreadable page.
+        -- No fixed Slack indexing, discovery, or response deadline is promised.
+}

@@ -654,7 +654,7 @@ rule TokenRefreshed {
         -- retaining a transport that still uses the old credential.
         -- Only transports retained by this OAuth recovery receive its new
         -- bearer; unrelated stale teardown retries retain their credentials.
-        -- The request whose 401 triggered the refresh (a tools/call or
+        -- For ordinary replay-eligible calls, the request whose 401 triggered the refresh (a tools/call or
         -- initialize) is replayed by the executor with the refreshed bearer
         -- once authorized, so a normal token expiry never surfaces as a tool
         -- failure (see deferred ReAuthCallRetry). Bind dispatch and replay to
@@ -1284,6 +1284,10 @@ deferred ReAuthCallRetry    -- see: crates/phoenix-tools/src/mcp.rs
     -- holding and replaying the specific call belongs to the tool-execution
     -- path. Schema-bound calls re-check their admitted definition after recovery
     -- and return unavailable instead of replaying against a changed definition.
+    -- Durable external-delivery callers may select single-attempt execution.
+    -- That port validates readiness and the selected schema but never replays
+    -- a dispatched call after a transport/auth failure; it returns uncertainty
+    -- to the caller while leaving recovery for later calls available.
     -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
 
 ------------------------------------------------------------

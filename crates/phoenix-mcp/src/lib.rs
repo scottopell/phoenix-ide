@@ -349,6 +349,8 @@ pub struct McpServerStatus {
 /// the variant rather than string-matching the message.
 #[derive(Debug)]
 pub enum McpRequestError {
+    /// Local schema validation stopped the request before transport dispatch.
+    NotDispatched(String),
     /// Classified by the transport. The detail is unprefixed; format with the
     /// server name via `into_message`.
     Transport(TransportError),
@@ -356,8 +358,9 @@ pub enum McpRequestError {
     /// re-established before this server accepts another request because a
     /// stdio response may still arrive on the abandoned stream.
     Cancelled,
-    /// Tool-level failure (`isError` result) or malformed response; the
-    /// string is the complete display message.
+    /// An explicit MCP `isError` tool result, preserving provider evidence.
+    ToolRejected(String),
+    /// Malformed response; the string is the complete display message.
     Other(String),
 }
 
@@ -366,7 +369,9 @@ impl McpRequestError {
         match self {
             Self::Transport(e) => format!("MCP server '{server_name}': {e}"),
             Self::Cancelled => format!("MCP server '{server_name}': tool call cancelled"),
-            Self::Other(message) => message,
+            Self::Other(message) | Self::NotDispatched(message) | Self::ToolRejected(message) => {
+                message
+            }
         }
     }
 }
@@ -375,6 +380,27 @@ impl McpRequestError {
 pub enum McpToolCallError {
     Cancelled,
     Failed(String),
+}
+
+#[derive(Debug)]
+pub enum McpOneShotError {
+    /// No tool request was dispatched.
+    NotDispatched(String),
+    /// The remote tool reported failure. Effects are still application-specific.
+    ToolRejected(String),
+    /// Dispatch may have occurred; another attempt could duplicate a write.
+    Uncertain(String),
+}
+
+impl McpOneShotError {
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotDispatched(message)
+            | Self::Uncertain(message)
+            | Self::ToolRejected(message) => message,
+        }
+    }
 }
 
 impl From<String> for McpToolCallError {
@@ -499,7 +525,9 @@ impl HandshakeFailure {
             }
             other @ (McpRequestError::Transport(_)
             | McpRequestError::Cancelled
-            | McpRequestError::Other(_)) => Self::Other(other.into_message(server_name)),
+            | McpRequestError::Other(_)
+            | McpRequestError::NotDispatched(_)
+            | McpRequestError::ToolRejected(_)) => Self::Other(other.into_message(server_name)),
         }
     }
 }
@@ -1035,7 +1063,7 @@ impl CallContext {
     ) -> Result<String, McpRequestError> {
         if let Some(expected) = expected_schema {
             if self.tools_changed.load(Ordering::Acquire) {
-                return Err(McpRequestError::Other(
+                return Err(McpRequestError::NotDispatched(
                     "EUNAVAIL: MCP catalog changed before execution".into(),
                 ));
             }
@@ -1047,7 +1075,7 @@ impl CallContext {
                 .iter()
                 .any(|tool| tool.name == tool_name && tool.input_schema == *expected)
             {
-                return Err(McpRequestError::Other(format!(
+                return Err(McpRequestError::NotDispatched(format!(
                     "EUNAVAIL: MCP tool '{tool_name}' schema changed or is unavailable"
                 )));
             }
@@ -1107,7 +1135,7 @@ impl CallContext {
         let output = text.join("\n");
 
         if is_error {
-            Err(McpRequestError::Other(output))
+            Err(McpRequestError::ToolRejected(output))
         } else {
             Ok(output)
         }
@@ -1664,34 +1692,48 @@ async fn bind_loopback_listeners(port: u16) -> std::io::Result<Vec<tokio::net::T
 /// loopback `listeners`) to Phoenix's real callback route under `target_base`
 /// (REQ-MCP-020). Accepts in a loop so a retry after a failed token exchange —
 /// which leaves the flow pending — is still received, until the flow resolves
-/// (the listener is aborted) or the 5-minute flow window elapses.
+/// (the listener is aborted) or the local sign-in window expires.
 async fn run_loopback_redirect(
     server: String,
     listeners: Vec<tokio::net::TcpListener>,
     target_base: String,
 ) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(5);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25 * 60);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
-            return;
-        }
         let accepts = listeners
             .iter()
             .map(|l| Box::pin(l.accept()))
             .collect::<Vec<_>>();
         match tokio::time::timeout(remaining, futures::future::select_all(accepts)).await {
-            Ok((Ok((stream, _)), _, _)) => bounce_loopback_callback(stream, &target_base).await,
+            Ok((Ok((stream, _)), _, _)) => {
+                let _ = tokio::time::timeout(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    bounce_loopback_callback(stream, &target_base),
+                )
+                .await;
+            }
             Ok((Err(e), _, _)) => {
                 tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
+                // Retry readiness errors on the same sockets. In particular,
+                // descriptor exhaustion/aborted connections must not discard
+                // both address families or extend the authorization window.
+                if !wait_for_loopback_retry(deadline).await {
+                    return;
+                }
             }
-            Err(_) => {
-                tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
-                return;
-            }
+            Err(_) => return,
         }
     }
+}
+
+async fn wait_for_loopback_retry(deadline: tokio::time::Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    tokio::time::sleep(remaining.min(std::time::Duration::from_millis(500))).await;
+    tokio::time::Instant::now() < deadline
 }
 
 /// Read one callback request off `stream` and reply `302` to Phoenix's real
@@ -1700,7 +1742,11 @@ async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
+    let Ok(Ok(n)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await
+    else {
+        return;
+    };
     let request = String::from_utf8_lossy(&buf[..n]);
     let query = callback_request_query(&request);
     let location = format!(
@@ -1717,7 +1763,7 @@ async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
-    tracing::debug!("OAuth loopback callback bounced to {location}");
+    tracing::debug!(target_base, "OAuth loopback callback bounced to Phoenix");
 }
 
 #[allow(clippy::too_many_lines)] // One ordered sequence: discover, acquire client, bind callback, publish.
@@ -1943,8 +1989,16 @@ enum RefreshServerOutcome {
 // McpClientManager
 // ---------------------------------------------------------------------------
 
+/// Opaque identity of one serving connection; credentials are never exposed.
+#[derive(Clone)]
+pub struct McpConnectionBinding {
+    server_name: String,
+    handle: SupervisorHandle,
+    epoch: u64,
+    config: McpServerConfig,
+}
+
 /// Owns all MCP server connections.
-///
 #[derive(Clone)]
 pub struct McpClientManager {
     servers: Arc<RwLock<ServerMap>>,
@@ -2156,6 +2210,7 @@ impl McpClientManager {
         code: &str,
         iss: Option<&str>,
     ) -> Result<String, String> {
+        self.expire_finished_oauth_listeners().await;
         // The state nonce binds the callback to exactly one pending flow
         // (callback_state_matches): a code injected by another tab, server,
         // or a cancelled flow matches nothing and is rejected before any
@@ -3227,7 +3282,23 @@ impl McpClientManager {
         })
     }
 
+    async fn expire_finished_oauth_listeners(&self) {
+        let expired: Vec<String> = {
+            let listeners = self.oauth.loopback_listeners.lock().unwrap();
+            let pending = self.oauth.pending.lock().unwrap();
+            listeners
+                .iter()
+                .filter(|(_, handle)| handle.is_finished())
+                .filter_map(|(name, _)| pending.get(name).map(|flow| flow.state_nonce.clone()))
+                .collect()
+        };
+        for nonce in expired {
+            self.fail_oauth_authorization(&nonce, "Local OAuth callback window expired after 25 minutes or its listener stopped. Reload MCP to start a new sign-in.").await;
+        }
+    }
+
     pub async fn status(&self) -> Vec<McpServerStatus> {
+        self.expire_finished_oauth_listeners().await;
         let handles: Vec<(String, SupervisorHandle)> = self
             .servers
             .read()
@@ -3378,6 +3449,134 @@ impl McpClientManager {
                 }
                 McpToolCallError::Failed(message) => message,
             })
+    }
+
+    /// Call at most once, preserving whether local readiness prevented dispatch.
+    /// A dispatched call is never replayed after transport or authentication failure.
+    /// # Errors
+    /// Returns `NotDispatched` for local setup refusal, otherwise `Uncertain`.
+    pub async fn call_tool_once(
+        self: &Arc<Self>,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Value,
+        expected_schema: Value,
+    ) -> Result<String, McpOneShotError> {
+        let binding = self.bind_connection(server_name).await?;
+        self.call_tool_once_bound(&binding, tool_name, arguments, expected_schema)
+            .await
+    }
+
+    /// Capture one connection for identity verification and subsequent operations.
+    /// # Errors
+    /// Refuses missing, disabled or unready connections.
+    pub async fn bind_connection(
+        &self,
+        server_name: &str,
+    ) -> Result<McpConnectionBinding, McpOneShotError> {
+        if self.disabled_servers.read().await.contains(server_name) {
+            return Err(McpOneShotError::NotDispatched(format!(
+                "MCP server '{server_name}' is disabled"
+            )));
+        }
+        let handle = self
+            .servers
+            .read()
+            .await
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| {
+                McpOneShotError::NotDispatched(format!(
+                    "MCP server '{server_name}' is not connected"
+                ))
+            })?;
+        let snapshot = handle.snapshot();
+        if !matches!(snapshot.state, SupervisorState::Ready(_)) {
+            return Err(McpOneShotError::NotDispatched(
+                "MCP connection is not ready".into(),
+            ));
+        }
+        Ok(McpConnectionBinding {
+            server_name: server_name.into(),
+            handle,
+            epoch: snapshot.epoch,
+            config: snapshot.config,
+        })
+    }
+
+    /// Dispatch once only on the exact connection previously verified by the caller.
+    /// # Errors
+    /// Connection replacement refuses dispatch; a dispatched result may be uncertain.
+    pub async fn call_tool_once_bound(
+        self: &Arc<Self>,
+        binding: &McpConnectionBinding,
+        tool_name: &str,
+        arguments: Value,
+        expected_schema: Value,
+    ) -> Result<String, McpOneShotError> {
+        let server_name = binding.server_name.as_str();
+        if self.disabled_servers.read().await.contains(server_name)
+            || !self
+                .servers
+                .read()
+                .await
+                .get(server_name)
+                .is_some_and(|current| current.same_actor(&binding.handle))
+        {
+            return Err(McpOneShotError::NotDispatched(
+                "Verified MCP connection was removed or disabled".into(),
+            ));
+        }
+        let handle = binding.handle.clone();
+        let config = binding.config.clone();
+        let outcome = handle
+            .call_bound(
+                config.clone(),
+                Some(binding.epoch),
+                tool_name.to_string(),
+                arguments,
+                CancellationToken::new(),
+                Some(expected_schema),
+            )
+            .await?;
+        // Restore the connection for later callers without replaying this call.
+        // In particular, an expired OAuth session must not remain stranded just
+        // because the caller requires exact per-dispatch accounting.
+        if !matches!(outcome.recovery, CallRecovery::None) {
+            let manager = Arc::clone(self);
+            let name = server_name.to_string();
+            let epoch = outcome.epoch;
+            let recovery = outcome.recovery;
+            let invocation_config = config;
+            self.spawn_background(async move {
+                match recovery {
+                    CallRecovery::OAuth(kind) => {
+                        let _ = manager
+                            .recover_oauth_for_config(
+                                &name,
+                                &handle,
+                                epoch,
+                                kind,
+                                &invocation_config,
+                            )
+                            .await;
+                    }
+                    CallRecovery::Transport | CallRecovery::CancelledTransport => {
+                        let _ = manager.recover_actor(&name, &handle, epoch, None).await;
+                    }
+                    CallRecovery::None => {}
+                }
+            });
+        }
+        outcome.result.map_err(|e| match e {
+            McpRequestError::NotDispatched(message) => McpOneShotError::NotDispatched(message),
+            McpRequestError::ToolRejected(message) => McpOneShotError::ToolRejected(message),
+            other @ (McpRequestError::Transport(_)
+            | McpRequestError::Cancelled
+            | McpRequestError::Other(_)) => {
+                McpOneShotError::Uncertain(other.into_message(server_name))
+            }
+        })
     }
 
     /// # Errors
@@ -3596,10 +3795,10 @@ impl McpClientManager {
                         {
                             self.wait_for_ready(handle, &cancel).await?;
                         }
-                        Err(error) if error == "MCP tool call cancelled" => {
+                        Err(error) if error.message() == "MCP tool call cancelled" => {
                             return Err(McpToolCallError::Cancelled);
                         }
-                        Err(error) => return Err(McpToolCallError::Failed(error)),
+                        Err(error) => return Err(McpToolCallError::Failed(error.message().into())),
                     }
                 }
                 SupervisorState::Connecting | SupervisorState::Recovering => {
@@ -5788,6 +5987,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_single_attempt_refuses_replaced_connections_before_dispatch() {
+        for replace_actor in [false, true] {
+            let schema = serde_json::json!({"type":"object"});
+            let (first, first_calls, _) = fake_server(vec![]);
+            *first.tools.write().unwrap() = vec![McpToolDef {
+                name: "post".into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            }];
+            let handle = server_handle(first);
+            let manager = Arc::new(McpClientManager::new());
+            manager
+                .servers
+                .write()
+                .await
+                .insert("fake".into(), handle.clone());
+            let binding = manager.bind_connection("fake").await.unwrap();
+            let (replacement, replacement_calls, _) =
+                fake_server(vec![exchange(Ok(serde_json::json!({"content":[]})))]);
+            *replacement.tools.write().unwrap() = vec![McpToolDef {
+                name: "post".into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            }];
+            if replace_actor {
+                manager
+                    .servers
+                    .write()
+                    .await
+                    .insert("fake".into(), server_handle(replacement));
+            } else {
+                let epoch = handle.reconfigure(handle.snapshot().config).await.unwrap();
+                assert!(handle.publish(epoch, replacement).await);
+            }
+            assert!(matches!(
+                manager
+                    .call_tool_once_bound(&binding, "post", serde_json::json!({}), schema.clone())
+                    .await,
+                Err(McpOneShotError::NotDispatched(_))
+            ));
+            assert!(first_calls.lock().unwrap().is_empty());
+            assert!(replacement_calls.lock().unwrap().is_empty());
+            let current = manager.bind_connection("fake").await.unwrap();
+            manager
+                .call_tool_once_bound(&current, "post", serde_json::json!({}), schema)
+                .await
+                .unwrap();
+            assert_eq!(replacement_calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn single_attempt_does_not_replay_dispatched_reads_or_writes() {
+        for name in ["post", "read_thread"] {
+            let (server, requests, _) = fake_server(vec![exchange(Err(
+                TransportError::Disconnected("response lost after write".into()),
+            ))]);
+            let schema = serde_json::json!({"type":"object"});
+            *server.tools.write().unwrap() = vec![McpToolDef {
+                name: name.into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            }];
+            let manager = Arc::new(McpClientManager::new());
+            let handle = server_handle(server);
+            let epoch = handle.snapshot().epoch;
+            manager
+                .servers
+                .write()
+                .await
+                .insert("fake".into(), handle.clone());
+            assert!(matches!(
+                manager
+                    .call_tool_once("fake", name, serde_json::json!({}), schema)
+                    .await,
+                Err(McpOneShotError::Uncertain(_))
+            ));
+            tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+                .await
+                .expect("connection recovery must settle without tool replay");
+            assert!(handle.snapshot().epoch > epoch);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "a dispatch must not be replayed during recovery: {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_attempt_setup_failures_are_definitely_unsent() {
+        let manager = Arc::new(McpClientManager::new());
+        let schema = serde_json::json!({"type":"object"});
+        assert!(matches!(
+            manager
+                .call_tool_once("missing", "post", serde_json::json!({}), schema.clone())
+                .await,
+            Err(McpOneShotError::NotDispatched(_))
+        ));
+        let (server, requests, _) = fake_server(vec![]);
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".into(), server_handle(server));
+        assert!(matches!(
+            manager
+                .call_tool_once("fake", "post", serde_json::json!({}), schema.clone())
+                .await,
+            Err(McpOneShotError::NotDispatched(_))
+        ));
+        manager.disabled_servers.write().await.insert("fake".into());
+        assert!(matches!(
+            manager
+                .call_tool_once("fake", "post", serde_json::json!({}), schema)
+                .await,
+            Err(McpOneShotError::NotDispatched(_))
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn call_tool_surfaces_is_error_result_as_tool_error() {
         let (server, _, _) = fake_server(vec![exchange(Ok(serde_json::json!({
             "isError": true,
@@ -5799,6 +6120,7 @@ mod tests {
             .await
             .expect_err("isError result must be an error");
 
+        assert!(matches!(&err, McpRequestError::ToolRejected(message) if message == "boom"));
         assert!(!server.should_reestablish(&err));
         assert_eq!(err.into_message("fake"), "boom");
     }
@@ -5856,6 +6178,146 @@ mod tests {
             *tool_call_timeout = Duration::from_secs(900);
         }
         assert_ne!(base, changed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oauth_accept_retry_preserves_its_original_window_and_yields() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        for _ in 0..3 {
+            let before = tokio::time::Instant::now();
+            assert!(wait_for_loopback_retry(deadline).await);
+            assert!(
+                tokio::time::Instant::now() > before,
+                "readiness failures must not spin"
+            );
+        }
+        assert!(!wait_for_loopback_retry(deadline).await);
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert!(!wait_for_loopback_retry(deadline).await);
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_listener_outlives_five_minutes_and_accepts_retries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::time::pause();
+        let task = tokio::spawn(run_loopback_redirect(
+            "fixture".into(),
+            vec![listener],
+            "https://localhost:8021".into(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(301)).await;
+        assert!(
+            !task.is_finished(),
+            "a published sign-in must retain its callback listener"
+        );
+        tokio::time::resume();
+        for query in [
+            "code=fixture%2Bcode&state=fixture",
+            "code=retry&state=fixture",
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET /callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 302 Found"));
+            assert!(response.contains(&format!(
+                "Location: https://localhost:8021/api/mcp/oauth/callback?{query}\r\n"
+            )));
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(25 * 60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "the 25-minute local sign-in window is bounded"
+        );
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn expired_callback_listener_clears_sign_in_url_and_preserves_reload_retry() {
+        let manager = Arc::new(McpClientManager::new());
+        let (server, _, _) = fake_server(vec![]);
+        let config = server.config.clone();
+        let owner = server_handle(server);
+        let RecoveryClaim::Leader(permit) = owner.claim_oauth_recovery(0).await else {
+            panic!("recovery owner")
+        };
+        assert!(
+            owner
+                .await_oauth(
+                    permit.epoch,
+                    "https://auth.example/authorize".into(),
+                    "sign in".into()
+                )
+                .await
+        );
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fixture".into(), owner.clone());
+        manager
+            .pending_oauth_urls
+            .write()
+            .await
+            .insert("fixture".into(), "https://auth.example/authorize".into());
+        manager.oauth.pending.lock().unwrap().insert(
+            "fixture".into(),
+            PendingAuthFlow {
+                www_authenticate: None,
+                owner: Some(OAuthFlowOwner::Reconnect(owner, permit.epoch)),
+                config,
+                state_nonce: "fixture-nonce".into(),
+                pkce_verifier: "fixture-verifier".into(),
+                redirect_uri: "http://localhost:3118/callback".into(),
+                token_endpoint: "https://auth.example/token".into(),
+                issuer: "https://auth.example".into(),
+                iss_required: false,
+                registration: OAuthRegistrationRecord {
+                    auth_server: "https://auth.example".into(),
+                    client_id: "fixture".into(),
+                    client_secret: None,
+                    token_endpoint_auth_method: "none".into(),
+                    redirect_uri: None,
+                },
+                resource: "https://mcp.example".into(),
+                scopes: vec!["mcp.read".into()],
+            },
+        );
+        let listener = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+        assert!(listener.is_finished());
+        manager
+            .oauth
+            .loopback_listeners
+            .lock()
+            .unwrap()
+            .insert("fixture".into(), listener);
+        let status = manager.status().await;
+        let fixture = status.iter().find(|s| s.name == "fixture").unwrap();
+        assert!(fixture.pending_oauth_url.is_none());
+        assert_eq!(fixture.state, McpConnState::Failed);
+        assert!(fixture
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("25 minutes"));
+        assert!(manager.oauth.pending.lock().unwrap().is_empty());
+        assert!(manager.pending_oauth_urls.read().await.is_empty());
+        assert!(manager
+            .complete_oauth_authorization("fixture-nonce", "unexchanged", None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

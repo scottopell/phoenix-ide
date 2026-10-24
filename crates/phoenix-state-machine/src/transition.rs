@@ -2466,6 +2466,7 @@ pub fn transition_parent(
                     idempotent: false,
                 })
                 .with_effect(Effect::PersistUserInputMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
                     content: phoenix_core::domain::db_schema::MessageContent::user(annotations),
                     message_id: uuid::Uuid::new_v4().to_string(),
                 })
@@ -2527,6 +2528,7 @@ pub fn transition_parent(
                 ..
             },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                source,
                 request_id,
                 answers,
                 annotations,
@@ -2569,7 +2571,14 @@ pub fn transition_parent(
                 }))
                 .with_effect(Effect::PersistUserInputMessage {
                     content: phoenix_core::domain::db_schema::MessageContent::user(user_text),
-                    message_id: uuid::Uuid::new_v4().to_string(),
+                    message_id: source.as_ref().map_or_else(
+                        || uuid::Uuid::new_v4().to_string(),
+                        |s| s.message_id.clone(),
+                    ),
+                    origin: source
+                        .map_or(phoenix_core::domain::db_schema::InputOrigin::UserApi, |s| {
+                            s.origin
+                        }),
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -8044,6 +8053,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercise successive question identities and stale responses together.
     fn question_request_identity_is_fresh_and_rejects_stale_actions() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
@@ -8098,6 +8108,7 @@ mod tests {
                 &q2,
                 &test_context(),
                 Event::UserQuestionResponse {
+                    source: None,
                     request_id: Some(q1_id.clone()),
                     answers: answers.clone(),
                     annotations: None,
@@ -8119,12 +8130,19 @@ mod tests {
             &q2,
             &test_context(),
             Event::UserQuestionResponse {
+                source: Some(phoenix_core::domain::sm_event::QuestionAnswerSource {
+                    message_id: "slack-answer-input".into(),
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                        request_id: "slack-answer-request".into(),
+                    },
+                }),
                 request_id: Some(q2_id.clone()),
                 answers,
                 annotations: None,
             },
         )
         .unwrap();
+        assert!(answered.effects.iter().any(|effect|matches!(effect,Effect::PersistUserInputMessage {message_id,origin:phoenix_core::domain::db_schema::InputOrigin::SlackGateway {request_id},..} if message_id=="slack-answer-input" && request_id=="slack-answer-request")));
         assert!(matches!(
             answered.new_state,
             ConvState::LlmRequesting { attempt: 1 }
@@ -8141,6 +8159,7 @@ mod tests {
             &q2,
             &test_context(),
             Event::UserQuestionResponse {
+                source: None,
                 request_id: None,
                 answers: std::collections::HashMap::new(),
                 annotations: None,
@@ -8438,6 +8457,7 @@ mod tests {
             &state,
             &test_context(),
             Event::UserQuestionResponse {
+                source: None,
                 request_id: Some(request_id),
                 answers,
                 annotations: None,

@@ -1382,14 +1382,12 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         registry_source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
         registry_match = re.search(r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)", registry_source, re.DOTALL)
         self.assertIsNotNone(registry_match)
-        historical_entries, removed = re.subn(
-            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
-            "",
+        historical_entries = re.sub(
+            r"    Migration\s*\{\s*version:\s*(\d+),.*?\n    \},",
+            lambda entry: entry.group(0) if int(entry.group(1)) <= 128 else "",
             registry_match.group(2),
-            count=1,
             flags=re.DOTALL,
         )
-        self.assertEqual(1, removed, "synthetic qualified-128 fixture requires current migration 129")
         historical_registry = self.transaction / "qualified-128-migrations.rs"
         historical_registry.write_text(
             registry_source[:registry_match.start(2)] + historical_entries + registry_source[registry_match.end(2):]

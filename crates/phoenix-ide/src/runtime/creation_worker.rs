@@ -125,12 +125,20 @@ async fn process_claimed_product_creation(
         Stage::ResolveRepository,
     )
     .await?;
-    let repo_root = tokio::task::spawn_blocking({
-        let cwd = cwd.clone();
-        move || discover_product_repository(Path::new(&cwd))
-    })
-    .await
-    .map_err(|error| format!("repository discovery join failed: {error}"))??;
+    let direct_gateway = matches!(
+        job.intent.origin,
+        crate::db::ProductCreationOrigin::SlackGateway { .. }
+    );
+    let repo_root = if direct_gateway {
+        None
+    } else {
+        tokio::task::spawn_blocking({
+            let cwd = cwd.clone();
+            move || discover_product_repository(Path::new(&cwd))
+        })
+        .await
+        .map_err(|error| format!("repository discovery join failed: {error}"))??
+    };
 
     let (
         effective_cwd,
@@ -3145,7 +3153,9 @@ mod product_creation_delivery_replay_tests {
     }
 
     fn initialized_product_repository() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().unwrap();
+        // Selected working directories reject symlink segments, including macOS /var.
+        // ast-grep-ignore: no-direct-temp-dir-reads -- test fixture uses the canonical host temp root.
+        let repo = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         for args in [
             vec!["init", "--initial-branch=main"],
             vec!["config", "user.name", "Product Creation Test"],
@@ -3355,7 +3365,8 @@ mod product_creation_delivery_replay_tests {
     async fn direct_product_creation_advances_noop_phases_in_sequence() {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
-        let directory = tempfile::tempdir().unwrap();
+        // ast-grep-ignore: no-direct-temp-dir-reads -- test fixture uses the canonical host temp root.
+        let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         sqlx::raw_sql(
             "CREATE TABLE observed_creation_stages (stage TEXT NOT NULL);
              CREATE TRIGGER observe_creation_stage AFTER UPDATE OF provisioning_stage

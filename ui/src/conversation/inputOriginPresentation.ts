@@ -16,6 +16,8 @@ export function inputOriginPresentation(origin: InputOrigin | undefined): {
         title: `From conversation ID ${origin.product_conversation_id} · transcript ID ${origin.transcript_id}`,
         className: 'meta',
       };
+    case 'slack_gateway':
+      return { label: 'Slack request', title: `Slack request ${origin.request_id}`, className: 'user' };
     case 'subscription_event':
       return { label: 'Conversation event', title: 'Conversation event', className: 'meta' };
     case 'system_generated':

@@ -90,7 +90,10 @@ pagination, or error handling.
 WHERE a server is stdio
 THE SYSTEM SHALL spawn it as a child process with piped stdin/stdout/stderr,
 drain stderr to logs, detect process exit, and respawn-and-reinitialize on a
-crash-like I/O failure before retrying the failed call once.
+crash-like I/O failure before retrying an ordinary replay-eligible failed call once.
+
+WHEN a durable external-delivery caller selects single-attempt execution,
+THE SYSTEM SHALL preserve ready-state and discovered-schema validation but SHALL NOT replay a dispatched call after a transport or authentication failure. The caller SHALL receive the failure so it can retain uncertain delivery evidence; connection recovery for later calls SHALL remain available.
 
 **Rationale:** A local subprocess can crash; transparent respawn keeps its
 tools usable without operator intervention. Stderr drain prevents the child
@@ -560,8 +563,15 @@ each received callback to its real callback route. THE SYSTEM SHALL bind the
 listener before surfacing the authorization URL and fail the flow if the port
 cannot be bound, so a sign-in URL is never published when its callback could not
 be received. The listener SHALL bind loopback only (both IP families), accept
-callbacks until the flow resolves or the flow window elapses (a failed exchange
-leaves the flow retryable, so the listener must remain), and a prior listener
+callbacks until the flow resolves or the 25-minute local sign-in window expires
+(a failed exchange leaves the flow retryable within that window).
+Transient callback accept failures SHALL retain the bound sockets and retry
+with bounded backoff within the original window, without extending it.
+Status and
+callback handling SHALL clear authorization URLs whose loopback listener has
+stopped and surface a retryable sign-in failure, rather than leave a dead link
+visible. This local deadline SHALL NOT extend provider code or token expiry.
+A prior listener
 for the same server SHALL be cancelled and its port released before a new flow
 binds it. A malformed `callbackPort` (non-integer, zero, or out of range)
 SHALL make the server config unusable rather than silently falling back to a

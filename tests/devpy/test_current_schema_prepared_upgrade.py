@@ -60,7 +60,7 @@ def compiled_ledger(through: int | None = QUALIFIED_TARGET) -> list[tuple[int, s
             registry,
         )
     ]
-    return migrations if through is None else [item for item in migrations if item[0] <= through]
+    return [item for item in migrations if item[0] <= (129 if through is None else through)]
 
 
 class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
@@ -68,8 +68,7 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.current_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
-        source = self.current_registry.read_text()
+        source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
         registry_match = re.search(
             r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)",
             source,
@@ -77,14 +76,27 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         )
         self.assertIsNotNone(registry_match)
         entries = registry_match.group(2)
-        historical_entries, removed = re.subn(
-            r"    Migration\s*\{\s*version:\s*129,.*?\n    \},",
-            "",
+        target129_entries = re.sub(
+            r"    Migration\s*\{\s*version:\s*(\d+),.*?\n    \},",
+            lambda entry: entry.group(0) if int(entry.group(1)) <= 129 else "",
             entries,
-            count=1,
             flags=re.DOTALL,
         )
-        self.assertEqual(removed, 1, "historical registry fixture requires migration 129")
+        self.current_registry = self.root / "qualified-129-migrations.rs"
+        self.current_registry.write_text(
+            source[:registry_match.start(2)] + target129_entries + source[registry_match.end(2):]
+        )
+        # Synthetic historical candidate bytes; production artifact pins stay unchanged.
+        for name in ("PREPARED_SOURCE128_REGISTRY_SHA256", "PREPARED_SCHEMA129_REGISTRY_SHA256"):
+            pin = mock.patch.object(helper, name, helper.sha256(self.current_registry))
+            pin.start()
+            self.addCleanup(pin.stop)
+        historical_entries = re.sub(
+            r"    Migration\s*\{\s*version:\s*(\d+),.*?\n    \},",
+            lambda entry: entry.group(0) if int(entry.group(1)) <= QUALIFIED_TARGET else "",
+            entries,
+            flags=re.DOTALL,
+        )
         self.registry = self.root / "qualified-128-migrations.rs"
         self.registry.write_text(
             source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
@@ -575,6 +587,11 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
             helper.migration_registry(current_registry)
         with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
             helper.validate_current_schema_database(database, current_registry)
+
+    def test_latest_registry_is_not_admitted_by_historical_qualification(self) -> None:
+        registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        with self.assertRaisesRegex(helper.ActivationError, "newer than the qualified target"):
+            helper.migration_registry(registry, qualified_source128=True)
 
     def test_exact_candidate_target_is_also_an_admitted_prepared_source(self) -> None:
         database = self.database(through=128)
