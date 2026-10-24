@@ -1,3 +1,4 @@
+import type { WatchGoalCapture } from './generated/WatchGoalCapture';
 import type { ChainSseWireEvent } from './generated/ChainSseWireEvent';
 // SSE wire-format runtime validation (task 02674) + compile-time
 // alignment to Rust-generated types (task 02677).
@@ -114,9 +115,29 @@ export const MESSAGE_TYPE_OPTIONS = [
   'continuation',
 ] as const;
 
+const RemoteOriginInstanceSchema = v.pipe(
+  v.string(),
+  v.regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+);
+
 export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.variant('kind', [
   v.looseObject({ kind: v.literal('unknown_historical') }),
   v.looseObject({ kind: v.literal('user_api') }),
+  v.looseObject({ kind: v.literal('remote_api'), instance_id: RemoteOriginInstanceSchema }),
+  v.looseObject({
+    kind: v.literal('remote_conversation'),
+    instance_id: RemoteOriginInstanceSchema,
+    product_conversation_id: v.pipe(v.string(), v.nonEmpty()),
+    transcript_id: v.pipe(v.string(), v.nonEmpty()),
+    source_call: v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })),
+  }),
+  v.looseObject({
+    kind: v.literal('remote_coordinator'),
+    instance_id: RemoteOriginInstanceSchema,
+    product_conversation_id: v.pipe(v.string(), v.nonEmpty()),
+    transcript_id: v.pipe(v.string(), v.nonEmpty()),
+    source_call: v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })),
+  }),
   v.looseObject({ kind: v.literal('system_generated') }),
   v.looseObject({ kind: v.literal('subscription_event'), event_id: v.string() }),
   v.looseObject({
@@ -127,8 +148,37 @@ export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.varian
   }),
 ]);
 
+const FederatedEventOutcomeSchema = v.picklist(['completed', 'failed', 'cancelled']);
+const FederatedEventUrlSchema = v.pipe(v.string(), v.url(), v.check(value => {
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return url.protocol === 'https:' && !url.username && !url.password;
+}, 'Expected a credential-free HTTPS destination URL'));
+const FederatedEventNavigationSchema = v.variant('status', [
+  v.object({ status: v.literal('available'), stable_url: FederatedEventUrlSchema, source_url: FederatedEventUrlSchema }),
+  v.object({ status: v.literal('unavailable'), reason: v.picklist(['missing_connection', 'missing_locator', 'invalid_locator']) }),
+]);
+
+const goalOwnerVersion = v.pipe(v.number(), v.safeInteger(), v.minValue(0));
+const capturedGoalVersion = v.pipe(v.number(), v.safeInteger(), v.minValue(1));
+const capturedGoalText = v.pipe(v.string(), v.check(value => value.trim().length > 0));
+const watchGoalCaptureSchema = v.variant('kind', [
+  v.strictObject({ kind: v.literal('legacy_not_captured') }),
+  v.strictObject({ kind: v.literal('not_captured_disabled') }),
+  v.strictObject({ kind: v.literal('captured_no_goal'), owner_id: capturedGoalText, owner_version: goalOwnerVersion, usage: v.literal('unavailable_not_captured') }),
+  v.strictObject({ kind: v.literal('captured_saved_goal'), owner_id: capturedGoalText, goal_id: capturedGoalText, objective: capturedGoalText,
+    owner_version: capturedGoalVersion, usage: v.literal('unavailable_not_captured'), state: v.variant('kind', [
+      v.strictObject({ kind: v.literal('underway') }),
+      v.strictObject({ kind: v.literal('blocked'), reason: capturedGoalText }),
+      v.strictObject({ kind: v.literal('complete'), reason: capturedGoalText }),
+      v.strictObject({ kind: v.literal('exhausted'), reason: capturedGoalText }),
+      v.strictObject({ kind: v.literal('suspended'), reason: capturedGoalText }),
+    ]),
+  }),
+]) satisfies v.GenericSchema<unknown, WatchGoalCapture>;
+
 export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation> = v.variant('status', [
-  v.looseObject({
+  v.pipe(v.looseObject({
     status: v.literal('available'),
     event_id: v.string(),
     product_conversation_id: v.string(),
@@ -139,6 +189,7 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
     source_generation: v.number(),
     occurred_at_us: v.number(),
     provenance: v.picklist(['subscription', 'mandatory_close_failure']),
+    goal_capture: v.nullable(watchGoalCaptureSchema),
     outcome: v.variant('kind', [
       v.looseObject({ kind: v.literal('turn_finished') }),
       v.looseObject({ kind: v.literal('failed'), reason: v.string() }),
@@ -146,8 +197,33 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
       v.looseObject({ kind: v.literal('cancelled') }),
       v.looseObject({ kind: v.literal('awaiting_user_response') }),
       v.looseObject({ kind: v.literal('awaiting_task_approval') }),
+      v.looseObject({ kind: v.literal('goal_changed') }),
     ]),
+  }), v.check(event => {
+    const changed = event.outcome.kind === 'goal_changed';
+    if (changed !== (event.source_occurrence_kind === 'goal_change')) return false;
+    if (event.provenance === 'mandatory_close_failure') return event.goal_capture === null && !changed;
+    const capture = event.goal_capture;
+    if (capture === null) return false;
+    if ('owner_id' in capture && capture.owner_id !== event.product_conversation_id) return false;
+    return !changed || (capture.kind === 'captured_saved_goal' && capture.owner_version === event.source_generation && capture.owner_id === event.source_occurrence_id);
+  }, 'Saved goal facts differ from the local occurrence or route')),
+  v.looseObject({
+    status: v.literal('federated_fact'), event_id: v.string(), instance_id: v.string(),
+    product_conversation_id: v.string(), source_transcript_id: v.string(),
+    outcome: FederatedEventOutcomeSchema, occurred_at_us: v.number(), navigation: FederatedEventNavigationSchema,
   }),
+  v.pipe(v.looseObject({
+    status: v.literal('federated_gap'), event_id: v.string(), instance_id: v.string(),
+    product_conversation_id: v.string(), current_transcript_id: v.string(),
+    requested_after: v.pipe(v.number(), v.integer(), v.minValue(0)),
+    resume_after: v.pipe(v.number(), v.integer(), v.minValue(1)),
+    current: v.variant('kind', [
+      v.object({ kind: v.literal('nonterminal') }),
+      v.object({ kind: v.literal('terminal'), outcome: FederatedEventOutcomeSchema }),
+    ]),
+    navigation: FederatedEventNavigationSchema,
+  }), v.check(gap => gap.resume_after > gap.requested_after, 'Gap must advance the replay cursor')),
   v.looseObject({
     status: v.literal('unavailable'),
     event_id: v.string(),

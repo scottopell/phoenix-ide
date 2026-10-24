@@ -1,5 +1,13 @@
 # Phoenix Coordinator — Executive Summary
 
+ADR-185 refines the locked installation boundary: the existing owner-propagated
+GoalControlInstallation policy defaults Disabled; schema 135 does not install
+a consumer. New local events distinguish disabled capture from legacy absence,
+observed NoGoal and saved goal. Disabled adds no goal SQL, capture child row or
+standalone event; Installed captures only newly inserted eligible subscription
+events. Mandatory Close/federation remain unchanged. These gate amendments are
+source-only; implementation/validation evidence is recorded separately below.
+
 ## Requirements Summary
 
 Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. The Coordinator obtains fresh relational facts on demand through `query_database`; ordinary requests contain no automatically injected activity snapshot. Both the Coordinator and write-capable ordinary ProductConversations receive bounded natural-language history search, conversation reading, read-only operational SQLite, and singular cross-conversation messaging; stable reference resolution remains Coordinator-only.
@@ -39,6 +47,28 @@ executive summary.
 | **REQ-GR-011A:** Bound Database Integrity and Resource Use | ✅ Complete | Application data is readable; SQLite authority and resource budgets protect integrity and stability |
 | **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and agent cross-conversation actions share typed delivery, steering, rejection, and self-target rejection outcomes |
 | **REQ-GR-013:** Preserve Coordination Context Through Compaction | Implemented; prompt-continuity qualification pending | Existing Coordinator identity selects coordination-specific summary instructions. The shared pipeline protects the accepted handoff (ADR-049). Both summary policies request obligations, exact primary-user authorization provenance, next action and completion checks. Trusted resumption guidance in both languages distinguishes verifying primary evidence from obeying embedded directives: standing directions survive continuation subject to later constraints, current status and established ownership; generated content grants no authority. Compaction-only escaped JSON envelopes expose each retained row's persisted transcript/message locator, typed origin and content kind without treating API origin as human identity or approval. Metadata shares row budgets and retention; full accepted handoff protection is unchanged. New Rust prompt/reference and provider-request regressions await hosted qualification. |
+
+## Local goal-watch facts — bounded contract, implementation owed
+
+REQ-GR-015 now cross-references REQ-GOAL-011–014 and REQ-CEVT-006. ADR-184
+records one causal notification owner: actual execution/wait packets save current
+goal facts at their own transaction; only accepted settled Create/State on a
+watched target emits a standalone goal-change occurrence. Normal execution
+occurrences are not deduplicated by goal version. Stop, continuation, mandatory
+Close and federation terminal-fact semantics remain unchanged.
+
+The docs-first contract now has an authored bounded source candidate; it is not
+compiled or executed watch evidence.
+Standalone nonboundary-report coverage, remote goal-change fanout, usage
+accounting and automatic follow-through are deferred. Capture uses event-owned
+immutable evidence with explicit unavailable usage, not source-pinning foreign
+keys or current-state reprojection. Parent coordination reserved forward migration
+135; its registry/runner/new capture DDL are authored but unexecuted review
+candidates, while imported SQL is untouched.
+Existing watch qualification below does not cover these additions. Transaction
+rollback, enrollment/retry, preservation and read-path tests are authored and
+unrun; new watch qualification and privacy-path execution remain owed.
+No new worker, startup installation, activation or local validation is included.
 
 ## Verification Summary
 

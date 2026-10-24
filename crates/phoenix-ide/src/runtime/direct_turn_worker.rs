@@ -143,6 +143,8 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
     watch_delivery: Option<Arc<RuntimeManager>>,
+    subscription_sync:
+        Arc<tokio::sync::Mutex<crate::api::federation::subscriptions::SubscriptionSync>>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -167,6 +169,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             clock,
             process_incarnation,
             watch_delivery: None,
+            subscription_sync: Arc::default(),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
@@ -180,6 +183,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
     async fn deliver_watch_events(&self) {
         if let Some(manager) = &self.watch_delivery {
             crate::coordinator_watch_delivery::deliver_pass(manager).await;
+            self.subscription_sync.lock().await.sync_pass(manager).await;
         }
     }
 
@@ -365,6 +369,14 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         candidate: DiscoverableAcceptedTurn,
         now: Timestamp,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        if matches!(
+            candidate.prepared.input(),
+            phoenix_workflow::PreparedTurnInput::GoalStart(_)
+        ) {
+            tracing::debug!(turn_id = candidate.turn_id.0,
+                "typed Goal Start adoption is not installed; retaining accepted input without dispatch");
+            return Ok(());
+        }
         let lease_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
         let claim_input = ClaimAuthoritativeTurnInput {
             turn_id: candidate.turn_id,
@@ -394,9 +406,14 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         let Some(authority) = claim.authority else {
             return Ok(());
         };
-        let prepared = match PreparedDirectTurnPayload::from_exact_bytes(
-            candidate.prepared.payload(),
-        ) {
+        let prepared = match candidate
+            .prepared
+            .message_payload()
+            .map_err(|error| format!("{error:?}"))
+            .and_then(|bytes| {
+                PreparedDirectTurnPayload::from_exact_bytes(bytes)
+                    .map_err(|error| error.to_string())
+            }) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let terminal = phoenix_workflow::TurnCommand::Fail {

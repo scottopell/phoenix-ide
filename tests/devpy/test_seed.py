@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 import sqlite3
 import tempfile
 import unittest
@@ -12,7 +13,8 @@ def load_devpy():
     spec = importlib.util.spec_from_file_location("devpy_seed_under_test", ROOT / "dev.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with mock.patch.dict(sys.modules, {spec.name: module}):
+        spec.loader.exec_module(module)
     return module
 
 

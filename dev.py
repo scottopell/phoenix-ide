@@ -17,6 +17,7 @@ import datetime
 import enum
 import fcntl
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -136,6 +137,12 @@ class CheckWorkProfile:
     finalized_monotonic_ns: int | None = None
     metadata: dict = dataclasses.field(default_factory=dict)
     artifacts_finalized: bool = False
+    goal_owned_process: subprocess.Popen | None = None
+    goal_owned_reader: threading.Thread | None = None
+    goal_reader_stop: threading.Event | None = None
+    goal_owned_output: "_QualificationOutputLog | None" = None
+    goal_owned_finisher: threading.Thread | None = None
+    goal_capture_error: str = ""
 
     @classmethod
     def start(cls, artifact_dir: Path | None = None):
@@ -217,10 +224,139 @@ def _profile_failed(error: BaseException | None) -> bool:
     return _profile_returncode(error) != 0
 
 
+def _goal_begin_cleanup(profile):
+    if "goal_cleanup_deadline" not in profile.metadata:
+        profile.metadata["goal_cleanup_deadline"] = min(
+            time.monotonic() + 10, profile.metadata["goal_step_deadline_ns"] / 1e9)
+    return profile.metadata["goal_cleanup_deadline"]
+
+
+def _goal_reap_before_finalize(profile, *, terminate=False, timed_out=False):
+    if profile.metadata.get("goal_cleanup_failed"):
+        raise RuntimeError("focused closure INCOMPLETE; original cleanup deadline remains final")
+    proc = profile.goal_owned_process
+    if proc is None:
+        return profile.goal_capture_error
+    deadline = _goal_begin_cleanup(profile)
+    log = profile.goal_owned_output
+
+    def remaining():
+        return max(0, deadline - time.monotonic())
+
+    def incomplete(message):
+        profile.metadata["goal_unreaped"] = True
+        profile.metadata["goal_cleanup_failed"] = message
+        if log is not None:
+            # Diagnostic only: do not acquire a possibly reader-owned lock.
+            log.error = f"{message}; payload INCOMPLETE"
+        raise RuntimeError(f"{message}; focused closure INCOMPLETE")
+
+    def signal_unreaped(signum):
+        # returncode may have become known even when Popen.wait raised.
+        if proc.returncode is None:
+            if remaining() <= 0:
+                incomplete("focused signal has no remaining ownership budget")
+            try:
+                os.killpg(proc.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    try:
+        if terminate:
+            signal_unreaped(signal.SIGTERM if timed_out else signal.SIGKILL)
+        if proc.returncode is None:
+            if remaining() <= 0:
+                incomplete("focused root has no remaining reap budget")
+            try:
+                proc.wait(timeout=min(2, remaining()))
+            except subprocess.TimeoutExpired:
+                if proc.returncode is None:
+                    signal_unreaped(signal.SIGKILL)
+                    if remaining() <= 0:
+                        incomplete("focused root remains unreaped at deadline")
+                    try:
+                        proc.wait(timeout=remaining())
+                    except subprocess.TimeoutExpired:
+                        incomplete("focused root remains unreaped at deadline")
+        if proc.returncode is None:
+            incomplete("focused root has no terminal status")
+        # Observation only: no TERM/KILL after root reaping, even on interruption.
+        while True:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+            if remaining() <= 0:
+                incomplete("focused group remains observable at deadline")
+            time.sleep(min(0.01, remaining()))
+        reader = profile.goal_owned_reader
+        if reader is not None and reader.ident is not None:
+            reader.join(timeout=min(log.DRAIN_SECONDS if log is not None else 5, remaining()))
+            if reader.is_alive():
+                if log is not None:
+                    log.error = "stdout remained open after root wait; payload INCOMPLETE; writer ownership unresolved"
+                profile.goal_reader_stop.set()
+                reader.join(timeout=remaining())
+            if reader.is_alive():
+                incomplete("focused output reader remains alive at deadline")
+        if remaining() <= 0:
+            incomplete("focused closure deadline exhausted before capture finish")
+        # Reader is now dead/not-started. Finish can never contend with its append.
+        # A blocked footer write/close also must not hold the owner beyond deadline.
+        def finish_capture():
+            try:
+                if reader is None or reader.ident is None:
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                if log is not None:
+                    profile.goal_capture_error = log.finish(proc.returncode, timed_out, True)
+            except BaseException as error:
+                profile.goal_capture_error = f"focused capture finish failed: {error}; payload INCOMPLETE"
+        finisher = threading.Thread(target=finish_capture, daemon=True)
+        profile.goal_owned_finisher = finisher
+        finisher.start()
+        finisher.join(timeout=remaining())
+        if finisher.is_alive():
+            incomplete("focused capture finish remains alive at deadline")
+        if remaining() <= 0:
+            incomplete("focused capture finish exhausted closure deadline")
+    except BaseException as error:
+        profile.metadata["goal_unreaped"] = True
+        profile.metadata.setdefault("goal_cleanup_failed", str(error))
+        if log is not None:
+            log.error = f"{error}; payload INCOMPLETE"
+        raise
+    profile.goal_owned_process = None
+    profile.goal_owned_reader = None
+    profile.goal_reader_stop = None
+    profile.goal_owned_finisher = None
+    profile.goal_owned_output = None
+    profile.metadata.pop("goal_unreaped", None)
+    return profile.goal_capture_error
+
+
+
 def _finalize_check_profile(error: BaseException | None) -> None:
     profile = _CHECK_PROFILE
     if profile is None or profile.artifacts_finalized:
         return
+    if profile.metadata.get("goal_cleanup_failed"):
+        message = "refusing profile finalization after incomplete focused closure"
+        if error is not None:
+            error.add_note(message)
+            return
+        raise RuntimeError(message)
+    if getattr(profile, "goal_owned_process", None) is not None:
+        _goal_begin_cleanup(profile)
+        try:
+            _goal_reap_before_finalize(profile, terminate=True)
+        except BaseException as closure_error:
+            if error is not None:
+                error.add_note(f"focused closure INCOMPLETE: {closure_error}")
+                return
+            raise
+    if profile.metadata.get("goal_unreaped"):
+        raise RuntimeError("refusing profile finalization before focused command reap")
     profile.artifacts_finalized = True
     returncode = _profile_returncode(error)
     failed = returncode != 0
@@ -270,13 +406,19 @@ def _finalize_check_profile(error: BaseException | None) -> None:
             [sys.executable, str(ROOT / "scripts" / "check_profile_report.py"),
              str(profile.artifact_dir), "--run-id", profile.run_id],
             capture_output=True, text=True, check=False,
+            timeout=max(0.001, (profile.metadata["goal_step_deadline_ns"] - time.monotonic_ns()) / 1e9)
+            if "goal_step_deadline_ns" in profile.metadata else None,
         )
         if report.returncode == 0:
             print(f"  i  CPU work profile: {_display_path(profile.artifact_dir / 'summary.md')}")
         else:
+            if "goal_step_deadline_ns" in profile.metadata:
+                raise RuntimeError(f"focused profile report failed: {report.stderr.strip()}")
             print(f"  i  CPU work report failed: {report.stderr.strip()}")
     except Exception as finalize_error:
         print(f"  ⚠ CPU work profile finalization failed: {finalize_error}", file=sys.stderr)
+        if "goal_step_deadline_ns" in profile.metadata:
+            raise
 
 
 def _cpu_attributes(user_ms: float, system_ms: float, provenance: str, **extra) -> dict:
@@ -455,14 +597,9 @@ def _emit_profile_record_spans(profile_dir: Path, parent, patterns: tuple[str, .
     return emitted
 
 
-def _write_nextest_profile_config(profile: CheckWorkProfile) -> Path:
-    config = profile.artifact_dir / "nextest-profile.toml"
-    wrapper = ROOT / "scripts" / "check_profile_command.py"
-    output_dir = profile.artifact_dir / "rust-tests"
-    command = json.dumps([
-        sys.executable, str(wrapper), "--output-dir", str(output_dir), "--",
-    ])
-    config.write_text(
+def _render_nextest_profile_config(output_dir: Path, *, interpreter: str, wrapper: Path) -> str:
+    command = json.dumps([interpreter, str(wrapper), "--output-dir", str(output_dir), "--"])
+    return (
         'nextest-version = "0.9.98"\n'
         'experimental = ["wrapper-scripts"]\n\n'
         '[scripts.wrapper.phoenix-cpu]\n'
@@ -471,7 +608,47 @@ def _write_nextest_profile_config(profile: CheckWorkProfile) -> Path:
         'filter = "all()"\n'
         'run-wrapper = "phoenix-cpu"\n'
     )
+
+
+def _write_nextest_profile_config(profile: CheckWorkProfile) -> Path:
+    config = profile.artifact_dir / "nextest-profile.toml"
+    config.write_text(_render_nextest_profile_config(
+        profile.artifact_dir / "rust-tests", interpreter=str(Path(sys.executable).resolve()),
+        wrapper=(ROOT / "scripts/check_profile_command.py").resolve()))
     return config
+
+
+def _goal_helper():
+    spec = importlib.util.spec_from_file_location("goal_qualification", ROOT / "scripts/goal_qualification.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _goal_active_execution(phase):
+    profile = _CHECK_PROFILE
+    if profile is None or profile.artifacts_finalized or profile.finalized_cpu is not None:
+        raise ValueError("Goals execution requires the current open in-process profile owner")
+    helper = _goal_helper()
+    execution = helper.execution_binding(profile, phase, _render_nextest_profile_config)
+    if phase == "focused":
+        execution["producer_receipt_sha256"] = helper.digest((helper.job_directory() / "ready.json").read_bytes())
+    return execution
+
+
+def _goal_qualification_commands(has_nextest, compile_p, test_p, codegen_p, test_threads, nextest_profile_args):
+    if os.environ.get("PHOENIX_GOAL_REUSE_DIR") in (None, "", "false"):
+        return None
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not has_nextest or compile_p or test_p or codegen_p:
+        raise SystemExit("goal qualification requires CI full-workspace nextest")
+    if nextest_profile_args:
+        expected = _goal_helper().validate_execution(_goal_active_execution("check"))
+        if nextest_profile_args != expected:
+            raise SystemExit("goal qualification rejects foreign profile arguments")
+    helper = [sys.executable, str(ROOT / "scripts/goal_qualification.py")]
+    return ([*helper, "capture"], [*helper, "broad", "--test-threads", str(test_threads)],
+            [*helper, "codegen", "--test-threads", str(test_threads)])
+
 
 
 def _dev_trace_endpoint(environ: dict[str, str] | None = None) -> str | None:
@@ -4208,6 +4385,7 @@ def _categorize_changed_paths(paths) -> set:
             "scripts/check_profile_command.py",
             "scripts/check_profile_report.py",
             "scripts/python_unittest_profile.py",
+            "scripts/goal_qualification.py",
         }:
             cats.add("SPECS")
         if p.startswith("ast-grep-rules/"):
@@ -5549,8 +5727,11 @@ class _QualificationOutputLog:
 
 
 def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
-    if name == "cargo clippy" and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
-        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / "cargo-clippy.full.log"
+    if env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        filenames = {"cargo clippy": "cargo-clippy.full.log",
+                     "dev.py unit tests": "python-unittest.full.log"}
+        if name in filenames:
+            return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / filenames[name]
     return None
 
 
@@ -5569,6 +5750,8 @@ def cmd_check(
     compiler_cache: str | None = None,
     profile_work: bool = False,
     compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+    goal_focused_filter: str | None = None,
+    goal_step_deadline_ns: int | None = None,
 ):
     """Run lint, format checks, tests, and task validation within one worker budget.
 
@@ -5601,9 +5784,15 @@ def cmd_check(
     # a markdown/spec/task-only change must not require Corepack/pnpm or a
     # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
     # (handled in _gate_lanes) forces every lane.
-    active, skipped = _resolve_check_lanes(gate=gate, lanes=lanes)
+    focused_only = goal_focused_filter is not None
+    if focused_only and (not profile_work or not goal_focused_filter or lanes not in (None, "rust")
+                         or goal_step_deadline_ns is None or compiler_cache is not None):
+        raise SystemExit("focused-only requires profile-work, filter, absolute deadline, and no other lanes/cache override")
+    active, skipped = ({"rust"}, {}) if focused_only else _resolve_check_lanes(gate=gate, lanes=lanes)
+    compiler_cache_env = None
+    goal_reuse_commands = None
     CARGO_TEST_TIMEOUT, cargo_test_timeout_source = (
-        _cargo_test_timeout_secs() if "rust" in active else (DEFAULT_CARGO_TEST_TIMEOUT_SECS, None)
+        _cargo_test_timeout_secs() if "rust" in active and not focused_only else (DEFAULT_CARGO_TEST_TIMEOUT_SECS, None)
     )
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
@@ -5643,7 +5832,7 @@ def cmd_check(
     # narrowing — run the full workspace". Both escape hatches force full:
     # the `--all` flag (gate=False) and the PHOENIX_CHECK_ALL=1 env var — kept
     # in lockstep with _gate_lanes(), which honors the same env var.
-    _force_full = (not gate) or os.environ.get("PHOENIX_CHECK_ALL") == "1"
+    _force_full = focused_only or (not gate) or os.environ.get("PHOENIX_CHECK_ALL") == "1"
     rust_scope = None
     if not _force_full and "rust" in active:
         _scope = _rust_scope_crates(_changed_paths_vs_base() or set())
@@ -5661,7 +5850,7 @@ def cmd_check(
             out += ["-p", c]
         return out
 
-    def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT):
+    def run_step(name, cmd, cwd=ROOT, env_extra=None, *, timeout=CHECK_TIMEOUT, goal_phase=None):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
         # timeout we keep the last N lines of output instead of throwing it
         # away. Process is launched in its own session so SIGKILL can target
@@ -5719,20 +5908,59 @@ def cmd_check(
             env["PHOENIX_CHECK_PROFILE_STEP"] = name
 
         output_log = None
-        if diagnostic_path := _check_diagnostic_log_path(name, env):
+        diagnostic_path = _check_diagnostic_log_path(name, env)
+        if name == "cargo test" and goal_reuse_commands is not None:
+            diagnostic_path = Path(env["PHOENIX_GOAL_REUSE_DIR"]) / "cargo-tests.full.log"
+        if name == "goal focused":
+            diagnostic_path = _CHECK_PROFILE.artifact_dir / "goals.full.log"
+        if diagnostic_path:
             diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
             output_log = _QualificationOutputLog(diagnostic_path)
+        binding_fd = None
         try:
-            proc = subprocess.Popen(
-                launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=output_log is None, env=env, start_new_session=True,
-                bufsize=1 if output_log is None else 0,
-            )
+            if goal_phase is not None and _CHECK_PROFILE is not None:
+                execution = _goal_active_execution(goal_phase)
+                if goal_phase == "focused":
+                    _CHECK_PROFILE.metadata["goal_execution"] = execution
+                # Anonymous file carries the inherited binding snapshot; no retained phase ledger.
+                with tempfile.TemporaryFile() as capability:
+                    capability.write(json.dumps(execution, sort_keys=True).encode())
+                    capability.seek(0)
+                    binding_fd = capability.fileno()
+                    if goal_phase == "focused":
+                        timeout = min(timeout, (goal_step_deadline_ns - time.monotonic_ns()) / 1e9 - 40)
+                        if timeout <= 0:
+                            raise TimeoutError("focused absolute execution window exhausted")
+                    launched_cmd += ["--profile-binding-fd", str(binding_fd)]
+                    if execution != _goal_active_execution(goal_phase):
+                        raise ValueError("execution binding changed before spawn")
+                    if goal_phase == "focused":
+                        timeout = min(timeout, (goal_step_deadline_ns - time.monotonic_ns()) / 1e9 - 40)
+                        if timeout <= 0:
+                            raise TimeoutError("focused deadline exhausted before spawn")
+                    proc = subprocess.Popen(
+                        launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=output_log is None, env=env, start_new_session=True,
+                        bufsize=1 if output_log is None else 0, pass_fds=(binding_fd,))
+            else:
+                proc = subprocess.Popen(
+                    launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=output_log is None, env=env, start_new_session=True,
+                    bufsize=1 if output_log is None else 0,
+                )
         except BaseException:
-            if output_log is not None:
+            if focused_only:
+                _goal_begin_cleanup(_CHECK_PROFILE)
+                _CHECK_PROFILE.metadata["goal_cleanup_failed"] = "focused spawn/setup aborted before reader ownership"
+                if output_log is not None:
+                    output_log.error = "focused spawn/setup aborted; payload INCOMPLETE"
+            elif output_log is not None:
                 output_log.finish(None, False, False)
             raise
 
+        if focused_only:
+            _CHECK_PROFILE.goal_owned_process = proc
+            _CHECK_PROFILE.goal_owned_output = output_log
         reader_cpu_ms = 0.0
 
         stop_reader = threading.Event()
@@ -5771,32 +5999,63 @@ def cmd_check(
                 reader_cpu_ms = (time.thread_time_ns() - started_reader_ns) / 1_000_000.0
 
         rt = threading.Thread(target=reader, daemon=True)
-        rt.start()
-
-        timed_out = False
-        try:
-            rc = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        if focused_only:
+            _CHECK_PROFILE.goal_owned_reader = rt
+            _CHECK_PROFILE.goal_reader_stop = stop_reader
+        if focused_only:
+            timed_out = False
+            original_error = None
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                rc = proc.wait(timeout=3)
+                rt.start()
+                timeout = min(timeout, max(0, (goal_step_deadline_ns - time.monotonic_ns()) / 1e9 - 40))
+                rc = proc.wait(timeout=timeout)
+                # First root completion: before any reader drain, finish, or accounting.
+                _goal_begin_cleanup(_CHECK_PROFILE)
             except subprocess.TimeoutExpired:
+                # First abort: even if wait has already set returncode before raising.
+                _goal_begin_cleanup(_CHECK_PROFILE)
+                timed_out = True
+            except BaseException as error:
+                _goal_begin_cleanup(_CHECK_PROFILE)
+                if output_log is not None:
+                    output_log.error = "focused wait/setup interrupted; payload INCOMPLETE"
+                original_error = error
+            try:
+                capture_error = _goal_reap_before_finalize(
+                    _CHECK_PROFILE, terminate=timed_out or original_error is not None, timed_out=timed_out)
+            except BaseException as closure_error:
+                if original_error is None:
+                    raise
+                original_error.add_note(f"focused closure INCOMPLETE: {closure_error}")
+            if original_error is not None:
+                raise original_error.with_traceback(original_error.__traceback__)
+            rc = proc.returncode
+        else:
+            rt.start()
+            timed_out = False
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                rc = proc.wait(timeout=5)
-        finally:
-            capture_error = ""
-            if output_log is not None:
-                output_log.settle_reader(rt, stop_reader)
-                capture_error = output_log.finish(proc.returncode, timed_out, not rt.is_alive())
-            else:
-                rt.join(timeout=5)
+                try:
+                    rc = proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    rc = proc.wait(timeout=5)
+            finally:
+                capture_error = ""
+                if output_log is not None:
+                    output_log.settle_reader(rt, stop_reader)
+                    capture_error = output_log.finish(proc.returncode, timed_out, not rt.is_alive())
+                else:
+                    rt.join(timeout=5)
         finished_at = time.monotonic()
         finished_wall_ns = time.time_ns()
         elapsed = finished_at - t0
@@ -5869,12 +6128,43 @@ def cmd_check(
         if profile_work and _CHECK_PROFILE is not None:
             patterns = {
                 "cargo test": ("rust-tests/*.json",),
+                "goal focused": ("rust-tests/*.json",),
                 "vitest": ("vitest-cpu-*.jsonl",),
                 "dev.py unit tests": ("python-test-cpu.jsonl",),
                 "e2e": ("e2e-scenario-cpu.jsonl",),
             }.get(name, ())
             _emit_profile_record_spans(_CHECK_PROFILE.artifact_dir, span, patterns)
         return rc
+
+    if focused_only:
+        profile = _CHECK_PROFILE
+        if profile is None or profile.artifacts_finalized or profile.finalized_cpu is not None:
+            raise ValueError("focused profile is not open")
+        profile.metadata["goal_step_deadline_ns"] = goal_step_deadline_ns
+        _goal_helper().job_directory()
+        _write_nextest_profile_config(profile)
+        _goal_active_execution("focused")
+        _CHECK_PROFILE.metadata.update({"goal_step_deadline_ns": goal_step_deadline_ns,
+                                        "active_lanes": ["rust"], "goal_phase": "focused"})
+        original_name = threading.current_thread().name
+        old_handlers = {}
+        def interrupt(signum, _frame):
+            raise InterruptedError(f"focused received signal {signum}")
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                old_handlers[signum] = signal.signal(signum, interrupt)
+            threading.current_thread().name = "rust"
+            helper = [sys.executable, str(ROOT / "scripts/goal_qualification.py"), "focused",
+                      "--filter", goal_focused_filter, "--test-threads", "2"]
+            rc = run_step("goal focused", helper, timeout=1200, goal_phase="focused")
+            if rc:
+                raise subprocess.CalledProcessError(rc, helper)
+        finally:
+            threading.current_thread().name = original_name
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+            reporter.close()
+        return
 
     def lane_rust():
         """Rust lane: test compile → codegen export → staleness diff → test run.
@@ -5908,15 +6198,20 @@ def cmd_check(
         # target dir, so its RUSTC_WORKSPACE_WRAPPER=clippy-driver fingerprint
         # churn can never invalidate this dir's build (and the two builds
         # don't contend on the shared target lock).
-        compile_rc = run_step("cargo test compile", compile_cmd)
+        reuse_env = compiler_cache_env if goal_reuse_commands is not None else None
+        goal_phase = "check" if goal_reuse_commands is not None else None
+        compile_rc = run_step("cargo test compile", compile_cmd, env_extra=reuse_env, goal_phase=goal_phase)
+        if compile_rc != 0 and goal_reuse_commands is not None:
+            return
         if compile_rc == 0:
             # TS_RS_EXPORT_DIR is read at test runtime (not macro expansion),
             # so this run reuses the harnesses compiled above verbatim.
             rc = run_step("codegen", codegen_cmd,
-                          env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+                          env_extra={**(reuse_env or {}), "TS_RS_EXPORT_DIR": str(codegen_export_base)},
+                          goal_phase=goal_phase)
             if rc == 0:
                 codegen_stale_step()
-        run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
+        run_step("cargo test", test_cmd, env_extra=reuse_env, timeout=CARGO_TEST_TIMEOUT, goal_phase=goal_phase)
 
     def lane_clippy():
         """Clippy in a bounded, non-incremental target directory.
@@ -6550,6 +6845,10 @@ def cmd_check(
             has_nextest, compile_p, _pflags(), codegen_p, test_threads,
             nextest_profile_args,
         )
+        goal_reuse_commands = _goal_qualification_commands(
+            has_nextest, compile_p, _pflags(), codegen_p, test_threads, nextest_profile_args)
+        if goal_reuse_commands is not None:
+            compile_cmd, test_cmd, codegen_cmd = goal_reuse_commands
 
         # Scratch base for the ts-rs export. Every `#[ts(export_to)]` in the
         # workspace uses a `../../../ui/src/generated/` path relative to the
@@ -14350,6 +14649,11 @@ def main():
         help="Use this empty artifact directory for a correlated profiling run",
     )
 
+    check_parser.add_argument("--goal-focused-filter", default=None,
+                              help="Run only the same-job focused Goals consumer under a fresh profile")
+    check_parser.add_argument("--goal-step-deadline-ns", type=int, default=None,
+                              help="Absolute host-monotonic deadline from the focused workflow step")
+
     check_plan_parser = sub.add_parser(
         "check-plan",
         help="Print the incremental check lane/group plan without running lanes",
@@ -14574,6 +14878,14 @@ def main():
 
     if args.command == "check":
         _check_cpu_budget()  # Reject invalid input before optional dependency bootstrap.
+        if args.goal_focused_filter is not None:
+            if (not args.goal_focused_filter or args.lanes not in (None, "rust")
+                    or args.compiler_cache is not None or args.goal_step_deadline_ns is None
+                    or not args.profile_work_dir or os.environ.get("PHOENIX_GOAL_REUSE_DIR") in (None, "", "false")
+                    or not 0 < args.goal_step_deadline_ns - time.monotonic_ns() <= 1_260_000_000_000):
+                parser.error("focused-only requires same-job reuse, fresh profile dir, filter and a deadline within1260s")
+        elif args.goal_step_deadline_ns is not None:
+            parser.error("goal step deadline requires focused-only mode")
 
     # --pretty composes from the global flag and the per-subcommand flag.
     pretty = args.pretty_global or getattr(args, "pretty", False)
@@ -14629,6 +14941,8 @@ def main():
             pretty=pretty,
             compiler_cache=args.compiler_cache,
             profile_work=args.profile_work,
+            goal_focused_filter=args.goal_focused_filter,
+            goal_step_deadline_ns=args.goal_step_deadline_ns,
         )
     elif args.command == "check-plan":
         cmd_check_plan(gate=not args.check_all, lanes=args.lanes, fmt=args.format)

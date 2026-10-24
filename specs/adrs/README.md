@@ -179,6 +179,13 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [142](142_ordinary-skill-catalog-is-executor-turn-local.md) | Ordinary skill catalog advertisement is executor-turn-local | Accepted | REQ-SK-007, REQ-SK-008, REQ-SK-009 |
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
+| [180](180_federated-subscriptions-carry-bounded-terminal-facts.md) | Federated subscriptions carry bounded durable terminal facts | Accepted | REQ-FED-015; extends ADR-070 across authenticated peers |
+| [181](181_federated-subscriptions-end-with-their-source.md) | Federated subscriptions end with their source conversation | Accepted | REQ-FED-015; extends ADR-070/180 |
+| [182](182_immutable-conversation-goals-use-owner-version-fences.md) | Immutable conversation goals use owner-version fences | Accepted | REQ-GOAL-001 through REQ-GOAL-008 |
+| [183](183_owner-goal-controls-reference-accepted-command-receipts.md) | Owner goal controls reference accepted command receipts | Accepted | REQ-GOAL-003/004/004.1/007/008/009; extends ADR-182 |
+| [184](184_local-goal-watch-facts-belong-to-their-causal-event.md) | Local goal-watch facts belong to their causal event | Accepted | REQ-GOAL-011–014, REQ-GR-015, REQ-CEVT-006; extends ADR-070/182/183 |
+| [185](185_goal-control-installation-is-an-explicit-owner-policy.md) | Goal-control installation is an explicit owner policy | Accepted | REQ-GOAL-011–014, REQ-GR-015, REQ-CEVT-006; refines ADR-184 |
+| [186](186_per-goal-model-request-admission-and-typed-start.md) | Per-goal logical request admission and genuine typed Start | Proposed | REQ-GOAL-015–018, REQ-GR-007; extends ADR-182/183/185 |
 
 ## For agents: which decisions bind your task
 
@@ -186,6 +193,9 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing durable goals, no-chat owner controls, or goal attribution/persistence | 182/183, within 034's compatibility scope |
+| Adding local saved goal-watch facts or changing notification/transaction ownership | 184/185, with 070/182/183; federation remains 180/181 |
+| Reviewing per-goal finite requests, genuine typed Start or host yield/settlement ordering | Proposed 186 with 182/183/185; no execution installation follows from the draft |
 | Changing navigation console attribution or CDP context ownership | 110/111, superseding 109, with 107/108 |
 | Changing conversation Markdown disclosures, their source ranges, streaming selection, or find interpretation | 099 |
 | Changing Codex model discovery, availability, or account-bound routing | 062, then 052 and 034 |

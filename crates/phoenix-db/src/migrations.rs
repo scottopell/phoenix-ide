@@ -11,6 +11,9 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod federated_subscriptions;
+mod goal_execution;
+mod local_goal_watch;
 mod retire_commission_review;
 mod settle_historical_continuation;
 
@@ -661,7 +664,556 @@ const MIGRATIONS: &[Migration] = &[
         name: "single_conversation_name_and_route_projection",
         sql: "",
     },
+    Migration {
+        version: 130,
+        name: "normalized_remote_input_origin",
+        sql: "",
+    },
+    Migration {
+        version: 131,
+        name: "bounded_federated_terminal_subscriptions",
+        sql: include_str!("federation_subscriptions/schema.sql"),
+    },
+    Migration {
+        version: 132,
+        name: "durable_conversation_goal_storage",
+        sql: include_str!("conversation_goals/schema.sql"),
+    },
+    Migration {
+        version: 133,
+        name: "opaque_federation_peer_notes",
+        sql: "ALTER TABLE federation_peer_connections ADD COLUMN notes TEXT NOT NULL DEFAULT ''
+              CHECK (typeof(notes) = 'text' AND length(CAST(notes AS BLOB)) <= 32768);",
+    },
+    Migration {
+        version: 134,
+        name: "durable_conversation_goal_user_control",
+        sql: MIGRATION_134,
+    },
+    Migration {
+        version: 135,
+        name: "local_watch_goal_capture",
+        sql: include_str!("coordinator_watches/goal_capture.sql"),
+    },
+    Migration {
+        version: 136,
+        name: "per_goal_execution_requests",
+        sql: MIGRATION_136,
+    },
+    Migration {
+        version: 137,
+        name: "goal_start_materialization_witness",
+        sql: include_str!("conversation_goals/start_materialization_candidate.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "federation_local_stop_acceptance",
+        sql: include_str!("federation_subscriptions/local_stop_acceptance.sql"),
+    },
 ];
+
+const MIGRATION_136: &str = concat!(
+    include_str!("conversation_goals/execution_candidate.sql"),
+    "\n",
+    include_str!("conversation_goals/start_candidate.sql"),
+);
+
+const MIGRATION_134: &str = concat!(
+    include_str!("conversation_goals/control_candidate.sql"),
+    "\n",
+    include_str!("conversation_goals/user_control_candidate.sql"),
+);
+
+async fn run_migration_130(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        const OLD_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event')";
+        const NEW_CHECK: &str = "origin_kind IN ('unknown_historical', 'user_api', 'internal_conversation', 'system_generated', 'subscription_event', 'remote_api', 'remote_conversation', 'remote_coordinator')";
+
+        let mut tx = guard.connection().begin().await?;
+        let tables = [
+            ("messages", "messages"),
+            ("steering_messages", "steering"),
+            ("durable_turns", "durable_turn"),
+        ];
+        for (table, _) in tables {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN origin_source_instance_id TEXT CHECK (
+                    origin_source_instance_id IS NULL OR (
+                        typeof(origin_source_instance_id) = 'text'
+                        AND length(origin_source_instance_id) = 36
+                        AND origin_source_instance_id = lower(origin_source_instance_id)
+                        AND substr(origin_source_instance_id, 9, 1) = '-'
+                        AND substr(origin_source_instance_id, 14, 1) = '-'
+                        AND substr(origin_source_instance_id, 15, 1) = '4'
+                        AND substr(origin_source_instance_id, 19, 1) = '-'
+                        AND substr(origin_source_instance_id, 20, 1) IN ('8', '9', 'a', 'b')
+                        AND substr(origin_source_instance_id, 24, 1) = '-'
+                        AND length(replace(origin_source_instance_id, '-', '')) = 32
+                        AND replace(origin_source_instance_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+                    )
+                )"
+            )))
+            .execute(&mut *tx)
+            .await?;
+        }
+        for (table, _) in tables {
+            let sql: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(&mut *tx)
+            .await?;
+            if sql.matches(OLD_CHECK).count() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "migration 130 found unexpected {table} origin CHECK"
+                )));
+            }
+            sqlx::query("UPDATE sqlite_schema SET sql = ?2 WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .bind(sql.replacen(OLD_CHECK, NEW_CHECK, 1))
+                .execute(&mut *tx)
+                .await?;
+        }
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA schema_version = {}",
+            schema_version + 1
+        )))
+        .execute(&mut *tx)
+        .await?;
+        for (table, origin_trigger) in tables {
+            for operation in ["insert", "update"] {
+                let event = if operation == "insert" { "INSERT" } else { "UPDATE" };
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "DROP TRIGGER {origin_trigger}_origin_{operation};
+                     DROP TRIGGER {table}_source_call_{operation};
+                     CREATE TRIGGER {origin_trigger}_origin_{operation} BEFORE {event} ON {table}
+                     WHEN (NEW.origin_kind = 'subscription_event') != (NEW.origin_subscription_event_id IS NOT NULL)
+                       OR (NEW.origin_kind IN ('remote_api', 'remote_conversation', 'remote_coordinator')) !=
+                          (NEW.origin_source_instance_id IS NOT NULL AND length(trim(NEW.origin_source_instance_id)) > 0)
+                       OR (NEW.origin_kind NOT IN ('remote_api', 'remote_conversation', 'remote_coordinator') AND NEW.origin_source_instance_id IS NOT NULL)
+                       OR (NEW.origin_kind IN ('internal_conversation', 'remote_conversation', 'remote_coordinator')) !=
+                          (NEW.origin_product_conversation_id IS NOT NULL AND length(trim(NEW.origin_product_conversation_id)) > 0
+                           AND NEW.origin_transcript_id IS NOT NULL AND length(trim(NEW.origin_transcript_id)) > 0)
+                       OR (NEW.origin_kind NOT IN ('internal_conversation', 'remote_conversation', 'remote_coordinator') AND
+                           (NEW.origin_product_conversation_id IS NOT NULL OR NEW.origin_transcript_id IS NOT NULL))
+                     BEGIN SELECT RAISE(ABORT, 'invalid input origin'); END;
+                     CREATE TRIGGER {table}_source_call_{operation} BEFORE {event} ON {table}
+                     WHEN (NEW.origin_source_message_id IS NOT NULL OR NEW.origin_source_tool_use_id IS NOT NULL) AND
+                       (NEW.origin_kind NOT IN ('internal_conversation', 'remote_conversation', 'remote_coordinator')
+                        OR NEW.origin_source_message_id IS NULL OR length(NEW.origin_source_message_id) = 0
+                        OR NEW.origin_source_tool_use_id IS NULL OR length(NEW.origin_source_tool_use_id) = 0)
+                     BEGIN SELECT RAISE(ABORT, 'invalid source call'); END;"
+                )))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
+
+#[cfg(test)]
+mod migration_130_tests {
+    use super::*;
+
+    async fn fixture() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE messages (id TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE steering_messages (id TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE durable_turns (id TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE coordinator_watch_events (event_id TEXT PRIMARY KEY);
+             INSERT INTO coordinator_watch_events VALUES ('event');
+             INSERT INTO messages VALUES ('historical', 'message');
+             INSERT INTO steering_messages VALUES ('historical', 'steering');
+             INSERT INTO durable_turns VALUES ('historical', 'turn');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_110).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_112).execute(&pool).await.unwrap();
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN origin_subscription_event_id TEXT REFERENCES coordinator_watch_events(event_id)"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    fn migration() -> &'static Migration {
+        MIGRATIONS.iter().find(|m| m.version == 130).unwrap()
+    }
+
+    #[tokio::test]
+    async fn widens_in_place_without_rewriting_history_or_foreign_keys() {
+        let pool = fixture().await;
+        let before: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        run_migration_130(&pool, migration()).await.unwrap();
+        let after: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        for (table, payload) in [
+            ("messages", "message"),
+            ("steering_messages", "steering"),
+            ("durable_turns", "turn"),
+        ] {
+            let row: (String, String, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT payload, origin_kind, origin_source_instance_id FROM {table} WHERE id = 'historical'"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, (payload.into(), "unknown_historical".into(), None));
+            let foreign_columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT \"from\" FROM pragma_foreign_key_list('{table}')"
+            )))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(foreign_columns, ["origin_subscription_event_id"]);
+        }
+        let writable: i64 = sqlx::query_scalar("PRAGMA writable_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(writable, 0);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn insert_and_update_enforce_all_origin_shapes() {
+        let pool = fixture().await;
+        run_migration_130(&pool, migration()).await.unwrap();
+        let instance = "f672a139-f8e5-47e6-83ed-883122aa3260";
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            for (kind, product, transcript, event, peer, message, call, valid) in [
+                (
+                    "unknown_historical",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+                ("user_api", None, None, None, None, None, None, true),
+                ("system_generated", None, None, None, None, None, None, true),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    Some("event"),
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+                (
+                    "internal_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    None,
+                    Some("message"),
+                    Some("call"),
+                    true,
+                ),
+                (
+                    "remote_api",
+                    None,
+                    None,
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    true,
+                ),
+                (
+                    "remote_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    true,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    Some("call"),
+                    true,
+                ),
+                ("unknown_kind", None, None, None, None, None, None, false),
+                (
+                    "user_api",
+                    None,
+                    None,
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "internal_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                ("remote_api", None, None, None, None, None, None, false),
+                ("remote_api", None, None, None, Some(" "), None, None, false),
+                (
+                    "remote_api",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_api",
+                    None,
+                    None,
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    Some("call"),
+                    false,
+                ),
+                (
+                    "remote_conversation",
+                    None,
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_conversation",
+                    Some("product"),
+                    Some(" "),
+                    None,
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    None,
+                    false,
+                ),
+                (
+                    "remote_coordinator",
+                    Some("product"),
+                    Some("transcript"),
+                    None,
+                    Some(instance),
+                    Some("message"),
+                    Some(""),
+                    false,
+                ),
+                (
+                    "remote_conversation",
+                    Some("product"),
+                    Some("transcript"),
+                    Some("event"),
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    Some("missing-event"),
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                (
+                    "subscription_event",
+                    None,
+                    None,
+                    Some("event"),
+                    Some(instance),
+                    None,
+                    None,
+                    false,
+                ),
+            ]
+            .into_iter()
+            .chain(
+                ["remote_api", "remote_conversation", "remote_coordinator"]
+                    .into_iter()
+                    .flat_map(|kind| {
+                        [
+                            "not-a-uuid",
+                            "F672A139-F8E5-47E6-83ED-883122AA3260",
+                            "00000000-0000-0000-0000-000000000000",
+                            "f672a139-f8e5-17e6-83ed-883122aa3260",
+                            "f672a139-f8e5-47e6-03ed-883122aa3260",
+                            "f672a139-f8e5-47e6-c3ed-883122aa3260",
+                            "f672a139-f8e5-47e6-83ed-883122aa326g",
+                            "f672a139_f8e5-47e6-83ed-883122aa3260",
+                            "f672a139f8e547e683ed883122aa3260",
+                            "f672a139-f8e5-47e6-83ed-883122aa326",
+                        ]
+                        .into_iter()
+                        .map(move |peer| {
+                            let conversation = kind != "remote_api";
+                            (
+                                kind,
+                                conversation.then_some("product"),
+                                conversation.then_some("transcript"),
+                                None,
+                                Some(peer),
+                                None,
+                                None,
+                                false,
+                            )
+                        })
+                    }),
+            ) {
+                for insert in [true, false] {
+                    let statement = if insert {
+                        format!("INSERT INTO {table} (id, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id) VALUES ('candidate', ?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+                    } else {
+                        format!("UPDATE {table} SET origin_kind = ?1, origin_product_conversation_id = ?2, origin_transcript_id = ?3, origin_subscription_event_id = ?4, origin_source_instance_id = ?5, origin_source_message_id = ?6, origin_source_tool_use_id = ?7 WHERE id = 'historical'")
+                    };
+                    let result = sqlx::query(sqlx::AssertSqlSafe(statement))
+                        .bind(kind)
+                        .bind(product)
+                        .bind(transcript)
+                        .bind(event)
+                        .bind(peer)
+                        .bind(message)
+                        .bind(call)
+                        .execute(&pool)
+                        .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        valid,
+                        "{table}: {kind}, insert={insert}: {result:?}"
+                    );
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DELETE FROM {table} WHERE id = 'candidate'"
+                    )))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_check_rolls_back_columns_and_restores_guard() {
+        let pool = fixture().await;
+        let mut guard = WritableSchemaGuard::enable(&pool).await.unwrap();
+        sqlx::query("UPDATE sqlite_schema SET sql = replace(sql, 'subscription_event', 'unexpected') WHERE type = 'table' AND name = 'durable_turns'")
+            .execute(guard.connection()).await.unwrap();
+        guard.disable().await.unwrap();
+        assert!(run_migration_130(&pool, migration()).await.is_err());
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM pragma_table_info('{table}') WHERE name = 'origin_source_instance_id'"
+            )))
+            .fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 0);
+        }
+        let writable: i64 = sqlx::query_scalar("PRAGMA writable_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(writable, 0);
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _migrations WHERE version = 130")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, 0);
+    }
+}
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
 
@@ -11559,8 +12111,38 @@ async fn run_migration_121(pool: &SqlitePool, migration: &Migration) -> DbResult
 /// # Errors
 ///
 /// Returns a [`DbError`] if the underlying database operation fails.
-#[allow(clippy::too_many_lines)]
 pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
+    run_migration_list(pool, MIGRATIONS).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_before_goal_storage_for_test(pool: &SqlitePool) -> DbResult<u32> {
+    let goal_index = MIGRATIONS
+        .iter()
+        .position(|migration| migration.name == "durable_conversation_goal_storage")
+        .expect("goal storage migration is registered");
+    run_migration_list(pool, &MIGRATIONS[..goal_index]).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_through_goal_user_control_history_for_test(
+    pool: &SqlitePool,
+) -> DbResult<u32> {
+    let end = MIGRATIONS.partition_point(|migration| migration.version <= 137);
+    run_migration_list(pool, &MIGRATIONS[..end]).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_before_goal_user_control_for_test(pool: &SqlitePool) -> DbResult<u32> {
+    let index = MIGRATIONS
+        .iter()
+        .position(|migration| migration.version == 134)
+        .expect("goal user-control migration is registered");
+    run_migration_list(pool, &MIGRATIONS[..index]).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbResult<u32> {
     // Ensure the tracking table exists
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS _migrations (\
@@ -11586,7 +12168,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
     let mut applied = 0u32;
 
-    for migration in MIGRATIONS {
+    for migration in migrations {
         if applied_versions.contains(&migration.version) {
             continue;
         }
@@ -11622,6 +12204,27 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             continue;
         }
 
+        if migration.version == 131 {
+            federated_subscriptions::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 136 {
+            goal_execution::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+        if migration.version == 135 {
+            local_goal_watch::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+        if migration.version == 130 {
+            run_migration_130(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
         if migration.version == 127 {
             coordinator_home::run(pool, migration).await?;
             applied += 1;
@@ -12474,6 +13077,8 @@ END;
 
 #[cfg(test)]
 mod tests {
+    type AdmissionMigrationSnapshot = (String, Option<String>, bool, Option<String>, bool);
+
     use super::*;
 
     #[tokio::test]
@@ -12487,7 +13092,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
-        assert_outbox_child_indexes_are_used(db.pool()).await;
+        assert_current_outbox_child_indexes_are_used(db.pool()).await;
         let ledger: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _migrations WHERE version IN (119, 122) ORDER BY version",
         )
@@ -12694,9 +13299,9 @@ mod tests {
                      VALUES (6, 2, 'wake-history', 'wake-history:message', 'tool-6', 'Fired', 1, 20);
                  INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
                      prepared_fingerprint, prepared_payload, disposition, generation, owns_conversation,
-                     canonical_message_id)
+                     canonical_message_id, materialized)
                      VALUES (100, 100, 'wake-history', 'wake:6:2', 'accepted-fingerprint', X'FF000A',
-                         'Runtime', 7, 1, 'wake-history:message');
+                         'Runtime', 7, 1, 'wake-history:message', 1);
                  INSERT INTO workflow_external_acceptance_bindings (profile_kind, profile_version,
                      target_scope, idempotency_key, intent_fingerprint, workflow_id,
                      receipt_handle, disposition_handle, created_at)
@@ -14373,11 +14978,244 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
+    #[tokio::test]
+    async fn migration_138_preserves_137_receipts_history_cursors_and_pending_unsubscribe() {
+        use phoenix_core::domain::{
+            close::TranscriptConversationId,
+            federation_subscription::{
+                FederatedTerminalFact, SubscriptionCursor, SubscriptionReference,
+                SubscriptionReplay, TerminalFactOutcome,
+            },
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("subscription-upgrade.sqlite");
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        let through_137 = MIGRATIONS.partition_point(|migration| migration.version <= 137);
+        run_migration_list(db.pool(), &MIGRATIONS[..through_137])
+            .await
+            .unwrap();
+        let target = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let reference = SubscriptionReference {
+            instance_id: InstanceId::new(),
+            product_conversation_id: ProductConversationId::parse("upgrade-product").unwrap(),
+        };
+        let subscription = uuid::Uuid::new_v4();
+        db.save_remote_subscription(&reference, subscription)
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for sequence in 1..=2 {
+            let remote = db
+                .remote_subscription_for_product(&reference)
+                .await
+                .unwrap()
+                .unwrap();
+            let replay = SubscriptionReplay::Facts {
+                events: vec![FederatedTerminalFact {
+                    event_id: uuid::Uuid::new_v4(),
+                    sequence: SubscriptionCursor::try_from(sequence).unwrap(),
+                    source_transcript_id: TranscriptConversationId::parse("upgrade-source")
+                        .unwrap(),
+                    outcome: TerminalFactOutcome::Completed,
+                    occurred_at_us: sequence,
+                }],
+            };
+            db.stage_remote_replay(&remote, &replay).await.unwrap();
+            let note = db
+                .pending_remote_notifications(&remote)
+                .await
+                .unwrap()
+                .remove(0);
+            db.request_remote_notification_authorization(&remote, &note.admission_id)
+                .await
+                .unwrap();
+            db.save_remote_notification_navigation(
+                &remote,
+                &note.admission_id,
+                "/c/upgrade-product",
+                "/c/upgrade-source?source_transcript=upgrade-source",
+            )
+            .await
+            .unwrap();
+            db.confirm_remote_authorization(&remote, &note.admission_id, uuid::Uuid::new_v4())
+                .await
+                .unwrap();
+            if sequence == 1 {
+                sqlx::query("INSERT INTO steering_messages(message_id,conversation_id,ordinal,text,origin_kind,origin_subscription_event_id) VALUES (?1,?2,0,'accepted fact','subscription_event',?1)")
+                    .bind(&note.admission_id).bind(&target.id).execute(db.pool()).await.unwrap();
+            }
+            ids.push(note.admission_id);
+        }
+        db.begin_remote_unsubscribe(&reference, subscription)
+            .await
+            .unwrap();
+        let before: Vec<AdmissionMigrationSnapshot> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
+        db.pool().close().await;
+        drop(db);
+        let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        let after: Vec<AdmissionMigrationSnapshot> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+        assert_migration_138_stopped_history(&db, &reference, subscription, &ids, &target.id).await;
+    }
+
+    async fn assert_migration_138_stopped_history(
+        db: &crate::Database,
+        reference: &phoenix_core::domain::federation_subscription::SubscriptionReference,
+        subscription: uuid::Uuid,
+        ids: &[String],
+        target: &str,
+    ) {
+        use crate::federation_subscriptions::RemoteNotificationDisposition;
+        use phoenix_core::domain::federation_subscription::SubscriptionCursor;
+        let saved = db
+            .remote_subscription_by_id(reference.instance_id, subscription)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.admitted_cursor.get(), 1);
+        assert!(saved.pending_unsubscribe);
+        let history = db
+            .remote_notification_history(&saved, SubscriptionCursor::START)
+            .await
+            .unwrap();
+        let presentations = db.remote_notification_presentations(ids).await.unwrap();
+        assert!(matches!(
+            history[0].disposition,
+            RemoteNotificationDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            history[1].disposition,
+            RemoteNotificationDisposition::Suppressed
+        ));
+        assert!(matches!(
+            presentations[&ids[0]].0.disposition,
+            RemoteNotificationDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            presentations[&ids[1]].0.disposition,
+            RemoteNotificationDisposition::Suppressed
+        ));
+        assert!(presentations
+            .values()
+            .all(|(_, navigation)| navigation.is_some()));
+        let error = sqlx::query("INSERT INTO steering_messages(message_id,conversation_id,ordinal,text,origin_kind,origin_subscription_event_id) VALUES (?1,?2,1,'late fact','subscription_event',?1)")
+            .bind(&ids[1]).bind(target).execute(db.pool()).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("federation subscription locally stopped"));
+        let accepted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1")
+                .bind(target)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(accepted, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_133_adds_empty_notes_to_existing_connections() {
+        let pool = test_pool().await;
+        sqlx::raw_sql("CREATE TABLE federation_peer_connections (peer_instance_id TEXT PRIMARY KEY, bearer_credential TEXT NOT NULL);
+                       INSERT INTO federation_peer_connections VALUES ('existing', 'retained');")
+            .execute(&pool).await.unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 133)
+            .unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
+        let row: (String, String) = sqlx::query_as("SELECT notes, bearer_credential FROM federation_peer_connections WHERE peer_instance_id = 'existing'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row, (String::new(), "retained".into()));
+        sqlx::query("UPDATE federation_peer_connections SET notes = ?1")
+            .bind("雪".repeat(10922) + "ab")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("UPDATE federation_peer_connections SET notes = ?1")
+                .bind("雪".repeat(10923))
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn migration_133_fresh_schema_enforces_notes_without_enabling_goal_controls() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        let id = "33333333-3333-4333-8333-333333333333";
+        sqlx::query(
+            "INSERT INTO federation_peer_connections
+            (peer_instance_id,peer_display_name,domain_or_ipv4_host,port,bearer_credential,created_at_us)
+            VALUES (?,'Peer','peer.example',8031,?,1)",
+        )
+        .bind(id)
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let notes: String = sqlx::query_scalar(
+            "SELECT notes FROM federation_peer_connections WHERE peer_instance_id=?",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(notes.is_empty());
+        sqlx::query("UPDATE federation_peer_connections SET notes=? WHERE peer_instance_id=?")
+            .bind("雪".repeat(10922) + "ab")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for value in ["雪".repeat(10923), "a".repeat(32769)] {
+            assert!(sqlx::query(
+                "UPDATE federation_peer_connections SET notes=? WHERE peer_instance_id=?"
+            )
+            .bind(value)
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .is_err());
+        }
+        for invalid in ["NULL", "X'01'"] {
+            assert!(sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE federation_peer_connections SET notes={invalid} WHERE peer_instance_id='{id}'"
+            ))).execute(db.pool()).await.is_err());
+        }
+        let notes_ledger: (i64, String) =
+            sqlx::query_as("SELECT version,name FROM _migrations WHERE version=133")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(notes_ledger, (133, "opaque_federation_peer_notes".into()));
+        assert_eq!(
+            db.goal_control_installation(),
+            crate::conversation_goals::control::GoalControlInstallation::Disabled
+        );
+        assert!(MIGRATIONS.iter().any(|migration| migration.version == 134
+            && migration.name == "durable_conversation_goal_user_control"));
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (137, "goal_start_materialization_witness"),
+            (136, "per_goal_execution_requests"),
+            (135, "local_watch_goal_capture"),
+            (134, "durable_conversation_goal_user_control"),
+            (133, "opaque_federation_peer_notes"),
+            (132, "durable_conversation_goal_storage"),
+            (131, "bounded_federated_terminal_subscriptions"),
+            (130, "normalized_remote_input_origin"),
             (129, "single_conversation_name_and_route_projection"),
             (128, "product_creation_provisioning_stage"),
             (127, "coordinator_owned_work_scope_home"),
@@ -14695,6 +15533,280 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap()
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_130_upgrades_full_129_schema_preserving_history_and_fresh_parity() {
+        type ForeignKeyRow = (
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+        );
+        let db = crate::Database::from_pool_for_tests(test_pool().await, String::new());
+        db.run_migrations().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS _migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _migrations (version, name) VALUES (130, 'fixture_skip_remote_origin'), (131, 'fixture_skip_subscriptions'), (132, 'durable_conversation_goal_storage'), (133, 'opaque_federation_peer_notes'), (134, 'durable_conversation_goal_user_control')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let before_130 = MIGRATIONS.partition_point(|migration| migration.version < 130);
+        let through_131 = MIGRATIONS.partition_point(|migration| migration.version <= 131);
+        assert_eq!(
+            run_migration_list(db.pool(), &MIGRATIONS[..before_130])
+                .await
+                .unwrap() as usize,
+            before_130
+        );
+        sqlx::query("DELETE FROM _migrations WHERE version = 130")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let ledger_before: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT version, name, applied_at FROM _migrations WHERE version <= 129 ORDER BY version")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ledger_before.last().unwrap().0, 129);
+        let target = db
+            .create_conversation("origin-upgrade", "origin-upgrade", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for (index, kind) in [
+            "unknown_historical",
+            "user_api",
+            "system_generated",
+            "internal_conversation",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ordinal = i64::try_from(index).unwrap();
+            let source_product = (kind == "internal_conversation").then_some("historical-product");
+            let source_transcript =
+                (kind == "internal_conversation").then_some("historical-transcript");
+            sqlx::query(
+                "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+                     content, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id)
+                 VALUES (?1, ?2, ?3, 'user', '{ \"text\" : \"preserved history\" }',
+                     '2026-01-01T00:00:00Z', ?4, ?5, ?6)",
+            )
+            .bind(format!("historical-message-{index}"))
+            .bind(&target.id)
+            .bind(ordinal + 1)
+            .bind(kind)
+            .bind(source_product)
+            .bind(source_transcript)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text,
+                     origin_kind, origin_product_conversation_id, origin_transcript_id)
+                 VALUES (?1, ?2, ?3, 'preserved steering', ?4, ?5, ?6)",
+            )
+            .bind(format!("historical-steering-{index}"))
+            .bind(&target.id)
+            .bind(ordinal)
+            .bind(kind)
+            .bind(source_product)
+            .bind(source_transcript)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO workflows (workflow_id, profile_kind, profile_version,
+                     runtime_acceptance_enabled, external_acceptance_enabled, version, generation,
+                     status, snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                     created_at, updated_at)
+                 VALUES (?1, 'direct_turn', 1, 0, 1, 1, 7, 'Active', 'direct_turn.snapshot',
+                     1, X'0001FF', 10, 20)",
+            )
+            .bind(ordinal + 1)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
+                     prepared_fingerprint, prepared_payload, disposition, generation, owns_conversation,
+                     origin_kind, origin_product_conversation_id, origin_transcript_id)
+                 VALUES (?1, ?1, ?2, ?3, ?4, X'FF000A', 'Steering', 7, 0, ?5, ?6, ?7)",
+            )
+            .bind(ordinal + 1)
+            .bind(&target.id)
+            .bind(format!("historical-turn-{index}"))
+            .bind(format!("historical-fingerprint-{index}"))
+            .bind(kind)
+            .bind(source_product)
+            .bind(source_transcript)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let mut history = Vec::new();
+        for table in [
+            "messages",
+            "steering_messages",
+            "durable_turns",
+            "workflows",
+        ] {
+            let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            )))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert!(!columns.iter().any(|c| c == "origin_source_instance_id"));
+            let values = columns
+                .iter()
+                .map(|column| {
+                    let quoted = format!("\"{}\"", column.replace('"', "\"\""));
+                    format!("typeof({quoted}) || ':' || hex({quoted})")
+                })
+                .collect::<Vec<_>>()
+                .join(" || '|' || ");
+            let select = format!("SELECT {values} FROM {table} ORDER BY 1");
+            let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(select.clone()))
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 4, "{table}");
+            history.push((table, select, rows));
+        }
+        let foreign_keys = "SELECT s.name, f.id, f.seq, f.\"table\", f.\"from\", f.\"to\",
+                f.on_update, f.on_delete, f.\"match\"
+             FROM sqlite_schema s JOIN pragma_foreign_key_list(s.name) f
+             WHERE s.type = 'table' ORDER BY s.name, f.id, f.seq";
+        let foreign_keys_before: Vec<ForeignKeyRow> = sqlx::query_as(foreign_keys)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(!foreign_keys_before.is_empty());
+        assert_eq!(
+            run_migration_list(db.pool(), &MIGRATIONS[..through_131])
+                .await
+                .unwrap(),
+            1
+        );
+        for (table, select, before) in history {
+            let after: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(select))
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(after, before, "{table}");
+        }
+        let ledger_after: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT version, name, applied_at FROM _migrations WHERE version <= 129 ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(ledger_after, ledger_before);
+        for table in ["messages", "steering_messages", "durable_turns"] {
+            let null_origins: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE origin_source_instance_id IS NULL"
+            )))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(null_origins, 4, "{table}");
+        }
+        let keys_after_130: Vec<ForeignKeyRow> = sqlx::query_as(foreign_keys)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(keys_after_130, foreign_keys_before);
+        sqlx::query("DELETE FROM _migrations WHERE version = 131")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            run_migration_list(db.pool(), &MIGRATIONS[..through_131])
+                .await
+                .unwrap(),
+            1
+        );
+        let goal_table_before: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='conversation_goals')",
+        ).fetch_one(db.pool()).await.unwrap();
+        assert!(
+            !goal_table_before,
+            "fixture stamps only defer later migrations"
+        );
+        sqlx::query("DELETE FROM _migrations WHERE version IN (132,133,134)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            run_pending_migrations(db.pool()).await.unwrap() as usize,
+            MIGRATIONS.len() - through_131
+        );
+        let user_control_ledger: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version=134")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            user_control_ledger,
+            "durable_conversation_goal_user_control"
+        );
+        let goal_ledger: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version=132")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(goal_ledger, "durable_conversation_goal_storage");
+        let fresh = crate::Database::open_in_memory().await.unwrap();
+        let schema_sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema
+            WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name";
+        let upgraded_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_sql)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let fresh_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_sql)
+                .fetch_all(fresh.pool())
+                .await
+                .unwrap();
+        assert_eq!(upgraded_schema, fresh_schema);
+        for pool in [db.pool(), fresh.pool()] {
+            let keys: Vec<ForeignKeyRow> =
+                sqlx::query_as(foreign_keys).fetch_all(pool).await.unwrap();
+            let fresh_keys: Vec<ForeignKeyRow> = sqlx::query_as(foreign_keys)
+                .fetch_all(fresh.pool())
+                .await
+                .unwrap();
+            assert_eq!(keys, fresh_keys);
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .is_empty());
+            let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(integrity, "ok");
+        }
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+    }
+
     async fn coordinator_event_child_fixture(
         event_count: i64,
         null_rows_per_child: i64,
@@ -14791,6 +15903,104 @@ with tempfile.TemporaryDirectory() as directory:
             handle.remove_progress_handler();
         }
         steps.load(Ordering::Relaxed)
+    }
+
+    async fn assert_current_outbox_child_indexes_are_used(pool: &SqlitePool) {
+        let watch_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM coordinator_watch_events WHERE event_id = 'explain'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        assert!(
+            watch_plan
+                .iter()
+                .any(|detail| detail.contains("SEARCH subscription_delivery_identities")),
+            "{watch_plan:?}"
+        );
+        let parent: (String, String, String) = sqlx::query_as(
+            "SELECT \"table\", \"to\", on_delete FROM pragma_foreign_key_list('subscription_delivery_identities') WHERE \"from\"='local_event_id'",
+        )
+        .fetch_one(pool).await.unwrap();
+        assert_eq!(
+            parent,
+            (
+                "coordinator_watch_events".into(),
+                "event_id".into(),
+                "CASCADE".into()
+            )
+        );
+        let delivery_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM subscription_delivery_identities WHERE id = 'explain'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        for (table, index) in [
+            ("messages", "idx_messages_origin_subscription_event_id"),
+            (
+                "steering_messages",
+                "idx_steering_messages_origin_subscription_event_id",
+            ),
+            (
+                "durable_turns",
+                "idx_durable_turns_origin_subscription_event_id",
+            ),
+        ] {
+            let parent: (String, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT \"table\", \"to\" FROM pragma_foreign_key_list('{table}') WHERE \"from\"='origin_subscription_event_id'",
+            )))
+            .fetch_one(pool).await.unwrap();
+            assert_eq!(
+                parent,
+                ("subscription_delivery_identities".into(), "id".into())
+            );
+            let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno",
+            )))
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            assert_eq!(columns, vec!["origin_subscription_event_id"], "{index}");
+            let partial: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT partial FROM pragma_index_list('{table}') WHERE name=?",
+            )))
+            .bind(index)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(partial, 1, "{index}");
+            let sql: String =
+                sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type='index' AND name=?")
+                    .bind(index)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            let predicate = sql
+                .split_once("WHERE")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                predicate.trim_end_matches(';'),
+                "origin_subscription_event_id IS NOT NULL",
+                "{index}"
+            );
+            assert!(
+                delivery_plan.iter().any(|detail| detail.contains(&format!(
+                    "SEARCH {table} USING COVERING INDEX {index} (origin_subscription_event_id=?)"
+                ))),
+                "{table} must use its indexed child lookup: {delivery_plan:?}"
+            );
+        }
     }
 
     async fn assert_outbox_child_indexes_are_used(pool: &SqlitePool) {
@@ -19631,6 +20841,43 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(row.get::<i64, _>("chain_messages_at_answer"), 17);
     }
 
+    async fn skip_later_migrations_for_partial_archive_fixture(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO _migrations (version, name)
+             VALUES (70, 'temporarily_skip_product_conversation_migration'),
+                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
+                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
+                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
+                    (74, 'temporarily_skip_completed_continuation_handoffs'),
+                    (91, 'temporarily_skip_product_creation_jobs'),
+                    (92, 'temporarily_skip_creation_checkout_pin'),
+                    (93, 'temporarily_skip_product_creation_ownership'),
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
+                    (100, 'temporarily_skip_automatic_continuation_admission'),
+                    (101, 'temporarily_skip_svg_artifacts'),
+                    (102, 'temporarily_skip_automatic_continuation_superseded'),
+                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
+                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
+                    (111, 'temporarily_skip_coordinator_watches'),
+                    (113, 'temporarily_skip_historical_continuation_settlement'),
+                    (119, 'temporarily_skip_close_cleanup_failures'),
+                    (120, 'temporarily_skip_coordinator_question_wait_events'),
+                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
+                    (123, 'temporarily_skip_close_startup_interruption'),
+                    (124, 'temporarily_skip_federation_peer_tls_trust'),
+                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
+                    (126, 'temporarily_skip_wake_feature_retirement'),
+                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
+                    (128, 'temporarily_skip_product_creation_provisioning_stage'),
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
+                    (130, 'temporarily_skip_normalized_remote_input_origin'),
+                    (131, 'temporarily_skip_bounded_federated_terminal_subscriptions')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// Migration 006: a chain with mixed `archived` state has every member
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
@@ -19676,39 +20923,15 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO _migrations (version, name)
-             VALUES (70, 'temporarily_skip_product_conversation_migration'),
-                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
-                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
-                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (91, 'temporarily_skip_product_creation_jobs'),
-                    (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership'),
-                    (95, 'temporarily_skip_product_lifecycle_reconciliation'),
-                    (100, 'temporarily_skip_automatic_continuation_admission'),
-                    (101, 'temporarily_skip_svg_artifacts'),
-                    (102, 'temporarily_skip_automatic_continuation_superseded'),
-                    (103, 'temporarily_skip_automatic_continuation_resume_phase'),
-                    (108, 'temporarily_skip_authority_timestamp_storage_class'),
-                    (111, 'temporarily_skip_coordinator_watches'),
-                    (113, 'temporarily_skip_historical_continuation_settlement'),
-                    (119, 'temporarily_skip_close_cleanup_failures'),
-                    (120, 'temporarily_skip_coordinator_question_wait_events'),
-                    (122, 'temporarily_skip_coordinator_event_child_indexes'),
-                    (123, 'temporarily_skip_close_startup_interruption'),
-                    (124, 'temporarily_skip_federation_peer_tls_trust'),
-                    (125, 'temporarily_skip_ipv6_federation_peer_hosts'),
-                    (126, 'temporarily_skip_wake_feature_retirement'),
-                    (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
-                    (128, 'temporarily_skip_product_creation_provisioning_stage'),
-                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        run_pending_migrations(&pool).await.unwrap();
+        skip_later_migrations_for_partial_archive_fixture(&pool).await;
+        run_before_goal_storage_for_test(&pool).await.unwrap();
+        assert_pre_goal_storage_fixture(&pool).await;
+        let ledger_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 6")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger_name, "archive_partially_archived_chains");
 
         // Wire chain edges *after* migrations so 003 (the column) is in place.
         for (parent, child) in [
@@ -19730,29 +20953,23 @@ with tempfile.TemporaryDirectory() as directory:
         sqlx::raw_sql(MIGRATION_006).execute(&pool).await.unwrap();
 
         let archived_for = |id: &'static str| {
-            let pool = pool.clone();
-            async move {
-                sqlx::query("SELECT archived FROM conversations WHERE id = ?1")
-                    .bind(id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap()
-                    .get::<bool, _>("archived")
-            }
+            sqlx::query_scalar::<_, bool>("SELECT archived FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
         };
 
         // Chain A: every member ends archived.
-        assert!(archived_for("a-root").await);
-        assert!(archived_for("a-mid").await);
-        assert!(archived_for("a-leaf").await);
+        assert!(archived_for("a-root").await.unwrap());
+        assert!(archived_for("a-mid").await.unwrap());
+        assert!(archived_for("a-leaf").await.unwrap());
         // Chain B: untouched (already fully archived).
-        assert!(archived_for("b-root").await);
-        assert!(archived_for("b-leaf").await);
+        assert!(archived_for("b-root").await.unwrap());
+        assert!(archived_for("b-leaf").await.unwrap());
         // Chain C: untouched (none archived).
-        assert!(!archived_for("c-root").await);
-        assert!(!archived_for("c-leaf").await);
+        assert!(!archived_for("c-root").await.unwrap());
+        assert!(!archived_for("c-leaf").await.unwrap());
         // Standalone: untouched.
-        assert!(archived_for("solo-s").await);
+        assert!(archived_for("solo-s").await.unwrap());
     }
 
     /// Migration 007: top-level Explore conversations get `worktree_path`
@@ -20524,6 +21741,45 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(indexes.len(), 3, "dependent wake indexes must survive");
     }
 
+    async fn assert_pre_goal_storage_fixture(pool: &SqlitePool) {
+        let late_ledger: Vec<(u32, String)> = sqlx::query_as(
+            "SELECT version, name FROM _migrations WHERE version >= 132 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(
+            late_ledger.is_empty(),
+            "unexpected late ledger: {late_ledger:?}"
+        );
+        let goal_schema: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'conversation_goal*' ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(
+            goal_schema.is_empty(),
+            "unexpected goal schema: {goal_schema:?}"
+        );
+    }
+
+    async fn assert_product_fixture_ledger(pool: &SqlitePool, versions: &[u32]) {
+        let actual: Vec<(u32, String)> = sqlx::query_as(
+            "SELECT version, name FROM _migrations WHERE version BETWEEN 70 AND 73 ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let expected: Vec<(u32, String)> = MIGRATIONS
+            .iter()
+            .filter(|migration| versions.contains(&migration.version))
+            .map(|migration| (migration.version, migration.name.to_owned()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_pre_goal_storage_fixture(pool).await;
+    }
+
     async fn setup_schema_before_migration_070(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
         sqlx::raw_sql(
@@ -20570,16 +21826,25 @@ with tempfile.TemporaryDirectory() as directory:
                     (126, 'temporarily_skip_wake_feature_retirement'),
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
-                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
+                    (130, 'temporarily_skip_normalized_remote_input_origin'),
+                    (131, 'temporarily_skip_bounded_federated_terminal_subscriptions')",
         )
         .execute(pool)
         .await
         .unwrap();
-        run_pending_migrations(pool).await.unwrap();
+        run_before_goal_storage_for_test(pool).await.unwrap();
         sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71, 72, 73)")
             .execute(pool)
             .await
             .unwrap();
+        assert_product_fixture_ledger(pool, &[]).await;
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'product_conversations')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -20621,7 +21886,8 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 4);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
 
         for blank_id in ["   ", "\t", "\n", " \t\n "] {
             assert!(sqlx::query(
@@ -20727,7 +21993,8 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 4);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         let membership: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'orphan-worker'",
         )
@@ -20834,7 +22101,8 @@ with tempfile.TemporaryDirectory() as directory:
                 .await
                 .unwrap();
 
-            assert!(run_pending_migrations(&pool).await.is_err());
+            assert!(run_before_goal_storage_for_test(&pool).await.is_err());
+            assert_product_fixture_ledger(&pool, &[]).await;
             assert!(!sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(
                      SELECT 1 FROM pragma_table_info('conversations')
@@ -20851,7 +22119,8 @@ with tempfile.TemporaryDirectory() as directory:
     async fn migration_070_rejects_invalid_membership_and_coordinator_lifecycle() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
+        run_before_goal_storage_for_test(&pool).await.unwrap();
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
 
         assert!(sqlx::query(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -20934,7 +22203,8 @@ with tempfile.TemporaryDirectory() as directory:
     async fn migration_070_rejects_invalid_continuation_and_parent_topology() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
+        run_before_goal_storage_for_test(&pool).await.unwrap();
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES
                  ('ordinary-a', 'ordinary', 'open'),
@@ -21151,7 +22421,7 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -21178,7 +22448,9 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         let parent: String = sqlx::query_scalar(
             "SELECT parent_conversation_id FROM conversations WHERE id = 'recursive-subordinate'",
         )
@@ -21199,7 +22471,7 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -21228,7 +22500,9 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 1);
+        assert_product_fixture_ledger(&pool, &[70, 71, 72, 73]).await;
         let invalid_parents: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM conversations child
@@ -21253,7 +22527,7 @@ with tempfile.TemporaryDirectory() as directory:
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_before_goal_storage_for_test(&pool).await.unwrap(), 3);
 
         sqlx::raw_sql(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
@@ -21278,7 +22552,9 @@ with tempfile.TemporaryDirectory() as directory:
             .execute(&pool)
             .await
             .unwrap();
-        assert!(run_pending_migrations(&pool).await.is_err());
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
+        assert!(run_before_goal_storage_for_test(&pool).await.is_err());
+        assert_product_fixture_ledger(&pool, &[70, 71, 72]).await;
         assert!(!sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM _migrations WHERE version = 73)",
         )

@@ -18,10 +18,10 @@ use super::event::{
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
-    OverloadRetryGuidance, ParentState, RecoverableContinuationFailure, RecoveryKind,
-    RecoveryResumeTarget, ServerOverloadPhase, ServerOverloadRetry, ServerOverloadTarget,
-    SubAgentOutcome, SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome,
-    ToolCall, ToolInput,
+    OverloadRetryGuidance, ParentState, PendingSubAgent, RecoverableContinuationFailure,
+    RecoveryKind, RecoveryResumeTarget, ServerOverloadPhase, ServerOverloadRetry,
+    ServerOverloadTarget, SubAgentOutcome, SubAgentResult, SubAgentState, TaskApprovalHandoff,
+    TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -842,6 +842,15 @@ pub fn transition_core(
         .with_effect(Effect::PersistState)
         .with_effect(Effect::notify_state_change())
         .with_effect(Effect::RequestLlm)),
+        (CoreState::Idle, CoreEvent::AuthoritativeGoalStart { receipt, authority }) => Ok(
+            CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistAuthoritativeGoalStart {
+                    receipt: receipt.clone(),
+                    authority: authority.clone(),
+                })
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm),
+        ),
         (
             CoreState::Idle | CoreState::Error { .. },
             CoreEvent::AuthoritativeUserMessage { payload, authority },
@@ -849,7 +858,7 @@ pub fn transition_core(
             CoreState::LlmRequesting { attempt: 1 },
         )
         .with_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload.as_ref().clone(),
+            payload: payload.clone(),
             authority: authority.clone(),
             idempotent: false,
         })
@@ -858,14 +867,18 @@ pub fn transition_core(
 
         (
             CoreState::Error { .. },
-            CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+            CoreEvent::UserMessage { .. }
+            | CoreEvent::AuthoritativeUserMessage { .. }
+            | CoreEvent::AuthoritativeGoalStart { .. },
         ) => Err(TransitionError::NonResumableError),
 
         (
             CoreState::LlmRequesting { .. }
             | CoreState::ToolExecuting { .. }
             | CoreState::AwaitingSubAgents { .. },
-            CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+            CoreEvent::UserMessage { .. }
+            | CoreEvent::AuthoritativeUserMessage { .. }
+            | CoreEvent::AuthoritativeGoalStart { .. },
         )
         | (
             CoreState::ToolExecuting { .. } | CoreState::AwaitingSubAgents { .. },
@@ -876,6 +889,7 @@ pub fn transition_core(
             CoreState::CancellingTool { .. } | CoreState::CancellingSubAgents { .. },
             CoreEvent::UserMessage { .. }
             | CoreEvent::AuthoritativeUserMessage { .. }
+            | CoreEvent::AuthoritativeGoalStart { .. }
             | CoreEvent::SteerDrainedUserMessages { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
@@ -1130,6 +1144,68 @@ fn handle_core_llm_response(
     .with_effect(Effect::execute_tool(first)))
 }
 
+fn finish_tool_round_step(
+    remaining_tools: &[ToolCall],
+    completed_results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+    pending_sub_agents: &[PendingSubAgent],
+    assistant_message: &AssistantMessage,
+    result: impl Into<phoenix_core::domain::conversation_goal::ToolRoundResult>,
+) -> CoreTransitionResult {
+    match (remaining_tools.is_empty(), pending_sub_agents.is_empty()) {
+        (false, _) => {
+            let mut new_results = completed_results.to_vec();
+            new_results.push(result.into());
+
+            let next_tool = remaining_tools[0].clone();
+            let new_remaining = remaining_tools[1..].to_vec();
+
+            CoreTransitionResult::new(CoreState::ToolExecuting {
+                current_tool: next_tool.clone(),
+                remaining_tools: new_remaining,
+                completed_results: new_results,
+                pending_sub_agents: pending_sub_agents.to_vec(),
+                assistant_message: assistant_message.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change())
+            .with_effect(Effect::execute_tool(next_tool))
+        }
+
+        (true, true) => {
+            let mut all_results = completed_results.to_vec();
+            all_results.push(result.into());
+
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in last-tool transition");
+
+            CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm)
+        }
+
+        (true, false) => {
+            let mut all_results = completed_results.to_vec();
+            all_results.push(result.into());
+
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect(
+                    "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
+                );
+
+            CoreTransitionResult::new(CoreState::AwaitingSubAgents {
+                pending: pending_sub_agents.to_vec(),
+                completed_results: vec![],
+                spawn_tool_id: None,
+            })
+            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change())
+        }
+    }
+}
+
 /// Handles `ToolComplete` and `SpawnAgentsComplete` events during `ToolExecuting` state.
 #[allow(clippy::too_many_lines)]
 fn handle_core_tool_complete(
@@ -1148,77 +1224,16 @@ fn handle_core_tool_complete(
     };
 
     match event {
-        // ToolComplete (more tools remaining) -> next tool
         CoreEvent::ToolComplete {
             tool_use_id,
             result,
-        } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
-            let mut new_results = completed_results.clone();
-            new_results.push(result);
-
-            let next_tool = remaining_tools[0].clone();
-            let new_remaining = remaining_tools[1..].to_vec();
-
-            Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
-                current_tool: next_tool.clone(),
-                remaining_tools: new_remaining,
-                completed_results: new_results,
-                pending_sub_agents: pending_sub_agents.clone(),
-                assistant_message: assistant_message.clone(),
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::execute_tool(next_tool)))
-        }
-
-        // ToolComplete (last tool, no sub-agents) -> LlmRequesting
-        CoreEvent::ToolComplete {
-            tool_use_id,
+        } if tool_use_id == current_tool.id => Ok(finish_tool_round_step(
+            remaining_tools,
+            completed_results,
+            pending_sub_agents,
+            assistant_message,
             result,
-        } if tool_use_id == current_tool.id
-            && remaining_tools.is_empty()
-            && pending_sub_agents.is_empty() =>
-        {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in last-tool transition");
-
-            Ok(
-                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm),
-            )
-        }
-
-        // ToolComplete (last tool, has sub-agents) -> AwaitingSubAgents
-        CoreEvent::ToolComplete {
-            tool_use_id,
-            result,
-        } if tool_use_id == current_tool.id
-            && remaining_tools.is_empty()
-            && !pending_sub_agents.is_empty() =>
-        {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect(
-                    "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
-                );
-
-            Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
-                pending: pending_sub_agents.clone(),
-                completed_results: vec![],
-                spawn_tool_id: None,
-            })
-            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change()))
-        }
+        )),
 
         // SpawnAgentsComplete (more tools) -> accumulate
         CoreEvent::SpawnAgentsComplete {
@@ -1227,7 +1242,7 @@ fn handle_core_tool_complete(
             spawned,
         } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
-            new_results.push(result);
+            new_results.push(result.into());
 
             let mut new_pending = pending_sub_agents.clone();
             new_pending.extend(spawned);
@@ -1258,7 +1273,7 @@ fn handle_core_tool_complete(
 
             let mut all_results = completed_results.clone();
             let spawn_id = result.tool_use_id.clone();
-            all_results.push(result);
+            all_results.push(result.into());
 
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
@@ -1278,6 +1293,7 @@ fn handle_core_tool_complete(
         | CoreEvent::SpawnAgentsComplete { .. }
         | CoreEvent::UserMessage { .. }
         | CoreEvent::AuthoritativeUserMessage { .. }
+        | CoreEvent::AuthoritativeGoalStart { .. }
         | CoreEvent::UserCancel { .. }
         | CoreEvent::LlmResponse { .. }
         | CoreEvent::LlmError { .. }
@@ -1386,6 +1402,7 @@ fn handle_core_cancellation(
         ) if *tool_use_id == aborted_id => {
             let all_results = build_cancellation_results(
                 completed_results,
+                assistant_message,
                 tool_use_id,
                 "Cancelled by user",
                 skipped_tools,
@@ -1428,6 +1445,7 @@ fn handle_core_cancellation(
         ) if *tool_use_id == completed_id => {
             let all_results = build_cancellation_results(
                 completed_results,
+                assistant_message,
                 tool_use_id,
                 "Cancelled by user",
                 skipped_tools,
@@ -1491,21 +1509,38 @@ fn handle_core_cancellation(
 /// Builds the tool results list for cancellation transitions, including the
 /// cancelled current tool and skipped remaining tools.
 fn build_cancellation_results(
-    completed_results: &[ToolResult],
+    completed_results: &[phoenix_core::domain::conversation_goal::ToolRoundResult],
+    assistant_message: &AssistantMessage,
     cancelled_tool_id: &str,
     cancel_reason: &str,
     skipped_tools: &[ToolCall],
-) -> Vec<ToolResult> {
+) -> Vec<phoenix_core::domain::conversation_goal::ToolRoundResult> {
+    use phoenix_core::domain::llm_types::ContentBlock;
     let mut all_results = completed_results.to_vec();
-    all_results.push(ToolResult::cancelled(
-        cancelled_tool_id.to_string(),
-        cancel_reason,
-    ));
+    let cancelled_report = assistant_message.content.iter().any(|block| {
+        matches!(block,
+        ContentBlock::ToolUse { id, name, .. } if id == cancelled_tool_id && name == "goal_report")
+    });
+    let cancelled = if cancelled_report {
+        ToolResult::error(
+            cancelled_tool_id.to_owned(),
+            format!("ECANCELLED: goal report was not committed: {cancel_reason}"),
+        )
+    } else {
+        ToolResult::cancelled(cancelled_tool_id.to_owned(), cancel_reason)
+    };
+    all_results.push(cancelled.into());
     for tool in skipped_tools {
-        all_results.push(ToolResult::cancelled(
-            tool.id.clone(),
-            "Skipped due to cancellation",
-        ));
+        let skipped = if tool.name() == "goal_report" {
+            ToolResult::error(
+                tool.id.clone(),
+                "ECANCELLED: goal report was not executed because the previous tool was cancelled"
+                    .into(),
+            )
+        } else {
+            ToolResult::cancelled(tool.id.clone(), "Skipped due to cancellation")
+        };
+        all_results.push(skipped.into());
     }
     all_results
 }
@@ -2286,7 +2321,8 @@ fn creation_provisioned_transition(
             | Effect::PersistAuthoritativeUserMessage { idempotent, .. } => {
                 *idempotent = true;
             }
-            Effect::PersistState
+            Effect::PersistAuthoritativeGoalStart { .. }
+            | Effect::PersistState
             | Effect::RequestLlm
             | Effect::CompleteCreation { .. }
             | Effect::MaterializeCreation { .. }
@@ -2373,6 +2409,122 @@ pub fn transition_parent(
     event: ParentEvent,
 ) -> Result<ParentTransitionResult, TransitionError> {
     match (state, event) {
+        (
+            ParentState::Core(CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            }),
+            ParentEvent::Parent(ParentOnlyEvent::GoalManagementPrepared {
+                management,
+                duration_ms,
+            }),
+        ) if context.is_coordinator
+            && current_tool.name() == "goal_manage"
+            && management.source().tool_use_id.as_str() == current_tool.id
+            && management.source().message_id.as_str() == assistant_message.message_id
+            && management.source().transcript_id.as_str() == context.conversation_id =>
+        {
+            let core = finish_tool_round_step(
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+                phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement {
+                    management,
+                    duration_ms,
+                },
+            );
+            Ok(ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
+        (
+            ParentState::Core(
+                core @ CoreState::CancellingTool {
+                    tool_use_id,
+                    assistant_message,
+                    ..
+                },
+            ),
+            ParentEvent::Parent(ParentOnlyEvent::GoalManagementPrepared { management, .. }),
+        ) if context.is_coordinator
+            && management.source().tool_use_id.as_str() == tool_use_id
+            && management.source().message_id.as_str() == assistant_message.message_id
+            && management.source().transcript_id.as_str() == context.conversation_id =>
+        {
+            handle_core_cancellation(
+                core,
+                CoreEvent::ToolAborted {
+                    tool_use_id: tool_use_id.clone(),
+                },
+            )
+            .map(|core| ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
+        (
+            ParentState::Core(CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+            }),
+            ParentEvent::Parent(ParentOnlyEvent::GoalReportPrepared {
+                report,
+                duration_ms,
+            }),
+        ) if current_tool.name() == "goal_report"
+            && report.call().tool_use_id.as_str() == current_tool.id
+            && report.call().message_id.as_str() == assistant_message.message_id
+            && report.call().transcript_id.as_str() == context.conversation_id =>
+        {
+            let result =
+                phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalReport {
+                    report,
+                    duration_ms,
+                };
+            let core = finish_tool_round_step(
+                remaining_tools,
+                completed_results,
+                pending_sub_agents,
+                assistant_message,
+                result,
+            );
+            Ok(ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
+        (
+            ParentState::Core(
+                core @ CoreState::CancellingTool {
+                    tool_use_id,
+                    assistant_message,
+                    ..
+                },
+            ),
+            ParentEvent::Parent(ParentOnlyEvent::GoalReportPrepared { report, .. }),
+        ) if report.call().tool_use_id.as_str() == tool_use_id
+            && report.call().message_id.as_str() == assistant_message.message_id
+            && report.call().transcript_id.as_str() == context.conversation_id =>
+        {
+            handle_core_cancellation(
+                core,
+                CoreEvent::ToolAborted {
+                    tool_use_id: tool_use_id.clone(),
+                },
+            )
+            .map(|core| ParentTransitionResult {
+                new_state: ParentState::Core(core.new_state),
+                effects: core.effects,
+            })
+        }
         // ============================================================
         // Parent-only state: AwaitingTaskApproval
         // ============================================================
@@ -2381,6 +2533,7 @@ pub fn transition_parent(
             ParentEvent::Core(
                 CoreEvent::UserMessage { .. }
                 | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. }
                 | CoreEvent::UserTriggerContinuation { .. },
             ),
         ) => Err(TransitionError::AwaitingTaskApproval),
@@ -2501,6 +2654,7 @@ pub fn transition_parent(
             ParentEvent::Core(
                 CoreEvent::UserMessage { .. }
                 | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. }
                 | CoreEvent::UserTriggerContinuation { .. },
             ),
         ) => Err(TransitionError::AwaitingUserResponse),
@@ -2774,7 +2928,9 @@ pub fn transition_parent(
         (
             ParentState::ContextExhausted { .. },
             ParentEvent::Core(
-                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. },
             ),
         ) => Err(TransitionError::ContextExhausted),
 
@@ -2788,13 +2944,17 @@ pub fn transition_parent(
         (
             ParentState::HandedOff { .. },
             ParentEvent::Core(
-                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. },
             ),
         )
         | (
             ParentState::Terminal,
             ParentEvent::Core(
-                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::AuthoritativeGoalStart { .. },
             ),
         ) => Err(TransitionError::ConversationTerminal),
 
@@ -4025,8 +4185,45 @@ pub fn handle_outcome(
     context: &ConvContext,
     outcome: EffectOutcome,
 ) -> Result<TransitionResult, InvalidOutcome> {
+    if matches!(&outcome, EffectOutcome::Llm(LlmOutcome::GoalControlRevoked))
+        && !matches!(state, ConvState::LlmRequesting { .. })
+    {
+        return Err(InvalidOutcome {
+            reason: "goal-control revocation has no current provider request".into(),
+        });
+    }
     let event = match outcome {
         EffectOutcome::Llm(llm) => llm_outcome_to_event(llm, state),
+        EffectOutcome::Tool(ToolExecOutcome::Aborted {
+            tool_use_id,
+            reason: super::outcome::AbortReason::GoalControlRevoked,
+        }) if matches!(state, ConvState::ToolExecuting { current_tool, .. }
+            if current_tool.id == tool_use_id) =>
+        {
+            return transition(
+                state,
+                context,
+                Event::UserCancel {
+                    reason: None,
+                    cause: CancelCause::UserRequested,
+                },
+            )
+            .and_then(|cancelling| {
+                let mut settled = transition(
+                    &cancelling.new_state,
+                    context,
+                    Event::ToolAborted { tool_use_id },
+                )?;
+                let mut effects = cancelling.effects;
+                effects.retain(|effect| !matches!(effect, Effect::PersistState));
+                effects.append(&mut settled.effects);
+                settled.effects = effects;
+                Ok(settled)
+            })
+            .map_err(|error| InvalidOutcome {
+                reason: error.to_string(),
+            });
+        }
         EffectOutcome::Tool(tool) => tool_outcome_to_event(tool),
         EffectOutcome::SubAgent { agent_id, outcome } => {
             Event::SubAgentResult { agent_id, outcome }
@@ -4206,6 +4403,10 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::GoalControlRevoked => Event::UserCancel {
+            reason: None,
+            cause: CancelCause::UserRequested,
+        },
         LlmOutcome::OutputTokensExhausted { message } => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -4524,6 +4725,82 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn typed_start_event() -> Event {
+        use phoenix_core::domain::conversation_goal::{
+            GoalExecution, GoalId, GoalSnapshot, GoalStartInput, GoalStartReceipt,
+            GoalStartRequester, GoalState, GoalText, GoalVersion,
+        };
+        use phoenix_core::domain::product_conversation::ProductConversationId;
+        let goal = GoalSnapshot {
+            owner: ProductConversationId::parse("start-owner").unwrap(),
+            goal_id: GoalId::parse("start-goal").unwrap(),
+            version: GoalVersion::parse(1).unwrap(),
+            objective: GoalText::parse("Implement the admitted objective").unwrap(),
+            state: GoalState::Underway,
+        };
+        let request = GoalStartInput::new(
+            uuid::Uuid::new_v4(),
+            GoalStartRequester::Owner {
+                principal_id: uuid::Uuid::new_v4(),
+            },
+            goal.fence(),
+        )
+        .unwrap();
+        Event::AuthoritativeGoalStart {
+            receipt: GoalStartReceipt::new(
+                request,
+                GoalExecution::parse(7, 9).unwrap(),
+                GoalText::parse("start-transcript").unwrap(),
+                Some(9),
+                goal,
+            )
+            .unwrap(),
+            authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority::new(
+                7, 9, 1, 1, 1, 0, 10,
+            ),
+        }
+    }
+
+    #[test]
+    fn conversation_goal_start_reducer_uses_only_nonmessage_authoritative_materialization() {
+        let Event::AuthoritativeGoalStart { receipt, authority } = typed_start_event() else {
+            unreachable!()
+        };
+        let result = transition_core(
+            &CoreState::Idle,
+            &test_context(),
+            CoreEvent::AuthoritativeGoalStart { receipt, authority },
+        )
+        .unwrap();
+        assert_eq!(result.new_state, CoreState::LlmRequesting { attempt: 1 });
+        assert_eq!(result.effects.len(), 3);
+        assert!(matches!(
+            &result.effects[0],
+            Effect::PersistAuthoritativeGoalStart { .. }
+        ));
+        assert!(matches!(&result.effects[2], Effect::RequestLlm));
+        assert!(!result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistMessage { .. } | Effect::PersistAuthoritativeUserMessage { .. }
+        )));
+    }
+
+    #[test]
+    fn conversation_goal_start_reducer_rejects_busy_and_subagent_adoption() {
+        assert!(SubAgentEvent::try_from(typed_start_event()).is_err());
+        let Event::AuthoritativeGoalStart { receipt, authority } = typed_start_event() else {
+            unreachable!()
+        };
+        assert!(matches!(
+            transition_core(
+                &CoreState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                CoreEvent::AuthoritativeGoalStart { receipt, authority }
+            ),
+            Err(TransitionError::AgentBusy)
+        ));
+    }
+
     fn test_context() -> ConvContext {
         ConvContext::new(
             "test-conv",
@@ -4532,6 +4809,130 @@ mod tests {
             200_000,
             16_384,
         )
+    }
+
+    fn management_fixture() -> (
+        ConvState,
+        phoenix_core::domain::conversation_goal::GoalPendingManagement,
+    ) {
+        use phoenix_core::domain::{
+            conversation_goal::*, llm_types::ContentBlock,
+            product_conversation::ProductConversationId,
+        };
+        let request = GoalManagementRequest::Create {
+            owner: ProductConversationId::parse("target").unwrap(),
+            expected_version: GoalVersion::INITIAL,
+            objective: GoalText::parse("objective").unwrap(),
+        };
+        let input = serde_json::to_value(&request).unwrap();
+        let assistant = AssistantMessage::new(
+            "canonical-management".into(),
+            vec![ContentBlock::tool_use(
+                "manage",
+                "goal_manage",
+                input.clone(),
+            )],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "manage",
+                ToolInput::from_name_and_value("goal_manage", input),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: assistant,
+        };
+        let intent = GoalPendingManagement::new(
+            GoalAgentSource {
+                product_conversation_id: ProductConversationId::parse("coordinator").unwrap(),
+                transcript_id: GoalText::parse("test-conv").unwrap(),
+                execution: GoalExecution::parse(1, 2).unwrap(),
+                message_id: GoalText::parse("canonical-management").unwrap(),
+                tool_use_id: GoalText::parse("manage").unwrap(),
+            },
+            0,
+            request,
+        );
+        (state, intent)
+    }
+
+    #[test]
+    fn conversation_goal_management_preparation_requires_coordinator_and_exact_canonical_call() {
+        let (state, management) = management_fixture();
+        let event = Event::GoalManagementPrepared {
+            management,
+            duration_ms: 3,
+        };
+        assert!(transition(&state, &test_context(), event.clone()).is_err());
+        let mut context = test_context();
+        context.is_coordinator = true;
+        let prepared = transition(&state, &context, event.clone()).unwrap();
+        assert!(prepared.effects.iter().any(|effect| matches!(effect,
+            Effect::PersistCheckpoint { data: CheckpointData::ToolRound { tool_results, .. } }
+            if matches!(tool_results.as_slice(), [phoenix_core::domain::conversation_goal::ToolRoundResult::PendingGoalManagement { .. }])
+        )));
+        for field in ["tool", "message", "transcript"] {
+            let mut wrong = state.clone();
+            let ConvState::ToolExecuting {
+                current_tool,
+                assistant_message,
+                ..
+            } = &mut wrong
+            else {
+                panic!("tool")
+            };
+            match field {
+                "tool" => current_tool.id = "wrong".into(),
+                "message" => assistant_message.message_id = "wrong".into(),
+                _ => context.conversation_id = "wrong".into(),
+            }
+            assert!(transition(&wrong, &context, event.clone()).is_err());
+            context.conversation_id = "test-conv".into();
+        }
+        assert!(phoenix_core::domain::sm_event::SubAgentEvent::try_from(event).is_err());
+    }
+
+    #[test]
+    fn conversation_goal_provider_revocation_cancels_only_the_current_request() {
+        let requesting = ConvState::LlmRequesting { attempt: 1 };
+        let cancelled = handle_outcome(
+            &requesting,
+            &test_context(),
+            EffectOutcome::Llm(LlmOutcome::GoalControlRevoked),
+        )
+        .unwrap();
+        assert!(matches!(cancelled.new_state, ConvState::Idle));
+        assert!(cancelled
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(!cancelled
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm | Effect::ScheduleRetry { .. })));
+        assert!(handle_outcome(
+            &ConvState::Idle,
+            &test_context(),
+            EffectOutcome::Llm(LlmOutcome::GoalControlRevoked)
+        )
+        .is_err());
+
+        let generic = handle_outcome(
+            &requesting,
+            &test_context(),
+            EffectOutcome::Llm(LlmOutcome::Cancelled),
+        )
+        .unwrap();
+        assert!(matches!(
+            generic.new_state,
+            ConvState::Error {
+                error_kind: ErrorKind::Cancelled,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6487,8 +6888,8 @@ mod tests {
                 payload: effect_payload,
                 authority: effect_authority,
                 idempotent: false,
-            } if effect_payload.message_id() == payload.message_id()
-                && effect_payload.delivery.llm_text == payload.delivery.llm_text
+            } if effect_payload.as_ref() == &payload
+                && serde_json::to_value(effect_payload).unwrap() == serde_json::to_value(&payload).unwrap()
                 && effect_authority == &authority
         )));
         assert!(!result
@@ -6744,6 +7145,44 @@ mod tests {
             result.new_state,
             ConvState::LlmRequesting { attempt: 1 }
         ));
+    }
+
+    #[test]
+    fn conversation_goal_cancelled_and_skipped_reports_are_refusals_not_success_lookalikes() {
+        use phoenix_core::domain::{db_schema::ToolOutcome, llm_types::ContentBlock};
+        for current_name in ["goal_report", "think"] {
+            let assistant = AssistantMessage::new(
+                "cancelled-report-assistant".into(),
+                vec![
+                    ContentBlock::tool_use("current", current_name, serde_json::json!({})),
+                    ContentBlock::tool_use("skipped-report", "goal_report", serde_json::json!({})),
+                ],
+                None,
+                None,
+            );
+            let skipped = ToolCall::new(
+                "skipped-report",
+                ToolInput::from_name_and_value("goal_report", serde_json::json!({})),
+            );
+            let results = build_cancellation_results(
+                &[],
+                &assistant,
+                "current",
+                "Cancelled by user",
+                &[skipped],
+            );
+            assert_eq!(results.len(), 2);
+            let current = results[0].finalized().unwrap();
+            if current_name == "goal_report" {
+                assert!(matches!(current.outcome, ToolOutcome::Error { .. }));
+                assert!(current.is_error());
+            } else {
+                assert!(matches!(current.outcome, ToolOutcome::Cancelled { .. }));
+                assert!(!current.is_error());
+            }
+            assert!(results[1].finalized().unwrap().is_error());
+            assert!(CheckpointData::tool_round(assistant, results).is_ok());
+        }
     }
 
     #[test]
@@ -7800,7 +8239,11 @@ mod tests {
             .expect("should persist a tool-round checkpoint with the rejection");
         let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
         assert_eq!(tool_results.len(), 1);
-        match &tool_results[0].outcome {
+        match &tool_results[0]
+            .finalized()
+            .expect("finalized rejection")
+            .outcome
+        {
             ToolOutcome::Error { output, .. } => {
                 assert!(
                     output.contains("parent"),
@@ -9399,7 +9842,7 @@ mod tests {
                 .expect("Direct rejection must persist a tool result");
             let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
             assert!(matches!(
-                &tool_results[0].outcome,
+                &tool_results[0].finalized().expect("finalized rejection").outcome,
                 ToolOutcome::Error { output, .. }
                     if output == "propose_task is unavailable for this conversation."
             ));

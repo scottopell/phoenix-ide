@@ -2,11 +2,28 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use phoenix_core::domain::instance_identity::{
-    InstanceId, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem, PeerHost, PeerTlsTrust,
+    InstanceId, InstanceSelector, PeerBaseUrl, PeerBearerCredential, PeerCaCertificatePem,
+    PeerHost, PeerTlsTrust,
 };
 use sqlx::Row;
 
 use crate::{Database, DbError, DbResult};
+
+#[derive(Debug, serde::Serialize)]
+pub struct FederationPeerSummary {
+    pub peer_instance_id: InstanceId,
+    pub peer_display_name: String,
+    #[serde(serialize_with = "serialize_peer_base_url")]
+    pub base_url: PeerBaseUrl,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+fn serialize_peer_base_url<S: serde::Serializer>(
+    url: &PeerBaseUrl,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(url)
+}
 
 pub struct FederationPeerConnection {
     pub peer_instance_id: InstanceId,
@@ -17,7 +34,96 @@ pub struct FederationPeerConnection {
     pub created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum FederationPeerSelectionError {
+    #[error("peer not found")]
+    NotFound,
+    #[error("peer display name is ambiguous")]
+    Ambiguous,
+    #[error(transparent)]
+    Database(#[from] DbError),
+}
+
 impl Database {
+    /// List advertised peer metadata without reading connection credentials.
+    ///
+    /// # Errors
+    /// Returns an error for invalid stored metadata or a failed query.
+    pub async fn federation_peer_summaries(&self) -> DbResult<Vec<FederationPeerSummary>> {
+        let rows = sqlx::query("SELECT peer_instance_id, peer_display_name, domain_or_ipv4_host, ipv6_host, port, created_at_us FROM federation_peer_connections ORDER BY peer_instance_id")
+            .fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| {
+                let domain: Option<String> = row.try_get("domain_or_ipv4_host")?;
+                let address: Option<Vec<u8>> = row.try_get("ipv6_host")?;
+                let host = match (domain.as_deref(), address) {
+                    (Some(domain), None) => PeerHost::DomainOrIpv4(domain),
+                    (None, Some(bytes)) => PeerHost::Ipv6(std::net::Ipv6Addr::from(
+                        <[u8; 16]>::try_from(bytes)
+                            .map_err(|_| DbError::Serialization("invalid IPv6 peer host".into()))?,
+                    )),
+                    _ => return Err(DbError::Serialization("invalid peer host shape".into())),
+                };
+                let port: i64 = row.try_get("port")?;
+                Ok(FederationPeerSummary {
+                    peer_instance_id: row
+                        .try_get::<String, _>("peer_instance_id")?
+                        .parse()
+                        .map_err(
+                        |error: phoenix_core::domain::instance_identity::InstanceIdParseError| {
+                            DbError::Serialization(error.to_string())
+                        },
+                    )?,
+                    peer_display_name: row.try_get("peer_display_name")?,
+                    base_url: PeerBaseUrl::from_host_port(
+                        host,
+                        u16::try_from(port)
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    )
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    created_at: chrono::DateTime::from_timestamp_micros(
+                        row.try_get("created_at_us")?,
+                    )
+                    .ok_or_else(|| DbError::Serialization("invalid peer timestamp".into()))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Read the opaque owner note for an existing peer.
+    ///
+    /// # Errors
+    /// Returns a database error when the read fails.
+    pub async fn federation_peer_notes(&self, peer: InstanceId) -> DbResult<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT notes FROM federation_peer_connections WHERE peer_instance_id = ?1",
+        )
+        .bind(peer.to_string())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Replace the opaque owner note; returns false for an unknown peer.
+    ///
+    /// # Errors
+    /// Rejects notes over 32768 UTF-8 bytes and failed writes.
+    pub async fn set_federation_peer_notes(&self, peer: InstanceId, notes: &str) -> DbResult<bool> {
+        if notes.len() > 32768 {
+            return Err(DbError::Serialization(
+                "peer notes exceed 32768 UTF-8 bytes".into(),
+            ));
+        }
+        Ok(sqlx::query(
+            "UPDATE federation_peer_connections SET notes = ?2 WHERE peer_instance_id = ?1",
+        )
+        .bind(peer.to_string())
+        .bind(notes)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
     /// Persist or replace one caller-side directional peer connection.
     ///
     /// # Errors
@@ -139,6 +245,44 @@ impl Database {
         .transpose()
     }
 
+    /// Resolve one exact peer identity or one unambiguous display name.
+    ///
+    /// # Errors
+    /// Returns a database error for malformed persisted data, and a typed selection error when the
+    /// selector is missing or ambiguous.
+    pub async fn resolve_federation_peer(
+        &self,
+        selector: &InstanceSelector,
+    ) -> Result<FederationPeerConnection, FederationPeerSelectionError> {
+        match selector {
+            InstanceSelector::Id(id) => self
+                .federation_peer_connection(*id)
+                .await?
+                .ok_or(FederationPeerSelectionError::NotFound),
+            InstanceSelector::DisplayName(name) => {
+                let ids: Vec<String> = sqlx::query_scalar(
+                    "SELECT peer_instance_id FROM federation_peer_connections
+                     WHERE peer_display_name = ?1 ORDER BY peer_instance_id LIMIT 2",
+                )
+                .bind(name)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(DbError::from)?;
+                match ids.as_slice() {
+                    [] => Err(FederationPeerSelectionError::NotFound),
+                    [id] => self
+                        .federation_peer_connection(
+                            InstanceId::from_str(id)
+                                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                        )
+                        .await?
+                        .ok_or(FederationPeerSelectionError::NotFound),
+                    [_, _, ..] => Err(FederationPeerSelectionError::Ambiguous),
+                }
+            }
+        }
+    }
+
     /// Remove one caller-side directional peer connection.
     ///
     /// # Errors
@@ -159,6 +303,56 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_selector_requires_exact_id_or_unambiguous_display_name() {
+        let db = Database::open_in_memory().await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let first = InstanceId::new();
+        let second = InstanceId::new();
+        for (id, url, token) in [
+            (
+                first,
+                PeerBaseUrl::from_str("https://first.peer.example").unwrap(),
+                PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap(),
+            ),
+            (
+                second,
+                PeerBaseUrl::from_str("https://second.peer.example").unwrap(),
+                PeerBearerCredential::parse(format!("phx_peer_{}", "b".repeat(43))).unwrap(),
+            ),
+        ] {
+            db.save_federation_peer_connection(
+                id,
+                "duplicate",
+                &url,
+                &token,
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.resolve_federation_peer(&InstanceSelector::Id(first))
+                .await
+                .unwrap()
+                .peer_instance_id,
+            first
+        );
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::DisplayName("missing".to_string()))
+                .await,
+            Err(FederationPeerSelectionError::NotFound)
+        ));
+        assert!(matches!(
+            db.resolve_federation_peer(&InstanceSelector::DisplayName("duplicate".to_string()))
+                .await,
+            Err(FederationPeerSelectionError::Ambiguous)
+        ));
+    }
 
     #[tokio::test]
     async fn schema_rejects_malformed_peer_identity_and_origins() {

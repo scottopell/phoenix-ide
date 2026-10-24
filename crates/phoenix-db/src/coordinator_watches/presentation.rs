@@ -26,6 +26,7 @@ pub struct WatchEventPresentation {
     pub outcome: WatchOutcome,
     pub occurred_at_us: i64,
     pub provenance: WatchEventProvenance,
+    pub goal_capture: Option<phoenix_core::domain::watch_goal::WatchGoalCapture>,
 }
 
 const EVENT_IDS_PER_QUERY: usize = 400;
@@ -47,6 +48,10 @@ impl Database {
                     COALESCE(w.source_product_conversation_id, e.mandatory_source_product_id) AS product_id,
                     e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
                     e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
+                    e.goal_capture_kind, gc.kind AS capture_kind, gc.owner_id AS capture_owner_id,
+                    gc.owner_version AS capture_owner_version, gc.goal_id AS capture_goal_id,
+                    gc.objective AS capture_objective, gc.state AS capture_state,
+                    gc.reason AS capture_reason, gc.usage_kind AS capture_usage_kind,
                     (SELECT COALESCE(NULLIF(root.title, ''),
                                      NULLIF(root.slug, ''), 'Untitled conversation')
                      FROM conversations root
@@ -57,6 +62,7 @@ impl Database {
                              AND predecessor.continued_in_conv_id = root.id)
                      ORDER BY root.id LIMIT 1) AS display_name
                  FROM coordinator_watch_events e
+                 LEFT JOIN coordinator_watch_goal_captures gc ON gc.event_id=e.event_id
                  LEFT JOIN coordinator_watches w ON w.id = e.watch_id
                  LEFT JOIN product_conversations p
                    ON p.id = COALESCE(w.source_product_conversation_id, e.mandatory_source_product_id)
@@ -90,6 +96,7 @@ impl Database {
                     )?,
                     occurred_at_us: row.try_get("occurred_at_us")?,
                     provenance,
+                    goal_capture: super::goal_facts::decode(&row)?,
                 };
                 events.insert(event.event_id.clone(), event);
             }
@@ -137,6 +144,7 @@ mod tests {
             "Completed",
             None,
             false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -232,6 +240,7 @@ mod tests {
                 kind,
                 reason,
                 false,
+                crate::conversation_goals::control::GoalControlInstallation::Disabled,
             )
             .await
             .unwrap();

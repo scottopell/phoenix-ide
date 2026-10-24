@@ -123,6 +123,32 @@ impl fmt::Display for PeerBaseUrl {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceSelector {
+    Id(InstanceId),
+    DisplayName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("instance selector cannot be empty")]
+pub struct InstanceSelectorError;
+
+impl InstanceSelector {
+    /// Interpret `UUIDv4` values as exact identities and all other non-empty values as display names.
+    ///
+    /// # Errors
+    /// Returns [`InstanceSelectorError`] when the selector is empty.
+    pub fn parse(value: impl Into<String>) -> Result<Self, InstanceSelectorError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(InstanceSelectorError);
+        }
+        Ok(InstanceId::from_str(trimmed)
+            .map_or_else(|_| Self::DisplayName(trimmed.to_string()), Self::Id))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHost<'a> {
     DomainOrIpv4(&'a str),
@@ -137,6 +163,44 @@ impl FederationQueryDatabaseEndpoint {
     pub fn as_url(&self) -> &url::Url {
         &self.0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationSearchConversationsEndpoint(url::Url);
+
+impl FederationSearchConversationsEndpoint {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationReadConversationEndpoint(url::Url);
+
+impl FederationReadConversationEndpoint {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerNavigationUrl(url::Url);
+
+impl PeerNavigationUrl {
+    #[must_use]
+    pub fn as_url(&self) -> &url::Url {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PeerNavigationUrlError {
+    #[error("peer navigation locator must be an absolute application path")]
+    NotAbsolutePath,
+    #[error("peer navigation locator changed the selected peer origin")]
+    ChangedOrigin,
 }
 
 impl PeerBaseUrl {
@@ -183,6 +247,58 @@ impl PeerBaseUrl {
                 .join("/api/federation/peer/query-database")
                 .expect("fixed federation route is a valid URL path"),
         )
+    }
+
+    /// Return the closed endpoint for bounded remote conversation search.
+    ///
+    /// # Panics
+    /// Panics only if the fixed compile-time route is not a valid URL path.
+    #[must_use]
+    pub fn search_conversations_endpoint(&self) -> FederationSearchConversationsEndpoint {
+        FederationSearchConversationsEndpoint(
+            self.0
+                .join("/api/federation/peer/search-conversations")
+                .expect("fixed federation route is a valid URL path"),
+        )
+    }
+
+    /// Return the fixed authenticated peer conversation-read endpoint.
+    ///
+    /// # Panics
+    /// Panics only if the compile-time route is not a valid URL path.
+    #[must_use]
+    pub fn read_conversation_endpoint(&self) -> FederationReadConversationEndpoint {
+        FederationReadConversationEndpoint(
+            self.0
+                .join("/api/federation/peer/read-conversation")
+                .expect("fixed federation route is a valid URL path"),
+        )
+    }
+
+    /// Bind a destination-generated application route to this selected peer origin.
+    ///
+    /// # Errors
+    /// Returns an error if the locator is not an absolute application path or changes origin.
+    pub fn navigation_url(
+        &self,
+        locator: &str,
+    ) -> Result<PeerNavigationUrl, PeerNavigationUrlError> {
+        if !locator.starts_with('/') || locator.starts_with("//") {
+            return Err(PeerNavigationUrlError::NotAbsolutePath);
+        }
+        let joined = self
+            .0
+            .join(locator)
+            .map_err(|_| PeerNavigationUrlError::NotAbsolutePath)?;
+        if joined.scheme() != self.0.scheme()
+            || joined.host() != self.0.host()
+            || joined.port_or_known_default() != self.0.port_or_known_default()
+            || !joined.username().is_empty()
+            || joined.password().is_some()
+        {
+            return Err(PeerNavigationUrlError::ChangedOrigin);
+        }
+        Ok(PeerNavigationUrl(joined))
     }
 
     /// Reconstruct a peer origin from normalized relational columns.
@@ -498,6 +614,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instance_selector_distinguishes_uuid_and_display_name() {
+        let id = InstanceId::new();
+        assert_eq!(
+            InstanceSelector::parse(id.to_string()).unwrap(),
+            InstanceSelector::Id(id)
+        );
+        assert_eq!(
+            InstanceSelector::parse("  remote mbp  ").unwrap(),
+            InstanceSelector::DisplayName("remote mbp".to_string())
+        );
+        assert!(InstanceSelector::parse("  ").is_err());
+    }
+
+    #[test]
     fn peer_base_url_requires_a_bare_https_origin() {
         assert!(PeerBaseUrl::from_str("https://peer.example").is_ok());
         let endpoint = PeerBaseUrl::from_str("https://peer.example:8443")
@@ -531,6 +661,25 @@ mod tests {
             "https://peer.example:0",
         ] {
             assert!(PeerBaseUrl::from_str(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn peer_navigation_binds_destination_routes_without_changing_origin() {
+        let base = PeerBaseUrl::from_str("https://peer.example:8443").unwrap();
+        let navigation = base
+            .navigation_url("/c/product-id?source_transcript=transcript-id#message-message-id")
+            .unwrap();
+        assert_eq!(
+            navigation.as_url().as_str(),
+            "https://peer.example:8443/c/product-id?source_transcript=transcript-id#message-message-id"
+        );
+        for locator in [
+            "c/product-id",
+            "//attacker.example/c/product-id",
+            "https://attacker.example/c/product-id",
+        ] {
+            assert!(base.navigation_url(locator).is_err(), "{locator}");
         }
     }
 

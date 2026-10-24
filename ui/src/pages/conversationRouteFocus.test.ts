@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ConversationState } from '../api';
 import {
   decideRouteFocus,
+  messageIdFromLocationHash,
   reduceRouteFocusState,
   type RouteFocusInputs,
   type RouteFocusState,
@@ -25,6 +26,14 @@ function baseInputs(): RouteFocusInputs {
     phase: idleState(),
   };
 }
+
+describe('messageIdFromLocationHash', () => {
+  it('decodes punctuated message IDs and tolerates malformed encodings', () => {
+    expect(messageIdFromLocationHash('#message-old%3Amsg%23part')).toBe('old:msg#part');
+    expect(messageIdFromLocationHash('#message-bad%ZZ')).toBe('bad%ZZ');
+    expect(messageIdFromLocationHash('#other-value')).toBeUndefined();
+  });
+});
 
 describe('decideRouteFocus', () => {
   const cases: ReadonlyArray<readonly [string, Partial<RouteFocusInputs>, RouteFocusState['decision']]> = [

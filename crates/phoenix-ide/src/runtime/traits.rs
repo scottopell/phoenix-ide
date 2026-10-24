@@ -26,20 +26,37 @@ pub enum LoadedActiveDirectTurn {
         active: ActiveDirectTurn,
         canonical_message_id: String,
     },
+    GoalStart {
+        active: ActiveDirectTurn,
+        receipt: phoenix_workflow::GoalStartReceiptId,
+        materialized: bool,
+    },
 }
 
 impl LoadedActiveDirectTurn {
     pub const fn active(&self) -> &ActiveDirectTurn {
         match self {
-            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+            Self::Unmaterialized { active }
+            | Self::Materialized { active, .. }
+            | Self::GoalStart { active, .. } => active,
         }
     }
 
     pub fn into_active(self) -> ActiveDirectTurn {
         match self {
-            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+            Self::Unmaterialized { active }
+            | Self::Materialized { active, .. }
+            | Self::GoalStart { active, .. } => active,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoritativeGoalStartInput {
+    pub receipt: phoenix_core::domain::conversation_goal::GoalStartReceipt,
+    pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+    pub state_updated_at: DateTime<Utc>,
+    pub now: phoenix_workflow::Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +80,7 @@ pub enum AuthoritativeUserMessageMaterialization {
 pub enum ActiveDirectTurnTerminal {
     Completed,
     Cancelled,
+    GoalControlRevoked,
     Failed { reason: String },
 }
 
@@ -70,7 +88,7 @@ impl ActiveDirectTurnTerminal {
     pub(crate) const fn variant_name(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
-            Self::Cancelled => "cancelled",
+            Self::Cancelled | Self::GoalControlRevoked => "cancelled",
             Self::Failed { .. } => "failed",
         }
     }
@@ -120,6 +138,39 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn goal_request_completion_is_current(
+        &self,
+        _admitted: &phoenix_db::workflow::AdmittedGoalRequest,
+        _transcript: &str,
+        _state: &ConvState,
+        _stamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        Err("storage does not own admitted Goal response validation".into())
+    }
+
+    async fn commit_goal_request_checkpoint(
+        &self,
+        _command: &phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+    ) -> Result<
+        phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpointOutcome,
+        String,
+    > {
+        Err("storage does not own admitted Goal request checkpoints".into())
+    }
+
+    async fn admit_goal_start_request_context(
+        &self,
+        conversation_id: &str,
+        active: Option<&ActiveDirectTurn>,
+        state_updated_at: DateTime<Utc>,
+        operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String>;
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        input: &AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>;
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -381,19 +432,8 @@ pub trait MessageStore: Send + Sync {
         assistant: &crate::db::Message,
         tool_results: &[crate::db::Message],
         proposal: &crate::db::ForkProposal,
-    ) -> Result<(), String>;
-
-    /// Atomically persist a completed tool round (REQ-BED-007): the assistant
-    /// message and every paired tool-result message commit in a single
-    /// transaction, or none do. The caller pre-builds the message rows
-    /// (seq-allocated and content-mapped) so the broadcast seq ordering matches
-    /// the persisted rows. A partial write would leave an unpaired `tool_use`
-    /// that 400s every later LLM request.
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
 
     async fn persist_tool_round_and_state(
@@ -413,6 +453,67 @@ pub trait MessageStore: Send + Sync {
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment;
 
+    async fn admit_goal_control_dispatch(
+        &self,
+        conv_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit, String>;
+
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String>;
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String>;
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        proposal: &crate::db::ForkProposal,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String>;
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    >;
+
+    async fn persist_revoked_pending_goal_tool_round(
+        &self,
+        _checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        _settlement: &ActiveDirectTurnSettlement,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        tracing::debug!("storage cannot commit an atomic revoked pending-goal settlement");
+        TerminalMutationEstablishment::KnownNotCommitted(
+            "storage does not support atomic revoked pending-goal settlement".into(),
+        )
+    }
+
+    async fn persist_revoked_goal_tool_round(
+        &self,
+        _conv_id: &str,
+        _assistant: &Message,
+        _tool_results: &[Message],
+        _settlement: &ActiveDirectTurnSettlement,
+        _update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment {
+        tracing::debug!("storage cannot commit an atomic revoked-goal tool settlement");
+        TerminalMutationEstablishment::KnownNotCommitted(
+            "storage does not support atomic revoked-goal tool settlement".into(),
+        )
+    }
+
     async fn persist_sub_agent_results_with_terminal_obligation(
         &self,
         evidence: &TerminalSubAgentEvidence,
@@ -429,11 +530,33 @@ pub enum TerminalEvidenceEstablishment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TerminalMutationEstablishment {
-    Established { transcript_generation: Option<i64> },
+pub enum TerminalMutationEstablishment<T = ()> {
+    Established {
+        transcript_generation: Option<i64>,
+        value: T,
+    },
     Retired,
     KnownNotCommitted(String),
     Unclassifiable(String),
+}
+
+impl<T> TerminalMutationEstablishment<T> {
+    pub(crate) fn map<U>(self, convert: impl FnOnce(T) -> U) -> TerminalMutationEstablishment<U> {
+        match self {
+            Self::Established {
+                transcript_generation,
+                value,
+            } => TerminalMutationEstablishment::Established {
+                transcript_generation,
+                value: convert(value),
+            },
+            Self::Retired => TerminalMutationEstablishment::Retired,
+            Self::KnownNotCommitted(error) => {
+                TerminalMutationEstablishment::KnownNotCommitted(error)
+            }
+            Self::Unclassifiable(error) => TerminalMutationEstablishment::Unclassifiable(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +579,14 @@ pub struct PersistedStateSnapshot {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    async fn subscription_goal_captures(
+        &self,
+        event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    >;
+
     async fn record_execution_cancel(&self, _conversation_id: &str) -> Result<(), String> {
         Ok(())
     }
@@ -794,6 +925,97 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn goal_request_completion_is_current(
+        &self,
+        admitted: &phoenix_db::workflow::AdmittedGoalRequest,
+        transcript: &str,
+        state: &ConvState,
+        stamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        (**self)
+            .goal_request_completion_is_current(admitted, transcript, state, stamp)
+            .await
+    }
+
+    async fn commit_goal_request_checkpoint(
+        &self,
+        command: &phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+    ) -> Result<
+        phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpointOutcome,
+        String,
+    > {
+        (**self).commit_goal_request_checkpoint(command).await
+    }
+
+    async fn admit_goal_start_request_context(
+        &self,
+        conversation_id: &str,
+        active: Option<&ActiveDirectTurn>,
+        state_updated_at: DateTime<Utc>,
+        operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
+        (**self)
+            .admit_goal_start_request_context(conversation_id, active, state_updated_at, operation)
+            .await
+    }
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        input: &AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>
+    {
+        (**self).materialize_authoritative_goal_start(input).await
+    }
+
+    async fn admit_goal_control_dispatch(
+        &self,
+        conv_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit, String> {
+        (**self).admit_goal_control_dispatch(conv_id, active).await
+    }
+
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        (**self).persist_goal_tool_round_and_state(checkpoint).await
+    }
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        (**self)
+            .persist_goal_tool_round_state_and_replay(checkpoint, update)
+            .await
+    }
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        proposal: &crate::db::ForkProposal,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        (**self)
+            .persist_goal_fork_tool_round(checkpoint, proposal, update)
+            .await
+    }
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        (**self)
+            .persist_goal_terminal_tool_round(checkpoint, obligation, update)
+            .await
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -1064,6 +1286,8 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         assistant: &crate::db::Message,
         tool_results: &[crate::db::Message],
         proposal: &crate::db::ForkProposal,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         (**self)
             .persist_fork_proposal_with_tool_round(
@@ -1071,18 +1295,9 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 assistant,
                 tool_results,
                 proposal,
+                state,
+                state_updated_at,
             )
-            .await
-    }
-
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-    ) -> Result<(), String> {
-        (**self)
-            .persist_tool_round(conv_id, assistant, tool_results)
             .await
     }
 
@@ -1116,6 +1331,32 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
             .await
     }
 
+    async fn persist_revoked_pending_goal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        (**self)
+            .persist_revoked_pending_goal_tool_round(checkpoint, settlement, update)
+            .await
+    }
+
+    async fn persist_revoked_goal_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        results: &[Message],
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment {
+        (**self)
+            .persist_revoked_goal_tool_round(conv_id, assistant, results, settlement, update)
+            .await
+    }
+
     async fn persist_sub_agent_results_with_terminal_obligation(
         &self,
         evidence: &TerminalSubAgentEvidence,
@@ -1129,6 +1370,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
+    async fn subscription_goal_captures(
+        &self,
+        event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    > {
+        (**self).subscription_goal_captures(event_ids).await
+    }
+
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         (**self).record_execution_cancel(conversation_id).await
     }
@@ -1587,10 +1838,12 @@ fn direct_turn_terminal_command(
             turn_id: turn.turn_id,
             expected_generation: turn.generation,
         },
-        ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
-            turn_id: turn.turn_id,
-            expected_generation: turn.generation,
-        },
+        ActiveDirectTurnTerminal::Cancelled | ActiveDirectTurnTerminal::GoalControlRevoked => {
+            phoenix_workflow::TurnCommand::Cancel {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+            }
+        }
         ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnCommand::Fail {
             turn_id: turn.turn_id,
             expected_generation: turn.generation,
@@ -1601,6 +1854,175 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn goal_request_completion_is_current(
+        &self,
+        admitted: &phoenix_db::workflow::AdmittedGoalRequest,
+        transcript: &str,
+        state: &ConvState,
+        stamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, String> {
+        self.db
+            .goal_request_completion_is_current(admitted, transcript, state, stamp)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn commit_goal_request_checkpoint(
+        &self,
+        command: &phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpoint<'_>,
+    ) -> Result<
+        phoenix_db::conversation_goals::request_checkpoint::GoalRequestCheckpointOutcome,
+        String,
+    > {
+        self.db
+            .commit_goal_request_checkpoint(command)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn admit_goal_start_request_context(
+        &self,
+        conversation_id: &str,
+        active: Option<&ActiveDirectTurn>,
+        state_updated_at: DateTime<Utc>,
+        operation: phoenix_core::domain::conversation_goal::GoalRequestOperation,
+    ) -> Result<Option<phoenix_db::workflow::GoalStartRequestContext>, String> {
+        self.db
+            .workflow_repository()
+            .admit_goal_start_request_context(
+                conversation_id,
+                active.map(|active| (active.turn_id, active.generation)),
+                state_updated_at,
+                operation,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn materialize_authoritative_goal_start(
+        &self,
+        input: &AuthoritativeGoalStartInput,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<phoenix_db::workflow::GoalStartAdoptionOutcome>
+    {
+        use phoenix_db::workflow::{GoalStartAdoptionInput, LocalAuthorityResult};
+        if self.db.goal_execution_installation()
+            == phoenix_db::conversation_goals::execution::GoalExecutionInstallation::Disabled
+            || self.db.goal_control_installation()
+                == phoenix_db::conversation_goals::control::GoalControlInstallation::Disabled
+            || i64::try_from(input.authority.turn_id.0).ok()
+                != Some(input.receipt.execution().turn_id())
+        {
+            return LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::workflow::GoalStartAdoptionOutcome::Rejected,
+            );
+        }
+        let repo = self.db.workflow_repository();
+        let start_id = match repo.goal_start_id_for_receipt(&input.receipt).await {
+            Ok(Some(id)) => id,
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "Start materialization cannot establish retained canonical receipt identity"
+                );
+                return LocalAuthorityResult::DurableFactUnclassified;
+            }
+        };
+        repo.materialize_goal_start(&GoalStartAdoptionInput {
+            authority: direct_turn_local_authority(&input.authority),
+            start_id,
+            receipt: input.receipt.clone(),
+            state_updated_at: input.state_updated_at,
+            now: input.now,
+        })
+        .await
+    }
+
+    async fn admit_goal_control_dispatch(
+        &self,
+        conv_id: &str,
+        active: Option<&ActiveDirectTurn>,
+    ) -> Result<phoenix_db::conversation_goals::control::dispatch::GoalDispatchPermit, String> {
+        let active = active
+            .map(|turn| {
+                i64::try_from(turn.turn_id.0)
+                    .map(|id| (id, turn.generation))
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        self.db
+            .admit_goal_control_dispatch(conv_id, active)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_goal_tool_round_and_state(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        self.db
+            .persist_goal_tool_round_and_state(checkpoint)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_goal_tool_round_state_and_replay(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        self.db
+            .persist_goal_tool_round_state_and_replay(checkpoint, update)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_goal_fork_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        proposal: &crate::db::ForkProposal,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> Result<phoenix_db::conversation_goals::round::CommittedGoalRound, String> {
+        self.db
+            .persist_goal_fork_tool_round(checkpoint, proposal, update)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_goal_terminal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        match self
+            .db
+            .persist_goal_terminal_tool_round(checkpoint, obligation, update)
+            .await
+        {
+            Ok(value) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+                value,
+            },
+            Err(error) => {
+                let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::GoalRound {
+                    assistant: Box::new(checkpoint.assistant.clone()),
+                    execution: checkpoint.execution,
+                    results: checkpoint.results.to_vec(),
+                };
+                classify_goal_terminal_mutation(
+                    &self.db,
+                    checkpoint,
+                    &evidence,
+                    obligation,
+                    error.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -1721,7 +2143,9 @@ impl MessageStore for DatabaseStorage {
     ) -> TerminalEvidenceEstablishment {
         let terminal = match &settlement.terminal {
             ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
-            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+            ActiveDirectTurnTerminal::Cancelled | ActiveDirectTurnTerminal::GoalControlRevoked => {
+                phoenix_workflow::TurnTerminal::Cancelled
+            }
             ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
                 reason: reason.clone(),
             },
@@ -2053,6 +2477,20 @@ impl MessageStore for DatabaseStorage {
                     phoenix_workflow::Materialization::Unmaterialized => {
                         LoadedActiveDirectTurn::Unmaterialized { active }
                     }
+                    phoenix_workflow::Materialization::UnmaterializedGoalStart { receipt } => {
+                        LoadedActiveDirectTurn::GoalStart {
+                            active,
+                            receipt,
+                            materialized: false,
+                        }
+                    }
+                    phoenix_workflow::Materialization::MaterializedGoalStart { receipt } => {
+                        LoadedActiveDirectTurn::GoalStart {
+                            active,
+                            receipt,
+                            materialized: true,
+                        }
+                    }
                     phoenix_workflow::Materialization::Materialized { message_id } => {
                         LoadedActiveDirectTurn::Materialized {
                             active,
@@ -2076,6 +2514,7 @@ impl MessageStore for DatabaseStorage {
         match repo.persist_terminal_obligation(&obligation).await {
             Ok(()) => TerminalMutationEstablishment::Established {
                 transcript_generation: None,
+                value: (),
             },
             Err(error) => {
                 classify_terminal_mutation(
@@ -2169,6 +2608,8 @@ impl MessageStore for DatabaseStorage {
         assistant: &crate::db::Message,
         tool_results: &[crate::db::Message],
         proposal: &crate::db::ForkProposal,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         self.db
             .persist_fork_proposal_with_tool_round(
@@ -2176,19 +2617,9 @@ impl MessageStore for DatabaseStorage {
                 assistant,
                 tool_results,
                 proposal,
+                state,
+                state_updated_at,
             )
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn persist_tool_round(
-        &self,
-        conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-    ) -> Result<(), String> {
-        self.db
-            .persist_tool_round(conv_id, assistant, tool_results)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2231,8 +2662,91 @@ impl MessageStore for DatabaseStorage {
         {
             Ok(()) => TerminalMutationEstablishment::Established {
                 transcript_generation: None,
+                value: (),
             },
             Err(error) => {
+                classify_terminal_mutation(
+                    &self.db,
+                    &evidence,
+                    &obligation,
+                    error.to_string(),
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn persist_revoked_pending_goal_tool_round(
+        &self,
+        checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment<
+        phoenix_db::conversation_goals::round::CommittedGoalTerminalRound,
+    > {
+        if settlement.terminal != ActiveDirectTurnTerminal::GoalControlRevoked {
+            return TerminalMutationEstablishment::KnownNotCommitted(
+                "atomic revoked pending-goal settlement requires control revocation".into(),
+            );
+        }
+        let obligation = terminal_obligation(settlement, None);
+        match self
+            .db
+            .persist_revoked_pending_goal_tool_round(checkpoint, &obligation, update)
+            .await
+        {
+            Ok(value) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+                value,
+            },
+            Err(error) => {
+                let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::GoalRound {
+                    assistant: Box::new(checkpoint.assistant.clone()),
+                    execution: checkpoint.execution,
+                    results: checkpoint.results.to_vec(),
+                };
+                classify_goal_terminal_mutation(
+                    &self.db,
+                    checkpoint,
+                    &evidence,
+                    &obligation,
+                    error.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn persist_revoked_goal_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        results: &[Message],
+        settlement: &ActiveDirectTurnSettlement,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> TerminalMutationEstablishment {
+        if settlement.terminal != ActiveDirectTurnTerminal::GoalControlRevoked {
+            return TerminalMutationEstablishment::KnownNotCommitted(
+                "atomic revoked-goal settlement requires control revocation".into(),
+            );
+        }
+        let obligation = terminal_obligation(settlement, None);
+        match self
+            .db
+            .persist_revoked_goal_tool_round(conv_id, assistant, results, &obligation, update)
+            .await
+        {
+            Ok(()) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+                value: (),
+            },
+            Err(error) => {
+                let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::Messages(
+                    std::iter::once(assistant.clone())
+                        .chain(results.iter().cloned())
+                        .collect(),
+                );
                 classify_terminal_mutation(
                     &self.db,
                     &evidence,
@@ -2274,6 +2788,7 @@ impl MessageStore for DatabaseStorage {
         {
             Ok(transcript_generation) => TerminalMutationEstablishment::Established {
                 transcript_generation,
+                value: (),
             },
             Err(error) => {
                 let transcript_generation = if evidence.is_message_mutation() {
@@ -2301,13 +2816,15 @@ impl MessageStore for DatabaseStorage {
     }
 }
 
-fn terminal_obligation(
+pub(crate) fn terminal_obligation(
     settlement: &ActiveDirectTurnSettlement,
     response_message_id: Option<String>,
 ) -> phoenix_db::workflow::DirectTurnTerminalObligationInput {
     let terminal = match &settlement.terminal {
         ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
-        ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+        ActiveDirectTurnTerminal::Cancelled | ActiveDirectTurnTerminal::GoalControlRevoked => {
+            phoenix_workflow::TurnTerminal::Cancelled
+        }
         ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
             reason: reason.clone(),
         },
@@ -2321,6 +2838,38 @@ fn terminal_obligation(
             state_updated_at: settlement.state_updated_at,
         },
         response_message_id,
+    }
+}
+
+pub(super) async fn classify_goal_terminal_mutation(
+    db: &crate::db::Database,
+    checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
+    evidence: &phoenix_db::workflow::TerminalEvidenceExpectation,
+    obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+    command_error: String,
+) -> TerminalMutationEstablishment<phoenix_db::conversation_goals::round::CommittedGoalTerminalRound>
+{
+    match classify_terminal_mutation(db, evidence, obligation, command_error, None).await {
+        TerminalMutationEstablishment::Established {
+            transcript_generation,
+            ..
+        } => match db.retained_goal_terminal_round(checkpoint).await {
+            Ok(Some(value)) => TerminalMutationEstablishment::Established {
+                transcript_generation,
+                value,
+            },
+            Ok(None) => TerminalMutationEstablishment::Unclassifiable(
+                "established goal round lost its exact retained rows".into(),
+            ),
+            Err(error) => TerminalMutationEstablishment::Unclassifiable(error.to_string()),
+        },
+        TerminalMutationEstablishment::Retired => TerminalMutationEstablishment::Retired,
+        TerminalMutationEstablishment::KnownNotCommitted(error) => {
+            TerminalMutationEstablishment::KnownNotCommitted(error)
+        }
+        TerminalMutationEstablishment::Unclassifiable(error) => {
+            TerminalMutationEstablishment::Unclassifiable(error)
+        }
     }
 }
 
@@ -2340,6 +2889,7 @@ async fn classify_terminal_mutation(
             transcript_generation,
         }) => TerminalMutationEstablishment::Established {
             transcript_generation,
+            value: (),
         },
         Ok(phoenix_db::workflow::TerminalEvidenceProbe::Retired) => {
             TerminalMutationEstablishment::Retired
@@ -2377,6 +2927,19 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn subscription_goal_captures(
+        &self,
+        event_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, phoenix_core::domain::watch_goal::WatchGoalCapture>,
+        String,
+    > {
+        self.db
+            .coordinator_watch_goal_captures(event_ids)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn record_execution_cancel(&self, conversation_id: &str) -> Result<(), String> {
         sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1) ON CONFLICT DO NOTHING")
             .bind(conversation_id).execute(self.db.pool()).await.map_err(|error| error.to_string())?;

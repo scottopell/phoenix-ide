@@ -527,6 +527,14 @@ use std::collections::HashMap;
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
 pub enum Event {
+    GoalManagementPrepared {
+        management: crate::domain::conversation_goal::GoalPendingManagement,
+        duration_ms: u64,
+    },
+    GoalReportPrepared {
+        report: crate::domain::conversation_goal::GoalPendingReport,
+        duration_ms: u64,
+    },
     // User events
     UserMessage {
         /// Display text — stored in DB and shown in history (REQ-IR-006).
@@ -546,6 +554,10 @@ pub enum Event {
     },
     AuthoritativeUserMessage {
         payload: PreparedDirectTurnPayload,
+        authority: DirectTurnAttemptAuthority,
+    },
+    AuthoritativeGoalStart {
+        receipt: crate::domain::conversation_goal::GoalStartReceipt,
         authority: DirectTurnAttemptAuthority,
     },
     /// Starts an admitted sub-agent whose initial user message is already durable.
@@ -794,6 +806,7 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            Event::AuthoritativeGoalStart { .. } => "AuthoritativeGoalStart",
             Event::PersistedSubAgentBootstrap => "PersistedSubAgentBootstrap",
             Event::RetryBufferedSubAgentResults => "RetryBufferedSubAgentResults",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
@@ -805,6 +818,8 @@ impl Event {
             Event::ContinuationServerOverloaded { .. } => "ContinuationServerOverloaded",
             Event::OverloadRetryDeadlineExpired => "OverloadRetryDeadlineExpired",
             Event::RetryTimeout { .. } => "RetryTimeout",
+            Event::GoalReportPrepared { .. } => "GoalReportPrepared",
+            Event::GoalManagementPrepared { .. } => "GoalManagementPrepared",
             Event::ToolComplete { .. } => "ToolComplete",
             Event::ToolAborted { .. } => "ToolAborted",
             Event::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
@@ -862,6 +877,10 @@ pub enum CoreEvent {
     },
     AuthoritativeUserMessage {
         payload: Box<PreparedDirectTurnPayload>,
+        authority: DirectTurnAttemptAuthority,
+    },
+    AuthoritativeGoalStart {
+        receipt: crate::domain::conversation_goal::GoalStartReceipt,
         authority: DirectTurnAttemptAuthority,
     },
     UserCancel {
@@ -952,6 +971,14 @@ pub enum CoreEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum ParentOnlyEvent {
+    GoalManagementPrepared {
+        management: crate::domain::conversation_goal::GoalPendingManagement,
+        duration_ms: u64,
+    },
+    GoalReportPrepared {
+        report: crate::domain::conversation_goal::GoalPendingReport,
+        duration_ms: u64,
+    },
     TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
@@ -1055,6 +1082,12 @@ impl TryFrom<Event> for ParentEvent {
             Event::AuthoritativeUserMessage { payload, authority } => {
                 Ok(ParentEvent::Core(CoreEvent::AuthoritativeUserMessage {
                     payload: Box::new(payload),
+                    authority,
+                }))
+            }
+            Event::AuthoritativeGoalStart { receipt, authority } => {
+                Ok(ParentEvent::Core(CoreEvent::AuthoritativeGoalStart {
+                    receipt,
                     authority,
                 }))
             }
@@ -1226,6 +1259,22 @@ impl TryFrom<Event> for ParentEvent {
             Event::UserQuestionDismissed { request_id } => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::UserQuestionDismissed { request_id },
             )),
+            Event::GoalManagementPrepared {
+                management,
+                duration_ms,
+            } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::GoalManagementPrepared {
+                    management,
+                    duration_ms,
+                },
+            )),
+            Event::GoalReportPrepared {
+                report,
+                duration_ms,
+            } => Ok(ParentEvent::Parent(ParentOnlyEvent::GoalReportPrepared {
+                report,
+                duration_ms,
+            })),
             Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
             Event::CredentialBecameAvailable { observed_at } => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialBecameAvailable { observed_at },
@@ -1285,6 +1334,10 @@ impl TryFrom<Event> for SubAgentEvent {
                     authority,
                 }))
             }
+            Event::AuthoritativeGoalStart { .. } => Err(EventConversionError {
+                event_variant: "AuthoritativeGoalStart",
+                target_type: "SubAgentEvent",
+            }),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "SubAgentEvent",
@@ -1437,6 +1490,8 @@ impl TryFrom<Event> for SubAgentEvent {
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
             Event::TaskApprovalDecided { .. }
+            | Event::GoalReportPrepared { .. }
+            | Event::GoalManagementPrepared { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed { .. }
@@ -1463,6 +1518,7 @@ impl CoreEvent {
         match self {
             CoreEvent::UserMessage { .. } => "UserMessage",
             CoreEvent::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
+            CoreEvent::AuthoritativeGoalStart { .. } => "AuthoritativeGoalStart",
             CoreEvent::UserCancel { .. } => "UserCancel",
             CoreEvent::LlmResponse { .. } => "LlmResponse",
             CoreEvent::LlmError { .. } => "LlmError",
@@ -1494,6 +1550,8 @@ impl ParentEvent {
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::UserQuestionDismissed { .. } => "UserQuestionDismissed",
+                ParentOnlyEvent::GoalReportPrepared { .. } => "GoalReportPrepared",
+                ParentOnlyEvent::GoalManagementPrepared { .. } => "GoalManagementPrepared",
                 ParentOnlyEvent::DismissError => "DismissError",
                 ParentOnlyEvent::CredentialBecameAvailable { .. } => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",
@@ -1622,6 +1680,136 @@ mod direct_turn_payload_tests {
         let mut attributed = payload;
         attributed.submitted.origin = InputOrigin::UserApi;
         assert!(!attributed.submitted_identity_matches(&retry));
+    }
+
+    #[test]
+    fn historical_v2_local_origin_bytes_remain_exact() {
+        let historical = br#"{"v":2,"submitted":{"text":"display @file","origin":{"kind":"internal_conversation","product_conversation_id":"product","transcript_id":"transcript"},"images":[],"files":[],"message_id":"msg-1","user_agent":"agent/test","skill_invocation":null,"expansion_policy":"expand_references"},"delivery":{"text":"body","llm_text":null,"images":[],"files":[],"user_agent":"agent/test","skill_invocation":null}}"#;
+        let current = br#"{"v":2,"submitted":{"text":"display @file","origin":{"kind":"internal_conversation","product_conversation_id":"product","transcript_id":"transcript","source_call":null},"images":[],"files":[],"message_id":"msg-1","user_agent":"agent/test","skill_invocation":null,"expansion_policy":"expand_references"},"delivery":{"text":"body","llm_text":null,"images":[],"files":[],"user_agent":"agent/test","skill_invocation":null}}"#;
+        let payload = PreparedDirectTurnPayload::from_exact_bytes(historical).unwrap();
+        assert_eq!(PreparedDirectTurnPayload::VERSION, 2);
+        assert_eq!(payload.to_exact_bytes().unwrap().as_slice(), current);
+        assert_eq!(
+            payload
+                .pre_source_call_exact_bytes()
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            historical
+        );
+        assert_eq!(
+            PreparedDirectTurnPayload::from_exact_bytes(current).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn pre_source_call_exact_bytes_remains_local_only() {
+        use crate::domain::db_schema::InputOrigin;
+        use crate::domain::instance_identity::InstanceId;
+        use crate::domain::product_conversation::ProductConversationId;
+
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("product").unwrap();
+        let mut payload = PreparedDirectTurnPayload::from_parts(
+            submitted(
+                "msg-1",
+                SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            ),
+            delivery("body", None),
+        );
+        let local = InputOrigin::InternalConversation {
+            product_conversation_id: product_conversation_id.clone(),
+            transcript_id: "transcript".into(),
+            source_call: None,
+        };
+        payload.submitted.origin = local.clone();
+        assert!(payload.pre_source_call_exact_bytes().unwrap().is_some());
+        for origin in [
+            InputOrigin::UnknownHistorical,
+            InputOrigin::UserApi,
+            InputOrigin::SystemGenerated,
+            InputOrigin::SubscriptionEvent {
+                event_id: "event".into(),
+            },
+            InputOrigin::RemoteApi { instance_id },
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+            local
+                .with_source_call_columns(Some("message".into()), Some("tool".into()))
+                .unwrap(),
+        ] {
+            payload.submitted.origin = origin;
+            assert!(payload.pre_source_call_exact_bytes().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn remote_retry_acceptance_retains_stored_locator_and_exact_payload() {
+        use crate::domain::db_schema::InputOrigin;
+        use crate::domain::instance_identity::InstanceId;
+        use crate::domain::product_conversation::ProductConversationId;
+
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("product").unwrap();
+        for origin in [
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id: "transcript".into(),
+                source_call: None,
+            },
+        ] {
+            let mut identity = submitted("msg-1", SubmittedDirectTurnExpansionPolicy::LiteralText);
+            identity.origin = origin;
+            let payload =
+                PreparedDirectTurnPayload::from_parts(identity.clone(), delivery("body", None));
+            let bytes = payload.to_exact_bytes().unwrap();
+            identity.origin = identity
+                .origin
+                .with_source_call_columns(Some("retry-message".into()), Some("retry-tool".into()))
+                .unwrap();
+            assert!(payload.submitted_identity_matches(&identity));
+            assert!(payload.submitted.origin.source_call().is_none());
+            assert_eq!(payload.to_exact_bytes().unwrap(), bytes);
+            assert_eq!(
+                PreparedDirectTurnPayload::from_exact_bytes(&bytes).unwrap(),
+                payload
+            );
+            identity.text.push_str(" changed");
+            assert!(!payload.submitted_identity_matches(&identity));
+
+            let mut located = payload;
+            located.submitted.origin = located
+                .submitted
+                .origin
+                .with_source_call_columns(Some("stored-message".into()), Some("stored-tool".into()))
+                .unwrap();
+            let stored_bytes = located.to_exact_bytes().unwrap();
+            identity.text = located.submitted.text.clone();
+            assert!(located.submitted_identity_matches(&identity));
+            assert_eq!(
+                located.submitted.origin.source_call().unwrap().message_id,
+                "stored-message"
+            );
+            assert_eq!(located.to_exact_bytes().unwrap(), stored_bytes);
+        }
     }
 
     #[test]

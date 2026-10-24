@@ -114,12 +114,13 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
     };
     let service = SendChatApplicationService::new(db.clone(), runtime.clone());
     for event in events {
+        let text = notification(&event);
         let request = SendChatRequest {
             conversation_id: target.clone(),
             origin: InputOrigin::SubscriptionEvent {
                 event_id: event.event_id.clone(),
             },
-            text: notification(&event),
+            text,
             message_id: event.event_id.clone(),
             images: Vec::new(),
             files: Vec::new(),
@@ -145,6 +146,9 @@ pub(crate) async fn deliver_pass(runtime: &Arc<RuntimeManager>) {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod captured_notification_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -332,6 +336,7 @@ mod tests {
 
     fn failure(stop: CloseFailureStop) -> PendingWatchEvent {
         PendingWatchEvent {
+            goal_capture: None,
             route: WatchEventRoute::MandatoryCloseFailure {
                 run_ordinal: phoenix_core::domain::close::CloseRunOrdinal::parse(2).unwrap(),
                 remaining_resources: Vec::new(),

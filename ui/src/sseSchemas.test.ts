@@ -293,6 +293,29 @@ describe('parseEvent', () => {
       expect(v.safeParse(InputOriginSchema, { kind: 'human' }).success).toBe(false);
     });
 
+    it.each(['remote_api', 'remote_conversation', 'remote_coordinator'] as const)('requires an authenticated instance identity for %s', (kind) => {
+      const origin = {
+        kind, instance_id: 'a48ea5c2-37cc-42d5-a1d7-fac1d7765d4e',
+        ...(kind === 'remote_api' ? {} : {
+          product_conversation_id: 'product-1', transcript_id: 'row-1',
+          source_call: { message_id: 'source-message', tool_use_id: 'source-tool' },
+        }),
+      };
+      expect(v.parse(InputOriginSchema, origin)).toEqual(origin);
+      expect(v.parse(SseMessageDataSchema, { opening: null, sequence_id: 5, message: { ...goodMsg, origin } }).message.origin).toEqual(origin);
+      const { instance_id: _instance, ...missing } = origin;
+      expect(_instance).toBeTruthy();
+      expect(v.safeParse(InputOriginSchema, missing).success).toBe(false);
+      for (const instance_id of [null, 42, '', 'peer-name', '00000000-0000-0000-0000-000000000000', 'a48ea5c2-37cc-12d5-a1d7-fac1d7765d4e']) {
+        expect(v.safeParse(InputOriginSchema, { ...origin, instance_id }).success).toBe(false);
+      }
+      if (kind !== 'remote_api') {
+        expect(v.safeParse(InputOriginSchema, { ...origin, transcript_id: undefined }).success).toBe(false);
+        expect(v.safeParse(InputOriginSchema, { ...origin, product_conversation_id: '' }).success).toBe(false);
+        expect(v.parse(InputOriginSchema, { ...origin, source_call: null })).toEqual({ ...origin, source_call: null });
+      }
+    });
+
     it('rejects a message whose sequence_id arrives as a string', () => {
       inProdMode(() => {
         const { dispatch, actions } = mockDispatch();

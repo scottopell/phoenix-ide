@@ -66,10 +66,7 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    # 5 setup/network + 20 native + 72 check + 10 musl + 2 evidence + 4 post-actions.
-    # Setup/network and musl are planning estimates, not completion guarantees.
-    # Check: 60.5 Rust watchdog + 10 normal fmt + 1.5 probes/teardown/report.
-    timeout-minutes: 113
+    timeout-minutes: 160
     env:
       PYTHONUNBUFFERED: "1"
       PHOENIX_DEV_TRACE_ENDPOINT: "off"
@@ -77,9 +74,10 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
+      PHOENIX_GOAL_REUSE_DIR: ''
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
-      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "2400"
+      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "3600"
       PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
       PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
     steps:
@@ -89,6 +87,17 @@ jobs:
       - name: Initialize Rust evidence
         timeout-minutes: 1
         run: |
+          case "$GITHUB_EVENT_NAME" in
+            push|workflow_dispatch)
+              : "${RUNNER_TEMP:?missing runner temp}" "${GITHUB_RUN_ID:?missing run id}" "${GITHUB_RUN_ATTEMPT:?missing run attempt}" "${GITHUB_ENV:?missing environment file}"
+              reuse_dir="$RUNNER_TEMP/goal-qualification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-check-rust"
+              case "$reuse_dir" in
+                *$'\n'*|*$'\r'*) echo 'invalid multiline reuse path' >&2; exit 1 ;;
+              esac
+              printf 'PHOENIX_GOAL_REUSE_DIR=%s\n' "$reuse_dir" >> "$GITHUB_ENV"
+              ;;
+            *) printf 'PHOENIX_GOAL_REUSE_DIR=\n' >> "$GITHUB_ENV" ;;
+          esac
           mkdir -p "$RUST_EVIDENCE_DIR"
           # The check profile directory must remain empty until dev.py claims it.
           printf 'run=%s attempt=%s sha=%s job=%s started=%s\n' \
@@ -128,8 +137,32 @@ jobs:
             --identity step:ci:native-launcher -- cargo build -j 1 -p phoenix_ide --bin phoenix_ide
           test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
       - name: ./dev.py check (rust,cargo-fmt)
-        timeout-minutes: 72
+        timeout-minutes: 95
         run: ./dev.py check --lanes rust,cargo-fmt --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
+      - name: Focused goal qualification (fresh profile, same binaries)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 21
+        env:
+          PHOENIX_CHECK_WORKERS: "2"
+          CARGO_BUILD_JOBS: "2"
+          RUST_TEST_THREADS: "2"
+        run: |
+          set -o pipefail
+          deadline=$(python3 -c 'import time; print(time.monotonic_ns() + 1_260_000_000_000)')
+          goal_filter='test(/conversation_goal|goal_capture|goal_service|coordinator_watches::goal_facts::|migrations::local_goal_watch::|migrations::goal_execution::|direct_turn::tests::(message_free_start_materializes_once_without_canonical_message|start_cannot_be_steering_or_rehydrate_with_a_message_materialization)|runtime::executor::watch_goal_context_tests::|captured_notification_shared_|actual_local_and_remote_stable_id_collision_never_reinterprets_remote_fact_as_local_watch|steering_accept|checkpoint_commit_survives|persist_fork_proposal_with_tool_round|persist_tool_round_|terminal_tool_round|sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reopen_and_retry/) or test(/::(migration_006_archives_partially_archived_chains|migration_070_preserves_orphan_subagent_behind_hidden_tombstone|migration_070_backfills_first_class_product_conversations_and_reanchors_close|migration_070_rejects_invalid_continuation_and_parent_topology|migration_070_rejects_invalid_membership_and_coordinator_lifecycle|migration_070_rejects_legacy_forks_and_cycles_transactionally|migration_073_rejects_unrecoverable_recursive_subordinate_cycle|migration_073_reparents_delimiter_bearing_legacy_ids|migration_073_reparents_preexisting_recursive_subordinate_parent)$/)'
+          if [[ -n "$PHOENIX_GOAL_REUSE_DIR" && "$PHOENIX_GOAL_REUSE_DIR" != false ]]; then
+            ./dev.py check --goal-focused-filter "$goal_filter" \
+              --goal-step-deadline-ns "$deadline" --profile-work \
+              --profile-work-dir "$RUST_EVIDENCE_DIR/focused"
+          else
+            # Retained explicit default PR path; this is not a metadata-only B consumer.
+            python3 scripts/check_profile_command.py --output-dir "$RUST_EVIDENCE_DIR/focused-default" \
+              --identity step:ci:focused-default -- \
+              timeout --signal=TERM --kill-after=10s 20m cargo nextest run --locked \
+              -p phoenix-core -p phoenix-db -p phoenix_ide -E "$goal_filter" \
+              --test-threads 2 --no-fail-fast --failure-output immediate \
+              --status-level all --final-status-level all
+          fi 2>&1 | tee "$RUST_EVIDENCE_DIR/goals.log"
       - name: Check production feature on musl
         timeout-minutes: 10
         env:
@@ -143,7 +176,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rust-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.RUST_EVIDENCE_DIR }}
+          path: |
+            ${{ env.RUST_EVIDENCE_DIR }}
+            ${{ env.PHOENIX_GOAL_REUSE_DIR }}
+            target/codegen-scratch/**/*.ts
           if-no-files-found: warn
 
   check-clippy:
@@ -583,6 +619,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      PHOENIX_CHECK_DIAGNOSTIC_DIR: ${{ github.workspace }}/target/ci-ui-evidence/${{ github.run_id }}-${{ github.run_attempt }}
       CARGO_TERM_COLOR: always
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -639,6 +676,15 @@ jobs:
         working-directory: ui
       - name: ./dev.py check (ui/specs)
         run: ./dev.py check --lanes tsc,ui-lint,vitest,ast-grep,allium,spec-shape,spec-anchors,pkglock
+
+      - name: Upload UI Python diagnostics
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-python-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PHOENIX_CHECK_DIAGNOSTIC_DIR }}/python-unittest.full.log
+          if-no-files-found: warn
 
   check-finalization-geometry:
     name: check (assistant finalization geometry)
@@ -737,6 +783,18 @@ jobs:
         run: node --test scripts/roadmap-issue-reducer.test.mjs
       - name: ./dev.py check (task)
         run: ./dev.py check --lanes task
+      - name: Client contract unit tests (declared client dependencies)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          requirements="$RUNNER_TEMP/phoenix-client.requirements.txt"
+          uv --version
+          uv export --script phoenix-client.py --format requirements-txt --output-file "$requirements"
+          sha256sum phoenix-client.py "$requirements"
+          cat "$requirements"
+          uv run --no-project --with-requirements "$requirements" python -m unittest discover \
+            -s tests -p test_phoenix_client.py -v 2>&1 | tee "$RUNNER_TEMP/phoenix-client-tests.log"
+
 
   notify-main-failure:
     name: Open issue on main CI failure

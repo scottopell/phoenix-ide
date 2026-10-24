@@ -325,7 +325,12 @@ mod tests {
             None,
             None,
         );
-        let completed_results = vec![ToolResult::success("done".into(), "Ready".into())];
+        let completed_results = vec![
+            phoenix_core::domain::conversation_goal::ToolRoundResult::from(ToolResult::success(
+                "done".into(),
+                "Ready".into(),
+            )),
+        ];
         if cancelling {
             ConvState::CancellingTool {
                 cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
