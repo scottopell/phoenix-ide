@@ -500,7 +500,22 @@ pub(crate) async fn record_slack_native_outcome_tx(
     if !matches!(kind, "Completed" | "Cancelled" | "Failed") {
         return Ok(());
     }
-    let requests = requests_for_native_input(tx, transcript, source).await?;
+    let mut requests: std::collections::BTreeSet<_> =
+        requests_for_native_input(tx, transcript, source)
+            .await?
+            .into_iter()
+            .collect();
+    // A later steering drain replaces the native anchor. Every materialized,
+    // dequeued Slack input still owes its terminal explanation until an outcome
+    // is captured. This broadening is only for generic terminal fallback, never
+    // permission to publish a private question or a model-selected answer.
+    let consumed: Vec<String> = sqlx::query_scalar("SELECT m.origin_slack_request_id FROM messages m
+        JOIN steering_acceptance_receipts receipt ON receipt.conversation_id=m.conversation_id AND receipt.message_id=m.message_id
+        WHERE m.conversation_id=?1 AND m.origin_slack_request_id IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM steering_messages pending WHERE pending.conversation_id=m.conversation_id AND pending.message_id=m.message_id)
+          AND NOT EXISTS(SELECT 1 FROM slack_gateway_native_outcomes outcome WHERE outcome.request_id=m.origin_slack_request_id AND outcome.kind IN ('Completed','Cancelled','Failed'))")
+        .bind(transcript).fetch_all(&mut **tx).await?;
+    requests.extend(consumed);
     for request in requests {
         sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,context_exhausted) SELECT ?1,?2,?3,?4,?5 FROM conversations WHERE id=?4 AND (?3!='Completed' OR state_kind IN ('idle','terminal','completed')) ON CONFLICT DO NOTHING")
             .bind(request).bind(occurrence).bind(if context_exhausted {"Failed"}else{kind}).bind(transcript).bind(context_exhausted).execute(&mut **tx).await?;
@@ -546,9 +561,6 @@ async fn active_reply_requests(
     let mut requests = std::collections::BTreeSet::new();
     for input in inputs {
         requests.extend(requests_for_native_input(tx, transcript, &input).await?);
-        let consumed:Vec<String>=sqlx::query_scalar("SELECT m.origin_slack_request_id FROM messages m JOIN messages first ON first.conversation_id=m.conversation_id WHERE first.message_id=?1 AND m.conversation_id=?2 AND m.origin_slack_request_id IS NOT NULL AND m.sequence_id>=first.sequence_id")
-            .bind(input).bind(transcript).fetch_all(&mut **tx).await?;
-        requests.extend(consumed);
     }
     Ok(requests)
 }
@@ -559,6 +571,13 @@ async fn requests_for_native_input(
     message: &str,
 ) -> DbResult<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT origin_slack_request_id FROM messages WHERE conversation_id=?1 AND message_id=?2 AND origin_slack_request_id IS NOT NULL
+        UNION SELECT member.origin_slack_request_id FROM messages anchor
+        JOIN messages member ON member.conversation_id=anchor.conversation_id
+        JOIN steering_acceptance_receipts receipt ON receipt.conversation_id=member.conversation_id AND receipt.message_id=member.message_id
+        WHERE anchor.conversation_id=?1 AND anchor.message_id=?2 AND member.origin_slack_request_id IS NOT NULL
+          AND member.sequence_id>=anchor.sequence_id
+          AND member.sequence_id<COALESCE((SELECT MIN(sequence_id) FROM messages answer WHERE answer.conversation_id=?1 AND answer.message_type='agent' AND answer.sequence_id>anchor.sequence_id),9223372036854775807)
+          AND NOT EXISTS(SELECT 1 FROM steering_messages pending WHERE pending.conversation_id=member.conversation_id AND pending.message_id=member.message_id)
         UNION SELECT coverage.request_id FROM messages m
         JOIN slack_gateway_requests answer ON answer.request_id=m.origin_slack_request_id
         JOIN slack_gateway_questions q ON q.question_id=answer.question_id AND q.transcript_id=answer.question_transcript
@@ -619,7 +638,7 @@ impl Database {
     /// Materialize replies/notices from transactionally captured native occurrences.
     pub async fn process_slack_native_outcomes(&self) -> DbResult<()> {
         let mut tx = self.pool().begin().await?;
-        let completed: Vec<String> = sqlx::query_scalar("SELECT c.id FROM conversations c JOIN steering_execution_occurrences o ON o.conversation_id=c.id JOIN messages m ON m.conversation_id=c.id AND m.message_id=o.message_id WHERE c.state_kind IN ('idle','terminal','completed') AND m.origin_slack_request_id IS NOT NULL AND o.source_kind IN ('steering','seeded_fork','interaction_response') AND EXISTS(SELECT 1 FROM messages answer WHERE answer.conversation_id=c.id AND answer.message_type='agent' AND answer.sequence_id>m.sequence_id) AND NOT EXISTS(SELECT 1 FROM durable_turns t WHERE t.conversation_id=c.id AND t.owns_conversation=1)")
+        let completed: Vec<String> = sqlx::query_scalar("SELECT c.id FROM conversations c JOIN steering_execution_occurrences o ON o.conversation_id=c.id JOIN messages m ON m.conversation_id=c.id AND m.message_id=o.message_id WHERE c.state_kind IN ('idle','terminal','completed') AND EXISTS(SELECT 1 FROM messages candidate WHERE candidate.conversation_id=c.id AND candidate.origin_slack_request_id IS NOT NULL) AND o.source_kind IN ('steering','seeded_fork','interaction_response') AND EXISTS(SELECT 1 FROM messages answer WHERE answer.conversation_id=c.id AND answer.message_type='agent' AND answer.sequence_id>m.sequence_id) AND NOT EXISTS(SELECT 1 FROM durable_turns t WHERE t.conversation_id=c.id AND t.owns_conversation=1)")
             .fetch_all(&mut *tx).await?;
         for transcript in completed {
             crate::record_initial_execution_outcome_tx(
@@ -790,6 +809,185 @@ mod tests {
         .await
         .unwrap();
         db.set_slack_configuration(&other).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercise the real atomic drain and both terminal capture paths together.
+    async fn drained_batch_completion_covers_every_slack_input_but_not_pending_work() {
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, Message, MessageContent},
+            sm_event::SteerEntry,
+            sm_state::ConvState,
+        };
+        for (private_first, legacy_checkpoint, private_later) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conv = db
+                .create_conversation("batch", "batch", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let mut requests = Vec::new();
+            for ts in ["100.000001", "100.000002", "100.000003"] {
+                db.accept_slack_source(&source(ts, SlackRequestKind::Explicit), false)
+                    .await
+                    .unwrap();
+            }
+            requests.extend(
+                db.slack_requests("example.slack.com", "UOWNER")
+                    .await
+                    .unwrap(),
+            );
+            db.slack_bind_product(
+                &requests[0].binding_id,
+                conv.product_conversation_id.as_str(),
+            )
+            .await
+            .unwrap();
+            let mut entries = Vec::new();
+            let private_entry = SteerEntry {
+                text: "private".into(),
+                origin: InputOrigin::UnknownHistorical,
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "private".into(),
+                user_agent: None,
+                skill_invocation: None,
+            };
+            if private_first {
+                entries.push(private_entry.clone());
+            }
+            for r in &requests {
+                entries.push(SteerEntry {
+                    text: r.input_id.clone(),
+                    origin: InputOrigin::SlackGateway {
+                        request_id: r.request_id.clone(),
+                    },
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: r.input_id.clone(),
+                    user_agent: None,
+                    skill_invocation: None,
+                });
+                db.slack_mark_admitted(&r.request_id, &conv.id)
+                    .await
+                    .unwrap();
+            }
+            if private_later {
+                entries.insert(entries.len() - 1, private_entry);
+            }
+            for e in &entries {
+                db.append_steering_entry(&conv.id, e, "batch-fixture")
+                    .await
+                    .unwrap();
+            }
+            let drain_count = entries.len() - 1 - usize::from(private_later);
+            let drained: Vec<_> = entries[..drain_count]
+                .iter()
+                .enumerate()
+                .map(|(n, e)| {
+                    let content = MessageContent::user(&e.text);
+                    Message {
+                        message_id: e.message_id.clone(),
+                        origin: e.origin.clone(),
+                        conversation_id: conv.id.clone(),
+                        sequence_id: i64::try_from(n + 1).unwrap(),
+                        message_type: content.message_type(),
+                        content,
+                        display_data: None,
+                        usage_data: None,
+                        created_at: chrono::Utc::now(),
+                    }
+                })
+                .collect();
+            db.commit_steering_drain(
+                &conv.id,
+                &drained,
+                &ConvState::LlmRequesting { attempt: 1 },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            let mut sequence = i64::try_from(drained.len() + 1).unwrap();
+            if private_later {
+                db.add_message_with_seq(
+                    "interim",
+                    &conv.id,
+                    sequence,
+                    &MessageContent::agent(vec![]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                sequence += 1;
+                let e = &entries[drain_count];
+                let mut message = drained[0].clone();
+                message.message_id.clone_from(&e.message_id);
+                message.origin.clone_from(&e.origin);
+                message.content = MessageContent::user(&e.text);
+                message.sequence_id = sequence;
+                db.commit_steering_drain(
+                    &conv.id,
+                    &[message],
+                    &ConvState::LlmRequesting { attempt: 1 },
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+                sequence += 1;
+            }
+            if legacy_checkpoint {
+                db.add_message_with_seq(
+                    "answer",
+                    &conv.id,
+                    sequence,
+                    &MessageContent::agent(vec![]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                sqlx::query("UPDATE conversations SET state='{\"type\":\"idle\"}',state_kind='idle' WHERE id=?1").bind(&conv.id).execute(db.pool()).await.unwrap();
+            } else {
+                db.add_message_and_clear_provider_replay(
+                    "answer",
+                    &conv.id,
+                    sequence,
+                    &MessageContent::agent(vec![]),
+                    None,
+                    None,
+                    &ConvState::Idle,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            }
+            db.process_slack_native_outcomes().await.unwrap();
+            db.process_slack_native_outcomes().await.unwrap();
+            let returns = db
+                .slack_returns("example.slack.com", "UOWNER")
+                .await
+                .unwrap();
+            let covered: std::collections::BTreeSet<_> = returns
+                .iter()
+                .flat_map(|r| r.request_ids.iter().cloned())
+                .collect();
+            let expected: std::collections::BTreeSet<_> =
+                requests[..2].iter().map(|r| r.request_id.clone()).collect();
+            assert_eq!(
+                covered, expected,
+                "private_first={private_first}, legacy={legacy_checkpoint}"
+            );
+            assert_eq!(returns.len(), 1);
+            assert_eq!(db.get_steering_queue(&conv.id).await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -1612,6 +1810,8 @@ mod tests {
             )
             .await
             .unwrap();
+            sqlx::query("INSERT INTO steering_acceptance_receipts(conversation_id,message_id,request_fingerprint) VALUES ('test',?1,'consumed-fixture')")
+                .bind(&r.input_id).execute(db.pool()).await.unwrap();
             ids.push(r.request_id);
         }
         db.add_message_with_seq_and_origin(
