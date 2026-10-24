@@ -564,7 +564,10 @@ listener before surfacing the authorization URL and fail the flow if the port
 cannot be bound, so a sign-in URL is never published when its callback could not
 be received. The listener SHALL bind loopback only (both IP families), accept
 callbacks until the flow resolves or the 25-minute local sign-in window expires
-(a failed exchange leaves the flow retryable within that window). Status and
+(a failed exchange leaves the flow retryable within that window).
+Transient callback accept failures SHALL retain the bound sockets and retry
+with bounded backoff within the original window, without extending it.
+Status and
 callback handling SHALL clear authorization URLs whose loopback listener has
 stopped and surface a retryable sign-in failure, rather than leave a dead link
 visible. This local deadline SHALL NOT extend provider code or token expiry.

@@ -1707,18 +1707,33 @@ async fn run_loopback_redirect(
             .collect::<Vec<_>>();
         match tokio::time::timeout(remaining, futures::future::select_all(accepts)).await {
             Ok((Ok((stream, _)), _, _)) => {
-                let _ =
-                    tokio::time::timeout(remaining, bounce_loopback_callback(stream, &target_base))
-                        .await;
+                let _ = tokio::time::timeout(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    bounce_loopback_callback(stream, &target_base),
+                )
+                .await;
             }
             Ok((Err(e), _, _)) => {
                 tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
-                // A persistent accept failure cannot receive another callback.
-                return;
+                // Retry readiness errors on the same sockets. In particular,
+                // descriptor exhaustion/aborted connections must not discard
+                // both address families or extend the authorization window.
+                if !wait_for_loopback_retry(deadline).await {
+                    return;
+                }
             }
             Err(_) => return,
         }
     }
+}
+
+async fn wait_for_loopback_retry(deadline: tokio::time::Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    tokio::time::sleep(remaining.min(std::time::Duration::from_millis(500))).await;
+    tokio::time::Instant::now() < deadline
 }
 
 /// Read one callback request off `stream` and reply `302` to Phoenix's real
@@ -6163,6 +6178,23 @@ mod tests {
             *tool_call_timeout = Duration::from_secs(900);
         }
         assert_ne!(base, changed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oauth_accept_retry_preserves_its_original_window_and_yields() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        for _ in 0..3 {
+            let before = tokio::time::Instant::now();
+            assert!(wait_for_loopback_retry(deadline).await);
+            assert!(
+                tokio::time::Instant::now() > before,
+                "readiness failures must not spin"
+            );
+        }
+        assert!(!wait_for_loopback_retry(deadline).await);
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert!(!wait_for_loopback_retry(deadline).await);
     }
 
     #[tokio::test]
