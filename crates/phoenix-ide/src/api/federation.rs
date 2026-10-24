@@ -2790,8 +2790,8 @@ mod tests {
     fn query_response_body(
         destination: InstanceId,
         caller: InstanceId,
-        columns: Vec<String>,
-        rows: serde_json::Value,
+        columns: &serde_json::Value,
+        rows: &serde_json::Value,
     ) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "destination_instance_id": destination,
@@ -2816,8 +2816,8 @@ mod tests {
         let body = query_response_body(
             destination,
             caller,
-            vec!["value".into()],
-            serde_json::json!([[{
+            &serde_json::json!(["value"]),
+            &serde_json::json!([[{
                 "type": "text",
                 "value": format!("prefix-{bearer}-suffix")
             }]]),
@@ -2837,8 +2837,8 @@ mod tests {
         let body = query_response_body(
             destination,
             caller,
-            vec![format!("alias-{bearer}")],
-            serde_json::json!([[{"type": "integer", "value": 7}]]),
+            &serde_json::json!([format!("alias-{bearer}")]),
+            &serde_json::json!([[{"type": "integer", "value": 7}]]),
         );
 
         assert!(matches!(
@@ -2854,8 +2854,8 @@ mod tests {
         let body = query_response_body(
             destination,
             caller,
-            vec!["label".into(), "count".into()],
-            serde_json::json!([[
+            &serde_json::json!(["label", "count"]),
+            &serde_json::json!([[
                 {"type": "text", "value": "ordinary remote data"},
                 {"type": "integer", "value": 7}
             ]]),
