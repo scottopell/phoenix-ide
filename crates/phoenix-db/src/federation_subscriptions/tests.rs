@@ -1866,6 +1866,15 @@ async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply(
         .await
         .unwrap()
         .is_empty());
+    db.complete_remote_unsubscribe(&remote.reference, remote.subscription_id)
+        .await
+        .unwrap();
+    let unknown = db.next_remote_subscription_sync_batch(4).await.unwrap();
+    assert_eq!(unknown.len(), 1);
+    assert!(!unknown[0].pending_unsubscribe);
+    db.begin_remote_unsubscribe(&remote.reference, remote.subscription_id)
+        .await
+        .unwrap();
     let SubscriptionAuthorization::Authorized { authorization_id } = authorized else {
         panic!("source authorized")
     };
@@ -1877,6 +1886,9 @@ async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply(
         RemoteAuthorizationOutcome::LocallyStopped
     );
     assert!(steer(&db, &target, &note.admission_id).await.is_err());
+    let queued = db.next_remote_subscription_sync_batch(4).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].pending_unsubscribe);
     db.complete_remote_unsubscribe(&remote.reference, remote.subscription_id)
         .await
         .unwrap();
@@ -1892,9 +1904,11 @@ async fn staged_authorization_attempt_survives_local_unsubscribe_and_lost_reply(
             .disposition,
         RemoteNotificationDisposition::Suppressed
     ));
-    let stored: (Option<String>, bool) = sqlx::query_as("SELECT authorization_id, authorization_requested FROM federation_remote_admissions WHERE admission_id = ?1")
+    let stored: (Option<String>, bool, Option<String>) = sqlx::query_as("SELECT authorization_id, authorization_requested, accepted_transcript_id FROM federation_remote_admissions WHERE admission_id = ?1")
         .bind(&note.admission_id).fetch_one(db.pool()).await.unwrap();
-    assert_eq!(stored, (Some(authorization_id.to_string()), true));
+    assert_eq!(stored, (Some(authorization_id.to_string()), true, None));
+    let stopped = db.remote_subscriptions(None, 1).await.unwrap().remove(0);
+    assert_eq!(stopped.admitted_cursor, SubscriptionCursor::START);
 }
 
 #[tokio::test]

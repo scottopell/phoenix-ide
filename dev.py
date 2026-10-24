@@ -6684,6 +6684,7 @@ def cmd_check(
                     "discover",
                     "tests/devpy",
                 ]
+            unittest_cmd.append("-v")
             run_step("dev.py unit tests", unittest_cmd)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
