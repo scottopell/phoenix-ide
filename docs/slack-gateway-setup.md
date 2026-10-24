@@ -53,6 +53,8 @@ agent. The command is frozen before a submission; status reads use that exact
 command and receipt even after settings change. Exit failure, timeout or invalid
 submission evidence leaves the external outcome uncertain; Phoenix does not
 blindly retry a send. Stderr is not exposed as notification content.
+A correlated `failed` submission with a nonempty sanitized `reason` is a
+terminal failure, retained with its receipt rather than treated as uncertain.
 
 Submit input:
 
@@ -78,6 +80,12 @@ is `submitted`, `delivered` with nonempty `proof`, or `failed` with a sanitized
 operation before returning proof; a service accepting a request is insufficient.
 It must not echo credentials, private findings, raw provider headers or request
 bodies. The process timeout is 45 seconds and output is capped at 64 KiB.
+
+For a source inside a thread, acceptance verifies the parent and exact reply
+together using a narrow timestamp range. Its initial quoted context includes
+those two messages; the agent can read more discussion through ordinary Slack
+tools when the assignment needs it. Top-level sources retain a bounded thread
+read. Coverage and truncation remain visible in the conversation.
 Confirmation does not prove that the owner's device displayed an alert.
 
 ## Acceptance and stopping

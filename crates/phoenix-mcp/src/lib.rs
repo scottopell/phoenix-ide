@@ -3450,13 +3450,42 @@ impl McpClientManager {
         let config = handle.snapshot().config;
         let outcome = handle
             .call_for_config(
-                config,
+                config.clone(),
                 tool_name.to_string(),
                 arguments,
                 CancellationToken::new(),
                 Some(expected_schema),
             )
             .await?;
+        // Restore the connection for later callers without replaying this call.
+        // In particular, an expired OAuth session must not remain stranded just
+        // because the caller requires exact per-dispatch accounting.
+        if !matches!(outcome.recovery, CallRecovery::None) {
+            let manager = Arc::clone(self);
+            let name = server_name.to_string();
+            let epoch = outcome.epoch;
+            let recovery = outcome.recovery;
+            let invocation_config = config;
+            self.spawn_background(async move {
+                match recovery {
+                    CallRecovery::OAuth(kind) => {
+                        let _ = manager
+                            .recover_oauth_for_config(
+                                &name,
+                                &handle,
+                                epoch,
+                                kind,
+                                &invocation_config,
+                            )
+                            .await;
+                    }
+                    CallRecovery::Transport | CallRecovery::CancelledTransport => {
+                        let _ = manager.recover_actor(&name, &handle, epoch, None).await;
+                    }
+                    CallRecovery::None => {}
+                }
+            });
+        }
         outcome.result.map_err(|e| match e {
             McpRequestError::NotDispatched(message) => McpOneShotError::NotDispatched(message),
             other @ (McpRequestError::Transport(_)
@@ -5875,33 +5904,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_attempt_does_not_replay_a_dispatched_write() {
-        let (server, requests, _) = fake_server(vec![exchange(Err(TransportError::Disconnected(
-            "response lost after write".into(),
-        )))]);
-        let schema = serde_json::json!({"type":"object"});
-        *server.tools.write().unwrap() = vec![McpToolDef {
-            name: "post".into(),
-            description: String::new(),
-            input_schema: schema.clone(),
-        }];
-        let manager = Arc::new(McpClientManager::new());
-        manager
-            .servers
-            .write()
-            .await
-            .insert("fake".into(), server_handle(server));
-        assert!(matches!(
+    async fn single_attempt_does_not_replay_dispatched_reads_or_writes() {
+        for name in ["post", "read_thread"] {
+            let (server, requests, _) = fake_server(vec![exchange(Err(
+                TransportError::Disconnected("response lost after write".into()),
+            ))]);
+            let schema = serde_json::json!({"type":"object"});
+            *server.tools.write().unwrap() = vec![McpToolDef {
+                name: name.into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            }];
+            let manager = Arc::new(McpClientManager::new());
+            let handle = server_handle(server);
+            let epoch = handle.snapshot().epoch;
             manager
-                .call_tool_once("fake", "post", serde_json::json!({}), schema)
-                .await,
-            Err(McpOneShotError::Uncertain(_))
-        ));
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            1,
-            "an uncertain write must not be replayed during recovery"
-        );
+                .servers
+                .write()
+                .await
+                .insert("fake".into(), handle.clone());
+            assert!(matches!(
+                manager
+                    .call_tool_once("fake", name, serde_json::json!({}), schema)
+                    .await,
+                Err(McpOneShotError::Uncertain(_))
+            ));
+            tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+                .await
+                .expect("connection recovery must settle without tool replay");
+            assert!(handle.snapshot().epoch > epoch);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "a dispatch must not be replayed during recovery: {name}"
+            );
+        }
     }
 
     #[tokio::test]

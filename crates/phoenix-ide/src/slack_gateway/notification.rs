@@ -36,7 +36,13 @@ enum Outcome {
     Failed { reason: String },
 }
 
-pub(super) async fn notify(c: &Config, output: &SlackReturn) -> Result<String, String> {
+#[derive(Debug)]
+pub(super) enum Submission {
+    Submitted { receipt: String },
+    Failed { receipt: String, reason: String },
+}
+
+pub(super) async fn notify(c: &Config, output: &SlackReturn) -> Result<Submission, String> {
     let url = if output.published {
         let product = output
             .product_id
@@ -65,10 +71,18 @@ pub(super) async fn notify(c: &Config, output: &SlackReturn) -> Result<String, S
         },
     )
     .await?;
-    if !matches!(response.outcome, Outcome::Submitted) {
-        return Err("Notification submission did not return a receipt; outcome uncertain".into());
+    submission(response)
+}
+
+fn submission(response: Response) -> Result<Submission, String> {
+    match response.outcome {
+        Outcome::Submitted => Ok(Submission::Submitted { receipt: response.receipt }),
+        Outcome::Failed { reason } if !reason.trim().is_empty() => {
+            Ok(Submission::Failed { receipt: response.receipt, reason })
+        }
+        Outcome::Delivered { .. } | Outcome::Failed { .. } =>
+            Err("Notification submission did not establish submission or explicit failure; outcome uncertain".into()),
     }
-    Ok(response.receipt)
 }
 
 pub(super) async fn observe(output: &SlackReturn) -> Result<SlackNotificationObservation, String> {

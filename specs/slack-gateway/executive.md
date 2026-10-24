@@ -77,6 +77,14 @@ assertion was updated to the new typed outcome and passed in isolation. Clippy,
 formatting, Allium and structural/timing checks pass. The next public review and
 full CI head remain qualification gates.
 
+The second public review identified explicit notifier rejection, recovery replay
+accounting, unavailable search hits and independent thread-root verification.
+Those fixes passed the expanded 238-case MCP/gateway suite. A final two-case
+one-shot test also confirms connection recovery settles without replaying a
+read or write. The eight API-guidance checks follow the shared native question
+service, and Clippy, formatting, Allium and structural/timing checks pass.
+Latest-head hosted CI and automatic review remain gates.
+
 The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
 passed online-backup and stopped-snapshot rehearsals from the installed complete
 127 ledger to its exact complete 130 registry. Integrity, foreign keys,

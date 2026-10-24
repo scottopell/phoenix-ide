@@ -31,8 +31,9 @@ contract SlackDiscoveryPort {
         -- SlackCall. Failed dispatches consume allowance too. This is a logical
         -- tool-call limit, not a provider-wide or underlying HTTP-request quota.
         -- Agent-initiated tools, manual inspection, and notification-provider calls are outside
-        -- this allowance. Reads may have transport-internal retries; external
-        -- writes follow the lifecycle's single-attempt/uncertainty contract.
+        -- this allowance. A dispatched gateway tool call is not replayed by
+        -- MCP recovery; a later retry requires a new allowance grant. External
+        -- writes also follow the lifecycle's single-attempt/uncertainty contract.
         -- An allowance grant is necessary, not sufficient, for a side effect:
         -- acknowledgment needs an accepted request, and a thread send needs
         -- a lifecycle-owned return attempt with its exact source/destination.
@@ -41,13 +42,17 @@ contract SlackDiscoveryPort {
     @invariant VerifiedPageBoundary
         -- Evidence binds the exact query and position. Every returned candidate
         -- is either already recorded, positively rejected, or represented by a
-        -- verified eligible observation. Partial reads, parser errors, and failed
+        -- verified eligible observation. A positively established deleted or
+        -- inaccessible source is ineligible, without marking its identity handled.
+        -- Transient failures, partial reads, parser errors, and failed identity
         -- verification cannot produce completed PageEvidence.
         -- Before candidate context/reaction reads, consult the lifecycle's
         -- recorded source identities (accepted and baseline) and own-output
         -- evidence. Recorded sources are skipped without those extra reads.
         -- The configured workspace, owner actor, exact message identity and
         -- author are verified independently of untrusted message prose.
+        -- A source reply must also be observed under its claimed root; the
+        -- search permalink alone does not establish that return destination.
         -- Eligibility uses the current and preceding three calendar dates in
         -- the owner's timezone at source validation, not the scan's start date.
         -- Source-message age cannot substitute for a reaction-add timestamp.

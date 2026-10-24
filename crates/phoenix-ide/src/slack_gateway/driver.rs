@@ -443,15 +443,27 @@ async fn dispatch_returns(
             }
         } else {
             match super::notification::notify(c, &output).await {
-                Ok(instance) => state
+                Ok(super::notification::Submission::Submitted { receipt }) => state
                     .db
                     .slack_finish_return(
                         &output.return_id,
                         &attempt,
                         phoenix_db::SlackReturnState::Submitted,
                         None,
-                        Some(&instance),
+                        Some(&receipt),
                         None,
+                    )
+                    .await
+                    .map_err(err)?,
+                Ok(super::notification::Submission::Failed { receipt, reason }) => state
+                    .db
+                    .slack_finish_return(
+                        &output.return_id,
+                        &attempt,
+                        phoenix_db::SlackReturnState::Failed,
+                        None,
+                        Some(&receipt),
+                        Some(&reason),
                     )
                     .await
                     .map_err(err)?,
@@ -851,6 +863,75 @@ mod tests {
         ProviderStreamTelemetry, Usage,
     };
     use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    async fn explicit_notifier_rejection_is_terminal_and_preserves_the_reason() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let response = r#"{"version":1,"notification_id":"rejected","owner":"UFIXTURE","receipt":"rejection-receipt","state":"failed","reason":"Recipient disabled"}"#;
+        let c = Config {
+            enabled: false,
+            mcp_server: "fixture".into(),
+            owner: "UFIXTURE".into(),
+            workspace: "fixture.slack.com".into(),
+            timezone: "America/New_York".into(),
+            phoenix_url: "https://localhost:8043".into(),
+            notification_command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("cat >/dev/null; printf '%s' '{response}'"),
+            ]),
+        };
+        let source = phoenix_db::SlackSource {
+            workspace: c.workspace.clone(),
+            owner: c.owner.clone(),
+            channel: "CFIXTURE".into(),
+            message_ts: "100.000001".into(),
+            thread_ts: "100.000001".into(),
+            source_url: "https://fixture.slack.com/archives/CFIXTURE/p100000001".into(),
+            instruction: String::new(),
+            context: "quoted".into(),
+            observed_at_unix_micros: 1,
+            kind: SlackRequestKind::Briefing,
+        };
+        state.db.accept_slack_source(&source, false).await.unwrap();
+        let request = state
+            .db
+            .slack_requests(&c.workspace, &c.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('rejected',?1,'notice','private','ready',1)")
+            .bind(&request.binding_id).execute(state.db.pool()).await.unwrap();
+        let slack = Slack::new(state.mcp_manager.clone(), &c);
+        dispatch_returns(&state, &c, &slack, false).await.unwrap();
+        let output = state
+            .db
+            .slack_returns(&c.workspace, &c.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.state, phoenix_db::SlackReturnState::Failed);
+        assert_eq!(output.failure.as_deref(), Some("Recipient disabled"));
+        assert_eq!(
+            output.notification_receipt.as_deref(),
+            Some("rejection-receipt")
+        );
+        let attempt: String = sqlx::query_scalar(
+            "SELECT attempt_id FROM slack_gateway_returns WHERE return_id='rejected'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        dispatch_returns(&state, &c, &slack, false).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT attempt_id FROM slack_gateway_returns WHERE return_id='rejected'"
+            )
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap(),
+            attempt
+        );
+    }
     #[tokio::test]
     async fn undispatched_reply_retries_after_tool_readiness_recovers() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;

@@ -109,6 +109,65 @@ async fn backlog() -> Backlog {
 
 // REQ-SG-003/004/005/017: an old message gets a new reaction behind six baseline sources.
 #[tokio::test]
+async fn deleted_hit_does_not_block_baseline_or_a_later_page() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = config();
+    state
+        .db
+        .set_app_setting("slack_gateway", &serde_json::to_string(&c).unwrap())
+        .await
+        .unwrap();
+    let ts = format!("{}.000001", chrono::Utc::now().timestamp());
+    let sources = ["CDELETED", "CLATER"].map(|channel| phoenix_db::SlackSource {
+        workspace: c.workspace.clone(),
+        owner: c.owner.clone(),
+        channel: channel.into(),
+        thread_ts: ts.clone(),
+        message_ts: ts.clone(),
+        source_url: format!(
+            "https://fixture.slack.com/archives/{channel}/p{}",
+            ts.replace('.', "")
+        ),
+        instruction: String::new(),
+        context: "context".into(),
+        observed_at_unix_micros: 1,
+        kind: phoenix_db::SlackRequestKind::Briefing,
+    });
+    let fixture = reaction_fixture(sources.to_vec(), Arc::new(Mutex::new(Vec::new())));
+    let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+    slack.fixture = Some(Arc::new(move |tool, args| {
+        if tool == "slack_read_thread" && args["channel_id"] == "CDELETED" {
+            Err("message_not_found".into())
+        } else {
+            fixture(tool, args)
+        }
+    }));
+    driver::discover(&state, &c, &slack).await.unwrap();
+    let ready: bool = sqlx::query_scalar("SELECT baseline_complete FROM slack_gateway_accounts")
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+    assert!(ready);
+    assert!(!state
+        .db
+        .slack_source_recorded(&c.workspace, &c.owner, "CDELETED", &ts)
+        .await
+        .unwrap());
+    assert!(state
+        .db
+        .slack_source_recorded(&c.workspace, &c.owner, "CLATER", &ts)
+        .await
+        .unwrap());
+    assert!(state
+        .db
+        .slack_requests(&c.workspace, &c.owner)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+// REQ-SG-003/004/005/017: an old message gets a new reaction behind six baseline sources.
+#[tokio::test]
 async fn reaction_backlog_measurement() {
     let Backlog {
         state,

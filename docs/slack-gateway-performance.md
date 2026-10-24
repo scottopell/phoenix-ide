@@ -5,8 +5,9 @@
 The fixture runs production parsing, discovery and SQLite-backed acceptance.
 It contains six recorded baseline sources followed by one unseen reaction on
 an older eligible message; the prefix query is empty. Each search page contains
-one result. Calls count logical tool dispatches rather than provider-internal
-HTTP requests or transport retries.
+one result. Calls count tool dispatches rather than provider-internal HTTP
+requests. MCP recovery does not replay gateway calls; a later retry consumes
+another allowance grant.
 
 | Measurement | One page per query/pass | Bounded bursts and early deduplication |
 | --- | ---: | ---: |

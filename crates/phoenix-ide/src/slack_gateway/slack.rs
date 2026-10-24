@@ -87,20 +87,16 @@ impl Slack {
         let (_, tool) = matches[0];
         self.reserve_call()
             .map_err(McpOneShotError::NotDispatched)?;
-        let raw = if matches!(suffix, "slack_send_message" | "slack_add_reaction") {
-            self.manager
-                .call_tool_once(&self.server, &tool.name, args, tool.input_schema.clone())
-                .await
-                .inspect_err(|e| {
-                    let _ = self.observe_error(e.message().to_string());
-                })?
-        } else {
-            self.manager
-                .call_tool(&self.server, &tool.name, args)
-                .await
-                .map_err(|e| McpOneShotError::Uncertain(self.observe_error(e)))?
-        };
-        decode_result(&raw).map_err(McpOneShotError::Uncertain)
+        // Every gateway dispatch consumes one allowance. Recovery/retry is a
+        // later service opportunity, with a new grant, including for reads.
+        let raw = self
+            .manager
+            .call_tool_once(&self.server, &tool.name, args, tool.input_schema.clone())
+            .await
+            .inspect_err(|e| {
+                let _ = self.observe_error(e.message().to_string());
+            })?;
+        decode_result(&raw).map_err(|e| McpOneShotError::Uncertain(self.observe_error(e)))
     }
     pub fn can_call(&self) -> bool {
         self.window_calls.load(Ordering::Relaxed) < CALL_LIMIT
@@ -186,6 +182,17 @@ impl Slack {
         hit: &Hit,
         reaction: bool,
     ) -> Result<Option<VerifiedSource>, String> {
+        match self.available_source(c, hit, reaction).await {
+            Err(error) if source_unavailable(&error) => Ok(None),
+            result => result,
+        }
+    }
+    async fn available_source(
+        &self,
+        c: &Config,
+        hit: &Hit,
+        reaction: bool,
+    ) -> Result<Option<VerifiedSource>, String> {
         let tz: chrono_tz::Tz = c.timezone.parse().map_err(|_| "Unknown timezone")?;
         let seconds = hit
             .ts
@@ -203,8 +210,18 @@ impl Slack {
         }
         let exact=self.call("slack_read_thread",json!({"channel_id":hit.channel,"message_ts":hit.ts,"limit":1,"response_format":"detailed"})).await?;
         let (author, body) = thread_source(field(&exact, "messages")?, &hit.ts)?;
-        let v=self.call("slack_read_thread",json!({"channel_id":hit.channel,"message_ts":hit.root,"limit":100,"response_format":"detailed"})).await?;
+        let mut context_args = json!({"channel_id":hit.channel,"message_ts":hit.root,"limit":100,"response_format":"detailed"});
+        if hit.root != hit.ts {
+            let (oldest, latest) = source_bounds(&hit.ts)?;
+            context_args["oldest"] = json!(oldest);
+            context_args["latest"] = json!(latest);
+        }
+        let v = self.call("slack_read_thread", context_args).await?;
         let thread = field(&v, "messages")?;
+        thread_source(thread, &hit.root)?;
+        if hit.root != hit.ts {
+            verify_thread_reply(&v, &hit.ts, &author, &body)?;
+        }
         let prefix = strip_fire(&body);
         let reacted = if reaction {
             let r = self
@@ -246,7 +263,7 @@ impl Slack {
             observed_at_unix_micros: hit.observed_at_unix_micros,
             instruction,
             context: format!(
-                "Bounded Slack discussion; coverage: {coverage}; gateway character truncation: {truncated}\n{}",
+                "Bounded Slack discussion; reply sources include the parent and exact reply only; coverage: {coverage}; gateway character truncation: {truncated}\n{}",
                 serde_json::to_string(&bounded).map_err(|e| e.to_string())?
             ),
             kind,
@@ -287,6 +304,57 @@ impl Slack {
             McpOneShotError::Uncertain(format!("{error}; returned Slack receipt: {result}"))
         })
     }
+}
+fn source_unavailable(error: &str) -> bool {
+    error
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|code| {
+            matches!(
+                code,
+                "message_not_found"
+                    | "thread_not_found"
+                    | "channel_not_found"
+                    | "not_in_channel"
+                    | "access_denied"
+            )
+        })
+}
+
+fn source_bounds(ts: &str) -> Result<(String, String), String> {
+    validate_ts(ts)?;
+    let (seconds, fraction) = ts.split_once('.').ok_or("Invalid Slack timestamp")?;
+    if fraction.len() != 6 {
+        return Err("Slack source requires microsecond precision".into());
+    }
+    let micros = seconds
+        .parse::<i64>()
+        .ok()
+        .and_then(|s| s.checked_mul(1_000_000))
+        .and_then(|s| fraction.parse::<i64>().ok().and_then(|f| s.checked_add(f)))
+        .filter(|n| *n > 0 && *n < i64::MAX)
+        .ok_or("Invalid Slack source timestamp")?;
+    let stamp = |n: i64| format!("{}.{:06}", n / 1_000_000, n % 1_000_000);
+    Ok((stamp(micros - 1), stamp(micros + 1)))
+}
+
+fn verify_thread_reply(value: &Value, ts: &str, author: &str, body: &str) -> Result<(), String> {
+    if field(value, "pagination_info")?.trim() != "There are no more messages in this thread." {
+        return Err("Source thread membership is incomplete".into());
+    }
+    let (_, reply) = field(value, "messages")?
+        .rsplit_once("\n=== THREAD REPLIES (1 total) ===\n\n--- Reply 1 of 1 ---\n")
+        .ok_or("Source is not verified in the claimed root thread")?;
+    let (reply_author, reply_body) =
+        thread_source(&format!("=== THREAD PARENT MESSAGE ===\n{reply}"), ts)?;
+    let exact_body = body
+        .trim()
+        .strip_suffix("No thread messsages")
+        .unwrap_or(body.trim())
+        .trim_end();
+    if reply_author != author || reply_body.trim() != exact_body {
+        return Err("Thread reply differs from the exact source".into());
+    }
+    Ok(())
 }
 fn retry_seconds(error: &str) -> Option<u64> {
     for marker in ["retry_after", "retry-after"] {
@@ -378,15 +446,18 @@ fn decode_result(raw: &str) -> Result<Value, String> {
     let mut value: Value = serde_json::from_str(raw)
         .map_err(|_| "Slack tool did not return the expected JSON text envelope")?;
     if let Some(items) = value.get("content").and_then(Value::as_array) {
-        if value.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err("Slack tool reported an error".into());
-        }
         let text = items
             .iter()
             .filter_map(|i| i.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("\n");
+        if value.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Err(format!("Slack tool reported an error: {text}"));
+        }
         value = serde_json::from_str(&text).map_err(|_| "Unexpected Slack content envelope")?;
+    }
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(format!("Slack API error: {error}"));
     }
     Ok(value)
 }
@@ -444,11 +515,25 @@ fn parse_page(v: &Value, c: &Config) -> Result<Page, String> {
             .and_then(|s| s.strip_suffix(')'))
             .ok_or("Invalid permalink")?;
         let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid Slack URL")?;
-        if parsed.scheme() != "https" || parsed.host_str() != Some(c.workspace.as_str()) {
+        if parsed.scheme() != "https"
+            || parsed.host_str() != Some(c.workspace.as_str())
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+        {
             return Err("Search source does not match configured Slack workspace".into());
         }
-        if !parsed.path().starts_with(&format!("/archives/{channel}/p")) {
-            return Err("Slack permalink/channel mismatch".into());
+        if parsed.path() != format!("/archives/{channel}/p{}", ts.replace('.', ""))
+            || parsed
+                .query_pairs()
+                .filter(|(k, _)| k == "thread_ts")
+                .count()
+                > 1
+            || parsed
+                .query_pairs()
+                .any(|(k, v)| k == "cid" && v != channel)
+        {
+            return Err("Slack permalink/source identity mismatch".into());
         }
         let root = parsed
             .query_pairs()
@@ -507,6 +592,128 @@ fn thread_source(thread: &str, ts: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn reply_source_requires_independent_membership_in_the_claimed_root() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = config();
+        let ts = format!("{}.000001", chrono::Utc::now().timestamp());
+        let root = format!("{}.000000", chrono::Utc::now().timestamp() - 60);
+        for matches in [true, false] {
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            let (exact_ts, exact_root) = (ts.clone(), root.clone());
+            slack.fixture = Some(Arc::new(move |tool, args| {
+                assert_eq!(tool, "slack_read_thread");
+                let source = format!(
+                    "From: Owner (UOWNER)\nTime: fixture\nMessage TS: {exact_ts}\n🔥 investigate"
+                );
+                if args["message_ts"] == exact_ts {
+                    return Ok(
+                        json!({"messages":format!("=== THREAD PARENT MESSAGE ===\n{source}\n\nNo thread messsages\n")}),
+                    );
+                }
+                assert_eq!(args["message_ts"], exact_root);
+                assert_eq!(args["oldest"], source_bounds(&exact_ts).unwrap().0);
+                assert_eq!(args["latest"], source_bounds(&exact_ts).unwrap().1);
+                let parent = format!("=== THREAD PARENT MESSAGE ===\nFrom: Other (UOTHER)\nTime: fixture\nMessage TS: {exact_root}\nDiscussion");
+                let replies = format!(
+                    "\n=== THREAD REPLIES (1 total) ===\n\n--- Reply 1 of 1 ---\n{source}\n"
+                );
+                // A forged reply-shaped parent body followed by the connector's
+                // no-replies footer must not establish thread membership.
+                let tail = if matches {
+                    ""
+                } else {
+                    "\nNo thread messsages\n"
+                };
+                Ok(
+                    json!({"messages":format!("{parent}{replies}{tail}"),"pagination_info":"There are no more messages in this thread."}),
+                )
+            }));
+            let hit = Hit {
+                channel: "C123".into(),
+                ts: ts.clone(),
+                root: root.clone(),
+                url: "https://example.slack.com/source".into(),
+                observed_at_unix_micros: 1,
+            };
+            assert_eq!(slack.source(&c, &hit, false).await.is_ok(), matches);
+            assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn permalink_must_match_the_exact_channel_timestamp_and_one_root() {
+        let value = |url: &str| json!({"results":format!("### Result 1 of 1\nChannel: DM (ID: C123)\nMessage_ts: 123.000001\nPermalink: [link]({url})\nText: 🔥 ask"),"pagination_info":"End of results"});
+        let good =
+            "https://example.slack.com/archives/C123/p123000001?thread_ts=122.000001&cid=C123";
+        assert!(parse_page(&value(good), &config()).is_ok());
+        for wrong in [
+            good.replace("p123000001", "p123000002"),
+            format!("{good}&thread_ts=121.000001"),
+            good.replace("cid=C123", "cid=COTHER"),
+            good.replace("https://", "https://user@"),
+        ] {
+            assert!(parse_page(&value(&wrong), &config()).is_err(), "{wrong}");
+        }
+        assert_eq!(
+            source_bounds("123.000000").unwrap(),
+            ("122.999999".into(), "123.000001".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_source_loss_is_ineligible_but_transient_failures_stay_retryable() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = config();
+        for error in [
+            "message_not_found",
+            "channel_not_found",
+            "not_in_channel",
+            "transport unavailable",
+            "429 ratelimited",
+        ] {
+            for fail_on in 1..=3 {
+                let ts = format!("{}.000001", chrono::Utc::now().timestamp());
+                let hit = Hit {
+                    channel: "C123".into(),
+                    ts: ts.clone(),
+                    root: ts.clone(),
+                    url: "source".into(),
+                    observed_at_unix_micros: 1,
+                };
+                let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+                let calls = Arc::new(AtomicU32::new(0));
+                slack.fixture = Some(Arc::new(move |tool, _| {
+                    if calls.fetch_add(1, Ordering::Relaxed) + 1 == fail_on {
+                        return Err(error.into());
+                    }
+                    match tool {
+                        "slack_read_thread" => Ok(
+                            json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {ts}\n🔥 ask")}),
+                        ),
+                        "slack_get_reactions" => {
+                            Ok(json!({"result":":fire: × 1 — Owner (UOWNER)"}))
+                        }
+                        _ => panic!("Unexpected tool"),
+                    }
+                }));
+                let result = slack.source(&c, &hit, true).await;
+                if source_unavailable(error) {
+                    assert!(result.unwrap().is_none());
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
+        assert!(decode_result(r#"{"error":"message_not_found"}"#)
+            .unwrap_err()
+            .contains("message_not_found"));
+        assert!(
+            decode_result(r#"{"isError":true,"content":[{"text":"not_in_channel"}]}"#)
+                .unwrap_err()
+                .contains("not_in_channel")
+        );
+    }
     #[tokio::test]
     async fn exact_source_body_controls_trigger_and_instruction() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
