@@ -367,7 +367,8 @@ function FileChips({
 
 function InputSender({ origin }: { origin: InputOrigin | undefined }) {
   if (origin?.kind !== 'internal_conversation') {
-    return <span className="message-sender">{inputOriginPresentation(origin).label}</span>;
+    const presentation = inputOriginPresentation(origin);
+    return <span className="message-sender" title={presentation.title}>{presentation.label}</span>;
   }
   return (
     <span className="message-sender">

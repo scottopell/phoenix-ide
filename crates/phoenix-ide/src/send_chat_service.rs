@@ -43,6 +43,7 @@ pub(crate) struct SendChatRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SendChatTarget {
+    StableCoordinator(phoenix_core::domain::product_conversation::ProductConversationId),
     ExactTranscript(String),
     StableProductConversation(String),
 }
@@ -53,6 +54,14 @@ pub(crate) enum SendChatOutcome {
     AlreadyPersisted,
     QueuedAsSteering,
     Rejected { message: String, code: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SendChatReplay {
+    #[default]
+    New,
+    Direct,
+    Steering,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -253,14 +262,39 @@ impl SendChatApplicationService {
     pub(crate) async fn send_to_target(
         &self,
         target: SendChatTarget,
-        mut req: SendChatRequest,
+        req: SendChatRequest,
     ) -> Result<(String, SendChatOutcome), SendChatServiceError> {
+        self.send_to_target_with_replay(target, req)
+            .await
+            .map(|(id, outcome, _)| (id, outcome))
+    }
+
+    pub(crate) async fn send_to_target_with_replay(
+        &self,
+        target: SendChatTarget,
+        mut req: SendChatRequest,
+    ) -> Result<(String, SendChatOutcome, SendChatReplay), SendChatServiceError> {
+        let mut replay = SendChatReplay::New;
         match target {
             SendChatTarget::ExactTranscript(conversation_id) => {
                 req.conversation_id = conversation_id.clone();
-                self.send(req)
+                self.send_with_admission_guard(req, None, &mut replay)
                     .await
-                    .map(|outcome| (conversation_id, outcome))
+                    .map(|outcome| (conversation_id, outcome, replay))
+            }
+            SendChatTarget::StableCoordinator(product_conversation_id) => {
+                let _product_admission = self
+                    .runtime
+                    .lock_product_message_admission(product_conversation_id.as_str())
+                    .await;
+                let conversation_id = self
+                    .stable_coordinator_transcript_id(product_conversation_id, &req.message_id)
+                    .await?;
+                let admission_guard = self.runtime.lock_message_acceptance(&conversation_id).await;
+                req.conversation_id = conversation_id.clone();
+                self.send_with_admission_guard(req, Some(admission_guard), &mut replay)
+                    .await
+                    .map(|outcome| (conversation_id, outcome, replay))
             }
             SendChatTarget::StableProductConversation(product_conversation_id) => {
                 let _product_admission = self
@@ -283,9 +317,9 @@ impl SendChatApplicationService {
                 {
                     req.conversation_id = conversation_id.clone();
                     return self
-                        .send(req)
+                        .send_with_admission_guard(req, None, &mut replay)
                         .await
-                        .map(|outcome| (conversation_id, outcome));
+                        .map(|outcome| (conversation_id, outcome, replay));
                 }
                 let aggregate = self
                     .db
@@ -305,7 +339,7 @@ impl SendChatApplicationService {
                     },
                 ) = admission
                 else {
-                    return Ok((conversation_id, history_unavailable_outcome()));
+                    return Ok((conversation_id, history_unavailable_outcome(), replay));
                 };
                 if admitted_product_conversation_id.as_str() != product_conversation_id {
                     return Err(SendChatServiceError::Internal(
@@ -315,18 +349,55 @@ impl SendChatApplicationService {
                 }
                 req.conversation_id = conversation_id.clone();
                 return self
-                    .send_with_admission_guard(req, Some(admission_guard))
+                    .send_with_admission_guard(req, Some(admission_guard), &mut replay)
                     .await
-                    .map(|outcome| (conversation_id, outcome));
+                    .map(|outcome| (conversation_id, outcome, replay));
             }
         }
+    }
+
+    async fn stable_coordinator_transcript_id(
+        &self,
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+        message_id: &str,
+    ) -> Result<String, SendChatServiceError> {
+        let conversation_id = if let Some(owner) = self
+            .db
+            .product_conversation_client_message_owner(&product_conversation_id, message_id)
+            .await
+            .map_err(map_conversation_load_error)?
+        {
+            owner
+        } else {
+            let current = self
+                .db
+                .coordinator_conversation_id()
+                .await
+                .map_err(map_conversation_load_error)?
+                .ok_or_else(|| SendChatServiceError::NotFound("Coordinator unavailable".into()))?;
+            let conversation = self
+                .db
+                .get_conversation(&current)
+                .await
+                .map_err(map_conversation_load_error)?;
+            if conversation.product_conversation_id != product_conversation_id
+                || conversation.runtime_role != crate::work_scope::RuntimeRole::Coordinator
+            {
+                return Err(SendChatServiceError::NotFound(
+                    "Coordinator identity changed".into(),
+                ));
+            }
+            current
+        };
+        Ok(conversation_id)
     }
 
     pub(crate) async fn send(
         &self,
         req: SendChatRequest,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
-        self.send_with_admission_guard(req, None).await
+        self.send_with_admission_guard(req, None, &mut SendChatReplay::New)
+            .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -334,6 +405,7 @@ impl SendChatApplicationService {
         &self,
         mut req: SendChatRequest,
         admission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        replay: &mut SendChatReplay,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
         let conversation = self
             .runtime
@@ -352,6 +424,15 @@ impl SendChatApplicationService {
                         == req.message_id
             })
         {
+            if matches!(
+                req.origin,
+                phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. }
+                    | phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { .. }
+                    | phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { .. }
+                    | phoenix_core::domain::db_schema::InputOrigin::InternalConversation { .. }
+            ) {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
             if req.expansion_policy == MessageExpansionPolicy::LiteralText
                 && (req.message_id != intent.message_id.as_str()
                     || req.text != intent.handoff
@@ -374,6 +455,7 @@ impl SendChatApplicationService {
         match lookup_durable_replay(&self.db, &req, &submitted).await? {
             DurableReplayOutcome::Missing => {}
             DurableReplayOutcome::ExactMaterialized => {
+                *replay = SendChatReplay::Direct;
                 return Ok(SendChatOutcome::AlreadyPersisted);
             }
             DurableReplayOutcome::ExactUnmaterializedTerminal => {
@@ -384,6 +466,7 @@ impl SendChatApplicationService {
                 });
             }
             DurableReplayOutcome::ExactUnmaterializedLive => {
+                *replay = SendChatReplay::Direct;
                 self.runtime.kick_direct_turn_worker();
                 return Ok(SendChatOutcome::Delivered);
             }
@@ -391,6 +474,7 @@ impl SendChatApplicationService {
         if let Some(outcome) =
             lookup_durable_steering_replay(&self.db, &req, &request_fingerprint).await?
         {
+            *replay = SendChatReplay::Steering;
             return Ok(outcome);
         }
         let acceptance_guard = match admission_guard {
@@ -405,6 +489,7 @@ impl SendChatApplicationService {
         match lookup_durable_replay(&self.db, &req, &submitted).await? {
             DurableReplayOutcome::Missing => {}
             DurableReplayOutcome::ExactMaterialized => {
+                *replay = SendChatReplay::Direct;
                 return Ok(SendChatOutcome::AlreadyPersisted);
             }
             DurableReplayOutcome::ExactUnmaterializedTerminal => {
@@ -415,6 +500,7 @@ impl SendChatApplicationService {
                 });
             }
             DurableReplayOutcome::ExactUnmaterializedLive => {
+                *replay = SendChatReplay::Direct;
                 self.runtime.kick_direct_turn_worker();
                 return Ok(SendChatOutcome::Delivered);
             }
@@ -422,6 +508,7 @@ impl SendChatApplicationService {
         if let Some(outcome) =
             lookup_durable_steering_replay(&self.db, &req, &request_fingerprint).await?
         {
+            *replay = SendChatReplay::Steering;
             return Ok(outcome);
         }
 
@@ -655,6 +742,7 @@ impl SendChatApplicationService {
                     .await
                 {
                     Ok(ScopedDirectTurnReplayLookup::Exact { turn, .. }) => {
+                        *replay = SendChatReplay::Direct;
                         return Ok(match turn.materialization {
                             Materialization::Unmaterialized => {
                                 if matches!(
@@ -695,10 +783,12 @@ impl SendChatApplicationService {
         };
         drop(acceptance_guard);
         match step.outcome {
-            TurnOutcome::Created { .. } | TurnOutcome::ExactReplay { .. } => {
+            TurnOutcome::Created { .. } => self.runtime.kick_direct_turn_worker(),
+            TurnOutcome::ExactReplay { .. } => {
+                *replay = SendChatReplay::Direct;
                 self.runtime.kick_direct_turn_worker();
             }
-            TurnOutcome::TerminalReplay { .. } => {}
+            TurnOutcome::TerminalReplay { .. } => *replay = SendChatReplay::Direct,
             TurnOutcome::Rearmed { .. } | TurnOutcome::RearmReplay { .. } => {
                 return Err(SendChatServiceError::Internal(
                     "direct-turn accept returned a rearm-only outcome".to_string(),
@@ -2000,6 +2090,196 @@ mod tests {
                 .unwrap(),
             DurableReplayOutcome::ExactUnmaterializedLive
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn admission_replay_metadata_preserves_direct_and_steering_without_changing_local_outputs(
+    ) {
+        use super::{SendChatApplicationService, SendChatReplay, SendChatTarget};
+        use phoenix_core::domain::{db_schema::InputOrigin, instance_identity::InstanceId};
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let db = &state.db;
+        for id in ["remote-direct-replay", "remote-steering-replay"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        let service = SendChatApplicationService::new(db.clone(), state.runtime.clone());
+        let direct = SendChatRequest {
+            conversation_id: "remote-direct-replay".into(),
+            origin: InputOrigin::RemoteApi {
+                instance_id: InstanceId::new(),
+            },
+            message_id: uuid::Uuid::new_v4().to_string(),
+            expansion_policy: MessageExpansionPolicy::LiteralText,
+            ..request()
+        };
+        let target = SendChatTarget::ExactTranscript(direct.conversation_id.clone());
+        let (_, outcome, replay) = service
+            .send_to_target_with_replay(target.clone(), direct.clone())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendChatOutcome::Delivered);
+        assert_eq!(replay, SendChatReplay::New);
+        let (_, outcome, replay) = service
+            .send_to_target_with_replay(target.clone(), direct.clone())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendChatOutcome::Delivered);
+        assert_eq!(replay, SendChatReplay::Direct);
+        assert_eq!(
+            service.send_to_target(target, direct).await.unwrap().1,
+            SendChatOutcome::Delivered
+        );
+
+        let steering = SendChatRequest {
+            conversation_id: "remote-steering-replay".into(),
+            ..request()
+        };
+        let steering = SendChatRequest {
+            origin: InputOrigin::RemoteApi {
+                instance_id: InstanceId::new(),
+            },
+            expansion_policy: MessageExpansionPolicy::LiteralText,
+            ..steering
+        };
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: steering.origin.clone(),
+            text: steering.text.clone(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: steering.message_id.clone(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        db.append_steering_entry(
+            &steering.conversation_id,
+            &entry,
+            &super::request_fingerprint(&steering).unwrap(),
+        )
+        .await
+        .unwrap();
+        let target = SendChatTarget::ExactTranscript(steering.conversation_id.clone());
+        let (_, outcome, replay) = service
+            .send_to_target_with_replay(target.clone(), steering.clone())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendChatOutcome::QueuedAsSteering);
+        assert_eq!(replay, SendChatReplay::Steering);
+        db.add_message_with_seq_and_origin(
+            &steering.message_id,
+            &steering.conversation_id,
+            1,
+            &crate::db::MessageContent::user(&steering.text),
+            None,
+            None,
+            &steering.origin,
+        )
+        .await
+        .unwrap();
+        db.remove_steering_entry(&steering.conversation_id, &steering.message_id)
+            .await
+            .unwrap();
+        let (_, outcome, replay) = service
+            .send_to_target_with_replay(target.clone(), steering.clone())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendChatOutcome::AlreadyPersisted);
+        assert_eq!(replay, SendChatReplay::Steering);
+        assert_eq!(
+            service
+                .send_to_target(target.clone(), steering.clone())
+                .await
+                .unwrap()
+                .1,
+            SendChatOutcome::AlreadyPersisted
+        );
+        let changed_instance = SendChatRequest {
+            origin: InputOrigin::RemoteApi {
+                instance_id: InstanceId::new(),
+            },
+            ..steering
+        };
+        assert!(matches!(
+            service
+                .send_to_target_with_replay(target, changed_instance)
+                .await,
+            Err(SendChatServiceError::IdempotencyConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_reserved_opening_uuid_is_rejected_before_origin_can_be_replaced() {
+        use phoenix_core::domain::{
+            db_schema::InputOrigin, instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let successor = historical_manual_opening(&state.db, "remote-reserved-parent", None).await;
+        let reserved_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "DELETE FROM continuation_dispatch_intents WHERE successor_conversation_id = ?1",
+        )
+        .bind(&successor)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, user_agent, opening_authority, created_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, 'user_authorized_instruction', ?5)",
+        )
+        .bind("remote-reserved-parent")
+        .bind(&successor)
+        .bind(&reserved_id)
+        .bind("historical manual handoff")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        let service =
+            super::SendChatApplicationService::new(state.db.clone(), state.runtime.clone());
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("remote-source").unwrap();
+        for origin in [
+            InputOrigin::RemoteApi { instance_id },
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "remote-source-member".into(),
+                source_call: None,
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id: "remote-coordinator-member".into(),
+                source_call: None,
+            },
+        ] {
+            let collision = SendChatRequest {
+                conversation_id: successor.clone(),
+                origin,
+                message_id: reserved_id.clone(),
+                text: "historical manual handoff".into(),
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+                ..request()
+            };
+            assert!(matches!(
+                service.send(collision).await,
+                Err(SendChatServiceError::IdempotencyConflict)
+            ));
+        }
+        assert!(state.db.get_messages(&successor).await.unwrap().is_empty());
+        assert!(state
+            .db
+            .workflow_repository()
+            .load_active_runtime_turn(&ConversationAuthority(successor))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

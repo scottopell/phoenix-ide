@@ -31,18 +31,22 @@ pub struct ResolveGlobalReferenceRequest {
     pub reference: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResolveGlobalReferenceResponse {
-    pub kind: String,
-    pub id: String,
+    pub reference: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
     pub href: Option<String>,
     pub title: Option<String>,
     pub work_scope: ResolvedWorkScope,
+    pub path_owner_instance_id: Option<phoenix_core::domain::instance_identity::InstanceId>,
+    pub related_references:
+        Vec<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub source_call: Option<phoenix_core::domain::db_schema::SourceToolCall>,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum ResolvedWorkScope {
     Missing,
     Unavailable {
@@ -60,16 +64,18 @@ pub enum ResolvedWorkScope {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum WorkScopeUnavailableReason {
     RecordNotFound,
     InvalidRecord,
     ReadFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum ResolvedEnvironmentKind {
     CoordinatorHome,
     AllocatedWorktree,
@@ -77,8 +83,9 @@ pub enum ResolvedEnvironmentKind {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum ServerPathSemantics {
     ServerFilesystem,
 }
@@ -870,6 +877,33 @@ pub(crate) enum CoordinatorWorkScopeTargetError {
     Read,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QualifiedSearchError {
+    #[error("{0}")]
+    Unavailable(&'static str),
+    #[error("{0}")]
+    Failed(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QualifiedReadError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+fn qualified_read_db_error(error: &DbError) -> QualifiedReadError {
+    if matches!(
+        error,
+        DbError::ConversationNotFound(_) | DbError::MessageNotFound(_)
+    ) {
+        QualifiedReadError::Invalid(error.to_string())
+    } else {
+        QualifiedReadError::Failed(error.to_string())
+    }
+}
+
 impl GlobalReadService {
     pub(crate) fn new(
         db: crate::db::Database,
@@ -885,6 +919,10 @@ impl GlobalReadService {
 
     fn from_state(state: &AppState) -> Self {
         Self::new(state.db.clone(), state.message_retriever.clone())
+    }
+
+    pub(crate) fn database(&self) -> &crate::db::Database {
+        &self.db
     }
 
     #[cfg(test)]
@@ -1000,45 +1038,66 @@ impl GlobalReadService {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn search(&self, query: &str) -> Result<String, String> {
-        let hits = self.search_hits(query).await?;
-        self.format_search_hits(&hits).await
-    }
-
-    pub(crate) async fn search_hits(
+    async fn search_hits_result(
         &self,
         query: &str,
-    ) -> Result<Vec<crate::db::RetrievedChunk>, String> {
+    ) -> Result<Vec<crate::db::RetrievedChunk>, QualifiedSearchError> {
         let query = query.trim();
         if query.is_empty() {
-            return Err("query is required".to_string());
+            return Err(QualifiedSearchError::Failed(
+                "query is required".to_string(),
+            ));
         }
         if let Some(message) = self
             .message_retriever
             .reconciliation_status()
             .unavailable_message()
         {
-            return Err(message.to_string());
+            return Err(QualifiedSearchError::Unavailable(message));
         }
-        let hits = self
-            .message_retriever
-            .retrieve(self.search_request(query).await?)
+        self.message_retriever
+            .retrieve(
+                self.search_request(query)
+                    .await
+                    .map_err(QualifiedSearchError::Failed)?,
+            )
             .await
-            .map_err(|e| format!("search failed: {e}"))?;
-        Ok(hits)
+            .map_err(|error| QualifiedSearchError::Failed(format!("search failed: {error}")))
     }
 
-    pub(crate) async fn format_search_hits(
+    #[cfg(test)]
+    pub(crate) async fn search_hits(
         &self,
-        hits: &[crate::db::RetrievedChunk],
-    ) -> Result<String, String> {
-        if hits.is_empty() {
-            Ok("No matching messages found.".to_string())
-        } else {
-            format_global_search_hits(self, hits)
-                .await
-                .map_err(|e| format!("search citation failed: {e}"))
-        }
+        query: &str,
+    ) -> Result<Vec<crate::db::RetrievedChunk>, String> {
+        self.search_hits_result(query)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn qualified_search(
+        &self,
+        query: &str,
+    ) -> Result<Vec<QualifiedSearchHit>, QualifiedSearchError> {
+        let hits = self.search_hits_result(query).await?;
+        qualify_search_hits(self, &hits)
+            .await
+            .map_err(|error| QualifiedSearchError::Failed(error.to_string()))
+    }
+
+    pub(crate) async fn resolve_federation_peer(
+        &self,
+        selector: &phoenix_core::domain::instance_identity::InstanceSelector,
+    ) -> Result<crate::db::FederationPeerConnection, crate::db::FederationPeerSelectionError> {
+        self.db.resolve_federation_peer(selector).await
+    }
+
+    pub(crate) async fn remote_search(
+        &self,
+        peer: &crate::db::FederationPeerConnection,
+        query: &str,
+    ) -> Result<Vec<QualifiedSearchHit>, crate::api::federation::FederationClientError> {
+        crate::api::federation::search_remote_conversations(&self.db, peer, query).await
     }
 
     pub(crate) async fn search_request(&self, query: &str) -> Result<RetrievalRequest, String> {
@@ -1071,6 +1130,253 @@ impl GlobalReadService {
             .map_err(|e| format!("failed to read Coordinator chain: {e}"))
     }
 
+    pub(crate) fn parse_read_target(
+        raw: &str,
+    ) -> Result<phoenix_core::domain::conversation_reference::ConversationReferenceTarget, String>
+    {
+        use phoenix_core::domain::conversation_reference::{
+            ConversationReferenceTarget, MessageId,
+        };
+
+        match parse_canonical_conversation_reference(raw, true)
+            .map_err(|error| error.to_string())?
+        {
+            CanonicalConversationReference::StableProductConversation(product_conversation_id) => {
+                Ok(ConversationReferenceTarget::ProductConversation {
+                    product_conversation_id,
+                })
+            }
+            CanonicalConversationReference::ExactTranscript {
+                transcript_id,
+                message_id: Some(message_id),
+            } => Ok(ConversationReferenceTarget::Message {
+                transcript_id,
+                message_id: MessageId::parse(message_id).map_err(|error| error.to_string())?,
+            }),
+            CanonicalConversationReference::ExactTranscript {
+                transcript_id,
+                message_id: None,
+            } => Ok(ConversationReferenceTarget::Transcript { transcript_id }),
+        }
+    }
+
+    async fn resolve_qualified_read_target(
+        &self,
+        target: &phoenix_core::domain::conversation_reference::ConversationReferenceTarget,
+    ) -> Result<ConversationReadTarget, QualifiedReadError> {
+        use phoenix_core::domain::conversation_reference::ConversationReferenceTarget;
+
+        match target {
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id,
+            } => {
+                let snapshot = self
+                    .db
+                    .read_ordinary_product_conversation_snapshot(
+                        product_conversation_id.as_str(),
+                        None,
+                        None,
+                        1,
+                    )
+                    .await
+                    .map_err(|error| qualified_read_db_error(&error))?;
+                if snapshot.aggregate.product_conversation.id() != product_conversation_id {
+                    return Err(QualifiedReadError::Invalid(
+                        "ProductConversation reference not found".to_string(),
+                    ));
+                }
+                Ok(ConversationReadTarget::StableCurrent {
+                    transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                        snapshot.aggregate.latest_transcript_row_id,
+                    )
+                    .map_err(|error| QualifiedReadError::Failed(error.to_string()))?,
+                })
+            }
+            ConversationReferenceTarget::Transcript { transcript_id } => {
+                Ok(ConversationReadTarget::Exact {
+                    transcript_id: transcript_id.clone(),
+                    message_id: None,
+                })
+            }
+            ConversationReferenceTarget::Message {
+                transcript_id,
+                message_id,
+            } => Ok(ConversationReadTarget::Exact {
+                transcript_id: transcript_id.clone(),
+                message_id: Some(message_id.to_string()),
+            }),
+            ConversationReferenceTarget::Coordinator => Err(QualifiedReadError::Invalid(
+                "Coordinator is not a readable conversation target".to_string(),
+            )),
+        }
+    }
+
+    fn qualified_evidence_references(
+        instance_id: phoenix_core::domain::instance_identity::InstanceId,
+        transcript_id: &phoenix_core::domain::close::TranscriptConversationId,
+        message_ids: Vec<String>,
+    ) -> Result<
+        Vec<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+        QualifiedReadError,
+    > {
+        use phoenix_core::domain::conversation_reference::{
+            ConversationReferenceTarget, MessageId, QualifiedConversationReference,
+        };
+
+        message_ids
+            .into_iter()
+            .map(|message_id| {
+                MessageId::parse(message_id)
+                    .map(|message_id| {
+                        QualifiedConversationReference::new(
+                            instance_id,
+                            ConversationReferenceTarget::Message {
+                                transcript_id: transcript_id.clone(),
+                                message_id,
+                            },
+                        )
+                    })
+                    .map_err(|error| QualifiedReadError::Failed(error.to_string()))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn read_conversation_target(
+        &self,
+        target: &phoenix_core::domain::conversation_reference::ConversationReferenceTarget,
+        cursor: usize,
+    ) -> Result<QualifiedConversationRead, QualifiedReadError> {
+        use phoenix_core::domain::conversation_reference::{
+            ConversationReferenceTarget, QualifiedConversationReference,
+        };
+
+        let requested = target.clone();
+        let read_target = self.resolve_qualified_read_target(target).await?;
+        let (transcript_id, message_id, evidence_label) = match read_target {
+            ConversationReadTarget::StableCurrent { transcript_id } => {
+                (transcript_id, None, "current evidence")
+            }
+            ConversationReadTarget::Exact {
+                transcript_id,
+                message_id,
+            } => (transcript_id, message_id, "exact evidence"),
+        };
+        let conv = self
+            .db
+            .get_conversation(transcript_id.as_str())
+            .await
+            .map_err(|error| qualified_read_db_error(&error))?;
+        if self
+            .db
+            .is_coordinator_conversation(&conv.id)
+            .await
+            .map_err(|error| qualified_read_db_error(&error))?
+        {
+            return Err(QualifiedReadError::Invalid(
+                "Coordinator is not readable through global recall".to_string(),
+            ));
+        }
+        let (content, next_cursor, evidence_message_ids) =
+            if let Some(message_id) = message_id.as_deref() {
+                (
+                    read_conversation_around_message(&self.db, &conv, message_id, false, true)
+                        .await
+                        .map_err(|error| qualified_read_db_error(&error))?,
+                    None,
+                    vec![message_id.to_string()],
+                )
+            } else {
+                read_conversation_page_by_sequence(&self.db, &conv, cursor, evidence_label, false)
+                    .await
+                    .map_err(|error| qualified_read_db_error(&error))?
+            };
+        let (source_navigation, stable_navigation) = self
+            .conversation_read_navigation(&conv, message_id.as_deref())
+            .await
+            .map_err(QualifiedReadError::Failed)?;
+        let instance_id = self
+            .db
+            .instance_id()
+            .await
+            .map_err(|error| QualifiedReadError::Failed(error.to_string()))?;
+        let stable_conversation = ordinary_product_citation(&self.db, &conv)
+            .await
+            .map_err(|error| qualified_read_db_error(&error))?
+            .map(|(product_id, _, _)| {
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(product_id)
+                    .map(|product_conversation_id| {
+                        QualifiedConversationReference::new(
+                            instance_id,
+                            ConversationReferenceTarget::ProductConversation {
+                                product_conversation_id,
+                            },
+                        )
+                    })
+                    .map_err(|error| QualifiedReadError::Failed(error.to_string()))
+            })
+            .transpose()?;
+        let evidence =
+            Self::qualified_evidence_references(instance_id, &transcript_id, evidence_message_ids)?;
+        Ok(QualifiedConversationRead {
+            requested: QualifiedConversationReference::new(instance_id, requested),
+            resolved: QualifiedConversationReference::new(
+                instance_id,
+                match message_id {
+                    Some(message_id) => ConversationReferenceTarget::Message {
+                        transcript_id,
+                        message_id: phoenix_core::domain::conversation_reference::MessageId::parse(
+                            message_id,
+                        )
+                        .map_err(|error| QualifiedReadError::Failed(error.to_string()))?,
+                    },
+                    None => ConversationReferenceTarget::Transcript { transcript_id },
+                },
+            ),
+            content,
+            stable_conversation,
+            source_navigation,
+            evidence,
+            next_cursor,
+            stable_navigation,
+        })
+    }
+
+    async fn conversation_read_navigation(
+        &self,
+        conv: &Conversation,
+        message_id: Option<&str>,
+    ) -> Result<(QualifiedSearchNavigation, Option<QualifiedSearchNavigation>), String> {
+        let message = match message_id {
+            Some(message_id) => Some(
+                self.db
+                    .get_message_by_id(message_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            ),
+            None => None,
+        };
+        let source = QualifiedSearchNavigation::AppLocal {
+            path: conversation_message_href(
+                conv,
+                message
+                    .as_ref()
+                    .map(|message| (message.message_id.as_str(), message.message_type)),
+            ),
+        };
+        let stable = ordinary_product_citation(&self.db, conv)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(
+                |(product_id, slug, _)| QualifiedSearchNavigation::AppLocal {
+                    path: crate::api::product_conversations::product_route(
+                        slug.as_deref(),
+                        &product_id,
+                    ),
+                },
+            );
+        Ok((source, stable))
+    }
+
     pub(crate) async fn read_conversation(
         &self,
         conversation: &str,
@@ -1092,11 +1398,11 @@ impl GlobalReadService {
             .await
             .map_err(|e| format!("transcript not found: {e}"))?;
         if let Some(message_id) = message_id {
-            read_conversation_around_message(&self.db, &conv, message_id)
+            read_conversation_around_message(&self.db, &conv, message_id, true, false)
                 .await
                 .map_err(|e| format!("read failed: {e}"))
         } else {
-            read_conversation_page(&self.db, &conv, cursor, evidence_label)
+            read_conversation_page(&self.db, &conv, cursor, evidence_label, true)
                 .await
                 .map_err(|e| format!("read failed: {e}"))
         }
@@ -1151,7 +1457,16 @@ impl GlobalReadService {
         &self,
         reference: &str,
     ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-        resolve_reference_impl(self, reference).await
+        let mut resolution = resolve_reference_impl(self, reference).await?;
+        if matches!(resolution.work_scope, ResolvedWorkScope::Available { .. }) {
+            resolution.path_owner_instance_id = Some(
+                self.db
+                    .instance_id()
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+            );
+        }
+        Ok(resolution)
     }
 }
 
@@ -1219,6 +1534,136 @@ async fn ordinary_product_citation(
         }))
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct QualifiedConversationRead {
+    pub requested: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub resolved: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub stable_conversation:
+        Option<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub evidence: Vec<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub content: String,
+    pub next_cursor: Option<usize>,
+    pub source_navigation: QualifiedSearchNavigation,
+    pub stable_navigation: Option<QualifiedSearchNavigation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct QualifiedSearchSender {
+    pub stable: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub exact: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub source_call: Option<phoenix_core::domain::db_schema::SourceToolCall>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
+pub enum QualifiedSearchNavigation {
+    AppLocal { path: String },
+    Peer { url: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct QualifiedSearchHit {
+    pub source: phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    pub source_navigation: Option<QualifiedSearchNavigation>,
+    pub stable_conversation:
+        Option<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    pub stable_navigation: Option<QualifiedSearchNavigation>,
+    pub role: String,
+    pub sender: Option<QualifiedSearchSender>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub snippet: String,
+}
+
+pub(crate) async fn qualify_search_hits(
+    service: &GlobalReadService,
+    hits: &[crate::db::RetrievedChunk],
+) -> Result<Vec<QualifiedSearchHit>, DbError> {
+    let instance_id = service.db.instance_id().await?;
+    let mut qualified = Vec::with_capacity(hits.len());
+    let mut sender_kinds = std::collections::HashMap::new();
+    for hit in hits {
+        let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(
+            hit.conversation_id.clone(),
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let message_id =
+            phoenix_core::domain::conversation_reference::MessageId::parse(hit.message_id.clone())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let (source_navigation, stable_conversation, stable_navigation) = match service
+            .db
+            .get_conversation(&hit.conversation_id)
+            .await
+        {
+            Ok(conversation) => {
+                let citation = ordinary_product_citation(&service.db, &conversation).await?;
+                let stable = citation
+                        .as_ref()
+                        .map(|(product_id, _, _)| {
+                            phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                                product_id.clone(),
+                            )
+                            .map(|product_conversation_id| {
+                                phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                                    instance_id,
+                                    phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                                        product_conversation_id,
+                                    },
+                                )
+                            })
+                            .map_err(|error| DbError::Serialization(error.to_string()))
+                        })
+                        .transpose()?;
+                let stable_navigation =
+                    citation.map(
+                        |(product_id, slug, _)| QualifiedSearchNavigation::AppLocal {
+                            path: crate::api::product_conversations::product_route(
+                                slug.as_deref(),
+                                &product_id,
+                            ),
+                        },
+                    );
+                (
+                    Some(QualifiedSearchNavigation::AppLocal {
+                        path: conversation_message_href(
+                            &conversation,
+                            Some((&hit.message_id, hit.message_type)),
+                        ),
+                    }),
+                    stable,
+                    stable_navigation,
+                )
+            }
+            Err(DbError::ConversationNotFound(_)) => (None, None, None),
+            Err(error) => return Err(error),
+        };
+        qualified.push(QualifiedSearchHit {
+            source: phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                instance_id,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                    transcript_id,
+                    message_id,
+                },
+            ),
+            source_navigation,
+            stable_conversation,
+            stable_navigation,
+            role: attributed_role(hit.message_type, &hit.origin).to_string(),
+            sender: qualified_search_sender(
+                &service.db,
+                instance_id,
+                &hit.origin,
+                &mut sender_kinds,
+            )
+            .await?,
+            created_at: hit.created_at,
+            snippet: hit.snippet.clone(),
+        });
+    }
+    Ok(qualified)
+}
+
+#[cfg(test)]
 pub(crate) async fn format_global_search_hits(
     service: &GlobalReadService,
     hits: &[crate::db::RetrievedChunk],
@@ -1297,11 +1742,16 @@ async fn read_conversation_page(
     conv: &Conversation,
     cursor: usize,
     evidence_label: &str,
+    include_navigation: bool,
 ) -> Result<String, DbError> {
     let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
-        let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
-        format!("Conversation @conv:{id}\nconversation link: {route}\n")
+        if include_navigation {
+            let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
+            format!("Conversation @conv:{id}\nconversation link: {route}\n")
+        } else {
+            format!("Conversation @conv:{id}\n")
+        }
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -1321,34 +1771,144 @@ async fn read_conversation_page(
     Ok(header)
 }
 
+async fn read_conversation_page_by_sequence(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    cursor: usize,
+    evidence_label: &str,
+    include_navigation: bool,
+) -> Result<(String, Option<usize>, Vec<String>), DbError> {
+    let after_sequence = i64::try_from(cursor).unwrap_or(i64::MAX);
+    let messages = db
+        .get_messages_after_limited(
+            &conv.id,
+            after_sequence,
+            READ_MESSAGE_BATCH.saturating_add(1),
+        )
+        .await?;
+    let batch_limit = usize::try_from(READ_MESSAGE_BATCH).unwrap_or(0);
+    let mut has_more_rows = messages.len() > batch_limit;
+    let batch: Vec<_> = messages.into_iter().take(batch_limit).collect();
+    let batch_len = batch.len();
+    let mut out = String::new();
+    let mut next_cursor = None;
+    let mut evidence_message_ids = Vec::new();
+    let mut visible_row_did_not_fit = false;
+    let mut sender_kinds = std::collections::HashMap::new();
+    for (index, message) in batch.into_iter().enumerate() {
+        if message_is_hidden(&message) {
+            next_cursor = usize::try_from(message.sequence_id).ok();
+            continue;
+        }
+        let line = render_global_message_line_for_navigation(
+            db,
+            conv,
+            &message,
+            &mut sender_kinds,
+            include_navigation,
+        )
+        .await?;
+        let remaining = READ_PAGE_CHARS.saturating_sub(out.chars().count());
+        if line.chars().count() > remaining {
+            if out.is_empty() {
+                out.extend(line.chars().take(remaining));
+                out.push_str(
+                    "\n[… message truncated; inspect the selected destination for full content]",
+                );
+                next_cursor = usize::try_from(message.sequence_id).ok();
+                evidence_message_ids.push(message.message_id);
+            } else {
+                visible_row_did_not_fit = true;
+            }
+            has_more_rows |= index.saturating_add(1) < batch_len;
+            break;
+        }
+        out.push_str(&line);
+        next_cursor = usize::try_from(message.sequence_id).ok();
+        evidence_message_ids.push(message.message_id);
+    }
+    if out.is_empty() && !has_more_rows {
+        out.push_str("(end of conversation)");
+    }
+    let page = read_conversation_header(db, conv, evidence_label, include_navigation).await? + &out;
+    Ok((
+        page,
+        (has_more_rows || visible_row_did_not_fit)
+            .then_some(next_cursor)
+            .flatten(),
+        evidence_message_ids,
+    ))
+}
+
+async fn read_conversation_header(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    evidence_label: &str,
+    include_navigation: bool,
+) -> Result<String, DbError> {
+    let stable = ordinary_product_citation(db, conv).await?;
+    let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
+        if include_navigation {
+            let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
+            format!("Conversation @conv:{id}\nconversation link: {route}\n")
+        } else {
+            format!("Conversation @conv:{id}\n")
+        }
+    });
+    let title = stable.as_ref().map_or_else(
+        || {
+            conv.title
+                .as_deref()
+                .or(conv.slug.as_deref())
+                .unwrap_or(&conv.id)
+        },
+        |(_, _, title)| title.as_str(),
+    );
+    Ok(format!(
+        "{stable_header}{evidence_label}: @transcript:{} — {}\nupdated: {}\n---\n",
+        conv.id, title, conv.updated_at
+    ))
+}
+
 async fn read_conversation_around_message(
     db: &crate::db::Database,
     conv: &Conversation,
     message_id: &str,
+    include_navigation: bool,
+    bounded: bool,
 ) -> Result<String, DbError> {
     let target = db.get_message_by_id(message_id).await?;
-    if target.conversation_id != conv.id {
+    if target.conversation_id != conv.id || message_is_hidden(&target) {
         return Err(DbError::MessageNotFound(message_id.to_string()));
     }
-    let probe_limit = READ_TARGET_SIDE_MESSAGES.saturating_add(1);
-    let (mut before, mut after) = db
-        .get_messages_around(&conv.id, target.sequence_id, probe_limit, probe_limit)
-        .await?;
-    let side_limit = usize::try_from(READ_TARGET_SIDE_MESSAGES).unwrap_or(0);
-    let has_more_before = before.len() > side_limit;
-    let has_more_after = after.len() > side_limit;
-    if has_more_before {
-        before.remove(0);
-    }
-    after.truncate(side_limit);
-    let mut messages = before;
-    messages.push(target);
-    messages.extend(after);
+    let (messages, has_more_before, has_more_after) = if bounded {
+        (vec![target], false, false)
+    } else {
+        let probe_limit = READ_TARGET_SIDE_MESSAGES.saturating_add(1);
+        let (mut before, mut after) = db
+            .get_messages_around(&conv.id, target.sequence_id, probe_limit, probe_limit)
+            .await?;
+        let side_limit = usize::try_from(READ_TARGET_SIDE_MESSAGES).unwrap_or(0);
+        let has_more_before = before.len() > side_limit;
+        let has_more_after = after.len() > side_limit;
+        if has_more_before {
+            before.remove(0);
+        }
+        after.truncate(side_limit);
+        let mut messages = before;
+        messages.push(target);
+        messages.extend(after);
+        (messages, has_more_before, has_more_after)
+    };
 
     let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
-        let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
-        format!("Conversation @conv:{id}\nconversation link: {route}\n")
+        if include_navigation {
+            let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
+            format!("Conversation @conv:{id}\nconversation link: {route}\n")
+        } else {
+            format!("Conversation @conv:{id}\n")
+        }
     });
     let title = stable.as_ref().map_or_else(
         || {
@@ -1365,12 +1925,26 @@ async fn read_conversation_around_message(
     );
     let mut sender_kinds = std::collections::HashMap::new();
     for message in messages {
-        if !message_is_hidden(&message) {
-            out.push_str(
-                &render_global_message_line_with_cache(db, conv, &message, &mut sender_kinds)
-                    .await?,
-            );
+        if message_is_hidden(&message) {
+            continue;
         }
+        let line = render_global_message_line_for_navigation(
+            db,
+            conv,
+            &message,
+            &mut sender_kinds,
+            include_navigation,
+        )
+        .await?;
+        if bounded && out.chars().count().saturating_add(line.chars().count()) > READ_PAGE_CHARS {
+            if message.message_id == message_id {
+                let remaining = READ_PAGE_CHARS.saturating_sub(out.chars().count());
+                out.extend(line.chars().take(remaining));
+                out.push_str("\n[… target message truncated; inspect the selected destination for full content]");
+            }
+            break;
+        }
+        out.push_str(&line);
     }
     Ok(out)
 }
@@ -1440,14 +2014,19 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
 }
 
 fn conversation_href(conv: &Conversation) -> String {
-    format!("/c/{}?source_transcript={}", conv.id, conv.id)
+    let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(&conv.id)
+        .expect("persisted conversation ids are valid transcript ids");
+    crate::api::product_conversations::exact_transcript_route(&transcript_id)
 }
 
 fn conversation_message_href(conv: &Conversation, message: Option<(&str, MessageType)>) -> String {
     let base = conversation_href(conv);
     match message {
         Some((message_id, message_type)) if message_type_has_rendered_anchor(message_type) => {
-            format!("{base}#message-{message_id}")
+            format!(
+                "{base}{}",
+                crate::api::product_conversations::message_fragment(message_id)
+            )
         }
         _ => base,
     }
@@ -1468,6 +2047,9 @@ pub(crate) fn attributed_role(
     match message_type {
         MessageType::User => match origin {
             InputOrigin::UserApi => "User API",
+            InputOrigin::RemoteApi { .. } => "Remote API",
+            InputOrigin::RemoteConversation { .. } => "Remote conversation",
+            InputOrigin::RemoteCoordinator { .. } => "Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Conversation",
             InputOrigin::SystemGenerated => "System input",
             InputOrigin::SubscriptionEvent { .. } => "Conversation event",
@@ -1480,12 +2062,120 @@ pub(crate) fn attributed_role(
         MessageType::Continuation => "Continuation",
         MessageType::Skill => match origin {
             InputOrigin::UserApi => "Skill · User API",
+            InputOrigin::RemoteApi { .. } => "Skill · Remote API",
+            InputOrigin::RemoteConversation { .. } => "Skill · Remote conversation",
+            InputOrigin::RemoteCoordinator { .. } => "Skill · Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Skill · Conversation",
             InputOrigin::SystemGenerated => "Skill · System input",
             InputOrigin::SubscriptionEvent { .. } => "Skill · Conversation event",
             InputOrigin::UnknownHistorical => "Skill · Unknown input",
         },
     }
+}
+
+fn remote_qualified_sender(
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+) -> Result<Option<QualifiedSearchSender>, DbError> {
+    use phoenix_core::domain::{
+        close::TranscriptConversationId,
+        conversation_reference::{ConversationReferenceTarget, QualifiedConversationReference},
+        db_schema::InputOrigin,
+    };
+
+    let (instance_id, transcript_id, stable_target) = match origin {
+        InputOrigin::RemoteConversation {
+            instance_id,
+            product_conversation_id,
+            transcript_id,
+            ..
+        } => (
+            *instance_id,
+            transcript_id,
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: product_conversation_id.clone(),
+            },
+        ),
+        InputOrigin::RemoteCoordinator {
+            instance_id,
+            transcript_id,
+            ..
+        } => (
+            *instance_id,
+            transcript_id,
+            ConversationReferenceTarget::Coordinator,
+        ),
+        InputOrigin::UnknownHistorical
+        | InputOrigin::UserApi
+        | InputOrigin::RemoteApi { .. }
+        | InputOrigin::InternalConversation { .. }
+        | InputOrigin::SystemGenerated
+        | InputOrigin::SubscriptionEvent { .. } => return Ok(None),
+    };
+    let transcript_id = TranscriptConversationId::parse(transcript_id)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    Ok(Some(QualifiedSearchSender {
+        source_call: origin.source_call().cloned(),
+        stable: QualifiedConversationReference::new(instance_id, stable_target),
+        exact: QualifiedConversationReference::new(
+            instance_id,
+            ConversationReferenceTarget::Transcript { transcript_id },
+        ),
+    }))
+}
+
+async fn qualified_search_sender(
+    db: &crate::db::Database,
+    instance_id: phoenix_core::domain::instance_identity::InstanceId,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+    sender_kinds: &mut std::collections::HashMap<
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        Option<phoenix_core::domain::product_conversation::ProductConversationKind>,
+    >,
+) -> Result<Option<QualifiedSearchSender>, DbError> {
+    use phoenix_core::domain::{
+        conversation_reference::{ConversationReferenceTarget, QualifiedConversationReference},
+        db_schema::InputOrigin,
+        product_conversation::ProductConversationKind,
+    };
+
+    if let Some(sender) = remote_qualified_sender(origin)? {
+        return Ok(Some(sender));
+    }
+    let InputOrigin::InternalConversation {
+        product_conversation_id,
+        transcript_id,
+        ..
+    } = origin
+    else {
+        return Ok(None);
+    };
+    let kind = if let Some(kind) = sender_kinds.get(product_conversation_id) {
+        *kind
+    } else {
+        let kind = db
+            .product_conversation_kind(product_conversation_id)
+            .await?;
+        sender_kinds.insert(product_conversation_id.clone(), kind);
+        kind
+    };
+    let stable_target = match kind {
+        Some(ProductConversationKind::Coordinator) => ConversationReferenceTarget::Coordinator,
+        Some(ProductConversationKind::Ordinary) | None => {
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: product_conversation_id.clone(),
+            }
+        }
+    };
+    let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(transcript_id)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    Ok(Some(QualifiedSearchSender {
+        source_call: origin.source_call().cloned(),
+        stable: QualifiedConversationReference::new(instance_id, stable_target),
+        exact: QualifiedConversationReference::new(
+            instance_id,
+            ConversationReferenceTarget::Transcript { transcript_id },
+        ),
+    }))
 }
 
 pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputOrigin) -> String {
@@ -1497,6 +2187,13 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
             ..
         } => format!(
             " from recorded product conversation {product_conversation_id} via @transcript:{transcript_id}"
+        ),
+        InputOrigin::RemoteApi { instance_id } => format!(" from authenticated instance {instance_id} (API channel)"),
+        InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!(
+            " from recorded remote product conversation {product_conversation_id}, authenticated instance {instance_id}, transcript {transcript_id}"
+        ),
+        InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!(
+            " from remote Coordinator {product_conversation_id}, authenticated instance {instance_id}, transcript {transcript_id}"
         ),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
@@ -1548,6 +2245,9 @@ async fn attributed_sender_with_cache(
                 ),
             })
         }
+        InputOrigin::RemoteApi { .. }
+        | InputOrigin::RemoteConversation { .. }
+        | InputOrigin::RemoteCoordinator { .. } => Ok(attributed_sender(origin)),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
         | InputOrigin::SystemGenerated
@@ -1574,18 +2274,40 @@ async fn render_global_message_line_with_cache(
         Option<phoenix_core::domain::product_conversation::ProductConversationKind>,
     >,
 ) -> Result<String, DbError> {
+    render_global_message_line_for_navigation(db, conv, message, sender_kinds, true).await
+}
+
+async fn render_global_message_line_for_navigation(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    message: &crate::db::Message,
+    sender_kinds: &mut std::collections::HashMap<
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        Option<phoenix_core::domain::product_conversation::ProductConversationKind>,
+    >,
+    include_navigation: bool,
+) -> Result<String, DbError> {
     let role = attributed_role(message.message_type, &message.origin);
-    let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
     let sender = attributed_sender_with_cache(db, &message.origin, sender_kinds).await?;
-    Ok(format!(
-        "[{}{} · {} · {}]({}) @transcript:{}#message-{}\n{}\n\n",
+    let label = format!(
+        "{}{} · {} · {}",
         role,
         sender,
         message.created_at.format("%Y-%m-%d %H:%M"),
         message.message_id,
-        href,
-        conv.id,
-        message.message_id,
+    );
+    let heading = if include_navigation {
+        let href =
+            conversation_message_href(conv, Some((&message.message_id, message.message_type)));
+        format!(
+            "[{label}]({href}) @transcript:{}#message-{}",
+            conv.id, message.message_id
+        )
+    } else {
+        format!("[{label}]")
+    };
+    Ok(format!(
+        "{heading}\n{}\n\n",
         render_full_message_text(message).trim()
     ))
 }
@@ -1850,7 +2572,7 @@ fn decode_route_value(value: &str) -> Result<String, AppError> {
 
 enum WebReferenceResolution {
     Product(String),
-    Exact(ResolveGlobalReferenceResponse),
+    Exact(Box<ResolveGlobalReferenceResponse>),
     NotWeb,
 }
 
@@ -2008,17 +2730,103 @@ async fn resolve_web_reference(
             if let Some(message_id) = fragment.and_then(message_id_fragment) {
                 return resolve_message(service, conv, &decode_route_value(message_id)?, global)
                     .await
+                    .map(Box::new)
                     .map(WebReferenceResolution::Exact);
             }
-            return Ok(WebReferenceResolution::Exact(
-                resolve_conversation(service, conv, global).await,
-            ));
+            return Ok(WebReferenceResolution::Exact(Box::new(
+                resolve_conversation(service, conv, global).await?,
+            )));
         }
     }
     Ok(canonical_product.map_or(
         WebReferenceResolution::NotWeb,
         WebReferenceResolution::Product,
     ))
+}
+
+async fn qualified_reference(
+    service: &GlobalReadService,
+    target: phoenix_core::domain::conversation_reference::ConversationReferenceTarget,
+) -> Result<phoenix_core::domain::conversation_reference::QualifiedConversationReference, AppError>
+{
+    let instance_id = service
+        .db
+        .instance_id()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(
+        phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+            instance_id,
+            target,
+        ),
+    )
+}
+
+async fn qualified_transcript_references<'a>(
+    service: &GlobalReadService,
+    transcript_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<
+    Vec<phoenix_core::domain::conversation_reference::QualifiedConversationReference>,
+    AppError,
+> {
+    use phoenix_core::domain::conversation_reference::ConversationReferenceTarget;
+
+    let instance_id = service
+        .db
+        .instance_id()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    transcript_ids
+        .into_iter()
+        .map(|id| {
+            phoenix_core::domain::close::TranscriptConversationId::parse(id)
+                .map(|transcript_id| {
+                    phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                        instance_id,
+                        ConversationReferenceTarget::Transcript { transcript_id },
+                    )
+                })
+                .map_err(|error| AppError::Internal(error.to_string()))
+        })
+        .collect()
+}
+
+async fn resolved_product_reference(
+    service: &GlobalReadService,
+    typed_id: phoenix_core::domain::product_conversation::ProductConversationId,
+    aggregate: crate::db::ProductConversationAggregate,
+    current: ResolvedCurrentMember,
+    related_references: Vec<
+        phoenix_core::domain::conversation_reference::QualifiedConversationReference,
+    >,
+) -> Result<ResolveGlobalReferenceResponse, AppError> {
+    Ok(ResolveGlobalReferenceResponse {
+        reference: qualified_reference(
+            service,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: typed_id.clone(),
+            },
+        )
+        .await?,
+        href: Some(super::product_conversations::canonical_route(&aggregate)),
+        title: aggregate
+            .root
+            .conversation
+            .title
+            .clone()
+            .or(aggregate.root.conversation.slug.clone()),
+        work_scope: current.work_scope,
+        path_owner_instance_id: None,
+        source_call: None,
+        related_references,
+        summary: format!(
+            "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
+            aggregate.root.conversation.id,
+            current.id,
+            current.state.variant_name(),
+            current.updated_at.to_rfc3339()
+        ),
+    })
 }
 
 async fn resolve_reference_impl(
@@ -2028,7 +2836,7 @@ async fn resolve_reference_impl(
     let reference = raw.trim();
     let canonical_product = match resolve_web_reference(service, reference).await? {
         WebReferenceResolution::Product(id) => Some(id),
-        WebReferenceResolution::Exact(resolved) => return Ok(resolved),
+        WebReferenceResolution::Exact(resolved) => return Ok(*resolved),
         WebReferenceResolution::NotWeb => None,
     };
     if let Some(rest) = reference
@@ -2068,24 +2876,19 @@ async fn resolve_reference_impl(
                 .forget();
         }
         let current = resolve_current_member_and_work_scope(service, id).await?;
-        return Ok(ResolveGlobalReferenceResponse {
-            kind: "product_conversation".to_string(),
-            id: typed_id.to_string(),
-            href: Some(super::product_conversations::canonical_route(&aggregate)),
-            title: aggregate.root.conversation.title.clone().or(aggregate
-                .root
-                .conversation
-                .slug
-                .clone()),
-            work_scope: current.work_scope,
-            summary: format!(
-                "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
-                aggregate.root.conversation.id,
-                current.id,
-                current.state.variant_name(),
-                current.updated_at.to_rfc3339()
-            ),
-        });
+        let related_references = qualified_transcript_references(
+            service,
+            [aggregate.root.conversation.id.as_str(), current.id.as_str()],
+        )
+        .await?;
+        return resolved_product_reference(
+            service,
+            typed_id,
+            aggregate,
+            current,
+            related_references,
+        )
+        .await;
     }
     if let Some(rest) = reference.strip_prefix("@transcript:") {
         let (id, fragment) = split_fragment(rest);
@@ -2105,7 +2908,7 @@ async fn resolve_reference_impl(
         if let Some(message_id) = message_id {
             return resolve_message(service, conv, message_id, false).await;
         }
-        return Ok(resolve_conversation(service, conv, false).await);
+        return resolve_conversation(service, conv, false).await;
     }
     if let Some(rest) = reference.strip_prefix("@work:") {
         let (id, _) = split_fragment(rest);
@@ -2216,25 +3019,74 @@ async fn resolve_conversation(
     service: &GlobalReadService,
     conv: Conversation,
     global_href: bool,
-) -> ResolveGlobalReferenceResponse {
+) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let href = Some(if global_href {
         format!("/global/{}", conv.id)
     } else {
         conversation_href(&conv)
     });
     let title = conv.title.clone().or(conv.slug.clone());
-    ResolveGlobalReferenceResponse {
-        kind: "conversation".to_string(),
-        id: conv.id.clone(),
+    Ok(ResolveGlobalReferenceResponse {
+        reference: qualified_reference(
+            service,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Transcript {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    conv.id.clone(),
+                )
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+            },
+        )
+        .await?,
         href,
         title: title.clone(),
         work_scope: resolve_work_scope(service, &conv).await,
+        path_owner_instance_id: None,
+        source_call: None,
+        related_references: Vec::new(),
         summary: format!(
             "conversation {} updated {} state {}",
             title.unwrap_or(conv.id),
             conv.updated_at,
             conv.state.variant_name()
         ),
+    })
+}
+
+fn map_message_reference_db_error(error: DbError) -> AppError {
+    match error {
+        DbError::MessageNotFound(_) => {
+            AppError::NotFound("message reference target not found".to_string())
+        }
+        other @ (DbError::Sqlx(_)
+        | DbError::ConversationNotFound(_)
+        | DbError::MessageConflict(_)
+        | DbError::TranscriptSnapshotChanged
+        | DbError::SlugExists(_)
+        | DbError::ConversationAlreadyExists(_)
+        | DbError::CoordinatorWorkScope(_)
+        | DbError::Serialization(_)
+        | DbError::SubAgentLifecycleConflict(_)
+        | DbError::ContinuationPrecondition(_)
+        | DbError::CloseFoundationConflict(_)
+        | DbError::CloseAdmissionFenced(_)
+        | DbError::ProductConversationUnavailable(_)
+        | DbError::SteeringQueueFull
+        | DbError::ProductCreationClaimLost
+        | DbError::CloseFoundationPrecondition(_)
+        | DbError::CloseFoundationStaleLatest { .. }
+        | DbError::CloseFoundationRepairRequired(_)
+        | DbError::CloseFoundationNotFound(_)
+        | DbError::ForkProposalConflict(_)
+        | DbError::DirectTurnConflict(_)
+        | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        | DbError::DormantGitRepositoryCatchupStaleOperation
+        | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+        | DbError::DormantGitRepositoryReadinessCatchupInProgress
+        | DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
+            AppError::Internal(other.to_string())
+        }
     }
 }
 
@@ -2248,7 +3100,7 @@ async fn resolve_message(
         .db
         .get_message_by_id(message_id)
         .await
-        .map_err(|_| AppError::NotFound("message reference target not found".to_string()))?;
+        .map_err(map_message_reference_db_error)?;
     if message.conversation_id != conv.id {
         return Err(AppError::NotFound(
             "message reference target not found".to_string(),
@@ -2265,15 +3117,58 @@ async fn resolve_message(
         conversation_message_href(&conv, Some((&message.message_id, message.message_type)))
     });
     let title = conv.title.clone().or(conv.slug.clone());
+    let related_references = match &message.origin {
+        phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            ..
+        } => {
+            let mut references =
+                qualified_transcript_references(service, [transcript_id.as_str()]).await?;
+            match stable_reference_target(service, product_conversation_id.clone()).await {
+                Ok(target) => references.push(qualified_reference(service, target).await?),
+                Err(AppError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+            references
+        }
+        phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { .. }
+        | phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { .. } => {
+            let sender = remote_qualified_sender(&message.origin)
+                .map_err(|error| AppError::Internal(format!("sender reference failed: {error}")))?
+                .ok_or_else(|| AppError::Internal("remote sender reference missing".to_string()))?;
+            vec![sender.exact, sender.stable]
+        }
+        phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
+        | phoenix_core::domain::db_schema::InputOrigin::UserApi
+        | phoenix_core::domain::db_schema::InputOrigin::RemoteApi { .. }
+        | phoenix_core::domain::db_schema::InputOrigin::SystemGenerated
+        | phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { .. } => Vec::new(),
+    };
     let sender = attributed_sender_with_stable(&service.db, &message.origin)
         .await
         .map_err(|error| AppError::Internal(format!("sender attribution failed: {error}")))?;
     Ok(ResolveGlobalReferenceResponse {
-        kind: "message".to_string(),
-        id: message.message_id.clone(),
+        reference: qualified_reference(
+            service,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    conv.id.clone(),
+                )
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+                message_id: phoenix_core::domain::conversation_reference::MessageId::parse(
+                    message.message_id.clone(),
+                )
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+            },
+        )
+        .await?,
         href,
         title,
         work_scope: resolve_work_scope(service, &conv).await,
+        path_owner_instance_id: None,
+        source_call: message.origin.source_call().cloned(),
+        related_references,
         summary: format!(
             "{}{} message {} in @transcript:{} at {}: {}",
             attributed_role(message.message_type, &message.origin),
@@ -2284,6 +3179,32 @@ async fn resolve_message(
             trim_chars(render_full_message_text(&message).trim(), 240)
         ),
     })
+}
+
+async fn stable_reference_target(
+    service: &GlobalReadService,
+    product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+) -> Result<phoenix_core::domain::conversation_reference::ConversationReferenceTarget, AppError> {
+    match service
+        .db
+        .product_conversation_kind(&product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        Some(
+            phoenix_core::domain::product_conversation::ProductConversationKind::Coordinator,
+        ) => Ok(
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Coordinator,
+        ),
+        Some(phoenix_core::domain::product_conversation::ProductConversationKind::Ordinary) => Ok(
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                product_conversation_id,
+            },
+        ),
+        None => Err(AppError::NotFound(
+            "product conversation reference target not found".to_string(),
+        )),
+    }
 }
 
 async fn resolve_chain(
@@ -2328,15 +3249,23 @@ async fn resolve_chain(
         || format!("@transcript:{root_id}"),
         |member| format!("@transcript:{member}"),
     );
+    let related_references =
+        qualified_transcript_references(service, members.iter().map(String::as_str)).await?;
     Ok(ResolveGlobalReferenceResponse {
-        kind: "chain".to_string(),
-        id: root_id.to_string(),
+        reference: qualified_reference(
+            service,
+            stable_reference_target(service, root.product_conversation_id.clone()).await?,
+        )
+        .await?,
         href: Some(crate::api::product_conversations::product_route(
             root.slug.as_deref(),
             root.product_conversation_id.as_str(),
         )),
         title: root.title.clone().or(root.slug.clone()),
         work_scope,
+        path_owner_instance_id: None,
+        source_call: None,
+        related_references,
         summary: format!(
             "legacy chain rooted at @transcript:{root_id} with {} member(s); current/latest {}; ordered members: {}",
             members.len(),
@@ -2363,6 +3292,11 @@ async fn resolve_work(
     if chain_root.as_deref().is_some_and(|root_id| root_id != id) {
         return Err(AppError::NotFound(
             "work reference target not found".to_string(),
+        ));
+    }
+    if root.parent_conversation_id.is_some() {
+        return Err(AppError::BadRequest(
+            "sub-agent work references are not stable ProductConversation targets".to_string(),
         ));
     }
     let member_ids = service
@@ -2395,12 +3329,21 @@ async fn resolve_work(
         .or(current.title.clone())
         .or(current.slug.clone())
         .unwrap_or_else(|| current.id.clone());
+    let related_references =
+        qualified_transcript_references(service, members.iter().map(|member| member.id.as_str()))
+            .await?;
     Ok(ResolveGlobalReferenceResponse {
-        kind: "work".to_string(),
-        id: id.to_string(),
+        reference: qualified_reference(
+            service,
+            stable_reference_target(service, root.product_conversation_id.clone()).await?,
+        )
+        .await?,
         href: Some(href),
         title: Some(title),
         work_scope: resolve_work_scope(service, current).await,
+        path_owner_instance_id: None,
+        source_call: None,
+        related_references,
         summary: format!(
             "work reference identity; root @transcript:{}; current/latest @transcript:{}; current state {}; state updated {}; conversation updated {}; archived {}",
             root.id,
@@ -3244,16 +4187,151 @@ mod previous_transcripts_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_global_search_hits, message_id_fragment, render_full_message_text,
-        render_global_message_line, resolve_conversation_read_target, resolve_reference_impl,
-        resolve_work_scope, split_fragment, ConversationReadTarget,
-        CoordinatorWorkScopeTargetError, GlobalMessageTarget, GlobalMessageTargetError,
-        GlobalReadService, ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
-        WorkScopeUnavailableReason,
+        format_global_search_hits, message_id_fragment, qualify_search_hits,
+        read_conversation_page_by_sequence, render_full_message_text, render_global_message_line,
+        resolve_conversation_read_target, resolve_reference_impl, resolve_work_scope,
+        split_fragment, ConversationReadTarget, CoordinatorWorkScopeTargetError,
+        GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService, QualifiedSearchHit,
+        ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
+        WorkScopeUnavailableReason, READ_MESSAGE_BATCH,
     };
     use std::sync::Arc;
 
+    use phoenix_core::domain::db_schema::MessageContent;
+
     use crate::db::MessageRetriever;
+
+    #[tokio::test]
+    async fn remote_page_cursor_does_not_skip_a_visible_row_that_did_not_fit() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("page-fit", "page-fit", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let first = db
+            .add_message(
+                "page-fit-first",
+                &conv.id,
+                &MessageContent::user("a".repeat(6_900)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.add_message(
+            "page-fit-second",
+            &conv.id,
+            &MessageContent::user("second visible marker"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (_, cursor, evidence) =
+            read_conversation_page_by_sequence(&db, &conv, 0, "evidence", false)
+                .await
+                .unwrap();
+        assert_eq!(cursor, usize::try_from(first.sequence_id).ok());
+        assert_eq!(evidence, vec![first.message_id]);
+        let (next, _, _) =
+            read_conversation_page_by_sequence(&db, &conv, cursor.unwrap(), "evidence", false)
+                .await
+                .unwrap();
+        assert!(next.contains("second visible marker"));
+    }
+
+    #[tokio::test]
+    async fn all_hidden_read_batches_terminate_with_monotonic_cursor() {
+        use phoenix_core::domain::db_schema::MessageContent;
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("all-hidden", "all-hidden", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..=READ_MESSAGE_BATCH * 2 {
+            db.add_message(
+                &format!("all-hidden-{index}"),
+                &conv.id,
+                &MessageContent::user("invisible"),
+                Some(&serde_json::json!({"hidden": true})),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mut cursor = 0;
+        for page in 0..3 {
+            let (content, next, evidence) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_conversation_page_by_sequence(&db, &conv, cursor, "evidence", false),
+            )
+            .await
+            .expect("hidden pages must terminate")
+            .unwrap();
+            assert!(evidence.is_empty());
+            assert!(!content.contains("invisible"));
+            if page < 2 {
+                let next = next.expect("remaining scanned rows require a cursor");
+                assert!(next > cursor);
+                cursor = next;
+            } else {
+                assert!(next.is_none());
+                assert!(content.contains("(end of conversation)"));
+            }
+        }
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::render_message_page(&db, &conv, 0),
+        )
+        .await
+        .expect("legacy hidden scan must terminate")
+        .unwrap();
+        assert_eq!(body, "(end of conversation)");
+    }
+
+    #[tokio::test]
+    async fn remote_page_cursor_advances_past_hidden_only_batch() {
+        use phoenix_core::domain::db_schema::MessageContent;
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("hidden-page", "hidden-page", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..64 {
+            db.add_message(
+                &format!("hidden-page-{index}"),
+                &conv.id,
+                &MessageContent::user("hidden"),
+                Some(&serde_json::json!({"hidden": true})),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.add_message(
+            "visible-after-hidden",
+            &conv.id,
+            &MessageContent::user("visible after hidden marker"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (_, cursor, evidence) =
+            read_conversation_page_by_sequence(&db, &conv, 0, "evidence", false)
+                .await
+                .unwrap();
+        assert!(cursor.is_some());
+        assert!(evidence.is_empty());
+        let (next, _, _) =
+            read_conversation_page_by_sequence(&db, &conv, cursor.unwrap(), "evidence", false)
+                .await
+                .unwrap();
+        assert!(next.contains("visible after hidden marker"));
+    }
 
     #[tokio::test]
     async fn compatibility_resolver_rejects_blank_product_and_bare_references_without_panicking() {
@@ -3362,6 +4440,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_senders_ignore_local_kind_cache_and_database_even_on_id_collision() {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget,
+            db_schema::InputOrigin,
+            instance_identity::InstanceId,
+            product_conversation::{ProductConversationId, ProductConversationKind},
+        };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let local_instance = db.instance_id().await.unwrap();
+        let remote_instance = InstanceId::new();
+        let product = ProductConversationId::parse("colliding-product").unwrap();
+        db.pool().close().await;
+        for coordinator in [false, true] {
+            let origin = if coordinator {
+                InputOrigin::RemoteCoordinator {
+                    instance_id: remote_instance,
+                    product_conversation_id: product.clone(),
+                    transcript_id: "colliding-transcript".into(),
+                    source_call: None,
+                }
+            } else {
+                InputOrigin::RemoteConversation {
+                    instance_id: remote_instance,
+                    product_conversation_id: product.clone(),
+                    transcript_id: "colliding-transcript".into(),
+                    source_call: None,
+                }
+            };
+            let origin = origin
+                .with_source_call_columns(
+                    Some("same-source-message".into()),
+                    Some("remote-exact-tool".into()),
+                )
+                .unwrap();
+            let mut cache = std::collections::HashMap::from([(
+                product.clone(),
+                Some(if coordinator {
+                    ProductConversationKind::Ordinary
+                } else {
+                    ProductConversationKind::Coordinator
+                }),
+            )]);
+            let before = cache.clone();
+            let text = super::attributed_sender_with_cache(&db, &origin, &mut cache)
+                .await
+                .unwrap();
+            assert!(text.contains(&remote_instance.to_string()));
+            assert_eq!(text.contains("remote Coordinator"), coordinator);
+            assert!(!text.contains("@transcript:"));
+            let sender = super::qualified_search_sender(&db, local_instance, &origin, &mut cache)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sender.stable.instance_id, remote_instance);
+            assert_eq!(sender.exact.instance_id, remote_instance);
+            assert_eq!(sender.source_call, origin.source_call().cloned());
+            assert_eq!(
+                sender.source_call.as_ref().unwrap().tool_use_id,
+                "remote-exact-tool"
+            );
+            assert_eq!(
+                sender.stable.target,
+                if coordinator {
+                    ConversationReferenceTarget::Coordinator
+                } else {
+                    ConversationReferenceTarget::ProductConversation {
+                        product_conversation_id: product.clone(),
+                    }
+                }
+            );
+            assert_eq!(cache, before);
+            cache.clear();
+            assert!(
+                super::qualified_search_sender(&db, local_instance, &origin, &mut cache)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(cache.is_empty());
+        }
+        let api = InputOrigin::RemoteApi {
+            instance_id: remote_instance,
+        };
+        let mut cache = std::collections::HashMap::new();
+        assert!(
+            super::qualified_search_sender(&db, local_instance, &api, &mut cache)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(super::attributed_sender_with_cache(&db, &api, &mut cache)
+            .await
+            .unwrap()
+            .contains("API channel"));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn malformed_remote_transcript_is_not_reinterpreted_as_local() {
+        use phoenix_core::domain::{
+            db_schema::InputOrigin, instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        for coordinator in [false, true] {
+            let instance_id = InstanceId::new();
+            let product_conversation_id = ProductConversationId::parse("product").unwrap();
+            let origin = if coordinator {
+                InputOrigin::RemoteCoordinator {
+                    instance_id,
+                    product_conversation_id,
+                    transcript_id: " ".into(),
+                    source_call: None,
+                }
+            } else {
+                InputOrigin::RemoteConversation {
+                    instance_id,
+                    product_conversation_id,
+                    transcript_id: " ".into(),
+                    source_call: None,
+                }
+            };
+            assert!(super::remote_qualified_sender(&origin).is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn remote_message_search_and_resolve_keep_recipient_evidence_receiver_owned() {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget,
+            db_schema::{InputOrigin, MessageContent},
+            instance_identity::InstanceId,
+        };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let recipient = db
+            .create_conversation("recipient", "recipient", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let local_coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let local_instance = db.instance_id().await.unwrap();
+        let remote_instance = InstanceId::new();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        for (n, origin) in [
+            InputOrigin::RemoteConversation {
+                instance_id: remote_instance,
+                product_conversation_id: local_coordinator.product_conversation_id.clone(),
+                transcript_id: local_coordinator.id.clone(),
+                source_call: None,
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id: remote_instance,
+                product_conversation_id: recipient.product_conversation_id.clone(),
+                transcript_id: recipient.id.clone(),
+                source_call: None,
+            },
+            InputOrigin::RemoteApi {
+                instance_id: remote_instance,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("remote-message-{n}");
+            db.add_message_with_seq_and_origin(
+                &id,
+                &recipient.id,
+                i64::try_from(n + 1).unwrap(),
+                &MessageContent::user("remote attribution evidence"),
+                None,
+                None,
+                &origin,
+            )
+            .await
+            .unwrap();
+            let resolved = super::resolve_message(&service, recipient.clone(), &id, false)
+                .await
+                .unwrap();
+            assert_eq!(resolved.reference.instance_id, local_instance);
+            assert!(
+                matches!(&resolved.reference.target, ConversationReferenceTarget::Message { transcript_id, message_id } if transcript_id.as_str() == recipient.id && message_id.as_str() == id)
+            );
+            let expected = super::remote_qualified_sender(&origin).unwrap();
+            if let Some(sender) = expected {
+                assert_eq!(
+                    resolved.related_references,
+                    vec![sender.exact, sender.stable]
+                );
+            } else {
+                assert!(resolved.related_references.is_empty());
+            }
+        }
+        let hits = service
+            .message_retriever
+            .retrieve(crate::db::RetrievalRequest::natural_language(
+                "remote attribution evidence",
+                crate::db::RetrievalScope::Global,
+                10,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        let qualified = super::qualify_search_hits(&service, &hits).await.unwrap();
+        for (hit, search) in hits.iter().zip(qualified) {
+            assert_eq!(search.source.instance_id, local_instance);
+            assert!(
+                matches!(search.stable_conversation.as_ref().map(|r| &r.target), Some(ConversationReferenceTarget::ProductConversation { product_conversation_id }) if product_conversation_id == &recipient.product_conversation_id)
+            );
+            let expected = super::remote_qualified_sender(&hit.origin).unwrap();
+            match (search.sender, expected) {
+                (Some(actual), Some(expected)) => {
+                    assert_eq!(actual.stable, expected.stable);
+                    assert_eq!(actual.exact, expected.exact);
+                }
+                (None, None) => assert!(matches!(hit.origin, InputOrigin::RemoteApi { .. })),
+                _ => panic!("remote sender attribution missing"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sender_attribution_propagates_classification_failures() {
         use phoenix_core::domain::db_schema::InputOrigin;
 
@@ -3400,11 +4701,201 @@ mod tests {
             .unwrap();
         db.pool().close().await;
 
-        let error = super::read_conversation_page(&db, &conv, 0, "evidence")
+        let error = super::read_conversation_page(&db, &conv, 0, "evidence", true)
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("closed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn message_resolution_keeps_exact_sender_after_delete_and_on_remote_collision() {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget,
+            db_schema::{InputOrigin, MessageContent, SourceToolCall},
+            instance_identity::InstanceId,
+        };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let reader = db
+            .create_conversation("resolve-reader", "resolve-reader", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let sender = db
+            .create_conversation("resolve-sender", "resolve-sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let remote_instance = InstanceId::new();
+        let call = SourceToolCall {
+            message_id: "recorded-source-message".into(),
+            tool_use_id: "recorded-source-tool".into(),
+        };
+        let origins = [
+            InputOrigin::InternalConversation {
+                product_conversation_id: sender.product_conversation_id.clone(),
+                transcript_id: sender.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            },
+            InputOrigin::RemoteConversation {
+                instance_id: remote_instance,
+                product_conversation_id: reader.product_conversation_id.clone(),
+                transcript_id: reader.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id: remote_instance,
+                product_conversation_id: reader.product_conversation_id.clone(),
+                transcript_id: reader.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            },
+        ];
+        for (index, origin) in origins.iter().enumerate() {
+            db.add_message_with_seq_and_origin(
+                &format!("resolve-input-{index}"),
+                &reader.id,
+                i64::try_from(index + 1).unwrap(),
+                &MessageContent::user("retained input"),
+                None,
+                None,
+                origin,
+            )
+            .await
+            .unwrap();
+        }
+        db.delete_conversation(&sender.id).await.unwrap();
+        assert_eq!(
+            db.product_conversation_kind(&sender.product_conversation_id)
+                .await
+                .unwrap(),
+            None
+        );
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let local_instance = db.instance_id().await.unwrap();
+        for (index, _) in origins.iter().enumerate() {
+            let result = super::resolve_message(
+                &service,
+                reader.clone(),
+                &format!("resolve-input-{index}"),
+                false,
+            )
+            .await
+            .unwrap();
+            let (instance, transcript) = if index == 0 {
+                (local_instance, &sender.id)
+            } else {
+                (remote_instance, &reader.id)
+            };
+            assert_eq!(result.source_call, Some(call.clone()));
+            assert!(result.related_references.iter().any(|reference| reference.instance_id == instance && matches!(&reference.target, ConversationReferenceTarget::Transcript { transcript_id } if transcript_id.as_str() == transcript)));
+            assert_eq!(
+                result.related_references.len(),
+                if index == 0 { 1 } else { 2 }
+            );
+            let wire = serde_json::to_value(&result).unwrap();
+            let decoded: super::ResolveGlobalReferenceResponse =
+                serde_json::from_value(wire).unwrap();
+            assert_eq!(decoded.source_call, Some(call.clone()));
+        }
+        db.pool().close().await;
+        assert!(matches!(
+            super::stable_reference_target(&service, sender.product_conversation_id).await,
+            Err(crate::api::handlers::AppError::Internal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_resolution_surfaces_sender_classification_database_errors() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let reader = db
+            .create_conversation(
+                "classification-error",
+                "classification-error",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let origin = InputOrigin::InternalConversation {
+            product_conversation_id: reader.product_conversation_id.clone(),
+            transcript_id: reader.id.clone(),
+            source_call: None,
+        };
+        db.add_message_with_seq_and_origin(
+            "classification-error-input",
+            &reader.id,
+            1,
+            &MessageContent::user("retained message"),
+            None,
+            None,
+            &origin,
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE product_conversations RENAME COLUMN kind TO unavailable_kind")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let error = super::resolve_message(&service, reader, "classification-error-input", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::api::handlers::AppError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn local_search_sender_preserves_recorded_call_for_ordinary_and_coordinator() {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let ordinary = db
+            .create_conversation("call-sender", "call-sender", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let instance = db.instance_id().await.unwrap();
+        for (index, conv) in [ordinary, coordinator].iter().enumerate() {
+            let call = SourceToolCall {
+                message_id: "same-message".into(),
+                tool_use_id: format!("exact-tool-{index}"),
+            };
+            let origin = InputOrigin::InternalConversation {
+                product_conversation_id: conv.product_conversation_id.clone(),
+                transcript_id: conv.id.clone(),
+                source_call: Some(Box::new(call.clone())),
+            };
+            let message_id = format!("recorded-call-{index}");
+            db.add_message_with_seq_and_origin(
+                &message_id,
+                &conv.id,
+                1,
+                &MessageContent::user("recorded sender"),
+                None,
+                None,
+                &origin,
+            )
+            .await
+            .unwrap();
+            let recorded = db.get_message_by_id(&message_id).await.unwrap();
+            assert_eq!(recorded.origin.source_call(), Some(&call));
+            let sender = super::qualified_search_sender(
+                &db,
+                instance,
+                &recorded.origin,
+                &mut std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(sender.source_call, Some(call.clone()));
+            let wire = serde_json::to_value(&sender).unwrap();
+            assert_eq!(wire["source_call"]["tool_use_id"], call.tool_use_id);
+            let decoded: super::QualifiedSearchSender = serde_json::from_value(wire).unwrap();
+            assert_eq!(decoded.source_call, Some(call));
+        }
     }
 
     #[tokio::test]
@@ -3492,6 +4983,39 @@ mod tests {
         assert!(!rendered.contains(&format!("@conv:{}", coordinator.product_conversation_id)));
     }
 
+    fn assert_qualified_search_sender(
+        search: &QualifiedSearchHit,
+        hit: &crate::db::RetrievedChunk,
+    ) {
+        use phoenix_core::domain::{
+            conversation_reference::ConversationReferenceTarget, db_schema::InputOrigin,
+        };
+
+        let InputOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id,
+            ..
+        } = &hit.origin
+        else {
+            assert!(search.sender.is_none());
+            return;
+        };
+        let sender = search.sender.as_ref().unwrap();
+        assert_eq!(sender.stable.instance_id, search.source.instance_id);
+        assert!(matches!(
+            &sender.stable.target,
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: qualified_product_id,
+            } if qualified_product_id == product_conversation_id
+        ));
+        assert!(matches!(
+            &sender.exact.target,
+            ConversationReferenceTarget::Transcript {
+                transcript_id: qualified_transcript_id,
+            } if qualified_transcript_id.as_str() == transcript_id
+        ));
+    }
+
     #[tokio::test]
     async fn search_hit_uses_same_recorded_attribution_as_full_read() {
         use phoenix_core::domain::db_schema::{InputOrigin, MessageContent, MessageType};
@@ -3543,40 +5067,45 @@ mod tests {
         for (origin, expected) in cases {
             message.origin = origin.clone();
             hit.origin = origin;
-            let search = format_global_search_hits(&service, &[hit.clone()])
+            let search = qualify_search_hits(&service, std::slice::from_ref(&hit))
                 .await
-                .unwrap();
+                .unwrap()
+                .remove(0);
             let full = render_global_message_line(&service.db, &conv, &message)
                 .await
                 .unwrap();
-            assert!(search.contains(&format!("@conv:{}", conv.product_conversation_id)));
-            let product_route = crate::api::product_conversations::product_route(
-                None,
-                conv.product_conversation_id.as_str(),
-            );
-            assert!(
-                search.contains(&format!("{product_route}?source_transcript={}", conv.id)),
-                "{search}"
-            );
-            assert!(search.contains(&format!(
-                "@transcript:{}#message-{}",
-                hit.conversation_id, hit.message_id
-            )));
-            assert!(search.contains(expected), "{search}");
+            assert!(matches!(
+                search.stable_conversation.as_ref().map(|reference| &reference.target),
+                Some(phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation { product_conversation_id })
+                    if product_conversation_id == &conv.product_conversation_id
+            ));
+            assert!(matches!(
+                &search.source.target,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message { transcript_id, message_id }
+                    if transcript_id.as_str() == hit.conversation_id && message_id.as_str() == hit.message_id
+            ));
+            assert!(matches!(
+                search.source_navigation.as_ref(),
+                Some(super::QualifiedSearchNavigation::AppLocal { path })
+                    if path.contains(&format!("source_transcript={}", conv.id))
+            ));
+            assert_qualified_search_sender(&search, &hit);
             assert!(full.contains(expected), "{full}");
             if expected != "User API" {
-                assert!(!search.contains("User API"), "{search}");
+                assert_ne!(search.role, "User API");
             }
             message.message_type = MessageType::Skill;
             hit.message_type = MessageType::Skill;
-            let search = format_global_search_hits(&service, &[hit.clone()])
+            let search = qualify_search_hits(&service, std::slice::from_ref(&hit))
                 .await
-                .unwrap();
+                .unwrap()
+                .remove(0);
             let full = render_global_message_line(&service.db, &conv, &message)
                 .await
                 .unwrap();
             let skill_label = format!("Skill · {expected}");
-            assert!(search.contains(&skill_label), "{search}");
+            assert!(search.role.starts_with("Skill · "));
+            assert_qualified_search_sender(&search, &hit);
             assert!(full.contains(&skill_label), "{full}");
             message.message_type = MessageType::User;
             hit.message_type = MessageType::User;
@@ -3656,11 +5185,44 @@ mod tests {
             message_count: 1,
         };
 
-        let output = format_global_search_hits(&service, &[hit]).await.unwrap();
+        let output = format_global_search_hits(&service, std::slice::from_ref(&hit))
+            .await
+            .unwrap();
 
         assert!(output.contains("Effective Rename"), "{output}");
         assert!(!output.contains("Aggregate Title"), "{output}");
         assert!(!output.contains("Successor Local Title"), "{output}");
+
+        let qualified = qualify_search_hits(&service, std::slice::from_ref(&hit))
+            .await
+            .unwrap();
+        assert_eq!(qualified.len(), 1);
+        assert_eq!(
+            qualified[0].source.instance_id,
+            service.db.instance_id().await.unwrap()
+        );
+        assert_eq!(
+            qualified[0].source.target,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    hit.conversation_id.clone(),
+                )
+                .unwrap(),
+                message_id: phoenix_core::domain::conversation_reference::MessageId::parse(
+                    hit.message_id.clone(),
+                )
+                .unwrap(),
+            }
+        );
+        assert!(matches!(
+            qualified[0]
+                .stable_conversation
+                .as_ref()
+                .map(|reference| &reference.target),
+            Some(
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation { .. }
+            )
+        ));
     }
 
     #[test]
@@ -3850,14 +5412,24 @@ mod tests {
         (service, product_id, root_scope_id, current_scope_id)
     }
 
-    #[tokio::test]
-    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
-        let (service, product_id, root_scope_id, current_scope_id) =
-            continued_scope_fixture().await;
+    async fn assert_stable_reference_resolution(
+        service: &GlobalReadService,
+        product_id: &phoenix_core::domain::product_conversation::ProductConversationId,
+        current_scope_id: phoenix_core::work_scope::WorkScopeId,
+    ) {
         let stable = service
             .resolve_reference(&format!("@conv:{product_id}"))
             .await
             .unwrap();
+        assert_eq!(
+            stable.reference,
+            phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                service.db.instance_id().await.unwrap(),
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                    product_conversation_id: product_id.clone(),
+                },
+            )
+        );
         assert_eq!(
             stable.work_scope,
             ResolvedWorkScope::Available {
@@ -3879,21 +5451,33 @@ mod tests {
             "/product-conversations/root-scope".to_string(),
         ] {
             let canonical = service.resolve_reference(&reference).await.unwrap();
-            assert_eq!(canonical.id, stable.id);
+            assert_eq!(canonical.reference, stable.reference);
             assert_eq!(canonical.work_scope, stable.work_scope);
             assert_eq!(canonical.href.as_deref(), Some("/c/root-scope-2"));
         }
-        let stable_json = serde_json::to_value(&stable).unwrap();
-        assert_eq!(stable_json["work_scope"]["status"], "available");
-        assert_eq!(
-            stable_json["work_scope"]["path_semantics"],
-            "server_filesystem"
-        );
+    }
 
+    async fn assert_exact_reference_resolution(
+        service: &GlobalReadService,
+        product_id: &phoenix_core::domain::product_conversation::ProductConversationId,
+        root_scope_id: phoenix_core::work_scope::WorkScopeId,
+    ) {
         let exact = service
             .resolve_reference("@transcript:root-scope")
             .await
             .unwrap();
+        assert_eq!(
+            exact.reference,
+            phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+                service.db.instance_id().await.unwrap(),
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Transcript {
+                    transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                        "root-scope",
+                    )
+                    .unwrap(),
+                },
+            )
+        );
         assert_eq!(
             exact.href.as_deref(),
             Some("/c/root-scope?source_transcript=root-scope")
@@ -3902,7 +5486,7 @@ mod tests {
             .resolve_reference(exact.href.as_deref().unwrap())
             .await
             .unwrap();
-        assert_eq!(pinned.id, exact.id);
+        assert_eq!(pinned.reference, exact.reference);
         assert_eq!(pinned.work_scope, exact.work_scope);
         for path in [
             format!("/c/{product_id}"),
@@ -3914,7 +5498,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(pinned.id, exact.id);
+            assert_eq!(pinned.reference, exact.reference);
             assert_eq!(pinned.work_scope, exact.work_scope);
             for suffix in [
                 "source_transcript=",
@@ -3927,7 +5511,6 @@ mod tests {
                     .is_err());
             }
         }
-
         assert_eq!(
             exact.work_scope,
             ResolvedWorkScope::Available {
@@ -3940,6 +5523,14 @@ mod tests {
                 path_semantics: ServerPathSemantics::ServerFilesystem,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reference_resolution_reports_exact_selected_scope_and_server_paths() {
+        let (service, product_id, root_scope_id, current_scope_id) =
+            continued_scope_fixture().await;
+        assert_stable_reference_resolution(&service, &product_id, current_scope_id).await;
+        assert_exact_reference_resolution(&service, &product_id, root_scope_id).await;
     }
 
     #[tokio::test]
@@ -3977,7 +5568,19 @@ mod tests {
                 .resolve_reference(&format!("{prefix}{product}#message-root%3Amessage"))
                 .await
                 .unwrap();
-            assert_eq!(found.id, root_message.message_id);
+            assert_eq!(
+                found.reference.target,
+                phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Message {
+                    transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                        "root-scope",
+                    )
+                    .unwrap(),
+                    message_id: phoenix_core::domain::conversation_reference::MessageId::parse(
+                        root_message.message_id.clone(),
+                    )
+                    .unwrap(),
+                }
+            );
             assert!(found.href.unwrap().contains("source_transcript=root-scope"));
             assert!(service
                 .resolve_reference(&format!("{prefix}{product}#message-foreign-message"))
@@ -4069,7 +5672,15 @@ mod tests {
             .resolve_reference("@transcript:race-root")
             .await
             .unwrap();
-        assert_eq!(historical.id, "race-root");
+        assert_eq!(
+            historical.reference.target,
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Transcript {
+                transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                    "race-root",
+                )
+                .unwrap(),
+            }
+        );
         assert_eq!(
             historical.work_scope,
             ResolvedWorkScope::Available {
@@ -4133,6 +5744,88 @@ mod tests {
                 reason: WorkScopeUnavailableReason::RecordNotFound,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_chain_and_work_aliases_preserve_stable_product_identity() {
+        let (service, product_id, _, _) = continued_scope_fixture().await;
+        let expected = phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+            service.db.instance_id().await.unwrap(),
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::ProductConversation {
+                product_conversation_id: product_id,
+            },
+        );
+
+        for reference in ["@chain:root-scope", "@work:root-scope"] {
+            let resolved = service.resolve_reference(reference).await.unwrap();
+            assert_eq!(resolved.reference, expected, "{reference}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_work_alias_rejects_subagent_identity_inheritance() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let parent = db
+            .create_conversation("parent", "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation("child", "child", "/tmp", false, Some(&parent.id), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            child.product_conversation_id,
+            parent.product_conversation_id
+        );
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+
+        let error = service
+            .resolve_reference(&format!("@work:{}", child.id))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::api::handlers::AppError::BadRequest(message) if message.contains("sub-agent work references"))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_coordinator_aliases_preserve_coordinator_identity() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue\"}', state_kind = 'context_exhausted' WHERE id = ?1")
+            .bind(&coordinator.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let continuation = match db.continue_conversation(&coordinator.id).await.unwrap() {
+            crate::db::ContinueOutcome::Created(continuation) => continuation,
+            crate::db::ContinueOutcome::AlreadyContinued(conversation) => {
+                panic!(
+                    "unexpected existing Coordinator continuation: {}",
+                    conversation.id
+                )
+            }
+            crate::db::ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("Coordinator fixture state was {state_variant}, not context_exhausted")
+            }
+        };
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let expected = phoenix_core::domain::conversation_reference::QualifiedConversationReference::new(
+            db.instance_id().await.unwrap(),
+            phoenix_core::domain::conversation_reference::ConversationReferenceTarget::Coordinator,
+        );
+
+        for reference in [
+            format!("@chain:{}", coordinator.id),
+            format!("@work:{}", coordinator.id),
+        ] {
+            let resolved = service.resolve_reference(&reference).await.unwrap();
+            assert_eq!(resolved.reference, expected, "{reference}");
+            assert!(resolved.summary.contains(&continuation.id));
+        }
     }
 
     #[tokio::test]

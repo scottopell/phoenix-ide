@@ -10,6 +10,22 @@ export function inputOriginPresentation(origin: InputOrigin | undefined): {
   switch (origin.kind) {
     case 'user_api':
       return { label: 'User · API', title: 'User · API', className: 'user' };
+    case 'remote_api':
+      return {
+        label: `API · instance ${origin.instance_id}`,
+        title: `API-channel input from authenticated instance ${origin.instance_id}`,
+        className: 'meta',
+      };
+    case 'remote_conversation':
+    case 'remote_coordinator': {
+      const sender = origin.kind === 'remote_coordinator' ? 'remote Coordinator' : 'remote conversation';
+      const label = `From ${sender} ID ${origin.product_conversation_id} · instance ${origin.instance_id} · transcript ID ${origin.transcript_id}`;
+      return {
+        label,
+        title: `${label} · ${origin.source_call ? `source message ${origin.source_call.message_id} · tool ${origin.source_call.tool_use_id}` : 'source call unavailable (not recorded)'}`,
+        className: 'meta',
+      };
+    }
     case 'internal_conversation':
       return {
         label: 'From conversation',

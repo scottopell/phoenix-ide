@@ -566,9 +566,37 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
         .route(
+            "/api/federation/subscriptions/notifications",
+            get(super::federation::subscriptions::owner_notifications),
+        )
+        .route(
+            "/api/federation/subscriptions",
+            get(super::federation::subscriptions::owner_list),
+        )
+        .route(
+            "/api/federation/subscriptions/create",
+            post(super::federation::subscriptions::owner_create).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/subscriptions/sync-once",
+            post(super::federation::subscriptions::owner_sync).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/subscriptions/unsubscribe",
+            post(super::federation::subscriptions::owner_unsubscribe).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
             "/api/federation/enrollments",
             post(super::federation::issue_enrollment),
         )
+        .merge(super::federation::owner::router())
+        .merge(super::federation::peer_notes::router())
         .route(
             "/api/federation/peers/import",
             post(super::federation::import_peer_connection),
@@ -644,8 +672,63 @@ pub fn create_router(state: AppState) -> Router {
     // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
     let peer_router = Router::new()
         .route(
+            "/api/federation/peer/identity",
+            get(super::federation::peer_identity),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/create",
+            post(super::federation::subscriptions::create).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/replay",
+            post(super::federation::subscriptions::replay).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/authorize",
+            post(super::federation::subscriptions::authorize).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/unsubscribe",
+            post(super::federation::subscriptions::unsubscribe).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/send-conversation-message",
+            post(super::federation::send_conversation_message).layer(DefaultBodyLimit::max(
+                super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/send-authored-conversation-message",
+            post(super::federation::send_authored_conversation_message).layer(
+                DefaultBodyLimit::max(super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES),
+            ),
+        )
+        .route(
             "/api/federation/peer/query-database",
             post(super::federation::query_database)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/search-conversations",
+            post(super::federation::search_conversations)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/read-conversation",
+            post(super::federation::read_conversation)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/resolve-reference",
+            post(super::federation::resolve_reference)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
         .layer(middleware::from_fn_with_state(
@@ -19349,17 +19432,21 @@ mod lifecycle_handler_tests {
             .unwrap(),
         );
         let local = state.db.instance_id().await.unwrap();
+        let receiver = InstanceId::new();
+        let offline = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let offline_port = offline.local_addr().unwrap().port();
+        drop(offline);
         let body = serde_json::json!({
-            "peer_display_name": "peer",
-            "base_url": "https://peer.example",
             "enrollment": {
-                "receiver_instance_id": InstanceId::new(),
+                "receiver_instance_id": receiver,
+                "receiver_display_name": "peer",
+                "receiver_base_url": format!("https://localhost:{offline_port}"),
                 "caller_instance_id": local,
                 "token": format!("phx_peer_{}", "a".repeat(43)),
                 "tls_trust": { "kind": "platform_roots" },
             }
         });
-        let app = create_router(state);
+        let app = create_router(state.clone());
 
         let unauthorized = app
             .clone()
@@ -19387,7 +19474,71 @@ mod lifecycle_handler_tests {
             )
             .await
             .unwrap();
-        assert_eq!(imported.status(), StatusCode::OK);
+        assert_eq!(imported.status(), StatusCode::BAD_GATEWAY);
+        assert!(state
+            .db
+            .federation_peer_connection(receiver)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_import_rejects_legacy_top_level_destination_fields_before_side_effects() {
+        use phoenix_core::domain::instance_identity::InstanceId;
+
+        let mut state = hard_delete_cascade_tests::make_test_state().await;
+        state.password = Some(
+            phoenix_core::domain::instance_identity::OwnerPassword::parse(
+                "owner-password".to_string(),
+            )
+            .unwrap(),
+        );
+        let local = state.db.instance_id().await.unwrap();
+        let receiver = InstanceId::new();
+        let destination_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        destination_listener.set_nonblocking(true).unwrap();
+        let destination_port = destination_listener.local_addr().unwrap().port();
+        let body = serde_json::json!({
+            "enrollment": {
+                "receiver_instance_id": receiver,
+                "receiver_display_name": "peer",
+                "receiver_base_url": format!("https://localhost:{destination_port}"),
+                "caller_instance_id": local,
+                "token": format!("phx_peer_{}", "a".repeat(43)),
+                "tls_trust": { "kind": "platform_roots" },
+            },
+            "peer_display_name": "legacy-peer",
+            "base_url": "https://conflicting.example",
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_router(state.clone()).oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/federation/peers/import")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer owner-password")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("unknown fields must be rejected before contacting the destination")
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(matches!(
+            destination_listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(state
+            .db
+            .federation_peer_connection(receiver)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -19425,10 +19576,10 @@ mod lifecycle_handler_tests {
                 base64::engine::general_purpose::STANDARD.encode(certificate.der())
             );
             let body = serde_json::json!({
-                "peer_display_name": "peer",
-                "base_url": "https://peer.example",
                 "enrollment": {
                     "receiver_instance_id": peer,
+                    "receiver_display_name": "peer",
+                    "receiver_base_url": "https://peer.example",
                     "caller_instance_id": local,
                     "token": format!("phx_peer_{}", "a".repeat(43)),
                     "tls_trust": {
@@ -19692,7 +19843,9 @@ mod lifecycle_handler_tests {
         let caller = phoenix_core::domain::instance_identity::InstanceId::new();
         let request_body = serde_json::json!({
             "caller_instance_id": caller,
-            "caller_display_name": "peer"
+            "caller_display_name": "peer",
+            "receiver_display_name": "receiver",
+            "receiver_base_url": "https://receiver.example"
         })
         .to_string();
 
@@ -19712,6 +19865,11 @@ mod lifecycle_handler_tests {
         let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
         let first_bundle: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
         let first_token = first_bundle["token"].as_str().unwrap();
+        assert_eq!(first_bundle["receiver_display_name"], "receiver");
+        assert_eq!(
+            first_bundle["receiver_base_url"],
+            "https://receiver.example/"
+        );
 
         let forbidden = create_router(state.clone())
             .oneshot(

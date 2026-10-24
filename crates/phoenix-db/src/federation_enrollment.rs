@@ -8,6 +8,7 @@ use crate::{Database, DbError, DbResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FederationEnrollment {
+    pub enrollment_id: uuid::Uuid,
     pub caller_instance_id: InstanceId,
     pub caller_display_name: String,
     pub revoked_at_us: Option<i64>,
@@ -16,6 +17,10 @@ pub struct FederationEnrollment {
 fn decode_enrollment(row: &sqlx::sqlite::SqliteRow) -> DbResult<FederationEnrollment> {
     let caller_id: String = row.try_get("caller_instance_id")?;
     Ok(FederationEnrollment {
+        enrollment_id: row
+            .try_get::<String, _>("id")?
+            .parse()
+            .map_err(|error: uuid::Error| DbError::Serialization(error.to_string()))?,
         caller_instance_id: InstanceId::from_str(&caller_id)
             .map_err(|error| DbError::Serialization(error.to_string()))?,
         caller_display_name: row.try_get("caller_display_name")?,
@@ -114,7 +119,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let row = sqlx::query(
-            "SELECT caller_instance_id, caller_display_name, revoked_at_us
+            "SELECT id, caller_instance_id, caller_display_name, revoked_at_us
              FROM federation_enrollments
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
         )
@@ -192,7 +197,7 @@ impl Database {
         credential_verifier: &FederationCredentialVerifier,
     ) -> DbResult<Option<FederationEnrollment>> {
         let row = sqlx::query(
-            "SELECT caller_instance_id, caller_display_name, revoked_at_us
+            "SELECT id, caller_instance_id, caller_display_name, revoked_at_us
              FROM federation_enrollments
              WHERE credential_verifier = ?1 AND revoked_at_us IS NULL",
         )
@@ -211,7 +216,7 @@ impl Database {
         caller_instance_id: InstanceId,
     ) -> DbResult<Option<FederationEnrollment>> {
         let row = sqlx::query(
-            "SELECT caller_instance_id, caller_display_name, revoked_at_us
+            "SELECT id, caller_instance_id, caller_display_name, revoked_at_us
              FROM federation_enrollments
              WHERE caller_instance_id = ?1 AND revoked_at_us IS NULL",
         )

@@ -143,6 +143,7 @@ pub struct CloseRun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
+#[derive(schemars::JsonSchema)]
 pub struct TranscriptConversationId(String);
 
 impl TranscriptConversationId {

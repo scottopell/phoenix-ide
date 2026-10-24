@@ -1,3 +1,8 @@
+pub(crate) mod openapi;
+
+pub(crate) mod owner;
+pub(crate) mod peer_notes;
+pub(crate) mod subscriptions;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -6,62 +11,1007 @@ use axum::{
 };
 use base64::Engine;
 use futures::StreamExt as _;
-use phoenix_core::domain::instance_identity::{
-    FederationCredentialVerifier, InstanceId, PeerTlsTrust,
+use phoenix_core::domain::{
+    conversation_reference::ConversationReferenceTarget,
+    instance_identity::{
+        FederationCredentialVerifier, InstanceId, PeerBaseUrl, PeerDisplayName, PeerTlsTrust,
+    },
 };
+
+use super::auth::{OwnerAuthenticated, PeerAuthenticated};
+use super::AppState;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
-use super::auth::{OwnerAuthenticated, PeerAuthenticated};
-use super::AppState;
+fn deserialize_peer_display_name<'de, D>(deserializer: D) -> Result<PeerDisplayName, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    PeerDisplayName::parse(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_peer_display_name<S>(value: &PeerDisplayName, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.as_str())
+}
+
+fn deserialize_peer_base_url<'de, D>(deserializer: D) -> Result<PeerBaseUrl, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+fn serialize_peer_base_url<S>(value: &PeerBaseUrl, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_str(value)
+}
 
 static QUERY_ADMISSION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
 const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
+const MAX_PEER_IDENTITY_RESPONSE_BYTES: usize = 4 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IssueEnrollmentRequest {
     pub caller_instance_id: InstanceId,
     pub caller_display_name: String,
+    #[serde(deserialize_with = "deserialize_peer_display_name")]
+    #[schemars(with = "String")]
+    pub receiver_display_name: PeerDisplayName,
+    #[serde(deserialize_with = "deserialize_peer_base_url")]
+    #[schemars(with = "String")]
+    pub receiver_base_url: PeerBaseUrl,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EnrollmentTransferBundle {
     pub receiver_instance_id: InstanceId,
+    #[serde(
+        deserialize_with = "deserialize_peer_display_name",
+        serialize_with = "serialize_peer_display_name"
+    )]
+    #[schemars(with = "String")]
+    pub receiver_display_name: PeerDisplayName,
+    #[serde(
+        deserialize_with = "deserialize_peer_base_url",
+        serialize_with = "serialize_peer_base_url"
+    )]
+    #[schemars(with = "String")]
+    pub receiver_base_url: PeerBaseUrl,
     pub caller_instance_id: InstanceId,
     pub token: String,
     pub tls_trust: PeerTlsTrust,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct RevokeEnrollmentResponse {
     pub revoked: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImportPeerConnectionRequest {
-    pub peer_display_name: String,
-    pub base_url: String,
     pub enrollment: EnrollmentTransferBundle,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct ImportPeerConnectionResponse {
     pub peer_instance_id: InstanceId,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeerIdentityResponse {
+    pub receiver_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+}
+
+pub(crate) const MAX_REMOTE_MESSAGE_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_REMOTE_SEND_REQUEST_BODY_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteMessageText(String);
+
+impl RemoteMessageText {
+    pub fn parse(text: String) -> Result<Self, &'static str> {
+        if text.trim().is_empty() || text.len() > MAX_REMOTE_MESSAGE_BYTES {
+            return Err("message must be nonblank and at most 32768 UTF-8 bytes");
+        }
+        Ok(Self(text))
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteMessageText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub enum RemoteSendTarget {
+    ProductConversation {
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+    },
+    Transcript {
+        transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+    },
+    Coordinator {},
+}
+
+impl RemoteSendTarget {
+    fn locators_are_bounded(&self) -> bool {
+        match self {
+            Self::ProductConversation {
+                product_conversation_id,
+            } => product_conversation_id.as_str().len() <= 1024,
+            Self::Transcript { transcript_id } => transcript_id.as_str().len() <= 1024,
+            Self::Coordinator {} => true,
+        }
+    }
+
+    pub(crate) fn parse_tool_target(raw: &str) -> Result<Self, String> {
+        if raw == "@coordinator" {
+            return Ok(Self::Coordinator {});
+        }
+        match crate::api::global_read::GlobalReadService::parse_read_target(raw)? {
+            ConversationReferenceTarget::ProductConversation {
+                product_conversation_id,
+            } => Ok(Self::ProductConversation {
+                product_conversation_id,
+            }),
+            ConversationReferenceTarget::Transcript { transcript_id } => {
+                Ok(Self::Transcript { transcript_id })
+            }
+            ConversationReferenceTarget::Coordinator => Ok(Self::Coordinator {}),
+            ConversationReferenceTarget::Message { .. } => {
+                Err("send targets cannot be message citations".into())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteSourceToolCall {
+    message_id: RemoteSenderLocator,
+    tool_use_id: RemoteSenderLocator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+#[derive(schemars::JsonSchema)]
+struct RemoteSenderLocator(String);
+
+impl RemoteSenderLocator {
+    fn parse(value: String) -> Result<Self, &'static str> {
+        if value.trim().is_empty() || value.len() > 1024 {
+            return Err("sender locator must be nonblank and at most 1024 bytes");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteSenderLocator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub enum RemoteSenderAttestation {
+    Conversation {
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+        transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+        source_call: RemoteSourceToolCall,
+    },
+    Coordinator {
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+        transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+        source_call: RemoteSourceToolCall,
+    },
+}
+
+impl RemoteSenderAttestation {
+    pub(crate) fn from_conversation(
+        source: crate::db::Conversation,
+        call: phoenix_core::domain::db_schema::SourceToolCall,
+    ) -> Result<Self, String> {
+        let call = RemoteSourceToolCall {
+            message_id: RemoteSenderLocator::parse(call.message_id).map_err(str::to_string)?,
+            tool_use_id: RemoteSenderLocator::parse(call.tool_use_id).map_err(str::to_string)?,
+        };
+        let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(source.id)
+            .map_err(|error| error.to_string())?;
+        let product_conversation_id = source.product_conversation_id;
+        Ok(
+            if source.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+                Self::Coordinator {
+                    product_conversation_id,
+                    transcript_id,
+                    source_call: call,
+                }
+            } else {
+                Self::Conversation {
+                    product_conversation_id,
+                    transcript_id,
+                    source_call: call,
+                }
+            },
+        )
+    }
+
+    fn into_origin(self, instance_id: InstanceId) -> phoenix_core::domain::db_schema::InputOrigin {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let convert_call = |call: RemoteSourceToolCall| {
+            Box::new(SourceToolCall {
+                message_id: call.message_id.0,
+                tool_use_id: call.tool_use_id.0,
+            })
+        };
+        match self {
+            Self::Conversation {
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            } => InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id,
+                transcript_id: transcript_id.to_string(),
+                source_call: Some(convert_call(source_call)),
+            },
+            Self::Coordinator {
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            } => InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id: transcript_id.to_string(),
+                source_call: Some(convert_call(source_call)),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteSendMessageRequest {
+    pub destination_instance_id: InstanceId,
+    pub target: RemoteSendTarget,
+    pub message_id: uuid::Uuid,
+    pub message: RemoteMessageText,
+}
+
+impl RemoteSendMessageRequest {
+    fn locators_are_bounded(&self) -> bool {
+        self.target.locators_are_bounded()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteAuthoredSendMessageRequest {
+    pub destination_instance_id: InstanceId,
+    pub target: RemoteSendTarget,
+    pub message_id: uuid::Uuid,
+    pub message: RemoteMessageText,
+    pub sender: RemoteSenderAttestation,
+}
+
+impl RemoteAuthoredSendMessageRequest {
+    pub(crate) fn from_message(
+        request: RemoteSendMessageRequest,
+        sender: RemoteSenderAttestation,
+    ) -> Self {
+        let RemoteSendMessageRequest {
+            destination_instance_id,
+            target,
+            message_id,
+            message,
+        } = request;
+        Self {
+            destination_instance_id,
+            target,
+            message_id,
+            message,
+            sender,
+        }
+    }
+
+    fn into_parts(self) -> (RemoteSendMessageRequest, RemoteSenderAttestation) {
+        let Self {
+            destination_instance_id,
+            target,
+            message_id,
+            message,
+            sender,
+        } = self;
+        (
+            RemoteSendMessageRequest {
+                destination_instance_id,
+                target,
+                message_id,
+                message,
+            },
+            sender,
+        )
+    }
+
+    fn locators_are_bounded(&self) -> bool {
+        let sender_bounded = match &self.sender {
+            RemoteSenderAttestation::Conversation {
+                product_conversation_id,
+                transcript_id,
+                ..
+            }
+            | RemoteSenderAttestation::Coordinator {
+                product_conversation_id,
+                transcript_id,
+                ..
+            } => {
+                product_conversation_id.as_str().len() <= 1024
+                    && transcript_id.as_str().len() <= 1024
+            }
+        };
+        self.target.locators_are_bounded() && sender_bounded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
+pub enum RemoteSendDisposition {
+    Delivered,
+    Queued,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteStableDestination {
+    pub instance_id: InstanceId,
+    pub product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub enum RemoteSendNavigation {
+    AppLocal { path: String },
+    Peer { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteMessageAcceptance {
+    pub accepting_transcript: phoenix_core::domain::close::TranscriptConversationId,
+    pub stable_destination: RemoteStableDestination,
+    pub stable_navigation: RemoteSendNavigation,
+    pub accepting_transcript_navigation: RemoteSendNavigation,
+    pub accepting_message_navigation: RemoteSendNavigation,
+    pub disposition: RemoteSendDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
+pub enum RemoteSendRejectionCode {
+    DestinationMismatch,
+    InvalidTarget,
+    SenderNotAllowed,
+    TargetNotFound,
+    IdempotencyConflict,
+    TargetUnavailable,
+    AdmissionRejected,
+    Busy,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub enum RemoteSendReceipt {
+    Accepted {
+        acceptance: RemoteMessageAcceptance,
+    },
+    Duplicate {
+        acceptance: RemoteMessageAcceptance,
+    },
+    Rejected {
+        code: RemoteSendRejectionCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
+pub struct RemoteSendMessageResponse {
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub target: RemoteSendTarget,
+    pub message_id: uuid::Uuid,
+    pub receipt: RemoteSendReceipt,
+}
+
+pub async fn send_conversation_message(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteSendMessageRequest>,
+) -> Response {
+    let origin = phoenix_core::domain::db_schema::InputOrigin::RemoteApi {
+        instance_id: authenticated.caller_instance_id,
+    };
+    receive_remote_message(authenticated, state, request, origin).await
+}
+
+pub async fn send_authored_conversation_message(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteAuthoredSendMessageRequest>,
+) -> Response {
+    if !request.locators_are_bounded() {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let (request, sender) = request.into_parts();
+    let origin = sender.into_origin(authenticated.caller_instance_id);
+    receive_remote_message(authenticated, state, request, origin).await
+}
+
+async fn receive_remote_message(
+    authenticated: PeerAuthenticated,
+    state: AppState,
+    request: RemoteSendMessageRequest,
+    origin: phoenix_core::domain::db_schema::InputOrigin,
+) -> Response {
+    if !request.locators_are_bounded() {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let destination = match state.db.instance_id().await {
+        Ok(destination) => destination,
+        Err(error) => {
+            tracing::error!(%error, "failed to load federation send destination");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let receipt = if request.destination_instance_id == destination {
+        admit_remote_message(&state, &request, origin).await
+    } else {
+        RemoteSendReceipt::Rejected {
+            code: RemoteSendRejectionCode::DestinationMismatch,
+            message: "destination instance identity mismatch".into(),
+        }
+    };
+    Json(RemoteSendMessageResponse {
+        destination_instance_id: destination,
+        caller_instance_id: authenticated.caller_instance_id,
+        target: request.target,
+        message_id: request.message_id,
+        receipt,
+    })
+    .into_response()
+}
+
+async fn resolve_remote_send_target(
+    state: &AppState,
+    target: &RemoteSendTarget,
+    origin: &phoenix_core::domain::db_schema::InputOrigin,
+) -> Result<crate::send_chat_service::SendChatTarget, RemoteSendReceipt> {
+    use crate::send_chat_service::SendChatTarget;
+    let rejected = |code, message: String| RemoteSendReceipt::Rejected {
+        code,
+        message: bounded_send_diagnostic(&message),
+    };
+    let exact = match target {
+        RemoteSendTarget::Coordinator {} => Some(
+            state
+                .db
+                .coordinator_conversation_id()
+                .await
+                .map_err(|error| rejected(RemoteSendRejectionCode::Internal, error.to_string()))?
+                .ok_or_else(|| {
+                    rejected(
+                        RemoteSendRejectionCode::TargetNotFound,
+                        "Coordinator unavailable".into(),
+                    )
+                })?,
+        ),
+        RemoteSendTarget::Transcript { transcript_id } => Some(transcript_id.to_string()),
+        RemoteSendTarget::ProductConversation { .. } => None,
+    };
+    if let Some(id) = &exact {
+        let conversation = state.db.get_conversation(id).await.map_err(|error| {
+            rejected(RemoteSendRejectionCode::TargetNotFound, error.to_string())
+        })?;
+        if conversation.parent_conversation_id.is_some() {
+            return Err(rejected(
+                RemoteSendRejectionCode::InvalidTarget,
+                "sub-agent targets are not allowed".into(),
+            ));
+        }
+        if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+            if !matches!(
+                origin,
+                phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { .. }
+            ) {
+                return Err(rejected(
+                    RemoteSendRejectionCode::SenderNotAllowed,
+                    "only a remote Coordinator may message the destination Coordinator".into(),
+                ));
+            }
+            return Ok(if matches!(target, RemoteSendTarget::Coordinator {}) {
+                SendChatTarget::StableCoordinator(conversation.product_conversation_id)
+            } else {
+                SendChatTarget::ExactTranscript(id.clone())
+            });
+        }
+    }
+    let raw = match target {
+        RemoteSendTarget::ProductConversation {
+            product_conversation_id,
+        } => format!("@conv:{product_conversation_id}"),
+        RemoteSendTarget::Transcript { transcript_id } => format!("@transcript:{transcript_id}"),
+        RemoteSendTarget::Coordinator {} => {
+            return Err(rejected(
+                RemoteSendRejectionCode::InvalidTarget,
+                "Coordinator role unavailable".into(),
+            ))
+        }
+    };
+    let service = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match service
+        .resolve_message_target(&raw)
+        .await
+        .map_err(|error| rejected(RemoteSendRejectionCode::InvalidTarget, error.to_string()))?
+    {
+        crate::api::global_read::GlobalMessageTarget::StableProductConversation {
+            product_conversation_id,
+        } => Ok(SendChatTarget::StableProductConversation(
+            product_conversation_id.to_string(),
+        )),
+        crate::api::global_read::GlobalMessageTarget::ExactTranscript { transcript_id } => {
+            Ok(SendChatTarget::ExactTranscript(transcript_id.to_string()))
+        }
+    }
+}
+
+async fn admit_remote_message(
+    state: &AppState,
+    request: &RemoteSendMessageRequest,
+    origin: phoenix_core::domain::db_schema::InputOrigin,
+) -> RemoteSendReceipt {
+    use crate::send_chat_service::{
+        MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatReplay,
+        SendChatRequest, SendChatServiceError,
+    };
+    let target = match resolve_remote_send_target(state, &request.target, &origin).await {
+        Ok(target) => target,
+        Err(receipt) => return receipt,
+    };
+    let service = SendChatApplicationService::new(state.db.clone(), state.runtime.clone());
+    let admission = service
+        .send_to_target_with_replay(
+            target,
+            SendChatRequest {
+                conversation_id: String::new(),
+                origin,
+                text: request.message.0.clone(),
+                message_id: request.message_id.to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            },
+        )
+        .await;
+    let (id, outcome, replay) = match admission {
+        Ok(result) => result,
+        Err(error) => {
+            let code = match &error {
+                SendChatServiceError::IdempotencyConflict => {
+                    RemoteSendRejectionCode::IdempotencyConflict
+                }
+                SendChatServiceError::NotFound(_) => RemoteSendRejectionCode::TargetNotFound,
+                SendChatServiceError::Busy => RemoteSendRejectionCode::Busy,
+                SendChatServiceError::CloseAdmissionFenced
+                | SendChatServiceError::HistoryUnavailable => {
+                    RemoteSendRejectionCode::TargetUnavailable
+                }
+                SendChatServiceError::AttachmentValidation(_)
+                | SendChatServiceError::Expansion { .. } => {
+                    RemoteSendRejectionCode::AdmissionRejected
+                }
+                SendChatServiceError::Internal(_) | SendChatServiceError::Dispatch(_) => {
+                    RemoteSendRejectionCode::Internal
+                }
+            };
+            return RemoteSendReceipt::Rejected {
+                code,
+                message: bounded_send_diagnostic(&error.to_string()),
+            };
+        }
+    };
+    if let SendChatOutcome::Rejected { message, .. } = outcome {
+        return RemoteSendReceipt::Rejected {
+            code: RemoteSendRejectionCode::AdmissionRejected,
+            message: bounded_send_diagnostic(&message),
+        };
+    }
+    let disposition =
+        if replay == SendChatReplay::Steering || outcome == SendChatOutcome::QueuedAsSteering {
+            RemoteSendDisposition::Queued
+        } else {
+            RemoteSendDisposition::Delivered
+        };
+    remote_acceptance_receipt(state, request, id, disposition, replay).await
+}
+
+async fn remote_acceptance_receipt(
+    state: &AppState,
+    request: &RemoteSendMessageRequest,
+    id: String,
+    disposition: RemoteSendDisposition,
+    replay: crate::send_chat_service::SendChatReplay,
+) -> RemoteSendReceipt {
+    let conversation = match state.db.get_conversation(&id).await {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            return RemoteSendReceipt::Rejected {
+                code: RemoteSendRejectionCode::Internal,
+                message: bounded_send_diagnostic(&error.to_string()),
+            }
+        }
+    };
+    let stable_path = if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        "/global".to_string()
+    } else {
+        match state
+            .db
+            .ordinary_product_conversation_citation(&conversation.product_conversation_id)
+            .await
+        {
+            Ok(Some(citation)) => super::product_conversations::product_route(
+                citation.root_slug.as_deref(),
+                citation.product_conversation_id.as_str(),
+            ),
+            Ok(None) | Err(_) => {
+                return RemoteSendReceipt::Rejected {
+                    code: RemoteSendRejectionCode::Internal,
+                    message: "accepted destination navigation unavailable".into(),
+                }
+            }
+        }
+    };
+    let transcript = phoenix_core::domain::close::TranscriptConversationId::parse(id)
+        .expect("persisted transcript is nonempty");
+    let exact_path = super::product_conversations::exact_transcript_route(&transcript);
+    let message_id = accepting_message_id(&transcript, request.message_id, disposition);
+    let acceptance = RemoteMessageAcceptance {
+        accepting_transcript: transcript,
+        stable_navigation: RemoteSendNavigation::AppLocal { path: stable_path },
+        accepting_transcript_navigation: RemoteSendNavigation::AppLocal {
+            path: exact_path.clone(),
+        },
+        accepting_message_navigation: RemoteSendNavigation::AppLocal {
+            path: format!(
+                "{exact_path}{}",
+                super::product_conversations::message_fragment(&message_id)
+            ),
+        },
+        stable_destination: RemoteStableDestination {
+            instance_id: request.destination_instance_id,
+            product_conversation_id: conversation.product_conversation_id,
+        },
+        disposition,
+    };
+    if replay == crate::send_chat_service::SendChatReplay::New {
+        RemoteSendReceipt::Accepted { acceptance }
+    } else {
+        RemoteSendReceipt::Duplicate { acceptance }
+    }
+}
+
+fn accepting_message_id(
+    transcript: &phoenix_core::domain::close::TranscriptConversationId,
+    message_id: uuid::Uuid,
+    disposition: RemoteSendDisposition,
+) -> String {
+    match disposition {
+        RemoteSendDisposition::Delivered => format!("{transcript}:{message_id}"),
+        RemoteSendDisposition::Queued => message_id.to_string(),
+    }
+}
+
+fn bounded_send_diagnostic(message: &str) -> String {
+    message.chars().take(512).collect()
+}
+
+pub async fn send_remote_conversation_message(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    request: &RemoteSendMessageRequest,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    send_remote_message(
+        local_db,
+        peer,
+        request,
+        request,
+        "/api/federation/peer/send-conversation-message",
+    )
+    .await
+}
+
+pub(crate) async fn send_remote_authored_conversation_message(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    request: &RemoteAuthoredSendMessageRequest,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    if !request.locators_are_bounded() {
+        return Err(FederationClientError::RemoteRejected(
+            "send locators exceed the request budget".into(),
+        ));
+    }
+    let (message, _) = request.clone().into_parts();
+    send_remote_message(
+        local_db,
+        peer,
+        &message,
+        request,
+        "/api/federation/peer/send-authored-conversation-message",
+    )
+    .await
+}
+
+async fn send_remote_message(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    request: &RemoteSendMessageRequest,
+    body: &impl Serialize,
+    path: &str,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    if !request.locators_are_bounded() {
+        return Err(FederationClientError::RemoteRejected(
+            "send locators exceed the request budget".into(),
+        ));
+    }
+    if request.destination_instance_id != peer.peer_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    let caller = local_db.instance_id().await?;
+    let endpoint = peer.base_url.navigation_url(path)?;
+    let response = remote_query_client(&peer.tls_trust)?
+        .post(endpoint.as_url().clone())
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(body)
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut response = decode_remote_send_response(status, &bytes, caller, request)?;
+    if let RemoteSendReceipt::Accepted { acceptance }
+    | RemoteSendReceipt::Duplicate { acceptance } = &mut response.receipt
+    {
+        for navigation in [
+            &mut acceptance.stable_navigation,
+            &mut acceptance.accepting_transcript_navigation,
+            &mut acceptance.accepting_message_navigation,
+        ] {
+            let RemoteSendNavigation::AppLocal { path } = navigation else {
+                return Err(FederationClientError::SendProvenanceMismatch);
+            };
+            let url = peer.base_url.navigation_url(path)?.as_url().to_string();
+            *navigation = RemoteSendNavigation::Peer { url };
+        }
+    }
+    Ok(response)
+}
+
+fn decode_remote_send_response(
+    status: StatusCode,
+    bytes: &[u8],
+    caller: InstanceId,
+    request: &RemoteSendMessageRequest,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    if !status.is_success() {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    }
+    let response: RemoteSendMessageResponse = serde_json::from_slice(bytes)?;
+    if response.destination_instance_id != request.destination_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.message_id != request.message_id || response.target != request.target {
+        return Err(FederationClientError::SendProvenanceMismatch);
+    }
+    if let RemoteSendReceipt::Accepted { acceptance }
+    | RemoteSendReceipt::Duplicate { acceptance } = &response.receipt
+    {
+        if acceptance.stable_destination.instance_id != request.destination_instance_id {
+            return Err(FederationClientError::SendProvenanceMismatch);
+        }
+        let RemoteSendNavigation::AppLocal { path: stable_path } = &acceptance.stable_navigation
+        else {
+            return Err(FederationClientError::SendProvenanceMismatch);
+        };
+        let stable_shape = super::product_conversations::canonical_product_route_shape(stable_path);
+        let stable_matches = match &request.target {
+            RemoteSendTarget::ProductConversation { .. } => stable_shape,
+            RemoteSendTarget::Coordinator {} => stable_path == "/global",
+            RemoteSendTarget::Transcript { .. } => stable_shape || stable_path == "/global",
+        };
+        let exact_path =
+            super::product_conversations::exact_transcript_route(&acceptance.accepting_transcript);
+        let message_id = accepting_message_id(
+            &acceptance.accepting_transcript,
+            request.message_id,
+            acceptance.disposition,
+        );
+        let message_path = format!(
+            "{exact_path}{}",
+            super::product_conversations::message_fragment(&message_id)
+        );
+        if !stable_matches
+            || acceptance.accepting_transcript_navigation
+                != (RemoteSendNavigation::AppLocal { path: exact_path })
+            || acceptance.accepting_message_navigation
+                != (RemoteSendNavigation::AppLocal { path: message_path })
+        {
+            return Err(FederationClientError::SendProvenanceMismatch);
+        }
+        match &request.target {
+            RemoteSendTarget::ProductConversation {
+                product_conversation_id,
+            } if product_conversation_id
+                != &acceptance.stable_destination.product_conversation_id =>
+            {
+                return Err(FederationClientError::SendProvenanceMismatch)
+            }
+            RemoteSendTarget::Transcript { transcript_id }
+                if transcript_id != &acceptance.accepting_transcript =>
+            {
+                return Err(FederationClientError::SendProvenanceMismatch)
+            }
+            RemoteSendTarget::ProductConversation { .. }
+            | RemoteSendTarget::Transcript { .. }
+            | RemoteSendTarget::Coordinator {} => {}
+        }
+    }
+    Ok(response)
+}
+
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RemoteQueryDatabaseRequest {
     pub destination_instance_id: InstanceId,
     pub sql: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteQueryDatabaseResponse {
     pub destination_instance_id: InstanceId,
     pub caller_instance_id: InstanceId,
     pub result: phoenix_db::CoordinatorQueryResult,
+}
+
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RemoteSearchRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub query: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoteSearchResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub hits: Vec<crate::api::global_read::QualifiedSearchHit>,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoteReadConversationRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub target: ConversationReferenceTarget,
+    pub cursor: usize,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoteReadConversationResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub read: crate::api::global_read::QualifiedConversationRead,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoteResolveReferenceRequest {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub reference: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoteResolveReferenceResponse {
+    pub caller_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub resolution: crate::api::global_read::ResolveGlobalReferenceResponse,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
+enum RemoteReadErrorCode {
+    InvalidTarget,
+    DestinationUnavailable,
+    ResponseTooLarge,
+    CallerMismatch,
+    DestinationMismatch,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+struct RemoteReadErrorResponse {
+    code: RemoteReadErrorCode,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
+enum RemoteResolveErrorCode {
+    InvalidReference,
+    DestinationUnavailable,
+    ResponseTooLarge,
+    CallerMismatch,
+    DestinationMismatch,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+struct RemoteResolveErrorResponse {
+    code: RemoteResolveErrorCode,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
+enum RemoteSearchErrorCode {
+    SearchIndexUnavailable,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+struct RemoteSearchErrorResponse {
+    code: RemoteSearchErrorCode,
+    message: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -76,12 +1026,395 @@ pub enum FederationClientError {
     ResponseTooLarge(usize),
     #[error("remote query rejected: {0}")]
     RemoteRejected(String),
+    #[error("remote query response contains federation credentials")]
+    CredentialReflection,
+    #[error("subscription enrollment authentication rejected")]
+    SubscriptionAuthenticationRejected,
     #[error("invalid federation response: {0}")]
     InvalidResponse(#[from] serde_json::Error),
     #[error("destination identity mismatch")]
     DestinationMismatch,
     #[error("caller identity mismatch")]
     CallerMismatch,
+    #[error("remote search result provenance mismatch")]
+    SearchProvenanceMismatch,
+    #[error("remote search navigation locator is invalid: {0}")]
+    SearchNavigation(#[from] phoenix_core::domain::instance_identity::PeerNavigationUrlError),
+    #[error("remote search unavailable: {0}")]
+    SearchUnavailable(String),
+    #[error("remote send receipt provenance mismatch")]
+    SendProvenanceMismatch,
+    #[error("remote read response provenance mismatch")]
+    ReadProvenanceMismatch,
+    #[error("remote read target rejected: {0}")]
+    ReadInvalidTarget(String),
+    #[error("remote read destination unavailable: {0}")]
+    ReadUnavailable(String),
+    #[error("remote read response exceeds the bounded response budget: {0}")]
+    ReadResponseTooLarge(String),
+    #[error("remote reference rejected: {0}")]
+    ResolveInvalidReference(String),
+    #[error("remote reference destination unavailable: {0}")]
+    ResolveUnavailable(String),
+    #[error("remote reference response exceeds the bounded response budget: {0}")]
+    ResolveResponseTooLarge(String),
+    #[error("remote reference provenance mismatch")]
+    ResolveProvenanceMismatch,
+}
+
+pub async fn resolve_remote_reference(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    reference: String,
+) -> Result<crate::api::global_read::ResolveGlobalReferenceResponse, FederationClientError> {
+    let caller_instance_id = local_db.instance_id().await?;
+    let expected_target =
+        crate::api::global_read::GlobalReadService::parse_read_target(&reference).ok();
+    let endpoint = peer
+        .base_url
+        .navigation_url("/api/federation/peer/resolve-reference")?;
+    let client = remote_query_client(&peer.tls_trust)?;
+    let response = client
+        .post(endpoint.as_url().clone())
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&RemoteResolveReferenceRequest {
+            caller_instance_id,
+            destination_instance_id: peer.peer_instance_id,
+            reference,
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut response = decode_remote_resolve_response(status, &bytes)?;
+    if response.destination_instance_id != peer.peer_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller_instance_id {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.resolution.reference.instance_id != peer.peer_instance_id {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    if response
+        .resolution
+        .source_call
+        .as_ref()
+        .is_some_and(|call| {
+            [&call.message_id, &call.tool_use_id]
+                .iter()
+                .any(|id| id.trim().is_empty() || id.len() > 1024)
+        })
+    {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    if expected_target
+        .as_ref()
+        .is_some_and(|target| target != &response.resolution.reference.target)
+    {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    let path_owner_matches = match (
+        &response.resolution.work_scope,
+        response.resolution.path_owner_instance_id,
+    ) {
+        (crate::api::global_read::ResolvedWorkScope::Available { .. }, Some(instance_id)) => {
+            instance_id == peer.peer_instance_id
+        }
+        (crate::api::global_read::ResolvedWorkScope::Available { .. }, None) | (_, Some(_)) => {
+            false
+        }
+        (_, None) => true,
+    };
+    if !path_owner_matches {
+        return Err(FederationClientError::ResolveProvenanceMismatch);
+    }
+    if let Some(path) = &response.resolution.href {
+        if !resolved_reference_href_matches(&response.resolution.reference.target, path) {
+            return Err(FederationClientError::ResolveProvenanceMismatch);
+        }
+        response.resolution.href = Some(peer.base_url.navigation_url(path)?.as_url().to_string());
+    }
+    Ok(response.resolution)
+}
+
+fn resolved_reference_href_matches(target: &ConversationReferenceTarget, href: &str) -> bool {
+    use crate::api::product_conversations::{
+        canonical_product_route_shape, exact_transcript_route, message_fragment,
+    };
+
+    match target {
+        ConversationReferenceTarget::ProductConversation { .. } => {
+            canonical_product_route_shape(href)
+        }
+        ConversationReferenceTarget::Transcript { transcript_id } => {
+            href == exact_transcript_route(transcript_id)
+        }
+        ConversationReferenceTarget::Message {
+            transcript_id,
+            message_id,
+        } => {
+            let base = exact_transcript_route(transcript_id);
+            href == base || href == format!("{base}{}", message_fragment(message_id.as_str()))
+        }
+        ConversationReferenceTarget::Coordinator => href == "/global",
+    }
+}
+
+fn decode_remote_resolve_response(
+    status: StatusCode,
+    bytes: &[u8],
+) -> Result<RemoteResolveReferenceResponse, FederationClientError> {
+    if status.is_success() {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    let Some(error) = serde_json::from_slice::<RemoteResolveErrorResponse>(bytes).ok() else {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    };
+    Err(match error.code {
+        RemoteResolveErrorCode::InvalidReference => {
+            FederationClientError::ResolveInvalidReference(error.message)
+        }
+        RemoteResolveErrorCode::DestinationUnavailable => {
+            FederationClientError::ResolveUnavailable(error.message)
+        }
+        RemoteResolveErrorCode::ResponseTooLarge => {
+            FederationClientError::ResolveResponseTooLarge(error.message)
+        }
+        RemoteResolveErrorCode::CallerMismatch => FederationClientError::CallerMismatch,
+        RemoteResolveErrorCode::DestinationMismatch => FederationClientError::DestinationMismatch,
+    })
+}
+
+fn validate_remote_read_provenance(
+    response: &RemoteReadConversationResponse,
+    target: &ConversationReferenceTarget,
+    peer_instance_id: InstanceId,
+    caller_instance_id: InstanceId,
+) -> Result<(), FederationClientError> {
+    if response.destination_instance_id != peer_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller_instance_id {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    let resolved_matches_request = match (target, &response.read.resolved.target) {
+        (
+            ConversationReferenceTarget::ProductConversation { .. },
+            ConversationReferenceTarget::Transcript { .. },
+        ) => true,
+        (
+            ConversationReferenceTarget::Transcript {
+                transcript_id: requested,
+            },
+            ConversationReferenceTarget::Transcript {
+                transcript_id: resolved,
+            },
+        ) => requested == resolved,
+        (
+            ConversationReferenceTarget::Message {
+                transcript_id: requested_transcript,
+                message_id: requested_message,
+            },
+            ConversationReferenceTarget::Message {
+                transcript_id: resolved_transcript,
+                message_id: resolved_message,
+            },
+        ) => requested_transcript == resolved_transcript && requested_message == resolved_message,
+        (
+            ConversationReferenceTarget::ProductConversation { .. },
+            ConversationReferenceTarget::ProductConversation { .. }
+            | ConversationReferenceTarget::Message { .. }
+            | ConversationReferenceTarget::Coordinator,
+        )
+        | (
+            ConversationReferenceTarget::Transcript { .. },
+            ConversationReferenceTarget::ProductConversation { .. }
+            | ConversationReferenceTarget::Message { .. }
+            | ConversationReferenceTarget::Coordinator,
+        )
+        | (
+            ConversationReferenceTarget::Message { .. },
+            ConversationReferenceTarget::ProductConversation { .. }
+            | ConversationReferenceTarget::Transcript { .. }
+            | ConversationReferenceTarget::Coordinator,
+        )
+        | (ConversationReferenceTarget::Coordinator, _) => false,
+    };
+    if response.read.requested.instance_id != peer_instance_id
+        || response.read.requested.target != *target
+        || response.read.resolved.instance_id != peer_instance_id
+        || !resolved_matches_request
+    {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    }
+    Ok(())
+}
+
+pub async fn read_remote_conversation(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    target: ConversationReferenceTarget,
+    cursor: usize,
+) -> Result<crate::api::global_read::QualifiedConversationRead, FederationClientError> {
+    let caller_instance_id = local_db.instance_id().await?;
+    let client = remote_query_client(&peer.tls_trust)?;
+    let response = client
+        .post(peer.base_url.read_conversation_endpoint().as_url().clone())
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&RemoteReadConversationRequest {
+            caller_instance_id,
+            destination_instance_id: peer.peer_instance_id,
+            target: target.clone(),
+            cursor,
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut response = decode_remote_read_response(status, &bytes)?;
+    validate_remote_read_provenance(
+        &response,
+        &target,
+        peer.peer_instance_id,
+        caller_instance_id,
+    )?;
+    let (ConversationReferenceTarget::Transcript {
+        transcript_id: resolved_transcript,
+    }
+    | ConversationReferenceTarget::Message {
+        transcript_id: resolved_transcript,
+        ..
+    }) = &response.read.resolved.target
+    else {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    };
+    if response.read.evidence.iter().any(|reference| {
+        reference.instance_id != peer.peer_instance_id
+            || !matches!(
+                &reference.target,
+                ConversationReferenceTarget::Message { transcript_id, .. }
+                    if transcript_id == resolved_transcript
+            )
+    }) {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    }
+    if let ConversationReferenceTarget::Message {
+        message_id: requested_message,
+        ..
+    } = &target
+    {
+        if response.read.evidence.len() != 1
+            || !matches!(
+                &response.read.evidence[0].target,
+                ConversationReferenceTarget::Message { message_id, .. }
+                    if message_id == requested_message
+            )
+        {
+            return Err(FederationClientError::ReadProvenanceMismatch);
+        }
+    }
+    match (
+        &response.read.stable_conversation,
+        &response.read.stable_navigation,
+    ) {
+        (
+            Some(stable),
+            Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { .. }),
+        ) if stable.instance_id == peer.peer_instance_id
+            && (matches!(
+                (&target, &stable.target),
+                (
+                    ConversationReferenceTarget::ProductConversation {
+                        product_conversation_id: requested,
+                    },
+                    ConversationReferenceTarget::ProductConversation {
+                        product_conversation_id: returned,
+                    },
+                ) if requested == returned
+            ) || (!matches!(
+                target,
+                ConversationReferenceTarget::ProductConversation { .. }
+            ) && matches!(
+                &stable.target,
+                ConversationReferenceTarget::ProductConversation { .. }
+            ))) => {}
+        (None, None) => {}
+        _ => return Err(FederationClientError::ReadProvenanceMismatch),
+    }
+    qualify_remote_read_navigation(&peer.base_url, &mut response.read)?;
+    Ok(response.read)
+}
+
+fn decode_remote_read_response(
+    status: StatusCode,
+    bytes: &[u8],
+) -> Result<RemoteReadConversationResponse, FederationClientError> {
+    if status.is_success() {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    let Some(error) = serde_json::from_slice::<RemoteReadErrorResponse>(bytes).ok() else {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    };
+    Err(match error.code {
+        RemoteReadErrorCode::InvalidTarget => {
+            FederationClientError::ReadInvalidTarget(error.message)
+        }
+        RemoteReadErrorCode::DestinationUnavailable => {
+            FederationClientError::ReadUnavailable(error.message)
+        }
+        RemoteReadErrorCode::ResponseTooLarge => {
+            FederationClientError::ReadResponseTooLarge(error.message)
+        }
+        RemoteReadErrorCode::CallerMismatch => FederationClientError::CallerMismatch,
+        RemoteReadErrorCode::DestinationMismatch => FederationClientError::DestinationMismatch,
+    })
+}
+
+pub async fn search_remote_conversations(
+    db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    query: &str,
+) -> Result<Vec<crate::api::global_read::QualifiedSearchHit>, FederationClientError> {
+    let caller_instance_id = db.instance_id().await?;
+    let client = remote_query_client(&peer.tls_trust)?;
+    let response = client
+        .post(
+            peer.base_url
+                .search_conversations_endpoint()
+                .as_url()
+                .clone(),
+        )
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(&RemoteSearchRequest {
+            caller_instance_id,
+            destination_instance_id: peer.peer_instance_id,
+            query: query.to_owned(),
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut hits =
+        decode_remote_search_response(status, &bytes, peer.peer_instance_id, caller_instance_id)?;
+    qualify_remote_search_navigation(&peer.base_url, &mut hits)?;
+    Ok(hits)
 }
 
 pub async fn query_remote_database(
@@ -94,9 +1427,10 @@ pub async fn query_remote_database(
     let caller_instance_id = db.instance_id().await?;
     let endpoint = peer.base_url.query_database_endpoint();
     let client = remote_query_client(&peer.tls_trust)?;
+    let bearer = peer.bearer_credential.expose();
     let response = client
         .post(endpoint.as_url().clone())
-        .bearer_auth(peer.bearer_credential.expose())
+        .bearer_auth(bearer)
         .json(&RemoteQueryDatabaseRequest {
             destination_instance_id: peer_instance_id,
             sql: sql.to_owned(),
@@ -109,7 +1443,7 @@ pub async fn query_remote_database(
     while let Some(chunk) = stream.next().await {
         append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
     }
-    decode_remote_query_response(status, &bytes, peer_instance_id, caller_instance_id)
+    decode_remote_query_response(status, &bytes, peer_instance_id, caller_instance_id, bearer)
 }
 
 fn remote_query_client(tls_trust: &PeerTlsTrust) -> Result<reqwest::Client, FederationClientError> {
@@ -145,6 +1479,7 @@ fn decode_remote_query_response(
     bytes: &[u8],
     expected_destination: InstanceId,
     expected_caller: InstanceId,
+    bearer: &str,
 ) -> Result<RemoteQueryDatabaseResponse, FederationClientError> {
     if !status.is_success() {
         let detail = serde_json::from_slice::<serde_json::Value>(bytes)
@@ -164,7 +1499,149 @@ fn decode_remote_query_response(
     if response.caller_instance_id != expected_caller {
         return Err(FederationClientError::CallerMismatch);
     }
+    let rendered =
+        serde_json::to_string(&response.result).map_err(FederationClientError::InvalidResponse)?;
+    if rendered.contains(bearer) {
+        return Err(FederationClientError::CredentialReflection);
+    }
     Ok(response)
+}
+
+fn qualify_remote_read_navigation(
+    base_url: &phoenix_core::domain::instance_identity::PeerBaseUrl,
+    read: &mut crate::api::global_read::QualifiedConversationRead,
+) -> Result<(), FederationClientError> {
+    use crate::api::global_read::QualifiedSearchNavigation;
+
+    let QualifiedSearchNavigation::AppLocal { path } = &read.source_navigation else {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    };
+    if !resolved_reference_href_matches(&read.resolved.target, path) {
+        return Err(FederationClientError::ReadProvenanceMismatch);
+    }
+    let url = base_url.navigation_url(path)?.as_url().to_string();
+    read.source_navigation = QualifiedSearchNavigation::Peer { url };
+    if let Some(navigation) = &read.stable_navigation {
+        let QualifiedSearchNavigation::AppLocal { path } = navigation else {
+            return Err(FederationClientError::ReadProvenanceMismatch);
+        };
+        if !crate::api::product_conversations::canonical_product_route_shape(path) {
+            return Err(FederationClientError::ReadProvenanceMismatch);
+        }
+        let url = base_url.navigation_url(path)?.as_url().to_string();
+        read.stable_navigation = Some(QualifiedSearchNavigation::Peer { url });
+    }
+    Ok(())
+}
+
+fn qualify_remote_search_navigation(
+    base_url: &phoenix_core::domain::instance_identity::PeerBaseUrl,
+    hits: &mut [crate::api::global_read::QualifiedSearchHit],
+) -> Result<(), FederationClientError> {
+    use crate::api::global_read::QualifiedSearchNavigation;
+
+    for hit in hits {
+        match &hit.source_navigation {
+            None => {}
+            Some(QualifiedSearchNavigation::AppLocal { path }) => {
+                let url = base_url.navigation_url(path)?.as_url().to_string();
+                hit.source_navigation = Some(QualifiedSearchNavigation::Peer { url });
+            }
+            Some(QualifiedSearchNavigation::Peer { .. }) => {
+                return Err(FederationClientError::SearchProvenanceMismatch);
+            }
+        }
+
+        match (&hit.stable_conversation, &hit.stable_navigation) {
+            (None, None) => {}
+            (Some(_), Some(QualifiedSearchNavigation::AppLocal { path })) => {
+                let url = base_url.navigation_url(path)?.as_url().to_string();
+                hit.stable_navigation = Some(QualifiedSearchNavigation::Peer { url });
+            }
+            _ => return Err(FederationClientError::SearchProvenanceMismatch),
+        }
+    }
+    Ok(())
+}
+
+fn decode_remote_search_response(
+    status: StatusCode,
+    bytes: &[u8],
+    expected_destination: InstanceId,
+    expected_caller: InstanceId,
+) -> Result<Vec<crate::api::global_read::QualifiedSearchHit>, FederationClientError> {
+    if !status.is_success() {
+        let error = serde_json::from_slice::<RemoteSearchErrorResponse>(bytes).ok();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            if let Some(RemoteSearchErrorResponse {
+                code: RemoteSearchErrorCode::SearchIndexUnavailable,
+                message,
+            }) = &error
+            {
+                return Err(FederationClientError::SearchUnavailable(message.clone()));
+            }
+        }
+        let detail = error
+            .map(|error| error.message)
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(FederationClientError::RemoteRejected(detail));
+    }
+    let response: RemoteSearchResponse = serde_json::from_slice(bytes)?;
+    if response.destination_instance_id != expected_destination {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != expected_caller {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.hits.iter().any(|hit| {
+        hit.source.instance_id != expected_destination
+            || match &hit.source_navigation {
+                None => false,
+                Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { path }) => {
+                    !resolved_reference_href_matches(&hit.source.target, path)
+                }
+                Some(crate::api::global_read::QualifiedSearchNavigation::Peer { .. }) => true,
+            }
+            || !matches!(
+                &hit.source.target,
+                ConversationReferenceTarget::Message { .. }
+            )
+            || match (&hit.stable_conversation, &hit.stable_navigation) {
+                (None, None) => false,
+                (
+                    Some(stable),
+                    Some(crate::api::global_read::QualifiedSearchNavigation::AppLocal { path }),
+                ) => {
+                    !super::product_conversations::canonical_product_route_shape(path)
+                        || stable.instance_id != expected_destination
+                        || !matches!(
+                            &stable.target,
+                            ConversationReferenceTarget::ProductConversation { .. }
+                        )
+                }
+                _ => true,
+            }
+            || hit.sender.as_ref().is_some_and(|sender| {
+                sender.stable.instance_id != sender.exact.instance_id
+                    || sender.source_call.as_ref().is_some_and(|call| {
+                        [&call.message_id, &call.tool_use_id]
+                            .iter()
+                            .any(|id| id.trim().is_empty() || id.len() > 1024)
+                    })
+                    || !matches!(
+                        &sender.stable.target,
+                        ConversationReferenceTarget::ProductConversation { .. }
+                            | ConversationReferenceTarget::Coordinator
+                    )
+                    || !matches!(
+                        &sender.exact.target,
+                        ConversationReferenceTarget::Transcript { .. }
+                    )
+            })
+    }) {
+        return Err(FederationClientError::SearchProvenanceMismatch);
+    }
+    Ok(response.hits)
 }
 
 fn random_peer_token() -> String {
@@ -174,6 +1651,244 @@ fn random_peer_token() -> String {
         "phx_peer_{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     )
+}
+
+pub async fn resolve_reference(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteResolveReferenceRequest>,
+) -> Response {
+    let destination = match state.db.instance_id().await {
+        Ok(instance_id) => instance_id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read local instance identity");
+            return remote_resolve_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                RemoteResolveErrorCode::DestinationUnavailable,
+                "destination reference resolver unavailable",
+            );
+        }
+    };
+    if request.destination_instance_id != destination {
+        return remote_resolve_error(
+            StatusCode::CONFLICT,
+            RemoteResolveErrorCode::DestinationMismatch,
+            "destination instance identity mismatch",
+        );
+    }
+    if request.caller_instance_id != authenticated.caller_instance_id {
+        return remote_resolve_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            RemoteResolveErrorCode::CallerMismatch,
+            "caller instance identity mismatch",
+        );
+    }
+    let service = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match service.resolve_reference(&request.reference).await {
+        Ok(resolution) => {
+            let response = RemoteResolveReferenceResponse {
+                caller_instance_id: authenticated.caller_instance_id,
+                destination_instance_id: destination,
+                resolution,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(encoded) if encoded.len() <= MAX_REMOTE_RESPONSE_BYTES => {
+                    Json(response).into_response()
+                }
+                Ok(_) => remote_resolve_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    RemoteResolveErrorCode::ResponseTooLarge,
+                    "remote reference response exceeds the bounded response budget",
+                ),
+                Err(error) => {
+                    tracing::error!(%error, "failed to encode peer reference resolution");
+                    remote_resolve_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        RemoteResolveErrorCode::DestinationUnavailable,
+                        "destination reference resolver unavailable",
+                    )
+                }
+            }
+        }
+        Err(
+            crate::api::handlers::AppError::BadRequest(message)
+            | crate::api::handlers::AppError::NotFound(message),
+        ) => remote_resolve_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            RemoteResolveErrorCode::InvalidReference,
+            &message,
+        ),
+        Err(error) => {
+            tracing::error!(?error, "peer reference resolution failed");
+            remote_resolve_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                RemoteResolveErrorCode::DestinationUnavailable,
+                "destination reference resolver unavailable",
+            )
+        }
+    }
+}
+
+fn remote_resolve_error(
+    status: StatusCode,
+    code: RemoteResolveErrorCode,
+    message: &str,
+) -> Response {
+    (
+        status,
+        Json(RemoteResolveErrorResponse {
+            code,
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+pub async fn read_conversation(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteReadConversationRequest>,
+) -> Response {
+    let destination = match state.db.instance_id().await {
+        Ok(instance_id) => instance_id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read local instance identity");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if request.destination_instance_id != destination {
+        return (
+            StatusCode::CONFLICT,
+            Json(RemoteReadErrorResponse {
+                code: RemoteReadErrorCode::DestinationMismatch,
+                message: "destination instance identity mismatch".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if request.caller_instance_id != authenticated.caller_instance_id {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(RemoteReadErrorResponse {
+                code: RemoteReadErrorCode::CallerMismatch,
+                message: "caller instance identity mismatch".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if matches!(request.target, ConversationReferenceTarget::Coordinator) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(RemoteReadErrorResponse {
+                code: RemoteReadErrorCode::InvalidTarget,
+                message: "Coordinator is not a readable conversation target".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let service = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match service
+        .read_conversation_target(&request.target, request.cursor)
+        .await
+    {
+        Ok(read) => {
+            let response = RemoteReadConversationResponse {
+                caller_instance_id: authenticated.caller_instance_id,
+                destination_instance_id: destination,
+                read,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(encoded) if encoded.len() <= MAX_REMOTE_RESPONSE_BYTES => {
+                    Json(response).into_response()
+                }
+                Ok(_) => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(RemoteReadErrorResponse {
+                        code: RemoteReadErrorCode::ResponseTooLarge,
+                        message: "remote read response exceeds the bounded response budget"
+                            .to_string(),
+                    }),
+                )
+                    .into_response(),
+                Err(error) => {
+                    tracing::error!(%error, "failed to encode peer conversation read");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        Err(crate::api::global_read::QualifiedReadError::Invalid(error)) => {
+            tracing::debug!(%error, "peer conversation read rejected");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(RemoteReadErrorResponse {
+                    code: RemoteReadErrorCode::InvalidTarget,
+                    message: error,
+                }),
+            )
+                .into_response()
+        }
+        Err(crate::api::global_read::QualifiedReadError::Failed(error)) => {
+            tracing::error!(%error, "peer conversation read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RemoteReadErrorResponse {
+                    code: RemoteReadErrorCode::DestinationUnavailable,
+                    message: "destination conversation read unavailable".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn search_conversations(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteSearchRequest>,
+) -> Response {
+    let local_id = match state.db.instance_id().await {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read local instance identity for peer search");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if request.destination_instance_id != local_id {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if request.caller_instance_id != peer.caller_instance_id || request.query.trim().is_empty() {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let read = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match read.qualified_search(request.query.trim()).await {
+        Ok(hits) => Json(RemoteSearchResponse {
+            caller_instance_id: peer.caller_instance_id,
+            destination_instance_id: local_id,
+            hits,
+        })
+        .into_response(),
+        Err(crate::api::global_read::QualifiedSearchError::Unavailable(message)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(RemoteSearchErrorResponse {
+                code: RemoteSearchErrorCode::SearchIndexUnavailable,
+                message: message.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(crate::api::global_read::QualifiedSearchError::Failed(error)) => {
+            tracing::error!(%error, "peer search failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 pub async fn query_database(
@@ -253,6 +1968,59 @@ where
     })
 }
 
+async fn verify_enrollment_destination(
+    receiver_base_url: &PeerBaseUrl,
+    tls_trust: &PeerTlsTrust,
+    bearer_credential: &phoenix_core::domain::instance_identity::PeerBearerCredential,
+    expected_receiver_instance_id: InstanceId,
+    expected_caller_instance_id: InstanceId,
+) -> Result<(), FederationClientError> {
+    let endpoint = receiver_base_url
+        .navigation_url("/api/federation/peer/identity")
+        .expect("fixed federation identity route remains on the peer origin");
+    let response = remote_query_client(tls_trust)?
+        .get(endpoint.as_url().clone())
+        .bearer_auth(bearer_credential.expose())
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_PEER_IDENTITY_RESPONSE_BYTES)?;
+    }
+    if !status.is_success() {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    }
+    let identity: PeerIdentityResponse = serde_json::from_slice(&bytes)?;
+    if identity.receiver_instance_id != expected_receiver_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if identity.caller_instance_id != expected_caller_instance_id {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    Ok(())
+}
+
+pub async fn peer_identity(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+) -> Response {
+    match state.db.instance_id().await {
+        Ok(receiver_instance_id) => Json(PeerIdentityResponse {
+            receiver_instance_id,
+            caller_instance_id: authenticated.caller_instance_id,
+        })
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read peer identity");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn issue_enrollment(
     _owner: OwnerAuthenticated,
     State(state): State<AppState>,
@@ -265,7 +2033,10 @@ pub async fn issue_enrollment(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if request.caller_instance_id == local_id || request.caller_display_name.trim().is_empty() {
+    let Ok(caller_display_name) = PeerDisplayName::parse(&request.caller_display_name) else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
+    if request.caller_instance_id == local_id {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
@@ -275,7 +2046,7 @@ pub async fn issue_enrollment(
         .db
         .replace_federation_enrollment(
             request.caller_instance_id,
-            request.caller_display_name.trim(),
+            caller_display_name.as_str(),
             &verifier,
         )
         .await
@@ -288,6 +2059,8 @@ pub async fn issue_enrollment(
         StatusCode::CREATED,
         Json(EnrollmentTransferBundle {
             receiver_instance_id: local_id,
+            receiver_display_name: request.receiver_display_name,
+            receiver_base_url: request.receiver_base_url,
             caller_instance_id: request.caller_instance_id,
             token,
             tls_trust: state.federation_tls_trust.clone(),
@@ -308,35 +2081,54 @@ pub async fn import_peer_connection(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if request.enrollment.caller_instance_id != local_id
-        || request.enrollment.receiver_instance_id == local_id
-        || request.peer_display_name.trim().is_empty()
-    {
+    let EnrollmentTransferBundle {
+        receiver_instance_id,
+        receiver_display_name,
+        receiver_base_url,
+        caller_instance_id,
+        token,
+        tls_trust,
+    } = request.enrollment;
+    if caller_instance_id != local_id || receiver_instance_id == local_id {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let Ok(base_url) = request.base_url.parse() else {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-    };
     let Ok(bearer_credential) =
-        phoenix_core::domain::instance_identity::PeerBearerCredential::parse(
-            request.enrollment.token,
-        )
+        phoenix_core::domain::instance_identity::PeerBearerCredential::parse(token)
     else {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
+    match verify_enrollment_destination(
+        &receiver_base_url,
+        &tls_trust,
+        &bearer_credential,
+        receiver_instance_id,
+        local_id,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(FederationClientError::DestinationMismatch | FederationClientError::CallerMismatch) => {
+            tracing::warn!("federation peer identity did not match the enrollment bundle");
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(_) => {
+            tracing::warn!("federation peer identity verification failed closed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    }
     match state
         .db
         .save_federation_peer_connection(
-            request.enrollment.receiver_instance_id,
-            request.peer_display_name.trim(),
-            &base_url,
+            receiver_instance_id,
+            receiver_display_name.as_str(),
+            &receiver_base_url,
             &bearer_credential,
-            &request.enrollment.tls_trust,
+            &tls_trust,
         )
         .await
     {
         Ok(()) => Json(ImportPeerConnectionResponse {
-            peer_instance_id: request.enrollment.receiver_instance_id,
+            peer_instance_id: receiver_instance_id,
         })
         .into_response(),
         Err(error) => {
@@ -365,6 +2157,9 @@ pub async fn revoke_enrollment(
 }
 
 #[cfg(test)]
+mod send_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -377,6 +2172,124 @@ mod tests {
         assert_eq!(first.len(), "phx_peer_".len() + 43);
     }
 
+    #[test]
+    fn resolved_routes_distinguish_canonical_navigation_from_exact_evidence() {
+        let product = ConversationReferenceTarget::ProductConversation {
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "stable-product-id",
+                )
+                .unwrap(),
+        };
+        assert!(resolved_reference_href_matches(
+            &product,
+            "/c/readable-name"
+        ));
+        assert!(resolved_reference_href_matches(
+            &product,
+            "/c/%C3%BCber-%E6%9D%B1%E4%BA%AC"
+        ));
+        for invalid in [
+            "/c/",
+            "/c/readable-name/extra",
+            "/c/readable-name?source_transcript=other",
+            "https://peer.example/c/readable-name",
+        ] {
+            assert!(!resolved_reference_href_matches(&product, invalid));
+        }
+
+        let transcript = ConversationReferenceTarget::Transcript {
+            transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                "exact-transcript",
+            )
+            .unwrap(),
+        };
+        assert!(resolved_reference_href_matches(
+            &transcript,
+            "/c/exact-transcript?source_transcript=exact-transcript"
+        ));
+        assert!(!resolved_reference_href_matches(
+            &transcript,
+            "/c/readable-name"
+        ));
+    }
+
+    #[test]
+    fn read_navigation_is_bound_before_same_origin_qualification() {
+        use crate::api::global_read::{QualifiedConversationRead, QualifiedSearchNavigation};
+        let instance = InstanceId::new();
+        let reference = serde_json::json!({
+            "instance_id": instance,
+            "target": {"kind":"message", "transcript_id":"exact", "message_id":"message"}
+        });
+        let make_read = |source: &str, stable: &str| -> QualifiedConversationRead {
+            serde_json::from_value(serde_json::json!({
+                "requested": reference, "resolved": reference,
+                "stable_conversation": {"instance_id":instance,"target":{"kind":"product_conversation","product_conversation_id":"product"}},
+                "evidence":[reference], "content":"evidence", "next_cursor":null,
+                "source_navigation":{"kind":"app_local","path":source},
+                "stable_navigation":{"kind":"app_local","path":stable}
+            })).unwrap()
+        };
+        let origin = "https://peer.example".parse().unwrap();
+        let exact = "/c/exact?source_transcript=exact#message-message";
+        for wrong in [
+            "/c/other?source_transcript=other#message-message",
+            "/c/exact?source_transcript=exact#message-other",
+            "/api/federation/peers",
+            "https://peer.example/c/exact?source_transcript=exact#message-message",
+        ] {
+            let mut read = make_read(wrong, "/c/current-slug");
+            assert!(qualify_remote_read_navigation(&origin, &mut read).is_err());
+        }
+        for wrong in [
+            "/settings",
+            "/c/current/extra",
+            "/c/current?source_transcript=other",
+            "/c/current#message-other",
+        ] {
+            let mut read = make_read(exact, wrong);
+            assert!(qualify_remote_read_navigation(&origin, &mut read).is_err());
+        }
+        let mut read = make_read(exact, "/c/renamed-slug");
+        qualify_remote_read_navigation(&origin, &mut read).unwrap();
+        assert!(matches!(
+            read.source_navigation,
+            QualifiedSearchNavigation::Peer { .. }
+        ));
+        // Non-rendered message kinds legitimately point at the exact transcript without a fragment.
+        let mut read = make_read("/c/exact?source_transcript=exact", "/c/current-slug");
+        qualify_remote_read_navigation(&origin, &mut read).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enrollment_rejects_uuid_caller_names_but_accepts_real_names() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let peer = InstanceId::new();
+        for (name, expected) in [
+            (peer.to_string(), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                InstanceId::new().to_string(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            ("dev-mbp-42".into(), StatusCode::CREATED),
+            (" 雪 laptop ".into(), StatusCode::CREATED),
+        ] {
+            let issued = issue_enrollment(
+                OwnerAuthenticated,
+                State(state.clone()),
+                Json(IssueEnrollmentRequest {
+                    caller_instance_id: peer,
+                    caller_display_name: name.clone(),
+                    receiver_display_name: PeerDisplayName::parse("receiver").unwrap(),
+                    receiver_base_url: "https://receiver.example".parse().unwrap(),
+                }),
+            )
+            .await;
+            assert_eq!(issued.status(), expected, "issue {name}");
+        }
+    }
+
     #[tokio::test]
     async fn peer_import_rejects_bundle_for_another_caller() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -384,10 +2297,10 @@ mod tests {
             OwnerAuthenticated,
             State(state),
             Json(ImportPeerConnectionRequest {
-                peer_display_name: "peer".to_string(),
-                base_url: "https://peer.example".to_string(),
                 enrollment: EnrollmentTransferBundle {
                     receiver_instance_id: InstanceId::new(),
+                    receiver_display_name: PeerDisplayName::parse("peer").unwrap(),
+                    receiver_base_url: "https://peer.example".parse().unwrap(),
                     caller_instance_id: InstanceId::new(),
                     token: format!("phx_peer_{}", "a".repeat(43)),
                     tls_trust: PeerTlsTrust::PlatformRoots,
@@ -397,6 +2310,257 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    struct EnrollmentReceiver {
+        _certificates: tempfile::TempDir,
+        instance_id: InstanceId,
+        origin: PeerBaseUrl,
+        trust: PeerTlsTrust,
+        shutdown: tokio_util::sync::CancellationToken,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl EnrollmentReceiver {
+        async fn stop(self) {
+            self.shutdown.cancel();
+            self.server.await.unwrap();
+        }
+    }
+
+    async fn start_enrollment_receiver(
+        caller_instance_id: InstanceId,
+        token: &str,
+    ) -> EnrollmentReceiver {
+        let certificates = tempfile::tempdir().unwrap();
+        let mut tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+            dir: certificates.path().to_path_buf(),
+            hosts: vec!["localhost".to_string()],
+        })
+        .unwrap();
+        tls.server.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let certificate_pem = phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+            std::fs::read_to_string(tls.ca_cert_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let trust = PeerTlsTrust::PrivateCa { certificate_pem };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let instance_id = state.db.instance_id().await.unwrap();
+        state
+            .db
+            .replace_federation_enrollment(
+                caller_instance_id,
+                "caller",
+                &FederationCredentialVerifier::from_bearer(token.as_bytes()),
+            )
+            .await
+            .unwrap();
+        let app = crate::api::handlers::create_router(state);
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls.server));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            let accepted = tokio::select! {
+                () = server_shutdown.cancelled() => None,
+                accepted = listener.accept() => Some(accepted.unwrap()),
+            };
+            let Some((stream, _)) = accepted else {
+                return;
+            };
+            let Ok(stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let service = hyper_util::service::TowerToHyperService::new(app);
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+        });
+
+        EnrollmentReceiver {
+            _certificates: certificates,
+            instance_id,
+            origin,
+            trust,
+            shutdown,
+            server,
+        }
+    }
+
+    fn enrollment_bundle(
+        receiver_instance_id: InstanceId,
+        receiver_base_url: PeerBaseUrl,
+        caller_instance_id: InstanceId,
+        token: String,
+        tls_trust: PeerTlsTrust,
+    ) -> EnrollmentTransferBundle {
+        EnrollmentTransferBundle {
+            receiver_instance_id,
+            receiver_display_name: PeerDisplayName::parse("receiver").unwrap(),
+            receiver_base_url,
+            caller_instance_id,
+            token,
+            tls_trust,
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_import_verifies_authenticated_destination_before_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let token = format!("phx_peer_{}", "a".repeat(43));
+        let receiver = start_enrollment_receiver(caller_instance_id, &token).await;
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    receiver.instance_id,
+                    receiver.origin.clone(),
+                    caller_instance_id,
+                    token.clone(),
+                    receiver.trust.clone(),
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = caller_state
+            .db
+            .federation_peer_connection(receiver.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.peer_display_name, "receiver");
+        assert_eq!(saved.base_url, receiver.origin);
+        assert_eq!(saved.bearer_credential.expose(), token.as_str());
+        receiver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_import_rejects_wrong_destination_without_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let token = format!("phx_peer_{}", "b".repeat(43));
+        let receiver = start_enrollment_receiver(caller_instance_id, &token).await;
+        let claimed_receiver = InstanceId::new();
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    claimed_receiver,
+                    receiver.origin.clone(),
+                    caller_instance_id,
+                    token,
+                    receiver.trust.clone(),
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(caller_state
+            .db
+            .federation_peer_connection(claimed_receiver)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(caller_state
+            .db
+            .federation_peer_connection(receiver.instance_id)
+            .await
+            .unwrap()
+            .is_none());
+        receiver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_import_rejects_offline_destination_without_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let receiver_instance_id = InstanceId::new();
+        let offline = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let receiver_base_url =
+            format!("https://localhost:{}", offline.local_addr().unwrap().port())
+                .parse()
+                .unwrap();
+        drop(offline);
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    receiver_instance_id,
+                    receiver_base_url,
+                    caller_instance_id,
+                    format!("phx_peer_{}", "c".repeat(43)),
+                    PeerTlsTrust::PlatformRoots,
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(caller_state
+            .db
+            .federation_peer_connection(receiver_instance_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_import_rejects_untrusted_tls_without_saving() {
+        let caller_state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let caller_instance_id = caller_state.db.instance_id().await.unwrap();
+        let token = format!("phx_peer_{}", "d".repeat(43));
+        let receiver = start_enrollment_receiver(caller_instance_id, &token).await;
+        let unrelated_certificates = tempfile::tempdir().unwrap();
+        let unrelated = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+            dir: unrelated_certificates.path().to_path_buf(),
+            hosts: vec!["localhost".to_string()],
+        })
+        .unwrap();
+        let certificate_pem = phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+            std::fs::read_to_string(unrelated.ca_cert_path.unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let response = import_peer_connection(
+            OwnerAuthenticated,
+            State(caller_state.clone()),
+            Json(ImportPeerConnectionRequest {
+                enrollment: enrollment_bundle(
+                    receiver.instance_id,
+                    receiver.origin.clone(),
+                    caller_instance_id,
+                    token,
+                    PeerTlsTrust::PrivateCa { certificate_pem },
+                ),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(caller_state
+            .db
+            .federation_peer_connection(receiver.instance_id)
+            .await
+            .unwrap()
+            .is_none());
+        receiver.stop().await;
     }
 
     #[tokio::test]
@@ -435,8 +2599,70 @@ mod tests {
         server.await.unwrap();
     }
 
+    fn spawn_redirect_assertion_server(
+        source: tokio::net::TcpListener,
+        target: Option<tokio::net::TcpListener>,
+        acceptor: tokio_rustls::TlsAcceptor,
+        status: &'static str,
+        redirect_port: u16,
+        send_message: bool,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+            let (stream, _) = source.accept().await.unwrap();
+            let stream = acceptor.accept(stream).await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = Vec::new();
+            stream.read_until(b'\n', &mut request).await.unwrap();
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_until(b'\n', &mut request).await.unwrap();
+            }
+            let request = String::from_utf8(request).unwrap();
+            let operation = if send_message {
+                "send-conversation-message"
+            } else {
+                "query-database"
+            };
+            assert!(request.starts_with(&format!("POST /api/federation/peer/{operation} ")));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nLocation: https://localhost:{redirect_port}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            drop(stream);
+
+            tokio::select! {
+                accepted = async {
+                    match target {
+                        Some(target) => target.accept().await,
+                        None => source.accept().await,
+                    }
+                } => {
+                    accepted.unwrap();
+                    true
+                }
+                result = done_rx => {
+                    result.unwrap();
+                    false
+                }
+            }
+        });
+        (done_tx, server)
+    }
+
     #[tokio::test]
-    async fn authenticated_remote_query_does_not_follow_307_or_308() {
+    async fn authenticated_remote_query_and_send_do_not_follow_307_or_308() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let peer = InstanceId::new();
         let token = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
@@ -445,9 +2671,11 @@ mod tests {
         ))
         .unwrap();
 
-        for (status, cross_origin) in [
-            ("307 Temporary Redirect", false),
-            ("308 Permanent Redirect", true),
+        for (status, cross_origin, send_message) in [
+            ("307 Temporary Redirect", false, false),
+            ("308 Permanent Redirect", true, false),
+            ("307 Temporary Redirect", false, true),
+            ("308 Permanent Redirect", true, true),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let mut loaded = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
@@ -473,49 +2701,14 @@ mod tests {
                 listener.local_addr().unwrap().port()
             });
             let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(loaded.server));
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            let server = tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-                let (stream, _) = source.accept().await.unwrap();
-                let stream = acceptor.accept(stream).await.unwrap();
-                let mut stream = tokio::io::BufReader::new(stream);
-                let mut request = Vec::new();
-                stream.read_until(b'\n', &mut request).await.unwrap();
-                while !request.ends_with(b"\r\n\r\n") {
-                    stream.read_until(b'\n', &mut request).await.unwrap();
-                }
-                let request = String::from_utf8(request).unwrap();
-                assert!(request.starts_with("POST /api/federation/peer/query-database "));
-                assert!(request
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer "));
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\nLocation: https://localhost:{redirect_port}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                drop(stream);
-
-                tokio::select! {
-                    accepted = async {
-                        match target {
-                            Some(target) => target.accept().await,
-                            None => source.accept().await,
-                        }
-                    } => {
-                        accepted.unwrap();
-                        true
-                    }
-                    result = done_rx => {
-                        result.unwrap();
-                        false
-                    }
-                }
-            });
+            let (done_tx, server) = spawn_redirect_assertion_server(
+                source,
+                target,
+                acceptor,
+                status,
+                redirect_port,
+                send_message,
+            );
             state
                 .db
                 .save_federation_peer_connection(
@@ -530,7 +2723,30 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = query_remote_database(&state.db, peer, "SELECT 1").await;
+            let result = if send_message {
+                let connection = state
+                    .db
+                    .federation_peer_connection(peer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                send_remote_conversation_message(
+                    &state.db,
+                    &connection,
+                    &RemoteSendMessageRequest {
+                        destination_instance_id: peer,
+                        target: RemoteSendTarget::Coordinator {},
+                        message_id: uuid::Uuid::new_v4(),
+                        message: RemoteMessageText::parse("redirect test".into()).unwrap(),
+                    },
+                )
+                .await
+                .map(|_| ())
+            } else {
+                query_remote_database(&state.db, peer, "SELECT 1")
+                    .await
+                    .map(|_| ())
+            };
             assert!(matches!(
                 result,
                 Err(FederationClientError::RemoteRejected(detail))
@@ -560,8 +2776,156 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            decode_remote_query_response(StatusCode::OK, &body, destination, expected_caller),
+            decode_remote_query_response(
+                StatusCode::OK,
+                &body,
+                destination,
+                expected_caller,
+                "test-bearer",
+            ),
             Err(FederationClientError::CallerMismatch)
+        ));
+    }
+
+    fn query_response_body(
+        destination: InstanceId,
+        caller: InstanceId,
+        columns: &serde_json::Value,
+        rows: &serde_json::Value,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "destination_instance_id": destination,
+            "caller_instance_id": caller,
+            "result": {
+                "columns": columns,
+                "rows": rows,
+                "truncated": false,
+                "row_limit": 200,
+                "byte_limit": 64 * 1024,
+                "elapsed_ms": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_query_success_rejects_bearer_in_text_value() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let bearer = "phx_peer_reflected_value";
+        let body = query_response_body(
+            destination,
+            caller,
+            &serde_json::json!(["value"]),
+            &serde_json::json!([[{
+                "type": "text",
+                "value": format!("prefix-{bearer}-suffix")
+            }]]),
+        );
+
+        assert!(matches!(
+            decode_remote_query_response(StatusCode::OK, &body, destination, caller, bearer),
+            Err(FederationClientError::CredentialReflection)
+        ));
+    }
+
+    #[test]
+    fn remote_query_success_rejects_bearer_in_column_name() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let bearer = "phx_peer_reflected_column";
+        let body = query_response_body(
+            destination,
+            caller,
+            &serde_json::json!([format!("alias-{bearer}")]),
+            &serde_json::json!([[{"type": "integer", "value": 7}]]),
+        );
+
+        assert!(matches!(
+            decode_remote_query_response(StatusCode::OK, &body, destination, caller, bearer),
+            Err(FederationClientError::CredentialReflection)
+        ));
+    }
+
+    #[test]
+    fn remote_query_success_preserves_non_secret_data() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let body = query_response_body(
+            destination,
+            caller,
+            &serde_json::json!(["label", "count"]),
+            &serde_json::json!([[
+                {"type": "text", "value": "ordinary remote data"},
+                {"type": "integer", "value": 7}
+            ]]),
+        );
+
+        let response = decode_remote_query_response(
+            StatusCode::OK,
+            &body,
+            destination,
+            caller,
+            "phx_peer_not_present",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(response.result).unwrap(),
+            serde_json::json!({
+                "columns": ["label", "count"],
+                "rows": [[
+                    {"type": "text", "value": "ordinary remote data"},
+                    {"type": "integer", "value": 7}
+                ]],
+                "truncated": false,
+                "row_limit": 200,
+                "byte_limit": 64 * 1024,
+                "elapsed_ms": 0
+            })
+        );
+    }
+
+    #[test]
+    fn remote_search_rejects_hit_from_wrong_source_instance() {
+        use phoenix_core::domain::{
+            close::TranscriptConversationId,
+            conversation_reference::{MessageId, QualifiedConversationReference},
+        };
+
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let body = serde_json::to_vec(&RemoteSearchResponse {
+            destination_instance_id: destination,
+            caller_instance_id: caller,
+            hits: vec![crate::api::global_read::QualifiedSearchHit {
+                source: QualifiedConversationReference::new(
+                    InstanceId::new(),
+                    ConversationReferenceTarget::Message {
+                        transcript_id: TranscriptConversationId::parse("remote-transcript")
+                            .unwrap(),
+                        message_id: MessageId::parse("remote-message").unwrap(),
+                    },
+                ),
+                source_navigation: Some(
+                    crate::api::global_read::QualifiedSearchNavigation::AppLocal {
+                        path:
+                            "/c/remote?source_transcript=remote-transcript#message-remote-message"
+                                .to_string(),
+                    },
+                ),
+                stable_conversation: None,
+                stable_navigation: None,
+                role: "assistant".to_string(),
+                sender: None,
+                created_at: chrono::Utc::now(),
+                snippet: "evidence".to_string(),
+            }],
+        })
+        .unwrap();
+
+        assert!(matches!(
+            decode_remote_search_response(StatusCode::OK, &body, destination, caller),
+            Err(FederationClientError::SearchProvenanceMismatch)
         ));
     }
 
@@ -584,6 +2948,7 @@ mod tests {
             br#"{"error":"specific SQL diagnostic"}"#,
             expected_destination,
             InstanceId::new(),
+            "test-bearer",
         );
 
         assert!(matches!(
@@ -651,6 +3016,7 @@ mod tests {
         let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let response = query_database_with_admission(
             PeerAuthenticated {
+                enrollment_id: uuid::Uuid::new_v4(),
                 caller_instance_id: InstanceId::new(),
                 caller_display_name: "peer".to_string(),
             },

@@ -2961,6 +2961,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2988,6 +2989,7 @@ dependencies = [
  "phoenix-tls",
  "phoenix-workflow",
  "rand 0.10.1",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3230,6 +3232,7 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pki-types",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4052,10 +4055,12 @@ version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "schemars_derive",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

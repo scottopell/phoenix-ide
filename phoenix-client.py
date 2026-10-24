@@ -21,15 +21,23 @@ REQ-CLI-009: Interaction (--respond, --dismiss-question, --dismiss-error, --canc
 REQ-CLI-010: Introspection (--diff, --git-status, --usage, --system-prompt, --tasks, --proposals)
 REQ-CLI-011: Discovery (--list-conversations, --search-conversations)
 REQ-CLI-012: Platform & Config (--version, --deployment, --env, --mcp-status, --usage-overview, --trajectory-export)
+REQ-CLI-013: Owner-mediated peer operations (--instance)
+REQ-CLI-014: Safe peer notes
+REQ-CLI-015: Remote subscription management
+REQ-CLI-016: Federation OpenAPI reference
 """
 
 import base64
+from contextlib import contextmanager
 import json
+import math
+from typing import Literal, TypedDict, cast
+from uuid import UUID, uuid4
 import os
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import click
 import httpx
@@ -39,6 +47,342 @@ from httpx_sse import connect_sse
 class PhoenixError(Exception):
     """Phoenix API error."""
     pass
+
+
+class ProductTarget(TypedDict):
+    kind: Literal['product_conversation']
+    product_conversation_id: str
+
+
+class TranscriptTarget(TypedDict):
+    kind: Literal['transcript']
+    transcript_id: str
+
+
+class MessageTarget(TypedDict):
+    kind: Literal['message']
+    transcript_id: str
+    message_id: str
+
+
+class CoordinatorTarget(TypedDict):
+    kind: Literal['coordinator']
+
+
+SendTarget = ProductTarget | TranscriptTarget | CoordinatorTarget
+ReadTarget = SendTarget | MessageTarget
+
+
+class QualifiedReference(TypedDict):
+    instance_id: str
+    target: ReadTarget
+
+
+class PeerConnection(TypedDict):
+    peer_instance_id: str
+    peer_display_name: str
+    base_url: str
+    created_at: str
+
+
+class PeerNotes(TypedDict):
+    notes: str
+
+
+OpenApiDocument = TypedDict('OpenApiDocument', {
+    'openapi': str, 'info': dict, 'x-phoenix-instance-id': str,
+    'paths': dict, 'components': dict,
+})
+
+
+class PeerOpenApi(TypedDict):
+    destination_instance_id: str
+    document: OpenApiDocument
+
+
+class RemoteQueryResult(TypedDict):
+    destination_instance_id: str
+    caller_instance_id: str
+    result: dict
+
+
+class RemoteSearchResult(TypedDict):
+    destination_instance_id: str
+    hits: list[dict]
+
+
+class RemoteReadResult(TypedDict):
+    requested: QualifiedReference
+    resolved: QualifiedReference
+    stable_conversation: QualifiedReference | None
+    evidence: list[QualifiedReference]
+    content: str
+    next_cursor: int | None
+    source_navigation: dict
+    stable_navigation: dict | None
+
+
+class RemoteResolution(TypedDict):
+    reference: QualifiedReference
+    href: str | None
+    title: str | None
+    work_scope: dict
+    path_owner_instance_id: str | None
+    related_references: list[QualifiedReference]
+    source_call: dict | None
+    summary: str
+
+
+class RemoteSendResult(TypedDict):
+    destination_instance_id: str
+    caller_instance_id: str
+    target: SendTarget
+    message_id: str
+    receipt: dict
+
+
+class SubscriptionReference(TypedDict):
+    instance_id: str
+    product_conversation_id: str
+
+
+class RemoteSubscription(TypedDict):
+    reference: SubscriptionReference
+    subscription_id: str
+    state: Literal['active', 'unsubscribed', 'revoked', 'source_closed']
+    admitted_cursor: int
+    enrolled: bool
+    pending_unsubscribe: bool
+
+
+class RemoteWatchResult(RemoteSubscription):
+    snapshot: dict
+
+
+class RemoteSyncResult(TypedDict):
+    synced_once: Literal[True]
+
+
+class RemoteUnwatchResult(TypedDict):
+    reference: SubscriptionReference
+    subscription_id: str
+    local_stopped: Literal[True]
+    remote_confirmed: bool
+
+
+def _require(valid: bool) -> None:
+    if not valid:
+        raise PhoenixError('Invalid owner federation response.')
+
+
+def _fields(value: object, names: str) -> dict:
+    _require(isinstance(value, dict) and set(value) == set(names.split()))
+    return cast(dict, value)
+
+
+def _text(value: object, nonempty: bool = False) -> str:
+    _require(isinstance(value, str) and (not nonempty or bool(value.strip())))
+    return cast(str, value)
+
+
+def _source_tool_call(value: object) -> None:
+    if value is not None:
+        call = _fields(value, 'message_id tool_use_id')
+        for key in ('message_id', 'tool_use_id'):
+            _text(call[key], True)
+            _require(len(call[key].encode('utf-8')) <= 1024)
+
+
+def _uuid(value: object) -> str:
+    _text(value, True)
+    try:
+        return str(UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        raise PhoenixError('Invalid UUID.') from None
+
+
+def _instance_id(value: object) -> str:
+    identity = _uuid(value)
+    _require(UUID(identity).version == 4)
+    return identity
+
+
+def _nonnegative(value: object) -> int:
+    _require(type(value) is int and value >= 0)
+    return cast(int, value)
+
+
+def _items(value: object) -> list:
+    _require(isinstance(value, list))
+    return cast(list, value)
+
+
+def _target(value: object, send: bool = False) -> ReadTarget:
+    _require(isinstance(value, dict))
+    kind = value.get('kind')
+    keys = {
+        'product_conversation': 'product_conversation_id',
+        'transcript': 'transcript_id',
+        'message': 'transcript_id message_id',
+        'coordinator': '',
+    }
+    _require(isinstance(kind, str) and kind in keys and not (send and kind == 'message'))
+    fields = keys[kind]
+    _fields(value, 'kind ' + fields)
+    for name in fields.split():
+        _text(value[name], True)
+    return cast(ReadTarget, value)
+
+
+def _reference(value: object, instance: str | None = None) -> QualifiedReference:
+    value = _fields(value, 'instance_id target')
+    identity = _instance_id(value['instance_id'])
+    _require(instance is None or identity == instance)
+    _target(value['target'])
+    return cast(QualifiedReference, value)
+
+
+def _peer_url(value: object, base: bool = False) -> None:
+    url = urlsplit(_text(value, True))
+    _require(url.scheme == 'https' and bool(url.hostname) and url.username is None and url.password is None)
+    if base:
+        _require(not url.query and not url.fragment)
+
+
+def _navigation(value: object, optional: bool = False) -> None:
+    if value is None and optional:
+        return
+    _require(isinstance(value, dict))
+    kind = value.get('kind')
+    _require(kind == 'peer')
+    _fields(value, 'kind url')
+    _peer_url(value['url'])
+
+
+def _subscription_reference(value: object) -> SubscriptionReference:
+    value = _fields(value, 'instance_id product_conversation_id')
+    _instance_id(value['instance_id'])
+    _text(value['product_conversation_id'], True)
+    return cast(SubscriptionReference, value)
+
+
+def _subscription(value: object, watch: bool = False) -> RemoteSubscription:
+    value = _fields(value, 'reference subscription_id state admitted_cursor enrolled pending_unsubscribe'
+                    + (' snapshot' if watch else ''))
+    _subscription_reference(value['reference'])
+    _uuid(value['subscription_id'])
+    _require(value['state'] in ('active', 'unsubscribed', 'revoked', 'source_closed'))
+    _nonnegative(value['admitted_cursor'])
+    _require(type(value['enrolled']) is bool and type(value['pending_unsubscribe']) is bool)
+    if watch:
+        snapshot = _fields(value['snapshot'], 'transcript_id state')
+        _text(snapshot['transcript_id'], True)
+        state = snapshot['state']
+        _require(isinstance(state, dict))
+        if state.get('kind') == 'terminal':
+            _fields(state, 'kind outcome')
+            _require(state['outcome'] in ('completed', 'failed', 'cancelled'))
+        else:
+            _fields(state, 'kind')
+            _require(state['kind'] == 'nonterminal')
+    return cast(RemoteSubscription, value)
+
+
+def _openapi_document(value: object, instance: str | None = None) -> OpenApiDocument:
+    _require(isinstance(value, dict))
+    _require(value.get('openapi') == '3.1.0')
+    identity = _instance_id(value.get('x-phoenix-instance-id'))
+    _require(instance is None or identity == instance)
+    _require(isinstance(value.get('paths'), dict) and bool(value['paths']))
+    _require(isinstance(value.get('info'), dict) and isinstance(value.get('components'), dict))
+    for key in ('title', 'version', 'description'):
+        _text(value['info'].get(key))
+    for key in ('schemas', 'securitySchemes'):
+        _require(isinstance(value['components'].get(key), dict))
+    return cast(OpenApiDocument, value)
+
+
+def _validate_query_cell(cell: object) -> None:
+    _require(isinstance(cell, dict))
+    kind = cell.get('type')
+    _require(kind in ('null', 'integer', 'real', 'text', 'blob'))
+    _fields(cell, 'type' if kind == 'null' else 'type value')
+    if kind == 'integer':
+        _require(type(cell['value']) is int and -(2**63) <= cell['value'] < 2**63)
+    elif kind == 'text':
+        _text(cell['value'])
+    elif kind == 'blob':
+        _nonnegative(_fields(cell['value'], 'bytes')['bytes'])
+    elif kind == 'real':
+        real = cell['value']
+        _require(isinstance(real, dict))
+        tag = real.get('kind')
+        _require(tag in ('finite', 'positive_infinity', 'negative_infinity', 'nan'))
+        _fields(real, 'kind value' if tag == 'finite' else 'kind')
+        if tag == 'finite':
+            _require(type(real['value']) in (int, float) and math.isfinite(real['value']))
+
+
+def _validate_work_scope(scope: object) -> None:
+    _require(isinstance(scope, dict))
+    status = scope.get('status')
+    _require(status in ('missing', 'unavailable', 'available'))
+    if status == 'missing':
+        _fields(scope, 'status')
+    elif status == 'unavailable':
+        _fields(scope, 'status work_scope_id reason')
+        _text(scope['work_scope_id'], True)
+        _require(scope['reason'] in ('record_not_found', 'invalid_record', 'read_failed'))
+    else:
+        _fields(scope, 'status work_scope_id lifecycle environment_kind cwd worktree_path effective_path path_semantics')
+        _text(scope['work_scope_id'], True)
+        _require(scope['lifecycle'] in ('active', 'retired'))
+        _require(scope['environment_kind'] in ('coordinator_home', 'allocated_worktree', 'unowned_cwd', 'none'))
+        _require(scope['path_semantics'] == 'server_filesystem')
+        for key in ('cwd', 'worktree_path', 'effective_path'):
+            if scope[key] is not None:
+                _text(scope[key])
+
+
+def _validate_send_receipt(receipt: object, peer: str, target: SendTarget) -> None:
+    _require(isinstance(receipt, dict))
+    outcome = receipt.get('outcome')
+    _require(outcome in ('accepted', 'duplicate', 'rejected'))
+    if outcome == 'rejected':
+        _fields(receipt, 'outcome code message')
+        _require(receipt['code'] in ('destination_mismatch', 'invalid_target', 'sender_not_allowed',
+                                   'target_not_found', 'idempotency_conflict', 'target_unavailable',
+                                   'admission_rejected', 'busy', 'internal'))
+        _text(receipt['message'])
+        # The owner route uses this same static diagnostic; don't trust free text.
+        receipt['message'] = 'destination rejected message'
+        return
+    _fields(receipt, 'outcome acceptance')
+    acceptance = _fields(receipt['acceptance'], 'accepting_transcript stable_destination stable_navigation accepting_transcript_navigation accepting_message_navigation disposition')
+    _text(acceptance['accepting_transcript'], True)
+    destination = _subscription_reference(acceptance['stable_destination'])
+    _require(_instance_id(destination['instance_id']) == peer)
+    if target['kind'] == 'product_conversation':
+        _require(destination['product_conversation_id'] == target['product_conversation_id'])
+    if target['kind'] == 'transcript':
+        _require(acceptance['accepting_transcript'] == target['transcript_id'])
+    _require(acceptance['disposition'] in ('delivered', 'queued'))
+    for key in ('stable_navigation', 'accepting_transcript_navigation', 'accepting_message_navigation'):
+        _navigation(acceptance[key])
+
+
+@contextmanager
+def _safe_owner_operation():
+    try:
+        yield
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        raise PhoenixError('Owner federation operation failed; no local fallback.') from None
+
+
+def _owner_json(response: httpx.Response) -> object:
+    # Never expose an error body, URL, transport exception, or credential.
+    response.raise_for_status()
+    return response.json()
 
 
 def _state_kind(state: object) -> str:
@@ -163,7 +507,7 @@ class PhoenixClient:
             # Password was provided but didn't work
             raise PhoenixError(
                 "Authentication failed: incorrect password. "
-                "Check PHOENIX_PASSWORD or --password value."
+                "Check PHOENIX_PASSWORD."
             )
         # No password provided -- prompt
         import getpass
@@ -225,6 +569,286 @@ class PhoenixClient:
         )
         resp.raise_for_status()
         return resp.json().get('hits', [])
+
+
+    def list_peer_connections(self) -> list[PeerConnection]:
+        """Credential-free summaries from the local owner's saved peer registry."""
+        with _safe_owner_operation():
+            rows = _items(_owner_json(self.http.get(f'{self.base_url}/api/federation/peers')))
+            identities = set()
+            for row in rows:
+                _fields(row, 'peer_instance_id peer_display_name base_url created_at')
+                identity = _instance_id(row['peer_instance_id'])
+                _require(identity not in identities)
+                identities.add(identity)
+                for key in ('peer_display_name', 'base_url', 'created_at'):
+                    _text(row[key], True)
+                _peer_url(row['base_url'], base=True)
+            return cast(list[PeerConnection], rows)
+
+    def _peer_instance(self, instance: str) -> str:
+        if not isinstance(instance, str) or not instance.strip():
+            raise PhoenixError('A nonempty instance is required; no local fallback.')
+        selector = instance.strip()
+        try:
+            return _instance_id(selector)
+        except PhoenixError:
+            matches = [peer['peer_instance_id'] for peer in self.list_peer_connections()
+                       if peer['peer_display_name'] == selector]
+            if len(matches) != 1:
+                raise PhoenixError('Unknown or ambiguous peer instance; no local fallback.')
+            return _instance_id(matches[0])
+
+    def get_peer_notes(self, instance: str) -> PeerNotes:
+        peer = self._peer_instance(instance)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.get(
+                f'{self.base_url}/api/federation/peers/{quote(peer, safe="")}/notes'
+            )), 'notes')
+            _text(value['notes'])
+            _require(len(value['notes'].encode('utf-8')) <= 32768)
+            return cast(PeerNotes, value)
+
+    def set_peer_notes(self, notes: str, instance: str) -> PeerNotes:
+        """Replace inert notes, without changing any peer connection authority."""
+        try:
+            valid = isinstance(notes, str) and len(notes.encode('utf-8')) <= 32768
+        except UnicodeError:
+            valid = False
+        if not valid:
+            raise PhoenixError('Notes must be text of at most 32768 UTF-8 bytes.')
+        peer = self._peer_instance(instance)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.put(
+                f'{self.base_url}/api/federation/peers/{quote(peer, safe="")}/notes',
+                json={'notes': notes},
+            )), 'notes')
+            _require(value['notes'] == notes)
+            return cast(PeerNotes, value)
+
+    def remote_query_database(self, sql: str, instance: str) -> RemoteQueryResult:
+        peer = self._peer_instance(instance)
+        _text(sql, True)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.post(
+                f'{self.base_url}/api/federation/query-database',
+                json={'instance': peer, 'sql': sql},
+            )), 'destination_instance_id caller_instance_id result')
+            _require(_instance_id(value['destination_instance_id']) == peer)
+            _require(_instance_id(value['caller_instance_id']) != peer)
+            result = _fields(value['result'], 'columns rows truncated row_limit byte_limit elapsed_ms')
+            columns = _items(result['columns'])
+            for column in columns:
+                _text(column)
+            _require(type(result['truncated']) is bool)
+            for key in ('row_limit', 'byte_limit', 'elapsed_ms'):
+                _nonnegative(result[key])
+            for row in _items(result['rows']):
+                _require(len(_items(row)) == len(columns))
+                for cell in row:
+                    _validate_query_cell(cell)
+            return cast(RemoteQueryResult, value)
+
+    def remote_search_messages(self, query: str, instance: str) -> RemoteSearchResult:
+        """Qualified peer message search, distinct from local conversation search."""
+        peer = self._peer_instance(instance)
+        _text(query, True)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.post(
+                f'{self.base_url}/api/federation/search-conversations',
+                json={'instance': peer, 'query': query},
+            )), 'destination_instance_id hits')
+            _require(_instance_id(value['destination_instance_id']) == peer)
+            for hit in _items(value['hits']):
+                _fields(hit, 'source source_navigation stable_conversation stable_navigation role sender created_at snippet')
+                _reference(hit['source'], peer)
+                _require(hit['source']['target']['kind'] == 'message')
+                if hit['stable_conversation'] is not None:
+                    _reference(hit['stable_conversation'], peer)
+                    _require(hit['stable_conversation']['target']['kind'] == 'product_conversation')
+                _navigation(hit['source_navigation'], optional=True)
+                _navigation(hit['stable_navigation'], optional=hit['stable_conversation'] is None)
+                _require((hit['stable_conversation'] is None) == (hit['stable_navigation'] is None))
+                for key in ('role', 'created_at', 'snippet'):
+                    _text(hit[key])
+                if hit['sender'] is not None:
+                    sender = _fields(hit['sender'], 'stable exact source_call')
+                    _reference(sender['stable'])
+                    _reference(sender['exact'], _instance_id(sender['stable']['instance_id']))
+                    _require(sender['stable']['target']['kind'] in ('product_conversation', 'coordinator'))
+                    _require(sender['exact']['target']['kind'] == 'transcript')
+                    _source_tool_call(sender['source_call'])
+            return cast(RemoteSearchResult, value)
+
+    def remote_read_conversation(self, target: ReadTarget, cursor: int, instance: str) -> RemoteReadResult:
+        peer = self._peer_instance(instance)
+        _target(target)
+        _nonnegative(cursor)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.post(
+                f'{self.base_url}/api/federation/read-conversation',
+                json={'instance': peer, 'target': target, 'cursor': cursor},
+            )), 'requested resolved stable_conversation evidence content next_cursor source_navigation stable_navigation')
+            _reference(value['requested'], peer)
+            _require(value['requested']['target'] == target)
+            _reference(value['resolved'], peer)
+            if target['kind'] == 'product_conversation':
+                _require(value['resolved']['target']['kind'] == 'transcript')
+            else:
+                _require(value['resolved']['target'] == target)
+            if value['stable_conversation'] is not None:
+                _reference(value['stable_conversation'], peer)
+                _require(value['stable_conversation']['target']['kind'] == 'product_conversation')
+            if target['kind'] == 'product_conversation':
+                _require(value['stable_conversation'] is not None
+                         and value['stable_conversation']['target'] == target)
+            for reference in _items(value['evidence']):
+                _reference(reference, peer)
+            _text(value['content'])
+            if value['next_cursor'] is not None:
+                _require(_nonnegative(value['next_cursor']) > cursor)
+            _navigation(value['source_navigation'])
+            _navigation(value['stable_navigation'], optional=value['stable_conversation'] is None)
+            _require((value['stable_conversation'] is None) == (value['stable_navigation'] is None))
+            return cast(RemoteReadResult, value)
+
+    def remote_resolve_reference(self, reference: str, instance: str) -> RemoteResolution:
+        """Return server paths as opaque strings; never inspect this host's filesystem."""
+        peer = self._peer_instance(instance)
+        _text(reference, True)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.post(
+                f'{self.base_url}/api/federation/resolve-reference',
+                json={'instance': peer, 'reference': reference},
+            )), 'reference href title work_scope path_owner_instance_id related_references source_call summary')
+            _source_tool_call(value['source_call'])
+            _reference(value['reference'], peer)
+            resolved_target = value['reference']['target']
+            if reference.startswith('@conv:'):
+                _require(resolved_target['kind'] == 'product_conversation')
+                _require(reference == '@conv:' + resolved_target['product_conversation_id'])
+            elif reference.startswith('@transcript:'):
+                _require(resolved_target['kind'] in ('transcript', 'message'))
+                expected = '@transcript:' + resolved_target['transcript_id']
+                if resolved_target['kind'] == 'message':
+                    expected += '#message-' + resolved_target['message_id']
+                _require(reference == expected)
+            for related in _items(value['related_references']):
+                _reference(related)
+            for key in ('href', 'title'):
+                if value[key] is not None:
+                    _text(value[key])
+            if value['href'] is not None:
+                _peer_url(value['href'])
+            _text(value['summary'])
+            _validate_work_scope(value['work_scope'])
+            if value['path_owner_instance_id'] is not None:
+                _require(_instance_id(value['path_owner_instance_id']) == peer)
+            _require((value['work_scope']['status'] == 'available')
+                     == (value['path_owner_instance_id'] is not None))
+            return cast(RemoteResolution, value)
+
+    def remote_send_conversation_message(
+        self, target: SendTarget, message: str, message_id: str, instance: str,
+    ) -> RemoteSendResult:
+        """Single attempt only. Reuse the supplied UUID if acceptance is uncertain."""
+        peer = self._peer_instance(instance)
+        _target(target, send=True)
+        _text(message, True)
+        identity = _uuid(message_id)
+        try:
+            with _safe_owner_operation():
+                value = _fields(_owner_json(self.http.post(
+                    f'{self.base_url}/api/federation/send-conversation-message',
+                    json={'instance': peer, 'target': target, 'message': message, 'message_id': message_id},
+                )), 'destination_instance_id caller_instance_id target message_id receipt')
+                _require(_instance_id(value['destination_instance_id']) == peer)
+                _require(_instance_id(value['caller_instance_id']) != peer)
+                _target(value['target'], send=True)
+                _require(value['target'] == target and _uuid(value['message_id']) == identity)
+                _validate_send_receipt(value['receipt'], peer, target)
+                return cast(RemoteSendResult, value)
+        except PhoenixError:
+            raise PhoenixError(
+                'Remote send outcome is uncertain. Retry only with the same message_id and payload; '
+                'no automatic retry or local fallback.'
+            ) from None
+
+    def remote_watch_conversation(self, product_id: str, instance: str) -> RemoteWatchResult:
+        peer = self._peer_instance(instance)
+        _text(product_id, True)
+        reference = {'instance_id': peer, 'product_conversation_id': product_id}
+        existing = [row for row in self.list_remote_subscriptions()
+                    if row['reference'] == reference and (row['state'] == 'active' or row['pending_unsubscribe'])]
+        if len(existing) > 1 or any(row['pending_unsubscribe'] for row in existing):
+            raise PhoenixError('Remote subscription is ambiguous or has an unconfirmed unsubscribe.')
+        identity = existing[0]['subscription_id'] if existing else str(uuid4())
+        with _safe_owner_operation():
+            value = _owner_json(self.http.post(
+                f'{self.base_url}/api/federation/subscriptions/create',
+                json={'instance': peer, 'product_conversation_id': product_id, 'subscription_id': identity},
+            ))
+            _subscription(value, watch=True)
+            _require(value['reference'] == reference and _uuid(value['subscription_id']) == _uuid(identity))
+            return cast(RemoteWatchResult, value)
+
+    def list_remote_subscriptions(self) -> list[RemoteSubscription]:
+        with _safe_owner_operation():
+            rows = _items(_owner_json(self.http.get(f'{self.base_url}/api/federation/subscriptions')))
+            identities = set()
+            for row in rows:
+                _subscription(row)
+                key = (_instance_id(row['reference']['instance_id']), _uuid(row['subscription_id']))
+                _require(key not in identities)
+                identities.add(key)
+            return cast(list[RemoteSubscription], rows)
+
+    def _remote_subscription(self, id: str) -> RemoteSubscription:
+        identity = _uuid(id)
+        rows = [row for row in self.list_remote_subscriptions() if _uuid(row['subscription_id']) == identity]
+        if len(rows) != 1:
+            raise PhoenixError('Unknown or ambiguous remote subscription; no local fallback.')
+        return rows[0]
+
+    def sync_remote_subscription(self, id: str) -> RemoteSyncResult:
+        row = self._remote_subscription(id)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.post(
+                f'{self.base_url}/api/federation/subscriptions/sync-once',
+                json={'instance': row['reference']['instance_id'],
+                      'product_conversation_id': row['reference']['product_conversation_id'],
+                      'subscription_id': row['subscription_id']},
+            )), 'synced_once')
+            _require(value['synced_once'] is True)
+            return cast(RemoteSyncResult, value)
+
+    def remote_unwatch_subscription(self, id: str) -> RemoteUnwatchResult:
+        row = self._remote_subscription(id)
+        with _safe_owner_operation():
+            value = _fields(_owner_json(self.http.post(
+                f'{self.base_url}/api/federation/subscriptions/unsubscribe',
+                json={'instance': row['reference']['instance_id'],
+                      'product_conversation_id': row['reference']['product_conversation_id'],
+                      'subscription_id': row['subscription_id']},
+            )), 'reference subscription_id local_stopped remote_confirmed')
+            _subscription_reference(value['reference'])
+            _require(value['reference'] == row['reference'])
+            _require(_uuid(value['subscription_id']) == _uuid(row['subscription_id']))
+            _require(value['local_stopped'] is True and type(value['remote_confirmed']) is bool)
+            return cast(RemoteUnwatchResult, value)
+
+    def get_openapi(self, instance: str | None = None) -> OpenApiDocument | PeerOpenApi:
+        """Fetch the federation API reference, not the complete Phoenix API."""
+        peer = self._peer_instance(instance) if instance is not None else None
+        with _safe_owner_operation():
+            if peer is None:
+                return _openapi_document(_owner_json(self.http.get(f'{self.base_url}/openapi.json')))
+            value = _fields(_owner_json(self.http.post(
+                f'{self.base_url}/api/federation/openapi', json={'instance': peer},
+            )), 'destination_instance_id document')
+            _require(_instance_id(value['destination_instance_id']) == peer)
+            _openapi_document(value['document'], peer)
+            return cast(PeerOpenApi, value)
 
 
     def respond_to_question(
@@ -1011,14 +1635,28 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
               help='Print aggregate token usage across all conversations and exit')
 @click.option('--trajectory-export', is_flag=True,
               help='Print full trajectory export for --conversation and exit')
+@click.option('--instance', default=None, help='Saved peer UUID or unique display name; never a URL/token')
+@click.option('--list-peer-connections', is_flag=True, help='Print credential-free saved peers as JSON')
+@click.option('--get-peer-notes', is_flag=True, help='Read inert peer notes; requires --instance')
+@click.option('--set-peer-notes', default=None, metavar='TEXT', help='Replace inert peer notes; requires --instance')
+@click.option('--query-database', default=None, metavar='SQL', help='Query a peer database; requires --instance')
+@click.option('--search-messages', default=None, metavar='QUERY', help='Qualified peer message search; requires --instance')
+@click.option('--read-conversation', default=None, metavar='TARGET_JSON', help='Read a typed peer target; requires --instance')
+@click.option('--cursor', default=None, type=click.IntRange(min=0), help='Read cursor (default 0)')
+@click.option('--resolve-reference', default=None, metavar='REFERENCE', help='Resolve on a peer; paths stay server handles')
+@click.option('--send-conversation-message', default=None, metavar='TARGET_JSON', help='Send MESSAGE once to a peer; requires --instance and --message-id')
+@click.option('--message-id', default=None, metavar='UUID', help='Caller-chosen remote send UUID; reuse on uncertain outcomes')
+@click.option('--watch-conversation', default=None, metavar='PRODUCT_ID', help='Watch a peer ProductConversation')
+@click.option('--list-remote-subscriptions', is_flag=True, help='Print saved remote subscriptions as JSON')
+@click.option('--sync-remote-subscription', default=None, metavar='UUID', help='Sync one uniquely identified saved subscription')
+@click.option('--unwatch-remote-subscription', default=None, metavar='UUID', help='Stop one uniquely identified saved subscription')
+@click.option('--openapi', is_flag=True, help='Print the federation API reference (local or selected --instance)')
 @click.option('--api-url', default=None,
               help='API endpoint URL (default: auto-detect from dev.py or PHOENIX_API_URL)')
 @click.option('--timeout', default=600, help='Timeout in seconds')
 @click.option('--poll-interval', default=1.0, help='Polling interval in seconds (with --poll)')
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
-@click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
-              help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, suggest, list_conversations, search_conversations, search_limit, respond, respond_json, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, suggest, list_conversations, search_conversations, search_limit, respond, respond_json, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, instance, list_peer_connections, get_peer_notes, set_peer_notes, query_database, search_messages, read_conversation, cursor, resolve_reference, send_conversation_message, message_id, watch_conversation, list_remote_subscriptions, sync_remote_subscription, unwatch_remote_subscription, openapi):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -1047,6 +1685,93 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         # Use polling instead of SSE
         phoenix-client.py --poll "Hello"
     """
+    password = os.environ.get('PHOENIX_PASSWORD')
+    remote_actions = [
+        list_peer_connections, get_peer_notes, set_peer_notes is not None,
+        query_database is not None, search_messages is not None, read_conversation is not None,
+        resolve_reference is not None, send_conversation_message is not None,
+        watch_conversation is not None, list_remote_subscriptions,
+        sync_remote_subscription is not None, unwatch_remote_subscription is not None, openapi,
+    ]
+    if instance is not None or any(remote_actions) or cursor is not None or message_id is not None:
+        if sum(remote_actions) != 1:
+            raise click.UsageError('Select exactly one owner federation action; --instance cannot select local actions.')
+        explicit_conversation = (conversation and click.get_current_context().get_parameter_source('conversation')
+                                 == click.core.ParameterSource.COMMANDLINE)
+        if any((explicit_conversation, directory, images, model, list_models, list_projects, suggest,
+                list_conversations, search_conversations is not None, search_limit is not None,
+                respond, respond_json is not None, dismiss_question, dismiss_error,
+                cancel_steer is not None, continue_conv, diff, git_status, usage, system_prompt,
+                tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview,
+                trajectory_export, poll)):
+            raise click.UsageError('Owner federation actions cannot be combined with local actions/options.')
+        needs_instance = any((get_peer_notes, set_peer_notes is not None, query_database is not None,
+                              search_messages is not None, read_conversation is not None,
+                              resolve_reference is not None, send_conversation_message is not None,
+                              watch_conversation is not None))
+        if needs_instance and (instance is None or not instance.strip()):
+            raise click.UsageError('This action requires a nonempty --instance; no local fallback.')
+        if instance is not None and not (needs_instance or openapi):
+            raise click.UsageError('This action uses saved subscription identities or the local registry; --instance is unsupported.')
+        if cursor is not None and read_conversation is None:
+            raise click.UsageError('--cursor requires --read-conversation.')
+        if message_id is not None and send_conversation_message is None:
+            raise click.UsageError('--message-id requires --send-conversation-message.')
+        if message is not None and send_conversation_message is None:
+            raise click.UsageError('MESSAGE requires --send-conversation-message for federation actions.')
+        target = None
+        if read_conversation is not None or send_conversation_message is not None:
+            try:
+                target = json.loads(read_conversation if read_conversation is not None else send_conversation_message)
+                _target(target, send=send_conversation_message is not None)
+            except (ValueError, TypeError, PhoenixError):
+                raise click.UsageError('TARGET_JSON must be a valid typed conversation target.') from None
+        if send_conversation_message is not None:
+            if message_id is None:
+                raise click.UsageError('--send-conversation-message requires a caller-chosen --message-id UUID.')
+            try:
+                _uuid(message_id)
+            except PhoenixError:
+                raise click.UsageError('--message-id must be a UUID.') from None
+            if message is None:
+                message = sys.stdin.read()
+            if not message.strip():
+                raise click.UsageError('Remote send requires nonempty MESSAGE or stdin.')
+        if openapi and instance is not None and not instance.strip():
+            raise click.UsageError('--instance must be nonempty; no local fallback.')
+        with _safe_owner_operation():
+            client = PhoenixClient(api_url or _detect_api_url(), password=password)
+            client.ensure_authenticated()
+            if list_peer_connections:
+                result = client.list_peer_connections()
+            elif get_peer_notes:
+                result = client.get_peer_notes(instance)
+            elif set_peer_notes is not None:
+                result = client.set_peer_notes(set_peer_notes, instance)
+            elif query_database is not None:
+                result = client.remote_query_database(query_database, instance)
+            elif search_messages is not None:
+                result = client.remote_search_messages(search_messages, instance)
+            elif read_conversation is not None:
+                result = client.remote_read_conversation(target, cursor or 0, instance)
+            elif resolve_reference is not None:
+                result = client.remote_resolve_reference(resolve_reference, instance)
+            elif send_conversation_message is not None:
+                result = client.remote_send_conversation_message(target, message, message_id, instance)
+            elif watch_conversation is not None:
+                result = client.remote_watch_conversation(watch_conversation, instance)
+            elif list_remote_subscriptions:
+                result = client.list_remote_subscriptions()
+            elif sync_remote_subscription is not None:
+                result = client.sync_remote_subscription(sync_remote_subscription)
+            elif unwatch_remote_subscription is not None:
+                result = client.remote_unwatch_subscription(unwatch_remote_subscription)
+            else:
+                result = client.get_openapi(instance)
+            output = json.dumps(result, ensure_ascii=False, allow_nan=False)
+        click.echo(output)
+        return
+
     resolved_url = api_url or _detect_api_url()
 
     # Validate conversation-required flags before contacting the server.

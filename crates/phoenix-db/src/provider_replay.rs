@@ -238,7 +238,7 @@ impl Database {
             .transpose()
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -252,6 +252,7 @@ impl Database {
         .bind(origin.db_parts().1)
         .bind(origin.db_parts().2)
         .bind(origin.db_parts().3)
+        .bind(origin.db_parts().4)
     .bind(origin.source_call().map(|call| call.message_id.as_str()))
     .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
         .execute(&mut *tx)
@@ -636,6 +637,62 @@ mod tests {
             db.get_messages("source-replay").await.unwrap()[0].origin,
             origin
         );
+    }
+
+    #[tokio::test]
+    async fn remote_input_origin_and_provider_replay_clear_commit_together() {
+        use phoenix_core::domain::{db_schema::InputOrigin, instance_identity::InstanceId};
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("remote-clear", "remote-clear", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let instance = InstanceId::new().to_string();
+        for (index, kind) in ["remote_api", "remote_conversation", "remote_coordinator"]
+            .into_iter()
+            .enumerate()
+        {
+            let authored = kind != "remote_api";
+            let origin = InputOrigin::from_db_parts(
+                kind,
+                authored.then(|| "remote-product".into()),
+                authored.then(|| "remote-transcript".into()),
+                None,
+                Some(instance.clone()),
+            )
+            .unwrap()
+            .with_source_call_columns(
+                authored.then(|| "source-message".into()),
+                authored.then(|| "source-call".into()),
+            )
+            .unwrap();
+            db.store_provider_replay_state("remote-clear", &sample_payload())
+                .await
+                .unwrap();
+            let returned = db
+                .add_message_and_clear_provider_replay_with_origin(
+                    &format!("remote-{index}"),
+                    "remote-clear",
+                    i64::try_from(index + 1).unwrap(),
+                    &phoenix_core::domain::db_schema::MessageContent::user("remote input"),
+                    None,
+                    None,
+                    &origin,
+                    &phoenix_core::domain::sm_state::ConvState::Idle,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(returned.origin, origin);
+            assert_eq!(
+                db.get_messages("remote-clear").await.unwrap()[index].origin,
+                origin
+            );
+            assert!(db
+                .load_provider_replay_state("remote-clear")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]

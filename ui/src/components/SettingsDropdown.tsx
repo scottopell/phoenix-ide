@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { api, type CodexLoginPreflight, type LlmLanguageSetting, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
+import { FederationConnections } from './FederationConnections';
+import {
+  FEDERATION_CONNECTIONS_SETTINGS_VALUE,
+  OPEN_FEDERATION_CONNECTIONS_EVENT,
+  SETTINGS_QUERY_KEY,
+} from './settingsEvents';
 import {
   getBrowserNotificationPermission,
   useNotificationSettings,
@@ -57,14 +63,52 @@ export function SettingsDropdown({
   onPreflightInvalidated,
   compact = false,
 }: Props) {
-  const [open, setOpen] = useState(false);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const openConnectionsFromQuery = new URLSearchParams(location.search).get(SETTINGS_QUERY_KEY)
+    === FEDERATION_CONNECTIONS_SETTINGS_VALUE;
+  const [open, setOpen] = useState(openConnectionsFromQuery);
+  const [connectionsOpen, setConnectionsOpen] = useState(openConnectionsFromQuery);
   useRegisterFocusScope(open ? 'settings-dialog' : null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const connectionsTriggerRef = useRef<HTMLButtonElement | null>(null);
   const titleId = useId();
-  const navigate = useNavigate();
   const [menuPos, setMenuPos] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
+
+  useEffect(() => {
+    const openConnections = (event: Event) => {
+      event.preventDefault();
+      setOpen(true);
+      setConnectionsOpen(true);
+    };
+    window.addEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openConnections);
+    return () => window.removeEventListener(OPEN_FEDERATION_CONNECTIONS_EVENT, openConnections);
+  }, []);
+
+  useEffect(() => {
+    const search = new URLSearchParams(location.search);
+    if (search.get(SETTINGS_QUERY_KEY) !== FEDERATION_CONNECTIONS_SETTINGS_VALUE) return;
+
+    setOpen(true);
+    setConnectionsOpen(true);
+    search.delete(SETTINGS_QUERY_KEY);
+    const remainingSearch = search.toString();
+    void navigate({
+      pathname: location.pathname,
+      search: remainingSearch ? `?${remainingSearch}` : '',
+      hash: location.hash,
+    }, { replace: true, state: location.state });
+  }, [location.hash, location.pathname, location.search, location.state, navigate]);
+
+  useLayoutEffect(() => {
+    if (open && connectionsOpen) connectionsTriggerRef.current?.focus();
+  }, [open, connectionsOpen]);
+
+  useEffect(() => {
+    if (!open) setConnectionsOpen(false);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -185,6 +229,7 @@ export function SettingsDropdown({
               </button>
             </section>
           ) : null}
+          <FederationConnections open={connectionsOpen} onOpenChange={setConnectionsOpen} triggerRef={connectionsTriggerRef} />
           <NotificationsSection />
           <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
           <section className="settings-section">

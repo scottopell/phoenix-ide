@@ -158,6 +158,11 @@ class CheckPlanTests(unittest.TestCase):
                         self.assertIn("profile.toml", test_cmd)
                         self.assertIn("not test(/export_bindings/)", test_cmd)
                         self.assertIn("test(/export_bindings/)", codegen_cmd)
+                        for cmd in (test_cmd, codegen_cmd):
+                            self.assertEqual("final", cmd[cmd.index("--failure-output") + 1])
+                            self.assertEqual(
+                                "fail", cmd[cmd.index("--final-status-level") + 1]
+                            )
                     else:
                         self.assertEqual("export_bindings", test_cmd[-1])
                         self.assertIn("export_bindings", codegen_cmd)

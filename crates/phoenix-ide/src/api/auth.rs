@@ -26,10 +26,13 @@ use serde::{Deserialize, Serialize};
 
 use super::assets::public_root_asset;
 use super::AppState;
-use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+use phoenix_core::domain::instance_identity::{
+    FederationCredentialVerifier, InstanceId, PeerBearerCredential,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAuthenticated {
+    pub enrollment_id: uuid::Uuid,
     pub caller_instance_id: InstanceId,
     pub caller_display_name: String,
 }
@@ -455,8 +458,26 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // No password configured — pass through as the owner channel.
+    let reference_peer_token = (req.method() == axum::http::Method::GET
+        && req.uri().path() == "/openapi.json")
+        .then(|| bearer_token(&req).map(str::to_owned))
+        .flatten()
+        .filter(|token| PeerBearerCredential::parse(token.clone()).is_ok());
+
+    // With no password configured, local owner access remains open. An explicit
+    // peer credential on the dual-auth reference route must still authenticate.
     let Some(password) = &state.password else {
+        if let Some(token) = reference_peer_token.as_deref() {
+            if let Some(authenticated) = authenticate_peer_bearer(&state, token).await {
+                req.extensions_mut().insert(authenticated);
+                return next.run(req).await;
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Authentication required" })),
+            )
+                .into_response();
+        }
         req.extensions_mut().insert(OwnerAuthenticated);
         return next.run(req).await;
     };
@@ -473,9 +494,38 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
+    // The reference document accepts either owner or peer authentication. An
+    // exact-shape peer token is checked against both channels without charging a
+    // successful peer request to the owner's password-guess budget.
+    let key = throttle_key(req.headers(), peer_from_extensions(&req));
+    if let Some(token) = reference_peer_token.as_deref() {
+        let owner_locked = state.login_throttle.is_locked(&key);
+        if !owner_locked && owner_password_matches(token, password.expose()) {
+            state.login_throttle.record_success(&key);
+            req.extensions_mut().insert(OwnerAuthenticated);
+            return next.run(req).await;
+        }
+        if let Some(authenticated) = authenticate_peer_bearer(&state, token).await {
+            req.extensions_mut().insert(authenticated);
+            return next.run(req).await;
+        }
+        if owner_locked {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "Too many authentication attempts; try again later" })),
+            )
+                .into_response();
+        }
+        state.login_throttle.record_failure(&key);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Authentication required" })),
+        )
+            .into_response();
+    }
+
     // Bearer-password validation is throttled per peer IP, sharing the single
     // login budget, so this 200/401 oracle cannot be used for unlimited guesses.
-    let key = throttle_key(req.headers(), peer_from_extensions(&req));
     match check_bearer_password(&req, password.expose(), &state.login_throttle, &key) {
         BearerCheck::Valid => {
             req.extensions_mut().insert(OwnerAuthenticated);
@@ -496,30 +546,37 @@ pub async fn auth_middleware(
     }
 }
 
+async fn authenticate_peer_bearer(state: &AppState, token: &str) -> Option<PeerAuthenticated> {
+    if !token.starts_with("phx_peer_") {
+        return None;
+    }
+    let verifier = FederationCredentialVerifier::from_bearer(token.as_bytes());
+    let enrollment = match state.db.authenticate_federation_verifier(&verifier).await {
+        Ok(enrollment) => enrollment,
+        Err(error) => {
+            tracing::warn!(%error, "federation credential lookup failed closed");
+            None
+        }
+    }?;
+    Some(PeerAuthenticated {
+        enrollment_id: enrollment.enrollment_id,
+        caller_instance_id: enrollment.caller_instance_id,
+        caller_display_name: enrollment.caller_display_name,
+    })
+}
+
 pub async fn peer_auth_middleware(
     State(state): State<AppState>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    let authenticated = bearer_token(&req)
-        .filter(|token| token.starts_with("phx_peer_"))
-        .map(|token| FederationCredentialVerifier::from_bearer(token.as_bytes()));
-    let enrollment = match authenticated {
-        Some(verifier) => match state.db.authenticate_federation_verifier(&verifier).await {
-            Ok(enrollment) => enrollment,
-            Err(error) => {
-                tracing::warn!(%error, "federation credential lookup failed closed");
-                None
-            }
-        },
+    let authenticated = match bearer_token(&req).map(str::to_owned) {
+        Some(token) => authenticate_peer_bearer(&state, &token).await,
         None => None,
     };
 
-    if let Some(enrollment) = enrollment {
-        req.extensions_mut().insert(PeerAuthenticated {
-            caller_instance_id: enrollment.caller_instance_id,
-            caller_display_name: enrollment.caller_display_name,
-        });
+    if let Some(authenticated) = authenticated {
+        req.extensions_mut().insert(authenticated);
         next.run(req).await
     } else {
         (
