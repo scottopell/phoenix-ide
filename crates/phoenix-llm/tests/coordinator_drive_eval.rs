@@ -18,7 +18,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 const FIXTURE: &str = include_str!("../../../scripts/qa/coordinator-drive-eval/fixtures.json");
 const BUTTON_SOURCE: &str = include_str!("../../../ui/src/pages/coordinatorBriefing.ts");
-const CALL_LIMIT: usize = 5;
+const CALL_LIMIT: usize = 10;
 const OUTPUT_TOKENS: u32 = 3072;
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +51,8 @@ struct History {
 struct Variant {
     button: String,
     principles: Option<String>,
+    #[serde(default)]
+    replace_receipt_rule: bool,
 }
 
 fn fixture() -> Fixture {
@@ -98,6 +100,12 @@ fn tools() -> Vec<ToolDefinition> {
 
 fn system(variant: &Variant) -> String {
     let mut prompt = coordinator_prompt(LlmLanguage::PhoenixNative).to_string();
+    if variant.replace_receipt_rule {
+        prompt = prompt.replace(
+            "Message only when intervention is useful, report every target's committed result independently, and never imply recipient understanding, acknowledgement, execution, or completion.",
+            "Message only when intervention is useful. Never imply recipient understanding, acknowledgement, execution, or completion from message acceptance; when reporting delivery, distinguish each target's committed result.",
+        );
+    }
     if let Some(principles) = &variant.principles {
         prompt.push_str("\n\nCoordinator operating principles: ");
         prompt.push_str(principles);
@@ -172,13 +180,22 @@ impl FakeWorld {
                 json!({"rows": scenario.rows, "source": "synthetic_live_current_rows", "sql_executed": false})
             }),
             "read_conversation" => nonempty(input, "conversation_id").and_then(|id| {
+                let (reference, anchor) = id.split_once("#message-")
+                    .map_or((id, None), |(reference, anchor)| (reference, Some(anchor)));
                 let target = scenario.rows.iter().find_map(|row| {
                     let current = row["current_transcript_id"].as_str()?;
                     let stable = row["product_conversation_id"].as_str()?;
-                    (id == stable || id == current).then_some(stable)
+                    (reference == stable || reference == current).then_some(stable)
                 }).ok_or("unknown_conversation")?;
+                let cursor = usize::try_from(input.get("cursor").and_then(Value::as_u64).unwrap_or(0))
+                    .map_err(|_| "invalid_cursor")?;
                 scenario.conversations.get(target)
-                    .map(|messages| json!({"conversation_id":id,"messages":messages,"source":"synthetic_exact_tool_read"}))
+                    .map(|messages| {
+                        let page = messages.iter().skip(cursor).filter(|message| {
+                            anchor.is_none_or(|anchor| message["message_id"].as_str() == Some(anchor))
+                        }).collect::<Vec<_>>();
+                        json!({"conversation_id":id,"messages":page,"has_more":false,"cursor":null,"source":"synthetic_exact_tool_read"})
+                    })
                     .ok_or("unknown_conversation")
             }),
             "send_conversation_message" => nonempty(input, "target").and_then(|id| {
@@ -548,7 +565,44 @@ fn question_suspension_and_mixed_batch_have_no_side_effects() {
 }
 
 #[test]
-fn five_call_budget_is_frozen() {
+fn revised_candidate_removes_conflicting_receipt_rule() {
+    let fixture = fixture();
+    let prompt = system(&fixture.variants["C2"]);
+    assert!(!prompt.contains("report every target's committed result independently"));
+    assert!(prompt.contains("when reporting delivery, distinguish each target's committed result"));
+    assert!(prompt.contains("Coordinate quietly by default"));
+}
+
+#[test]
+fn exact_message_reads_and_end_of_history_are_bounded() {
+    let fixture = fixture();
+    let scenario = &fixture.scenarios[0];
+    let mut world = FakeWorld::default();
+    let (page, error) = world.dispatch(
+        scenario,
+        "read_conversation",
+        &json!({
+            "conversation_id":"@transcript:owner-current#message-synthetic-message-1"
+        }),
+    );
+    assert!(!error);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(page["messages"][0]["origin"], "user_api");
+    let (page, error) = world.dispatch(
+        scenario,
+        "read_conversation",
+        &json!({
+            "conversation_id":"@conv:owner", "cursor":2
+        }),
+    );
+    assert!(!error);
+    assert!(page["messages"].as_array().unwrap().is_empty());
+    assert_eq!(page["has_more"], false);
+    assert!(world.actions.is_empty());
+}
+
+#[test]
+fn call_budget_is_frozen() {
     assert_eq!(fixture().limits.max_provider_calls_per_trial, CALL_LIMIT);
     assert_eq!(fixture().limits.provider_timeout_seconds, 120);
     assert_eq!(fixture().limits.max_output_tokens, OUTPUT_TOKENS);
@@ -600,7 +654,7 @@ impl LlmService for ScriptedService {
 }
 
 #[tokio::test]
-async fn trial_enforces_five_calls_and_records_raw_steps() {
+async fn trial_enforces_call_budget_and_records_raw_steps() {
     let fixture = fixture();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("trial.json");
@@ -620,9 +674,12 @@ async fn trial_enforces_five_calls_and_records_raw_steps() {
     )
     .await;
     let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(service.calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert_eq!(
+        service.calls.load(std::sync::atomic::Ordering::SeqCst),
+        CALL_LIMIT
+    );
     assert_eq!(record["termination"], "provider_call_limit");
-    assert_eq!(record["steps"].as_array().unwrap().len(), 5);
+    assert_eq!(record["steps"].as_array().unwrap().len(), CALL_LIMIT);
     assert_eq!(record["steps"][0]["response"]["usage"]["input_tokens"], 10);
     assert_eq!(
         record["steps"][0]["tool_results"][0]["result"]["sql_executed"],
@@ -685,6 +742,10 @@ async fn coordinator_drive_eval() {
     let scenarios = selected(
         fixture.scenarios.iter().map(|s| s.id.as_str()),
         "PHOENIX_COORD_EVAL_SCENARIOS",
+    );
+    assert!(
+        variants.len() * scenarios.len() * repetitions <= 18,
+        "at most 18 trials per invocation; select explicit variants/scenarios"
     );
     std::fs::create_dir_all(output).expect("create output directory");
     let manifest = json!({"mode":mode,"model":model,"effort":effort,"repetitions":repetitions,"variants":variants,"scenarios":scenarios,"limits":{"max_provider_calls":CALL_LIMIT,"timeout_seconds":120,"max_output_tokens":OUTPUT_TOKENS},"fixture":serde_json::from_str::<Value>(FIXTURE).unwrap(),"expected_outcomes_file":"expected.json (not shown to model)"});

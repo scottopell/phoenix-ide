@@ -19,7 +19,7 @@ class FixtureTests(unittest.TestCase):
                 self.assertTrue(all(m['origin'] in ('user_api', 'system_generated') for m in messages))
         self.assertEqual(fixture['variants']['B']['button'], fixture['variants']['C']['button'])
         self.assertIn('Do not send messages, change anything', fixture['variants']['A']['button'])
-        self.assertEqual(fixture['limits']['max_provider_calls_per_trial'], 5)
+        self.assertEqual(fixture['limits']['max_provider_calls_per_trial'], 10)
         self.assertEqual(fixture['limits']['max_output_tokens'], 3072)
 
 if __name__ == '__main__':
