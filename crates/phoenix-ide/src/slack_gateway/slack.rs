@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 pub(super) const CALL_LIMIT: u32 = 16;
+const BUDGET_EXHAUSTED: &str = "Gateway call budget exhausted; operation was not dispatched";
 
 pub(super) struct Slack {
     manager: Arc<McpClientManager>,
@@ -115,6 +116,13 @@ impl Slack {
         self.window_calls.load(Ordering::Relaxed) < CALL_LIMIT
             && self.retry_after.load(std::sync::atomic::Ordering::Relaxed) == 0
     }
+    pub fn failure_status(&self, error: &str) -> &'static str {
+        if self.retry_after.load(Ordering::Relaxed) > 0 || error == BUDGET_EXHAUSTED {
+            "backing_off"
+        } else {
+            "failed"
+        }
+    }
     pub fn can_discover(&self) -> bool {
         self.retry_after.load(Ordering::Relaxed) == 0
             && CALL_LIMIT.saturating_sub(self.window_calls.load(Ordering::Relaxed)) >= 8
@@ -134,7 +142,7 @@ impl Slack {
                 })
                 .is_err()
         {
-            return Err("Gateway call budget exhausted; operation was not dispatched".into());
+            return Err(BUDGET_EXHAUSTED.into());
         }
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -729,6 +737,25 @@ impl ReactionEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn a_failed_final_call_is_not_itself_a_provider_backoff() {
+        let budget = Arc::new(AtomicU32::new(15));
+        let mut slack = Slack::with_budget(Arc::new(McpClientManager::new()), &config(), budget);
+        slack.fixture = Some(Arc::new(|_, _| {
+            Err("Malformed exact-source metadata".into())
+        }));
+        let failure = slack
+            .call("slack_read_thread", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(slack.failure_status(&failure), "failed");
+        let refused = slack
+            .call("slack_read_thread", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(slack.failure_status(&refused), "backing_off");
+        assert_eq!(slack.calls.load(Ordering::Relaxed), 1);
+    }
     #[tokio::test]
     async fn profile_prose_cannot_forge_the_authenticated_identity_fields() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;

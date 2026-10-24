@@ -97,6 +97,249 @@ async fn read_access_inspection_shares_the_automatic_gate_allowance_and_backoff(
     );
 }
 
+#[tokio::test]
+async fn changing_accounts_does_not_inherit_the_previous_retry_deadline() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let original = config();
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&original).unwrap())
+        .await
+        .unwrap();
+    state
+        .db
+        .slack_baseline_complete(&original.workspace, &original.owner)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE slack_gateway_accounts SET retry_at_us=?1")
+        .bind(chrono::Utc::now().timestamp_micros() + 3_600_000_000)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    let mut other = original.clone();
+    other.workspace = "other.slack.com".into();
+    other.owner = "WOTHER".into();
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&other).unwrap())
+        .await
+        .unwrap();
+    assert!(retry_deadline(&state.db, &other).await.unwrap().is_none());
+    assert!(retry_deadline(&state.db, &original)
+        .await
+        .unwrap()
+        .is_some());
+    let error = http::inspect(axum::extract::State(state), axum::Json(other))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, crate::api::handlers::AppError::BadRequest(message) if !message.contains("retry delay"))
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_retries_a_database_failure_without_restarting_phoenix() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let mut c = config();
+    c.enabled = false;
+    let source = phoenix_db::SlackSource {
+        workspace: c.workspace.clone(),
+        owner: c.owner.clone(),
+        channel: "CFIXTURE".into(),
+        message_ts: "100.000001".into(),
+        thread_ts: "100.000001".into(),
+        source_url: "https://fixture.slack.com/archives/CFIXTURE/p100000001".into(),
+        instruction: String::new(),
+        context: "fixture".into(),
+        observed_at_unix_micros: 1,
+        kind: phoenix_db::SlackRequestKind::Briefing,
+    };
+    // Seed accepted work before pausing its discovery configuration.
+    state.db.accept_slack_source(&source, false).await.unwrap();
+    state
+        .db
+        .set_slack_configuration(&serde_json::to_string(&c).unwrap())
+        .await
+        .unwrap();
+    let r = state
+        .db
+        .slack_requests(&c.workspace, &c.owner)
+        .await
+        .unwrap()
+        .remove(0);
+    state
+        .db
+        .fail_slack_before_admission(&r.request_id, "fixture failure")
+        .await
+        .unwrap();
+    state.db.slack_eyes_confirmed(&r.request_id).await.unwrap();
+    let output = state
+        .db
+        .slack_returns(&c.workspace, &c.owner)
+        .await
+        .unwrap()
+        .remove(0);
+    state
+        .db
+        .slack_begin_notification_return(
+            &output.return_id,
+            "fixture-attempt",
+            &["/fixture/notify".into()],
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER refuse_fixture_recovery BEFORE UPDATE ON slack_gateway_returns WHEN OLD.state='attempting' AND NEW.state='uncertain' BEGIN SELECT RAISE(ABORT,'transient recovery fixture'); END").execute(state.db.pool()).await.unwrap();
+    start(state.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM slack_gateway_accounts")
+                    .fetch_optional(state.db.pool())
+                    .await
+                    .unwrap();
+            if status.as_deref() == Some("failed") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery failure should be visible");
+    sqlx::query("DROP TRIGGER refuse_fixture_recovery")
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    state.db.slack_gateway_wakeup().notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()[0]
+                .state
+                == phoenix_db::SlackReturnState::Uncertain
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same gateway task should retry recovery");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Compare exhaustion and throttling against the same ready-return obligation.
+async fn ready_reply_precedes_exhausting_or_throttled_eyes_retries() {
+    for throttled in [false, true] {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let mut c = config();
+        c.enabled = false;
+        let conversation = state
+            .db
+            .create_conversation("eyes-priority", "eyes-priority", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut first = None;
+        for n in 0..14 {
+            let source = phoenix_db::SlackSource {
+                workspace: c.workspace.clone(),
+                owner: c.owner.clone(),
+                channel: "CFIXTURE".into(),
+                message_ts: format!("100.{:06}", n + 1),
+                thread_ts: "100.000000".into(),
+                source_url: format!(
+                    "https://fixture.slack.com/archives/CFIXTURE/p100{:06}",
+                    n + 1
+                ),
+                instruction: "fixture".into(),
+                context: "fixture".into(),
+                observed_at_unix_micros: 1,
+                kind: phoenix_db::SlackRequestKind::Explicit,
+            };
+            state.db.accept_slack_source(&source, false).await.unwrap();
+        }
+        for r in state
+            .db
+            .slack_requests(&c.workspace, &c.owner)
+            .await
+            .unwrap()
+        {
+            state
+                .db
+                .slack_bind_product(&r.binding_id, conversation.product_conversation_id.as_str())
+                .await
+                .unwrap();
+            state
+                .db
+                .slack_mark_admitted(&r.request_id, &conversation.id)
+                .await
+                .unwrap();
+            first.get_or_insert(r.binding_id);
+        }
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,created_at_unix_micros) VALUES ('ready',?1,'ready','thread','ready answer',1)").bind(first.unwrap()).execute(state.db.pool()).await.unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let calls = log.clone();
+        let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+        slack.fixture = Some(Arc::new(move |tool, args| {
+            calls.lock().unwrap().push(tool.to_string());
+            if let Some(proof) = workspace_probe(tool, &args) {
+                return Ok(proof);
+            }
+            match tool {
+                "slack_read_user_profile" => Ok(json!({"result":"User ID: UOWNER\nBot: No"})),
+                "slack_send_message" => Ok(
+                    json!({"message_link":"https://fixture.slack.com/archives/CFIXTURE/p200000001?thread_ts=100.000000","message_context":{"channel_id":"CFIXTURE","message_ts":"200.000001"}}),
+                ),
+                "slack_add_reaction" => Err(if throttled {
+                    "429 retry_after:120"
+                } else {
+                    "fixture eyes rejected"
+                }
+                .into()),
+                _ => panic!("unexpected tool {tool}"),
+            }
+        }));
+        driver::tick(&state, &c, &slack, Pass::Delivery)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.return_id == "ready")
+                .unwrap()
+                .state,
+            phoenix_db::SlackReturnState::Confirmed
+        );
+        let log = log.lock().unwrap();
+        let sent = log
+            .iter()
+            .position(|tool| tool == "slack_send_message")
+            .unwrap();
+        let eyes = log
+            .iter()
+            .position(|tool| tool == "slack_add_reaction")
+            .unwrap();
+        assert!(sent < eyes);
+        assert_eq!(
+            log.iter()
+                .filter(|tool| tool.as_str() == "slack_send_message")
+                .count(),
+            1
+        );
+        assert_eq!(
+            slack.calls.load(Ordering::Relaxed),
+            if throttled { 4 } else { 16 }
+        );
+    }
+}
+
 fn workspace_probe(tool: &str, args: &serde_json::Value) -> Option<serde_json::Value> {
     (tool == "slack_search_public_and_private" && args["filters"] == "after:1970-01-01")
         .then(|| json!({"results":"### Result 1 of 1\nChannel: proof (ID: CPROOF)\nMessage_ts: 10.000001\nPermalink: [link](https://fixture.slack.com/archives/CPROOF/p10000001)\nText: workspace identity only","pagination_info":"End of results"}))
@@ -628,6 +871,25 @@ async fn failed_candidate_verification_retains_page_until_retry() {
         .await
         .unwrap()
         .is_empty());
+    let mut reporting = slack::Slack::new(state.mcp_manager.clone(), &c);
+    reporting.fixture = failing.fixture.clone();
+    driver::tick(
+        &state,
+        &c,
+        &reporting,
+        Pass::Discovery {
+            reactions_first: true,
+        },
+    )
+    .await
+    .unwrap();
+    let scan = sqlx::query("SELECT status,retry_at_us,last_error FROM slack_gateway_accounts")
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(scan.get::<String, _>("status"), "failed");
+    assert!(scan.get::<Option<i64>, _>("retry_at_us").is_none());
+    assert!(scan.get::<Option<String>, _>("last_error").is_some());
     let mut resumed = slack::Slack::new(state.mcp_manager.clone(), &c);
     resumed.fixture = Some(fixture);
     driver::discover(&state, &c, &resumed).await.unwrap();

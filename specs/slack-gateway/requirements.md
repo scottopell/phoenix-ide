@@ -176,6 +176,8 @@ Ready responses SHALL be reconciled independently of waiting for the next discov
 
 The gateway's owner-facing read-access inspection SHALL share that allowance, serialization and persisted retry deadline, without accepting triggers or advancing discovery. Direct agent or manual MCP tool calls are outside this gateway allowance.
 
+Ready return delivery SHALL receive an opportunity before acknowledgment retries can exhaust allowance or introduce a new provider delay. Retry deadlines SHALL apply to the configured owner/workspace, rather than another retained account. Non-throttling discovery failures SHALL be reported as failed rather than provider backoff. A startup recovery failure SHALL remain visible and be retried without requiring a Phoenix restart; no external work SHALL begin before that recovery succeeds.
+
 WHEN initialization is complete and the saved prefix search has advanced, THE SYSTEM SHALL offer a bounded newest-prefix-page check independently of that saved position, subject to the shared allowance, backoff and discovery time bounds. It SHALL preserve capacity for catch-up and accepted work, alternate which class receives the first opportunity, and use the same source-verification and immutable acceptance boundary for both paths. A freshness observation SHALL NOT advance saved positions, establish full-window completion, or bypass initialization. This check SHALL NOT promise that all newly indexed messages are observed on that opportunity; full catch-up remains responsible for the rest of the window.
 
 **Rationale:** The owner needs evidence that the gateway is watching without exhausting the same Slack access used for investigations.

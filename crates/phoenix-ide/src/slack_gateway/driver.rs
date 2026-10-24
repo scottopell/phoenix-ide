@@ -37,7 +37,7 @@ pub(super) async fn tick(
         .slack_baseline_complete(&c.workspace, &c.owner)
         .await
         .map_err(err)?;
-    let retry_at = super::retry_deadline(&state.db).await?;
+    let retry_at = super::retry_deadline(&state.db, c).await?;
     let backing_off = retry_at.is_some_and(|at| at > chrono::Utc::now().timestamp_micros());
     let identity = if !needs_slack {
         Err("No Slack operation is required for local reconciliation".into())
@@ -52,7 +52,13 @@ pub(super) async fn tick(
             if let Err(error) = discover_ordered(state, c, slack, reactions_first).await {
                 state
                     .db
-                    .slack_scan_status(&c.workspace, &c.owner, false, "backing_off", Some(&error))
+                    .slack_scan_status(
+                        &c.workspace,
+                        &c.owner,
+                        false,
+                        slack.failure_status(&error),
+                        Some(&error),
+                    )
                     .await
                     .map_err(err)?;
             }
@@ -310,12 +316,27 @@ async fn reconcile_work(
     slack: &Slack,
     identity_verified: bool,
 ) -> Result<(), String> {
-    for request in state
+    let requests = state
         .db
         .slack_requests(&c.workspace, &c.owner)
         .await
-        .map_err(err)?
-    {
+        .map_err(err)?;
+    for request in &requests {
+        if !request.admitted && request.failure.is_none() {
+            if let Err(e) = admit(state, request).await {
+                tracing::warn!(request_id=%request.request_id,error=%e,"Slack admission not yet reconciled");
+            }
+        }
+    }
+    state
+        .db
+        .process_slack_native_outcomes()
+        .await
+        .map_err(err)?;
+    // A failed eyes retry must not consume the last call or introduce backoff
+    // before an already-ready answer gets its delivery opportunity.
+    dispatch_returns(state, c, slack, identity_verified).await?;
+    for request in &requests {
         if identity_verified && slack.can_call() && !request.eyes_confirmed {
             match slack
                 .eyes(&request.source.channel, &request.source.message_ts)
@@ -326,23 +347,13 @@ async fn reconcile_work(
                     .slack_eyes_confirmed(&request.request_id)
                     .await
                     .map_err(err)?,
-                Err(e) => {
-                    tracing::warn!(request_id=%request.request_id,error=%e,"Slack acknowledgment pending");
+                Err(error) => {
+                    tracing::warn!(request_id=%request.request_id,%error,"Slack acknowledgment pending");
                 }
             }
         }
-        if !request.admitted && request.failure.is_none() {
-            if let Err(e) = admit(state, &request).await {
-                tracing::warn!(request_id=%request.request_id,error=%e,"Slack admission not yet reconciled");
-            }
-        }
     }
-    state
-        .db
-        .process_slack_native_outcomes()
-        .await
-        .map_err(err)?;
-    dispatch_returns(state, c, slack, identity_verified).await
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]

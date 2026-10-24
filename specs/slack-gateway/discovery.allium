@@ -92,6 +92,10 @@ contract NativeReconciliationPort {
         -- Slack acknowledgments and thread returns require owner verification
         -- and the shared allowance/backoff. Private notification operations retain
         -- their separate lifecycle and are outside the Slack allowance.
+        -- Ready returns receive their dispatch opportunity before acknowledgment
+        -- retries, so failed or throttled eyes cannot perpetually starve an answer.
+        -- Startup recovery errors remain visible and are retried before external
+        -- work; they do not permanently stop the gateway task.
         -- An idle recovery opportunity performs no Slack calls or searches.
 
     @invariant WakeupsAreHints
@@ -292,6 +296,8 @@ rule VerifyOwnerForService {
 
 -- A failed call is charged; the deadline blocks later service opportunities
 -- too. An exhausted allowance and a provider backoff are different conditions.
+-- The deadline belongs to this gateway's workspace/owner; retained historical
+-- accounts cannot impose backoff on a permitted different-account configuration.
 rule RetainProviderBackoff {
     when: SlackCallThrottled(call, retry_deadline)
     requires: call.state = in_flight

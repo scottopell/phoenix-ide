@@ -65,7 +65,7 @@ pub(crate) async fn inspect(
     s.db.slack_baseline_complete(&c.workspace, &c.owner)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    if super::retry_deadline(&s.db)
+    if super::retry_deadline(&s.db, &c)
         .await
         .map_err(AppError::Internal)?
         .is_some()

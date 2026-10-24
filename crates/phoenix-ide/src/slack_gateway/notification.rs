@@ -199,6 +199,9 @@ fn validate_response(bytes: &[u8], notification_id: &str, owner: &str) -> Result
     {
         return Err("Notification evidence identity does not match the request".into());
     }
+    if matches!(&response.outcome, Outcome::Failed { reason } if reason.trim().is_empty()) {
+        return Err("Notification failure reason is empty".into());
+    }
     Ok(response)
 }
 
@@ -257,5 +260,12 @@ mod tests {
             "UOWNER"
         )
         .is_err());
+        for reason in ["", " \n\t", "Provider refused delivery"] {
+            let value = json!({"version":1,"notification_id":"notice","owner":"UOWNER","receipt":"receipt","state":"failed","reason":reason});
+            assert_eq!(
+                validate_response(&serde_json::to_vec(&value).unwrap(), "notice", "UOWNER").is_ok(),
+                !reason.trim().is_empty()
+            );
+        }
     }
 }

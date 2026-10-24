@@ -108,9 +108,9 @@ pub(crate) fn access_gate() -> std::sync::Arc<tokio::sync::Mutex<BudgetWindow>> 
     std::sync::Arc::new(tokio::sync::Mutex::new(BudgetWindow::new()))
 }
 
-async fn retry_deadline(db: &crate::db::Database) -> Result<Option<i64>, String> {
-    sqlx::query_scalar("SELECT MAX(retry_at_us) FROM slack_gateway_accounts WHERE retry_at_us>?1")
-        .bind(chrono::Utc::now().timestamp_micros())
+async fn retry_deadline(db: &crate::db::Database, c: &Config) -> Result<Option<i64>, String> {
+    sqlx::query_scalar("SELECT MAX(retry_at_us) FROM slack_gateway_accounts WHERE workspace=?1 AND owner=?2 AND retry_at_us>?3")
+        .bind(&c.workspace).bind(&c.owner).bind(chrono::Utc::now().timestamp_micros())
         .fetch_one(db.pool())
         .await
         .map_err(|e| e.to_string())
@@ -151,10 +151,7 @@ impl BudgetWindow {
 }
 pub(crate) fn start(state: crate::api::AppState) {
     tokio::spawn(async move {
-        if let Err(e) = state.db.slack_recover_returns().await {
-            tracing::error!(error=%e,"Slack return recovery failed");
-            return;
-        }
+        let mut recovered = false;
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut recovery = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -183,6 +180,31 @@ pub(crate) fn start(state: crate::api::AppState) {
                     continue;
                 }
             };
+            if !recovered {
+                let recovery_result = async {
+                    state
+                        .db
+                        .slack_baseline_complete(&c.workspace, &c.owner)
+                        .await?;
+                    state.db.slack_recover_returns().await
+                }
+                .await;
+                if let Err(error) = recovery_result {
+                    tracing::error!(%error,"Slack return recovery will retry");
+                    let _ = state
+                        .db
+                        .slack_scan_status(
+                            &c.workspace,
+                            &c.owner,
+                            false,
+                            "failed",
+                            Some(&error.to_string()),
+                        )
+                        .await;
+                    continue;
+                }
+                recovered = true;
+            }
             let slack = slack::Slack::with_budget(state.mcp_manager.clone(), &c, budget.current());
             let calls_before = slack.calls.load(std::sync::atomic::Ordering::Relaxed);
             let started = std::time::Instant::now();
@@ -190,7 +212,13 @@ pub(crate) fn start(state: crate::api::AppState) {
                 tracing::warn!(%error,"Slack gateway pass failed");
                 let _ = state
                     .db
-                    .slack_scan_status(&c.workspace, &c.owner, false, "backing_off", Some(&error))
+                    .slack_scan_status(
+                        &c.workspace,
+                        &c.owner,
+                        false,
+                        slack.failure_status(&error),
+                        Some(&error),
+                    )
                     .await;
             }
             let calls = slack
