@@ -457,6 +457,7 @@ async fn conversation_goal_reducer_cancel_carries_pending_intent_without_renderi
         std::path::PathBuf::from("/tmp"),
         "claude-opus-5-5",
         200_000,
+        16_384,
     );
     let cancelling = transition(
         &state,
@@ -1401,6 +1402,7 @@ async fn goal_proposal_context(db: &Database, dir: &tempfile::TempDir) -> ConvCo
         dir.path().to_path_buf(),
         "claude-opus-5-5",
         200_000,
+        16_384,
     );
     context.mode = phoenix_core::domain::sm_state::ModeKind::Branch;
     context.mode_context = Some(phoenix_core::domain::mode_context::ModeContext::Branch {

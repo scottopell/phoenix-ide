@@ -42,7 +42,7 @@ pub async fn generate_title(
         provider_replay: None,
         responses_replay: Vec::new(),
         tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
-        max_tokens: Some(max_output_tokens.map_or(50, |limit| limit.min(50))), // Title should be very short
+        max_tokens: max_output_tokens.map_or(50, |limit| limit.min(50)), // Title should be very short
         effective_effort,
         service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
         telemetry: None,

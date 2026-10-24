@@ -12,7 +12,13 @@ fn runtime(
     cwd: &Path,
     client: Arc<MockLlmClient>,
 ) -> ConversationRuntime<DatabaseStorage, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
-    let mut context = ConvContext::new(conversation, cwd.to_path_buf(), "test-model", 200_000);
+    let mut context = ConvContext::new(
+        conversation,
+        cwd.to_path_buf(),
+        "test-model",
+        200_000,
+        16_384,
+    );
     context.is_coordinator = true;
     let (tx, rx) = mpsc::channel(8);
     ConversationRuntime::new(
@@ -180,6 +186,46 @@ async fn expected_captured_fact_missing_or_corrupt_fails_context_instead_of_no_g
         assert!(error.starts_with("failed to load subscription goal facts:"));
         sqlx::query("DROP VIEW coordinator_watch_goal_captures").execute(db.pool()).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn forced_pressure_preserves_captured_goal_facts_and_propagates_load_failure() {
+    let db = crate::db::Database::open_in_memory().await.unwrap();
+    let (message, _, _) = captured_notification(&db).await;
+    let storage = DatabaseStorage::new(db.clone());
+    let messages = std::slice::from_ref(&message);
+    let names = std::collections::HashSet::new();
+    let cache = std::sync::Mutex::new(Some(0));
+    let rendered = assemble_cleared_messages_with_pressure(
+        &storage,
+        &message.conversation_id,
+        messages,
+        None,
+        &names,
+        200_000,
+        &cache,
+        Some(200_000),
+    )
+    .await
+    .unwrap();
+    assert!(rendered_text(&rendered).contains(OBJECTIVE));
+    sqlx::query("ALTER TABLE coordinator_watch_goal_captures RENAME TO unavailable_captures")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let error = assemble_cleared_messages_with_pressure(
+        &storage,
+        &message.conversation_id,
+        messages,
+        None,
+        &names,
+        200_000,
+        &cache,
+        Some(200_000),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("failed to load subscription goal facts:"));
 }
 
 #[tokio::test]

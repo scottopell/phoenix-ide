@@ -814,7 +814,9 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         turnRetryContext: phaseIsTerminalFailure(phase) ? null : atom.turnRetryContext,
         toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
       };
-      return leavingStreamingPhase
+      const preserveExhaustedOutput = phase.type === 'error'
+        && phase.error_kind === 'output_tokens_exhausted';
+      return leavingStreamingPhase && !preserveExhaustedOutput
         ? clearStreamingBufferIfAffected(next, currentStreamingRequestId(atom))
         : next;
     }

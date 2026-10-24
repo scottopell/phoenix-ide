@@ -259,6 +259,7 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         | ErrorKind::Cancelled
         | ErrorKind::SubAgentError
         | ErrorKind::ContextExhausted
+        | ErrorKind::OutputTokensExhausted
         | ErrorKind::TurnLimitExhausted
         | ErrorKind::ContentFilter => {
             tracing::error!(
@@ -3166,11 +3167,7 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                if should_trigger_continuation(
-                    &usage_data,
-                    context.context_window,
-                    context.effective_effort.level(),
-                ) {
+                if should_trigger_continuation(&usage_data, context.context_window) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -3388,11 +3385,7 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(
-                &usage_data,
-                context.context_window,
-                context.effective_effort.level(),
-            ) {
+            if should_trigger_continuation(&usage_data, context.context_window) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3481,10 +3474,13 @@ pub fn transition_parent(
             // carry provider-specific strings and is persisted for the UI
             // banner / clipboard / seed-draft, so it is logged separately
             // rather than interpolated into user-facing text.
+            // `message` may describe either an authoritative provider rejection
+            // or a locally classified planned-capacity limit (REQ-LLM-004f
+            // preflight fit check) — both converge here because neither has a
+            // partial response to build a continuation summary from.
             tracing::warn!(
-                backend_message = %message,
-                "backend rejected request with context_length_exceeded; \
-                converging parent to ContextExhausted"
+                detail = %message,
+                "request classified as context-window exhausted; converging parent to ContextExhausted"
             );
             let summary = "Context limit reached before the turn could complete. \
                 Continue to compact and resume, or start a new conversation."
@@ -3986,11 +3982,7 @@ pub fn transition_sub_agent(
         ) => {
             let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(
-                &usage_data,
-                context.context_window,
-                context.effective_effort.level(),
-            ) {
+            if should_trigger_continuation(&usage_data, context.context_window) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -4415,6 +4407,17 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
             reason: None,
             cause: CancelCause::UserRequested,
         },
+        LlmOutcome::OutputTokensExhausted { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::OutputTokensExhausted,
+                attempt,
+                recovery_in_progress: false,
+                observed_at,
+                resets_at: None,
+            }
+        }
         LlmOutcome::Cancelled => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -4495,28 +4498,23 @@ fn current_attempt(state: &ConvState) -> u32 {
 /// Threshold as fraction of context window for triggering continuation (REQ-BED-019)
 const CONTINUATION_THRESHOLD: f64 = 0.90;
 
-/// Check if context usage has exceeded the continuation threshold (REQ-BED-019)
+/// Check if context usage has exceeded the continuation threshold (REQ-BED-019).
+///
+/// This is the sole trigger for a *completed* response (text-only, or a
+/// terminal `submit_result`/`submit_error`/`propose_task`/`ask_user_question`
+/// tool call): REQ-BED-019 is independent of the model's output-token
+/// budget. A declared output budget is reserved before *dispatch* — see
+/// `ConvContext::output_budget` and REQ-LLM-004f in `specs/llm/requirements.md`
+/// — not by lowering this post-response threshold, which would otherwise
+/// fail a successful response whose own usage is far below 90%.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
-fn should_trigger_continuation(
-    usage: &UsageData,
-    context_window: usize,
-    effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
-) -> bool {
+fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool {
     let used = usage.context_window_used();
-    let proportional_threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    let threshold = if effort
-        .is_some_and(phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom)
-    {
-        let reservation_threshold =
-            u64::try_from(context_window.saturating_sub(64_000 + 4_096)).unwrap_or(u64::MAX);
-        proportional_threshold.min(reservation_threshold)
-    } else {
-        proportional_threshold
-    };
+    let threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
     used >= threshold
 }
 
@@ -4714,6 +4712,9 @@ pub fn llm_error_to_db_error(
         phoenix_core::domain::llm_error_kind::LlmErrorKind::ContextWindowExceeded => {
             ErrorKind::ContextExhausted
         }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::OutputTokensExhausted => {
+            ErrorKind::OutputTokensExhausted
+        }
     }
 }
 
@@ -4801,7 +4802,13 @@ mod tests {
     }
 
     fn test_context() -> ConvContext {
-        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+        ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        )
     }
 
     fn management_fixture() -> (
@@ -7289,26 +7296,29 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            !should_trigger_continuation(&usage, 100_000, None),
+            !should_trigger_continuation(&usage, 100_000),
             "89.9% should not trigger continuation"
         );
     }
 
     #[test]
-    fn context_threshold_reserves_extended_effort_output_headroom() {
+    fn context_threshold_ignores_output_budget_for_completed_response() {
+        // PR #972 review finding 4363009774: a Codex-routed built-in with a
+        // 272k context and 128k output budget must not fail a successful,
+        // far-below-90% response as context-exhausted. REQ-BED-019's 90%
+        // threshold is independent of the output budget; 144k of usage here
+        // is ~53% of the 272k window — nowhere near the 90% bound — even
+        // though `context_window - output_budget` (144k) would have
+        // incorrectly fired under the superseded reservation-based check.
         let usage = UsageData {
-            input_tokens: 336_000,
+            input_tokens: 144_000,
             output_tokens: 0,
             reasoning_tokens: None,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
         };
 
-        assert!(should_trigger_continuation(
-            &usage,
-            400_000,
-            Some(phoenix_core::domain::llm_types::ModelEffort::Xhigh),
-        ));
+        assert!(!should_trigger_continuation(&usage, 272_000));
     }
 
     #[test]
@@ -7322,7 +7332,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000),
             "90% should trigger continuation"
         );
     }
@@ -7338,7 +7348,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000),
             "90.1% should trigger continuation"
         );
     }
@@ -7354,7 +7364,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000, None),
+            should_trigger_continuation(&usage, 100_000),
             "Combined tokens should count toward threshold"
         );
     }
@@ -7380,6 +7390,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 100_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7461,6 +7472,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 100_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7809,6 +7821,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -7873,7 +7886,7 @@ mod tests {
     fn coordinator_text_only_response_persists_without_filesystem() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7901,7 +7914,7 @@ mod tests {
     fn coordinator_tool_response_checkpoints_without_filesystem() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -7928,7 +7941,7 @@ mod tests {
         use crate::state::{ProposeTaskInput, ToolInput};
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
-        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000, 16_384);
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &context,
@@ -8011,6 +8024,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -8077,6 +8091,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -8151,6 +8166,7 @@ mod tests {
             service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             is_sub_agent: true,
             context_window: 200_000,
+            output_budget: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -8278,6 +8294,45 @@ mod tests {
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+    }
+
+    #[test]
+    fn output_exhaustion_stops_first_attempt_but_malformed_responses_retry() {
+        for (kind, retries) in [
+            (ErrorKind::OutputTokensExhausted, false),
+            (ErrorKind::InvalidResponse, true),
+        ] {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                Event::LlmError {
+                    message: "provider stopped".into(),
+                    error_kind: kind,
+                    attempt: 1,
+                    recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
+                    resets_at: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ScheduleRetry { .. })),
+                retries
+            );
+            if !retries {
+                assert!(matches!(
+                    result.new_state,
+                    ConvState::Error {
+                        error_kind: ErrorKind::OutputTokensExhausted,
+                        ..
+                    }
+                ));
+                assert!(ErrorKind::OutputTokensExhausted.is_user_resumable());
+            }
+        }
     }
 
     #[test]
@@ -9588,6 +9643,7 @@ mod tests {
                 tmp.path().to_path_buf(),
                 "test-model",
                 200_000,
+                16_384,
             );
             ctx.mode = mode;
             ctx.mode_context = mode_context;
@@ -10117,7 +10173,13 @@ mod teardown_tests {
     use std::path::PathBuf;
 
     fn test_context() -> super::ConvContext {
-        super::ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+        super::ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        )
     }
 
     fn pending(id: &str) -> PendingSubAgent {

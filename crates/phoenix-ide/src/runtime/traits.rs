@@ -3919,7 +3919,7 @@ mod registry_llm_client_tests {
             provider_replay: None,
             responses_replay: db.load_responses_replay_state("frozen").await.unwrap(),
             tool_availability: policy.clone(),
-            max_tokens: Some(100),
+            max_tokens: 100,
             effective_effort: EffectiveEffort::native_unknown(),
             service_tier: EffectiveServiceTier::Standard,
             telemetry: None,

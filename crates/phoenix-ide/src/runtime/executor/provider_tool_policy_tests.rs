@@ -198,6 +198,7 @@ fn runtime(
         directory.to_path_buf(),
         "claude-opus-5-5",
         200_000,
+        16_384,
     );
     runtime_for_context(db, context, client, tools)
 }

@@ -209,11 +209,6 @@ impl ModelEffort {
     ];
 
     #[must_use]
-    pub const fn needs_extended_output_headroom(self) -> bool {
-        matches!(self, Self::Xhigh | Self::Max)
-    }
-
-    #[must_use]
     pub const fn as_wire_name(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -649,7 +644,9 @@ pub struct LlmRequest {
     pub provider_replay: Option<super::provider_replay::AnthropicReplayPayload>,
     pub responses_replay: Vec<super::responses_replay::ResponsesResponseSet>,
     pub tool_availability: super::tool_availability::ToolAvailability,
-    pub max_tokens: Option<u32>,
+    /// Concrete output limit, also used for input-capacity reservation.
+    /// Agent-turn defaults and bounded utility calls follow REQ-LLM-004f.
+    pub max_tokens: u32,
     pub effective_effort: EffectiveEffort,
     pub service_tier: EffectiveServiceTier,
     pub telemetry: Option<LlmRequestTelemetry>,
@@ -661,23 +658,12 @@ pub struct LlmRequest {
 }
 
 impl LlmRequest {
+    /// The resolved output-token budget (REQ-LLM-004f). Equal to
+    /// `max_tokens` — a named accessor for call-site clarity. There is no
+    /// effort-based recomputation here: the budget was already resolved once
+    /// when the request was built.
     #[must_use]
-    pub fn reserved_output_tokens(&self) -> u32 {
-        self.raised_output_token_ceiling().unwrap_or_else(|| {
-            if self
-                .effective_effort
-                .level()
-                .is_some_and(ModelEffort::needs_extended_output_headroom)
-            {
-                64_000
-            } else {
-                16_384
-            }
-        })
-    }
-
-    #[must_use]
-    pub const fn raised_output_token_ceiling(&self) -> Option<u32> {
+    pub const fn reserved_output_tokens(&self) -> u32 {
         self.max_tokens
     }
 }
@@ -1070,13 +1056,12 @@ mod attempt_capture_tests {
             provider_replay: None,
             responses_replay: Vec::new(),
             tool_availability: crate::domain::tool_availability::ToolAvailability::all(vec![]),
-            max_tokens: Some(50),
+            max_tokens: 50,
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),
             service_tier: EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };
-        assert_eq!(request.raised_output_token_ceiling(), Some(50));
         assert_eq!(request.reserved_output_tokens(), 50);
     }
 

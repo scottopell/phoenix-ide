@@ -2696,6 +2696,14 @@ pub struct ConvContext {
     pub is_sub_agent: bool,
     /// Model's context window size in tokens
     pub context_window: usize,
+    /// The request's resolved output-token budget: the model's declared
+    /// supported output maximum (REQ-LLM-004f, ADR-144). The provider request
+    /// sends it as the output limit and the context planner reserves it when
+    /// deciding whether input still fits, so it is one value, never an
+    /// effort-keyed or invented number. Production installs the registry's
+    /// declared maximum for the active model and refreshes it on model/config
+    /// changes alongside `context_window`.
+    pub output_budget: usize,
     /// How this conversation handles context exhaustion
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
     /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
@@ -2745,12 +2753,14 @@ impl ConvContext {
         working_dir: PathBuf,
         model_id: impl Into<String>,
         context_window: usize,
+        output_budget: usize,
     ) -> Self {
         Self::with_execution_environment(
             conversation_id,
             ConversationExecutionEnvironment::Filesystem { working_dir },
             model_id,
             context_window,
+            output_budget,
         )
     }
 
@@ -2759,6 +2769,7 @@ impl ConvContext {
         execution_environment: ConversationExecutionEnvironment,
         model_id: impl Into<String>,
         context_window: usize,
+        output_budget: usize,
     ) -> Self {
         let id = conversation_id.into();
         Self {
@@ -2771,6 +2782,7 @@ impl ConvContext {
             effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: crate::domain::llm_types::ServiceTier::Standard,
             context_window,
+            output_budget,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
             explore_bash: ExploreBashCapability::Unavailable,
@@ -2794,12 +2806,14 @@ impl ConvContext {
         conversation_id: impl Into<String>,
         model_id: impl Into<String>,
         context_window: usize,
+        output_budget: usize,
     ) -> Self {
         let mut context = Self::with_execution_environment(
             conversation_id,
             ConversationExecutionEnvironment::NoFilesystem,
             model_id,
             context_window,
+            output_budget,
         );
         context.resource_scope = crate::work_scope::ResourceScopeKey::Coordinator;
         context.is_coordinator = true;
@@ -2827,6 +2841,7 @@ impl ConvContext {
         working_dir: PathBuf,
         model_id: impl Into<String>,
         context_window: usize,
+        output_budget: usize,
         root_conversation_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -2839,6 +2854,7 @@ impl ConvContext {
             effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: crate::domain::llm_types::ServiceTier::Standard,
             context_window,
+            output_budget,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
             explore_bash: ExploreBashCapability::Unavailable,

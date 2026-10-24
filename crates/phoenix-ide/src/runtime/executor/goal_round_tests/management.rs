@@ -65,6 +65,7 @@ fn provider_runtime(
         fixture.home.path().to_path_buf(),
         "claude-opus-5-5",
         200_000,
+        16_384,
     );
     context.is_coordinator = true;
     let mut runtime = runtime_for_context(

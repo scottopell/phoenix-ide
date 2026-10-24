@@ -144,6 +144,51 @@ pub(super) async fn assert_completed_start_owner(db: &Database, turn_id: u64, ge
 }
 
 #[tokio::test]
+async fn conversation_goal_output_exhaustion_stops_without_retry_or_second_request_charge() {
+    let (_directory, db, receipt, mut rt, client) = adopted().await;
+    let before = ledger(&db).await;
+    let mut completion = dispatch_response(&mut rt).await;
+    let admitted_id = completion.admitted.as_ref().unwrap().intent().id.clone();
+    assert_eq!(admitted_id.as_str(), request_id(&db).await);
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            usize::try_from(requests[0].max_tokens).unwrap(),
+            rt.context.output_budget,
+        );
+    }
+    completion.outcome = LlmOutcome::OutputTokensExhausted {
+        message: "provider reached the declared output maximum".into(),
+    };
+    rt.process_llm_completion(completion).await.unwrap();
+    assert!(matches!(
+        rt.state,
+        ConvState::Error {
+            error_kind: crate::db::ErrorKind::OutputTokensExhausted,
+            ..
+        }
+    ));
+    assert!(rt.retry_timer_handle.is_none());
+    assert!(rt.llm_task_handle.is_none());
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+    let after = ledger(&db).await;
+    assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+    assert_eq!(request_id(&db).await, admitted_id.as_str());
+    let stored = db.get_conversation(CONVERSATION).await.unwrap();
+    assert_eq!(stored.state, rt.state);
+    let (terminal, owns): (Option<String>, bool) = sqlx::query_as(
+        "SELECT terminal_kind, owns_conversation FROM durable_turns WHERE turn_id=?",
+    )
+    .bind(receipt.execution().turn_id())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(terminal.as_deref(), Some("Failed"));
+    assert!(!owns);
+}
+
+#[tokio::test]
 async fn conversation_goal_actual_no_tool_yield_automatically_reaches_explicit_terminal_report_in_same_execution(
 ) {
     use phoenix_core::domain::conversation_goal::GoalReportOutcome;

@@ -2775,7 +2775,7 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         let tools = Arc::new(self.tools.unwrap_or_default());
 
         let model_id = llm.model_id().to_string();
-        let context = ConvContext::new(&self.conv_id, self.working_dir, model_id, 200_000);
+        let context = ConvContext::new(&self.conv_id, self.working_dir, model_id, 200_000, 16_384);
 
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = crate::runtime::SseBroadcaster::new(128, 0);
@@ -2984,7 +2984,7 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: Some(100),
+            max_tokens: 100,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
 
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
@@ -3259,7 +3259,13 @@ mod tests {
         let tools = Arc::new(MockToolExecutor::new());
         let request_started = llm.request_started.clone();
 
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3385,7 +3391,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3492,7 +3504,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3609,7 +3627,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -3740,7 +3764,13 @@ mod tests {
         use tokio::sync::mpsc;
 
         let storage = storage_with_spawn_round("test-conv", "spawn-1").await;
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx = mpsc::channel::<Event>(32).0;
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 2);
@@ -3830,7 +3860,7 @@ mod tests {
         use phoenix_llm::ContentBlock;
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // Build AssistantMessage with tool_use blocks for all 3 tools
         let assistant_message = AssistantMessage::new(
@@ -3948,6 +3978,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -4004,6 +4035,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -4058,6 +4090,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -4107,6 +4140,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "test-root",
         );
 
@@ -4176,7 +4210,13 @@ mod tests {
         use std::path::PathBuf;
 
         // Parent context (not sub-agent)
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "parent-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -4225,7 +4265,13 @@ mod tests {
         let llm = Arc::new(MockLlmClient::new("test-model"));
         let tools = Arc::new(MockToolExecutor::new());
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "parent-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let _broadcast_rx = broadcast_tx.subscribe();
@@ -4326,7 +4372,13 @@ mod tests {
         ));
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -4440,6 +4492,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0);
@@ -4574,6 +4627,7 @@ mod tests {
                 PathBuf::from("/tmp"),
                 "streaming-mock",
                 200_000,
+                16_384,
             );
             let (event_tx, event_rx) = mpsc::channel(32);
             let broadcast_tx = crate::runtime::SseBroadcaster::new(4096, 0);
@@ -4705,7 +4759,7 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // Single pending agent: the real result drives the last-one → Idle arm.
         let state = ConvState::CancellingSubAgents {
@@ -4774,7 +4828,7 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // Two pending: X already drained, only Y remains.
         let state = ConvState::CancellingSubAgents {
@@ -4819,7 +4873,7 @@ mod tests {
         use phoenix_llm::ContentBlock;
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         // New round with a DIFFERENT tool_use_id ("new-id").
         let assistant_message = AssistantMessage::new(
@@ -4882,7 +4936,7 @@ mod tests {
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
-        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000, 16_384);
 
         let res = transition(
             &ConvState::Idle,
@@ -5025,7 +5079,13 @@ mod tests {
         let cooperative_completed = tools.cooperative_completed.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -5167,6 +5227,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "parent-conv",
         );
 

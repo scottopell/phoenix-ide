@@ -829,9 +829,17 @@ rule ResponsesStreamFailedByResponseFailed {
         ClassifyResponsesError(code: code, message: message)
 }
 
--- A response.incomplete event terminates the stream. A content_filter
--- reason is a terminal content_filter error; any other reason is a
--- retryable server_error.
+-- A response.incomplete event terminates the stream. Its
+-- incomplete_details.reason decides the class:
+--   content_filter    -> terminal content_filter error.
+--   max_output_tokens -> the model stopped at the request's output-token
+--                        budget: a terminal output_tokens_exhausted error
+--                        (non-auto-retryable, user resumable), distinct
+--                        from context_window_exceeded and from a retryable
+--                        server_error. Any partial tool call is discarded
+--                        and never dispatched; already-streamed visible
+--                        text stays in the ephemeral client buffer.
+--   anything else     -> retryable server_error.
 rule ResponsesStreamIncomplete {
     when: ResponsesIncompleteEvent(stream, reason)
 
@@ -844,9 +852,14 @@ rule ResponsesStreamIncomplete {
                 message: "Response incomplete: content_filter",
                 recovery_in_progress: false, has_quota: false)
         else:
-            llm/LlmError.created(kind: server_error,
-                message: "Response incomplete",
-                recovery_in_progress: false, has_quota: false)
+            if reason = "max_output_tokens":
+                llm/LlmError.created(kind: output_tokens_exhausted,
+                    message: "Response stopped at its output token budget before finishing",
+                    recovery_in_progress: false, has_quota: false)
+            else:
+                llm/LlmError.created(kind: server_error,
+                    message: "Response incomplete",
+                    recovery_in_progress: false, has_quota: false)
 }
 
 ------------------------------------------------------------
