@@ -615,3 +615,34 @@ WHEN that row becomes eligible for a live owner again
 THE SYSTEM SHALL retain snapshot authority until an accepted, matching, message-bearing hydration from a newly opened connection establishes live authority.
 
 A previous connection's hydration, a rejected connection epoch, or preserve-only hydration SHALL NOT restore live authority. Restoring authority SHALL publish the hydrated atom before notifying transcript subscribers, without exposing retained pre-Close content as live content.
+
+### REQ-MLRU-017: Original-Target Touch Release Routing
+
+WHEN a trusted touch starts within the transcript's bound physical scroller
+THE SYSTEM SHALL record the owned live touch identifier and original target within one component, physical-scroller, and owner-generation lifetime
+AND SHALL attempt to install original-target end/cancel listeners independently of that contact ownership.
+
+WHILE original-target listeners are successfully installed
+THE SYSTEM SHALL preserve release routing across same-element callback-ref rebinding and target removal
+AND SHALL accept only trusted end/cancel receipts matching current owned touch identifiers and original targets.
+
+WHEN one observed end/cancel event carries multiple owned changed touches
+THE SYSTEM SHALL account for every matching owned ended identifier exactly once
+AND SHALL preserve ownership of the remaining owned live identifiers, including contacts whose listener installation failed.
+
+THE SYSTEM SHALL bound owned live contacts by the latest admitted browser live-touch identifier set
+AND SHALL retain at most one listener registration per owned live contact
+AND SHALL release ended contact ownership and its listener registration on matching end/cancel, trusted live-list absence, identifier reuse, owner-generation retirement, physical-scroller replacement or retirement, and component unmount
+AND SHALL NOT retain completed-touch history or event payloads as routing resources.
+
+WHILE an end is missing and no subsequent admitted input or owner retirement occurs
+THE SYSTEM MAY retain outstanding owned contacts and installed listeners for the owner lifetime
+AND SHALL NOT infer physical release from elapsed time alone.
+
+THE SYSTEM SHALL keep contact and routing-resource lifetime independent of gesture-evidence abandonment and physical reconciliation timing
+AND SHALL NOT recreate expired movement evidence or restore tail-follow permission merely because a contact or listener registration survives.
+
+WHEN listener installation or removal fails
+THE SYSTEM SHALL invalidate any partial listener registration, attempt removal of both end/cancel listeners, report the failure, and preserve existing gesture bookkeeping
+AND SHALL preserve admitted contact ownership independently of listener availability
+AND SHALL NOT let removal failure suppress an admitted real end/cancel receipt.

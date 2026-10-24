@@ -10,6 +10,7 @@ import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange, V
 import type { ConversationState, Message } from '../api';
 import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
 import { MessageList } from './MessageList';
+import * as scrollPolicy from '../conversation/scrollMachine';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 import { transcriptPositioningCommandKey, type TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -71,7 +72,9 @@ vi.mock('./MessageComponents', async () => {
         ...(revealRequest !== undefined ? { revealRequest } : {}),
         ...(activeHighlight !== undefined ? { activeHighlight } : {}),
       });
-      if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      React.useEffect(() => {
+        if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      }, [revealRequest, onRevealHandled]);
       return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
     ToolOnlyAgentTurnGroup: ({ members, revealRequest, activeHighlight, onRevealHandled }: {
@@ -79,16 +82,18 @@ vi.mock('./MessageComponents', async () => {
       revealRequest?: AgentTextRevealRequest | null;
       activeHighlight?: AgentTextHighlight | null;
       onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
-    }) => (
-      <>
+    }) => {
+      React.useEffect(() => {
+        if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      }, [revealRequest, onRevealHandled]);
+      return <>
         {members.map(({ agent }) => {
           agentRenderCounter.count++;
           agentMessageProps.push({ message: agent, forceExpandedText: false, isLatestAgentMessage: false, ...(revealRequest !== undefined ? { revealRequest } : {}), ...(activeHighlight !== undefined ? { activeHighlight } : {}) });
-          if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
           return <div key={agent.message_id} id={`message-${agent.message_id}`} className="message agent" data-sequence-id={agent.sequence_id}>agent</div>;
         })}
-      </>
-    ),
+      </>;
+    },
     SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
       <div data-testid="subagent-status-mock">
         {stateData.completed_results.map((agent, index) => <div key={`completed-${index}`}>{`completed ${agent.task}`}</div>)}
@@ -130,6 +135,8 @@ vi.mock('./MessageContextMenu', () => ({
 // tests can exercise the manual auto-follow callback (see the
 // `handleTotalListHeightChanged` test group).
 const virtualTranscriptMock = {
+  rebindScroller: undefined as ((element: HTMLDivElement | null) => void) | undefined,
+  churnDuringLayout: false,
   scrollToIndex: vi.fn(),
   scrollToOwnedIndex: vi.fn(),
   completePosition: vi.fn(),
@@ -249,6 +256,13 @@ vi.mock('./VirtualTranscript', async () => {
         if (virtualTranscriptMock.publishDuringLayout) {
           virtualTranscriptMock.publishDuringLayout = false;
           onRangeChange?.(virtualTranscriptMock.currentSnapshot);
+        }
+      });
+      virtualTranscriptMock.rebindScroller = scrollerRef;
+      useLayoutEffect(() => {
+        if (virtualTranscriptMock.churnDuringLayout) {
+          scrollerRef?.(null);
+          scrollerRef?.(containerRef.current);
         }
       });
       useLayoutEffect(() => {
@@ -4098,6 +4112,246 @@ describe('handleTotalListHeightChanged', () => {
     }));
     await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
   });
+
+function requiredTouchScroller(container: HTMLElement): HTMLDivElement {
+  const element = container.querySelector('#messages');
+  if (!(element instanceof HTMLDivElement)) throw new Error('Missing transcript div scroller');
+  return element;
+}
+
+function requiredTouchEvidence<T>(value: T | undefined, label: string): T {
+  if (value === undefined) throw new Error('Missing touch regression evidence: ' + label);
+  return value;
+}
+
+// Insert inside MessageList.test.tsx's describe; add namespace import of
+// '../conversation/scrollMachine' as scrollPolicy. These test the real component
+// and reducer, but invoke captured native callbacks with explicit event models.
+// They do not establish trusted browser delivery; the existing host owns that proof.
+for (const stopType of ['touchend', 'touchcancel'] as const) {
+  it(`retains detached ${stopType} through same-scroller ref churn after evidence expiry`, () => {
+    vi.useFakeTimers();
+    const registrations: Array<{ target: EventTarget; type: string; listener: EventListener }> = [];
+    const original = HTMLElement.prototype.addEventListener;
+    const add = vi.spyOn(HTMLElement.prototype, 'addEventListener').mockImplementation(function (this: HTMLElement, type, listener, options) {
+      if (typeof listener === 'function') registrations.push({ target: this, type, listener });
+      return original.call(this, type, listener, options);
+    });
+    const reducer = vi.spyOn(scrollPolicy, 'reduceScrollMachine');
+    try {
+      const view = render(withConvContext(<MessageList
+        messages={[makeMessage(1, 'user')]} pendingMessages={[]} streamingRequestId={null}
+        convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+        onRetry={vi.fn()} onOpenFile={undefined} conversationId="retained-target"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}
+      />));
+      const scroller = requiredTouchScroller(view.container);
+      setupScroller(scroller, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+      act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+      const target = document.createElement('p'); scroller.append(target);
+      const touch = { identifier: 7, clientY: 100, target };
+      const start = { isTrusted: true, target, touches: [touch], changedTouches: [touch],
+        composedPath: () => [target, scroller, document, window] } as unknown as TouchEvent;
+      const startCallback = registrations.findLast(x => x.target === scroller && x.type === 'touchstart')!.listener;
+      act(() => startCallback(start));
+      fireEvent.touchMove(scroller, { touches: [touch] });
+      const stopCallback = registrations.findLast(x => x.target === target && x.type === stopType)!.listener;
+      target.remove();
+      act(() => {
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 100);
+        virtualTranscriptMock.rebindScroller?.(null);
+        virtualTranscriptMock.rebindScroller?.(scroller);
+      });
+      const receiptCount = () => reducer.mock.calls.filter(([, event]) => event.type === (stopType === 'touchend' ? 'touchEnded' : 'touchCancelled')).length;
+      const count = receiptCount();
+      const end = { type: stopType, isTrusted: true, target, touches: [], changedTouches: [touch] } as unknown as TouchEvent;
+      act(() => stopCallback({ ...end, changedTouches: [{ ...touch, identifier: 99 }] } as unknown as TouchEvent));
+      act(() => stopCallback({ ...end, isTrusted: false } as unknown as TouchEvent));
+      expect(receiptCount()).toBe(count);
+      act(() => { stopCallback(end); stopCallback(end); });
+      expect(receiptCount()).toBe(count + 1);
+      const result = reducer.mock.results.findLast((_, i) => requiredTouchEvidence(reducer.mock.calls[i], 'matching reducer call')[1].type === (stopType === 'touchend' ? 'touchEnded' : 'touchCancelled'))!.value;
+      expect(result.state).toMatchObject({ follow: { kind: 'reading' }, gesture: { kind: 'idle' } });
+      expect(result.effects).toEqual([]);
+      view.unmount();
+      act(() => stopCallback(end));
+      expect(receiptCount()).toBe(count + 1);
+    } finally { reducer.mockRestore(); add.mockRestore(); vi.useRealTimers(); }
+  });
+}
+
+it('unmount releases an outstanding original target before any end', () => {
+  const registrations: Array<{ target: EventTarget; type: string; listener: EventListener }> = [];
+  const original = HTMLElement.prototype.addEventListener;
+  const add = vi.spyOn(HTMLElement.prototype, 'addEventListener').mockImplementation(function (this: HTMLElement, type, listener, options) {
+    if (typeof listener === 'function') registrations.push({ target: this, type, listener });
+    return original.call(this, type, listener, options);
+  });
+  const reducer = vi.spyOn(scrollPolicy, 'reduceScrollMachine');
+  try {
+    const view = render(withConvContext(<MessageList
+      messages={[makeMessage(1, 'user')]} pendingMessages={[]} streamingRequestId={null}
+      convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+      onRetry={vi.fn()} onOpenFile={undefined} conversationId="retained-unmount"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}
+    />));
+    const scroller = requiredTouchScroller(view.container);
+    const target = document.createElement('p'); scroller.append(target);
+    const remove = vi.spyOn(target, 'removeEventListener');
+    const touch = { identifier: 7, target };
+    act(() => registrations.findLast(x => x.target === scroller && x.type === 'touchstart')!.listener({
+      isTrusted: true, target, touches: [touch], changedTouches: [touch], composedPath: () => [target, scroller],
+    } as unknown as TouchEvent));
+    const end = registrations.findLast(x => x.target === target && x.type === 'touchend')!.listener;
+    view.unmount();
+    expect(remove.mock.calls.map(([type]) => type)).toEqual(['touchend', 'touchcancel']);
+    const count = reducer.mock.calls.length;
+    end({ type: 'touchend', isTrusted: true, target, touches: [], changedTouches: [touch] } as unknown as TouchEvent);
+    expect(reducer.mock.calls).toHaveLength(count);
+  } finally { reducer.mockRestore(); add.mockRestore(); }
+});
+
+for (const scenario of ['owner-roundtrip', 'recycled-id', 'two-targets', 'two-target-batch', 'untrusted-start', 'live-list-prune', 'scroller-retirement', 'scroller-replacement', 'install-failure'] as const) {
+  it(`component retained touch admission: ${scenario}`, async () => {
+    const registrations: Array<{ target: EventTarget; type: string; listener: EventListener }> = [];
+    let failingTarget: EventTarget | null = null;
+    let injectedFailures = 0;
+    const original = HTMLElement.prototype.addEventListener;
+    const add = vi.spyOn(HTMLElement.prototype, 'addEventListener').mockImplementation(function (this: HTMLElement, type, listener, options) {
+      if (this === failingTarget && type === 'touchcancel') {
+        injectedFailures++;
+        throw new Error('install');
+      }
+      if (typeof listener === 'function') registrations.push({ target: this, type, listener });
+      return original.call(this, type, listener, options);
+    });
+    const reducer = vi.spyOn(scrollPolicy, 'reduceScrollMachine');
+    try {
+      const content = (conversationId: string) => withConvContext(<MessageList
+        conversationId={conversationId} messages={[makeMessage(1, 'user')]}
+        streamingRequestId={null} pendingMessages={[]} onRetry={vi.fn()} onOpenFile={undefined}
+        convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}
+      />);
+      const view = render(content('A'));
+      let scroller = requiredTouchScroller(view.container);
+      setupScroller(scroller, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+      act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+      const first = document.createElement('p'), second = document.createElement('p');
+      scroller.append(first, second);
+      const one = { identifier: 1, clientY: 100, target: first };
+      const two = { identifier: 2, clientY: 100, target: second };
+      const start = (target: HTMLElement, changed: typeof one[], live: typeof one[], trusted = true) => {
+        const callback = registrations.findLast(x => x.target === scroller && x.type === 'touchstart')!.listener;
+        act(() => callback({ isTrusted: trusted, target, changedTouches: changed, touches: live,
+          composedPath: () => [target, scroller] } as unknown as TouchEvent));
+      };
+      const receipt = (target: HTMLElement, changed: typeof one[], live: typeof one[] = []) => ({
+        type: 'touchend', isTrusted: true, target, changedTouches: changed, touches: live,
+      }) as unknown as TouchEvent;
+      const count = () => reducer.mock.calls.filter(([, e]) => e.type === 'touchEnded').length;
+      start(first, [one], [one]);
+      const old = registrations.findLast(x => x.target === first && x.type === 'touchend')!.listener;
+      if (scenario === 'owner-roundtrip') {
+        virtualTranscriptMock.churnDuringLayout = true;
+        view.rerender(content('B')); view.rerender(content('A'));
+        virtualTranscriptMock.churnDuringLayout = false;
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+        const retiredScroller = scroller;
+        scroller = requiredTouchScroller(view.container);
+        expect(scroller).not.toBe(retiredScroller);
+        expect(scroller.isConnected).toBe(true);
+        expect(retiredScroller.isConnected).toBe(false);
+        setupScroller(scroller, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+        scroller.append(first);
+        const priorRegistrations = registrations.filter(x => x.target === first && x.type === 'touchend').length;
+        start(first, [one], [one]);
+        expect(registrations.filter(x => x.target === first && x.type === 'touchend')).toHaveLength(priorRegistrations + 1);
+        const fresh = registrations.findLast(x => x.target === first && x.type === 'touchend')!.listener;
+        act(() => { virtualTranscriptMock.rebindScroller?.(null); virtualTranscriptMock.rebindScroller?.(scroller); });
+        act(() => fresh(receipt(first, [one]))); expect(count()).toBe(before + 1);
+      } else if (scenario === 'recycled-id') {
+        start(first, [one], [one]);
+        const fresh = registrations.findLast(x => x.target === first && x.type === 'touchend')!.listener;
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+        act(() => fresh(receipt(first, [one]))); expect(count()).toBe(before + 1);
+      } else if (scenario === 'scroller-retirement') {
+        const remove = vi.spyOn(first, 'removeEventListener');
+        await act(async () => {
+          virtualTranscriptMock.rebindScroller?.(null);
+          await new Promise<void>(resolve => queueMicrotask(resolve));
+        });
+        expect(remove).toHaveBeenCalledTimes(2);
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+      } else if (scenario === 'scroller-replacement') {
+        const replacement = document.createElement('div');
+        const before = count();
+        act(() => virtualTranscriptMock.rebindScroller?.(replacement));
+        act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+      } else if (scenario === 'install-failure') {
+        failingTarget = second;
+        const remove = vi.spyOn(second, 'removeEventListener');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          const beforeStarts = reducer.mock.calls.filter(([, e]) => e.type === 'touchStarted').length;
+          start(second, [two], [one, two]);
+          expect(reducer.mock.calls.filter(([, e]) => e.type === 'touchStarted')).toHaveLength(beforeStarts + 1);
+          expect(injectedFailures).toBe(1);
+          expect(log).toHaveBeenCalledWith('owned-touch listener installation failed', expect.objectContaining({ identifier: 2 }));
+          expect(remove.mock.calls.map(([type]) => type)).toEqual(['touchend', 'touchcancel']);
+          const installedThenRolledBack = registrations.findLast(x => x.target === second && x.type === 'touchend')!.listener;
+          const preEnd = count();
+          act(() => installedThenRolledBack(receipt(second, [two], [one])));
+          expect(count()).toBe(preEnd);
+          act(() => { virtualTranscriptMock.rebindScroller?.(null); virtualTranscriptMock.rebindScroller?.(scroller); });
+          first.remove();
+          const before = count();
+          act(() => old(receipt(first, [one], [two])));
+          expect(count()).toBe(before + 1);
+          const firstResultIndex = reducer.mock.calls.findLastIndex(([, e]) => e.type === 'touchEnded');
+          expect(requiredTouchEvidence(reducer.mock.calls[firstResultIndex], 'first end call')[1]).toMatchObject({ remainingTouches: 1 });
+          expect(requiredTouchEvidence(reducer.mock.results[firstResultIndex], 'first end result').value.state.gesture.kind).toBe('touch');
+          const secondEnd = registrations.findLast(x => x.target === scroller && x.type === 'touchend')!.listener;
+          act(() => secondEnd(receipt(second, [{ ...two, identifier: 99 }], [two])));
+          expect(count()).toBe(before + 1);
+          act(() => secondEnd(receipt(second, [two])));
+          expect(count()).toBe(before + 2);
+          expect(reducer.mock.calls.findLast(([, e]) => e.type === 'touchEnded')![1]).toMatchObject({ remainingTouches: 0 });
+          view.rerender(content('B')); view.rerender(content('A'));
+          act(() => { old(receipt(first, [one])); secondEnd(receipt(second, [two])); });
+          expect(count()).toBe(before + 2);
+        } finally { failingTarget = null; remove.mockRestore(); log.mockRestore(); }
+      } else if (scenario === 'two-targets' || scenario === 'two-target-batch') {
+        start(second, [two], [one, two]);
+        const other = registrations.findLast(x => x.target === second && x.type === 'touchend')!.listener;
+        act(() => { virtualTranscriptMock.rebindScroller?.(null); virtualTranscriptMock.rebindScroller?.(scroller); });
+        first.remove(); second.remove();
+        const before = count();
+        if (scenario === 'two-target-batch') {
+          const batch = receipt(first, [one, two]);
+          act(() => { old(batch); other(batch); });
+          expect(count()).toBe(before + 1);
+          expect(reducer.mock.calls.findLast(([, e]) => e.type === 'touchEnded')![1]).toMatchObject({ remainingTouches: 0 });
+          view.unmount();
+          return;
+        }
+        const foreignFirst = receipt(second, [two], [one]);
+        act(() => old(foreignFirst)); expect(count()).toBe(before);
+        act(() => other(foreignFirst)); expect(count()).toBe(before + 1);
+        const firstReceipt = reducer.mock.calls.findLast(([, e]) => e.type === 'touchEnded')![1];
+        expect(firstReceipt).toMatchObject({ remainingTouches: 1 });
+        act(() => old(receipt(first, [one]))); expect(count()).toBe(before + 2);
+      } else if (scenario === 'untrusted-start') {
+        start(second, [two], [two], false);
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before + 1);
+      } else {
+        start(second, [two], [two]);
+        const before = count(); act(() => old(receipt(first, [one]))); expect(count()).toBe(before);
+      }
+      view.unmount();
+    } finally { virtualTranscriptMock.churnDuringLayout = false; reducer.mockRestore(); add.mockRestore(); }
+  });
+}
 
   it('an unobservable lift stops withholding tail-follow once its bound expires', () => {
     vi.useFakeTimers();

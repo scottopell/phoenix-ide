@@ -127,6 +127,36 @@ beforeEach(() => {
 });
 
 describe('VirtualTranscript', () => {
+  it('commits active-gesture spacer compensation before the resize callback returns', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      render(<VirtualTranscript ariaLabel="Transcript" ref={ref} items={makeItems(50, 20)} getKey={item => item.id} estimatedExtent={20} overscan={200} renderItem={renderRow} scrollerRef={element => { scroller = element; }} />);
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      act(() => {
+        fireEvent.touchStart(scroller!, { touches: [{ identifier: 7 }], changedTouches: [{ identifier: 7 }] });
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      expect(row).not.toBeNull();
+      const spacer = document.querySelector<HTMLElement>('.virtual-transcript__spacer')!;
+      const before = Number.parseFloat(spacer.style.height);
+      let atCallbackReturn: number | null = null;
+      act(() => {
+        resizeObservers[0]!.triggerEntries([[row, 50]]);
+        expect(spacer.isConnected).toBe(true);
+        expect(document.querySelector('.virtual-transcript__spacer')).toBe(spacer);
+        atCallbackReturn = Number.parseFloat(spacer.style.height);
+      });
+      expect(spacer.isConnected).toBe(true);
+      expect(document.querySelector('.virtual-transcript__spacer')).toBe(spacer);
+      expect(atCallbackReturn).toBe(Number.parseFloat(spacer.style.height));
+      expect(atCallbackReturn).not.toBe(before);
+      expect(scrollTopOf(scroller)).toBe(395);
+    } finally { vi.useRealTimers(); }
+  });
   it('renders a bounded contiguous range with top and bottom spacers', () => {
     const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
 
