@@ -43,7 +43,7 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
     } catch (e) { setError(e instanceof Error ? e.message : 'Slack unavailable'); }
     finally { setBusy(false); }
   }
-  const fields = [ ['mcp_server', 'Existing MCP server name'], ['owner', 'Your Slack user ID'], ['workspace', 'Exact Slack permalink host'], ['timezone', 'IANA timezone'], ['phoenix_url', 'Phoenix URL'] ] as const;
+  const fields = [ ['mcp_server', 'Existing MCP server name'], ['owner', 'Your Slack user ID'], ['workspace', 'Exact Slack permalink host'], ['timezone', 'IANA timezone'], ['phoenix_url', 'Phoenix base URL (no path or query)'] ] as const;
   return <section className="settings-section">
     <button type="button" onClick={() => { if (!expanded) void refresh(); setExpanded(!expanded); }}>Slack gateway {expanded ? '▾' : '▸'}</button>
     {expanded && <>

@@ -15,6 +15,33 @@ fn config() -> Config {
     }
 }
 
+#[test]
+fn configuration_accepts_enterprise_owner_and_requires_a_phoenix_origin() {
+    let mut c = config();
+    for owner in ["UOWNER", "WOWNER"] {
+        c.owner = owner.into();
+        assert!(c.validate().is_ok());
+    }
+    for url in [
+        "https://phoenix.example",
+        "https://phoenix.example/",
+        "http://localhost:8031",
+    ] {
+        c.phoenix_url = url.into();
+        assert!(c.validate().is_ok(), "{url}");
+    }
+    for url in [
+        "https://phoenix.example/c/id",
+        "https://phoenix.example/?view=x",
+        "https://phoenix.example/#view",
+        "https://user:password@phoenix.example",
+        "ftp://phoenix.example",
+    ] {
+        c.phoenix_url = url.into();
+        assert!(c.validate().is_err(), "{url}");
+    }
+}
+
 #[tokio::test]
 async fn read_access_inspection_shares_the_automatic_gate_allowance_and_backoff() {
     let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;

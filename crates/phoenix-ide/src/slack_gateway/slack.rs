@@ -656,7 +656,7 @@ fn thread_source(thread: &str, ts: &str) -> Result<(String, String), String> {
         .next()
         .and_then(|s| s.strip_suffix(')'))
         .filter(|s| {
-            (s.starts_with('U') || s.starts_with('B'))
+            (s.starts_with('U') || s.starts_with('W') || s.starts_with('B'))
                 && s.chars().all(|c| c.is_ascii_alphanumeric())
         })
         .ok_or("Message does not have a verifiable Slack author")?;
@@ -1120,5 +1120,19 @@ mod tests {
         let t="=== THREAD PARENT MESSAGE ===\nFrom: Somebody (UOTHER)\nTime: fixture\nMessage TS: 123.456\n\nFrom: Owner (UOWNER)\nMessage TS: 999.000";
         assert_eq!(thread_source(t, "123.456").unwrap().0, "UOTHER");
         assert!(thread_source(t, "999.000").is_err());
+    }
+    #[test]
+    fn thread_source_accepts_enterprise_user_and_bot_author_ids() {
+        for author in ["UOWNER", "WOWNER", "WOTHER", "BAPP"] {
+            let text = format!("=== THREAD PARENT MESSAGE ===\nFrom: Name ({author})\nTime: fixture\nMessage TS: 123.456\nFull body");
+            assert_eq!(
+                thread_source(&text, "123.456").unwrap(),
+                (author.to_string(), "Full body".to_string())
+            );
+        }
+        for author in ["TTEAM", "WFORGED) extra", "W WITH SPACE"] {
+            let text = format!("=== THREAD PARENT MESSAGE ===\nFrom: Name ({author})\nTime: fixture\nMessage TS: 123.456\nFull body");
+            assert!(thread_source(&text, "123.456").is_err());
+        }
     }
 }

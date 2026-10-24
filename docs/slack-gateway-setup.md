@@ -7,7 +7,10 @@ locally as ordinary Phoenix conversations under the server user's permissions.
 
 Open Settings → Slack gateway (also available at `/settings/slack`). Configure
 an existing MCP server, your Slack user ID, the exact workspace permalink host,
-your IANA timezone and the Phoenix URL. The read-access check verifies identity
+your IANA timezone and the Phoenix origin, such as `https://phoenix.example`
+or `https://localhost:8031`, without a path, query or fragment.
+Slack owner IDs beginning with either `U` or `W` are supported.
+The read-access check verifies identity
 and source access without accepting requests or changing Slack.
 It shares the gateway's call allowance and provider retry deadline, so an
 exhausted allowance or active retry delay can postpone the check.

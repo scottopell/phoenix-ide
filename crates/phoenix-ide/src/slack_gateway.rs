@@ -24,7 +24,9 @@ pub(crate) struct Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
-        if !self.owner.starts_with('U') || !self.owner.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !(self.owner.starts_with('U') || self.owner.starts_with('W'))
+            || !self.owner.chars().all(|c| c.is_ascii_alphanumeric())
+        {
             return Err("Expected a Slack owner user ID".into());
         }
         if !self.workspace.ends_with(".slack.com") || self.workspace.contains('/') {
@@ -38,8 +40,14 @@ impl Config {
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
         {
-            return Err("Expected an HTTP(S) Phoenix URL without credentials".into());
+            return Err(
+                "Expected an HTTP(S) Phoenix origin without credentials, path, query or fragment"
+                    .into(),
+            );
         }
         if self.mcp_server.trim().is_empty() {
             return Err("Expected an existing MCP server name".into());
