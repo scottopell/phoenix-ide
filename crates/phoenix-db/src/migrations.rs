@@ -19721,7 +19721,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (126, 'temporarily_skip_wake_feature_retirement'),
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
-                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
+                    (130, 'temporarily_skip_slack_gateway')",
         )
         .execute(&pool)
         .await
@@ -20588,7 +20589,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (126, 'temporarily_skip_wake_feature_retirement'),
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
-                    (129, 'temporarily_skip_single_conversation_name_and_route_projection')",
+                    (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
+                    (130, 'temporarily_skip_slack_gateway')",
         )
         .execute(pool)
         .await

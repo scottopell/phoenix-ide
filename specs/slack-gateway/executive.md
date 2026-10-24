@@ -59,7 +59,11 @@ The public candidate adds migration 130 after upstream's migration 129, replaces
 the personal notifier with a provider-neutral command, and adds bounded
 newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
 Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
-checks have passed. The complete native Rust regression run is still in progress.
+checks have passed. The broad native run passed 5,319 tests and failed 14;
+historical migration fixtures and host-sensitive shell/browser cases are being
+rechecked separately. The developer-tool test run also found historical
+qualification fixtures tied to the ambient registry and a shared-build-directory
+environment leak; these require clean-environment verification.
 
 The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
 passed online-backup and stopped-snapshot rehearsals from the installed complete
@@ -73,9 +77,11 @@ provide automatic database rollback or qualify a generic 127-to-130 route.
 Production initialization completed without executing historical triggers. Two
 sequential explicit private-thread requests each produced exactly one native
 input and confirmed reply, reused one conversation and survived a managed
-restart without duplicates. Generic notification delivery was established;
-human alert confirmation and reaction-triggered private briefing acceptance
-remain pending. Only production discovery is enabled; the former dev watcher
+restart without duplicates. The owner confirmed the notification alert and
+reacted to the test notice. That gesture produced one native input in a separate
+briefing conversation, assistant output and one exactly correlated confirmed
+private return; the source thread received no reply. The bounded production
+acceptance sequence passed. Only production discovery is enabled; the former dev watcher
 is paused. Private operational evidence is retained outside the repository.
 
 The native client recognizes Slack origins and source links, with version-2
@@ -105,8 +111,8 @@ server candidate's source.
 Live automatic continuation and longer soak coverage remain unqualified until
 exercised. They are follow-up confidence work rather than an invented unlimited
 SLO for a bounded personal pilot. External shared-channel send limitations remain.
-Public PR review and native-client CI have not started; publication follows
-completion of the separately approved local acceptance sequence.
+Public PR review and native-client CI remain publication gates. The separately
+approved bounded local acceptance sequence is complete.
 
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

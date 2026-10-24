@@ -61,8 +61,10 @@ replies in 34.277 and 10.364 seconds from Slack's posted timestamps. Each had
 one native input and one return; both reused the same native conversation.
 A managed restart retained their identities and confirmed returns without
 duplicate work. The provider-neutral notifier also established delivery to the
-configured owner; human alert confirmation and the reaction-triggered briefing
-are separate acceptance checks.
+configured owner, who confirmed receiving the alert. Reacting to the notice
+created one separate private briefing and an exactly correlated confirmed private
+return, without a source-thread reply. These checks establish the bounded
+interaction, rather than a latency measurement for reaction discovery.
 
 These are two end-to-end observations with different polling phases, not a
 matched performance comparison, percentile or response-time guarantee. Source
