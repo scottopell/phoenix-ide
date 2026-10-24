@@ -452,11 +452,9 @@ impl KeywordSearchTool {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: Some(
-                selection
-                    .max_output_tokens
-                    .map_or(4096, |limit| limit.min(4096)),
-            ),
+            max_tokens: selection
+                .max_output_tokens
+                .map_or(4096, |limit| limit.min(4096)),
             effective_effort: selection.effective_effort,
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {

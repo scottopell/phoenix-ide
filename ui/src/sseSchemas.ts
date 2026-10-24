@@ -369,6 +369,7 @@ const ERROR_KIND_OPTIONS = [
   'cancelled',
   'sub_agent_error',
   'context_exhausted',
+  'output_tokens_exhausted',
   'turn_limit_exhausted',
   'content_filter',
 ] as const satisfies readonly WireErrorKind[];
@@ -846,6 +847,11 @@ export const BashErrorResponseSchema = v.variant('error', [
   v.looseObject({
     error: v.literal('spawn_failed'),
     error_message: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('launch_release_unknown'),
+    error_message: v.string(),
+    handle: v.string(),
   }),
   v.looseObject({
     error: v.literal('mutually_exclusive_modes'),

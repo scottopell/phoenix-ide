@@ -1,4 +1,4 @@
-import { bashLaunchOutcomes } from '../../testFixtures/bashLaunchOutcomes';
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from '../../testFixtures/bashLaunchOutcomes';
 import { describe, expect, it } from 'vitest';
 import type { ContentBlock, ConversationState, Message } from '../../api';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
@@ -243,6 +243,13 @@ describe('buildDiffSearchProjection', () => {
 });
 
 describe('typed semantic display projections', () => {
+  it('indexes launch-release-unknown handle and retry warning', () => {
+    const projection = buildTerminalToolResultProjection('bash', JSON.stringify(bashLaunchReleaseUnknown), undefined);
+    expect(projection.fullText).toContain('handle: bash-handle-42');
+    expect(projection.fullText).toContain('Do not automatically retry');
+    expect(projection.fullText).not.toContain('{');
+  });
+
   it('parses Markdown into stable visible-text blocks without source punctuation', () => {
     const blocks = buildMarkdownDisplayBlocks('# **Plan**\n\nUse `alpha` and ![diagram text](diagram.png).\n\n```ts\nconst beta = 1;\n```', 'standard');
     expect(blocks.map((block) => block.searchableText)).toEqual(expect.arrayContaining([

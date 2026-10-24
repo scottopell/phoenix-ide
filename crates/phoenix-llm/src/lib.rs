@@ -72,7 +72,7 @@ pub use retry_guidance::RetryAfter;
 // accessed via the `rate_limit` submodule.
 pub use models::{
     all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
-    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
+    ModelInfo, ModelSource, ModelSpec, NativeDefault,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
@@ -370,7 +370,12 @@ impl LoggingService {
                 LlmErrorKind::ServerOverloaded => LlmAttemptOutcome::ServerOverloaded,
                 LlmErrorKind::Network => LlmAttemptOutcome::NetworkError,
                 LlmErrorKind::TimedOut => LlmAttemptOutcome::TimedOut,
-                LlmErrorKind::ContextWindowExceeded => LlmAttemptOutcome::TokenBudgetExceeded,
+                // Output-token exhaustion reuses the existing token-budget
+                // outcome (REQ-LLM-006c): no new persisted outcome value, no
+                // outcome-schema migration owed.
+                LlmErrorKind::ContextWindowExceeded | LlmErrorKind::OutputTokensExhausted => {
+                    LlmAttemptOutcome::TokenBudgetExceeded
+                }
                 LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,
                 LlmErrorKind::InvalidRequest
                 | LlmErrorKind::PromptRejected
@@ -549,6 +554,21 @@ impl LlmService for LoggingService {
     }
 }
 
+/// Conservative character count for tool restrictions that a provider may append.
+#[must_use]
+pub fn tool_availability_advisory_chars(
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
+) -> usize {
+    let openai = openai::tool_advisory_text(availability);
+    if openai.is_some() || anthropic::native_policy_needs_advisory(availability) {
+        openai
+            .as_ref()
+            .map_or(0, |text| text.chars().count())
+            .max(anthropic::tool_advisory(availability).chars().count())
+    } else {
+        0
+    }
+}
 #[cfg(test)]
 mod logging_tests {
     use super::*;

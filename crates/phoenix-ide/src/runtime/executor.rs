@@ -1373,6 +1373,30 @@ async fn assemble_cleared_messages<S: StateStore>(
     context_window: usize,
     watermark_cache: &std::sync::Mutex<Option<i64>>,
 ) -> Vec<LlmMessage> {
+    assemble_cleared_messages_with_pressure(
+        storage,
+        conv_id,
+        db_messages,
+        excluded_message_id,
+        clearable_names,
+        context_window,
+        watermark_cache,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn assemble_cleared_messages_with_pressure<S: StateStore>(
+    storage: &S,
+    conv_id: &str,
+    db_messages: &[crate::db::Message],
+    excluded_message_id: Option<&str>,
+    clearable_names: &std::collections::HashSet<String>,
+    context_window: usize,
+    watermark_cache: &std::sync::Mutex<Option<i64>>,
+    pressure_override: Option<i64>,
+) -> Vec<LlmMessage> {
     let included_messages = || {
         db_messages
             .iter()
@@ -1414,6 +1438,7 @@ async fn assemble_cleared_messages<S: StateStore>(
         }
     };
 
+    let reported_prompt_tokens = pressure_override.or(reported_prompt_tokens);
     let plan = plan_tool_result_clearing(
         db_messages,
         clearable_names,
@@ -8056,6 +8081,7 @@ where
             &self.clearable_names,
             self.context
                 .context_window
+                .saturating_sub(self.context.output_budget)
                 .saturating_sub(trusted_token_reserve),
             &self.clear_watermark_cache,
         )
@@ -8105,19 +8131,9 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let desired_output_tokens = if effective_effort.level().is_some_and(
-            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
-        ) {
-            64_000
-        } else {
-            16_384
-        };
-        let request_output_tokens = self
-            .llm_registry
-            .output_token_limit(&model_id)
-            .map_or(desired_output_tokens, |limit| {
-                limit.min(desired_output_tokens)
-            });
+        let request_output_tokens = u32::try_from(self.context.output_budget).map_err(|_| {
+            "Resolved output budget cannot be represented by provider APIs".to_string()
+        })?;
         let working_dir = self
             .context
             .execution_environment
@@ -8306,17 +8322,69 @@ where
                 &historical_tool_references,
             )
             .await?;
-        let messages = frozen_messages;
-        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let responses_replay = self.storage.load_responses_replay_state(&conv_id).await?;
+        let fixed_tokens = estimate_fixed_request_tokens(&system_prompt, &tool_availability)
+            .saturating_add(estimate_private_replay_overhead(
+                &frozen_messages,
+                provider_replay.as_ref(),
+                &responses_replay,
+            ));
+        if dispatch_estimate_exceeds_context(
+            fixed_tokens,
+            &frozen_messages,
+            self.context.output_budget,
+            self.context.context_window,
+        ) {
+            let input_budget = self
+                .context
+                .context_window
+                .saturating_sub(self.context.output_budget)
+                .saturating_sub(fixed_tokens)
+                .saturating_sub(trusted_token_reserve);
+            let pressure =
+                i64::try_from(estimate_messages_tokens(&frozen_messages)).unwrap_or(i64::MAX);
+            frozen_messages = assemble_cleared_messages_with_pressure(
+                &self.storage,
+                &self.context.conversation_id,
+                &self
+                    .active_prompt_projection
+                    .as_ref()
+                    .expect("projection refreshed above")
+                    .messages,
+                None,
+                &self.clearable_names,
+                input_budget,
+                &self.clear_watermark_cache,
+                Some(pressure),
+            )
+            .await;
+            overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
+            if dispatch_estimate_exceeds_context(
+                fixed_tokens,
+                &frozen_messages,
+                self.context.output_budget,
+                self.context.context_window,
+            ) {
+                return Ok(Some(Event::LlmError {
+                    message: "Planned prompt and declared output budget exceed context capacity after permitted tool-result clearing; compact or revise the input.".into(),
+                    error_kind: crate::db::ErrorKind::ContextExhausted,
+                    attempt: retry_attempt, recovery_in_progress: false,
+                    observed_at: Utc::now(), resets_at: None,
+                }));
+            }
+        }
+
+        let messages = frozen_messages;
+        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+
         let request = LlmRequest {
             system: vec![SystemContent::cached(&system_prompt)],
             messages,
             provider_replay,
             responses_replay,
             tool_availability,
-            max_tokens: Some(request_output_tokens),
+            max_tokens: request_output_tokens,
             effective_effort,
             service_tier: effective_service_tier,
             telemetry: Some(phoenix_llm::LlmRequestTelemetry {
@@ -9554,21 +9622,10 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let desired_continuation_output = if effective_effort.level().is_some_and(
-            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
-        ) {
-            64_000
-        } else {
-            CONTINUATION_OUTPUT_RESERVE_TOKENS
-        };
-        let continuation_output_reserve = self.llm_registry.output_token_limit(&model_id).map_or(
-            desired_continuation_output,
-            |limit| {
-                usize::try_from(limit)
-                    .unwrap_or(usize::MAX)
-                    .min(desired_continuation_output)
-            },
-        );
+        let output_token_limit = u32::try_from(self.context.output_budget).map_err(|_| {
+            "Resolved output budget cannot be represented by provider APIs".to_string()
+        })?;
+        let continuation_output_reserve = self.context.output_budget;
 
         // Freeze the same persisted-only, generation-fenced projection used by
         // ordinary rounds before provider work can be scheduled. Continuation
@@ -9702,7 +9759,7 @@ where
             ), // No tools for continuation
             // Handoff quality favors completeness; cap high enough that a
             // thorough summary is not truncated mid-thought.
-            max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
+            max_tokens: output_token_limit,
             effective_effort,
             service_tier: effective_service_tier,
             telemetry: Some(phoenix_llm::LlmRequestTelemetry {
@@ -10855,10 +10912,6 @@ fn reread_reviewed_task_handoff_snapshot_at_exact_path(
 /// size is bounded separately by [`cap_messages_to_token_budget`].
 const CONTINUATION_BLOCK_CHAR_CAP: usize = 2000;
 
-/// Reserve (tokens) for the continuation reply — kept in lockstep with the
-/// `max_tokens` on the continuation request.
-const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
-
 /// Safety margin (tokens) against the chars/token estimate being optimistic.
 /// The prompt and system text are budgeted from their actual size separately,
 /// so this only covers estimate error, not their bulk.
@@ -10999,6 +11052,9 @@ fn estimate_message_tokens(msg: &LlmMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+            ContentBlock::ToolResult { images, .. } => {
+                estimate_text_tokens(&block.render_text()) + images.len() * IMAGE_TOKEN_ESTIMATE
+            }
             other => estimate_text_tokens(&other.render_text()),
         })
         .sum();
@@ -11083,6 +11139,79 @@ fn estimate_messages_tokens(messages: &[LlmMessage]) -> usize {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+fn estimate_private_replay_overhead(
+    messages: &[LlmMessage],
+    anthropic: Option<&phoenix_core::domain::provider_replay::AnthropicReplayPayload>,
+    responses: &[phoenix_core::domain::responses_replay::ResponsesResponseSet],
+) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .map(|message| {
+            let public_tokens = estimate_message_tokens(message);
+            let responses_extra = responses
+                .iter()
+                .find(|set| {
+                    message.source_message_id.as_deref() == Some(&set.owner_message_id)
+                        && message.content == set.public_content
+                })
+                .map_or(0, |set| {
+                    estimate_text_tokens(
+                        &serde_json::to_string(&set.output_items).expect("replay items serialize"),
+                    )
+                    .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+                    .saturating_sub(public_tokens)
+                });
+            let anthropic_extra = anthropic
+                .and_then(|payload| {
+                    payload.response_sets.iter().find(|set| {
+                        message.source_message_id.as_deref() == Some(&set.owner_message_id)
+                            && message.content == set.public_content
+                    })
+                })
+                .map_or(0, |set| {
+                    if set.private_blocks.is_empty() {
+                        0
+                    } else {
+                        estimate_text_tokens(
+                            &serde_json::to_string(&set.private_blocks)
+                                .expect("private blocks serialize"),
+                        )
+                    }
+                });
+            responses_extra.max(anthropic_extra)
+        })
+        .sum()
+}
+
+fn estimate_fixed_request_tokens(
+    system_prompt: &str,
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
+) -> usize {
+    estimate_text_tokens(system_prompt)
+        + phoenix_llm::tool_availability_advisory_chars(availability)
+            .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+        + availability
+            .declarations()
+            .iter()
+            .map(|tool| {
+                estimate_text_tokens(&serde_json::to_string(tool).expect("tool schema serializes"))
+            })
+            .sum::<usize>()
+}
+
+fn dispatch_estimate_exceeds_context(
+    fixed_tokens: usize,
+    history: &[LlmMessage],
+    output_budget: usize,
+    context_window: usize,
+) -> bool {
+    fixed_tokens
+        .saturating_add(estimate_messages_tokens(history))
+        .saturating_add(output_budget)
+        > context_window
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContinuationPipelineStage {
@@ -11153,11 +11282,12 @@ fn summarize_continuation_pipeline(
     messages: Vec<LlmMessage>,
     rejected_tool_calls: &[ToolCall],
     context_window: usize,
+    output_budget: usize,
 ) -> ContinuationPipelineSummary {
     let continuation_prompt = build_continuation_prompt(rejected_tool_calls);
     let fixed_tokens = estimate_text_tokens(&continuation_prompt)
         + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
-        + CONTINUATION_OUTPUT_RESERVE_TOKENS
+        + output_budget
         + CONTINUATION_SAFETY_MARGIN_TOKENS;
     let input_budget = context_window.saturating_sub(fixed_tokens);
 
@@ -11606,7 +11736,7 @@ mod strip_tool_blocks_tests {
             }]));
         }
 
-        let summary = summarize_continuation_pipeline(msgs, &[], 20_000);
+        let summary = summarize_continuation_pipeline(msgs, &[], 20_000, 4_096);
         let rendered = summary
             .stages
             .iter()
@@ -11673,7 +11803,7 @@ mod strip_tool_blocks_tests {
             ))]));
         }
 
-        let summary = summarize_continuation_pipeline(msgs, &[], 40_000);
+        let summary = summarize_continuation_pipeline(msgs, &[], 40_000, 4_096);
         let headroom = summary
             .stages
             .iter()
@@ -11728,7 +11858,7 @@ mod strip_tool_blocks_tests {
         let limits = phoenix_llm::ContinuationRequestLimits::codex_bridge();
         let history_item_cap = limits.max_history_messages(1).expect("Codex item cap");
         let context_window = 272_000;
-        let fixed_tokens = CONTINUATION_OUTPUT_RESERVE_TOKENS
+        let fixed_tokens = 4_096
             + CONTINUATION_SAFETY_MARGIN_TOKENS
             + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT);
         assert!(
@@ -11782,7 +11912,7 @@ mod strip_tool_blocks_tests {
             .map(|i| user_text(&format!("small history message {i}")))
             .collect();
         let context_window = 272_000;
-        let fixed_tokens = CONTINUATION_OUTPUT_RESERVE_TOKENS
+        let fixed_tokens = 4_096
             + CONTINUATION_SAFETY_MARGIN_TOKENS
             + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT);
         let budget = plan_continuation_history(messages, context_window, fixed_tokens, None);
@@ -12655,6 +12785,9 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
         phoenix_llm::LlmErrorKind::ServerOverloaded => crate::db::ErrorKind::ServerOverloaded,
         phoenix_llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
         phoenix_llm::LlmErrorKind::ContextWindowExceeded => crate::db::ErrorKind::ContextExhausted,
+        phoenix_llm::LlmErrorKind::OutputTokensExhausted => {
+            crate::db::ErrorKind::OutputTokensExhausted
+        }
     }
 }
 
@@ -12742,6 +12875,9 @@ fn llm_error_to_outcome(
             message: error.message,
         },
         LlmErrorKind::PromptRejected => LlmOutcome::PromptRejected {
+            message: error.message,
+        },
+        LlmErrorKind::OutputTokensExhausted => LlmOutcome::OutputTokensExhausted {
             message: error.message,
         },
     }
@@ -13083,6 +13219,7 @@ mod error_mapping_tests {
             std::path::PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         for (provider_kind, expected_kind, can_resume) in [
             (
@@ -13301,7 +13438,13 @@ mod dispatch_context_budget_tests {
     async fn request_rounds_use_one_snapshot_then_tails_and_rebuild_once_on_invalidation() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "bounded-projection-rounds";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         storage
             .add_message(
@@ -13393,10 +13536,17 @@ mod dispatch_context_budget_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn ordinary_new_turn_prompt_excludes_unadopted_historical_wake_results() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "historical-wake-prompt";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         for (id, text, display) in [
             (
@@ -13498,7 +13648,13 @@ mod dispatch_context_budget_tests {
     async fn ordinary_process_event_converts_projection_failure_to_typed_llm_error() {
         let cwd = TempDir::new().expect("cwd");
         let conv_id = "projection-liveness";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         storage.set_fail_prompt_projection_load(true);
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -13546,8 +13702,13 @@ mod dispatch_context_budget_tests {
     async fn coordinator_dispatch_keeps_one_stable_system_block_as_evidence_changes() {
         let cwd = TempDir::new().unwrap();
         let conv_id = "coordinator-on-demand";
-        let mut context =
-            ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let mut context = ConvContext::new(
+            conv_id,
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         context.is_coordinator = true;
         let storage = Arc::new(InMemoryStorage::new());
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -13610,65 +13771,236 @@ mod dispatch_context_budget_tests {
     }
 
     #[tokio::test]
-    async fn conservative_prompt_estimate_cannot_short_circuit_provider_dispatch() {
-        let cwd = TempDir::new().expect("cwd");
-        let conv_id = "large-estimate-still-dispatches";
-        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
-        let storage = Arc::new(InMemoryStorage::new());
-        storage
-            .add_message(
-                "large-user-message",
+    async fn ordinary_dispatch_reserves_output_before_provider_call() {
+        for (output_budget, should_dispatch) in [(16_384, true), (64_000, false)] {
+            let cwd = TempDir::new().expect("cwd");
+            let conv_id = "large-estimate-still-dispatches";
+            let context = ConvContext::new(
                 conv_id,
-                &MessageContent::User(UserContent::new("x".repeat(500_000))),
-                None,
-                None,
+                cwd.path().to_path_buf(),
+                "test-model",
+                200_000,
+                output_budget,
+            );
+            let storage = Arc::new(InMemoryStorage::new());
+            storage
+                .add_message(
+                    "large-user-message",
+                    conv_id,
+                    &MessageContent::User(UserContent::new("x".repeat(548_000))),
+                    None,
+                    None,
+                )
+                .await
+                .expect("persist large message");
+
+            let llm = Arc::new(MockLlmClient::new("test-model"));
+            llm.queue_response(LlmResponse {
+                provider_replay: None,
+                content: vec![ContentBlock::text("accepted by provider")],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let mut runtime = ConversationRuntime::new(
+                context,
+                ConvState::LlmRequesting { attempt: 1 },
+                storage,
+                llm.clone(),
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx,
+                SseBroadcaster::new(16, 0),
+            );
+
+            let result = runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+            if should_dispatch {
+                assert!(result.is_none());
+                runtime
+                    .llm_task_handle
+                    .take()
+                    .expect("request task")
+                    .await
+                    .unwrap();
+                let requests = llm.recorded_requests();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(
+                    requests[0].max_tokens,
+                    u32::try_from(output_budget).unwrap()
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Some(Event::LlmError {
+                        error_kind: crate::db::ErrorKind::ContextExhausted,
+                        ..
+                    })
+                ));
+                assert!(llm.recorded_requests().is_empty());
+                assert!(runtime.llm_task_handle.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn predispatch_planning_counts_only_replay_matching_the_retained_owner() {
+        use phoenix_core::domain::provider_replay::{
+            AnthropicPrivateBlock, AnthropicReplayPayload, AnthropicResponseIdentity,
+            AnthropicResponseSet, ContentIndex,
+        };
+        use phoenix_core::domain::responses_replay::ResponsesResponseSet;
+        let message = LlmMessage {
+            source_message_id: Some("owner".into()),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::text("short answer")],
+        };
+        let response = ResponsesResponseSet {
+            response_id: "r".into(),
+            model: "model".into(),
+            owner_message_id: "owner".into(),
+            public_content: message.content.clone(),
+            output_items: vec![
+                serde_json::json!({"type":"reasoning","encrypted_content":"x".repeat(8_000)}),
+            ],
+        };
+        let anthropic =
+            AnthropicReplayPayload::new(vec![AnthropicResponseSet::with_public_content(
+                AnthropicResponseIdentity {
+                    response_id: "a".into(),
+                    model: "model".into(),
+                },
+                message.content.clone(),
+                vec![AnthropicPrivateBlock::Thinking {
+                    index: ContentIndex(0),
+                    thinking: "t".repeat(8_000),
+                    signature: "sig".into(),
+                }],
             )
-            .await
-            .expect("persist large message");
-
-        let llm = Arc::new(MockLlmClient::new("test-model"));
-        llm.queue_response(LlmResponse {
-            provider_replay: None,
-            content: vec![ContentBlock::text("accepted by provider")],
-            end_turn: true,
-            usage: Usage::default(),
-            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-        });
-        let (event_tx, event_rx) = mpsc::channel(8);
-        let mut runtime = ConversationRuntime::new(
-            context,
-            ConvState::LlmRequesting { attempt: 1 },
-            storage,
-            llm.clone(),
-            Arc::new(MockToolExecutor::new()),
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx,
-            SseBroadcaster::new(16, 0),
+            .unwrap()
+            .with_owner_message_id("owner".into())])
+            .unwrap();
+        let responses_extra = estimate_private_replay_overhead(
+            std::slice::from_ref(&message),
+            None,
+            std::slice::from_ref(&response),
         );
-
-        runtime
-            .execute_effect(Effect::RequestLlm)
-            .await
-            .expect("dispatch large request");
-        runtime
-            .llm_task_handle
-            .take()
-            .expect("request task")
-            .await
-            .expect("request task completed");
-
-        let requests = llm.recorded_requests();
+        let anthropic_extra =
+            estimate_private_replay_overhead(std::slice::from_ref(&message), Some(&anthropic), &[]);
+        assert!(responses_extra >= 2_000);
+        assert!(anthropic_extra >= 2_000);
+        for extra in [responses_extra, anthropic_extra] {
+            assert!(dispatch_estimate_exceeds_context(
+                extra,
+                std::slice::from_ref(&message),
+                1_000,
+                2_000
+            ));
+        }
+        let mut other = message;
+        other.source_message_id = Some("another-owner".into());
         assert_eq!(
-            requests.len(),
-            1,
-            "only the provider can authoritatively reject the assembled request"
+            estimate_private_replay_overhead(
+                std::slice::from_ref(&other),
+                Some(&anthropic),
+                std::slice::from_ref(&response)
+            ),
+            0
         );
-        assert_eq!(requests[0].reserved_output_tokens(), 16_384);
+        other.source_message_id = Some("owner".into());
+        other.content = vec![ContentBlock::text("rewritten")];
+        assert_eq!(
+            estimate_private_replay_overhead(&[other], Some(&anthropic), &[response]),
+            0
+        );
+    }
+
+    #[test]
+    fn predispatch_planning_counts_retained_noncallable_declarations_and_advisory() {
+        use phoenix_core::domain::tool_availability::ToolAvailability;
+        let retained = ToolAvailability::new(
+            vec![phoenix_llm::ToolDefinition {
+                name: "retired_tool".into(),
+                description: "retained".repeat(2_000),
+                input_schema: serde_json::json!({"type": "object"}),
+                defer_loading: false,
+            }],
+            std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+        let empty = ToolAvailability::all(vec![]);
+        let fixed = estimate_fixed_request_tokens("system", &retained);
+        assert!(fixed > estimate_fixed_request_tokens("system", &empty) + 1_000);
+        assert!(phoenix_llm::tool_availability_advisory_chars(&retained) > 0);
+        assert!(dispatch_estimate_exceeds_context(fixed, &[], 100, 1_000));
+    }
+
+    #[test]
+    fn predispatch_planning_counts_images_nested_in_tool_results() {
+        let tool_message = |images| LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "capture".into(),
+                content: "screenshot".into(),
+                is_error: false,
+                images,
+            }],
+        };
+        let text_only = tool_message(vec![]);
+        let with_images = tool_message(vec![
+            phoenix_core::domain::llm_types::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AA==".into(),
+            };
+            2
+        ]);
+        let text_tokens = estimate_message_tokens(&text_only);
+        assert_eq!(
+            estimate_message_tokens(&with_images),
+            text_tokens + 2 * IMAGE_TOKEN_ESTIMATE
+        );
+        let context = text_tokens + 1_000;
+        assert!(!dispatch_estimate_exceeds_context(
+            0,
+            &[text_only],
+            1_000,
+            context
+        ));
+        assert!(dispatch_estimate_exceeds_context(
+            0,
+            &[with_images],
+            1_000,
+            context
+        ));
+    }
+
+    #[test]
+    fn predispatch_planning_accounts_for_system_tools_history_and_output() {
+        let messages = vec![LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("x".repeat(400))],
+        }];
+        let history = estimate_messages_tokens(&messages);
+        let context = history + 1_000;
+        assert!(!dispatch_estimate_exceeds_context(
+            0, &messages, 1_000, context
+        ));
+        assert!(dispatch_estimate_exceeds_context(
+            1, &messages, 1_000, context
+        ));
+        assert!(
+            estimate_fixed_request_tokens(
+                "system instructions",
+                &phoenix_core::domain::tool_availability::ToolAvailability::all(vec![])
+            ) > 0
+        );
     }
 }
 
@@ -13814,6 +14146,7 @@ mod creation_completion_lifecycle_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (event_tx, event_rx) = mpsc::channel(32);
         let llm = Arc::new(MockLlmClient::new("test-model"));
@@ -14130,7 +14463,13 @@ mod authoritative_user_message_effect_tests {
         let storage = Arc::new(InMemoryStorage::new());
         storage.queue_preflight_authoritative_user_message(preflight);
         storage.queue_materialize_authoritative_user_message(materialize);
-        let context = ConvContext::new("conv-direct", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "conv-direct",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -14534,7 +14873,14 @@ mod authoritative_user_message_effect_tests {
                 AuthoritativeUserMessageMaterialization::StaleAuthority,
             );
             rt.context.is_coordinator = coordinator;
+            // Bounded-handoff retention under a small context: the declared
+            // output budget must leave room for the fixed prompt plus the
+            // accepted handoff. Reserving the fixture's wide 16_384 budget
+            // against a 20_000 window would leave no headroom, so set an
+            // explicit small budget alongside the small window rather than
+            // relying on any Phoenix-internal fallback.
             rt.context.context_window = 20_000;
+            rt.context.output_budget = 4_096;
             let conv = rt.context.conversation_id.clone();
             let seed = "Edited handoff: Crick paused until Friday; Phoenix owns worker A. No deployment permission.";
             storage
@@ -14723,6 +15069,39 @@ mod authoritative_user_message_effect_tests {
                 ..
             }] if operation_id == &request.operation_id
         ));
+    }
+
+    #[tokio::test]
+    async fn declared_budget_is_shared_by_ordinary_and_continuation_requests() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.context.output_budget = 131_072;
+        rt.context.context_window = 1_048_576;
+        let (tx, rx) = mpsc::channel(16);
+        rt.event_tx = tx;
+        rt.event_rx = rx;
+        rt.execute_effect(Effect::RequestLlm).await.unwrap();
+        rt.llm_task_handle.take().unwrap().await.unwrap();
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "declared-output-budget".into(),
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        rt.execute_effect(Effect::RequestContinuation { request })
+            .await
+            .unwrap();
+        rt.llm_task_handle.take().unwrap().await.unwrap();
+        let calls = rt.llm_client.recorded_requests();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert_eq!(call.max_tokens, 131_072);
+            assert_eq!(call.reserved_output_tokens(), 131_072);
+        }
     }
 
     #[tokio::test]
@@ -17187,6 +17566,7 @@ mod approved_explore_follow_up_tests {
             worktree.clone(),
             "test-model",
             200_000,
+            16_384,
         );
         context.mode_context = Some(ModeContext::Explore {
             next_taskmd_id_hint: None,
@@ -17652,7 +18032,8 @@ mod context_exhausted_preserves_worktree_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
         broadcast::Receiver<SseEvent>,
     ) {
-        let mut context = ConvContext::new(conv_id, working_dir.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, working_dir.clone(), "test-model", 200_000, 16_384);
         context.work_scope_worktree = Some(working_dir);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18620,7 +19001,8 @@ mod approve_task_failure_effect_tests {
         let task_filename = "12345-p2-ready--fresh-handoff.md";
         std::fs::write(tasks_dir.join(task_filename), "Plan\n").unwrap();
 
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000, 16_384);
         context.desired_base_branch = Some(base_branch.to_string());
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18688,7 +19070,8 @@ mod approve_task_failure_effect_tests {
         let task_filename = "12345-p2-ready--persist-failure.md";
         std::fs::write(tasks_dir.join(task_filename), "# Persist failure\n").unwrap();
 
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000, 16_384);
         context.desired_base_branch = Some(base_branch.to_string());
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18742,7 +19125,8 @@ mod approve_task_failure_effect_tests {
         std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
         std::fs::remove_file(tasks_dir.join(task_filename)).unwrap();
 
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        let mut context =
+            ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000, 16_384);
         context.desired_base_branch = Some(base_branch.to_string());
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -19083,6 +19467,7 @@ mod explore_prompt_cache_shape_tests {
                 temp.path().to_path_buf(),
                 "test-model",
                 200_000,
+                16_384,
             ),
             ConvState::Idle,
             storage.clone(),
@@ -19264,6 +19649,7 @@ mod explore_prompt_cache_shape_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn explore_tool_loop_keeps_system_prompt_and_cache_key_stable_after_task_file_write() {
         let temp = TempDir::new().unwrap();
         let tasks_dir = temp.path().join("tasks");
@@ -19278,8 +19664,13 @@ mod explore_prompt_cache_shape_tests {
             .to_string();
 
         let conv_id = "explore-cache-shape";
-        let mut context =
-            ConvContext::new(conv_id, temp.path().to_path_buf(), "test-model", 200_000);
+        let mut context = ConvContext::new(
+            conv_id,
+            temp.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         context.mode_context = Some(ModeContext::Explore {
             next_taskmd_id_hint: Some(hinted_id.clone()),
         });
@@ -19468,7 +19859,13 @@ mod steer_drain_detector_tests {
     ) {
         let storage = Arc::new(InMemoryStorage::new());
         storage.set_steering_queue(conv_id, queue.clone());
-        let context = ConvContext::new(conv_id, PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -19697,6 +20094,7 @@ mod steer_drain_detector_tests {
             temp.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         let setup_context = ToolContext::new_with_resource_scope(
             CancellationToken::new(),
@@ -20038,6 +20436,7 @@ mod steer_drain_detector_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -22236,6 +22635,7 @@ mod steer_drain_detector_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
             "parent-conv",
         );
         let (_event_tx, event_rx) = mpsc::channel(32);
@@ -23381,6 +23781,7 @@ mod subagent_grace_tool_surface_tests {
             cwd.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         context.is_sub_agent = true;
         context.max_turns = 1;
@@ -23453,6 +23854,7 @@ mod subagent_grace_tool_surface_tests {
             cwd.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         context.is_sub_agent = true;
         context.max_turns = 1;
@@ -23525,6 +23927,7 @@ mod subagent_grace_tool_surface_tests {
             cwd.path().to_path_buf(),
             "test-model",
             200_000,
+            16_384,
         );
         context.is_sub_agent = true;
         context.max_turns = 1;
@@ -23612,6 +24015,7 @@ mod work_subagent_cwd_guard_tests {
             working_dir.to_path_buf(),
             "gpt-5.6-sol",
             200_000,
+            16_384,
         );
         context.resource_authority = match &mode_context {
             ModeContext::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
@@ -24781,10 +25185,17 @@ mod retry_timer_epoch_tests {
                 PathBuf::from("/tmp"),
                 "test-model",
                 200_000,
+                16_384,
                 "root-conv",
             )
         } else {
-            ConvContext::new("conv-retry", PathBuf::from("/tmp"), "test-model", 200_000)
+            ConvContext::new(
+                "conv-retry",
+                PathBuf::from("/tmp"),
+                "test-model",
+                200_000,
+                16_384,
+            )
         };
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -25532,7 +25943,13 @@ mod fork_proposal_persist_tests {
 
     fn runtime_in_dir(conv_id: &str, working_dir: &Path) -> (TestRuntime, Arc<InMemoryStorage>) {
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new(conv_id, working_dir.to_path_buf(), "test-model", 200_000);
+        let context = ConvContext::new(
+            conv_id,
+            working_dir.to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -26274,7 +26691,13 @@ mod llm_generation_guard_tests {
 
     fn runtime_requesting() -> TestRuntime {
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("conv-gen", PathBuf::from("/tmp"), "test-model", 200_000);
+        let context = ConvContext::new(
+            "conv-gen",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -26599,6 +27022,7 @@ mod tool_generation_guard_tests {
             PathBuf::from("/tmp"),
             "test-model",
             200_000,
+            16_384,
         );
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;

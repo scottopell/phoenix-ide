@@ -42,6 +42,12 @@ fn server_failure_disposition(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--bash-launch-v1")) {
+        #[cfg(unix)]
+        phoenix_tools::bash::launch_protocol::early_exec_from_stdin();
+        #[cfg(not(unix))]
+        std::process::exit(126);
+    }
     phoenix_browser::process_group::enter_chrome_exec()?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     phoenix_browser::process_group::ChromeExecShim::install()?;

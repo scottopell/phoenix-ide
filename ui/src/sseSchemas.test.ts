@@ -1,5 +1,5 @@
-import { bashLaunchOutcomes } from './testFixtures/bashLaunchOutcomes';
-import { BashResponseSchema } from './sseSchemas';
+import { bashLaunchOutcomes, bashLaunchReleaseUnknown } from './testFixtures/bashLaunchOutcomes';
+import { BashErrorResponseSchema, BashResponseSchema } from './sseSchemas';
 /**
  * SSE wire-format validation tests (task 02674).
  *
@@ -39,6 +39,12 @@ import {
   ChainQaFailedSchema,
 } from './sseSchemas';
 import * as v from 'valibot';
+
+describe('BashErrorResponseSchema', () => {
+  it('accepts launch-release-unknown with its retained handle', () => {
+    expect(v.safeParse(BashErrorResponseSchema, bashLaunchReleaseUnknown).success).toBe(true);
+  });
+});
 
 function makeEvent(data: unknown): Event {
   // parseEvent casts Event -> MessageEvent and reads `.data`. happy-dom ships

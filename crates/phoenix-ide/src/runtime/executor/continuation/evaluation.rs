@@ -56,7 +56,7 @@ fn request(
         provider_replay: None,
         responses_replay: Vec::new(),
         tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
-        max_tokens: Some(OUTPUT),
+        max_tokens: OUTPUT,
         effective_effort: registry.effective_effort(model, None),
         service_tier: registry.effective_service_tier(model, ServiceTier::Standard),
         telemetry: None,

@@ -222,6 +222,9 @@ function summarizeBashInputIdentity(input: Record<string, unknown>, display?: st
 }
 
 function bashStatusLabel(parsed: Record<string, unknown>): string | null {
+  if (parsed['error'] === 'launch_release_unknown') {
+    return `outcome uncertain · do not automatically retry${typeof parsed['handle'] === 'string' ? ` · handle ${parsed['handle']}` : ''}`;
+  }
   if (typeof parsed['error'] === 'string' && parsed['status'] !== 'outcome_unknown') return 'error';
   const status = typeof parsed['status'] === 'string' ? parsed['status'] : '';
   const exitCode = parsed['exit_code'];

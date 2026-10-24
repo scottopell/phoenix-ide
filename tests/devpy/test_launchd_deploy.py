@@ -5552,7 +5552,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_controller_durability_test")
 
     @contextlib.contextmanager
-    def deployment(self, *, paired=True, current=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False, candidate_commit="a" * 40, controller_commit="d" * 40, registry_bytes=b"candidate registry bytes\n"):
+    def deployment(self, *, paired=True, current=False, refresh=False, release=False, public=False, predecessor=True, fail_sync=None, fail_terminal=False, dirty=False, interrupt_handoff=False, candidate_commit="a" * 40, controller_commit="d" * 40, registry_bytes=b"candidate registry bytes\n"):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             root = Path(td)
             deploy = root / "deploy"
@@ -5577,11 +5577,18 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 release_tag="v2.0.0" if release else None,
                 release_commit=identity.git_sha if release else None,
             )
+            receipt_sha = None
+            if refresh:
+                receipt = root / f"PREPARATION-RECEIPT-{self.dev._macos_prepared_target()}.json"
+                receipt.write_text(json.dumps({"schema": 1, "operation": "prepare-main", "commit": candidate_commit}))
+                receipt_sha = self.dev._file_sha256(receipt)
             controller = self.dev.ProdDeployControllerOptions(
                 transaction_id="durability", prepared_artifact=root if paired else None,
                 expected_full_commit=identity.git_sha if paired else None,
-                paired_database_upgrade=paired and not current,
+                paired_database_upgrade=paired and not current and not refresh,
                 current_schema_upgrade=current,
+                same_schema_refresh=refresh,
+                expected_preparation_receipt_sha256=receipt_sha,
             )
             if release:
                 controller = dataclasses.replace(
@@ -6265,6 +6272,178 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
             self.assertEqual((staging.parents[1] / "active").read_text().strip(), controller.transaction_id)
             self.assertEqual(json.loads((staging.parents[1] / "status.json").read_text())["state"], "preparing")
             self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+
+class SameSchema129RefreshControllerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dev = load(ROOT / "dev.py", "devpy_same_schema129_refresh_test")
+
+    def options(self):
+        return self.dev.ProdDeployControllerOptions(
+            prepared_artifact=Path("prepared"), expected_full_commit="e" * 40,
+            expected_preparation_receipt_sha256="f" * 64, same_schema_refresh=True,
+        )
+
+    def test_cli_dispatches_private_refresh_without_running_checks(self):
+        argv = ["dev.py", "prod", "deploy", "--prepared-artifact", "prepared",
+                "--expected-full-commit", "e" * 40,
+                "--expected-preparation-receipt-sha256", "f" * 64, "--same-schema-refresh"]
+        with mock.patch.object(self.dev.sys, "argv", argv), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check, \
+             mock.patch.object(self.dev.sys.stdout, "reconfigure"), \
+             mock.patch.object(self.dev.sys.stderr, "reconfigure"):
+            self.dev.main()
+        deploy.assert_called_once_with(None, controller=self.options())
+        check.assert_not_called()
+
+    def test_prepared_only_options_and_clean_controller_are_required_before_claim(self):
+        valid = self.options()
+        with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check:
+            self.dev.cmd_prod_deploy(controller=valid)
+            deploy.assert_called_once_with(None, controller=valid)
+            check.assert_not_called()
+        invalid = [
+            ("v1.2.3", valid),
+            (None, dataclasses.replace(valid, prepared_artifact=None)),
+            (None, dataclasses.replace(valid, expected_full_commit=None)),
+            (None, dataclasses.replace(valid, expected_full_commit="e" * 12)),
+            (None, dataclasses.replace(valid, expected_preparation_receipt_sha256=None)),
+            (None, dataclasses.replace(valid, expected_preparation_receipt_sha256="F" * 64)),
+            (None, dataclasses.replace(valid, controller_source_commit="d" * 40)),
+            (None, dataclasses.replace(valid, backend="systemd")),
+            (None, dataclasses.replace(valid, enabled=True)),
+            (None, dataclasses.replace(valid, paired_database_upgrade=True)),
+            (None, dataclasses.replace(valid, current_schema_upgrade=True)),
+            (None, dataclasses.replace(valid, systemd_current_schema_upgrade=True)),
+        ]
+        for release, options in invalid:
+            with self.subTest(release=release, options=options), \
+                 mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+                 mock.patch.object(self.dev, "cmd_check") as check, \
+                 self.assertRaises(SystemExit):
+                self.dev.cmd_prod_deploy(release, controller=options)
+            claim.assert_not_called()
+            check.assert_not_called()
+        with mock.patch.object(self.dev.sys, "platform", "linux"), \
+             mock.patch.object(self.dev, "_claim_launchd_deploy") as claim, \
+             self.assertRaises(SystemExit):
+            self.dev.launchd_prod_deploy(controller=valid)
+        claim.assert_not_called()
+
+    def test_receipt_digest_mismatch_fails_before_candidate_validation_or_handoff(self):
+        fixture = LaunchdControllerDurabilityTests()
+        fixture.dev = self.dev
+        with fixture.deployment(refresh=True) as (staging, controller, events), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"), \
+             mock.patch.object(self.dev, "_prepare_prepared_artifact") as prepare, \
+             self.assertRaisesRegex(SystemExit, "receipt does not match"):
+            self.dev.launchd_prod_deploy(controller=dataclasses.replace(
+                controller, expected_preparation_receipt_sha256="f" * 64))
+        prepare.assert_not_called()
+        self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_clean_controller_failure_and_registry_mismatch_prevent_handoff(self):
+        fixture = LaunchdControllerDurabilityTests()
+        fixture.dev = self.dev
+        for dirty, registry, message in ((True, b"wrong registry", "clean controller"),
+                                          (False, b"wrong registry", "registry129 SHA-256")):
+            with self.subTest(dirty=dirty), fixture.deployment(
+                refresh=True, dirty=dirty, registry_bytes=registry,
+            ) as (staging, controller, events), mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                 self.assertRaisesRegex(SystemExit, message):
+                self.dev.launchd_prod_deploy(controller=controller)
+            self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+
+    def test_refresh_status_and_manual_recovery_route_to_current_schema(self):
+        fixture = LaunchdControllerDurabilityTests()
+        fixture.dev = self.dev
+        registry = subprocess.check_output(["git", "show", "HEAD:crates/phoenix-db/src/migrations.rs"], cwd=ROOT)
+        with fixture.deployment(refresh=True, registry_bytes=registry) as (staging, controller, _events), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"):
+            self.dev.launchd_prod_deploy(controller=controller)
+            status_path = staging.parents[1] / "status.json"
+            status = json.loads(status_path.read_text())
+            status.update(state="migration_started", finalization_pending=True)
+            status_path.write_text(json.dumps(status))
+            guidance = self.dev._paired_recovery_refusal("durability")
+            self.assertIn("finalize-current durability", guidance)
+            self.assertNotIn("retained candidate migration before candidate start", guidance)
+            with self.assertRaisesRegex(SystemExit, "predecessor recovery is forbidden"):
+                self.dev.cmd_prod_recover_paired("durability", current_schema=True)
+            self.dev.cmd_prod_finalize_paired("durability", current_schema=True)
+            command = [
+                event[1] for event in _events
+                if event[0] == "command" and "finalize-current" in event[1]
+            ]
+            self.assertEqual(len(command), 1)
+            self.assertEqual(command[0][1:3], (str(staging / "activate.py"), "finalize-current"))
+            self.assertEqual(command[0][4], str(staging / "manifest.json"))
+
+    def test_refresh_manifest_routes_as_current_schema_and_binds_private_receipt(self):
+        fixture = LaunchdControllerDurabilityTests()
+        fixture.dev = self.dev
+        registry = subprocess.check_output(["git", "show", "HEAD:crates/phoenix-db/src/migrations.rs"], cwd=ROOT)
+        with fixture.deployment(refresh=True, candidate_commit="e" * 40, registry_bytes=registry) as (staging, controller, events), \
+             mock.patch.object(self.dev.sys, "platform", "darwin"):
+            self.dev.launchd_prod_deploy(controller=controller)
+            path = staging / "manifest.json"
+            payload = json.loads(path.read_text())
+
+            def write_tampered_manifest(value):
+                path.chmod(0o600)
+                try:
+                    path.write_text(json.dumps(value))
+                finally:
+                    path.chmod(0o400)
+
+            evidence = payload["current_schema_upgrade"]
+            self.assertEqual(evidence["prepared_source_baseline"], 129)
+            self.assertEqual(evidence["candidate_registry_expected_sha256"], self.dev.SAME_SCHEMA129_REGISTRY_SHA256)
+            self.assertEqual(evidence["receipt_sha256"], controller.expected_preparation_receipt_sha256)
+            self.assertEqual(evidence["receipt_path"], str(staging / "receipt.json"))
+            self.assertEqual(self.dev._file_sha256(staging / "receipt.json"), evidence["receipt_sha256"])
+            self.assertEqual(payload["source_commit"], "e" * 40)
+            self.assertEqual(payload["current_schema_upgrade"]["controller_source_commit"], "d" * 40)
+            self.assertIs(self.dev._deploy_manifest_kind(staging), self.dev.DeployManifestKind.CURRENT_SCHEMA)
+            self.assertTrue(self.dev._deploy_status_matches_manifest(
+                staging, payload, json.loads((staging.parents[1] / "status.json").read_text()),
+                self.dev.DeployManifestKind.CURRENT_SCHEMA))
+            self.assertIn(("command", ("git", "show", "e" * 40 + ":crates/phoenix-db/src/migrations.rs")), events)
+            self.assertEqual(evidence["candidate_registry_expected_sha256"], self.dev._file_sha256(staging / "migrations.rs"))
+            # The same retained manifest must be consumable by the real helper, not a controller-only shape.
+            loaded = helper.Manifest.load(path)
+            self.assertEqual(loaded.source_commit, "e" * 40)
+            for change in (
+                lambda m: m["current_schema_upgrade"].update(prepared_source_baseline=128),
+                lambda m: m["current_schema_upgrade"].update(receipt_sha256="0" * 64),
+                lambda m: m["current_schema_upgrade"].update(candidate_registry_expected_sha256="0" * 64),
+                lambda m: m.update(source_kind="published_release"),
+                lambda m: m.update(ordinary_forward_migration={}),
+            ):
+                altered = json.loads(path.read_text())
+                change(altered)
+                write_tampered_manifest(altered)
+                self.assertIs(self.dev._deploy_manifest_kind(staging), self.dev.DeployManifestKind.UNKNOWN)
+                with self.assertRaises(helper.ActivationError):
+                    helper.validate_pre_disruption_handoff(helper.Manifest.load(path))
+                write_tampered_manifest(payload)
+            stripped = json.loads(path.read_text())
+            stripped["current_schema_upgrade"].pop("receipt_path")
+            stripped["current_schema_upgrade"].pop("receipt_sha256")
+            write_tampered_manifest(stripped)
+            self.assertIs(self.dev._deploy_manifest_kind(staging), self.dev.DeployManifestKind.UNKNOWN)
+            with self.assertRaises(helper.ActivationError):
+                helper.validate_pre_disruption_handoff(helper.Manifest.load(path))
+            write_tampered_manifest(payload)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
 
 
 class PreparedArtifactTests(unittest.TestCase):

@@ -98,6 +98,9 @@ pub struct RegisteredHandle {
 
 #[derive(Debug, Default)]
 struct SpawnAdmission {
+    /// Reservations not yet represented by a registered live handle.
+    capacity_reservations: AtomicUsize,
+    /// All reservations, including registered launches whose gate is unsettled.
     pending: AtomicUsize,
     settled: Arc<Notify>,
     unverified_launch: AtomicBool,
@@ -107,7 +110,8 @@ struct SpawnAdmission {
 pub struct SpawnReservation {
     owner: ResourceScopeKey,
     handle_id: HandleId,
-    committed: bool,
+    registered: bool,
+    settled: bool,
     launched: bool,
     admission: Arc<SpawnAdmission>,
 }
@@ -231,8 +235,13 @@ impl SpawnReservation {
     }
 
     fn settle(&mut self) {
-        if !self.committed {
-            self.committed = true;
+        if !self.settled {
+            self.settled = true;
+            if !self.registered {
+                self.admission
+                    .capacity_reservations
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
             self.admission.pending.fetch_sub(1, Ordering::AcqRel);
             self.admission.settled.notify_waiters();
         }
@@ -241,7 +250,7 @@ impl SpawnReservation {
 
 impl Drop for SpawnReservation {
     fn drop(&mut self) {
-        if self.launched && !self.committed {
+        if self.launched && !self.registered {
             self.admission
                 .unverified_launch
                 .store(true, Ordering::Release);
@@ -654,7 +663,11 @@ impl BashHandleRegistry {
         if handles.teardown_started || handles.admission.unverified_launch.load(Ordering::Acquire) {
             return Err(BashHandleError::SpawnFenced);
         }
-        if handles.live_count().await + handles.admission.pending.load(Ordering::Acquire)
+        if handles.live_count().await
+            + handles
+                .admission
+                .capacity_reservations
+                .load(Ordering::Acquire)
             >= self.live_handle_cap
         {
             return Err(BashHandleError::HandleCapReached {
@@ -663,10 +676,15 @@ impl BashHandleRegistry {
             });
         }
         handles.admission.pending.fetch_add(1, Ordering::AcqRel);
+        handles
+            .admission
+            .capacity_reservations
+            .fetch_add(1, Ordering::AcqRel);
         Ok(SpawnReservation {
             owner: owner.clone(),
             handle_id: Self::allocate_handle_id(),
-            committed: false,
+            registered: false,
+            settled: false,
             launched: false,
             admission: handles.admission.clone(),
         })
@@ -680,6 +698,27 @@ impl BashHandleRegistry {
         &self,
         reservation: &mut SpawnReservation,
         handle: Arc<Handle>,
+    ) -> Result<Arc<Handle>, BashHandleError> {
+        self.commit_spawn_inner(reservation, handle, true).await
+    }
+
+    /// Registers an admitted launch while retaining its pending gate custody lease.
+    ///
+    /// # Errors
+    /// Returns [`BashHandleError::SpawnFenced`] if the owner table disappeared.
+    pub async fn commit_spawn_gated(
+        &self,
+        reservation: &mut SpawnReservation,
+        handle: Arc<Handle>,
+    ) -> Result<Arc<Handle>, BashHandleError> {
+        self.commit_spawn_inner(reservation, handle, false).await
+    }
+
+    async fn commit_spawn_inner(
+        &self,
+        reservation: &mut SpawnReservation,
+        handle: Arc<Handle>,
+        settle: bool,
     ) -> Result<Arc<Handle>, BashHandleError> {
         let entry = self
             .get_existing(&reservation.owner)
@@ -695,7 +734,16 @@ impl BashHandleRegistry {
                 handle: inserted.clone(),
             },
         );
-        reservation.settle();
+        if !reservation.registered {
+            reservation.registered = true;
+            reservation
+                .admission
+                .capacity_reservations
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        if settle {
+            reservation.settle();
+        }
         Ok(inserted)
     }
 
@@ -780,11 +828,23 @@ impl BashHandleRegistry {
         );
     }
 
-    /// Snapshot live process-group ids across ALL work scopes, for the
-    /// shutdown kill-tree pass. Acquires read locks; callers must NOT
-    /// hold any per-scope lock while invoking this.
-    ///
-    /// REQ-BASH-007: walks live handles for the `shutdown_kill_tree` pass.
+    /// Clone handles across all work scopes for bounded shutdown signaling.
+    /// The returned handles retain their incarnation identity without holding
+    /// registry locks across signal attempts or exit observation.
+    pub(crate) async fn snapshot_handles_for_shutdown(&self) -> Vec<Arc<Handle>> {
+        let mut handles = Vec::new();
+        let map = self.inner.read().await;
+        for entry in map.values() {
+            let scope_handles = entry.read().await;
+            handles.extend(scope_handles.all().cloned());
+        }
+        handles
+    }
+
+    /// Diagnostic snapshot of live process-group ids across ALL work scopes.
+    /// These numbers convey no signaling authority; shutdown uses retained
+    /// handles instead. Acquires read locks; callers must NOT hold any
+    /// per-scope lock while invoking this.
     pub async fn snapshot_live_pgids(&self) -> Vec<i32> {
         let mut out = Vec::new();
         let map = self.inner.read().await;
@@ -1700,6 +1760,7 @@ mod tests {
             .await
             .expect("reserve commit");
         let committed_id = reservation.handle_id().clone();
+        reservation.mark_launched();
         let inserted = registry
             .commit_spawn(
                 &mut reservation,
@@ -1718,6 +1779,32 @@ mod tests {
             .expect("commit spawn");
         assert_eq!(inserted.handle_id, committed_id);
         assert!(registry.get_by_id(&committed_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn launched_registered_commit_drop_does_not_mark_scope_uncertain() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("launched-registered-drop");
+        let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
+        let handle_id = reservation.handle_id().clone();
+        reservation.mark_launched();
+        registry
+            .commit_spawn(
+                &mut reservation,
+                make_handle(
+                    "launched-registered-drop",
+                    handle_id.as_str(),
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await
+            .unwrap();
+        drop(reservation);
+
+        let table = registry.get_existing(&owner).await.unwrap();
+        let table = table.read().await;
+        assert!(!table.admission.unverified_launch.load(Ordering::Acquire));
+        assert_eq!(table.admission.pending.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -1938,6 +2025,99 @@ mod tests {
             registry.reserve_spawn(&owner).await,
             Err(BashHandleError::HandleCapReached { cap: 1, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn gated_commit_does_not_count_live_handle_and_reservation_twice() {
+        let registry = BashHandleRegistry::with_caps(RING_BUFFER_BYTES, 2);
+        let owner = scope("gated-cap");
+        let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
+        let handle_id = reservation.handle_id().to_string();
+        reservation.mark_launched();
+        registry
+            .commit_spawn_gated(
+                &mut reservation,
+                make_handle("gated-cap", &handle_id, RING_BUFFER_BYTES),
+            )
+            .await
+            .unwrap();
+
+        let _second = registry.reserve_spawn(&owner).await.unwrap();
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::HandleCapReached { cap: 2, .. })
+        ));
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn registered_gated_launches_release_capacity_but_remain_pending_for_teardown() {
+        let registry = Arc::new(BashHandleRegistry::with_caps(RING_BUFFER_BYTES, 8));
+        let owner = scope("four-gated-launches");
+        let mut gates = Vec::new();
+        for index in 0..4 {
+            let mut reservation = registry.reserve_spawn(&owner).await.unwrap();
+            let handle_id = reservation.handle_id().to_string();
+            reservation.mark_launched();
+            registry
+                .commit_spawn_gated(
+                    &mut reservation,
+                    make_handle(&format!("gated-{index}"), &handle_id, RING_BUFFER_BYTES),
+                )
+                .await
+                .unwrap();
+            gates.push(reservation);
+        }
+        let fifth = registry.reserve_spawn(&owner).await.unwrap();
+
+        let teardown = {
+            let registry = registry.clone();
+            let owner = owner.clone();
+            tokio::spawn(async move { registry.begin_teardown(&owner).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !teardown.is_finished(),
+            "registered gate leases remain pending"
+        );
+
+        // A gate lease settles exactly once; dropping its reservation afterward is inert.
+        registry.abort_spawn(gates.pop().unwrap());
+        assert!(
+            !teardown.is_finished(),
+            "other registered launches remain pending"
+        );
+        drop(gates);
+        drop(fifth);
+        assert!(teardown.await.expect("join").is_some());
+        let table = registry.get_existing(&owner).await.unwrap();
+        assert_eq!(
+            table.read().await.admission.pending.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn settling_registered_gate_preserves_unrelated_launch_uncertainty() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("unrelated-uncertainty");
+        let mut registered = registry.reserve_spawn(&owner).await.unwrap();
+        let handle_id = registered.handle_id().to_string();
+        registry
+            .commit_spawn_gated(
+                &mut registered,
+                make_handle("registered-gate", &handle_id, RING_BUFFER_BYTES),
+            )
+            .await
+            .unwrap();
+        let mut uncertain = registry.reserve_spawn(&owner).await.unwrap();
+        uncertain.mark_unregistered();
+        drop(uncertain);
+        registry.abort_spawn(registered);
+        let table = registry.get_existing(&owner).await.unwrap();
+        let table = table.read().await;
+        assert!(table.admission.unverified_launch.load(Ordering::Acquire));
+        assert_eq!(table.admission.pending.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

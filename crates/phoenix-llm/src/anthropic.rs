@@ -929,9 +929,7 @@ fn translate_request_with_tool_policy(
                 prefix_mismatch_behavior: "drop_block",
             },
         }),
-        max_tokens: request
-            .raised_output_token_ceiling()
-            .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
+        max_tokens: request.max_tokens,
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
@@ -998,7 +996,7 @@ fn validate_tool_search_references(
     Ok(())
 }
 
-fn native_policy_needs_advisory(availability: &ToolAvailability) -> bool {
+pub(crate) fn native_policy_needs_advisory(availability: &ToolAvailability) -> bool {
     let mut offered: std::collections::BTreeSet<_> = availability
         .anthropic_initial_declarations()
         .iter()
@@ -1038,7 +1036,7 @@ fn uses_tool_search(spec: &ModelSpec, request: &LlmRequest, native: bool) -> boo
             }))
 }
 
-fn tool_advisory(availability: &ToolAvailability) -> String {
+pub(crate) fn tool_advisory(availability: &ToolAvailability) -> String {
     format!(
         "The currently callable client tools are: {}. Other declared tools are retained only for historical context and must not be called; execution will return an unavailable error.",
         serde_json::to_string(availability.callable_names()).expect("tool names serialize"),
@@ -1484,6 +1482,20 @@ fn normalize_response_with_diagnostics(
         return Err(LlmError::prompt_rejected(message));
     }
 
+    // stop_reason=max_tokens is a budget-limited stop (REQ-LLM-006c): the model
+    // reached the request's output-token budget. Terminal for auto-retry, user
+    // resumable, distinct from context_window_exceeded and from a retryable
+    // fault. Checked before any partial tool_use is parsed into a tool call, so
+    // a truncated tool call is discarded and never dispatched; already-streamed
+    // visible text stays in the ephemeral client buffer. The assembled
+    // streaming response carries the same stop_reason, so a max_tokens stream is
+    // governed here rather than by the SSE-error discard path.
+    if resp.stop_reason.as_deref() == Some("max_tokens") {
+        return Err(LlmError::output_tokens_exhausted(
+            "Anthropic stopped at its output token budget before finishing",
+        ));
+    }
+
     let end_turn = resp.stop_reason.as_deref() == Some("end_turn");
 
     // Check if content has any client-actionable blocks. Server blocks
@@ -1564,14 +1576,6 @@ fn normalize_response_with_diagnostics(
     );
     response.provider_replay = provider_replay;
     Ok(response)
-}
-
-fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
-    if effort.is_some_and(ModelEffort::needs_extended_output_headroom) {
-        64_000
-    } else {
-        16_384
-    }
 }
 
 fn explicit_anthropic_effort(effort: ModelEffort) -> AnthropicOutputConfig {
@@ -1852,7 +1856,7 @@ mod tests {
             family: "Anthropic".into(),
             description: "test".into(),
             context_window: 200_000,
-            max_output_tokens: None,
+            max_output_tokens: 64_000,
             recommended: false,
             supports_tool_search,
             source: crate::models::ModelSource::BuiltIn,
@@ -1881,7 +1885,7 @@ mod tests {
                     defer_loading: true,
                 },
             ]),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -1896,7 +1900,7 @@ mod tests {
             provider_replay: None,
             responses_replay: vec![],
             tool_availability: ToolAvailability::all(vec![]),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -2352,7 +2356,7 @@ mod tests {
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Xhigh);
-        request.max_tokens = Some(16_384);
+        request.max_tokens = 16_384;
         let explicit =
             serde_json::to_value(translate_request(&spec, &request, false, true).unwrap()).unwrap();
         assert_eq!(explicit["output_config"]["effort"], "xhigh");
@@ -2620,7 +2624,7 @@ mod tests {
             provider_replay: None,
             responses_replay: vec![],
             tool_availability: ToolAvailability::all(vec![]),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -3026,6 +3030,79 @@ mod tests {
         })
         .unwrap();
         assert!(response.provider_replay.is_none());
+    }
+
+    /// `stop_reason="max_tokens"` must classify as exhausted even when a
+    /// (fully-formed, since Anthropic's `input` field is parsed JSON, not a
+    /// raw string) `tool_use` block is present — the truncated call must be
+    /// discarded, not dispatched.
+    #[test]
+    fn normalize_response_max_tokens_stop_reason_discards_tool_use() {
+        let error = normalize_response(AnthropicResponse {
+            id: "msg_truncated".into(),
+            model: "claude-opus-5-5".into(),
+            content: vec![AnthropicContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"cmd": "ls"}),
+            }],
+            stop_reason: Some("max_tokens".into()),
+            stop_details: None,
+            usage: AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 4096,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                speed: None,
+            },
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::OutputTokensExhausted);
+    }
+
+    /// Streaming equivalent: a `tool_use` block that never receives
+    /// `content_block_stop` (truncated mid-argument) followed by
+    /// `stop_reason="max_tokens"` must classify as exhausted, not fall back
+    /// to assembling a tool call from the partial/invalid JSON accumulated
+    /// so far (the partial-json parser falls back to `{}` on parse failure,
+    /// which would otherwise look like a legitimate empty-input tool call).
+    #[tokio::test]
+    async fn streaming_partial_tool_use_then_max_tokens_is_exhausted() {
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        acc.process_event(
+            "message_start",
+            r#"{"message":{"id":"msg_trunc","model":"claude-opus-5-5","usage":{"input_tokens":10}}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"tool_use","id":"tu1","name":"bash"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        // No content_block_stop — the block is still open when the budget runs out.
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event("message_stop", "{}", &tx).await.unwrap();
+
+        let error = acc.into_response_with_diagnostics(None).unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::OutputTokensExhausted);
     }
 
     #[test]

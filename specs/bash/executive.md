@@ -30,11 +30,19 @@ Persistence across Phoenix or system restart belongs to the separate
 `tmux` tool (see `specs/tmux-integration/`); this tool is "cheap and
 ephemeral, with a graceful failure mode."
 
-Phoenix sets `PR_SET_CHILD_SUBREAPER` at startup so descendants that escape
-their original process group (double-forks, `setsid`-using daemons) reparent
-to Phoenix rather than init; at shutdown, a kill-tree pass SIGKILLs every
-live handle's process group. This replaces the prior draft's wrong
-assumption that SIGHUP cascade would clean up children when Phoenix died.
+Phoenix attempts `PR_SET_CHILD_SUBREAPER` at startup where supported. Shutdown
+snapshots registered live handles and attempts incarnation-bound SIGKILL under
+one global deadline, then observes handle exit notifications while time remains.
+This is best-effort: successful signals or leader exits do not prove descendant
+absence or complete process-group reaping. Platforms without an
+incarnation-bound signaling primitive fail closed and log unsupported signaling;
+there is no raw numeric PID/PGID fallback.
+
+An `identity_unavailable` launch warning records the typed local observation
+cause and bounded numeric return/errno fields when available. It means Phoenix
+could not prove the launched child's identity: execution outcome may be
+ambiguous, and it does not authorize a reset, adoption, cleanup, or automatic
+retry. The warning contains no command or environment values.
 
 ## Input-failure evidence
 
@@ -116,7 +124,7 @@ entirely.
 | **REQ-BASH-004:** Ring Buffer + Read Semantics | 🔄 Rewrite | Bytes-bounded ring, per-line offsets, caller-controlled read window, plus typed ephemeral live-output projection for conversation cards with terminal handoff back to the normal tool result |
 | **REQ-BASH-005:** Live Handle Cap | ❌ New | Hard refusal with structured live-handles list |
 | **REQ-BASH-006:** Tombstones and Process Exit | ❌ New | Demote-on-exit, in-memory only, retained until conv hard-delete or Phoenix exit |
-| **REQ-BASH-007:** Child Process Reaper | ❌ New | `PR_SET_CHILD_SUBREAPER` at startup + SIGKILL kill-tree at shutdown |
+| **REQ-BASH-007:** Child Process Reaper | ❌ New | Subreaper where supported; bounded, incarnation-bound shutdown signal attempts (no complete-tree-reaping guarantee) |
 | **REQ-BASH-008:** Error Reporting | 🔄 Rewrite | Stable error ids, structured envelopes; non-zero exit is not an error |
 | **REQ-BASH-009:** No TTY Attached | 🔄 Carry-forward | Existing behavior; tool description points at `tmux` |
 | **REQ-BASH-010:** Tool Schema and Mutual Exclusion | 🔄 Rewrite (rev 3) | `op` discriminator with `run`/`peek`/`wait`/`kill`; `label` field added; legacy four-sibling inference, `mode` shim, `command` alias, and empty-string-as-absent tolerance retired (`deny_unknown_fields`); two narrow tolerances retained for active GPT default-fill (`since=0`, `lines+since`) |
@@ -131,7 +139,16 @@ entirely.
 | **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill, and compact conversation summaries retain identity/status/duration/output-tail rather than a generic done badge |
 | **REQ-BASH-016:** Coordinator Live-Handle Surface | ✅ Complete | Process-local discovery exposes only live Coordinator-controlled handles with immutable spawn cwd; output uses the authorized inspector, and exact stop is incarnation-bound and offered only on supported hosts |
-| **REQ-BASH-017:** Post-launch Identity and Registration Settlement | Implemented; reconciled-head hosted qualification pending | Caller-independent owned-child custody, 250ms natural-exit settlement, bounded capture (including empty records), and focused fault regressions are implemented. Scope uncertainty is typed separately from process-group failures and blocks successful Close retirement without a fabricated PGID. Generated TypeScript wire contracts are checked in; `.github/workflows/bash-launch.yml` regenerates them and runs focused Linux/macOS faults. Exact-successor hosted CI and fault qualification remain required after integration; no local tests/compiler run. |
+| **REQ-BASH-017:** Post-launch Identity and Registration Settlement | Implemented; reconciled-head hosted qualification pending | The preventive gated launcher validates birth identity and commits registration before releasing user payload; the pre-release native denial path proves no command marker is created. Caller-independent owned-child custody, 250ms natural-exit settlement, bounded capture (including empty records), and focused fault regressions cover failures after a child exists. Failed release returns a typed `launch_release_unknown` error with the retained handle and explicit no-retry/may-have-executed guidance; it is not reported as `spawn_failed`. Scope uncertainty remains conservative and sticky, blocks successful Close retirement, and never fabricates a PGID or authorizes reset/recovery. Generated TypeScript wire contracts are checked in; `.github/workflows/bash-launch.yml` regenerates them and requires the native executable for focused Linux/macOS qualification. Ordinary test runs explicitly skip native-executable cases when the fixture is absent; hosted qualification fails if it is absent. Exact-successor hosted CI and fault qualification remain required after integration; no local tests/compiler run.
+
+For local runs that include native-launch cases, build the production executable and select it explicitly:
+
+```sh
+cargo build -p phoenix_ide --bin phoenix_ide
+PHOENIX_BASH_LAUNCH_TEST_EXE="$PWD/target/debug/phoenix_ide" ./dev.py check
+```
+
+A Rust test harness executable is not a launcher fixture; without the native executable, gated launches fail closed.
 
 The branch-observation slice is implemented: bash-handle terminal completion reconciles
 WorkScope-scoped local Git state into durable observed-branch and PR-association facts, then
