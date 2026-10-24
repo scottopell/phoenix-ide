@@ -110,10 +110,9 @@ class CurrentSchemaPreparedUpgradeTests(unittest.TestCase):
         self.registry.write_text(
             source[:registry_match.start(2)] + historical_entries + source[registry_match.end(2):]
         )
-        self.assertEqual(
-            helper.migration_registry(self.registry)[-1],
-            (QUALIFIED_TARGET, "single_conversation_name_and_route_projection"),
-        )
+        base_ledger = self.source128_ledger[:-1]
+        self.assertEqual(base_ledger[-1][0], QUALIFIED_TARGET)
+        self.assertEqual(helper.migration_registry(self.registry), base_ledger)
         self.prepared_registry_pin = helper.sha256(self.registry)
         registry_pin = mock.patch.object(
             helper, "PREPARED_SOURCE114_REGISTRY_SHA256", self.prepared_registry_pin,

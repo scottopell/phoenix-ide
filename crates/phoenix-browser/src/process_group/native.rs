@@ -570,14 +570,23 @@ mod tests {
 
     #[test]
     fn linux_scan_reclassifies_malformed_stat_only_after_known_membership_loss() {
-        for stat in ["invalid", "42 (Chrome)", "42 (Chrome) S 1", "42 (Chrome) S 1 invalid"] {
+        for stat in [
+            "invalid",
+            "42 (Chrome)",
+            "42 (Chrome) S 1",
+            "42 (Chrome) S 1 invalid",
+        ] {
             for after in [Ok(0), Ok(99), Err(io::Error::from_raw_os_error(libc::ESRCH))] {
                 let mut observations = [Ok(42), after].into_iter();
                 let mut reads = 0;
                 let live = linux_process_is_live_member(
                     42,
                     42,
-                    |_| observations.next().expect("exactly two membership observations"),
+                    |_| {
+                        observations
+                            .next()
+                            .expect("exactly two membership observations")
+                    },
                     || {
                         reads += 1;
                         Ok(stat.to_owned())
@@ -610,7 +619,11 @@ mod tests {
                 let error = linux_process_is_live_member(
                     42,
                     42,
-                    |_| observations.next().expect("exactly two membership observations"),
+                    |_| {
+                        observations
+                            .next()
+                            .expect("exactly two membership observations")
+                    },
                     || {
                         reads += 1;
                         Ok(stat.to_owned())

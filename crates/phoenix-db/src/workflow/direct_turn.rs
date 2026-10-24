@@ -4495,9 +4495,8 @@ mod tests {
         assert!(refused.canonical_turn.is_none());
         read_only.rollback().await.unwrap();
 
-        let acquisition_error = match contender.begin_immediate_tx().await {
-            Err(error) => error,
-            Ok(_) => panic!("a held writer must deny immediate acquisition"),
+        let Err(acquisition_error) = contender.begin_immediate_tx().await else {
+            panic!("a held writer must deny immediate acquisition");
         };
         let DbError::Sqlx(sqlite_error) = &acquisition_error else {
             panic!("expected SQLite writer contention: {acquisition_error}");
@@ -4515,7 +4514,10 @@ mod tests {
                 ),
             );
         } else {
-            let observed = contender.claim_authoritative_turn(&absent).await.unwrap_err();
+            let observed = contender
+                .claim_authoritative_turn(&absent)
+                .await
+                .unwrap_err();
             let DbError::Sqlx(sqlite_error) = &observed else {
                 panic!("expected acquisition error, not read-only refusal: {observed}");
             };
@@ -4531,7 +4533,10 @@ mod tests {
         let refused = if establish {
             match contender.establish_authoritative_turn_claim(&absent).await {
                 ClaimAuthoritativeTurnEstablishment::Established(result) => *result,
-                other => panic!("unlocked refusal must be classified: {other:?}"),
+                other @ (ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(_)
+                | ClaimAuthoritativeTurnEstablishment::Unclassifiable(_)) => {
+                    panic!("unlocked refusal must be classified: {other:?}")
+                }
             }
         } else {
             contender.claim_authoritative_turn(&absent).await.unwrap()
@@ -4541,7 +4546,10 @@ mod tests {
         let claimed = if establish {
             match contender.establish_authoritative_turn_claim(&claim).await {
                 ClaimAuthoritativeTurnEstablishment::Established(result) => *result,
-                other => panic!("unlocked valid claim must establish: {other:?}"),
+                other @ (ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(_)
+                | ClaimAuthoritativeTurnEstablishment::Unclassifiable(_)) => {
+                    panic!("unlocked valid claim must establish: {other:?}")
+                }
             }
         } else {
             contender.claim_authoritative_turn(&claim).await.unwrap()
@@ -4552,7 +4560,10 @@ mod tests {
         let refused_live = if establish {
             match contender.establish_authoritative_turn_claim(&claim).await {
                 ClaimAuthoritativeTurnEstablishment::Established(result) => *result,
-                other => panic!("live-authority refusal must be classified: {other:?}"),
+                other @ (ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(_)
+                | ClaimAuthoritativeTurnEstablishment::Unclassifiable(_)) => {
+                    panic!("live-authority refusal must be classified: {other:?}")
+                }
             }
         } else {
             contender.claim_authoritative_turn(&claim).await.unwrap()
