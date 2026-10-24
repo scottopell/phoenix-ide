@@ -163,6 +163,25 @@ impl Database {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| DbError::Serialization("Slack owner is required".into()))?;
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let prior: Option<String> =
+            sqlx::query_scalar("SELECT value FROM app_settings WHERE key='slack_gateway'")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(prior) = prior {
+            let prior: serde_json::Value =
+                serde_json::from_str(&prior).map_err(|e| DbError::Serialization(e.to_string()))?;
+            if prior.get("workspace") == config.get("workspace")
+                && prior.get("owner") == config.get("owner")
+                && prior.get("timezone") != config.get("timezone")
+            {
+                let initializing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_accounts account WHERE workspace=?1 AND owner=?2 AND baseline_complete=0 AND EXISTS(SELECT 1 FROM slack_gateway_discovery scan WHERE scan.workspace=account.workspace AND scan.owner=account.owner))").bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
+                if initializing {
+                    return Err(DbError::Serialization(
+                        "Finish Slack initialization before changing its timezone".into(),
+                    ));
+                }
+            }
+        }
         let outstanding: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND (r.eyes_confirmed=0 OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.response_kind<>'clarification' AND o.state IN ('confirmed','failed')))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
         ).bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
@@ -556,8 +575,7 @@ async fn active_reply_requests(
             "Reply source is not the current native tool occurrence".into(),
         ));
     }
-    let inputs:Vec<String>=sqlx::query_scalar("SELECT canonical_message_id FROM durable_turns WHERE conversation_id=?1 AND owns_conversation=1 AND canonical_message_id IS NOT NULL UNION SELECT message_id FROM steering_execution_occurrences WHERE conversation_id=?1")
-        .bind(transcript).fetch_all(&mut **tx).await?;
+    let inputs = current_execution_inputs(tx, transcript).await?;
     let mut requests = std::collections::BTreeSet::new();
     for input in inputs {
         requests.extend(requests_for_native_input(tx, transcript, &input).await?);
@@ -591,6 +609,19 @@ async fn requests_for_native_input(
           AND NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage rc JOIN slack_gateway_returns o USING(return_id) WHERE rc.request_id=e.request_id AND o.response_kind!='clarification')")
         .bind(transcript).bind(message).fetch_all(&mut **tx).await?)
 }
+
+async fn current_execution_inputs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transcript: &str,
+) -> DbResult<Vec<String>> {
+    // A steering/interaction occurrence supersedes the original direct input
+    // even while its workflow is still settling. Private follow-ups cannot
+    // inherit its publication authority through a lagging durable-turn owner.
+    Ok(sqlx::query_scalar("SELECT message_id FROM steering_execution_occurrences WHERE conversation_id=?1
+        UNION SELECT canonical_message_id FROM durable_turns WHERE conversation_id=?1 AND owns_conversation=1 AND canonical_message_id IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM steering_execution_occurrences WHERE conversation_id=?1)")
+        .bind(transcript).fetch_all(&mut **tx).await?)
+}
 pub(crate) async fn record_slack_question_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     transcript: &str,
@@ -623,8 +654,7 @@ pub(crate) async fn record_slack_question_tx(
     };
     let body =
         serde_json::to_string(questions).map_err(|e| DbError::Serialization(e.to_string()))?;
-    let inputs:Vec<String>=sqlx::query_scalar("SELECT message_id FROM steering_execution_occurrences WHERE conversation_id=?1 UNION SELECT canonical_message_id FROM durable_turns WHERE conversation_id=?1 AND owns_conversation=1 AND canonical_message_id IS NOT NULL")
-        .bind(transcript).fetch_all(&mut **tx).await?;
+    let inputs = current_execution_inputs(tx, transcript).await?;
     for input in inputs {
         for request in requests_for_native_input(tx, transcript, &input).await? {
             sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body) VALUES (?1,?2,'question',?3,?2,?4) ON CONFLICT DO NOTHING")
@@ -774,6 +804,47 @@ async fn reject_slack_request_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn timezone_change_cannot_reinterpret_an_unfinished_baseline() {
+        let db = Database::open_in_memory().await.unwrap();
+        let original = serde_json::json!({"workspace":"example.slack.com","owner":"UOWNER","timezone":"UTC","enabled":true});
+        db.set_slack_configuration(&original.to_string())
+            .await
+            .unwrap();
+        db.slack_baseline_complete("example.slack.com", "UOWNER")
+            .await
+            .unwrap();
+        let mut changed = original.clone();
+        changed["timezone"] = serde_json::json!("America/New_York");
+        // Inspection alone creates an account, but has no baseline boundary.
+        db.set_slack_configuration(&changed.to_string())
+            .await
+            .unwrap();
+        db.set_slack_configuration(&original.to_string())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO slack_gateway_discovery(workspace,owner,kind,after_date,cursor) VALUES ('example.slack.com','UOWNER','reaction','2026-10-19','saved')").execute(db.pool()).await.unwrap();
+        assert!(db
+            .set_slack_configuration(&changed.to_string())
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_app_setting("slack_gateway").await.unwrap(),
+            Some(original.to_string())
+        );
+        let mut paused = original;
+        paused["enabled"] = serde_json::json!(false);
+        db.set_slack_configuration(&paused.to_string())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE slack_gateway_accounts SET baseline_complete=1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.set_slack_configuration(&changed.to_string())
+            .await
+            .unwrap();
+    }
     #[tokio::test]
     async fn account_switch_cannot_orphan_accepted_work() {
         let db = Database::open_in_memory().await.unwrap();
@@ -1389,6 +1460,10 @@ mod tests {
         )
         .await
         .unwrap();
+        // The original direct workflow may still own the conversation while
+        // a private steering occurrence has already become the active input.
+        sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'fixture',1,1,1,0,0,'Active','fixture',1,X'00',1,1)").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,canonical_message_id) VALUES (1,1,?1,'fixture','fixture',X'00','Runtime',0,1,?2)").bind(&conv.id).bind(&request.input_id).execute(db.pool()).await.unwrap();
         db.add_message_with_seq_and_origin(
             "private-input",
             &conv.id,
@@ -1400,6 +1475,44 @@ mod tests {
         )
         .await
         .unwrap();
+        db.update_conversation_state(
+            &conv.id,
+            &ConvState::AwaitingUserResponse {
+                questions: vec![phoenix_core::domain::sm_state::UserQuestion {
+                    header: "Private".into(),
+                    question: "Private clarification?".into(),
+                    options: vec![],
+                    multi_select: false,
+                }],
+                tool_use_id: "private-question".into(),
+                request_authority: phoenix_core::domain::sm_state::QuestionRequestAuthority::new(),
+            },
+        )
+        .await
+        .unwrap();
+        db.process_slack_native_outcomes().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM slack_gateway_native_outcomes WHERE kind='question'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(db
+            .slack_returns("example.slack.com", "UOWNER")
+            .await
+            .unwrap()
+            .is_empty());
+        sqlx::query("DELETE FROM durable_turns WHERE turn_id=1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workflows WHERE workflow_id=1")
+            .execute(db.pool())
+            .await
+            .unwrap();
         let mut tx = db.pool().begin().await.unwrap();
         record_slack_native_outcome_tx(
             &mut tx,
@@ -1814,6 +1927,8 @@ mod tests {
                 .bind(&r.input_id).execute(db.pool()).await.unwrap();
             ids.push(r.request_id);
         }
+        sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'fixture',1,1,1,0,0,'Active','fixture',1,X'00',1,1)").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,canonical_message_id) SELECT 1,1,'test','fixture','fixture',X'00','Runtime',0,1,input_id FROM slack_gateway_requests WHERE request_id=?1").bind(&ids[0]).execute(db.pool()).await.unwrap();
         db.add_message_with_seq_and_origin(
             "private-input",
             "test",
@@ -1868,6 +1983,14 @@ mod tests {
             )
             .await
             .is_err());
+        sqlx::query("DELETE FROM durable_turns WHERE turn_id=1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workflows WHERE workflow_id=1")
+            .execute(db.pool())
+            .await
+            .unwrap();
         let first_input: String =
             sqlx::query_scalar("SELECT input_id FROM slack_gateway_requests WHERE request_id=?1")
                 .bind(&ids[0])
