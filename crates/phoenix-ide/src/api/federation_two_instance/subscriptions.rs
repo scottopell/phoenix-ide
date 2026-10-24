@@ -697,14 +697,25 @@ async fn actual_close_after_source_authorization_suppresses_unadmitted_fact() {
         .json()
         .await
         .unwrap();
-    assert!(matches!(
-        response.result,
-        SubscriptionResult::Authorization {
-            authorization: SubscriptionAuthorization::Authorized { .. },
-            ..
-        }
-    ));
-    // No local confirmation: exercise the durable authorizing/crash window, not just a completed send.
+    let SubscriptionResult::Authorization {
+        authorization: SubscriptionAuthorization::Authorized { authorization_id },
+        navigation: Some(navigation),
+    } = response.result
+    else {
+        panic!("source authorization with navigation required")
+    };
+    a.state
+        .db
+        .confirm_remote_authorization(
+            &remote,
+            &pending.admission_id,
+            authorization_id,
+            &navigation.stable_path,
+            &navigation.source_path,
+        )
+        .await
+        .unwrap();
+    // Leave the confirmed receipt unadmitted to exercise the crash/restart recovery window.
     close_source(&b, &source).await;
     sync_once(&a.state.db, &a.state.runtime, &remote)
         .await

@@ -402,17 +402,16 @@ async fn request_active_peer_subscription(
     db: &Database,
     peer: &FederationPeerConnection,
     request: &SubscriptionRequest,
-) -> Result<SubscriptionResponse, String> {
+) -> Result<SubscriptionResponse, FederationClientError> {
     let response = request_peer(peer, request).await;
     if matches!(
         response,
         Err(FederationClientError::SubscriptionAuthenticationRejected)
     ) {
         db.settle_remote_subscription_revocation(&request.reference, request.subscription_id)
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
     }
-    response.map_err(|error| error.to_string())
+    response
 }
 
 pub(crate) async fn create_saved_peer_subscription(
@@ -459,7 +458,9 @@ pub(crate) async fn create_saved_peer_subscription(
         subscription_id: id,
         operation: SubscriptionOperation::Create,
     };
-    let response = request_active_peer_subscription(db, &peer, &request).await?;
+    let response = request_active_peer_subscription(db, &peer, &request)
+        .await
+        .map_err(|error| error.to_string())?;
     let SubscriptionResult::Created { snapshot } = response.result else {
         return Err("enrollment snapshot required".into());
     };
@@ -568,17 +569,13 @@ pub(crate) async fn sync_once(
     if remote.state != SubscriptionState::Active {
         return Ok(());
     }
-    drain_notifications(db, runtime, &remote, peer.as_ref()).await?;
-    let remote = db
-        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "remote subscription unavailable".to_string())?;
-    if remote.pending_unsubscribe || remote.state != SubscriptionState::Active {
-        return Ok(());
-    }
     let peer = peer.ok_or_else(|| "saved peer unavailable; no local fallback".to_string())?;
     let caller = db.instance_id().await.map_err(|error| error.to_string())?;
+    let had_pending_notifications = !db
+        .pending_remote_notifications(&remote)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_empty();
     if !remote.enrolled {
         request_active_peer_subscription(
             db,
@@ -590,12 +587,13 @@ pub(crate) async fn sync_once(
                 operation: SubscriptionOperation::Create,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         db.mark_remote_subscription_enrolled(&remote.reference, remote.subscription_id)
             .await
             .map_err(|error| error.to_string())?;
     }
-    let response = request_active_peer_subscription(
+    let response = match request_active_peer_subscription(
         db,
         &peer,
         &SubscriptionRequest {
@@ -607,13 +605,30 @@ pub(crate) async fn sync_once(
             },
         },
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(FederationClientError::SubscriptionAuthenticationRejected)
+            if had_pending_notifications =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let SubscriptionResult::Replay { replay } = response.result else {
         return Err("replay response required".into());
     };
     db.stage_remote_replay(&remote, &replay)
         .await
         .map_err(|error| error.to_string())?;
+    let remote = db
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "remote subscription unavailable".to_string())?;
+    if remote.pending_unsubscribe || remote.state != SubscriptionState::Active {
+        return Ok(());
+    }
     drain_notifications(db, runtime, &remote, Some(&peer)).await
 }
 
