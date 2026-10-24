@@ -94,6 +94,17 @@ The mandatory workspace proof changes the backlog fixture to 16 calls over two
 passes, with two context reads; the earlier 12-call result remains a historical
 measurement before that verification. Latest-head CI and review remain gates.
 
+The fourth review closes private-question publication through a lagging native
+owner, preserves literal reaction-shaped instruction lines, shares settings
+inspection's allowance/backoff with automatic service, guards unfinished
+initialization against timezone changes and retries positively rejected
+rate-limited sends. Exact source reads isolate the source timestamp; reaction
+metadata requires independent evidence. All 248 affected MCP/gateway tests pass,
+including shared inspection and private-input regressions. Clippy, formatting,
+Allium and structural/timing checks pass. Hosted Rust CI on the preceding head
+stopped at a Linux browser CLI teardown failure (`missing process group`);
+latest-head hosted CI and automatic review still require qualification.
+
 The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
 passed online-backup and stopped-snapshot rehearsals from the installed complete
 127 ledger to its exact complete 130 registry. Integrity, foreign keys,

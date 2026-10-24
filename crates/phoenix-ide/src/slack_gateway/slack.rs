@@ -40,6 +40,7 @@ pub(super) struct VerifiedSource {
     pub body: String,
 }
 impl Slack {
+    #[cfg(test)]
     pub fn new(manager: Arc<McpClientManager>, c: &Config) -> Self {
         Self::with_budget(manager, c, Arc::new(AtomicU32::new(0)))
     }
@@ -72,7 +73,11 @@ impl Slack {
             self.reserve_call()
                 .map_err(McpOneShotError::NotDispatched)?;
             return fixture(suffix, args)
-                .map_err(|e| McpOneShotError::Uncertain(self.observe_error(e)));
+                .map_err(McpOneShotError::Uncertain)
+                .and_then(classify_tool_value)
+                .inspect_err(|e| {
+                    let _ = self.observe_error(e.message().to_string());
+                });
         }
         let binding = self
             .connection
@@ -102,7 +107,9 @@ impl Slack {
             .inspect_err(|e| {
                 let _ = self.observe_error(e.message().to_string());
             })?;
-        decode_result(&raw).map_err(|e| McpOneShotError::Uncertain(self.observe_error(e)))
+        decode_result(&raw).inspect_err(|e| {
+            let _ = self.observe_error(e.message().to_string());
+        })
     }
     pub fn can_call(&self) -> bool {
         self.window_calls.load(Ordering::Relaxed) < CALL_LIMIT
@@ -113,10 +120,10 @@ impl Slack {
             && CALL_LIMIT.saturating_sub(self.window_calls.load(Ordering::Relaxed)) >= 8
     }
     pub fn can_refresh(&self) -> bool {
-        // One prefix page costs at most search + two source reads. Preserve
+        // One prefix page costs search + two source reads + reaction metadata. Preserve
         // another whole catch-up page and the four-call accepted-work reserve.
         self.retry_after.load(Ordering::Relaxed) == 0
-            && CALL_LIMIT.saturating_sub(self.window_calls.load(Ordering::Relaxed)) >= 11
+            && CALL_LIMIT.saturating_sub(self.window_calls.load(Ordering::Relaxed)) >= 12
     }
     fn reserve_call(&self) -> Result<(), String> {
         if self.retry_after.load(Ordering::Relaxed) != 0
@@ -134,7 +141,11 @@ impl Slack {
     }
     fn observe_error(&self, error: String) -> String {
         let lower = error.to_ascii_lowercase();
-        if lower.contains("429") || lower.contains("ratelimited") || lower.contains("rate limit") {
+        if lower.contains("429")
+            || lower.contains("ratelimited")
+            || lower.contains("rate_limited")
+            || lower.contains("rate limit")
+        {
             let seconds = retry_seconds(&lower).unwrap_or(60);
             self.retry_after
                 .store(seconds, std::sync::atomic::Ordering::Relaxed);
@@ -149,8 +160,8 @@ impl Slack {
             )
             .await?;
         let t = field(&v, "result")?;
-        if !t.lines().any(|l| l == format!("User ID: {}", c.owner))
-            || !t.lines().any(|l| l == "Bot: No")
+        if t.lines().next() != Some(format!("User ID: {}", c.owner).as_str())
+            || t.lines().rev().find(|line| line.starts_with("Bot: ")) != Some("Bot: No")
         {
             return Err(
                 "Authenticated Slack identity does not match configured human owner".into(),
@@ -229,8 +240,32 @@ impl Slack {
         if date > today || date < today - chrono::Days::new(3) {
             return Ok(None);
         }
-        let exact=self.call("slack_read_thread",json!({"channel_id":hit.channel,"message_ts":hit.ts,"limit":1,"response_format":"detailed"})).await?;
-        let (author, body) = thread_source(field(&exact, "messages")?, &hit.ts)?;
+        let (oldest, latest) = source_bounds(&hit.ts)?;
+        let exact=self.call("slack_read_thread",json!({"channel_id":hit.channel,"message_ts":hit.ts,"oldest":oldest,"latest":latest,"limit":1,"response_format":"detailed"})).await?;
+        if field(&exact, "pagination_info")?.trim() != "There are no more messages in this thread."
+        {
+            return Err("Exact source read is incomplete".into());
+        }
+        let (author, rendered) = thread_source(field(&exact, "messages")?, &hit.ts)?;
+        let raw = rendered
+            .trim_end()
+            .strip_suffix("\n\nNo thread messsages")
+            .ok_or("Exact source read did not isolate one message")?;
+        if !reaction && (author != c.owner || strip_fire(raw).is_none()) {
+            return Ok(None);
+        }
+        let r = self
+            .call(
+                "slack_get_reactions",
+                json!({"channel_id":hit.channel,"message_ts":hit.ts}),
+            )
+            .await?;
+        let reactions = ReactionEvidence::parse(field(&r, "result")?, &c.owner)?;
+        let body = reactions.message_body(raw)?;
+        let prefix = strip_fire(&body);
+        if !reactions.owner_fire && (reaction || author != c.owner || prefix.is_none()) {
+            return Ok(None);
+        }
         let mut context_args = json!({"channel_id":hit.channel,"message_ts":hit.root,"limit":100,"response_format":"detailed"});
         if hit.root != hit.ts {
             let (oldest, latest) = source_bounds(&hit.ts)?;
@@ -241,24 +276,7 @@ impl Slack {
         let thread = field(&v, "messages")?;
         thread_source(thread, &hit.root)?;
         if hit.root != hit.ts {
-            verify_thread_reply(&v, &hit.ts, &author, &body)?;
-        }
-        let prefix = strip_fire(&body);
-        let reacted = if reaction {
-            let r = self
-                .call(
-                    "slack_get_reactions",
-                    json!({"channel_id":hit.channel,"message_ts":hit.ts}),
-                )
-                .await?;
-            field(&r, "result")?
-                .lines()
-                .any(|l| l.starts_with(":fire: ") && l.contains(&format!("({})", c.owner)))
-        } else {
-            false
-        };
-        if !reacted && (author != c.owner || prefix.is_none()) {
-            return Ok(None);
+            verify_thread_reply(&v, &hit.ts, &author, &body, &reactions)?;
         }
         let kind = if author == c.owner {
             SlackRequestKind::Explicit
@@ -358,22 +376,22 @@ fn source_bounds(ts: &str) -> Result<(String, String), String> {
     Ok((stamp(micros - 1), stamp(micros + 1)))
 }
 
-fn verify_thread_reply(value: &Value, ts: &str, author: &str, body: &str) -> Result<(), String> {
+fn verify_thread_reply(
+    value: &Value,
+    ts: &str,
+    author: &str,
+    body: &str,
+    reactions: &ReactionEvidence,
+) -> Result<(), String> {
     if field(value, "pagination_info")?.trim() != "There are no more messages in this thread." {
         return Err("Source thread membership is incomplete".into());
-    }
-    if field(value, "messages")?
-        .trim_end()
-        .ends_with("\nNo thread messsages")
-    {
-        return Err("Claimed root contains no source reply".into());
     }
     let (_, reply) = field(value, "messages")?
         .rsplit_once("\n=== THREAD REPLIES (1 total) ===\n\n--- Reply 1 of 1 ---\n")
         .ok_or("Source is not verified in the claimed root thread")?;
     let (reply_author, reply_body) =
         thread_source(&format!("=== THREAD PARENT MESSAGE ===\n{reply}"), ts)?;
-    if reply_author != author || reply_body.trim() != body.trim() {
+    if reply_author != author || reactions.message_body(&reply_body)?.trim() != body.trim() {
         return Err("Thread reply differs from the exact source".into());
     }
     Ok(())
@@ -467,9 +485,12 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| format!("Slack response missing {key}"))
 }
-fn decode_result(raw: &str) -> Result<Value, String> {
-    let mut value: Value = serde_json::from_str(raw)
-        .map_err(|_| "Slack tool did not return the expected JSON text envelope")?;
+fn decode_result(raw: &str) -> Result<Value, McpOneShotError> {
+    let mut value: Value = serde_json::from_str(raw).map_err(|_| {
+        McpOneShotError::Uncertain(
+            "Slack tool did not return the expected JSON text envelope".into(),
+        )
+    })?;
     if let Some(items) = value.get("content").and_then(Value::as_array) {
         let text = items
             .iter()
@@ -477,14 +498,42 @@ fn decode_result(raw: &str) -> Result<Value, String> {
             .collect::<Vec<_>>()
             .join("\n");
         if value.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(format!("Slack tool reported an error: {text}"));
+            return Err(McpOneShotError::ToolRejected(text));
         }
-        value = serde_json::from_str(&text).map_err(|_| "Unexpected Slack content envelope")?;
+        value = serde_json::from_str(&text)
+            .map_err(|_| McpOneShotError::Uncertain("Unexpected Slack content envelope".into()))?;
     }
+    classify_tool_value(value)
+}
+fn classify_tool_value(value: Value) -> Result<Value, McpOneShotError> {
     if let Some(error) = value.get("error").and_then(Value::as_str) {
-        return Err(format!("Slack API error: {error}"));
+        return Err(if value.get("ok").and_then(Value::as_bool) == Some(false) {
+            McpOneShotError::ToolRejected(value.to_string())
+        } else {
+            McpOneShotError::Uncertain(format!("Slack API error: {error}"))
+        });
     }
     Ok(value)
+}
+pub(super) fn rate_rejection_proves_unsent(error: &McpOneShotError) -> bool {
+    let McpOneShotError::ToolRejected(message) = error else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(message) else {
+        return false;
+    };
+    value.get("ok").and_then(Value::as_bool) == Some(false)
+        && matches!(
+            value.get("error").and_then(Value::as_str),
+            Some("ratelimited" | "rate_limited")
+        )
+        && value
+            .get("method")
+            .and_then(Value::as_str)
+            .is_none_or(|method| method == "chat.postMessage")
+        && ["message_link", "message_context", "ts", "message_ts"]
+            .iter()
+            .all(|key| value.get(key).is_none_or(Value::is_null))
 }
 pub(super) fn strip_fire(text: &str) -> Option<&str> {
     let t = text.trim_start();
@@ -612,41 +661,95 @@ fn thread_source(thread: &str, ts: &str) -> Result<(String, String), String> {
                 && s.chars().all(|c| c.is_ascii_alphanumeric())
         })
         .ok_or("Message does not have a verifiable Slack author")?;
-    Ok((author.into(), message_body(lines.next().unwrap_or(""))))
+    Ok((author.into(), lines.next().unwrap_or("").into()))
 }
 
-fn message_body(raw: &str) -> String {
-    let body = raw.trim_end();
-    let body = body
-        .strip_suffix("\n\nNo thread messsages")
-        .unwrap_or(body)
-        .trim_end();
-    let mut lines: Vec<_> = body.lines().collect();
-    if lines.last().is_some_and(|line| {
-        line.strip_prefix("Reactions: ").is_some_and(|reactions| {
-            reactions.split(", ").all(|r| {
-                r.rsplit_once(" (").is_some_and(|(emoji, count)| {
-                    !emoji.is_empty()
-                        && count
-                            .strip_suffix(')')
-                            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-                })
+struct ReactionEvidence {
+    counts: std::collections::BTreeMap<String, u64>,
+    owner_fire: bool,
+}
+impl ReactionEvidence {
+    fn parse(text: &str, owner: &str) -> Result<Self, String> {
+        let mut counts = std::collections::BTreeMap::new();
+        let mut owner_fire = false;
+        if text.trim() == "No reactions found on this message." {
+            return Ok(Self { counts, owner_fire });
+        }
+        for line in text
+            .strip_prefix("Reactions on message:\n\n")
+            .ok_or("Unrecognized reaction evidence")?
+            .lines()
+            .filter(|l| !l.is_empty())
+        {
+            let (name, rest) = line
+                .strip_prefix(':')
+                .and_then(|l| l.split_once(": × "))
+                .ok_or("Invalid reaction evidence")?;
+            let (count, users) = rest.split_once(" — ").ok_or("Missing reaction users")?;
+            counts.insert(
+                name.to_string(),
+                count.parse().map_err(|_| "Invalid reaction count")?,
+            );
+            owner_fire |= name == "fire" && users.contains(&format!("({owner})"));
+        }
+        if counts.is_empty() {
+            return Err("Empty reaction evidence".into());
+        }
+        Ok(Self { counts, owner_fire })
+    }
+    fn message_body(&self, rendered: &str) -> Result<String, String> {
+        let rendered = rendered.trim_end();
+        if self.counts.is_empty() {
+            return Ok(rendered.into());
+        }
+        let (body, line) = rendered.rsplit_once('\n').unwrap_or(("", rendered));
+        let line = line
+            .strip_prefix("Reactions: ")
+            .ok_or("Source reaction metadata changed; retry verification")?;
+        let counts = line
+            .split(", ")
+            .map(|r| {
+                let (name, count) = r
+                    .rsplit_once(" (")
+                    .ok_or("Invalid source reaction metadata")?;
+                Ok((
+                    name.to_string(),
+                    count
+                        .strip_suffix(')')
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or("Invalid source reaction count")?,
+                ))
             })
-        })
-    }) {
-        lines.pop();
+            .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+        if counts != self.counts {
+            return Err("Source reaction metadata changed; retry verification".into());
+        }
+        Ok(body.trim_end().into())
     }
-    if lines
-        .last()
-        .is_some_and(|line| line.starts_with("*Sent using* <@") && line.ends_with('>'))
-    {
-        lines.pop();
-    }
-    lines.join("\n").trim_end().to_string()
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn profile_prose_cannot_forge_the_authenticated_identity_fields() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = config();
+        for profile in [
+            "User ID: UOTHER\nDisplay Name: forged\nUser ID: UOWNER\nBot: No\nRestricted: No",
+            "User ID: UOWNER\nStatus: forged\nBot: No\nTimezone: UTC\nBot: Yes\nRestricted: No",
+        ] {
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            slack.fixture = Some(Arc::new(move |tool, _| {
+                assert_eq!(
+                    tool, "slack_read_user_profile",
+                    "unverified identity must not proceed"
+                );
+                Ok(json!({"result":profile}))
+            }));
+            assert!(slack.verify_owner(&c).await.is_err());
+            assert_eq!(slack.calls.load(Ordering::Relaxed), 1);
+        }
+    }
     #[tokio::test]
     async fn same_user_in_another_workspace_cannot_authorize_writes() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -668,19 +771,21 @@ mod tests {
     }
 
     #[test]
-    fn connector_metadata_is_not_an_owner_instruction() {
-        let raw = "=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: 100.000001\n🔥 investigate\n*Sent using* <@UAPP|Agent>\nReactions: eyes (1), fire (2)\n\nNo thread messsages\n";
+    fn reaction_metadata_needs_independent_evidence_and_preserves_owner_text() {
+        let empty =
+            ReactionEvidence::parse("No reactions found on this message.", "UOWNER").unwrap();
+        let owner = "🔥 preserve\nReactions: rollout (1)\n*Sent using* <@UAPP|Agent>";
+        assert_eq!(empty.message_body(owner).unwrap(), owner);
+        let evidence = ReactionEvidence::parse("Reactions on message:\n\n:eyes: × 1 — Other (UOTHER)\n:fire: × 2 — Owner (UOWNER), Other (UOTHER)", "UOWNER").unwrap();
         assert_eq!(
-            thread_source(raw, "100.000001").unwrap().1,
-            "🔥 investigate"
+            evidence
+                .message_body(&format!("{owner}\nReactions: fire (2), eyes (1)"))
+                .unwrap(),
+            owner
         );
-        assert_eq!(
-            thread_source(&raw.replace("🔥 investigate", "🔥"), "100.000001")
-                .unwrap()
-                .1,
-            "🔥"
-        );
-        assert_eq!(message_body("Quote:\nNo thread messsages\nReactions: keep this example\nend\n\nNo thread messsages\n"), "Quote:\nNo thread messsages\nReactions: keep this example\nend");
+        assert!(evidence
+            .message_body(&format!("{owner}\nReactions: fire (1), eyes (1)"))
+            .is_err());
     }
 
     #[test]
@@ -704,13 +809,16 @@ mod tests {
             let mut slack = Slack::new(state.mcp_manager.clone(), &c);
             let (exact_ts, exact_root) = (ts.clone(), root.clone());
             slack.fixture = Some(Arc::new(move |tool, args| {
+                if tool == "slack_get_reactions" {
+                    return Ok(json!({"result":"No reactions found on this message."}));
+                }
                 assert_eq!(tool, "slack_read_thread");
                 let source = format!(
                     "From: Owner (UOWNER)\nTime: fixture\nMessage TS: {exact_ts}\n🔥 investigate"
                 );
                 if args["message_ts"] == exact_ts {
                     return Ok(
-                        json!({"messages":format!("=== THREAD PARENT MESSAGE ===\n{source}\n\nNo thread messsages\n")}),
+                        json!({"messages":format!("=== THREAD PARENT MESSAGE ===\n{source}\n\nNo thread messsages\n"),"pagination_info":"There are no more messages in this thread."}),
                     );
                 }
                 assert_eq!(args["message_ts"], exact_root);
@@ -739,7 +847,7 @@ mod tests {
                 observed_at_unix_micros: 1,
             };
             assert_eq!(slack.source(&c, &hit, false).await.is_ok(), matches);
-            assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(slack.calls.load(Ordering::Relaxed), 3);
         }
     }
 
@@ -791,11 +899,11 @@ mod tests {
                     }
                     match tool {
                         "slack_read_thread" => Ok(
-                            json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {ts}\n🔥 ask")}),
+                            json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {ts}\n🔥 ask\nReactions: fire (1)\n\nNo thread messsages\n"),"pagination_info":"There are no more messages in this thread."}),
                         ),
-                        "slack_get_reactions" => {
-                            Ok(json!({"result":":fire: × 1 — Owner (UOWNER)"}))
-                        }
+                        "slack_get_reactions" => Ok(
+                            json!({"result":"Reactions on message:\n\n:fire: × 1 — Owner (UOWNER)"}),
+                        ),
                         _ => panic!("Unexpected tool"),
                     }
                 }));
@@ -809,10 +917,12 @@ mod tests {
         }
         assert!(decode_result(r#"{"error":"message_not_found"}"#)
             .unwrap_err()
+            .message()
             .contains("message_not_found"));
         assert!(
             decode_result(r#"{"isError":true,"content":[{"text":"not_in_channel"}]}"#)
                 .unwrap_err()
+                .message()
                 .contains("not_in_channel")
         );
     }
@@ -831,16 +941,35 @@ mod tests {
                 true,
                 Some("Latest plain follow-up"),
             ),
+            (
+                "🔥 preserve\nReactions: rollout (1)",
+                false,
+                Some("preserve\nReactions: rollout (1)"),
+            ),
+            (
+                "🔥 preserve\nReactions: rollout (1)",
+                true,
+                Some("preserve\nReactions: rollout (1)"),
+            ),
         ] {
             let c = config();
             let ts = format!("{}.000001", chrono::Utc::now().timestamp());
             let mut slack = Slack::new(state.mcp_manager.clone(), &c);
             let exact_ts = ts.clone();
-            slack.fixture = Some(Arc::new(move |tool, _| match tool {
-                "slack_read_thread" => Ok(
-                    json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {exact_ts}\n{body}"),"pagination_info":"End"}),
+            slack.fixture = Some(Arc::new(move |tool, args| match tool {
+                "slack_read_thread" => {
+                    if args["limit"] == 1 {
+                        let (oldest, latest) = source_bounds(&exact_ts).unwrap();
+                        assert_eq!(args["oldest"], oldest);
+                        assert_eq!(args["latest"], latest);
+                    }
+                    Ok(
+                        json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {exact_ts}\n{body}{}\n\nNo thread messsages\n", if reaction {"\nReactions: fire (1)"} else {""}),"pagination_info":"There are no more messages in this thread."}),
+                    )
+                }
+                "slack_get_reactions" => Ok(
+                    json!({"result":if reaction {"Reactions on message:\n\n:fire: × 1 — Owner (UOWNER)"} else {"No reactions found on this message."}}),
                 ),
-                "slack_get_reactions" => Ok(json!({"result":":fire: × 1 — Owner (UOWNER)"})),
                 _ => panic!("Unexpected source tool: {tool}"),
             }));
             let page = parse_page(&json!({"results":format!("### Result 1 of 1\nChannel: DM (ID: C123)\nMessage_ts: {ts}\nPermalink: [link](https://example.slack.com/archives/C123/p{})\nText: 🔥 Stale search instruction", ts.replace('.', "")),"pagination_info":"End of results"}), &c).unwrap();
@@ -937,6 +1066,35 @@ mod tests {
     fn retry_directives_are_preserved() {
         assert_eq!(retry_seconds("429 retry_after: 300"), Some(300));
         assert_eq!(retry_seconds("retry-after: 120"), Some(120));
+    }
+    #[test]
+    fn only_explicit_rate_rejection_proves_a_send_was_not_accepted() {
+        for code in ["ratelimited", "rate_limited"] {
+            let error =
+                decode_result(&json!({"ok":false,"error":code,"retry_after":120}).to_string())
+                    .unwrap_err();
+            assert!(rate_rejection_proves_unsent(&error));
+        }
+        for value in [
+            json!({"ok":false,"error":"ratelimited","method":"chat.getPermalink"}),
+            json!({"ok":false,"error":"ratelimited","ts":"123.456"}),
+            json!({"error":"ratelimited"}),
+        ] {
+            assert!(!rate_rejection_proves_unsent(
+                &decode_result(&value.to_string()).unwrap_err()
+            ));
+        }
+        for error in [
+            McpOneShotError::Uncertain("HTTP 429 retry_after:120".into()),
+            McpOneShotError::ToolRejected("ratelimited retry_after:120".into()),
+        ] {
+            assert!(!rate_rejection_proves_unsent(&error));
+        }
+        let envelope =
+            json!({"isError":true,"content":[{"text":"{\"ok\":false,\"error\":\"ratelimited\"}"}]});
+        assert!(rate_rejection_proves_unsent(
+            &decode_result(&envelope.to_string()).unwrap_err()
+        ));
     }
     #[test]
     fn prefix_requires_first_content() {

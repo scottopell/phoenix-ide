@@ -92,9 +92,39 @@ pub(super) enum Pass {
     Delivery,
 }
 
-struct BudgetWindow {
+pub(crate) struct BudgetWindow {
     started: tokio::time::Instant,
     calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+pub(crate) fn access_gate() -> std::sync::Arc<tokio::sync::Mutex<BudgetWindow>> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(BudgetWindow::new()))
+}
+
+async fn retry_deadline(db: &crate::db::Database) -> Result<Option<i64>, String> {
+    sqlx::query_scalar("SELECT MAX(retry_at_us) FROM slack_gateway_accounts WHERE retry_at_us>?1")
+        .bind(chrono::Utc::now().timestamp_micros())
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn record_backoff(
+    db: &crate::db::Database,
+    c: &Config,
+    slack: &slack::Slack,
+    succeeded: bool,
+) -> Result<(), String> {
+    let seconds = slack.retry_after.load(std::sync::atomic::Ordering::Relaxed);
+    let retry = (seconds > 0).then(|| {
+        chrono::Utc::now().timestamp_micros().saturating_add(
+            i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000),
+        )
+    });
+    sqlx::query("UPDATE slack_gateway_accounts SET retry_at_us=CASE WHEN ?3 IS NOT NULL THEN ?3 WHEN ?5 AND retry_at_us<=?4 THEN NULL ELSE retry_at_us END,status=CASE WHEN ?3 IS NOT NULL THEN 'backing_off' ELSE status END,last_error=CASE WHEN ?3 IS NOT NULL THEN COALESCE(last_error,'Slack requested a retry delay') ELSE last_error END WHERE workspace=?1 AND owner=?2")
+        .bind(&c.workspace).bind(&c.owner).bind(retry).bind(chrono::Utc::now().timestamp_micros()).bind(succeeded).execute(db.pool()).await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 impl BudgetWindow {
     fn new() -> Self {
@@ -117,7 +147,6 @@ pub(crate) fn start(state: crate::api::AppState) {
             tracing::error!(error=%e,"Slack return recovery failed");
             return;
         }
-        let mut budget = BudgetWindow::new();
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut recovery = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -137,6 +166,7 @@ pub(crate) fn start(state: crate::api::AppState) {
             let Ok(_authority) = state.runtime.acquire_local_authority_pass() else {
                 return;
             };
+            let mut budget = state.slack_gateway_access.lock().await;
             let c = match config(&state.db).await {
                 Ok(Some(c)) => c,
                 Ok(_) => continue,

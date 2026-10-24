@@ -27,10 +27,11 @@ contract SlackDiscoveryPort {
     verify_candidate: (source_key: String) -> lifecycle/VerifiedObservation?
 
     @invariant CallAccounting
-        -- Every automatic gateway Slack tool dispatch needs a distinct granted
+        -- Every gateway Slack tool dispatch, including its owner-facing
+        -- read-access inspection, needs a distinct granted
         -- SlackCall. Failed dispatches consume allowance too. This is a logical
         -- tool-call limit, not a provider-wide or underlying HTTP-request quota.
-        -- Agent-initiated tools, manual inspection, and notification-provider calls are outside
+        -- Direct agent/manual MCP tools and notification-provider calls are outside
         -- this allowance. A dispatched gateway tool call is not replayed by
         -- MCP recovery; a later retry requires a new allowance grant. External
         -- writes also follow the lifecycle's single-attempt/uncertainty contract.
@@ -63,6 +64,9 @@ contract SlackDiscoveryPort {
         -- Eligibility uses the current and preceding three calendar dates in
         -- the owner's timezone at source validation, not the scan's start date.
         -- Source-message age cannot substitute for a reaction-add timestamp.
+        -- Candidate instruction evidence contains the exact source body, without
+        -- child replies. Reaction-shaped owner text is retained; stripping a
+        -- connector reaction trailer requires independent reaction evidence.
 
     @invariant QueryBoundary
         -- Prefix and owner-reaction searches cover the accessible eligible
@@ -71,6 +75,9 @@ contract SlackDiscoveryPort {
         -- Search observes current provider state, not a stable snapshot or an
         -- event log. Completion proves pagination ended, not that later arrivals
         -- or late indexing have been observed. Removed triggers may be missed.
+        -- Once an initial sweep has a retained boundary, timezone changes are
+        -- refused until initialization completes; pausing or repairing the same
+        -- timezone remains available. Inspection alone establishes no boundary.
 }
 
 contract NativeReconciliationPort {
@@ -97,9 +104,9 @@ contract NativeReconciliationPort {
 }
 
 enum SearchKind { prefix | reaction }
-enum ServiceKind { discovery | delivery }
+enum ServiceKind { discovery | delivery | inspection }
 enum ServicePhase { reconciling | searching | finished }
-enum CallPurpose { owner_identity | search_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply }
+enum CallPurpose { owner_identity | search_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply | inspection_read }
 enum CallState { in_flight | resolved }
 
 entity DiscoveryController {
@@ -167,7 +174,7 @@ config {
     burst_duration: Duration = 10.seconds
     maximum_page_calls: Integer = 4
     work_reserve: Integer = 4
-    maximum_refresh_calls: Integer = 3
+    maximum_refresh_calls: Integer = 4
 }
 
 -- REQ-SG-017. No token refill occurs inside a service opportunity. Renewal
@@ -193,7 +200,9 @@ rule BeginServiceOpportunity {
         catchup_first: controller.next_first_query = reaction,
         catchup_opportunity_taken: false
     )
-    ensures: ReconcileAcceptedWork(controller.gateway)
+    ensures:
+        if kind != inspection:
+            ReconcileAcceptedWork(controller.gateway)
 }
 
 rule OpenDiscoveryBurst {
@@ -216,9 +225,12 @@ rule GrantSlackCall {
     requires: purpose != owner_identity or (
         (service.kind = discovery and service.controller.gateway.enabled)
         or service.controller.has_slack_work
+        or service.kind = inspection
     )
     requires: purpose = owner_identity or service.owner_verified
     requires: purpose != fresh_prefix_page
+    requires: service.kind != inspection or purpose in {owner_identity, inspection_read}
+    requires: purpose != inspection_read or service.kind = inspection
     requires: purpose not in {search_page, candidate_read} or service.phase = searching
     requires: purpose != search_page or (
         service.kind = discovery and service.controller.gateway.enabled
@@ -440,6 +452,9 @@ surface DiscoveryBoundary {
         ReconcileAcceptedWork(gateway)
 
     @guarantee SchedulingPolicy
+        -- Owner-facing read-access inspection shares serial service, allowance
+        -- and persisted provider backoff. Its reads cannot accept triggers,
+        -- change saved query positions or acknowledge requests.
         -- Discovery opportunities occur on the configured discovery interval;
         -- accepted work is reconciled before any page opportunity. Ready reply
         -- commits request delivery opportunities; periodic recovery supplies

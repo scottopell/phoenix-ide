@@ -24,11 +24,14 @@ known source evidence before redundant context reads. Persist normal query
 cursors and completion independently of accepted source records.
 
 After readiness and prefix progress, offer one newest-prefix page when at least
-eleven calls remain: up to three refresh calls, four catch-up calls and four
+twelve calls remain: up to four refresh calls, four catch-up calls and four
 accepted-work calls. Alternate refresh-first and catch-up-first opportunities.
 Fresh evidence uses normal source validation and atomic acceptance but cannot
 advance a saved cursor or complete a full scan. Failed probes preserve saved
 progress; rate limits constrain all callers.
+
+The gateway's settings read-access check shares the same serialized allowance
+and persisted backoff. Direct agent/manual MCP tools remain outside this limit.
 
 ## Consequences
 

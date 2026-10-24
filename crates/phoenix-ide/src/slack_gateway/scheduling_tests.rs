@@ -15,6 +15,61 @@ fn config() -> Config {
     }
 }
 
+#[tokio::test]
+async fn read_access_inspection_shares_the_automatic_gate_allowance_and_backoff() {
+    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let c = config();
+    let clone = state.clone();
+    assert!(Arc::ptr_eq(
+        &state.slack_gateway_access,
+        &clone.slack_gateway_access
+    ));
+    let mut automatic_pass = state.slack_gateway_access.lock().await;
+    let mut slack =
+        slack::Slack::with_budget(state.mcp_manager.clone(), &c, automatic_pass.current());
+    slack.fixture = Some(Arc::new(|_, _| {
+        Ok(json!({"result":"User ID: UOWNER\nBot: No"}))
+    }));
+    // Calls charged by an automatic service exhaust the inspection allowance too.
+    for _ in 0..16 {
+        slack
+            .call("slack_read_user_profile", json!({}))
+            .await
+            .unwrap();
+    }
+    let inspection = http::inspect(axum::extract::State(clone), axum::Json(c.clone()));
+    tokio::pin!(inspection);
+    tokio::select! {
+        biased;
+        _ = &mut inspection => panic!("inspection bypassed the active automatic service"),
+        () = tokio::task::yield_now() => {}
+    }
+    drop(automatic_pass);
+    let result = inspection.await.err().unwrap();
+    assert!(
+        matches!(result, crate::api::handlers::AppError::BadRequest(message) if message.contains("allowance is exhausted"))
+    );
+    // Even a fresh process allowance cannot bypass a persisted provider delay.
+    let fresh = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    fresh
+        .db
+        .slack_baseline_complete(&c.workspace, &c.owner)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE slack_gateway_accounts SET retry_at_us=?1")
+        .bind(chrono::Utc::now().timestamp_micros() + 120_000_000)
+        .execute(fresh.db.pool())
+        .await
+        .unwrap();
+    let result = http::inspect(axum::extract::State(fresh), axum::Json(c))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(result, crate::api::handlers::AppError::BadRequest(message) if message.contains("retry delay"))
+    );
+}
+
 fn workspace_probe(tool: &str, args: &serde_json::Value) -> Option<serde_json::Value> {
     (tool == "slack_search_public_and_private" && args["filters"] == "after:1970-01-01")
         .then(|| json!({"results":"### Result 1 of 1\nChannel: proof (ID: CPROOF)\nMessage_ts: 10.000001\nPermalink: [link](https://fixture.slack.com/archives/CPROOF/p10000001)\nText: workspace identity only","pagination_info":"End of results"}))
@@ -49,9 +104,11 @@ fn reaction_fixture(
                 )
             }
             "slack_read_thread" => Ok(
-                json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Other (UOTHER)\nTime: fixture\nMessage TS: {}\nFixture context", args["message_ts"].as_str().unwrap()),"pagination_info":"There are no more messages in this thread."}),
+                json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Other (UOTHER)\nTime: fixture\nMessage TS: {}\nFixture context\nReactions: fire (1)\n\nNo thread messsages\n", args["message_ts"].as_str().unwrap()),"pagination_info":"There are no more messages in this thread."}),
             ),
-            "slack_get_reactions" => Ok(json!({"result":":fire: × 1 — Owner (UOWNER)"})),
+            "slack_get_reactions" => {
+                Ok(json!({"result":"Reactions on message:\n\n:fire: × 1 — Owner (UOWNER)"}))
+            }
             _ => Err(format!("Unexpected fixture tool: {tool}")),
         }
     })
@@ -591,7 +648,7 @@ async fn late_prefix_backlog() -> LatePrefixBacklog {
             )
         } else if tool == "slack_read_thread" && args["channel_id"] == "CLATE" {
             Ok(
-                json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {stamp}\n:fire: investigate"),"pagination_info":"There are no more messages in this thread."}),
+                json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {stamp}\n:fire: investigate\nReactions: fire (1)\n\nNo thread messsages\n"),"pagination_info":"There are no more messages in this thread."}),
             )
         } else {
             fixture(tool, args)
@@ -639,7 +696,7 @@ async fn completed_prefix_query_refreshes_new_message_without_resetting_catchup(
             .fetch_one(state.db.pool())
             .await
             .unwrap();
-            assert_eq!(cursor, "4");
+            assert_eq!(cursor, "3");
             assert_eq!(slack.calls.load(Ordering::Relaxed), 9);
             println!("FRESH_PREFIX passes=1 calls=9 source_reads=2 saved_reaction_cursor={cursor}");
         }

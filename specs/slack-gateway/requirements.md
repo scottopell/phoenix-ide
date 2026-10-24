@@ -48,6 +48,8 @@ WHEN the gateway is first enabled for an owner and workspace, THE SYSTEM SHALL r
 
 WHEN the gateway restarts with retained discovery state, THE SYSTEM SHALL preserve the baseline and handled identities rather than establish a new baseline that discards missed requests.
 
+WHEN initialization has retained a search boundary but is not complete, THE SYSTEM SHALL refuse timezone changes until it completes. Pausing discovery or repairing the connection without changing that timezone SHALL remain available.
+
 **Rationale:** Social reactions from before enablement must not unexpectedly start agents, while routine restarts must not lose requested work.
 
 ### REQ-SG-005 — Accept one immutable request per source message
@@ -136,6 +138,8 @@ THE SYSTEM SHALL instruct the agent to return the invocation's automatic answer 
 
 THE SYSTEM SHALL retain each output's exact native source and Slack destination, distinguish queued, confirmed, failed, and uncertain delivery, and preserve output obligations across same-version restart. A known-unsent operation MAY be retried within a bounded retry policy. An operation whose external outcome is unknown SHALL be reconciled or exposed as uncertain rather than blindly resent or declared delivered. An unavailable destination SHALL NOT be replaced by a different public channel.
 
+An explicit structured send rejection proving rate-limit refusal MAY establish known-unsent status and SHALL retain its retry delay. A transport-level rate error, opaque tool error, or failure after a possible accepted post SHALL NOT establish that proof.
+
 **Rationale:** The owner needs intentional replies and truthful delivery state, not accidental transcript publication or duplicate posts after a lost network response.
 
 ### REQ-SG-014 — Respect unavailable conversations and sources
@@ -169,6 +173,8 @@ THE SYSTEM SHALL expose whether discovery is enabled, baselining, healthy, await
 THE SYSTEM SHALL NOT promise a fixed discovery latency or complete event capture from search. Partial scans and throttling SHALL NOT advance completion evidence or handled identities for unseen triggers. Disabling discovery SHALL stop new acceptance without cancelling ordinary Phoenix work already accepted.
 
 Ready responses SHALL be reconciled independently of waiting for the next discovery interval. Their Slack operations SHALL share the gateway's finite call allowance and persisted retry deadline with discovery. Previously recorded source identities, including baseline identities, SHALL be skipped before fetching additional source context. Pagination SHALL preserve progress for both trigger searches without allowing one search to starve the other.
+
+The gateway's owner-facing read-access inspection SHALL share that allowance, serialization and persisted retry deadline, without accepting triggers or advancing discovery. Direct agent or manual MCP tool calls are outside this gateway allowance.
 
 WHEN initialization is complete and the saved prefix search has advanced, THE SYSTEM SHALL offer a bounded newest-prefix-page check independently of that saved position, subject to the shared allowance, backoff and discovery time bounds. It SHALL preserve capacity for catch-up and accepted work, alternate which class receives the first opportunity, and use the same source-verification and immutable acceptance boundary for both paths. A freshness observation SHALL NOT advance saved positions, establish full-window completion, or bypass initialization. This check SHALL NOT promise that all newly indexed messages are observed on that opportunity; full catch-up remains responsible for the rest of the window.
 

@@ -10462,6 +10462,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -16964,6 +16965,7 @@ mod regenerate_conversation_name_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -17414,6 +17416,7 @@ mod upgrade_model_state_guard_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -17715,6 +17718,7 @@ mod file_read_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -18502,6 +18506,7 @@ mod chat_authority_tests {
         );
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -19287,6 +19292,7 @@ mod lifecycle_handler_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,

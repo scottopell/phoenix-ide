@@ -52,10 +52,12 @@ and operational records are retained outside the public repository.
 The additional head probe reads one newest prefix page only when a retained
 prefix position has advanced and initialization is complete. It shares exact
 verification, accepted-source deduplication, provider backoff and the same call
-allowance as ordinary catch-up. It needs eleven remaining calls: at most three
+allowance as ordinary catch-up. It needs twelve remaining calls: at most four
 for its page, four for a catch-up page and four reserved for accepted work.
 First opportunity alternates between refresh and saved work. Probe evidence
 cannot advance saved cursors or establish full-window/baseline completion.
+The fresh candidate's exact source, independent reaction metadata and context
+reads share that bound. A literal reaction-shaped instruction line is preserved.
 
 Qualification records the focused scenarios and observed call counts in the
 feature executive summary. A failed probe may leave other saved pages able to

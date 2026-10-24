@@ -358,8 +358,9 @@ pub enum McpRequestError {
     /// re-established before this server accepts another request because a
     /// stdio response may still arrive on the abandoned stream.
     Cancelled,
-    /// Tool-level failure (`isError` result) or malformed response; the
-    /// string is the complete display message.
+    /// An explicit MCP `isError` tool result, preserving provider evidence.
+    ToolRejected(String),
+    /// Malformed response; the string is the complete display message.
     Other(String),
 }
 
@@ -368,7 +369,9 @@ impl McpRequestError {
         match self {
             Self::Transport(e) => format!("MCP server '{server_name}': {e}"),
             Self::Cancelled => format!("MCP server '{server_name}': tool call cancelled"),
-            Self::Other(message) | Self::NotDispatched(message) => message,
+            Self::Other(message) | Self::NotDispatched(message) | Self::ToolRejected(message) => {
+                message
+            }
         }
     }
 }
@@ -383,6 +386,8 @@ pub enum McpToolCallError {
 pub enum McpOneShotError {
     /// No tool request was dispatched.
     NotDispatched(String),
+    /// The remote tool reported failure. Effects are still application-specific.
+    ToolRejected(String),
     /// Dispatch may have occurred; another attempt could duplicate a write.
     Uncertain(String),
 }
@@ -391,7 +396,9 @@ impl McpOneShotError {
     #[must_use]
     pub fn message(&self) -> &str {
         match self {
-            Self::NotDispatched(message) | Self::Uncertain(message) => message,
+            Self::NotDispatched(message)
+            | Self::Uncertain(message)
+            | Self::ToolRejected(message) => message,
         }
     }
 }
@@ -519,7 +526,8 @@ impl HandshakeFailure {
             other @ (McpRequestError::Transport(_)
             | McpRequestError::Cancelled
             | McpRequestError::Other(_)
-            | McpRequestError::NotDispatched(_)) => Self::Other(other.into_message(server_name)),
+            | McpRequestError::NotDispatched(_)
+            | McpRequestError::ToolRejected(_)) => Self::Other(other.into_message(server_name)),
         }
     }
 }
@@ -1127,7 +1135,7 @@ impl CallContext {
         let output = text.join("\n");
 
         if is_error {
-            Err(McpRequestError::Other(output))
+            Err(McpRequestError::ToolRejected(output))
         } else {
             Ok(output)
         }
@@ -3547,6 +3555,7 @@ impl McpClientManager {
         }
         outcome.result.map_err(|e| match e {
             McpRequestError::NotDispatched(message) => McpOneShotError::NotDispatched(message),
+            McpRequestError::ToolRejected(message) => McpOneShotError::ToolRejected(message),
             other @ (McpRequestError::Transport(_)
             | McpRequestError::Cancelled
             | McpRequestError::Other(_)) => {
@@ -6096,6 +6105,7 @@ mod tests {
             .await
             .expect_err("isError result must be an error");
 
+        assert!(matches!(&err, McpRequestError::ToolRejected(message) if message == "boom"));
         assert!(!server.should_reestablish(&err));
         assert_eq!(err.into_message("fake"), "boom");
     }

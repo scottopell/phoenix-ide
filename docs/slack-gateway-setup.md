@@ -9,6 +9,8 @@ Open Settings → Slack gateway (also available at `/settings/slack`). Configure
 an existing MCP server, your Slack user ID, the exact workspace permalink host,
 your IANA timezone and the Phoenix URL. The read-access check verifies identity
 and source access without accepting requests or changing Slack.
+It shares the gateway's call allowance and provider retry deadline, so an
+exhausted allowance or active retry delay can postpone the check.
 
 Finish outstanding work before switching the configured owner or workspace.
 Pausing discovery still lets accepted work and its deliveries finish.
@@ -31,6 +33,8 @@ ready before using triggers; gestures observed during initialization can be
 absorbed by the baseline. Searches cover today and the previous three calendar
 dates in your timezone. Leave fire attached until eyes appears. Removing fire
 after acceptance does not cancel native work.
+Set the timezone before initialization; once its first sweep has started,
+changing the timezone requires that initialization finish first.
 
 Same-thread explicit requests reuse one ordinary conversation. Untriggered
 Slack replies do not wake it. Native questions return to Slack and require a

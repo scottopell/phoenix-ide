@@ -13,6 +13,9 @@ pub(crate) async fn put(
     Json(c): Json<Config>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     c.validate().map_err(AppError::BadRequest)?;
+    // A pass must finish using its retained configuration before a timezone
+    // or account update is evaluated against its completed durable progress.
+    let _access = s.slack_gateway_access.lock().await;
     let value = serde_json::to_string(&c).map_err(|e| AppError::Internal(e.to_string()))?;
     s.db.set_slack_configuration(&value).await.map_err(|e| {
         if let phoenix_db::DbError::Serialization(message) = e {
@@ -58,8 +61,37 @@ pub(crate) async fn inspect(
     Json(c): Json<Config>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     c.validate().map_err(AppError::BadRequest)?;
-    let slack = super::slack::Slack::new(s.mcp_manager.clone(), &c);
-    slack.verify_owner(&c).await.map_err(AppError::BadRequest)?;
+    let mut budget = s.slack_gateway_access.lock().await;
+    s.db.slack_baseline_complete(&c.workspace, &c.owner)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if super::retry_deadline(&s.db)
+        .await
+        .map_err(AppError::Internal)?
+        .is_some()
+    {
+        return Err(AppError::BadRequest(
+            "Slack requested a retry delay; try the read-access check later".into(),
+        ));
+    }
+    let slack = super::slack::Slack::with_budget(s.mcp_manager.clone(), &c, budget.current());
+    if !slack.can_call() {
+        return Err(AppError::BadRequest(
+            "The Slack call allowance is exhausted; try the read-access check later".into(),
+        ));
+    }
+    let result = inspect_reads(&c, &slack).await;
+    super::record_backoff(&s.db, &c, &slack, result.is_ok())
+        .await
+        .map_err(AppError::Internal)?;
+    result
+}
+
+async fn inspect_reads(
+    c: &Config,
+    slack: &super::slack::Slack,
+) -> Result<Json<serde_json::Value>, AppError> {
+    slack.verify_owner(c).await.map_err(AppError::BadRequest)?;
     let tz: chrono_tz::Tz = c
         .timezone
         .parse()
@@ -69,13 +101,13 @@ pub(crate) async fn inspect(
     let mut checks = Vec::new();
     for reactions in [false, true] {
         let page = slack
-            .search(&c, reactions, None, &after)
+            .search(c, reactions, None, &after)
             .await
             .map_err(AppError::BadRequest)?;
         let mut verified = 0;
         for hit in &page.hits {
             if slack
-                .source(&c, hit, reactions)
+                .source(c, hit, reactions)
                 .await
                 .map_err(AppError::BadRequest)?
                 .is_some()

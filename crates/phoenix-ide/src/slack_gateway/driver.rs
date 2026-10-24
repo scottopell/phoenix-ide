@@ -37,14 +37,7 @@ pub(super) async fn tick(
         .slack_baseline_complete(&c.workspace, &c.owner)
         .await
         .map_err(err)?;
-    let retry_at: Option<i64> = sqlx::query_scalar(
-        "SELECT retry_at_us FROM slack_gateway_accounts WHERE workspace=?1 AND owner=?2",
-    )
-    .bind(&c.workspace)
-    .bind(&c.owner)
-    .fetch_one(state.db.pool())
-    .await
-    .map_err(err)?;
+    let retry_at = super::retry_deadline(&state.db).await?;
     let backing_off = retry_at.is_some_and(|at| at > chrono::Utc::now().timestamp_micros());
     let identity = if !needs_slack {
         Err("No Slack operation is required for local reconciliation".into())
@@ -82,23 +75,12 @@ pub(super) async fn tick(
                 .map_err(err)?;
         }
     }
-    let retry_seconds = slack.retry_after.load(std::sync::atomic::Ordering::Relaxed);
-    let retry = if retry_seconds > 0 {
-        Some(
-            chrono::Utc::now().timestamp_micros().saturating_add(
-                i64::try_from(retry_seconds)
-                    .unwrap_or(i64::MAX)
-                    .saturating_mul(1_000_000),
-            ),
-        )
-    } else {
-        None
-    };
     let pass_calls = slack
         .calls
         .load(std::sync::atomic::Ordering::Relaxed)
         .saturating_sub(calls_before);
-    sqlx::query("UPDATE slack_gateway_accounts SET calls_last_pass=?3,pages_last_pass=?4,retry_at_us=CASE WHEN ?5 IS NOT NULL THEN ?5 WHEN ?7 AND retry_at_us<=?6 THEN NULL ELSE retry_at_us END,status=CASE WHEN ?5 IS NOT NULL THEN 'backing_off' ELSE status END,last_error=CASE WHEN ?5 IS NOT NULL THEN COALESCE(last_error,'Slack requested a retry delay') ELSE last_error END WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).bind(i64::from(pass_calls)).bind(i64::from(slack.pages.load(std::sync::atomic::Ordering::Relaxed))).bind(retry).bind(chrono::Utc::now().timestamp_micros()).bind(result.is_ok()).execute(state.db.pool()).await.map_err(err)?;
+    sqlx::query("UPDATE slack_gateway_accounts SET calls_last_pass=?3,pages_last_pass=?4 WHERE workspace=?1 AND owner=?2").bind(&c.workspace).bind(&c.owner).bind(i64::from(pass_calls)).bind(i64::from(slack.pages.load(std::sync::atomic::Ordering::Relaxed))).execute(state.db.pool()).await.map_err(err)?;
+    super::record_backoff(&state.db, c, slack, result.is_ok()).await?;
     result
 }
 async fn reconciliation_work(state: &AppState, c: &Config) -> Result<Option<bool>, String> {
@@ -415,9 +397,10 @@ async fn dispatch_returns(
                     )
                     .await
                     .map_err(err)?,
-                Err(phoenix_tools::mcp::McpOneShotError::Uncertain(message))
-                    if super::slack::destination_unavailable(&message) =>
-                {
+                Err(
+                    phoenix_tools::mcp::McpOneShotError::Uncertain(message)
+                    | phoenix_tools::mcp::McpOneShotError::ToolRejected(message),
+                ) if super::slack::destination_unavailable(&message) => {
                     state
                         .db
                         .slack_fail_return_with_notice(&output.return_id, &attempt, &message)
@@ -429,7 +412,9 @@ async fn dispatch_returns(
                     .slack_finish_return(
                         &output.return_id,
                         &attempt,
-                        if matches!(e, phoenix_tools::mcp::McpOneShotError::NotDispatched(_)) {
+                        if matches!(e, phoenix_tools::mcp::McpOneShotError::NotDispatched(_))
+                            || super::slack::rate_rejection_proves_unsent(&e)
+                        {
                             phoenix_db::SlackReturnState::KnownUnsent
                         } else {
                             phoenix_db::SlackReturnState::Uncertain
@@ -1024,6 +1009,41 @@ mod tests {
         assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
         slack.fixture = Some(Arc::new(|tool, _| {
             assert_eq!(tool, "slack_send_message");
+            Ok(serde_json::json!({"ok":false,"error":"ratelimited","retry_after":120}))
+        }));
+        dispatch_returns(&state, &c, &slack, true).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()[0]
+                .state,
+            phoenix_db::SlackReturnState::KnownUnsent
+        );
+        state
+            .db
+            .slack_baseline_complete(&c.workspace, &c.owner)
+            .await
+            .unwrap();
+        super::super::record_backoff(&state.db, &c, &slack, true)
+            .await
+            .unwrap();
+        let mut delayed = Slack::new(state.mcp_manager.clone(), &c);
+        delayed.fixture = Some(Arc::new(|_, _| {
+            panic!("persisted delay must prevent any dispatch")
+        }));
+        tick(&state, &c, &delayed, Pass::Delivery).await.unwrap();
+        assert_eq!(delayed.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        sqlx::query("UPDATE slack_gateway_accounts SET retry_at_us=1")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        slack
+            .retry_after
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        slack.fixture = Some(Arc::new(|tool, _| {
+            assert_eq!(tool, "slack_send_message");
             Ok(
                 serde_json::json!({"message_link":"https://fixture.slack.com/archives/CFIXTURE/p200000001?thread_ts=100.000000", "message_context":{"channel_id":"CFIXTURE","message_ts":"200.000001"}}),
             )
@@ -1038,7 +1058,7 @@ mod tests {
                 .state,
             phoenix_db::SlackReturnState::Confirmed
         );
-        assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
