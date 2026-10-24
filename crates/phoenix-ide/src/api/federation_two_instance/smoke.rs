@@ -626,92 +626,7 @@ async fn owner_https_facades_preserve_current_client_envelopes_and_auth_separati
         assert!(!response
             .to_string()
             .contains(peer.bearer_credential.expose()));
-        match operation {
-            "query-database" => {
-                assert_eq!(response["destination_instance_id"], destination.to_string());
-                assert_eq!(response["caller_instance_id"], caller_id.to_string());
-                for key in [
-                    "columns",
-                    "rows",
-                    "truncated",
-                    "row_limit",
-                    "byte_limit",
-                    "elapsed_ms",
-                ] {
-                    assert!(response["result"].get(key).is_some(), "{key}");
-                }
-            }
-            "search-conversations" => {
-                assert_eq!(response["destination_instance_id"], destination.to_string());
-                let hits = response["hits"].as_array().unwrap();
-                assert_eq!(hits.len(), 1);
-                for key in [
-                    "source",
-                    "source_navigation",
-                    "stable_conversation",
-                    "stable_navigation",
-                    "role",
-                    "sender",
-                    "created_at",
-                    "snippet",
-                ] {
-                    assert!(hits[0].get(key).is_some(), "{key}");
-                }
-                assert_eq!(hits[0]["source"]["instance_id"], destination.to_string());
-            }
-            "read-conversation" => {
-                assert_eq!(
-                    response["requested"]["instance_id"],
-                    destination.to_string()
-                );
-                assert_eq!(response["resolved"]["target"], request["target"]);
-                for key in [
-                    "stable_conversation",
-                    "evidence",
-                    "content",
-                    "next_cursor",
-                    "source_navigation",
-                    "stable_navigation",
-                ] {
-                    assert!(response.get(key).is_some(), "{key}");
-                }
-                assert!(response.get("read").is_none());
-            }
-            "resolve-reference" => {
-                for key in [
-                    "reference",
-                    "href",
-                    "title",
-                    "work_scope",
-                    "path_owner_instance_id",
-                    "related_references",
-                    "summary",
-                ] {
-                    assert!(response.get(key).is_some(), "{key}");
-                }
-            }
-            "send-conversation-message" => {
-                assert_eq!(response["destination_instance_id"], destination.to_string());
-                assert_eq!(response["caller_instance_id"], caller_id.to_string());
-                assert_eq!(response["target"], request["target"]);
-                assert_eq!(response["message_id"], request["message_id"]);
-                assert!(response.get("receipt").is_some());
-            }
-            "openapi" => {
-                assert_eq!(response["destination_instance_id"], destination.to_string());
-                assert_eq!(
-                    response["document"]["x-phoenix-instance-id"],
-                    destination.to_string()
-                );
-                assert_eq!(response["document"]["openapi"], "3.1.0");
-                assert!(response.get("openapi").is_none());
-                assert!(!response["document"]["paths"]
-                    .as_object()
-                    .unwrap()
-                    .is_empty());
-            }
-            _ => unreachable!(),
-        }
+        assert_owner_facade_response(operation, &response, &request, destination, caller_id);
     }
     let rejected = receiver
         .client
@@ -724,6 +639,101 @@ async fn owner_https_facades_preserve_current_client_envelopes_and_auth_separati
     assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
     caller.stop().await;
     receiver.stop().await;
+}
+
+fn assert_owner_facade_response(
+    operation: &str,
+    response: &serde_json::Value,
+    request: &serde_json::Value,
+    destination: InstanceId,
+    caller_id: InstanceId,
+) {
+    match operation {
+        "query-database" => {
+            assert_eq!(response["destination_instance_id"], destination.to_string());
+            assert_eq!(response["caller_instance_id"], caller_id.to_string());
+            for key in [
+                "columns",
+                "rows",
+                "truncated",
+                "row_limit",
+                "byte_limit",
+                "elapsed_ms",
+            ] {
+                assert!(response["result"].get(key).is_some(), "{key}");
+            }
+        }
+        "search-conversations" => {
+            assert_eq!(response["destination_instance_id"], destination.to_string());
+            let hits = response["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1);
+            for key in [
+                "source",
+                "source_navigation",
+                "stable_conversation",
+                "stable_navigation",
+                "role",
+                "sender",
+                "created_at",
+                "snippet",
+            ] {
+                assert!(hits[0].get(key).is_some(), "{key}");
+            }
+            assert_eq!(hits[0]["source"]["instance_id"], destination.to_string());
+        }
+        "read-conversation" => {
+            assert_eq!(
+                response["requested"]["instance_id"],
+                destination.to_string()
+            );
+            assert_eq!(response["resolved"]["target"], request["target"]);
+            for key in [
+                "stable_conversation",
+                "evidence",
+                "content",
+                "next_cursor",
+                "source_navigation",
+                "stable_navigation",
+            ] {
+                assert!(response.get(key).is_some(), "{key}");
+            }
+            assert!(response.get("read").is_none());
+        }
+        "resolve-reference" => {
+            for key in [
+                "reference",
+                "href",
+                "title",
+                "work_scope",
+                "path_owner_instance_id",
+                "related_references",
+                "summary",
+            ] {
+                assert!(response.get(key).is_some(), "{key}");
+            }
+        }
+        "send-conversation-message" => {
+            assert_eq!(response["destination_instance_id"], destination.to_string());
+            assert_eq!(response["caller_instance_id"], caller_id.to_string());
+            assert_eq!(response["target"], request["target"]);
+            assert_eq!(response["message_id"], request["message_id"]);
+            assert!(response.get("receipt").is_some());
+        }
+        "openapi" => {
+            assert_eq!(response["destination_instance_id"], destination.to_string());
+            assert_eq!(
+                response["document"]["x-phoenix-instance-id"],
+                destination.to_string()
+            );
+            assert_eq!(response["document"]["openapi"], "3.1.0");
+            assert!(response.get("openapi").is_none());
+            assert!(!response["document"]["paths"]
+                .as_object()
+                .unwrap()
+                .is_empty());
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[tokio::test]

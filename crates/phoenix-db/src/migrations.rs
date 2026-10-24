@@ -12125,6 +12125,14 @@ pub(crate) async fn run_before_goal_storage_for_test(pool: &SqlitePool) -> DbRes
 }
 
 #[cfg(test)]
+pub(crate) async fn run_through_goal_user_control_history_for_test(
+    pool: &SqlitePool,
+) -> DbResult<u32> {
+    let end = MIGRATIONS.partition_point(|migration| migration.version <= 137);
+    run_migration_list(pool, &MIGRATIONS[..end]).await
+}
+
+#[cfg(test)]
 pub(crate) async fn run_before_goal_user_control_for_test(pool: &SqlitePool) -> DbResult<u32> {
     let index = MIGRATIONS
         .iter()
@@ -13069,6 +13077,8 @@ END;
 
 #[cfg(test)]
 mod tests {
+    type AdmissionMigrationSnapshot = (String, Option<String>, bool, Option<String>, bool);
+
     use super::*;
 
     #[tokio::test]
@@ -15044,13 +15054,25 @@ with tempfile.TemporaryDirectory() as directory:
         db.begin_remote_unsubscribe(&reference, subscription)
             .await
             .unwrap();
-        let before: Vec<(String, Option<String>, bool, Option<String>, bool)> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
+        let before: Vec<AdmissionMigrationSnapshot> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
         db.pool().close().await;
         drop(db);
         let db = crate::Database::open(path.to_str().unwrap()).await.unwrap();
         assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
-        let after: Vec<(String, Option<String>, bool, Option<String>, bool)> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
+        let after: Vec<AdmissionMigrationSnapshot> = sqlx::query_as("SELECT admission_id, authorization_id, authorization_requested, accepted_transcript_id, suppressed FROM federation_remote_admissions ORDER BY after_cursor").fetch_all(db.pool()).await.unwrap();
         assert_eq!(before, after);
+        assert_migration_138_stopped_history(&db, &reference, subscription, &ids, &target.id).await;
+    }
+
+    async fn assert_migration_138_stopped_history(
+        db: &crate::Database,
+        reference: &phoenix_core::domain::federation_subscription::SubscriptionReference,
+        subscription: uuid::Uuid,
+        ids: &[String],
+        target: &str,
+    ) {
+        use crate::federation_subscriptions::RemoteNotificationDisposition;
+        use phoenix_core::domain::federation_subscription::SubscriptionCursor;
         let saved = db
             .remote_subscription_by_id(reference.instance_id, subscription)
             .await
@@ -15062,8 +15084,7 @@ with tempfile.TemporaryDirectory() as directory:
             .remote_notification_history(&saved, SubscriptionCursor::START)
             .await
             .unwrap();
-        let presentations = db.remote_notification_presentations(&ids).await.unwrap();
-        use crate::federation_subscriptions::RemoteNotificationDisposition;
+        let presentations = db.remote_notification_presentations(ids).await.unwrap();
         assert!(matches!(
             history[0].disposition,
             RemoteNotificationDisposition::Accepted { .. }
@@ -15084,13 +15105,13 @@ with tempfile.TemporaryDirectory() as directory:
             .values()
             .all(|(_, navigation)| navigation.is_some()));
         let error = sqlx::query("INSERT INTO steering_messages(message_id,conversation_id,ordinal,text,origin_kind,origin_subscription_event_id) VALUES (?1,?2,1,'late fact','subscription_event',?1)")
-            .bind(&ids[1]).bind(&target.id).execute(db.pool()).await.unwrap_err();
+            .bind(&ids[1]).bind(target).execute(db.pool()).await.unwrap_err();
         assert!(error
             .to_string()
             .contains("federation subscription locally stopped"));
         let accepted: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1")
-                .bind(&target.id)
+                .bind(target)
                 .fetch_one(db.pool())
                 .await
                 .unwrap();

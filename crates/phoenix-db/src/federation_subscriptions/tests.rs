@@ -2459,72 +2459,90 @@ async fn local_stop_fences_both_acceptance_paths_and_preserves_both_history_deco
                 .await
                 .unwrap()
                 .is_empty());
-            let history = db
-                .remote_notification_history(&remote, SubscriptionCursor::START)
-                .await
-                .unwrap();
-            let presentations = db
-                .remote_notification_presentations(std::slice::from_ref(id))
-                .await
-                .unwrap();
-            assert_eq!(history.len(), 1);
-            assert_eq!(presentations.len(), 1);
-            for stored in [&history[0], &presentations[id].0] {
-                assert_eq!(stored.admission_id, *id);
-                assert_eq!(
-                    matches!(
-                        stored.disposition,
-                        RemoteNotificationDisposition::Accepted { .. }
-                    ),
-                    stop_point == 3
-                );
-                assert_eq!(
-                    matches!(
-                        stored.disposition,
-                        RemoteNotificationDisposition::Suppressed
-                    ),
-                    stop_point != 3
-                );
-            }
-            let metadata: (Option<String>, bool, bool) = sqlx::query_as("SELECT authorization_id, authorization_requested, suppressed FROM federation_remote_admissions WHERE admission_id = ?1")
-                .bind(id).fetch_one(db.pool()).await.unwrap();
-            assert_eq!(
-                metadata,
-                (
-                    if stop_point == 0 {
-                        None
-                    } else {
-                        Some(authorization.to_string())
-                    },
-                    stop_point != 0,
-                    stop_point == 0
-                )
-            );
-            if stop_point > 0 {
-                assert!(presentations[id].1.is_some());
-            }
-            let saved = db
-                .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(saved.pending_unsubscribe);
-            assert_eq!(saved.admitted_cursor.get(), i64::from(stop_point == 3));
-            let turns: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id = ?1",
+            assert_stopped_acceptance_history(
+                &db,
+                &remote,
+                std::slice::from_ref(id),
+                authorization,
+                stop_point,
             )
-            .bind(id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-            let steers: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM steering_messages WHERE origin_subscription_event_id = ?1",
-            )
-            .bind(id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-            assert_eq!(turns + steers, i64::from(stop_point == 3));
+            .await;
         }
     }
+}
+
+async fn assert_stopped_acceptance_history(
+    db: &Database,
+    remote: &RemoteSubscription,
+    ids: &[String],
+    authorization: Uuid,
+    stop_point: i32,
+) {
+    let id = &ids[0];
+    let history = db
+        .remote_notification_history(remote, SubscriptionCursor::START)
+        .await
+        .unwrap();
+    let presentations = db
+        .remote_notification_presentations(std::slice::from_ref(id))
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(presentations.len(), 1);
+    for stored in [&history[0], &presentations[id].0] {
+        assert_eq!(stored.admission_id, *id);
+        assert_eq!(
+            matches!(
+                stored.disposition,
+                RemoteNotificationDisposition::Accepted { .. }
+            ),
+            stop_point == 3
+        );
+        assert_eq!(
+            matches!(
+                stored.disposition,
+                RemoteNotificationDisposition::Suppressed
+            ),
+            stop_point != 3
+        );
+    }
+    let metadata: (Option<String>, bool, bool) = sqlx::query_as("SELECT authorization_id, authorization_requested, suppressed FROM federation_remote_admissions WHERE admission_id = ?1")
+                .bind(id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        metadata,
+        (
+            if stop_point == 0 {
+                None
+            } else {
+                Some(authorization.to_string())
+            },
+            stop_point != 0,
+            stop_point == 0
+        )
+    );
+    if stop_point > 0 {
+        assert!(presentations[id].1.is_some());
+    }
+    let saved = db
+        .remote_subscription_by_id(remote.reference.instance_id, remote.subscription_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(saved.pending_unsubscribe);
+    assert_eq!(saved.admitted_cursor.get(), i64::from(stop_point == 3));
+    let turns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM durable_turns WHERE origin_subscription_event_id = ?1",
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let steers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM steering_messages WHERE origin_subscription_event_id = ?1",
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(turns + steers, i64::from(stop_point == 3));
 }

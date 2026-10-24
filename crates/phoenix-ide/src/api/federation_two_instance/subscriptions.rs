@@ -1709,10 +1709,6 @@ async fn expired_source_payload_replays_an_explicit_gap_with_current_snapshot_an
 
 #[tokio::test]
 async fn local_stop_after_https_authorization_is_typed_and_never_accepts_a_late_fact() {
-    use crate::send_chat_service::{
-        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest, SendChatServiceError,
-    };
-    use phoenix_core::domain::db_schema::InputOrigin;
     use phoenix_db::federation_subscriptions::RemoteAuthorizationOutcome;
     let a = TestInstance::start().await;
     let b = TestInstance::start().await;
@@ -1780,6 +1776,21 @@ async fn local_stop_after_https_authorization_is_typed_and_never_accepts_a_late_
             .unwrap(),
         RemoteAuthorizationOutcome::LocallyStopped
     );
+    assert_late_authorized_fact_is_stopped(&a, &remote, &note, authorization_id).await;
+    a.stop().await;
+    b.stop().await;
+}
+
+async fn assert_late_authorized_fact_is_stopped(
+    a: &TestInstance,
+    remote: &phoenix_db::federation_subscriptions::RemoteSubscription,
+    note: &phoenix_db::federation_subscriptions::RemoteNotification,
+    authorization_id: uuid::Uuid,
+) {
+    use crate::send_chat_service::{
+        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest, SendChatServiceError,
+    };
+    use phoenix_core::domain::db_schema::InputOrigin;
     let target = a
         .state
         .db
@@ -1807,7 +1818,7 @@ async fn local_stop_after_https_authorization_is_typed_and_never_accepts_a_late_
     let history = a
         .state
         .db
-        .remote_notification_history(&remote, SubscriptionCursor::START)
+        .remote_notification_history(remote, SubscriptionCursor::START)
         .await
         .unwrap();
     assert!(matches!(
@@ -1816,11 +1827,9 @@ async fn local_stop_after_https_authorization_is_typed_and_never_accepts_a_late_
     ));
     let receipts: (Option<String>, bool, Option<String>) = sqlx::query_as("SELECT authorization_id, authorization_requested, accepted_transcript_id FROM federation_remote_admissions WHERE admission_id = ?1").bind(&note.admission_id).fetch_one(a.state.db.pool()).await.unwrap();
     assert_eq!(receipts, (Some(authorization_id.to_string()), true, None));
-    assert!(refreshed(&a, &remote).await.pending_unsubscribe);
+    assert!(refreshed(a, remote).await.pending_unsubscribe);
     assert_eq!(
-        refreshed(&a, &remote).await.admitted_cursor,
+        refreshed(a, remote).await.admitted_cursor,
         SubscriptionCursor::START
     );
-    a.stop().await;
-    b.stop().await;
 }

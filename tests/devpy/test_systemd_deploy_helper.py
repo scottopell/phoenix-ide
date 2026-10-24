@@ -2313,8 +2313,11 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         ledger = helper.candidate_registry(ordinary)
         self.assertIn((134, "durable_conversation_goal_user_control"), ledger)
         self.assertIn((135, "local_watch_goal_capture"), ledger)
-        self.assertEqual(ledger[-2], (136, "per_goal_execution_requests"))
-        self.assertEqual(ledger[-1], (137, "goal_start_materialization_witness"))
+        self.assertEqual(ledger[-3:], (
+            (136, "per_goal_execution_requests"),
+            (137, "goal_start_materialization_witness"),
+            (138, "federation_local_stop_acceptance"),
+        ))
         protected = dataclasses.replace(manifest, registry=artifact)
         with mock.patch.object(helper, "PROTECTED_REGISTRY_SHA256", artifact.sha256):
             with self.assertRaisesRegex(helper.ActivationError, "exact qualified target128"):

@@ -36,7 +36,7 @@ async fn assert_registered(db: &Database) {
         .unwrap();
     assert_eq!(name, MIGRATION_NAME);
     let fresh = Database::open_in_memory().await.unwrap();
-    crate::conversation_goals::tests::assert_current_137_schema_and_goal_ledger(db, &fresh).await;
+    crate::conversation_goals::tests::assert_current_schema_and_goal_ledger(db, &fresh).await;
     assert_eq!(
         db.goal_control_installation(),
         GoalControlInstallation::Disabled
@@ -66,12 +66,13 @@ async fn conversation_goal_registered_134_through_137_fresh_and_real_133_upgrade
     ).fetch_one(prior.pool()).await.unwrap();
     assert_eq!(control_tables, 0);
     assert_eq!(
-        crate::migrations::run_pending_migrations(prior.pool())
+        crate::migrations::run_through_goal_user_control_history_for_test(prior.pool())
             .await
             .unwrap(),
         4
     );
     assert_eq!(schema(&prior).await, schema(&fresh).await);
+    assert_138_suffix_preserves_goal_history(&prior).await;
     assert_registered(&prior).await;
     for (table, query) in [
         (
@@ -138,7 +139,7 @@ async fn populated_upgrade(owner: Owner) {
     let before = retained(&db).await;
     let source = source_rows(&db).await;
     assert_eq!(
-        crate::migrations::run_pending_migrations(db.pool())
+        crate::migrations::run_through_goal_user_control_history_for_test(db.pool())
             .await
             .unwrap(),
         4
@@ -147,6 +148,7 @@ async fn populated_upgrade(owner: Owner) {
     assert_eq!(source_rows(&db).await, source);
     let fresh = Database::open_in_memory().await.unwrap();
     assert_eq!(schema(&db).await, schema(&fresh).await);
+    assert_138_suffix_preserves_goal_history(&db).await;
     assert_registered(&db).await;
     let cycle: (i64, i64) = sqlx::query_as(
         "SELECT h.report_turn_id,b.observed_version FROM conversation_goal_history h JOIN conversation_goal_bindings b ON b.turn_id=h.report_turn_id WHERE h.change_kind='report'",
@@ -210,7 +212,7 @@ async fn conversation_goal_registered_134_through_137_real_runner_failure_rolls_
     let before = retained(&db).await;
     let before_schema = schema(&db).await;
     let source = source_rows(&db).await;
-    let error = crate::migrations::run_pending_migrations(db.pool())
+    let error = crate::migrations::run_through_goal_user_control_history_for_test(db.pool())
         .await
         .unwrap_err();
     assert!(
@@ -231,13 +233,60 @@ async fn conversation_goal_registered_134_through_137_real_runner_failure_rolls_
         .await
         .unwrap();
     assert_eq!(
-        crate::migrations::run_pending_migrations(db.pool())
+        crate::migrations::run_through_goal_user_control_history_for_test(db.pool())
             .await
             .unwrap(),
         4
     );
     assert_eq!(retained(&db).await, before);
+    assert_138_suffix_preserves_goal_history(&db).await;
     assert_registered(&db).await;
+}
+
+async fn assert_138_suffix_preserves_goal_history(db: &Database) {
+    let historical: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=134 ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        historical,
+        vec![
+            (134, MIGRATION_NAME.into()),
+            (135, "local_watch_goal_capture".into()),
+            (136, "per_goal_execution_requests".into()),
+            (137, "goal_start_materialization_witness".into()),
+        ]
+    );
+    let before = retained(db).await;
+    let source = source_rows(db).await;
+    let goals_schema = schema(db).await;
+    assert_eq!(
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    let current: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=134 ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let mut expected = historical;
+    expected.push((138, "federation_local_stop_acceptance".into()));
+    assert_eq!(current, expected);
+    assert_eq!(retained(db).await, before);
+    assert_eq!(source_rows(db).await, source);
+    assert_eq!(schema(db).await, goals_schema);
+    assert_eq!(
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(retained(db).await, before);
+    assert_eq!(source_rows(db).await, source);
+    assert_healthy(db).await;
 }
 
 async fn assert_unreceipted_actor_rejected(db: &Database, command: &GoalUserCommand) {

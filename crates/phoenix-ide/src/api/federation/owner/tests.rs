@@ -68,6 +68,15 @@ async fn owner_router_preserves_safe_peer_array_string_notes_and_public_referenc
         .unwrap()
         .starts_with("https://peer.example:8031"));
     assert!(!value[0]["created_at"].as_str().unwrap().is_empty());
+    assert_owner_notes_and_public_reference(app, &state, peer_id, instance).await;
+}
+
+async fn assert_owner_notes_and_public_reference(
+    app: axum::Router,
+    state: &AppState,
+    peer_id: InstanceId,
+    instance: InstanceId,
+) {
     let path = format!("/api/federation/peers/{peer_id}/notes");
     let response = app
         .clone()
@@ -84,7 +93,7 @@ async fn owner_router_preserves_safe_peer_array_string_notes_and_public_referenc
     let initial: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 256 * 1024).await.unwrap()).unwrap();
     assert_eq!(initial, json!({"notes": ""}));
-    for notes in ["".to_string(), "雪".repeat(10922) + "ab"] {
+    for notes in [String::new(), "雪".repeat(10922) + "ab"] {
         let response = app
             .clone()
             .oneshot(
