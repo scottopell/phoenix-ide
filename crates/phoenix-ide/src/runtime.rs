@@ -5772,6 +5772,14 @@ impl RuntimeManager {
             self.llm_registry.resolve_model_id(&stored_model_id)?
         };
         let context_window = self.llm_registry.context_window(&model_id);
+        let output_budget = usize::try_from(
+            self.llm_registry
+                .output_token_limit(&model_id)
+                .ok_or_else(|| {
+                    format!("Model '{model_id}' has no declared output-token maximum")
+                })?,
+        )
+        .unwrap_or(usize::MAX);
         let approved_task_objective = self
             .db
             .get_approved_task_objective(conversation_id)
@@ -5789,10 +5797,11 @@ impl RuntimeManager {
                     .path_buf(),
                 &model_id,
                 context_window,
+                output_budget,
                 root_id,
             )
         } else if is_coordinator {
-            ConvContext::coordinator(&conv.id, &model_id, context_window)
+            ConvContext::coordinator(&conv.id, &model_id, context_window, output_budget)
         } else {
             ConvContext::new(
                 &conv.id,
@@ -5802,6 +5811,7 @@ impl RuntimeManager {
                     .path_buf(),
                 &model_id,
                 context_window,
+                output_budget,
             )
         };
         context.resource_scope = match conv.attached_work_scope_id.clone() {

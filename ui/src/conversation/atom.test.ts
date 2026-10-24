@@ -1604,6 +1604,23 @@ describe('conversationReducer', () => {
       expect(next.phase.type).toBe('awaiting_llm');
     });
 
+    it('retains already-visible output on output exhaustion without committing a message', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(), phase: { type: 'llm_requesting', attempt: 1 },
+        lastAppliedEventSeq: 2,
+        streamingBuffer: { text: 'unfinished answer', lastSequence: 2,
+          startedAt: 10, requestId: 'req-1' },
+      };
+      const next = dispatch(atom, {
+        type: 'sse_state_change', sequenceId: 3,
+        phase: { type: 'error', message: 'output exhausted', error_kind: 'output_tokens_exhausted' },
+        stateUpdatedAt: 20,
+      });
+      expect(next.streamingBuffer).toEqual(atom.streamingBuffer);
+      expect(next.messages).toEqual([]);
+      expect(next.phase.type).toBe('error');
+    });
+
     it('clears failed streamed tokens when llm_requesting ends in error/refusal', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),

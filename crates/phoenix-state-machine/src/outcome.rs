@@ -89,6 +89,12 @@ pub enum LlmOutcome {
     /// Provider rejected the assembled prompt. This does not retry the same
     /// request automatically, but persists a user-resumable conversation error.
     PromptRejected { message: String },
+    /// The model stopped at the request's output-token budget (Chat
+    /// `finish_reason=length`, Responses `incomplete/max_output_tokens`,
+    /// Anthropic `stop_reason=max_tokens`). Not auto-retried — an unchanged
+    /// request would exhaust again — but persists a user-resumable error so a
+    /// revised message or settings can free output room (REQ-LLM-006c).
+    OutputTokensExhausted { message: String },
     /// Request was cancelled (abort signal received).
     #[allow(dead_code)]
     Cancelled,

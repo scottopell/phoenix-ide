@@ -883,9 +883,8 @@ fn build_agent_request(
         provider_replay: None,
         responses_replay: Vec::new(),
         tool_availability,
-        max_tokens: Some(
-            max_output_tokens.map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),
-        ),
+        max_tokens: max_output_tokens
+            .map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),
         effective_effort,
         service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
         telemetry: None,

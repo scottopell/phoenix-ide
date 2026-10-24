@@ -755,6 +755,13 @@ pub enum ErrorKind {
     SubAgentError,
     /// Context window exhausted - not retryable
     ContextExhausted,
+    /// The model stopped at the request's output-token budget (Chat
+    /// `finish_reason=length`, Responses `incomplete/max_output_tokens`,
+    /// Anthropic `stop_reason=max_tokens`). Not auto-retried — an unchanged
+    /// request would exhaust again — but user-resumable: a revised message or
+    /// settings can free output room. Distinct from `ContextExhausted`, which
+    /// is not resumable.
+    OutputTokensExhausted,
     /// Sub-agent exhausted its grace turn without a terminal outcome - not retryable
     TurnLimitExhausted,
     /// Content filter or safety block - not retryable
@@ -783,6 +790,7 @@ impl ErrorKind {
             | Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
+            | Self::OutputTokensExhausted
             | Self::TurnLimitExhausted
             | Self::ContentFilter => AutoRetryPolicy::NoAutoRetry,
         }
@@ -818,6 +826,9 @@ impl ErrorKind {
             | Self::UsageLimitReached
             | Self::TimedOut
             | Self::InvalidRequest
+            // An output-token-budget stop is terminal for auto-retry but the
+            // user can free output room with a revised message or settings.
+            | Self::OutputTokensExhausted
             | Self::PromptRejected => UserResumePolicy::Resumable,
             Self::Cancelled
             | Self::SubAgentError

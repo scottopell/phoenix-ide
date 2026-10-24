@@ -21,6 +21,7 @@ export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation |
     case 'usage_limit_reached':
     case 'prompt_rejected':
     case 'invalid_request':
+    case 'output_tokens_exhausted':
       return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
     case 'cancelled':
     case 'sub_agent_error':

@@ -222,8 +222,8 @@ pub(super) fn plan_with_handoff(
     if required > context_window || history_item_cap == Some(0) {
         return Err(
             "The accepted previous handoff cannot fit in this model's compaction request. \
-             It has not been shortened or dropped. Select a model with a larger context window \
-             or lower reasoning effort, then retry compaction."
+             It has not been shortened or dropped. Select a model with more available input capacity \
+             or reduce the handoff input, then retry compaction."
                 .to_string(),
         );
     }

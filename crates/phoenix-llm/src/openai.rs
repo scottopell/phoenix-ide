@@ -565,6 +565,15 @@ impl ResponsesStreamAccumulator {
                         super::LlmErrorKind::ContentFilter,
                         format!("Response incomplete: {reason}"),
                     )
+                } else if reason == "max_output_tokens" {
+                    // Budget-limited stop, not a transport fault: terminal for
+                    // auto-retry, user-resumable. Any partial tool call in the
+                    // truncated response is discarded (we return Err rather than
+                    // assembling a response), and already-streamed visible text
+                    // stays in the ephemeral client buffer (REQ-LLM-006c).
+                    LlmError::output_tokens_exhausted(
+                        "Response stopped at its output token budget before finishing",
+                    )
                 } else {
                     LlmError::server_error(format!("Response incomplete: {reason}"))
                 });
@@ -723,6 +732,7 @@ impl ResponsesStreamAccumulator {
                 id: self.response_id,
                 model: self.model,
                 status: "completed".to_string(),
+                incomplete_details: None,
                 output: self.output_items.into_values().collect(),
                 usage: ResponsesApiUsage {
                     input_tokens: self.input_tokens,
@@ -1911,14 +1921,14 @@ fn translate_to_responses_request_for_model(
         input: input_items,
         instructions,
         tools,
+        // REQ-LLM-004f: Phoenix always resolves a concrete output-token
+        // budget; the codex backend forbids the field on the wire, so it is
+        // omitted here by design even though the request still carries the
+        // resolved budget for context planning.
         max_output_tokens: if use_codex_backend {
             None
         } else {
-            Some(
-                request
-                    .raised_output_token_ceiling()
-                    .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
-            )
+            Some(request.max_tokens)
         },
         stream: None,
         store: if use_codex_backend || official_openai_route {
@@ -2077,28 +2087,31 @@ fn chat_tool_choice(request: &LlmRequest, supported: bool) -> Option<ChatToolCho
     }
 }
 
-fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
-    let unavailable: Vec<_> = request
-        .tool_availability
+pub(crate) fn tool_advisory_text(
+    availability: &phoenix_core::domain::tool_availability::ToolAvailability,
+) -> Option<String> {
+    let unavailable: Vec<_> = availability
         .declarations()
         .iter()
-        .filter(|tool| !request.tool_availability.is_callable(&tool.name))
+        .filter(|tool| !availability.is_callable(&tool.name))
         .map(|tool| tool.name.as_str())
         .collect();
     if unavailable.is_empty() {
-        return;
+        return None;
     }
-    let text = instructions.get_or_insert_with(String::new);
-    text.push_str("\n\nThese tools are unavailable for new calls: ");
-    text.push_str(&unavailable.join(", "));
-    text.push_str(
-        ". Their definitions are retained for historical context. Choose available tools instead.",
-    );
-    tracing::debug!(
-        provider = "openai",
-        n = unavailable.len(),
-        "using advisory tool restriction on route without native support"
-    );
+    Some(format!("\n\nThese tools are unavailable for new calls: {}. Their definitions are retained for historical context. Choose available tools instead.", unavailable.join(", ")))
+}
+
+fn append_advisory(instructions: &mut Option<String>, request: &LlmRequest) {
+    if let Some(advisory) = tool_advisory_text(&request.tool_availability) {
+        instructions
+            .get_or_insert_with(String::new)
+            .push_str(&advisory);
+        tracing::debug!(
+            provider = "openai",
+            "using advisory tool restriction on route without native support"
+        );
+    }
 }
 
 fn bind_responses_model(
@@ -2147,14 +2160,6 @@ fn validate_responses_replay(request: &LlmRequest, api_name: &str) -> Result<(),
         }
     }
     Ok(())
-}
-
-fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
-    if effort.is_some_and(ModelEffort::needs_extended_output_headroom) {
-        64_000
-    } else {
-        16_384
-    }
 }
 
 fn platform_reasoning(effort: ModelEffort) -> ResponsesApiReasoning {
@@ -2395,6 +2400,26 @@ fn validate_responses_terminal_content(
     )))
 }
 
+/// Budget-limited stop (REQ-LLM-006c), checked before any output item is
+/// parsed so a truncated function-call argument never reaches JSON parsing:
+/// terminal for auto-retry, user-resumable. Mirrors the SSE
+/// `response.incomplete` + `max_output_tokens` handling for the
+/// non-streaming Responses API path.
+fn check_responses_output_budget(resp: &ResponsesApiResponse) -> Result<(), LlmError> {
+    if resp.status == "incomplete"
+        && resp
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            == Some("max_output_tokens")
+    {
+        return Err(LlmError::output_tokens_exhausted(
+            "Response stopped at its output token budget before finishing",
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
 fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
     normalize_responses_api_response_with_evidence(resp, false)
@@ -2404,6 +2429,8 @@ fn normalize_responses_api_response_with_evidence(
     resp: ResponsesApiResponse,
     observed_non_reasoning_output: bool,
 ) -> Result<LlmResponse, LlmError> {
+    check_responses_output_budget(&resp)?;
+
     let output_items: Vec<serde_json::Value> =
         resp.output.iter().map(|item| item.0.clone()).collect();
     let mut content = Vec::new();
@@ -2975,8 +3002,16 @@ pub(crate) struct ResponsesApiResponse {
     #[serde(default)]
     pub(crate) model: String,
     pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) incomplete_details: Option<ResponsesIncompleteDetails>,
     pub(crate) output: Vec<ResponsesApiOutput>,
     pub(crate) usage: ResponsesApiUsage,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3605,7 +3640,7 @@ fn translate_to_chat_request_with_route(
         model: api_name.to_string(),
         messages,
         tools,
-        max_tokens: request.max_tokens,
+        max_tokens: Some(request.max_tokens),
         reasoning_effort: request.effective_effort.explicit_level(),
         stream: None,
         stream_options: None,
@@ -3645,10 +3680,14 @@ fn normalize_chat_response(
                 model,
                 resp.usage.as_ref().and_then(ChatUsage::reasoning_tokens),
             );
-            return Err(LlmError::invalid_response(
-                "Chat completions hit the output token limit before finishing. \
-                 Try again with a larger max_tokens value or a model with a higher output budget."
-                    .to_string(),
+            // finish_reason=length is a budget-limited stop, not a transport
+            // fault: terminal for auto-retry (an unchanged request exhausts
+            // again) and user-resumable. Any partial tool call in the truncated
+            // choice is discarded (we return Err rather than assembling a
+            // response); already-streamed visible text stays in the ephemeral
+            // client buffer (REQ-LLM-006c).
+            return Err(LlmError::output_tokens_exhausted(
+                "Chat completion stopped at its output token budget before finishing",
             ));
         }
         Some("content_filter") => {
@@ -3897,10 +3936,12 @@ impl ChatStreamAccumulator {
                             "<streaming-chat-completions>",
                             reasoning_tokens,
                         );
-                        return Err(LlmError::invalid_response(
-                            "Chat completions hit the output token limit before finishing. \
-                             Try again with a larger max_tokens value or a model with a higher output budget."
-                                .to_string(),
+                        // Budget-limited stop (REQ-LLM-006c): terminal for
+                        // auto-retry, user-resumable. Returning Err discards any
+                        // partial tool call accumulated so far; already-streamed
+                        // visible text stays in the ephemeral client buffer.
+                        return Err(LlmError::output_tokens_exhausted(
+                            "Chat completion stopped at its output token budget before finishing",
                         ));
                     }
                     "content_filter" => {
@@ -4507,7 +4548,7 @@ mod tests {
             family: "OpenAI".into(),
             description: String::new(),
             context_window: 100_000,
-            max_output_tokens: Some(crate::DEFAULT_MAX_OUTPUT_TOKENS),
+            max_output_tokens: 16_384,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -4532,7 +4573,7 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -5166,7 +5207,7 @@ mod tests {
         // A cache-relevant property change also sends a full create on the same
         // live connection rather than applying stale continuation metadata.
         let mut property_changed = request_with(&[("changed", MessageRole::User)]);
-        property_changed.max_tokens = Some(42);
+        property_changed.max_tokens = 42;
         call(property_changed).await.unwrap();
         let requests = state.ws_requests.lock().await.clone();
         assert!(requests[3].1.get("previous_response_id").is_none());
@@ -5861,7 +5902,7 @@ mod tests {
             tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
                 vec![],
             ),
-            max_tokens: None,
+            max_tokens: 16_384,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
@@ -6149,7 +6190,7 @@ mod tests {
     #[test]
     fn explicit_effort_serializes_on_platform_and_native_default_omits_reasoning() {
         let mut request = empty_request();
-        request.max_tokens = Some(16_384);
+        request.max_tokens = 16_384;
 
         let native = serde_json::to_value(translate_to_responses_request(
             "gpt-5.6-sol",
@@ -7127,7 +7168,45 @@ mod tests {
             .process_event("response.incomplete", data, &tx)
             .await
             .unwrap_err();
-        assert_eq!(err.kind, LlmErrorKind::ServerError);
+        assert_eq!(err.kind, LlmErrorKind::OutputTokensExhausted);
+    }
+
+    /// The non-streaming Responses API reports the same budget-limited stop
+    /// via top-level `status`/`incomplete_details`, not an SSE event. A
+    /// truncated function-call argument string must never reach JSON
+    /// parsing — the exhaustion check must classify first.
+    #[test]
+    fn normalize_responses_json_incomplete_max_output_tokens_is_exhausted_not_invalid() {
+        let resp = ResponsesApiResponse {
+            id: "resp-truncated".to_string(),
+            model: "gpt-test".to_string(),
+            status: "incomplete".to_string(),
+            incomplete_details: Some(ResponsesIncompleteDetails {
+                reason: Some("max_output_tokens".to_string()),
+            }),
+            output: vec![ResponsesApiOutput(serde_json::json!({
+                "type": "function_call",
+                "name": "bash",
+                "call_id": "call-1",
+                "arguments": "{\"cmd\": \"ls -la /very/long/pa",
+            }))],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 4096,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                output_tokens_details: None,
+            },
+        };
+        let err = normalize_responses_api_response(resp).unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::LlmErrorKind::OutputTokensExhausted,
+            "status=incomplete with reason=max_output_tokens must classify as exhausted, \
+             not fall through to a parsed (or malformed-tool) success/invalid-response"
+        );
     }
 
     /// When the stream lacks `response.output_item.done` events but
@@ -7221,6 +7300,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: acc.output_items.into_values().collect(),
             usage: ResponsesApiUsage {
                 input_tokens: acc.input_tokens,
@@ -7404,6 +7484,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![],
             usage,
         })
@@ -7423,6 +7504,7 @@ mod tests {
             id: String::new(),
             model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -7448,6 +7530,7 @@ mod tests {
             id: "resp-reasoning-only".to_string(),
             model: "gpt-test".to_string(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![ResponsesApiOutput(serde_json::json!({
                 "type": "reasoning",
                 "id": "reasoning-1",
@@ -7605,6 +7688,7 @@ mod tests {
             id: "resp-reasoning-fixture".to_string(),
             model: "gpt-test".to_string(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: output.into_iter().map(ResponsesApiOutput).collect(),
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -8099,6 +8183,7 @@ mod tests {
         let resp = normalize_responses_api_response(ResponsesApiResponse {
             id: String::new(), model: String::new(),
             status: "completed".to_string(),
+            incomplete_details: None,
             output: vec![ResponsesApiOutput(serde_json::json!({"type":"message", "content":[{"type":"refusal", "refusal":"I can't help with that."}]}))],
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
@@ -8416,6 +8501,39 @@ mod tests {
         );
     }
 
+    /// `finish_reason="length"` must classify as exhausted before a partial
+    /// tool call's malformed JSON arguments are ever parsed, so a truncated
+    /// response never surfaces as "malformed tool arguments" instead of the
+    /// budget-limited stop it actually is.
+    #[test]
+    fn chat_json_length_with_malformed_tool_call_is_exhausted_not_invalid() {
+        let truncated = ChatCompletionsResponse {
+            choices: vec![ChatChoice {
+                message: ChatResponseMessage {
+                    reasoning_content: None,
+                    content: None,
+                    refusal: None,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call-1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "bash".to_string(),
+                            arguments: "{\"cmd\": \"ls -la /very/long/pa".to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("length".to_string()),
+            }],
+            usage: None,
+        };
+        assert_eq!(
+            normalize_chat_response(truncated, "compatible-chat-model")
+                .unwrap_err()
+                .kind,
+            crate::LlmErrorKind::OutputTokensExhausted
+        );
+    }
+
     #[tokio::test]
     async fn chat_stream_rejects_multiple_choices_and_invalid_tool_indices() {
         let request = empty_request();
@@ -8502,6 +8620,31 @@ mod tests {
             acc.into_response().unwrap_err().kind,
             crate::LlmErrorKind::InvalidResponse
         );
+    }
+
+    /// A partial tool-call delta followed by `finish_reason="length"` must
+    /// classify as exhausted without ever reaching `into_response`'s tool
+    /// argument JSON parse — the malformed, truncated arguments accumulated
+    /// so far must not surface as an unrelated "malformed tool" error.
+    #[tokio::test]
+    async fn chat_stream_partial_tool_then_length_is_exhausted_not_invalid() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-9","function":{"name":"bash","arguments":"{\"cmd\": \"ls -la /very/long/pa"}}]}}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        let error = acc
+            .process_event(
+                r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+                &tx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::OutputTokensExhausted);
     }
 
     #[tokio::test]
