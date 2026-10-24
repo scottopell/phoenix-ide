@@ -1,7 +1,7 @@
 //! The only component that knows the connected Slack tool names and text format.
 use super::Config;
 use phoenix_db::{SlackRequestKind, SlackSource};
-use phoenix_tools::mcp::{McpClientManager, McpOneShotError};
+use phoenix_tools::mcp::{McpClientManager, McpConnectionBinding, McpOneShotError};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ pub(super) struct Slack {
     manager: Arc<McpClientManager>,
     server: String,
     workspace: String,
+    connection: tokio::sync::OnceCell<McpConnectionBinding>,
     pub calls: std::sync::atomic::AtomicU32,
     pub pages: std::sync::atomic::AtomicU32,
     pub retry_after: std::sync::atomic::AtomicU64,
@@ -51,6 +52,7 @@ impl Slack {
             manager,
             server: c.mcp_server.clone(),
             workspace: c.workspace.clone(),
+            connection: tokio::sync::OnceCell::new(),
             calls: std::sync::atomic::AtomicU32::new(0),
             pages: std::sync::atomic::AtomicU32::new(0),
             retry_after: std::sync::atomic::AtomicU64::new(0),
@@ -72,6 +74,10 @@ impl Slack {
             return fixture(suffix, args)
                 .map_err(|e| McpOneShotError::Uncertain(self.observe_error(e)));
         }
+        let binding = self
+            .connection
+            .get_or_try_init(|| self.manager.bind_connection(&self.server))
+            .await?;
         let tools = self.manager.tool_definitions().await;
         let matches: Vec<_> = tools
             .iter()
@@ -91,7 +97,7 @@ impl Slack {
         // later service opportunity, with a new grant, including for reads.
         let raw = self
             .manager
-            .call_tool_once(&self.server, &tool.name, args, tool.input_schema.clone())
+            .call_tool_once_bound(binding, &tool.name, args, tool.input_schema.clone())
             .await
             .inspect_err(|e| {
                 let _ = self.observe_error(e.message().to_string());
@@ -149,6 +155,21 @@ impl Slack {
             return Err(
                 "Authenticated Slack identity does not match configured human owner".into(),
             );
+        }
+        // Profiles expose a user ID but no workspace identity. Verify one
+        // non-authorizing permalink on this same pinned connection before writes.
+        let evidence = self
+            .call(
+                "slack_search_public_and_private",
+                json!({
+                    "filters":"after:1970-01-01", "keywords":[], "natural_language_query":"",
+                    "limit":1, "response_format":"detailed", "include_context":false,
+                    "include_bots":true,"sort":"timestamp","sort_dir":"desc"
+                }),
+            )
+            .await?;
+        if parse_page(&evidence, c)?.hits.is_empty() {
+            return Err("Authenticated Slack workspace could not be established".into());
         }
         Ok(())
     }
@@ -341,17 +362,18 @@ fn verify_thread_reply(value: &Value, ts: &str, author: &str, body: &str) -> Res
     if field(value, "pagination_info")?.trim() != "There are no more messages in this thread." {
         return Err("Source thread membership is incomplete".into());
     }
+    if field(value, "messages")?
+        .trim_end()
+        .ends_with("\nNo thread messsages")
+    {
+        return Err("Claimed root contains no source reply".into());
+    }
     let (_, reply) = field(value, "messages")?
         .rsplit_once("\n=== THREAD REPLIES (1 total) ===\n\n--- Reply 1 of 1 ---\n")
         .ok_or("Source is not verified in the claimed root thread")?;
     let (reply_author, reply_body) =
         thread_source(&format!("=== THREAD PARENT MESSAGE ===\n{reply}"), ts)?;
-    let exact_body = body
-        .trim()
-        .strip_suffix("No thread messsages")
-        .unwrap_or(body.trim())
-        .trim_end();
-    if reply_author != author || reply_body.trim() != exact_body {
+    if reply_author != author || reply_body.trim() != body.trim() {
         return Err("Thread reply differs from the exact source".into());
     }
     Ok(())
@@ -381,6 +403,9 @@ pub(super) fn destination_unavailable(error: &str) -> bool {
                     | "is_archived"
                     | "not_in_channel"
                     | "restricted_action"
+                    | "restricted_action_thread_locked"
+                    | "restricted_action_read_only_channel"
+                    | "restricted_action_non_threadable_channel"
                     | "posting_to_general_channel_denied"
             )
         })
@@ -587,11 +612,88 @@ fn thread_source(thread: &str, ts: &str) -> Result<(String, String), String> {
                 && s.chars().all(|c| c.is_ascii_alphanumeric())
         })
         .ok_or("Message does not have a verifiable Slack author")?;
-    Ok((author.into(), lines.next().unwrap_or("").into()))
+    Ok((author.into(), message_body(lines.next().unwrap_or(""))))
+}
+
+fn message_body(raw: &str) -> String {
+    let body = raw.trim_end();
+    let body = body
+        .strip_suffix("\n\nNo thread messsages")
+        .unwrap_or(body)
+        .trim_end();
+    let mut lines: Vec<_> = body.lines().collect();
+    if lines.last().is_some_and(|line| {
+        line.strip_prefix("Reactions: ").is_some_and(|reactions| {
+            reactions.split(", ").all(|r| {
+                r.rsplit_once(" (").is_some_and(|(emoji, count)| {
+                    !emoji.is_empty()
+                        && count
+                            .strip_suffix(')')
+                            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                })
+            })
+        })
+    }) {
+        lines.pop();
+    }
+    if lines
+        .last()
+        .is_some_and(|line| line.starts_with("*Sent using* <@") && line.ends_with('>'))
+    {
+        lines.pop();
+    }
+    lines.join("\n").trim_end().to_string()
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn same_user_in_another_workspace_cannot_authorize_writes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = config();
+        for host in ["example.slack.com", "other.slack.com"] {
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            slack.fixture = Some(Arc::new(move |tool, _| match tool {
+                "slack_read_user_profile" => Ok(json!({"result":"User ID: UOWNER\nBot: No"})),
+                "slack_search_public_and_private" => Ok(
+                    json!({"results":format!("### Result 1 of 1\nChannel: proof (ID: C123)\nMessage_ts: 10.000001\nPermalink: [link](https://{host}/archives/C123/p10000001)\nText: identity only"),"pagination_info":"End of results"}),
+                ),
+                _ => panic!("identity verification must never mutate Slack"),
+            }));
+            assert_eq!(
+                slack.verify_owner(&c).await.is_ok(),
+                host == "example.slack.com"
+            );
+        }
+    }
+
+    #[test]
+    fn connector_metadata_is_not_an_owner_instruction() {
+        let raw = "=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: 100.000001\n🔥 investigate\n*Sent using* <@UAPP|Agent>\nReactions: eyes (1), fire (2)\n\nNo thread messsages\n";
+        assert_eq!(
+            thread_source(raw, "100.000001").unwrap().1,
+            "🔥 investigate"
+        );
+        assert_eq!(
+            thread_source(&raw.replace("🔥 investigate", "🔥"), "100.000001")
+                .unwrap()
+                .1,
+            "🔥"
+        );
+        assert_eq!(message_body("Quote:\nNo thread messsages\nReactions: keep this example\nend\n\nNo thread messsages\n"), "Quote:\nNo thread messsages\nReactions: keep this example\nend");
+    }
+
+    #[test]
+    fn permanent_thread_restrictions_are_not_uncertain_transport_outcomes() {
+        for code in [
+            "restricted_action_thread_locked",
+            "restricted_action_read_only_channel",
+            "restricted_action_non_threadable_channel",
+        ] {
+            assert!(destination_unavailable(&format!("Slack API error: {code}")));
+        }
+        assert!(!destination_unavailable("transport response lost"));
+    }
     #[tokio::test]
     async fn reply_source_requires_independent_membership_in_the_claimed_root() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;

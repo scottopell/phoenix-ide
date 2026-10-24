@@ -55,6 +55,9 @@ submission evidence leaves the external outcome uncertain; Phoenix does not
 blindly retry a send. Stderr is not exposed as notification content.
 A correlated `failed` submission with a nonempty sanitized `reason` is a
 terminal failure, retained with its receipt rather than treated as uncertain.
+A command that could not be launched is definitely unsent and remains retryable
+after the executable is repaired. Once a command starts, ambiguous outcomes
+retain the conservative uncertainty rule.
 
 Submit input:
 

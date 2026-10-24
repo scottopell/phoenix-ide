@@ -39,6 +39,13 @@ contract SlackDiscoveryPort {
         -- a lifecycle-owned return attempt with its exact source/destination.
         -- No SlackCall grants task authorization or delivery confirmation.
 
+    @invariant ConnectedIdentity
+        -- Actor and workspace evidence must both describe the same serving
+        -- connection. Operations retain that connection identity; replacement
+        -- before dispatch refuses the call rather than using the new account.
+        -- A workspace-only lookup may consume an owner_identity call but never
+        -- accepts candidates or advances trigger-search positions.
+
     @invariant VerifiedPageBoundary
         -- Evidence binds the exact query and position. Every returned candidate
         -- is either already recorded, positively rejected, or represented by a
@@ -84,14 +91,15 @@ contract NativeReconciliationPort {
         -- A durable intentional reply requests local reconciliation. Coalesced
         -- or lost notifications do not lose the reply: periodic recovery and
         -- retained-state restart inspect the same durable lifecycle state.
-        -- A delivery opportunity cannot start a search or accept a new source.
+        -- A delivery opportunity cannot start a trigger search or accept a new
+        -- source. Identity-only workspace evidence is independent of discovery.
         -- Disabling discovery does not cancel or suppress accepted native work.
 }
 
 enum SearchKind { prefix | reaction }
 enum ServiceKind { discovery | delivery }
 enum ServicePhase { reconciling | searching | finished }
-enum CallPurpose { owner_profile | search_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply }
+enum CallPurpose { owner_identity | search_page | fresh_prefix_page | candidate_read | acknowledgment | thread_reply }
 enum CallState { in_flight | resolved }
 
 entity DiscoveryController {
@@ -205,11 +213,11 @@ rule GrantSlackCall {
     requires: service.in_flight_calls.count = 0
     requires: service.controller.remaining_calls > 0
     requires: not service.controller.backoff_active
-    requires: purpose != owner_profile or (
+    requires: purpose != owner_identity or (
         (service.kind = discovery and service.controller.gateway.enabled)
         or service.controller.has_slack_work
     )
-    requires: purpose = owner_profile or service.owner_verified
+    requires: purpose = owner_identity or service.owner_verified
     requires: purpose != fresh_prefix_page
     requires: purpose not in {search_page, candidate_read} or service.phase = searching
     requires: purpose != search_page or (
@@ -278,6 +286,14 @@ rule RetainProviderBackoff {
     requires: retry_deadline > now
     ensures: call.state = resolved
     ensures: call.service.controller.retry_not_before = retry_deadline
+}
+
+rule ClearExpiredProviderBackoff {
+    when: UnthrottledServiceCompleted(service)
+    requires: service.controller.retry_not_before != null
+    requires: service.controller.retry_not_before <= now
+    requires: service.in_flight_calls.count = 0
+    ensures: service.controller.retry_not_before = null
 }
 
 -- Both query positions survive a partial burst. Completed queries remain

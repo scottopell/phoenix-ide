@@ -15,12 +15,20 @@ fn config() -> Config {
     }
 }
 
+fn workspace_probe(tool: &str, args: &serde_json::Value) -> Option<serde_json::Value> {
+    (tool == "slack_search_public_and_private" && args["filters"] == "after:1970-01-01")
+        .then(|| json!({"results":"### Result 1 of 1\nChannel: proof (ID: CPROOF)\nMessage_ts: 10.000001\nPermalink: [link](https://fixture.slack.com/archives/CPROOF/p10000001)\nText: workspace identity only","pagination_info":"End of results"}))
+}
+
 fn reaction_fixture(
     sources: Vec<phoenix_db::SlackSource>,
     log: Arc<Mutex<Vec<String>>>,
 ) -> Arc<slack::FixtureCall> {
     Arc::new(move |tool, args| {
         log.lock().unwrap().push(tool.to_string());
+        if let Some(proof) = workspace_probe(tool, &args) {
+            return Ok(proof);
+        }
         match tool {
             "slack_read_user_profile" => Ok(json!({"result":"User ID: UOWNER\nBot: No"})),
             "slack_search_public_and_private" => {
@@ -199,8 +207,8 @@ async fn reaction_backlog_measurement() {
                     .count()
             );
             assert_eq!(accepted.len(), 1);
-            assert_eq!(pass, 1);
-            assert_eq!(total, 12);
+            assert_eq!(pass, 2);
+            assert_eq!(total, 16);
             return;
         }
     }
@@ -217,11 +225,12 @@ async fn delivery_wakeups_share_one_budget_and_idle_never_searches() {
     for attempt in 0..20 {
         let mut slack = slack::Slack::with_budget(state.mcp_manager.clone(), &c, used.clone());
         let calls = calls.clone();
-        slack.fixture = Some(Arc::new(move |_, _| {
+        slack.fixture = Some(Arc::new(move |tool, args| {
             calls.fetch_add(1, Ordering::Relaxed);
-            Ok(json!({"result":"User ID: UOWNER\nBot: No"}))
+            Ok(workspace_probe(tool, &args)
+                .unwrap_or_else(|| json!({"result":"User ID: UOWNER\nBot: No"})))
         }));
-        assert_eq!(slack.verify_owner(&c).await.is_ok(), attempt < 16);
+        assert_eq!(slack.verify_owner(&c).await.is_ok(), attempt < 8);
     }
     assert_eq!(calls.load(Ordering::Relaxed), 16);
     assert_eq!(used.load(Ordering::Relaxed), 16);
@@ -258,7 +267,10 @@ async fn pass_metrics_exclude_calls_already_charged_to_the_window() {
     let c = config();
     let budget = Arc::new(std::sync::atomic::AtomicU32::new(6));
     let mut slack = slack::Slack::with_budget(state.mcp_manager.clone(), &c, budget.clone());
-    slack.fixture = Some(Arc::new(|method, _| {
+    slack.fixture = Some(Arc::new(|method, args| {
+        if let Some(proof) = workspace_probe(method, &args) {
+            return Ok(proof);
+        }
         if method.contains("read_user_profile") {
             Ok(json!({"result":"User ID: UOWNER\nBot: No"}))
         } else {
@@ -416,6 +428,39 @@ async fn throttled_scan_keeps_page_and_delivery_cannot_bypass_backoff() {
 // REQ-SG-006/017: throttling during accepted work must remain visible even
 // when the discovery burst cannot start any pages.
 #[tokio::test]
+async fn successful_unthrottled_pass_clears_an_expired_retry_deadline() {
+    let Backlog {
+        state,
+        config: c,
+        fixture,
+        ..
+    } = backlog().await;
+    sqlx::query("UPDATE slack_gateway_accounts SET retry_at_us=?1,status='backing_off'")
+        .bind(chrono::Utc::now().timestamp_micros() - 1)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
+    slack.fixture = Some(fixture);
+    driver::tick(
+        &state,
+        &c,
+        &slack,
+        Pass::Discovery {
+            reactions_first: true,
+        },
+    )
+    .await
+    .unwrap();
+    let retry: Option<i64> = sqlx::query_scalar("SELECT retry_at_us FROM slack_gateway_accounts")
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+    assert!(retry.is_none());
+    assert!(slack.calls.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
 async fn acknowledgment_throttle_is_reported_as_backoff() {
     let Backlog {
         state,
@@ -462,7 +507,7 @@ async fn acknowledgment_throttle_is_reported_as_backoff() {
     assert_eq!(row.get::<String, _>("status"), "backing_off");
     assert!(row.get::<i64, _>("retry_at_us") > chrono::Utc::now().timestamp_micros());
     assert!(row.get::<Option<String>, _>("last_error").is_some());
-    assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(slack.calls.load(Ordering::Relaxed), 3);
     assert_eq!(slack.pages.load(Ordering::Relaxed), 0);
 }
 
@@ -534,6 +579,9 @@ async fn late_prefix_backlog() -> LatePrefixBacklog {
     let prefix_reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let observed = prefix_reads.clone();
     let with_prefix: Arc<slack::FixtureCall> = Arc::new(move |tool, args| {
+        if let Some(proof) = workspace_probe(tool, &args) {
+            return Ok(proof);
+        }
         if tool == "slack_search_public_and_private"
             && !args["filters"].as_str().unwrap().contains("hasmy:")
         {
@@ -591,7 +639,7 @@ async fn completed_prefix_query_refreshes_new_message_without_resetting_catchup(
             .fetch_one(state.db.pool())
             .await
             .unwrap();
-            assert_eq!(cursor, "5");
+            assert_eq!(cursor, "4");
             assert_eq!(slack.calls.load(Ordering::Relaxed), 9);
             println!("FRESH_PREFIX passes=1 calls=9 source_reads=2 saved_reaction_cursor={cursor}");
         }

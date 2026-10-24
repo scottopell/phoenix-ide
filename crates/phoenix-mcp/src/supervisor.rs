@@ -209,6 +209,19 @@ impl SupervisorHandle {
         cancel: CancellationToken,
         expected_schema: Option<Value>,
     ) -> Result<CallOutcome, McpOneShotError> {
+        self.call_bound(config, None, tool, arguments, cancel, expected_schema)
+            .await
+    }
+
+    pub(crate) async fn call_bound(
+        &self,
+        config: McpServerConfig,
+        expected_epoch: Option<u64>,
+        tool: String,
+        arguments: Value,
+        cancel: CancellationToken,
+        expected_schema: Option<Value>,
+    ) -> Result<CallOutcome, McpOneShotError> {
         let (reply, receive) = oneshot::channel();
         let deadline = tokio::time::Instant::now()
             .checked_add(self.snapshot().config.tool_call_timeout())
@@ -220,6 +233,7 @@ impl SupervisorHandle {
         let call_cancel = cancel.child_token();
         let command = Command::Call {
             config,
+            expected_epoch,
             expected_schema,
             tool,
             arguments,
@@ -703,6 +717,7 @@ enum Command {
     },
     Call {
         config: McpServerConfig,
+        expected_epoch: Option<u64>,
         expected_schema: Option<Value>,
         tool: String,
         arguments: Value,
@@ -1052,6 +1067,7 @@ impl Actor {
             }
             Command::Call {
                 config,
+                expected_epoch,
                 expected_schema,
                 tool,
                 arguments,
@@ -1061,6 +1077,12 @@ impl Actor {
                 if self.snapshot.config != config {
                     let _ = reply.send(Err(McpOneShotError::NotDispatched(
                         "MCP tool invocation was superseded by a configuration change".to_owned(),
+                    )));
+                    return;
+                }
+                if expected_epoch.is_some_and(|epoch| epoch != self.epoch) {
+                    let _ = reply.send(Err(McpOneShotError::NotDispatched(
+                        "Verified MCP connection was replaced".into(),
                     )));
                     return;
                 }
@@ -1890,6 +1912,7 @@ mod epoch_tests {
             .mailbox
             .send(Command::Call {
                 config: handle.snapshot().config,
+                expected_epoch: None,
                 expected_schema: Some(original),
                 tool: "report".into(),
                 arguments: serde_json::json!({}),

@@ -9,24 +9,32 @@ one result. Calls count tool dispatches rather than provider-internal HTTP
 requests. MCP recovery does not replay gateway calls; a later retry consumes
 another allowance grant.
 
-| Measurement | One page per query/pass | Bounded bursts and early deduplication |
-| --- | ---: | ---: |
-| Discovery passes to acceptance | 7 | 1 |
-| Total calls | 36 | 12 |
-| Search calls | 8 | 8 |
-| Source/context reads | 14 | 2 |
-| Reaction reads | 7 | 1 |
-| Owner profile reads | 7 | 1 |
+| Measurement | One page per query/pass | Initial burst optimization | Current connection verification |
+| --- | ---: | ---: | ---: |
+| Discovery passes to acceptance | 7 | 1 | 2 |
+| Total calls | 36 | 12 | 16 |
+| Search calls, including identity-only probes | 8 | 8 | 11 |
+| Source/context reads | 14 | 2 | 2 |
+| Reaction reads | 7 | 1 | 1 |
+| Owner profile reads | 7 | 1 | 2 |
 
-Passes run without real interval waits. The removed six scheduled waits imply
-about six minutes for this fixture at a minute cadence; this is not a measured
-live latency speedup. Larger search pages have not been introduced.
+The initial optimization predates independent workspace verification. Current
+active passes use a profile read plus one identity-only permalink lookup on a
+fixed MCP connection. Two such probes and the additional pass's freshness check
+are included above. The four-call work reserve prevents starting the last unseen
+page in the first window; it completes in the second pass. Source-read savings
+remain unchanged. Empty workspace evidence refuses writes rather than guessing.
+
+Passes run without real interval waits. At a minute cadence the current fixture
+removes five scheduled waits; this is not a measured live latency speedup.
+Larger search pages and caching identity across passes have not been introduced.
 
 ## Delivery and idle behavior
 
 Native conversation fixtures exercise intentional reply selection, the durable
-outbox and post-commit wakeup. Two queued replies use five logical calls and no
-searches. Local timings exclude Slack network time. One hundred idle recovery
+outbox and post-commit wakeup. Two queued replies use six logical calls and no
+trigger searches, including the identity-only workspace lookup. Local timings
+exclude Slack network time. One hundred idle recovery
 checks make no MCP calls; production recovery checks occur every two seconds.
 
 A private live timing sample before newest-prefix refresh took 120.255 seconds

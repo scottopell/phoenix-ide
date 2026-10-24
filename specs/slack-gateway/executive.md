@@ -85,6 +85,15 @@ read or write. The eight API-guidance checks follow the shared native question
 service, and Clippy, formatting, Allium and structural/timing checks pass.
 Latest-head hosted CI and automatic review remain gates.
 
+The third public review added fixed-connection actor/workspace verification,
+retryable notifier launch refusal, expired backoff cleanup, connector-metadata
+separation, complete consumed-batch fallback coverage and permanent thread
+restriction handling. All 244 affected MCP/gateway cases pass on the revised
+source, with Clippy, formatting, Allium and structural/timing checks passing.
+The mandatory workspace proof changes the backlog fixture to 16 calls over two
+passes, with two context reads; the earlier 12-call result remains a historical
+measurement before that verification. Latest-head CI and review remain gates.
+
 The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
 passed online-backup and stopped-snapshot rehearsals from the installed complete
 127 ledger to its exact complete 130 registry. Integrity, foreign keys,

@@ -42,12 +42,32 @@ pub(super) enum Submission {
     Failed { receipt: String, reason: String },
 }
 
-pub(super) async fn notify(c: &Config, output: &SlackReturn) -> Result<Submission, String> {
+#[derive(Debug)]
+pub(super) enum NotificationError {
+    NotDispatched(String),
+    Uncertain(String),
+}
+impl NotificationError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotDispatched(s) | Self::Uncertain(s) => s,
+        }
+    }
+}
+impl From<&str> for NotificationError {
+    fn from(message: &str) -> Self {
+        Self::Uncertain(message.into())
+    }
+}
+
+pub(super) async fn notify(
+    c: &Config,
+    output: &SlackReturn,
+) -> Result<Submission, NotificationError> {
     let url = if output.published {
-        let product = output
-            .product_id
-            .as_deref()
-            .ok_or("Published notice has no conversation identity")?;
+        let product = output.product_id.as_deref().ok_or_else(|| {
+            NotificationError::NotDispatched("Published notice has no conversation identity".into())
+        })?;
         format!("{}/c/{product}", c.phoenix_url.trim_end_matches('/'))
     } else {
         format!(
@@ -57,9 +77,11 @@ pub(super) async fn notify(c: &Config, output: &SlackReturn) -> Result<Submissio
         )
     };
     let response = call(
-        c.notification_command
-            .as_deref()
-            .ok_or("Private notification command is not configured")?,
+        c.notification_command.as_deref().ok_or_else(|| {
+            NotificationError::NotDispatched(
+                "Private notification command is not configured".into(),
+            )
+        })?,
         Request {
             version: 1,
             notification_id: &output.return_id,
@@ -71,7 +93,7 @@ pub(super) async fn notify(c: &Config, output: &SlackReturn) -> Result<Submissio
         },
     )
     .await?;
-    submission(response)
+    submission(response).map_err(NotificationError::Uncertain)
 }
 
 fn submission(response: Response) -> Result<Submission, String> {
@@ -103,7 +125,8 @@ pub(super) async fn observe(output: &SlackReturn) -> Result<SlackNotificationObs
             operation: Operation::Inspect { receipt },
         },
     )
-    .await?;
+    .await
+    .map_err(|e| e.message().to_string())?;
     if response.receipt != receipt {
         return Err("Notification evidence does not match the submitted receipt".into());
     }
@@ -117,10 +140,12 @@ pub(super) async fn observe(output: &SlackReturn) -> Result<SlackNotificationObs
     })
 }
 
-async fn call(command: &[String], request: Request<'_>) -> Result<Response, String> {
-    let (program, args) = command
-        .split_first()
-        .ok_or("Missing notification executable")?;
+async fn call(command: &[String], request: Request<'_>) -> Result<Response, NotificationError> {
+    let (program, args) = command.split_first().ok_or_else(|| {
+        NotificationError::NotDispatched("Missing notification executable".into())
+    })?;
+    let payload = serde_json::to_vec(&request)
+        .map_err(|_| NotificationError::NotDispatched("Invalid notification request".into()))?;
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -128,10 +153,11 @@ async fn call(command: &[String], request: Request<'_>) -> Result<Response, Stri
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|_| "Unable to launch notification command")?;
+        .map_err(|_| {
+            NotificationError::NotDispatched("Unable to launch notification command".into())
+        })?;
     let mut stdin = child.stdin.take().ok_or("Missing notification input")?;
     let stdout = child.stdout.take().ok_or("Missing notification output")?;
-    let payload = serde_json::to_vec(&request).map_err(|_| "Invalid notification request")?;
     let result = tokio::time::timeout(std::time::Duration::from_secs(45), async {
         stdin
             .write_all(&payload)
@@ -160,6 +186,7 @@ async fn call(command: &[String], request: Request<'_>) -> Result<Response, Stri
     .await
     .map_err(|_| "Notification command timed out; outcome uncertain")??;
     validate_response(&result, request.notification_id, request.owner)
+        .map_err(NotificationError::Uncertain)
 }
 
 fn validate_response(bytes: &[u8], notification_id: &str, owner: &str) -> Result<Response, String> {
@@ -198,11 +225,13 @@ mod tests {
         assert!(call(&failed, request())
             .await
             .unwrap_err()
+            .message()
             .contains("success"));
         let oversized = command("cat >/dev/null; head -c 65537 /dev/zero".into());
         assert!(call(&oversized, request())
             .await
             .unwrap_err()
+            .message()
             .contains("size limit"));
     }
     #[test]

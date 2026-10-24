@@ -1966,8 +1966,16 @@ enum RefreshServerOutcome {
 // McpClientManager
 // ---------------------------------------------------------------------------
 
+/// Opaque identity of one serving connection; credentials are never exposed.
+#[derive(Clone)]
+pub struct McpConnectionBinding {
+    server_name: String,
+    handle: SupervisorHandle,
+    epoch: u64,
+    config: McpServerConfig,
+}
+
 /// Owns all MCP server connections.
-///
 #[derive(Clone)]
 pub struct McpClientManager {
     servers: Arc<RwLock<ServerMap>>,
@@ -3431,6 +3439,18 @@ impl McpClientManager {
         arguments: Value,
         expected_schema: Value,
     ) -> Result<String, McpOneShotError> {
+        let binding = self.bind_connection(server_name).await?;
+        self.call_tool_once_bound(&binding, tool_name, arguments, expected_schema)
+            .await
+    }
+
+    /// Capture one connection for identity verification and subsequent operations.
+    /// # Errors
+    /// Refuses missing, disabled or unready connections.
+    pub async fn bind_connection(
+        &self,
+        server_name: &str,
+    ) -> Result<McpConnectionBinding, McpOneShotError> {
         if self.disabled_servers.read().await.contains(server_name) {
             return Err(McpOneShotError::NotDispatched(format!(
                 "MCP server '{server_name}' is disabled"
@@ -3447,10 +3467,49 @@ impl McpClientManager {
                     "MCP server '{server_name}' is not connected"
                 ))
             })?;
-        let config = handle.snapshot().config;
+        let snapshot = handle.snapshot();
+        if !matches!(snapshot.state, SupervisorState::Ready(_)) {
+            return Err(McpOneShotError::NotDispatched(
+                "MCP connection is not ready".into(),
+            ));
+        }
+        Ok(McpConnectionBinding {
+            server_name: server_name.into(),
+            handle,
+            epoch: snapshot.epoch,
+            config: snapshot.config,
+        })
+    }
+
+    /// Dispatch once only on the exact connection previously verified by the caller.
+    /// # Errors
+    /// Connection replacement refuses dispatch; a dispatched result may be uncertain.
+    pub async fn call_tool_once_bound(
+        self: &Arc<Self>,
+        binding: &McpConnectionBinding,
+        tool_name: &str,
+        arguments: Value,
+        expected_schema: Value,
+    ) -> Result<String, McpOneShotError> {
+        let server_name = binding.server_name.as_str();
+        if self.disabled_servers.read().await.contains(server_name)
+            || !self
+                .servers
+                .read()
+                .await
+                .get(server_name)
+                .is_some_and(|current| current.same_actor(&binding.handle))
+        {
+            return Err(McpOneShotError::NotDispatched(
+                "Verified MCP connection was removed or disabled".into(),
+            ));
+        }
+        let handle = binding.handle.clone();
+        let config = binding.config.clone();
         let outcome = handle
-            .call_for_config(
+            .call_bound(
                 config.clone(),
+                Some(binding.epoch),
                 tool_name.to_string(),
                 arguments,
                 CancellationToken::new(),
@@ -5901,6 +5960,58 @@ mod tests {
             .await
             .is_err());
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bound_single_attempt_refuses_replaced_connections_before_dispatch() {
+        for replace_actor in [false, true] {
+            let schema = serde_json::json!({"type":"object"});
+            let (first, first_calls, _) = fake_server(vec![]);
+            *first.tools.write().unwrap() = vec![McpToolDef {
+                name: "post".into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            }];
+            let handle = server_handle(first);
+            let manager = Arc::new(McpClientManager::new());
+            manager
+                .servers
+                .write()
+                .await
+                .insert("fake".into(), handle.clone());
+            let binding = manager.bind_connection("fake").await.unwrap();
+            let (replacement, replacement_calls, _) =
+                fake_server(vec![exchange(Ok(serde_json::json!({"content":[]})))]);
+            *replacement.tools.write().unwrap() = vec![McpToolDef {
+                name: "post".into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            }];
+            if replace_actor {
+                manager
+                    .servers
+                    .write()
+                    .await
+                    .insert("fake".into(), server_handle(replacement));
+            } else {
+                let epoch = handle.reconfigure(handle.snapshot().config).await.unwrap();
+                assert!(handle.publish(epoch, replacement).await);
+            }
+            assert!(matches!(
+                manager
+                    .call_tool_once_bound(&binding, "post", serde_json::json!({}), schema.clone())
+                    .await,
+                Err(McpOneShotError::NotDispatched(_))
+            ));
+            assert!(first_calls.lock().unwrap().is_empty());
+            assert!(replacement_calls.lock().unwrap().is_empty());
+            let current = manager.bind_connection("fake").await.unwrap();
+            manager
+                .call_tool_once_bound(&current, "post", serde_json::json!({}), schema)
+                .await
+                .unwrap();
+            assert_eq!(replacement_calls.lock().unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
