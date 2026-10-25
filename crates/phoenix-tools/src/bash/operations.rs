@@ -2655,13 +2655,10 @@ mod tests {
             .await
             .expect("owned native command handle");
         let mut exit_rx = handle.exit_observer();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            exit_rx.wait_for(|exit| exit.is_some()),
-        )
-        .await
-        .expect("native command lifecycle did not settle")
-        .expect("native command lifecycle observer closed");
+        tokio::time::timeout(Duration::from_secs(10), exit_rx.wait_for(Option::is_some))
+            .await
+            .expect("native command lifecycle did not settle")
+            .expect("native command lifecycle observer closed");
         response_json(
             &terminal_or_panic_response(&handle, &ReadArgs::default(), true, false, None).await,
         )
