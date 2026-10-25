@@ -62,7 +62,7 @@ const observed: CapacityDiagnostic = {
   attempt_status: 'observed', attempt: { outcome: 'success', provider: 'OpenAI', duration_ms: 1200, ttft_ms: 0 },
   usage: { input_tokens: 120, output_tokens: 0, cache_read_tokens: 100, cache_write_tokens: null },
   plan: {
-    plan_id: 'fixture-observed', request_id: 'fixture-request', retry_attempt: 0, conversation_id: 'fixture', root_conversation_id: 'fixture',
+    plan_id: 'fixture-observed', request_id: 'fixture-request', retry_attempt: 1, conversation_id: 'fixture', root_conversation_id: 'fixture',
     kind: 'ordinary', model: 'fixture-model', route_class: 'open_ai_responses_direct', connection_id: null,
     context_window_tokens: 1000, output_reservation_tokens: 200, local_prediction_tokens: 150,
     provider_input_tokens: 120, superseded_count: null, counting_method: 'open_ai_complete_input', count_fallback: null,

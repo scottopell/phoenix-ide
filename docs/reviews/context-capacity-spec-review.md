@@ -2,7 +2,22 @@
 
 Reviewed 2026-10-25. Independent reviewer received only the implementation plan, proposed specs and neighboring normative contracts; no runtime code, production logs, or author conversation. This is a specification review, not proof of runtime correctness. No production changes were made.
 
-## Six highest-leverage findings
+## Current disposition
+
+All six design findings were resolved with the user. This document retains the original isolated review below as history; its proposed deferred switching, unresolved sizing/revision gates, and fixed timeout are not current requirements.
+
+| Original finding | Accepted resolution |
+| --- | --- |
+| 1. Model-switch boundary | Preserve the existing whitelist: Idle, Error, or RecoverableContinuationFailure only. Other states reject without queuing. Replan the next request under the selected model. No deferred-switch subsystem. |
+| 2. Successor fit | Normal continuation inherits the selected model/route and full output reservation. Validate complete successor overhead and leave max(8,192, ceil(one quarter of remaining input)) working tokens, plus future compaction feasibility. |
+| 3. Semantic preservation | Protect accepted predecessor input and instruct preservation over selected evidence. Do not promise lossless summarization or preservation of omitted history. No second memory authority. |
+| 4. Impossible frozen retry | Stop unchanged deterministic retries. Preserve originals; allow manual revision, one explicitly requested shortening candidate with human review/acceptance, or an admitted different model with atomic operation-attempt advancement and stale-result fencing. |
+| 5. Counting latency | At most one remote count across a request plan's candidates, with a finite implementation-selected deadline and visible fallback. The numeric timeout is engineering guidance, not a product constant. |
+| 6. Output clamp | Provider translation sends the approved full reservation without silently shrinking it. |
+
+These decisions are normative in the LLM and Bedrock requirements and ADR-146/147. Backend and UI implementation and focused qualification are recorded in task 44018 and feature executives. Full integration, two independent implementation review rounds, PR acceptance, deployment, and production recovery remain separate delivery gates. This earlier specification review counts as neither implementation round.
+
+## Original isolated findings (historical)
 
 ### 1. A request boundary is not necessarily a safe model-switch boundary
 
@@ -38,7 +53,7 @@ Anthropic request translation still described clamping output by remaining conte
 
 Draft repaired: translation consumes the capacity-approved declared reservation. Other bounded utility contracts remain valid. This is cross-spec drift, not a reason to add another budget abstraction.
 
-## Delivery disposition
+## Disposition at the initial review (superseded above)
 
 Plan and spec draft are saved for review. Findings 2 and 4 are implementation blockers; finding 1 requires explicit boundary acceptance scenarios. Findings 3, 5 and 6 have drafting repairs. Do not label this package runtime-ready or deploy recovery from it. No Allium open-question declarations were introduced; unresolved design gates are tracked here and in the task, rather than treated as settled normative behavior.
 
