@@ -1596,7 +1596,9 @@ AND SHALL commit the changed model settings and advanced continuation request ow
 AND SHALL NOT reauthorize an unchanged capacity plan merely because the same model was selected again.
 
 WHEN the user requests AI shortening
-THE SYSTEM SHALL preserve the original handoff and produce at most one candidate per explicit request
+THE SYSTEM SHALL durably preserve the exact nonempty original handoff before capacity planning or generation can fail and produce at most one candidate per explicit request
+AND SHALL reuse an existing transcript or retained-source reference when the original is already durable
+AND SHALL distinguish a retained review input from a generated candidate so retaining an input does not grant generated-context acceptance authority
 AND SHALL instruct the rewriting model to prioritize user intent, corrections, unresolved work, known uncertainty, and evidence references against the displayed size target
 AND SHALL validate the candidate's size and successor working room independently of the model's claims
 AND SHALL require user review and explicit acceptance before replacing the active handoff

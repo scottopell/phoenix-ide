@@ -5966,6 +5966,7 @@ async fn review_continuation_handoff(
             if !candidates.iter().any(|candidate| {
                 &candidate.id == candidate_id
                     && candidate.text == req.handoff
+                    && candidate.origin.is_generated()
                     && candidate.origin.revision().is_current_for(&parent)
             }) {
                 return Err(AppError::BadRequest(
@@ -6309,6 +6310,7 @@ async fn continue_conversation(
                 if !candidates.iter().any(|candidate| {
                     &candidate.id == candidate_id
                         && candidate.text == req.handoff
+                        && candidate.origin.is_generated()
                         && candidate.origin.revision().is_current_for(&parent)
                 }) {
                     return Err(AppError::BadRequest("Accepted candidate must exactly match a retained generated preview. Submit edits as a separate manual handoff.".to_string()));
@@ -21299,6 +21301,53 @@ mod handoff_capacity_api_tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn source_only_review_record_cannot_be_accepted_or_reviewed_as_generated() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("review-input", "review-input", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let current = state.db.get_conversation(&conversation.id).await.unwrap();
+        state
+            .db
+            .save_continuation_handoff_candidate(&crate::db::ContinuationHandoffCandidate {
+                id: "input-only".into(),
+                conversation_id: conversation.id.clone(),
+                origin: crate::db::ContinuationCandidateOrigin::ReviewInput {
+                    revision: crate::db::ContinuationSourceRevision::ExhaustedState {
+                        state_updated_at: current.state_updated_at,
+                    },
+                },
+                source: crate::db::ContinuationCandidateSource::UnattributedInput,
+                text: "exact draft".into(),
+            })
+            .await
+            .unwrap();
+        for action in ["continue", "handoff-review"] {
+            let (status, _) = post(&state, &conversation.id, action, serde_json::json!({"handoff":"exact draft", "message_id":"opening", "shorten":true, "source":{"kind":"candidate", "candidate_id":"input-only"}})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
     }
 
     #[tokio::test]

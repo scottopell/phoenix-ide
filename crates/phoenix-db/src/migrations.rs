@@ -673,10 +673,11 @@ const MIGRATIONS: &[Migration] = &[
             source_message_id TEXT REFERENCES messages(message_id) ON DELETE CASCADE,
             source_candidate_id TEXT REFERENCES continuation_handoff_candidates(id) ON DELETE CASCADE,
             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-            origin TEXT NOT NULL CHECK(origin IN ('oversized_summary', 'ai_shortening')),
+            origin TEXT NOT NULL CHECK(origin IN ('oversized_summary', 'ai_shortening', 'review_input')),
             candidate_text TEXT NOT NULL CHECK(length(trim(candidate_text)) > 0),
             created_at TEXT NOT NULL,
             CHECK(origin != 'oversized_summary' OR operation_id IS NOT NULL),
+            CHECK(origin != 'review_input' OR (source_message_id IS NULL AND source_candidate_id IS NULL)),
             CHECK((operation_id IS NOT NULL AND source_attempt IS NOT NULL AND exhausted_state_updated_at IS NULL)
                 OR (operation_id IS NULL AND source_attempt IS NULL AND exhausted_state_updated_at IS NOT NULL)),
             UNIQUE(conversation_id, ordinal),

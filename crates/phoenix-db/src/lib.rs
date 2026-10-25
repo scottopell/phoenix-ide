@@ -134,6 +134,9 @@ impl ContinuationSourceRevision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContinuationCandidateOrigin {
+    ReviewInput {
+        revision: ContinuationSourceRevision,
+    },
     OversizedSummary {
         operation_id: String,
         attempt: u32,
@@ -148,6 +151,14 @@ impl ContinuationCandidateOrigin {
         match self {
             Self::OversizedSummary { .. } => "oversized_summary",
             Self::AiShortening { .. } => "ai_shortening",
+            Self::ReviewInput { .. } => "review_input",
+        }
+    }
+    #[must_use]
+    pub fn is_generated(&self) -> bool {
+        match self {
+            Self::ReviewInput { .. } => false,
+            Self::OversizedSummary { .. } | Self::AiShortening { .. } => true,
         }
     }
     #[must_use]
@@ -160,7 +171,7 @@ impl ContinuationCandidateOrigin {
                 operation_id: operation_id.clone(),
                 attempt: *attempt,
             },
-            Self::AiShortening { revision } => revision.clone(),
+            Self::AiShortening { revision } | Self::ReviewInput { revision } => revision.clone(),
         }
     }
 }
@@ -170,7 +181,7 @@ impl ContinuationCandidateOrigin {
 pub enum ContinuationCandidateSource {
     UnattributedInput,
     TranscriptMessage { message_id: String },
-    GeneratedCandidate { candidate_id: String },
+    RetainedCandidate { candidate_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10789,7 +10800,7 @@ impl Database {
         Ok(false)
     }
 
-    /// Persist one immutable, reviewable generated candidate.
+    /// Persist one immutable review input or generated candidate.
     ///
     /// # Errors
     /// Returns database errors or a constraint violation for invalid candidate data.
@@ -10803,7 +10814,7 @@ impl Database {
             ContinuationCandidateSource::TranscriptMessage { message_id } => {
                 (Some(message_id.as_str()), None)
             }
-            ContinuationCandidateSource::GeneratedCandidate { candidate_id } => {
+            ContinuationCandidateSource::RetainedCandidate { candidate_id } => {
                 (None, Some(candidate_id.as_str()))
             }
         };
@@ -10886,6 +10897,7 @@ impl Database {
                         }
                     },
                     "ai_shortening" => ContinuationCandidateOrigin::AiShortening { revision },
+                    "review_input" => ContinuationCandidateOrigin::ReviewInput { revision },
                     other => {
                         return Err(DbError::Serialization(format!(
                             "Unknown candidate origin {other}"
@@ -10904,7 +10916,7 @@ impl Database {
                             ContinuationCandidateSource::TranscriptMessage { message_id }
                         }
                         (None, Some(candidate_id)) => {
-                            ContinuationCandidateSource::GeneratedCandidate { candidate_id }
+                            ContinuationCandidateSource::RetainedCandidate { candidate_id }
                         }
                         (None, None) => ContinuationCandidateSource::UnattributedInput,
                         (Some(_), Some(_)) => {
@@ -31879,6 +31891,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuation_recovery_review_input_survives_reload_without_generated_authority() {
+        let (directory, db) = open_file_backed_test_db("review.db").await;
+        let path = directory.path().join("review.db");
+        db.create_conversation("draft-parent", "draft", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let input = ContinuationHandoffCandidate {
+            id: "retained-draft".into(),
+            conversation_id: "draft-parent".into(),
+            origin: ContinuationCandidateOrigin::ReviewInput {
+                revision: ContinuationSourceRevision::Operation {
+                    operation_id: "op".into(),
+                    attempt: 1,
+                },
+            },
+            source: ContinuationCandidateSource::UnattributedInput,
+            text: "  exact draft λ\n".into(),
+        };
+        db.save_continuation_handoff_candidate(&input)
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+        let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+        let records = reopened
+            .continuation_handoff_candidates("draft-parent")
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, input.text);
+        assert!(!records[0].origin.is_generated());
+        assert!(matches!(
+            records[0].origin,
+            ContinuationCandidateOrigin::ReviewInput { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn continuation_recovery_candidates_are_immutable_ordered_children() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation(
@@ -31924,7 +31974,7 @@ mod tests {
                     attempt: 1,
                 },
             },
-            source: ContinuationCandidateSource::GeneratedCandidate {
+            source: ContinuationCandidateSource::RetainedCandidate {
                 candidate_id: original.id.clone(),
             },
             text: "shorter preview".to_string(),
@@ -31961,7 +32011,7 @@ mod tests {
             id: "cross-candidate".to_string(),
             conversation_id: "other-candidate-parent".to_string(),
             origin: original.origin.clone(),
-            source: ContinuationCandidateSource::GeneratedCandidate {
+            source: ContinuationCandidateSource::RetainedCandidate {
                 candidate_id: original.id.clone(),
             },
             text: "must not cross conversations".to_string(),

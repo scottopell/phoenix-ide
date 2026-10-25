@@ -9799,6 +9799,51 @@ where
             }
             _ => unreachable!("review state guarded above"),
         };
+        let retained_source = if shorten && !handoff.trim().is_empty() {
+            let source = if let Some(candidate_id) = source_candidate_id {
+                crate::db::ContinuationCandidateSource::RetainedCandidate { candidate_id }
+            } else {
+                self.storage
+                    .get_messages(&self.context.conversation_id)
+                    .await?
+                    .into_iter()
+                    .rev()
+                    .find_map(|message| match message.content {
+                        crate::db::MessageContent::Continuation(content)
+                            if content.summary == handoff =>
+                        {
+                            Some(crate::db::ContinuationCandidateSource::TranscriptMessage {
+                                message_id: message.message_id,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(crate::db::ContinuationCandidateSource::UnattributedInput)
+            };
+
+            if matches!(
+                source,
+                crate::db::ContinuationCandidateSource::UnattributedInput
+            ) {
+                let id = uuid::Uuid::new_v4().to_string();
+                self.storage
+                    .save_continuation_handoff_candidate(&crate::db::ContinuationHandoffCandidate {
+                        id: id.clone(),
+                        conversation_id: self.context.conversation_id.clone(),
+                        origin: crate::db::ContinuationCandidateOrigin::ReviewInput {
+                            revision: source_revision.clone(),
+                        },
+                        source,
+                        text: handoff.clone(),
+                    })
+                    .await?;
+                crate::db::ContinuationCandidateSource::RetainedCandidate { candidate_id: id }
+            } else {
+                source
+            }
+        } else {
+            crate::db::ContinuationCandidateSource::UnattributedInput
+        };
         let (system, tools) = self.prepare_successor_overhead().await?;
         let client = self
             .llm_client
@@ -9955,28 +10000,6 @@ where
                             .to_string(),
                     };
                 } else {
-                    let source = if let Some(candidate_id) = source_candidate_id {
-                        crate::db::ContinuationCandidateSource::GeneratedCandidate { candidate_id }
-                    } else {
-                        self.storage
-                            .get_messages(&self.context.conversation_id)
-                            .await?
-                            .into_iter()
-                            .rev()
-                            .find_map(|message| match message.content {
-                                crate::db::MessageContent::Continuation(content)
-                                    if content.summary == handoff =>
-                                {
-                                    Some(
-                                        crate::db::ContinuationCandidateSource::TranscriptMessage {
-                                            message_id: message.message_id,
-                                        },
-                                    )
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or(crate::db::ContinuationCandidateSource::UnattributedInput)
-                    };
                     let candidate_id = uuid::Uuid::new_v4().to_string();
                     self.storage
                         .save_continuation_handoff_candidate(
@@ -9986,7 +10009,7 @@ where
                                 origin: crate::db::ContinuationCandidateOrigin::AiShortening {
                                     revision: source_revision,
                                 },
-                                source,
+                                source: retained_source,
                                 text: candidate.clone(),
                             },
                         )
@@ -16023,6 +16046,58 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn handoff_review_preserves_new_manual_draft_before_every_shortening_outcome() {
+        for outcome in ["success", "empty", "error", "oversize"] {
+            let (mut rt, storage, _rx) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            rt.state = ConvState::ContextExhausted {
+                summary: "old boundary".into(),
+            };
+            let draft = if outcome == "oversize" {
+                "  exact draft λ\n".repeat(200_000)
+            } else {
+                "  exact new manual draft λ\n".into()
+            };
+            if outcome == "error" {
+                rt.llm_client
+                    .queue_error(phoenix_llm::LlmError::server_overloaded("test"));
+            } else {
+                rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+                    provider_replay: None,
+                    content: vec![ContentBlock::text(if outcome == "empty" {
+                        ""
+                    } else {
+                        "short"
+                    })],
+                    end_turn: true,
+                    usage: phoenix_llm::Usage::default(),
+                    stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+                });
+            }
+            rt.review_handoff_with_authority(draft.clone(), true, None,
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction).await.unwrap();
+            let records = storage.handoff_candidates.lock().unwrap();
+            assert_eq!(records[0].text, draft, "{outcome}");
+            assert!(matches!(
+                records[0].origin,
+                crate::db::ContinuationCandidateOrigin::ReviewInput { .. }
+            ));
+            assert!(!records[0].origin.is_generated());
+            assert_eq!(records.len(), if outcome == "success" { 2 } else { 1 });
+            if outcome == "success" {
+                assert!(
+                    matches!(&records[1].source, crate::db::ContinuationCandidateSource::RetainedCandidate { candidate_id } if candidate_id == &records[0].id)
+                );
+            }
+            assert!(
+                matches!(&rt.state, ConvState::ContextExhausted { summary } if summary == "old boundary")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn handoff_review_rejects_oversized_source_and_required_overhead_without_provider_call() {
         let (mut rt, _storage, _rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
@@ -16080,7 +16155,7 @@ mod authoritative_user_message_effect_tests {
             matches!(review.shortening, super::super::HandoffShorteningResult::Generated { text, capacity, .. } if text == candidate && !capacity.fits())
         );
         assert_eq!(
-            storage.handoff_candidates.lock().unwrap()[0].text,
+            storage.handoff_candidates.lock().unwrap()[1].text,
             candidate
         );
         assert_eq!(rt.llm_client.recorded_requests().len(), 1);
