@@ -34,15 +34,23 @@ pub(super) struct SuccessorCapacity {
 }
 
 impl SuccessorCapacity {
+    pub(super) fn working_room_tokens(self) -> usize {
+        self.context_window
+            .saturating_sub(self.ordinary_overhead_tokens)
+            .saturating_sub(self.output_tokens)
+            .div_ceil(4)
+            .max(SUCCESSOR_WORKING_ROOM_TOKENS)
+    }
+
     pub(super) fn handoff_budget(self) -> Result<usize, String> {
         let required = self
             .ordinary_overhead_tokens
             .saturating_add(self.output_tokens)
-            .saturating_add(SUCCESSOR_WORKING_ROOM_TOKENS);
+            .saturating_add(self.working_room_tokens());
         if required >= self.context_window {
             return Err(format!(
                 "Required instructions/tools (estimated {} tokens), output reservation ({}), and successor working room ({}) leave no handoff space in the {}-token context. Handoff editing cannot fix required-overhead pressure; select a model with more available input capacity or revise required instructions/tools.",
-                self.ordinary_overhead_tokens, self.output_tokens, SUCCESSOR_WORKING_ROOM_TOKENS, self.context_window,
+                self.ordinary_overhead_tokens, self.output_tokens, self.working_room_tokens(), self.context_window,
             ));
         }
         Ok(self.context_window - required)
@@ -53,7 +61,7 @@ impl SuccessorCapacity {
         if handoff_tokens > target {
             return Err(format!(
                 "Generated handoff is estimated at {handoff_tokens} tokens; target is at most {target} after instructions/tools ({}), output reservation ({}), and {} tokens of successor working room. The original transcript is preserved. Review a shorter handoff or explicitly select a model with more input capacity.",
-                self.ordinary_overhead_tokens, self.output_tokens, SUCCESSOR_WORKING_ROOM_TOKENS,
+                self.ordinary_overhead_tokens, self.output_tokens, self.working_room_tokens(),
             ));
         }
         Ok(())
@@ -90,9 +98,11 @@ mod tests {
             ordinary_overhead_tokens: 20_000,
             output_tokens: 128_000,
         };
-        assert_eq!(successor.handoff_budget().unwrap(), 115_808);
+        assert_eq!(successor.working_room_tokens(), 31_000);
+        assert_eq!(successor.handoff_budget().unwrap(), 93_000);
         assert!(successor.validate(124_000).is_err());
-        assert!(successor.validate(115_808).is_ok());
+        assert!(successor.validate(115_808).is_err());
+        assert!(successor.validate(93_000).is_ok());
         assert!(SuccessorCapacity {
             ordinary_overhead_tokens: usize::MAX,
             ..successor

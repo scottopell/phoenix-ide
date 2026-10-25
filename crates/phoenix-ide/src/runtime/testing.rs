@@ -641,6 +641,7 @@ pub struct InMemoryStorage {
     next_msg_id: Mutex<u64>,
     accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
     fail_continuation_handoff_provenance: Mutex<bool>,
+    continuation_opening_reads: Mutex<HashMap<String, crate::db::ContinuationOpeningRead>>,
     complete_creation_job_results: Mutex<VecDeque<Result<crate::db::CreationCasOutcome, String>>>,
     complete_creation_job_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     complete_creation_job_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -736,6 +737,7 @@ impl InMemoryStorage {
             next_msg_id: Mutex::new(1),
             accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
             fail_continuation_handoff_provenance: Mutex::new(false),
+            continuation_opening_reads: Mutex::new(HashMap::new()),
             complete_creation_job_results: Mutex::new(VecDeque::new()),
             complete_creation_job_started: Mutex::new(None),
             complete_creation_job_release: Mutex::new(None),
@@ -812,6 +814,17 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), message_id.to_string());
+    }
+
+    pub fn set_continuation_opening_read(
+        &self,
+        message_id: &str,
+        opening: crate::db::ContinuationOpeningRead,
+    ) {
+        self.continuation_opening_reads
+            .lock()
+            .unwrap()
+            .insert(message_id.to_string(), opening);
     }
 
     pub fn set_fail_continuation_handoff_provenance(&self, fail: bool) {
@@ -1258,12 +1271,17 @@ impl Default for InMemoryStorage {
 impl MessageStore for InMemoryStorage {
     async fn read_message_continuation_opening(
         &self,
-        _message_id: &str,
+        message_id: &str,
     ) -> Result<Option<crate::db::ContinuationOpeningRead>, String> {
         if *self.fail_continuation_handoff_provenance.lock().unwrap() {
             return Err("injected continuation handoff provenance failure".into());
         }
-        Ok(None)
+        Ok(self
+            .continuation_opening_reads
+            .lock()
+            .unwrap()
+            .get(message_id)
+            .cloned())
     }
 
     async fn has_pending_continuation_opening(&self, _conv_id: &str) -> Result<bool, String> {

@@ -1297,6 +1297,8 @@ Opening read authority SHALL be a typed sum of no opening evidence, an exact pen
 
 Accepted read authority SHALL require the exact completed handoff receipt and its persisted predecessor boundary and successor message. It SHALL retain the actual accepted message identity and durable authority. Generated predecessor context SHALL be represented by the boundary only while its actual persisted content equals the predecessor summary under the handoff content contract; user-authorized instructions and edited openings SHALL remain separate messages. Presentation SHALL be recomputed from persisted content on subsequent reads and content-update observations without changing accepted execution authority or copying summary text into the authority projection. A consistent completed receipt SHALL take precedence over a matching residual intent; conflicting or unreadable persisted evidence SHALL surface a read error rather than absence.
 
+Generated predecessor context SHALL be delivered to the model as readable English with an explicit untrusted provenance boundary. Payload delimiter characters SHALL be escaped losslessly without encoding the whole handoff or obscuring its natural language. The display text SHALL preserve exact Unicode and whitespace. A completed handoff's durable generated-context authority SHALL cause provider projection to derive from that display text, including when an older persisted LLM expansion used an encoded representation; user-authorized openings and ordinary expanded messages SHALL retain their distinct contracts. This projection SHALL NOT rewrite persisted transcripts or promote generated context into user authorization.
+
 ### REQ-BED-030A: ProductConversation Owns Aggregate Identity and Lifecycle
 
 EACH ProductConversation SHALL have a typed durable identity whose domain is independent of every transcript-row identity
@@ -1568,8 +1570,9 @@ WHEN generating an ordinary continuation
 THE SYSTEM SHALL inherit the predecessor's selected model and route
 AND SHALL reserve that model's full declared output allowance
 AND SHALL budget the generated handoff against the successor's complete ordinary request, including instructions and tools
-AND SHALL retain at least 8,192 tokens of successor working room after the encoded handoff, complete ordinary instructions/tools, and full output reservation
-AND SHALL validate the encoded successor projection rather than the unencoded summary text
+AND SHALL reserve successor working room equal to the greater of 8,192 tokens or one quarter of the input space remaining after complete ordinary instructions/tools and full output reservation, rounding upward
+AND SHALL retain that working room after the projected handoff
+AND SHALL validate the complete successor projection rather than the summary text alone
 AND SHALL require room for additional work rather than declare a successor ready merely because its opening request fits.
 
 WHEN protected input prevents the required successor working room

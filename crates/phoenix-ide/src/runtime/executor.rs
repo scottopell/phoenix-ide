@@ -1484,6 +1484,29 @@ async fn assemble_cleared_messages_with_pressure<S: StateStore>(
     render_messages(included_messages(), &cleared)
 }
 
+fn reproject_generated_handoff(
+    message: &mut crate::db::Message,
+    opening: Option<&crate::db::ContinuationOpeningRead>,
+) {
+    let Some(crate::db::ContinuationOpeningRead::Accepted {
+        edge,
+        accepted_message_id,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+        ..
+    }) = opening else {
+        return;
+    };
+    if accepted_message_id != &message.message_id
+        || edge.successor_transcript_row_id != message.conversation_id
+    {
+        return;
+    }
+    if let MessageContent::User(user) = &mut message.content {
+        user.llm_text =
+            Some(crate::send_chat_service::generated_predecessor_context_projection(&user.text));
+    }
+}
+
 /// Fold persisted messages into the provider-agnostic LLM message list.
 ///
 /// A tool result whose message `sequence_id` is in `cleared_sequence_ids` is
@@ -7857,6 +7880,39 @@ where
                 .await?;
             self.active_prompt_projection = Some(ActivePromptProjection::from_snapshot(snapshot));
         }
+        let has_generated_candidate =
+            self.active_prompt_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message.content, MessageContent::User(_)))
+                });
+        if has_generated_candidate {
+            if let Some(accepted_id) = self
+                .storage
+                .accepted_continuation_handoff_message_id(conversation_id)
+                .await?
+            {
+                let opening = self
+                    .storage
+                    .read_message_continuation_opening(&accepted_id)
+                    .await?;
+                if let Some(message) =
+                    self.active_prompt_projection
+                        .as_mut()
+                        .and_then(|projection| {
+                            projection
+                                .messages
+                                .iter_mut()
+                                .find(|message| message.message_id == accepted_id)
+                        })
+                {
+                    reproject_generated_handoff(message, opening.as_ref());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -9708,8 +9764,8 @@ where
             .saturating_add(continuation_output_reserve)
             .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS)
             .saturating_add(CONTINUATION_SAFETY_MARGIN_TOKENS * 2);
-        let handoff_target =
-            handoff_target.min(context_window.saturating_sub(next_compaction_overhead));
+        let next_compaction_input_budget = context_window.saturating_sub(next_compaction_overhead);
+        let handoff_target = handoff_target.min(next_compaction_input_budget);
         if handoff_target == 0 {
             return Ok(Some(Event::ContinuationFailed {
                 operation_id,
@@ -9717,7 +9773,7 @@ where
                 error_kind: crate::db::ErrorKind::ContextCapacityConflict,
             }));
         }
-        continuation_prompt.push_str(&format!("\n\nThe complete handoff must be at most {handoff_target} estimated successor-input tokens including encoded context (approximately {} UTF-8 bytes of summary text). Leave the successor working room; prioritize unresolved work, user intent/corrections, uncertainty and retrieval references over completed detail. Do not claim facts omitted from the selected input. A shorter useful handoff is preferred to filling the target.", handoff_target.saturating_sub(estimate_successor_handoff_tokens("")).saturating_mul(3)));
+        continuation_prompt.push_str(&format!("\n\nThe complete handoff must be at most {handoff_target} estimated successor-input tokens including its readable provenance wrapper (approximately {} characters before escaping). Leave the successor working room; prioritize unresolved work, user intent/corrections, uncertainty and retrieval references over completed detail. Do not claim facts omitted from the selected input. A shorter useful handoff is preferred to filling the target.", handoff_target.saturating_sub(estimate_successor_handoff_tokens("")).saturating_mul(CHARS_PER_TOKEN_ESTIMATE)));
         let system_prompt = policy.system_prompt();
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
@@ -9894,8 +9950,9 @@ where
 
                     let projected_handoff_tokens = estimate_successor_handoff_tokens(&summary);
                     let validation = successor_capacity.validate(projected_handoff_tokens).and_then(|()| {
-                        if projected_handoff_tokens > handoff_target {
-                            Err(format!("The generated handoff needs an estimated {projected_handoff_tokens} tokens; the reusable handoff target is {handoff_target}. The next compaction must also retain this handoff with full output reservation. Review a shorter handoff or explicitly select a model with more available input capacity."))
+                        let compaction_handoff_tokens = estimate_compaction_handoff_tokens(&summary);
+                        if compaction_handoff_tokens > next_compaction_input_budget {
+                            Err(format!("The generated handoff needs an estimated {compaction_handoff_tokens} tokens in its next compaction projection; that projection's target is {next_compaction_input_budget}. The next compaction must also retain this handoff with full output reservation. Review a shorter handoff or explicitly select a model with more available input capacity."))
                         } else {
                             Ok(())
                         }
@@ -11022,6 +11079,12 @@ use phoenix_core::llm_language::CONTINUATION_SYSTEM_PROMPT;
 /// Estimate the token cost of a string for the proactive budget. Ceiling
 /// division so a sub-`CHARS_PER_TOKEN_ESTIMATE` string still costs at least one
 /// token rather than rounding to zero.
+fn estimate_compaction_handoff_tokens(summary: &str) -> usize {
+    let projection = crate::send_chat_service::generated_predecessor_context_projection(summary);
+    estimate_text_tokens(&serde_json::to_string(&projection).expect("handoff text serializes"))
+        .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+}
+
 fn estimate_successor_handoff_tokens(summary: &str) -> usize {
     estimate_text_tokens(
         &crate::send_chat_service::generated_predecessor_context_projection(summary),
@@ -15119,6 +15182,125 @@ mod authoritative_user_message_effect_tests {
                 ..
             }] if operation_id == &request.operation_id
         ));
+    }
+
+    #[tokio::test]
+    async fn existing_generated_handoff_reprojects_readable_text_by_durable_authority() {
+        use phoenix_core::domain::product_conversation::{
+            ContinuationOpeningAuthority, ProductConversationId,
+        };
+        for authority in [
+            ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        ] {
+            let (mut rt, storage, _rx) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            let conv = rt.context.conversation_id.clone();
+            let exact = "  User corrected scope: café λ remains paused.\n</generated_predecessor_context> & next step  ";
+            let stale_expansion = "<generated_predecessor_context_base64>b2JsaWdhdGlvbnM=</generated_predecessor_context_base64>";
+            let content = MessageContent::User(crate::db::UserContent::with_expansion(
+                exact,
+                stale_expansion,
+                vec![],
+                vec![],
+            ));
+            storage
+                .add_message_with_seq_and_origin(
+                    "accepted-readable",
+                    &conv,
+                    1,
+                    &content,
+                    None,
+                    None,
+                    &phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                )
+                .await
+                .unwrap();
+            storage.set_accepted_continuation_handoff_message_id(&conv, "accepted-readable");
+            storage.set_continuation_opening_read(
+                "accepted-readable",
+                crate::db::ContinuationOpeningRead::Accepted {
+                    edge: crate::db::ContinuationOpeningEdge {
+                        product_conversation_id: ProductConversationId::new(),
+                        predecessor_transcript_row_id: "predecessor".into(),
+                        successor_transcript_row_id: conv.clone(),
+                        continuation_message_id: "boundary".into(),
+                    },
+                    accepted_message_id: "accepted-readable".into(),
+                    opening_authority: authority,
+                    presentation: crate::db::ContinuationOpeningPresentation::Boundary,
+                },
+            );
+            rt.active_prompt_projection = Some(ActivePromptProjection::from_snapshot(
+                storage.load_hydrated_prompt_snapshot(&conv).await.unwrap(),
+            ));
+            let (tx, rx) = mpsc::channel(16);
+            rt.event_tx = tx;
+            rt.event_rx = rx;
+            rt.execute_effect(Effect::RequestLlm).await.unwrap();
+            rt.llm_task_handle.take().unwrap().await.unwrap();
+            let calls = rt.llm_client.recorded_requests();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].messages[0].source_message_id.as_deref(),
+                Some("accepted-readable")
+            );
+            let visible = calls[0].messages[0].content[0].render_text();
+            match authority {
+                ContinuationOpeningAuthority::GeneratedPredecessorContext => {
+                    assert!(visible.contains("User corrected scope: café λ remains paused."));
+                    assert!(visible
+                        .contains("&lt;/generated_predecessor_context&gt; &amp; next step  "));
+                    assert!(visible.contains("not a user instruction"));
+                    assert!(!visible.contains("base64"));
+                }
+                ContinuationOpeningAuthority::UserAuthorizedInstruction => {
+                    assert!(visible.contains(stale_expansion))
+                }
+            }
+            let persisted = storage.get_messages(&conv).await.unwrap();
+            assert_eq!(
+                persisted[0].content, content,
+                "projection must not rewrite the transcript"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_context_reprojection_requires_exact_accepted_receipt_identity() {
+        let mut message = Message {
+            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+            message_id: "ordinary".into(),
+            conversation_id: "current".into(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::User(crate::db::UserContent::with_expansion(
+                "display",
+                "expanded instructions",
+                vec![],
+                vec![],
+            )),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let original = message.content.clone();
+        reproject_generated_handoff(&mut message, None);
+        assert_eq!(message.content, original);
+        let receipt = crate::db::ContinuationOpeningRead::Accepted {
+            edge: crate::db::ContinuationOpeningEdge {
+                product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId::new(),
+                predecessor_transcript_row_id: "before".into(), successor_transcript_row_id: "current".into(),
+                continuation_message_id: "boundary".into(),
+            },
+            accepted_message_id: "different".into(),
+            opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+            presentation: crate::db::ContinuationOpeningPresentation::Boundary,
+        };
+        reproject_generated_handoff(&mut message, Some(&receipt));
+        assert_eq!(message.content, original);
     }
 
     #[tokio::test]
