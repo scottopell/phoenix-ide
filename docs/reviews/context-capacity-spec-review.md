@@ -41,3 +41,7 @@ Draft repaired: translation consumes the capacity-approved declared reservation.
 ## Delivery disposition
 
 Plan and spec draft are saved for review. Findings 2 and 4 are implementation blockers; finding 1 requires explicit boundary acceptance scenarios. Findings 3, 5 and 6 have drafting repairs. Do not label this package runtime-ready or deploy recovery from it. No Allium open-question declarations were introduced; unresolved design gates are tracked here and in the task, rather than treated as settled normative behavior.
+
+## Validation
+
+`./dev.py check --lanes spec-shape`, `./dev.py tasks validate`, and `git diff --check` pass. The modified Bedrock Allium file reports zero errors. Anthropic Allium reports two existing parser errors at the unchanged qualified contract references `fulfils llm/ToolHistoryIntegrity` and `demands llm/ProviderRequestProjection`; the base commit contains the identical constructs. No claim is made that the complete Allium corpus passes. Runtime tests were not run because this change is documentation only.

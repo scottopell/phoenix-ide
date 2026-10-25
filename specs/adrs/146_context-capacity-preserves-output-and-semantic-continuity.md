@@ -18,7 +18,7 @@ The declared-output policy in ADR-144 removed effort-dependent output starvation
 
 Choose option 2. Clarify ADR-144's ambiguous context clamp: input reduction precedes dispatch; irreducible conflicts are visible rather than silently shrinking ordinary or handoff output. Keep bounded utility budgets. Common accounting does not require common provider serialization or identical ordinary/summary retention.
 
-Use route-supported counting only when it can change a reduction/refusal decision; bound one attempt to two seconds per frozen candidate, with visible local fallback. The timeout is an engineering default for this proposal rather than a measured provider latency result. No mandatory remote counting, endpoint probes, model downloads, or counting recovery service.
+Use route-supported counting only when it can change a reduction/refusal decision; bound the entire logical planning operation, across clearing and handoff candidates, to one remote counting attempt and two seconds, with visible local fallback. The timeout is an engineering default for this proposal rather than a measured provider latency result. No mandatory remote counting, endpoint probes, model downloads, or counting recovery service.
 
 Preserve one transcript and existing handoff lifecycle. Keep ordinary project guidance stable within a user turn and refreshed at the next turn; live authority remains independent. Prefer worthwhile monotonic clearing and stable provider serialization, accepting necessary rewarm at semantic boundaries. Extend existing content-free metrics and usage views rather than create new analytics or memory infrastructure.
 
