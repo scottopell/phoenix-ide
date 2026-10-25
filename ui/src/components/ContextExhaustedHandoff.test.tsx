@@ -258,7 +258,7 @@ describe('recovery authority and submission ownership', () => {
   });
   it('does not clear the old saved draft after a late submission outlives navigation', async () => {
     let resolve!: (value: 'accepted') => void;
-    const { rerender, props } = renderHandoff({ onContinue: vi.fn(() => new Promise((done) => { resolve = done; })) });
+    const { rerender, props } = renderHandoff({ onContinue: vi.fn(() => new Promise<'accepted'>((done) => { resolve = done; })) });
     fireEvent.click(screen.getByRole('button', { name: 'Edit first' }));
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Original saved edit' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue with edits' }));
