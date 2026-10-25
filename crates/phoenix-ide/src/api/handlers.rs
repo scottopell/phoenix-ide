@@ -17650,8 +17650,14 @@ mod upgrade_model_state_guard_tests {
     }
 
     async fn make_test_state() -> AppState {
+        make_test_state_with_registry(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm,
+        ))))
+        .await
+    }
+
+    async fn make_test_state_with_registry(llm_registry: Arc<ModelRegistry>) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
-        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(StubLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
@@ -17693,6 +17699,175 @@ mod upgrade_model_state_guard_tests {
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
+    }
+
+    #[derive(Debug)]
+    struct CapturingLlm {
+        model: &'static str,
+        requests: Arc<std::sync::Mutex<Vec<(String, u32)>>>,
+    }
+
+    #[async_trait]
+    impl LlmService for CapturingLlm {
+        async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            if request.telemetry.is_some() {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push((self.model.to_owned(), request.max_tokens));
+            }
+            StubLlm.complete(request).await
+        }
+        fn model_id(&self) -> &str {
+            self.model
+        }
+    }
+
+    async fn ordinary_turn(state: &AppState, id: &str, message_id: &str, text: &str) {
+        use tower::ServiceExt as _;
+        let mut events = state.runtime.conversation_broadcaster(id).await.subscribe();
+        let response = create_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/conversations/{id}/chat"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "text":text,"message_id":message_id,"expansion_policy":"literal_text"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut requesting = false;
+            loop {
+                match events.recv().await.unwrap() {
+                    crate::runtime::SseEvent::StateChange {
+                        state:
+                            ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. },
+                        ..
+                    } => requesting = true,
+                    crate::runtime::SseEvent::StateChange {
+                        state: ConvState::Idle,
+                        ..
+                    } if requesting => break,
+                    crate::runtime::SseEvent::ConversationBecameTerminal { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "ordinary request {message_id} did not settle: {:?}",
+            state.db.get_conversation(id).await.unwrap().state
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one real model-switch and pressure lifecycle
+    async fn accepted_model_switch_recreates_ordinary_request_limits_and_preserves_pressure_input()
+    {
+        use sqlx::Row as _;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let models = [
+            ("claude-opus-4-7", 200_000, 16_000),
+            ("claude-sonnet-5", 64_000, 8_000),
+        ];
+        let registry = ModelRegistry::for_test_with_model_limits(
+            models
+                .iter()
+                .map(|&(id, context, output)| {
+                    (
+                        id,
+                        Arc::new(CapturingLlm {
+                            model: id,
+                            requests: requests.clone(),
+                        }) as Arc<dyn LlmService>,
+                        context,
+                        output,
+                    )
+                })
+                .collect(),
+        );
+        let state = make_test_state_with_registry(Arc::new(registry)).await;
+        state.runtime.start_sub_agent_handler().await;
+        state.runtime.start_direct_turn_worker().await.unwrap();
+        let id = "model-switch-dispatch";
+        seed(&state, id).await;
+        for (index, (model, context, output)) in
+            [models[0], models[1], models[0]].into_iter().enumerate()
+        {
+            if index > 0 {
+                upgrade(&state, id, model).await.unwrap();
+            }
+            ordinary_turn(
+                &state,
+                id,
+                &format!("small-{index}"),
+                "Keep the correction and unfinished work.",
+            )
+            .await;
+            let plans = sqlx::query("SELECT model,context_window_tokens,output_reservation_tokens,outcome FROM request_capacity_plans WHERE conversation_id=? AND kind='ordinary' ORDER BY rowid")
+                .bind(id).fetch_all(state.db.pool()).await.unwrap();
+            assert_eq!(plans.len(), index + 1);
+            let plan = &plans[index];
+            assert_eq!(plan.get::<String, _>("model"), model);
+            assert_eq!(
+                plan.get::<i64, _>("context_window_tokens"),
+                i64::try_from(context).unwrap()
+            );
+            assert_eq!(
+                plan.get::<i64, _>("output_reservation_tokens"),
+                i64::from(output)
+            );
+            assert_eq!(plan.get::<String, _>("outcome"), "ready");
+            assert_eq!(requests.lock().unwrap()[index], (model.to_owned(), output));
+        }
+        upgrade(&state, id, models[1].0).await.unwrap();
+        let pressure_input =
+            "preserve this original correction and unresolved obligation ".repeat(4_000);
+        ordinary_turn(&state, id, "downgrade-pressure", &pressure_input).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "ordinary overflow must enter one real summary request"
+        );
+        let plan = sqlx::query("SELECT model,context_window_tokens,output_reservation_tokens,outcome FROM request_capacity_plans WHERE conversation_id=? AND kind='ordinary' ORDER BY rowid DESC LIMIT 1")
+            .bind(id).fetch_one(state.db.pool()).await.unwrap();
+        assert_eq!(plan.get::<String, _>("model"), models[1].0);
+        assert_eq!(plan.get::<i64, _>("context_window_tokens"), 64_000);
+        assert_eq!(plan.get::<i64, _>("output_reservation_tokens"), 8_000);
+        assert_eq!(plan.get::<String, _>("outcome"), "needs_compaction");
+        let summary_plan = sqlx::query("SELECT model,context_window_tokens,output_reservation_tokens,outcome FROM request_capacity_plans WHERE conversation_id=? AND kind='compaction' ORDER BY rowid DESC LIMIT 1")
+            .bind(id).fetch_one(state.db.pool()).await.unwrap();
+        assert_eq!(summary_plan.get::<String, _>("model"), models[1].0);
+        assert_eq!(summary_plan.get::<i64, _>("context_window_tokens"), 64_000);
+        assert_eq!(
+            summary_plan.get::<i64, _>("output_reservation_tokens"),
+            8_000
+        );
+        assert_eq!(summary_plan.get::<String, _>("outcome"), "ready");
+        assert_eq!(requests.lock().unwrap()[3], (models[1].0.to_owned(), 8_000));
+        let messages = state.db.get_messages(id).await.unwrap();
+        assert!(
+            messages.iter().any(|message| matches!(
+                &message.content,
+                crate::db::MessageContent::User(user) if user.text == pressure_input
+            )),
+            "the accepted original input must remain in the transcript"
+        );
+        assert!(matches!(
+            state.db.get_conversation(id).await.unwrap().state,
+            ConvState::ContextExhausted { summary } if summary == "stub"
+        ));
+        state.runtime.begin_process_shutdown();
+        state.runtime.drain_process_shutdown().await;
     }
 
     async fn upgrade(state: &AppState, id: &str, model: &str) -> Result<(), AppError> {

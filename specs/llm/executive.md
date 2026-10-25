@@ -72,10 +72,18 @@ request/state preservation, not model understanding, actual provider cache
 residency, cache hit rate, or cross-route reuse. No paid long-session evaluation
 has been performed.
 
-The model-switch fixtures qualify admission and durable selection only. An
-ordinary large-window to small-window switch followed by the next actual
-capacity plan/request, including a round trip, remains an integration
-qualification gap; separate capacity tests do not establish that combined path.
+The API integration fixture
+`accepted_model_switch_recreates_ordinary_request_limits_and_preserves_pressure_input`
+qualifies accepted model changes followed by actual ordinary dispatch through the
+direct-turn worker: 200,000 context / 16,000 output → 64,000 / 8,000 →
+200,000 / 16,000. Each persisted ordinary capacity plan and captured provider
+request uses the selected model and full output reservation after runtime
+recreation. Additional input pressure after another downgrade produces an
+ordinary `needs_compaction` plan and one real summary request using the smaller
+model and full 8,000-token reservation. Its original user input remains stored;
+the exhausted state contains the mock-generated summary. All seven owning API
+model-guard tests pass. These deterministic fixtures do not establish model
+understanding, cache hits, or full cross-provider interoperability.
 
 Independent specs-only review is recorded in
 `docs/reviews/context-capacity-spec-review.md`; independent implementation review
