@@ -992,6 +992,38 @@ export class ExpansionError extends Error {
  *  Branch-mode conversation on the same branch). `continuation_id` is set
  *  when `error_type === 'continuation_exists'` (REQ-BED-031) so the UI can
  *  route to the continuation without parsing the error message. */
+export type ContinueHandoffSource =
+  | { kind: 'manual' }
+  | { kind: 'summary'; message_id: string }
+  | { kind: 'candidate'; candidate_id: string };
+
+export interface HandoffCapacityReview {
+  counting_method: 'conservative_local_estimate' | 'open_ai_complete_input' | 'anthropic_estimate';
+  context_window_tokens: number;
+  required_overhead_tokens: number;
+  output_reservation_tokens: number;
+  successor_working_room_tokens: number;
+  handoff_tokens: number;
+  provider_input_tokens: number | null;
+  status: { kind: 'ready'; target_tokens: number } | { kind: 'handoff_too_large'; target_tokens: number } | { kind: 'required_overhead' };
+}
+export interface HandoffReviewResponse {
+  source: HandoffCapacityReview;
+  shortening: { kind: 'not_requested' } | { kind: 'failed'; error: string }
+    | { kind: 'generated'; candidate_id: string; text: string; capacity: HandoffCapacityReview };
+}
+type ContinuationSourceRevision = { kind: 'operation'; operation_id: string; attempt: number }
+  | { kind: 'exhausted_state'; state_updated_at: string };
+export interface HandoffCandidate {
+  id: string;
+  conversation_id: string;
+  origin: { kind: 'review_input' | 'ai_shortening'; revision: ContinuationSourceRevision }
+    | { kind: 'oversized_summary'; operation_id: string; attempt: number };
+  source: { kind: 'unattributed_input' } | { kind: 'transcript_message'; message_id: string }
+    | { kind: 'retained_candidate'; candidate_id: string };
+  text: string;
+}
+
 export interface ConflictErrorDetail {
   error: string;
   error_type: string;
@@ -999,6 +1031,7 @@ export interface ConflictErrorDetail {
   dirty_files?: string[];
   can_auto_stash?: boolean;
   continuation_id?: string;
+  capacity?: HandoffCapacityReview;
 }
 
 /** Thrown by API methods that return 409 with a typed conflict payload. */
@@ -2607,22 +2640,27 @@ export const api = {
   },
 
 
-  /** POST /api/conversations/:id/continue — context-exhausted handoff.
-   *
-   *  The endpoint is idempotent: if the parent already has a continuation,
-   *  this returns that existing continuation with `already_existed: true`.
-   *  Callers can therefore dispatch this unconditionally and let the server
-   *  resolve the race (see REQ-BED-030 / task 24696 Phase 2).
-   *
-   *  Error shape:
-   *   - 404 → `Error` (parent id not found)
-   *   - 409 → `ConflictError` (parent not in context-exhausted state;
-   *           `error_type = "parent_not_context_exhausted"`)
-   *   - other non-2xx → generic `Error`
-   */
+  async handoffCandidates(convId: string): Promise<HandoffCandidate[]> {
+    const resp = await fetch(`/api/conversations/${convId}/handoff-candidates`);
+    if (!resp.ok) throw new Error('Failed to load retained handoffs');
+    return resp.json();
+  },
+
+  async reviewHandoff(convId: string, request: { handoff: string; source: ContinueHandoffSource; shorten?: boolean }): Promise<HandoffReviewResponse> {
+    const resp = await fetch(`/api/conversations/${convId}/handoff-review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request),
+    });
+    if (!resp.ok) {
+      const error = await resp.json();
+      if (resp.status === 409) throw new ConflictError(error as ConflictErrorDetail);
+      throw new Error(error.error || 'Failed to review handoff');
+    }
+    return resp.json();
+  },
+
   async continueConversation(
     convId: string,
-    request: { handoff: string; message_id: string; user_agent?: string; retry_failed_automatic?: boolean },
+    request: { handoff: string; source?: ContinueHandoffSource; message_id: string; user_agent?: string; retry_failed_automatic?: boolean },
   ): Promise<{
     conversation_id: string;
     slug?: string;

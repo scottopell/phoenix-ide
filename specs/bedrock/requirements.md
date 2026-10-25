@@ -782,7 +782,7 @@ AND duplicate or stale results SHALL NOT create another summary or overwrite new
 
 WHEN continuation request fails after standard retries
 THE SYSTEM SHALL retain the operation and its retry inputs in a recoverable state
-AND SHALL display the failure and offer an explicit retry action
+AND SHALL display the failure and offer an explicit retry for transient failures or revised-input/model recovery for deterministic capacity conflicts
 
 WHEN the continuation summary is empty or whitespace-only
 THE SYSTEM SHALL treat it as a recoverable generation failure
@@ -821,7 +821,10 @@ THE SYSTEM SHALL invoke the continuation-successor operation shared with the man
 AND SHALL read the predecessor's exact persisted `continuation_summary`, without normalization or regeneration, as the successor's opening handoff
 AND SHALL durably type that opening handoff as generated predecessor context rather than a user-authorized instruction
 AND SHALL project it to the successor's provider as delimited context that cannot itself grant authority, approve work, or issue a new user command
-AND SHALL keep manually accepted unchanged or edited handoffs typed as user-authorized instructions
+AND SHALL preserve generated predecessor context authority when a user explicitly selects the exact persisted summary or a current generated candidate by its typed source identity
+AND SHALL type explicit manual/literal handoffs, including edits, as user-authorized instructions
+AND SHALL determine opening authority from the explicit source kind and durable acceptance evidence, never from action initiation, English text, or text equality
+AND SHALL retain the recorded authority of existing durable opening receipts
 AND SHALL NOT introduce a second successor-creation, handoff-dispatch, or continuation-topology path
 
 WHEN manual continuation, automatic continuation, duplicate delivery, or crash recovery races for the same exhausted predecessor
@@ -848,9 +851,10 @@ AND SHALL offer an explicit safe retry or fallback through the shared manual con
 WHEN the user reviews a context-exhausted conversation with no successor
 THE SYSTEM SHALL preserve the generated continuation summary as an immutable handoff
 AND SHALL offer distinct actions to:
-  - create a successor and submit the generated handoff unchanged as its first manually user-authorized opening message
+  - create a successor and submit the generated handoff unchanged by its persisted summary-message identity as generated predecessor context
   - edit a separate browser-local handoff draft before creating and starting the successor
   - copy the generated handoff without creating a successor
+  - regenerate a real handoff through REQ-BED-020a while no successor is reserved
 AND SHALL NOT present worktree cleanup or abandon controls on the handoff surface
 
 WHEN the user edits a handoff
@@ -1262,9 +1266,10 @@ THE SYSTEM SHALL also preserve its filesystem state:
 WHEN the user manually creates a continuation successor row
 THE SYSTEM SHALL atomically create that successor row, link it through `continued_in_conv_id`,
   persist the exact continuation boundary summary on the predecessor, and accept the user-selected
-  handoff text as the successor row's first user-authorized message
-AND SHALL use a client-generated message identifier for idempotent acceptance of that first user-authorized message
-AND SHALL keep the exact persisted continuation boundary summary distinct from the successor's first user-authorized message
+  handoff text as the successor row's first opening message under its explicit source authority
+AND SHALL preserve generated predecessor context for an exact summary-message or current generated-candidate source, and user-authorized instruction for an explicit manual/literal source
+AND SHALL use a client-generated message identifier for idempotent acceptance of that opening
+AND SHALL keep the exact persisted continuation boundary summary distinct from the successor's opening payload and recorded authority
 
 WHEN admitted automatic work creates a continuation successor row
 THE SYSTEM SHALL use the same atomic successor and `continued_in_conv_id` operation

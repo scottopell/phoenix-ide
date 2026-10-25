@@ -26,6 +26,8 @@ export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation |
     case 'cancelled':
     case 'sub_agent_error':
     case 'context_exhausted':
+    case 'context_capacity_conflict':
+    case 'planned_context_pressure':
     case 'turn_limit_exhausted':
     case 'content_filter':
       return { kind: errorKind, can_auto_retry: false, can_user_resume: false };

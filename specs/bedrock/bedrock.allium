@@ -1990,8 +1990,8 @@ rule IgnoreStaleOrDuplicateContinuationResult {
     ensures: ContinuationResultIgnored(conversation, operation_id)
 }
 
-rule UserStartsContinuationConversation {
-    when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+rule UserStartsManualContinuationConversation {
+    when: UserStartsManualContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
         or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation))
     requires: successor_handoff_fits(conversation, handoff_text)
@@ -2007,6 +2007,20 @@ rule UserStartsContinuationConversation {
         handoff_text,
         first_message_id,
         user_authorized_instruction)
+}
+
+-- REQ-BED-020b/021/030: a human starts the action; the typed source owns authority.
+rule UserAcceptsCurrentGeneratedSummary {
+    when: UserAcceptsGeneratedSummary(conversation, summary_message_id, new_conv, handoff_text, first_message_id)
+    requires: conversation.parent_status = context_exhausted
+    requires: exact_current_summary_source(conversation, summary_message_id, handoff_text)
+    requires: successor_handoff_fits(conversation, handoff_text)
+    requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_conversation.kind = coordinator
+        or conversation.product_lifecycle = open
+    requires: not exists CloseObligation{product_conversation: conversation.product_conversation}
+        where phase != completed
+    ensures: ContinuationSuccessorOperationRuns(conversation, new_conv, handoff_text, first_message_id, generated_predecessor_context)
 }
 
 rule ContinuationSuccessorOperationCommits {
@@ -2074,8 +2088,8 @@ rule ContinuationHandoffBecomesBoundary {
     @guidance
         -- The exact persisted continuation summary becomes the one visible
         -- boundary at the predecessor/successor join. The user-selected handoff
-        -- text is accepted atomically as the successor's first user message via
-        -- the client-generated first_message_id, and the boundary summary is not
+        -- text and explicit source authority are accepted atomically as the
+        -- successor opening via first_message_id, and the boundary summary is not
         -- duplicated as an ordinary transcript message on either side.
 }
 
@@ -2966,10 +2980,15 @@ rule ModeChangeNotification {
 --   shortening_request_fits(conversation: Parent, source: String) -> Boolean
 --       Complete protected rewrite source, instructions and full output reserve
 --       fit the selected model's context without clipping or another rewrite.
+--   exact_current_summary_source(conversation: Parent, message_id: String, text: String) -> Boolean
+--       The explicit summary source identifies the current predecessor's persisted
+--       continuation message and its exact text. Literal equality alone does not
+--       select this source or grant generated-context authority.
 --   candidate_current_for(candidate, conversation: Parent) -> Boolean
 --       Exact retained generated candidate text and owning conversation match;
 --       its operation/attempt or exhausted-state timestamp equals the current
---       source revision. A stale candidate remains history, not an acceptance.
+--       source revision. A source-only review_input is never generated. A stale
+--       candidate remains history, not an acceptance.
 --
 --   ApprovalAdoptionPersistedAtomically(
 --       conversation: Parent
@@ -3138,8 +3157,14 @@ rule ModeChangeNotification {
 --       True exactly when the shared continuation operation durably accepts one
 --       opening payload with one authority kind. Provider projection delimits
 --       generated_predecessor_context so it cannot grant authority, approve work,
---       or issue a new user command; user_authorized_instruction retains manual
---       Continue semantics.
+--       or issue a new user command. Generated context is readable English with
+--       losslessly escaped delimiters, preserving exact display Unicode/whitespace.
+--       Durable generated-context receipts govern live projection even when old
+--       persisted expansions encode the text; transcripts are not rewritten and a
+--       cache miss is accepted. Explicit manual/literal sources retain
+--       user_authorized_instruction, even when their bytes equal generated text.
+--       Existing completed receipts retain their recorded authority; neither
+--       English wording nor human initiation can reclassify them.
 --
 --   SuccessorOpeningAcceptedExactlyOnce(
 --       successor: Parent,
@@ -3652,7 +3677,10 @@ surface UserConversation {
             when conversation.core_status = idle
                 or (conversation.core_status = recoverable_continuation_failure and not continuation_capacity_conflict(conversation))
                 or (conversation.parent_status = context_exhausted and conversation.continued_in_conv_id = absent)
-        UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+        UserAcceptsGeneratedSummary(conversation, summary_message_id, new_conv, handoff_text, first_message_id)
+            when conversation.parent_status = context_exhausted
+                and conversation.continued_in_conv_id = absent
+        UserStartsManualContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
             when (conversation.parent_status = context_exhausted
                 or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation)))
                  and conversation.continued_in_conv_id = absent

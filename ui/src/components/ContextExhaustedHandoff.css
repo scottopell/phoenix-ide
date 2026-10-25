@@ -244,3 +244,24 @@
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+.handoff-capacity dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 16px;
+}
+
+.handoff-capacity dd {
+  margin: 0;
+  text-align: right;
+}
+
+.handoff-candidate-preview {
+  border-top: 1px solid var(--border-color);
+  margin-top: 16px;
+  padding-top: 12px;
+}
+
+.context-exhausted-handoff select {
+  max-width: 100%;
+}

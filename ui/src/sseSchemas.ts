@@ -322,6 +322,8 @@ const ERROR_KIND_OPTIONS = [
   'cancelled',
   'sub_agent_error',
   'context_exhausted',
+  'context_capacity_conflict',
+  'planned_context_pressure',
   'output_tokens_exhausted',
   'turn_limit_exhausted',
   'content_filter',
