@@ -49,3 +49,7 @@ Plan and spec draft are saved for review. Findings 2 and 4 are implementation bl
 ## User resolution: findings 2 and 4 recovery direction
 
 2026-10-25 voice review approved same-model ordinary continuation and full output reservation, with successor working room beyond bare fit. Exceptional capacity conflict offers original-preserving manual editing, one user-requested AI shortening candidate reviewed before replacement, or explicit model change. No automatic rewrite loop; candidate and rewrite request must fit; no silent source clipping. REQ-BED-020b records this decision. The exact working-room target and revision/generation-fencing transitions remain implementation specification gates; 40% is not a normative threshold.
+
+## Model-switch finding correction after implementation verification
+
+User challenged the mid-tool scenario. Read-only verification of the deployed baseline found `ConvState::allows_model_change` admits only Idle, Error and RecoverableContinuationFailure, and the API checks effective state. REQ-CONV-010h already prohibits queuing locked configuration changes; REQ-LLM-004c did not enumerate the states. The draft's next-request wording created the ambiguity. Added the exact admission whitelist to REQ-LLM-004c and cross-referenced it from 004l. No deferred-switch feature is required or authorized. Original finding 1 is a spec omission/draft regression, not an established runtime defect.

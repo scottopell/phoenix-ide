@@ -170,6 +170,11 @@ THE SYSTEM SHALL preserve the explicit override exactly
 
 ### REQ-LLM-004c: Atomic Model Switch and Override Reset
 
+WHEN a user requests a conversation model change
+THE SYSTEM SHALL admit it only from Idle, Error, or RecoverableContinuationFailure
+AND SHALL evaluate admission against the authoritative effective conversation state
+AND SHALL reject the change in every other state without modifying configuration or queuing a deferred switch.
+
 WHEN the selected model changes for a conversation
 THE SYSTEM SHALL apply the new selected model and any simultaneous explicit reasoning-effort reset or replacement as one atomic state transition
 AND SHALL NOT permit an intermediate persisted state where the old override is paired with the new model unintentionally
@@ -801,7 +806,8 @@ AND SHALL NOT require remote counting for requests local planning accepts, autom
 ### REQ-LLM-004l: Model and Route Changes Preserve Work
 
 WHEN a selected model or route changes
-THE SYSTEM SHALL apply that selection at the next provider request boundary that satisfies existing exchange-settlement and authoritative-abandonment contracts, without changing an in-flight request
+THE SYSTEM SHALL admit the change only under REQ-LLM-004c and apply the accepted selection to subsequent requests
+AND SHALL NOT change an in-flight request or introduce a queued model-switch lifecycle
 AND SHALL replan against the new effective limits and output maximum
 AND SHALL preserve portable public history, tool-call/result pairing, user corrections, and unresolved work
 AND SHALL retain provider-private replay and transport continuation state only when the destination route's existing compatibility contract permits it
