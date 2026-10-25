@@ -89,6 +89,8 @@ pub enum LlmOutcome {
     /// Provider rejected the assembled prompt. This does not retry the same
     /// request automatically, but persists a user-resumable conversation error.
     PromptRejected { message: String },
+    /// The admitted owner-control epoch was revoked during this provider request.
+    GoalControlRevoked,
     /// The model stopped at the request's output-token budget (Chat
     /// `finish_reason=length`, Responses `incomplete/max_output_tokens`,
     /// Anthropic `stop_reason=max_tokens`). Not auto-retried — an unchanged
@@ -125,6 +127,7 @@ pub enum ToolExecOutcome {
 pub enum AbortReason {
     /// User explicitly cancelled
     CancellationRequested,
+    GoalControlRevoked,
 }
 
 // ============================================================================

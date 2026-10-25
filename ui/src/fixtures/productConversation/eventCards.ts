@@ -10,7 +10,7 @@ const completed = {
   status: 'available', event_id: 'fixture-event-completed', product_conversation_id: 'source-member',
   display_name: compactEventTitle, source_transcript_id: 'source-member',
   source_occurrence_kind: 'turn', source_occurrence_id: 'fixture-turn-completed', source_generation: 7,
-  occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
+  occurred_at_us: 1791800000123456, provenance: 'subscription', goal_capture: { kind: 'not_captured_disabled' }, outcome: { kind: 'turn_finished' },
 } satisfies EventPresentation;
 
 function eventMessage(id: string, sequence: number, presentation: EventPresentation, text: string) {

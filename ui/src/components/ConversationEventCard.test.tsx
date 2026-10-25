@@ -1,6 +1,7 @@
+import type { WatchGoalCapture } from '../generated/WatchGoalCapture';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import * as v from 'valibot';
 import type { EventPresentation } from '../generated/EventPresentation';
@@ -15,7 +16,7 @@ vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValu
 const available = {
   status: 'available', event_id: 'event-exact', product_conversation_id: 'product-1', display_name: 'Fix routing',
   source_transcript_id: 'transcript-exact', source_occurrence_kind: 'turn', source_occurrence_id: 'occurrence-exact',
-  source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', outcome: { kind: 'turn_finished' },
+  source_generation: 7, occurred_at_us: 1791800000123456, provenance: 'subscription', goal_capture: { kind: 'not_captured_disabled' }, outcome: { kind: 'turn_finished' },
 } satisfies EventPresentation;
 const original = '[original provider text]\nTask complete is not inferred.';
 function Location() {
@@ -71,12 +72,12 @@ describe('compact conversation events', () => {
     expect(container.querySelector('details')).toHaveAttribute('open');
     expect(container.querySelector('.conversation-event-reason')).toHaveTextContent('Exact failure: keep /path?x=1');
   });
-  it('copies exact provenance and unchanged original text', () => {
+  it('copies exact provenance and unchanged original text', async () => {
     const { container } = mount();
     container.querySelector('details')!.open = true;
-    fireEvent.click(screen.getByRole('button', { name: 'Copy event provenance' }));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Copy event provenance' })); });
     expect(copyToClipboard).toHaveBeenCalledWith(eventCardFragments(available, available.event_id).provenance);
-    fireEvent.click(screen.getByRole('button', { name: 'Copy original event text' }));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Copy original event text' })); });
     expect(copyToClipboard).toHaveBeenCalledWith(original);
     expect(container.querySelector('[data-fragment-id="message-text"]')!.textContent).toBe(original);
   });
@@ -133,5 +134,110 @@ describe('typed event wire retention', () => {
     }
     expect(v.safeParse(EventPresentationSchema, { ...available, source_generation: '7' }).success).toBe(false);
     expect(v.safeParse(EventPresentationSchema, { status: 'available', payload: available }).success).toBe(false);
+  });
+});
+
+const federatedFact = {
+  status: 'federated_fact', event_id: 'federation:peer:fact:event',
+  instance_id: '11111111-1111-4111-8111-111111111111', product_conversation_id: 'product-1',
+  source_transcript_id: 'transcript-exact', outcome: 'completed', occurred_at_us: available.occurred_at_us,
+  navigation: { status: 'available', stable_url: 'https://peer.example/c/product-1', source_url: 'https://peer.example/c/transcript-exact?source_transcript=transcript-exact' },
+} satisfies EventPresentation;
+const federatedGap = {
+  status: 'federated_gap', event_id: 'federation:peer:gap:0:8', instance_id: federatedFact.instance_id,
+  product_conversation_id: 'product-1', current_transcript_id: 'successor', requested_after: 0, resume_after: 8,
+  current: { kind: 'nonterminal' }, navigation: { status: 'unavailable', reason: 'missing_connection' },
+} satisfies EventPresentation;
+
+describe('instance-qualified subscription events', () => {
+  it('uses destination HTTPS for colliding local IDs, preserving exact historical navigation', () => {
+    const { container } = mount(federatedFact);
+    container.querySelector('details')!.open = true;
+    expect(screen.getByRole('link', { name: 'Remote conversation · 11111111' })).toHaveAttribute('href', federatedFact.navigation.stable_url);
+    expect(screen.getByRole('link', { name: 'Exact destination transcript' })).toHaveAttribute('href', federatedFact.navigation.source_url);
+    expect(container.querySelector('a[href="/c/product-1"]')).toBeNull();
+    expect(screen.getByText('Turn finished')).toBeVisible();
+    expect(container.querySelector('details')!.textContent).toContain('task completion is not inferred');
+    expect(eventCardFragments(federatedFact, '').provenance).toContain(federatedFact.instance_id);
+  });
+  it('shows an explicit gap and current nonterminal state without inventing a completion or local link', () => {
+    const { container } = mount(federatedGap, 'event-provenance');
+    expect(screen.getByText('Retention gap')).toBeVisible();
+    expect(screen.getByText('Intermediate facts unavailable. Current state: Nonterminal.')).toBeVisible();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(container.querySelector('time')).toBeNull();
+    expect(screen.getByText('Remote navigation unavailable: missing connection')).toBeVisible();
+  });
+  it('distinguishes a gap terminal snapshot from an intermediate terminal fact', () => {
+    const terminalGap = { ...federatedGap, current: { kind: 'terminal', outcome: 'failed' } } as const;
+    expect(v.parse(EventPresentationSchema, terminalGap)).toEqual(terminalGap);
+    expect(eventCardFragments(terminalGap, '').reason).toContain('Current state: Failed');
+    expect(eventCardFragments(terminalGap, '').outcome).toBe('Retention gap');
+  });
+  it.each([federatedFact, federatedGap])('retains typed federated wire data at the 400/401 boundary', presentation => {
+    for (const sequence_id of [400, 401]) {
+      const parsed = v.parse(SseMessageDataSchema, { sequence_id, opening: null, message: { ...message(presentation), sequence_id } });
+      expect(parsed.message.event_presentation).toEqual(presentation);
+    }
+  });
+  it.each(['/c/product-1', 'javascript:alert(1)', 'http://peer.example/c/x', 'https://secret@peer.example/c/x'])('rejects unsafe destination navigation %s', stable_url => {
+    expect(v.safeParse(EventPresentationSchema, { ...federatedFact, navigation: { ...federatedFact.navigation, stable_url } }).success).toBe(false);
+  });
+  it('rejects non-advancing gaps, fabricated task outcomes, and missing navigation states', () => {
+    expect(v.safeParse(EventPresentationSchema, { ...federatedGap, requested_after: 8 }).success).toBe(false);
+    expect(v.safeParse(EventPresentationSchema, { ...federatedGap, current: { kind: 'terminal', outcome: 'done' } }).success).toBe(false);
+    expect(v.safeParse(EventPresentationSchema, { ...federatedFact, navigation: undefined }).success).toBe(false);
+  });
+  it('retains an explicit redacted state for a federated event instead of exposing source IDs', () => {
+    mount({ status: 'unavailable', event_id: federatedFact.event_id, reason: 'redacted' });
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.queryByText('Remote conversation · 11111111')).not.toBeInTheDocument();
+  });
+});
+
+const savedGoal = {
+  kind: 'captured_saved_goal', owner_id: 'product-1', goal_id: 'immutable-goal', objective: '  exact objective  ',
+  owner_version: 4, state: { kind: 'blocked', reason: '  exact blocked reason  ' }, usage: 'unavailable_not_captured',
+} satisfies WatchGoalCapture;
+
+describe('saved local goal event facts', () => {
+  it('keeps execution completion independent of a saved blocked goal and exposes exact searchable evidence', () => {
+    const event = { ...available, goal_capture: savedGoal } satisfies EventPresentation;
+    const { container } = mount(event, 'event-provenance');
+    expect(screen.getByText('Turn finished')).toBeVisible();
+    const provenance = container.querySelector('[data-fragment-id="event-provenance"]')!;
+    expect(provenance.textContent).toContain('Objective:   exact objective  ');
+    expect(provenance.textContent).toContain('Goal reason:   exact blocked reason  ');
+    expect(provenance.textContent).toContain('Goal state: blocked');
+    expect(provenance.textContent).toContain('Goal usage: unavailable (not captured)');
+    expect(provenance.textContent).not.toContain('budget consumed');
+    expect(buildConversationSearchProjection([{ kind: 'user', key: 'msg', message: message(event) }], 'exact blocked reason').matches).toHaveLength(1);
+  });
+  it.each([
+    { kind: 'legacy_not_captured' }, { kind: 'not_captured_disabled' },
+    { kind: 'captured_no_goal', owner_id: 'product-1', owner_version: 0, usage: 'unavailable_not_captured' },
+    savedGoal,
+  ] satisfies WatchGoalCapture[])('retains distinct saved case $kind through the typed message boundary', (goal_capture) => {
+    const event = { ...available, goal_capture };
+    const payload = { sequence_id: 400, opening: null, message: message(event) };
+    expect(v.parse(SseMessageDataSchema, payload).message.event_presentation).toEqual(event);
+    const text = eventCardFragments(event, available.event_id).provenance;
+    if (goal_capture.kind === 'not_captured_disabled') {
+      expect(text).toContain('capture disabled at event time');
+      expect(text).not.toContain('no recorded goal');
+    }
+  });
+  it('labels only the explicit standalone occurrence Goal changed, with no execution implication', () => {
+    mount({ ...available, goal_capture: savedGoal, source_occurrence_kind: 'goal_change', source_occurrence_id: 'product-1', source_generation: 4, outcome: { kind: 'goal_changed' } });
+    expect(screen.getByText('Goal changed')).toBeVisible();
+    expect(screen.queryByText('Turn finished')).not.toBeInTheDocument();
+  });
+  it('rejects unsafe or incomplete captured facts rather than fabricating an absence', () => {
+    for (const goal_capture of [
+      { ...savedGoal, owner_version: Number.MAX_SAFE_INTEGER + 1 },
+      { ...savedGoal, owner_version: 0 }, { ...savedGoal, owner_id: 'foreign-owner' }, { ...savedGoal, state: { kind: 'complete' } },
+      { ...savedGoal, state: { kind: 'blocked', reason: '' } },
+      { ...savedGoal, usage: 0 }, { kind: 'not_captured_disabled', objective: 'fabricated' },
+    ]) expect(v.safeParse(EventPresentationSchema, { ...available, goal_capture }).success).toBe(false);
   });
 });

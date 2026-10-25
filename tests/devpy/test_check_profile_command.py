@@ -266,7 +266,8 @@ class CheckProfileCommandTests(unittest.TestCase):
     def test_codegen_profile_shaping_preserves_filters_scope_and_threads(self):
         spec = importlib.util.spec_from_file_location("devpy_profile_under_test", ROOT / "dev.py")
         dev = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(dev)
+        with mock.patch.dict(sys.modules, {spec.name: dev}):
+            spec.loader.exec_module(dev)
         profile_args = ["--config-file", "profile.toml", "--profile", "phoenix-cpu"]
         for nextest in (True, False):
             with self.subTest(nextest=nextest):

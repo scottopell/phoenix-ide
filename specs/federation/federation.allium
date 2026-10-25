@@ -1,0 +1,243 @@
+-- allium: 3
+-- Directional enrollment lifecycle (REQ-FED-003/004).
+-- Transport encoding and endpoint-owned mutation lifecycles are not defined here.
+
+-- Governing owner authentication: ../auth/requirements.md REQ-AUTH-009.
+external entity OwnerAction {
+    authenticated: Boolean
+}
+
+-- Governing transport verification: requirements.md REQ-FED-002/003.
+external entity DestinationObservation {
+    authenticated_https: Boolean
+    instance_id: String
+}
+
+external entity PeerRequest {
+    enrollment: Enrollment
+    credential_verified: Boolean
+    authenticated: Boolean
+    caller_id: String?
+}
+
+
+entity Enrollment {
+    receiver_id: String
+    caller_id: String
+    credential_verifier: String
+    state: active | revoked
+}
+
+entity ConnectionImport {
+    local_instance_id: String
+    bundle_caller_id: String
+    destination_id: String
+    state: pending | enabled | rejected
+}
+
+
+-- REQ-FED-011: same scope survives transcript continuation; no ordinary
+-- retirement transition exists for this Coordinator-owned scope.
+entity CoordinatorExecution {
+    instance_id: String
+    work_scope_id: String
+    working_directory: String
+    current_transcript_id: String
+}
+
+rule CoordinatorContinues {
+    when: CoordinatorTranscriptContinued(execution, successor_id)
+    ensures: execution.current_transcript_id = successor_id
+    @guidance
+        -- Preserve scope identity, instance owner, directory, and files.
+        -- Normal process shutdown is not durable scope retirement.
+}
+
+rule AuthenticatePeer {
+    when: PeerCredentialVerified(request)
+    requires: request.credential_verified = true
+    requires: request.enrollment.state = active
+    ensures: request.authenticated = true
+    ensures: request.caller_id = request.enrollment.caller_id
+}
+
+rule RejectInvalidPeerCredential {
+    when: PeerCredentialVerified(request)
+    requires: request.credential_verified = false
+    ensures: request.authenticated = false
+    ensures: request.caller_id = absent
+}
+
+rule RejectRevokedPeer {
+    when: PeerCredentialVerified(request)
+    requires: request.enrollment.state = revoked
+    ensures: request.authenticated = false
+    ensures: request.caller_id = absent
+}
+
+rule IssueEnrollment {
+    when: OwnerIssuesEnrollment(owner, receiver_id, caller_id, verifier)
+    requires: owner.authenticated = true
+    requires: receiver_id != caller_id
+    ensures: Enrollment.created(
+        receiver_id: receiver_id,
+        caller_id: caller_id,
+        credential_verifier: verifier,
+        state: active
+    )
+    @guidance
+        -- Generate and show the transfer token only at the owner secret-transfer
+        -- surface. Persist its verifier, not a recoverable receiver-side token.
+        -- Issuance does not create a reciprocal enrollment.
+}
+
+rule EnableVerifiedImport {
+    when: DestinationVerified(import, observation)
+    requires: import.state = pending
+    requires: import.local_instance_id = import.bundle_caller_id
+    requires: observation.authenticated_https = true
+    requires: observation.instance_id = import.destination_id
+    ensures: import.state = enabled
+}
+
+rule RejectWrongCaller {
+    when: BundleImported(import)
+    requires: import.state = pending
+    requires: import.local_instance_id != import.bundle_caller_id
+    ensures: import.state = rejected
+}
+
+rule RejectWrongDestination {
+    when: DestinationVerified(import, observation)
+    requires: import.state = pending
+    requires: observation.authenticated_https = true
+    requires: observation.instance_id != import.destination_id
+    ensures: import.state = rejected
+}
+
+rule RevokeEnrollment {
+    when: OwnerRevokesEnrollment(owner, enrollment)
+    requires: owner.authenticated = true
+    requires: enrollment.state = active
+    ensures: enrollment.state = revoked
+    @guidance
+        -- Subsequent requests fail authentication. Already accepted actions
+        -- retain their endpoint-owned lifecycle; revocation is not rollback.
+}
+
+invariant EnabledConnectionMatchesCaller {
+    for c in ConnectionImport where c.state = enabled:
+        c.local_instance_id = c.bundle_caller_id
+}
+
+------------------------------------------------------------
+-- Bounded remote terminal-fact subscriptions
+------------------------------------------------------------
+
+entity FederatedSubscription {
+    subscription_id: String
+    enrollment: Enrollment
+    destination_instance: String
+    stable_conversation: String
+    last_admitted_event_id: String?
+    state: active | unsubscribed | revoked | source_closed
+}
+
+entity FederatedTerminalFact {
+    event_id: String
+    subscription: FederatedSubscription
+    outcome: terminal_completed | terminal_failed | terminal_cancelled
+    destination_committed: Boolean
+    admitted: Boolean
+}
+
+-- Helpers (pure predicates and observations used below)
+-- authenticated_destination(fact: FederatedTerminalFact) -> Boolean
+-- cursor_is_next(subscription: FederatedSubscription, event_id: String) -> Boolean
+-- explicit_gap_reported(subscription: FederatedSubscription) -> Boolean
+-- current_state_reported(stable_conversation: String) -> Boolean
+-- authenticated_subscription_caller(subscription: FederatedSubscription) -> Boolean
+-- owner_authenticated() -> Boolean
+-- open_ordinary_conversation(stable_conversation: String) -> Boolean
+-- unadmitted_facts_suppressed(subscription: FederatedSubscription) -> Boolean
+-- admitted_facts_retained(subscription: FederatedSubscription) -> Boolean
+-- subscription_tombstone_required(subscription: FederatedSubscription) -> Boolean
+
+rule AdmitFederatedTerminalFact {
+    when: TerminalFactReceived(subscription, fact)
+    requires: subscription.state = active
+    requires: subscription.enrollment.state = active
+    requires: fact.subscription = subscription
+    requires: fact.destination_committed
+    requires: authenticated_destination(fact)
+    requires: not fact.admitted
+    requires: cursor_is_next(subscription, fact.event_id)
+
+    ensures: fact.admitted = true
+    ensures: subscription.last_admitted_event_id = fact.event_id
+}
+
+rule RejectDuplicateFederatedTerminalFact {
+    when: TerminalFactReceived(subscription, fact)
+    requires: fact.admitted
+
+    ensures: subscription.last_admitted_event_id = subscription.last_admitted_event_id
+}
+
+rule RevokeFederatedSubscriptions {
+    when: subscription: FederatedSubscription.enrollment.state transitions_to revoked
+    requires: subscription.state = active
+
+    ensures: subscription.state = revoked
+}
+
+rule UnsubscribeFederatedSubscription {
+    when: FederatedUnsubscribeRequested(subscription)
+    requires: subscription.state = active
+    requires: authenticated_subscription_caller(subscription) or owner_authenticated()
+
+    ensures: subscription.state = unsubscribed
+}
+
+rule CloseFederatedSubscriptionWithSource {
+    when: SourceConversationClosed(subscription)
+    requires: subscription.state = active
+
+    ensures: subscription.state = source_closed
+    ensures: unadmitted_facts_suppressed(subscription)
+    ensures: admitted_facts_retained(subscription)
+}
+
+rule HardDeleteClosedFederatedSubscriptionSource {
+    when: SourceConversationHardDeleted(subscription)
+    requires: subscription.state = source_closed
+
+    ensures: admitted_facts_retained(subscription)
+    ensures: not subscription_tombstone_required(subscription)
+}
+
+rule ReconcileExpiredFederatedCursor {
+    when: SubscriptionCursorOutsideRetention(subscription)
+    requires: subscription.state = active
+    requires: subscription.enrollment.state = active
+
+    ensures: explicit_gap_reported(subscription)
+    ensures: current_state_reported(subscription.stable_conversation)
+}
+
+invariant ActiveFederatedSubscriptionsTargetOpenOrdinaryConversations {
+    for subscription in FederatedSubscriptions:
+        subscription.state = active implies
+            open_ordinary_conversation(subscription.stable_conversation)
+}
+
+invariant FederatedSubscriptionFactsAreTerminalOnly {
+    for fact in FederatedTerminalFacts:
+        fact.outcome in { terminal_completed, terminal_failed, terminal_cancelled }
+}
+
+invariant InactiveFederatedSubscriptionsAdmitNoFutureFacts {
+    for subscription in FederatedSubscriptions:
+        subscription.state != active implies
+            no_future_fact_admitted(subscription)
+}

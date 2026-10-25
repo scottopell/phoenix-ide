@@ -3,6 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { startTransition, StrictMode, Suspense, useEffect, useLayoutEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
+import { goalApi } from '../goalApi';
+import type { StateBarConversationExtension } from '../components/StateBar';
 import { ViewJourneyLifecycle, defaultViewIdentity } from '../hooks/conversationViewLifecycle';
 import { ViewJourneyReporter } from '../hooks/conversationViewTelemetry';
 import { ConversationRouteRedirect } from '../App';
@@ -160,12 +162,23 @@ vi.mock('../components/ConversationNavStack', async () => {
 };
 });
 
+vi.mock('../goalApi', async importOriginal => {
+  const actual = await importOriginal<typeof import('../goalApi')>();
+  return { ...actual, goalApi: {
+    current: vi.fn().mockResolvedValue(null), control: vi.fn().mockResolvedValue(null),
+    history: vi.fn().mockResolvedValue([]), command: vi.fn().mockResolvedValue('Command recorded.'),
+  } };
+});
+
 vi.mock('./ConversationPage', () => ({
   EmbeddedConversationPage: (props: Record<string, unknown>) => {
     embeddedConversationPageSpy(props);
+    const extension = props['stateBarExtension'] as StateBarConversationExtension | undefined;
     return (
       <div data-testid="embedded-conversation-page">
         embedded {String(props['slug'])}
+        {extension?.summary}
+        {extension?.details}
         <button onClick={() => window.dispatchEvent(new CustomEvent('phoenix:open-message-viewer', {
           detail: { sequenceId: 3, messageId: 'm-3', presentation: 'pane' },
         }))}>
@@ -446,7 +459,7 @@ function coordinatorSnapshot(snapshot: ProductConversationSnapshotView) {
 
 let conversationStore: ConversationStore;
 
-function renderPage(initialEntry: string | Partial<Location> = '/product-conversations/pc-1', withRouteSwitch = false, strict = false, journey?: ViewJourneyLifecycle) {
+function renderPage(initialEntry: string | Partial<Location> = '/product-conversations/pc-1', withRouteSwitch = false, strict = false, journey?: ViewJourneyLifecycle, globalExtension?: StateBarConversationExtension) {
   const content = (
     <ConversationContext.Provider value={conversationStore}>
     <ConversationReadinessProvider>
@@ -460,7 +473,7 @@ function renderPage(initialEntry: string | Partial<Location> = '/product-convers
             <Routes>
               <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
               <Route path="/transcript" element={<ConversationRouteRedirect />} />
-              <Route path="/global/:slug" element={<ProductConversationPage journey={journey} productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: undefined }} />} />
+              <Route path="/global/:slug" element={<ProductConversationPage journey={journey} productId="row-1" globalShell={{ composerQuickAction: undefined, stateBarExtension: globalExtension }} />} />
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage journey={journey} />} />
             </Routes>
             </FileExplorerProvider>
@@ -600,14 +613,28 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired'));
     const citation = screen.getByRole('link', { name: 'Exact chapter' });
     expect(citation).toHaveAttribute('href', '/transcript?source_transcript=row-1');
+    let releaseAlias!: () => void;
+    const aliasResolution = new Promise<void>(resolve => { releaseAlias = resolve; });
+    vi.mocked(api.resolveCoordinatorRoute).mockImplementationOnce(async () => {
+      await aliasResolution;
+      return { coordinator_id: null };
+    });
     fireEvent.click(citation);
-    await waitFor(() => expect(screen.getByTestId('product-conversation-page')).toBeVisible());
+    await waitFor(() => expect(api.resolveCoordinatorRoute).toHaveBeenCalledWith('row-1'));
+    expect(screen.getByTestId('history-location').textContent).toBe('/transcript?source_transcript=row-1');
+    expect(screen.getByTestId('product-conversation-page')).toBe(owner);
+    expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
+    await act(async () => { releaseAlias(); await aliasResolution; });
+    await waitFor(() => expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1?source_transcript=row-1'));
+    expect(screen.getByTestId('product-conversation-page')).toBeVisible();
     expect(screen.getByTestId('product-conversation-page')).toBe(owner);
     expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1?source_transcript=row-1');
     expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
     for (const direction of ['history back', 'history forward']) {
       fireEvent.click(screen.getByRole('button', { name: direction }));
-      await waitFor(() => expect(owner).toBeVisible());
+      const expectedRoute = direction === 'history back' ? '/c/pc-1' : '/c/pc-1?source_transcript=row-1';
+      await waitFor(() => expect(screen.getByTestId('history-location').textContent).toBe(expectedRoute));
+      expect(owner).toBeVisible();
       expect(screen.getByTestId('product-conversation-page')).toBe(owner);
       expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
     }
@@ -628,6 +655,64 @@ describe('ProductConversationPage', () => {
     expect(screen.queryByText('Original source transcript unavailable.')).not.toBeInTheDocument();
     expect(currentPositioning()).toMatchObject({ kind: 'positioning', command: { targetMessageId: 'm-1' } });
     expect(api.getCoordinatorHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it('wires ordinary goal facts into the existing embedded StateBar extension using stable product identity', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot());
+    renderPage();
+    await waitFor(() => expect(embeddedConversationPageSpy).toHaveBeenCalled());
+    await waitFor(() => expect(goalApi.current).toHaveBeenCalledWith('pc-1'));
+    expect(goalApi.control).toHaveBeenCalledWith('pc-1');
+    expect(goalApi.history).toHaveBeenCalledWith('pc-1', 0);
+    const extension = embeddedConversationPageSpy.mock.lastCall?.[0]?.stateBarExtension as StateBarConversationExtension;
+    expect(extension.summary).toBeTruthy();
+    expect(extension.details).toBeTruthy();
+    expect(goalApi.current).not.toHaveBeenCalledWith('row-2');
+    expect(goalApi.command).not.toHaveBeenCalled();
+  });
+
+  it('mounts explicit ordinary controls in the supplied extension and addresses only the stable owner', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot());
+    vi.mocked(goalApi.command).mockResolvedValueOnce('Command recorded.');
+    renderPage();
+    fireEvent.change(await screen.findByLabelText('New objective'), { target: { value: '  ordinary owner objective  ' } });
+    expect(goalApi.command).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Create goal' }));
+    await waitFor(() => expect(goalApi.command).toHaveBeenCalledTimes(1));
+    expect(goalApi.command).toHaveBeenCalledWith('pc-1', { kind: 'create', body: {
+      request_id: expect.any(String), expected_version: 0, objective: '  ordinary owner objective  ',
+    } });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop goal work' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'Stop goal work' }));
+    await waitFor(() => expect(goalApi.command).toHaveBeenCalledTimes(2));
+    expect(goalApi.command).toHaveBeenLastCalledWith('pc-1', { kind: 'stop', body: {
+      request_id: expect.any(String), command: 'stop', expected_control_version: 0,
+    } });
+  });
+
+  it('retains factual goals on History without editable commands', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({ ordinary_lifecycle: 'history', writable_transcript_row_id: null }));
+    renderPage();
+    expect(await screen.findByText('GOAL none')).toBeInTheDocument();
+    expect(screen.getByText(/Read-only: History or Close/)).toBeInTheDocument();
+    expect(screen.queryByLabelText('New objective')).not.toBeInTheDocument();
+    expect(goalApi.command).not.toHaveBeenCalled();
+  });
+
+  it('does not request ordinary goal facts or replace the Global extension for coordinator routes', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getCoordinatorHistory).mockResolvedValue(coordinatorSnapshot(makeSnapshot()));
+    const extension = { summary: <span>Existing Global summary</span>, details: <span>Existing Global details</span> };
+    renderPage('/global/row-1', false, false, undefined, extension);
+    expect(await screen.findByText('Existing Global summary')).toBeInTheDocument();
+    expect(screen.getByText('Existing Global details')).toBeInTheDocument();
+    expect(goalApi.current).not.toHaveBeenCalled();
+    expect(goalApi.control).not.toHaveBeenCalled();
+    expect(goalApi.history).not.toHaveBeenCalled();
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.stateBarExtension).toBe(extension);
   });
 
   it.each(['applied', 'superseded'] as const)('keeps a held hidden alias jump when an earlier page arrives before completion (%s)', async (terminal) => {

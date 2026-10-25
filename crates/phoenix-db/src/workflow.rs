@@ -424,10 +424,19 @@ pub struct CompleteScheduleOccurrenceInput {
 #[derive(Debug, Clone)]
 pub struct WorkflowRepository {
     pool: SqlitePool,
+    goal_control_installation: crate::conversation_goals::control::GoalControlInstallation,
     sqlite_workload_collector: Option<crate::SqliteWorkloadCollector>,
+    goal_execution_installation: crate::conversation_goals::execution::GoalExecutionInstallation,
 }
 
 impl WorkflowRepository {
+    #[cfg(test)]
+    pub(crate) fn goal_control_installation_for_tests(
+        &self,
+    ) -> crate::conversation_goals::control::GoalControlInstallation {
+        self.goal_control_installation
+    }
+
     pub(crate) async fn begin_tx(&self) -> DbResult<WorkflowTx<'_>> {
         Ok(WorkflowTx::new(self.pool.begin().await?))
     }
@@ -1271,6 +1280,10 @@ impl WorkflowRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
+            goal_control_installation:
+                crate::conversation_goals::control::GoalControlInstallation::Disabled,
+            goal_execution_installation:
+                crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
             sqlite_workload_collector: None,
         }
     }
@@ -1278,10 +1291,14 @@ impl WorkflowRepository {
     pub(crate) fn with_sqlite_workload_collector(
         pool: SqlitePool,
         sqlite_workload_collector: crate::SqliteWorkloadCollector,
+        goal_control_installation: crate::conversation_goals::control::GoalControlInstallation,
+        goal_execution_installation: crate::conversation_goals::execution::GoalExecutionInstallation,
     ) -> Self {
         Self {
             pool,
+            goal_control_installation,
             sqlite_workload_collector: Some(sqlite_workload_collector),
+            goal_execution_installation,
         }
     }
 
@@ -2677,7 +2694,7 @@ fn parse_capability(kind: &str, stable_command_id: Option<i64>) -> DbResult<Exec
         other => {
             return Err(DbError::Serialization(format!(
                 "unknown capability kind: {other}"
-            )))
+            )));
         }
     })
 }

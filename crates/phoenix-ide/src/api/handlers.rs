@@ -136,6 +136,7 @@ pub fn create_router(state: AppState) -> Router {
         // Static assets (embedded or filesystem fallback)
         .merge(crate::api::product_conversations::automatic_continuation_routes())
         .merge(exact_reads::routes())
+        .merge(super::goal_control::routes())
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
         .route("/preview/*filepath", get(serve_preview_file))
@@ -565,6 +566,70 @@ pub fn create_router(state: AppState) -> Router {
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
+        .route("/api/federation/peers", get(super::federation::owner_peers))
+        .route(
+            "/api/federation/peers/:instance/notes",
+            get(super::federation::owner_get_notes)
+                .put(super::federation::owner_put_notes)
+                .layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/federation/query-database",
+            post(super::federation::owner_query)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/search-conversations",
+            post(super::federation::owner_search)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/read-conversation",
+            post(super::federation::owner_read)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/resolve-reference",
+            post(super::federation::owner_resolve)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/send-conversation-message",
+            post(super::federation::owner_send).layer(DefaultBodyLimit::max(
+                super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/openapi",
+            post(super::federation::owner_openapi)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/subscriptions/notifications",
+            get(super::federation::subscriptions::owner_notifications),
+        )
+        .route(
+            "/api/federation/subscriptions",
+            get(super::federation::subscriptions::owner_list),
+        )
+        .route(
+            "/api/federation/subscriptions/create",
+            post(super::federation::subscriptions::owner_create).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/subscriptions/sync-once",
+            post(super::federation::subscriptions::owner_sync).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/subscriptions/unsubscribe",
+            post(super::federation::subscriptions::owner_unsubscribe).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
         .route(
             "/api/federation/enrollments",
             post(super::federation::issue_enrollment),
@@ -644,8 +709,53 @@ pub fn create_router(state: AppState) -> Router {
     // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
     let peer_router = Router::new()
         .route(
+            "/api/federation/peer/subscriptions/create",
+            post(super::federation::subscriptions::create).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/replay",
+            post(super::federation::subscriptions::replay).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/authorize",
+            post(super::federation::subscriptions::authorize).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/subscriptions/unsubscribe",
+            post(super::federation::subscriptions::unsubscribe).layer(DefaultBodyLimit::max(
+                super::federation::subscriptions::REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/federation/peer/send-conversation-message",
+            post(super::federation::send_conversation_message).layer(DefaultBodyLimit::max(
+                super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
             "/api/federation/peer/query-database",
             post(super::federation::query_database)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/search-conversations",
+            post(super::federation::search_conversations)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/read-conversation",
+            post(super::federation::read_conversation)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/resolve-reference",
+            post(super::federation::resolve_reference)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
         .layer(middleware::from_fn_with_state(
@@ -665,6 +775,7 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             super::auth::auth_middleware,
         ))
+        .route("/openapi.json", get(super::federation::federation_openapi))
         // HTTP access log + Datadog tracing: applied via `route_layer` so it
         // runs AFTER routing, making axum's `MatchedPath` (the route template,
         // e.g. `/api/conversations/:id/stream`) available in `make_span_with`.
@@ -5296,6 +5407,12 @@ async fn send_chat(
                 AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "message_id was already used for a different target or payload".to_string(),
                     "idempotency_conflict",
+                )))
+            }
+            crate::send_chat_service::SendChatServiceError::RemoteSubscriptionStopped => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Remote subscription locally stopped".to_string(),
+                    "remote_subscription_stopped",
                 )))
             }
             crate::send_chat_service::SendChatServiceError::Internal(message) => {
@@ -12987,6 +13104,42 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn captured_notification_shared_http_initial_and_history_keep_only_legacy_diagnostic() {
+        use crate::coordinator_watch_delivery::captured_notification_fixture::{
+            assert_private_absent, captured_notification, GOAL_ID, OBJECTIVE, REASON,
+        };
+        let state = make_test_state().await;
+        let (message, source, diagnostic) = captured_notification(&state.db).await;
+        let token = state
+            .db
+            .create_share_token(&message.conversation_id)
+            .await
+            .unwrap();
+        for source_removed in [false, true] {
+            if source_removed {
+                state.db.delete_conversation(&source).await.unwrap();
+            }
+            let Json(shared) = get_shared_conversation(State(state.clone()), Path(token.clone()))
+                .await
+                .unwrap();
+            let wire = serde_json::to_value(&shared).unwrap();
+            assert_private_absent(&wire);
+            assert_eq!(wire["messages"][0]["content"]["text"], diagnostic);
+            assert_eq!(
+                wire["messages"][0]["event_presentation"]["reason"],
+                "redacted"
+            );
+            let private = enrich_messages(&state.db, std::slice::from_ref(&message)).await;
+            let private_wire = serde_json::to_value(&private).unwrap();
+            let capture = private_wire[0]["event_presentation"]["goal_capture"].to_string();
+            for secret in [OBJECTIVE, REASON, GOAL_ID] {
+                assert!(capture.contains(secret));
+            }
+            assert_eq!(wire["messages"][0]["content"], private_wire[0]["content"]);
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_oauth_callback_rejects_unmatched_state_and_error_redirects() {
         use axum::extract::Query;
 
@@ -18638,8 +18791,10 @@ mod chat_authority_tests {
                     .await
                     .unwrap()
                     .expect("accepted direct turn");
-                let payload =
-                    PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+                let payload = PreparedDirectTurnPayload::from_exact_bytes(
+                    turn.prepared.message_payload().unwrap(),
+                )
+                .unwrap();
                 assert_eq!(payload.message_id(), "literal-message");
                 assert_eq!(payload.delivery.text, text);
                 assert!(payload.delivery.llm_text.is_none());
@@ -18791,8 +18946,10 @@ mod chat_authority_tests {
                 .await
                 .unwrap()
                 .expect("exact manual opening accepted");
-            let payload =
-                PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload()).unwrap();
+            let payload = PreparedDirectTurnPayload::from_exact_bytes(
+                turn.prepared.message_payload().unwrap(),
+            )
+            .unwrap();
             assert_eq!(payload.submitted.message_id, intent.message_id.as_str());
             assert_eq!(payload.submitted.text, text);
             assert_eq!(payload.delivery.text, text);

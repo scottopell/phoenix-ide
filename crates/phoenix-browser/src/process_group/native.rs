@@ -309,20 +309,29 @@ fn linux_process_is_live_member(
         }
         Err(error) => return Err(error),
     };
-    let tail = stat
-        .rsplit_once(')')
-        .ok_or_else(|| io::Error::other("invalid process stat"))?
-        .1;
-    let mut fields = tail.split_whitespace();
-    let state = fields
-        .next()
-        .ok_or_else(|| io::Error::other("missing process state"))?;
-    let _parent = fields.next();
-    let actual = fields
-        .next()
-        .and_then(|field| field.parse::<u32>().ok())
-        .ok_or_else(|| io::Error::other("missing process group"))?;
-    Ok(actual == group && state != "Z" && state != "X")
+    let parsed = (|| {
+        let tail = stat
+            .rsplit_once(')')
+            .ok_or_else(|| io::Error::other("invalid process stat"))?
+            .1;
+        let mut fields = tail.split_whitespace();
+        let state = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing process state"))?;
+        let _parent = fields.next();
+        let actual = fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(|| io::Error::other("missing process group"))?;
+        Ok(actual == group && state != "Z" && state != "X")
+    })();
+    match parsed {
+        Ok(live) => Ok(live),
+        Err(original) => match is_member() {
+            Ok(false) => Ok(false),
+            Ok(true) | Err(_) => Err(original),
+        },
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -556,6 +565,81 @@ mod tests {
                 observations.next().is_some(),
                 "unknown stat error must not reclassify"
             );
+        }
+    }
+
+    #[test]
+    fn linux_scan_reclassifies_malformed_stat_only_after_known_membership_loss() {
+        for stat in [
+            "invalid",
+            "42 (Chrome)",
+            "42 (Chrome) S 1",
+            "42 (Chrome) S 1 invalid",
+        ] {
+            for after in [
+                Ok(0),
+                Ok(99),
+                Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            ] {
+                let mut observations = [Ok(42), after].into_iter();
+                let mut reads = 0;
+                let live = linux_process_is_live_member(
+                    42,
+                    42,
+                    |_| {
+                        observations
+                            .next()
+                            .expect("exactly two membership observations")
+                    },
+                    || {
+                        reads += 1;
+                        Ok(stat.to_owned())
+                    },
+                )
+                .unwrap();
+                assert!(!live, "{stat:?}");
+                assert_eq!(reads, 1);
+                assert!(observations.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn linux_scan_preserves_parse_error_when_fresh_membership_is_owned_or_unknown() {
+        for (stat, message) in [
+            ("invalid", "invalid process stat"),
+            ("42 (Chrome)", "missing process state"),
+            ("42 (Chrome) S 1", "missing process group"),
+            ("42 (Chrome) S 1 invalid", "missing process group"),
+        ] {
+            for after in [
+                Ok(42),
+                Ok(-1),
+                Err(io::Error::from_raw_os_error(libc::EPERM)),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+            ] {
+                let mut observations = [Ok(42), after].into_iter();
+                let mut reads = 0;
+                let error = linux_process_is_live_member(
+                    42,
+                    42,
+                    |_| {
+                        observations
+                            .next()
+                            .expect("exactly two membership observations")
+                    },
+                    || {
+                        reads += 1;
+                        Ok(stat.to_owned())
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert_eq!(error.to_string(), message);
+                assert_eq!(error.raw_os_error(), None);
+                assert_eq!(reads, 1);
+                assert!(observations.next().is_none());
+            }
         }
     }
 

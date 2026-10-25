@@ -1,3 +1,4 @@
+pub(crate) mod goal_facts;
 mod mandatory_close;
 mod presentation;
 use mandatory_close::decode_route;
@@ -34,6 +35,7 @@ pub enum WatchOutcome {
     Cancelled,
     AwaitingUserResponse,
     AwaitingTaskApproval,
+    GoalChanged,
 }
 
 impl WatchOutcome {
@@ -42,6 +44,7 @@ impl WatchOutcome {
             ("completed", None) => Ok(Self::Completed),
             ("failed", Some(reason)) => Ok(Self::Failed { reason }),
             ("cleanup_failed", Some(reason)) => Ok(Self::CleanupFailed { reason }),
+            ("goal_changed", None) => Ok(Self::GoalChanged),
             ("cancelled", None) => Ok(Self::Cancelled),
             ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
                 Ok(Self::AwaitingUserResponse)
@@ -64,6 +67,7 @@ impl WatchOutcome {
             Self::Cancelled => "cancelled",
             Self::AwaitingUserResponse => "awaiting_user_response",
             Self::AwaitingTaskApproval => "awaiting_task_approval",
+            Self::GoalChanged => "goal_changed",
         }
     }
 
@@ -73,7 +77,7 @@ impl WatchOutcome {
             Self::Failed { reason } | Self::CleanupFailed { reason } => Some(reason),
             Self::AwaitingUserResponse => Some("question_request"),
             Self::AwaitingTaskApproval => Some("task_approval_wait"),
-            Self::Completed | Self::Cancelled => None,
+            Self::Completed | Self::Cancelled | Self::GoalChanged => None,
         }
     }
 }
@@ -81,6 +85,7 @@ impl WatchOutcome {
 #[derive(Debug, Clone)]
 pub struct PendingWatchEvent {
     pub route: WatchEventRoute,
+    pub goal_capture: Option<phoenix_core::domain::watch_goal::WatchGoalCapture>,
     pub event_id: String,
     pub product_conversation_id: ProductConversationId,
     pub source_transcript_id: String,
@@ -224,9 +229,14 @@ impl Database {
                   COALESCE(w.source_product_conversation_id, f.source_product_conversation_id) AS source_product_conversation_id,
                   e.source_transcript_id, e.source_occurrence_kind, e.source_occurrence_id,
                   e.source_generation, e.terminal_kind, e.terminal_reason, e.occurred_at_us,
+                    e.goal_capture_kind, gc.kind AS capture_kind, gc.owner_id AS capture_owner_id,
+                    gc.owner_version AS capture_owner_version, gc.goal_id AS capture_goal_id,
+                    gc.objective AS capture_objective, gc.state AS capture_state,
+                    gc.reason AS capture_reason, gc.usage_kind AS capture_usage_kind,
                   f.authority_kind, f.scope, f.resource_kind, f.identity_kind, f.identity_codec, f.identity_value,
                   f.detail, f.cleanup_run_ordinal, f.stop_certainty, f.confirmed_at_us AS stop_confirmed_at_unix_us
              FROM coordinator_watch_events e
+                 LEFT JOIN coordinator_watch_goal_captures gc ON gc.event_id=e.event_id
              LEFT JOIN coordinator_watches w ON w.id = e.watch_id
              LEFT JOIN product_conversations p ON p.id = w.source_product_conversation_id
              LEFT JOIN close_cleanup_failures f ON f.failure_occurrence_id = e.mandatory_failure_occurrence_id
@@ -246,6 +256,7 @@ impl Database {
                 let product_id: String = row.try_get("source_product_conversation_id")?;
                 Ok(PendingWatchEvent {
                     route: decode_route(&row)?,
+                    goal_capture: goal_facts::decode(&row)?,
                     event_id: row.try_get("event_id")?,
                     product_conversation_id: ProductConversationId::parse(product_id)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
@@ -289,24 +300,30 @@ impl Database {
     }
 }
 
+pub(crate) struct TerminalEventSource {
+    pub(crate) turn_id: u64,
+    pub(crate) generation: u64,
+}
+
 pub(crate) async fn record_terminal_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    turn_id: u64,
-    generation: u64,
+    source: TerminalEventSource,
     transcript_id: &str,
     terminal_kind: &str,
     reason: Option<&str>,
     context_exhausted: bool,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     record_watch_event_tx(
         tx,
         "direct_turn",
-        &turn_id.to_string(),
-        generation,
+        &source.turn_id.to_string(),
+        source.generation,
         transcript_id,
         terminal_kind,
         reason,
         context_exhausted,
+        installation,
     )
     .await
 }
@@ -346,6 +363,7 @@ pub(crate) async fn record_steering_event_tx(
     transcript_id: &str,
     category: &str,
     reason: Option<&str>,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     record_watch_event_tx(
         tx,
@@ -356,6 +374,7 @@ pub(crate) async fn record_steering_event_tx(
         category,
         reason,
         reason == Some("context exhausted"),
+        installation,
     )
     .await
 }
@@ -364,6 +383,7 @@ pub(crate) async fn record_wait_entry_tx(
     tx: &mut Transaction<'_, Sqlite>,
     transcript_id: &str,
     state: &ConvState,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     let (kind, outcome, identified_request) = match state {
         ConvState::AwaitingUserResponse {
@@ -427,15 +447,18 @@ pub(crate) async fn record_wait_entry_tx(
     .fetch_all(&mut **tx)
     .await?;
     for watch_id in watch_ids {
-        sqlx::query("INSERT INTO coordinator_watch_events
+        let inserted: Option<String> = sqlx::query_scalar("INSERT INTO coordinator_watch_events
             (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
-             source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us)
-            VALUES (?1, ?2, ?6, ?3, 0, ?4, ?7, ?6, ?5)
-            ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING")
+             source_generation, source_transcript_id, terminal_kind, terminal_reason, occurred_at_us, goal_capture_kind)
+            VALUES (?1, ?2, ?6, ?3, 0, ?4, ?7, ?6, ?5, ?8)
+            ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id) DO NOTHING RETURNING event_id")
             .bind(uuid::Uuid::new_v4().to_string()).bind(watch_id)
             .bind(&occurrence_id).bind(transcript_id)
             .bind(chrono::Utc::now().timestamp_micros()).bind(kind).bind(outcome)
-            .execute(&mut **tx).await?;
+            .bind(goal_facts::marker(installation)).fetch_optional(&mut **tx).await?;
+        if let Some(event_id) = inserted {
+            goal_facts::capture_transcript_tx(tx, installation, &event_id, transcript_id).await?;
+        }
     }
     Ok(())
 }
@@ -444,6 +467,7 @@ pub(crate) async fn record_summary_failure_tx(
     tx: &mut Transaction<'_, Sqlite>,
     transcript_id: &str,
     failure: &phoenix_core::domain::sm_state::RecoverableContinuationFailure,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     record_watch_event_tx(
         tx,
@@ -454,6 +478,7 @@ pub(crate) async fn record_summary_failure_tx(
         "Failed",
         Some("continuation summary failed"),
         false,
+        installation,
     )
     .await
 }
@@ -465,6 +490,7 @@ pub(crate) async fn record_creation_event_tx(
     transcript_id: &str,
     terminal_kind: &str,
     reason: Option<&str>,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     record_watch_event_tx(
         tx,
@@ -475,6 +501,7 @@ pub(crate) async fn record_creation_event_tx(
         terminal_kind,
         reason,
         reason == Some("context exhausted"),
+        installation,
     )
     .await
 }
@@ -489,6 +516,7 @@ async fn record_watch_event_tx(
     terminal_kind: &str,
     reason: Option<&str>,
     context_exhausted: bool,
+    installation: crate::conversation_goals::control::GoalControlInstallation,
 ) -> DbResult<()> {
     let cancelled =
         sqlx::query("DELETE FROM execution_cancel_observations WHERE conversation_id = ?1")
@@ -510,15 +538,33 @@ async fn record_watch_event_tx(
     if category == "completed" && context_exhausted {
         return Ok(());
     }
-    sqlx::query("INSERT INTO coordinator_watch_events
+    let occurred_at_us = Utc::now().timestamp_micros();
+    crate::federation_subscriptions::append_terminal_tx(
+        tx,
+        crate::federation_subscriptions::ClassifiedTerminal {
+            occurrence_kind,
+            occurrence_id,
+            generation: i64::try_from(generation)
+                .map_err(|_| DbError::Serialization("generation overflow".into()))?,
+            transcript_id,
+            outcome: phoenix_core::domain::federation_subscription::TerminalFactOutcome::try_from(
+                category,
+            )
+            .map_err(|error| DbError::Serialization(error.into()))?,
+            context_exhausted,
+            occurred_at_us,
+        },
+    )
+    .await?;
+    let inserted: Vec<String> = sqlx::query_scalar("INSERT INTO coordinator_watch_events
         (event_id, watch_id, source_occurrence_kind, source_occurrence_id,
          source_generation, source_transcript_id, terminal_kind, terminal_reason,
-         occurred_at_us, continuation_state)
+         occurred_at_us, continuation_state, goal_capture_kind)
         SELECT ?1, w.id, ?2, ?3, ?4, c.id, ?5, ?6, ?7,
           CASE WHEN ?9 AND ?5 = 'failed' AND EXISTS
                (SELECT 1 FROM automatic_continuation_admissions a WHERE a.predecessor_conversation_id = c.id
                 AND a.phase NOT IN ('failed', 'superseded'))
-               THEN 'awaiting' ELSE 'none' END
+               THEN 'awaiting' ELSE 'none' END, ?10
         FROM conversations c JOIN product_conversations p ON p.id = c.product_conversation_id
           JOIN coordinator_watches w ON w.source_product_conversation_id = p.id AND w.ended_at_us IS NULL
         WHERE c.id = ?8 AND c.parent_conversation_id IS NULL AND p.kind = 'ordinary'
@@ -526,14 +572,18 @@ async fn record_watch_event_tx(
           AND (?5 != 'completed' OR c.state_kind IN ('idle', 'terminal'))
           AND c.state_kind NOT IN ('awaiting_continuation', 'handed_off')
         ON CONFLICT(source_occurrence_kind, source_occurrence_id, source_generation, watch_id)
-        DO NOTHING")
+        DO NOTHING RETURNING event_id")
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(occurrence_kind)
         .bind(occurrence_id)
         .bind(i64::try_from(generation).map_err(|_| DbError::Serialization("generation overflow".into()))?)
         .bind(category).bind(if context_exhausted && category == "failed" { Some("context exhausted") } else { reason.or((category == "failed").then_some("turn failed")) })
-        .bind(Utc::now().timestamp_micros())
-        .bind(transcript_id).bind(context_exhausted).execute(&mut **tx).await?;
+        .bind(occurred_at_us)
+        .bind(transcript_id).bind(context_exhausted).bind(goal_facts::marker(installation))
+        .fetch_all(&mut **tx).await?;
+    for event_id in inserted {
+        goal_facts::capture_transcript_tx(tx, installation, &event_id, transcript_id).await?;
+    }
     Ok(())
 }
 
@@ -657,12 +707,15 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn_id,
-            0,
+            TerminalEventSource {
+                turn_id,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("overload recovery exhausted"),
             false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -839,9 +892,14 @@ mod tests {
             plan: "Review".into(),
         };
         let mut tx = db.pool().begin().await.unwrap();
-        record_wait_entry_tx(&mut tx, &source.id, &waiting)
-            .await
-            .unwrap();
+        record_wait_entry_tx(
+            &mut tx,
+            &source.id,
+            &waiting,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?3 WHERE id = ?2")
             .bind(serde_json::to_string(&waiting).unwrap())
             .bind(&source.id)
@@ -1039,9 +1097,17 @@ mod tests {
             .await
             .unwrap();
         let mut tx = db.pool().begin().await.unwrap();
-        record_creation_event_tx(&mut tx, "cancel-source", 0, &source.id, "Completed", None)
-            .await
-            .unwrap();
+        record_creation_event_tx(
+            &mut tx,
+            "cancel-source",
+            0,
+            &source.id,
+            "Completed",
+            None,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -1066,9 +1132,20 @@ mod tests {
         let id = source.product_conversation_id.clone();
         let historical = source_turn(&db, &source.id, "historical").await;
         let mut tx = db.pool().begin().await.unwrap();
-        record_terminal_event_tx(&mut tx, historical, 0, &source.id, "Completed", None, false)
-            .await
-            .unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            TerminalEventSource {
+                turn_id: historical,
+                generation: 0,
+            },
+            &source.id,
+            "Completed",
+            None,
+            false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = ?1")
             .bind(i64::try_from(historical).unwrap()).execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
@@ -1084,23 +1161,29 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("model failed"),
             false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("model failed"),
             false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -1137,12 +1220,15 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("context exhausted"),
             true,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -1237,12 +1323,15 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("failed"),
             false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -1274,17 +1363,31 @@ mod tests {
         db.watch_product_conversation(&product).await.unwrap();
         let turn = source_turn(&db, &source.id, "exhausted-success").await;
         let mut tx = db.pool().begin().await.unwrap();
-        record_terminal_event_tx(&mut tx, turn, 0, &source.id, "Completed", None, true)
-            .await
-            .unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
+            &source.id,
+            "Completed",
+            None,
+            true,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        )
+        .await
+        .unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("context exhausted"),
             true,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -1321,6 +1424,25 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        accept_watch_success_opening(&db, &source).await;
+        let (state, continuation): (String, String) = sqlx::query_as(
+            "SELECT delivery_state, continuation_state FROM coordinator_watch_events",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (state.as_str(), continuation.as_str()),
+            ("suppressed", "suppressed")
+        );
+        assert!(db
+            .pending_coordinator_watch_events(16)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    async fn accept_watch_success_opening(db: &Database, source: &crate::Conversation) {
         let (outcome, _) = db
             .continue_conversation_with_intent(
                 &source.id,
@@ -1341,21 +1463,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let (state, continuation): (String, String) = sqlx::query_as(
-            "SELECT delivery_state, continuation_state FROM coordinator_watch_events",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            (state.as_str(), continuation.as_str()),
-            ("suppressed", "suppressed")
-        );
-        assert!(db
-            .pending_coordinator_watch_events(16)
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     fn expect_created(outcome: crate::ContinueOutcome) -> crate::Conversation {
@@ -1404,12 +1511,15 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            turn,
-            0,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("source failed"),
             false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -1461,12 +1571,15 @@ mod tests {
         let mut tx = db.pool().begin().await.unwrap();
         record_terminal_event_tx(
             &mut tx,
-            later,
-            0,
+            TerminalEventSource {
+                turn_id: later,
+                generation: 0,
+            },
             &source.id,
             "Failed",
             Some("later failure"),
             false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
         )
         .await
         .unwrap();
@@ -1515,9 +1628,20 @@ mod tests {
         .unwrap();
 
         let mut tx = db.pool().begin().await.unwrap();
-        record_terminal_event_tx(&mut tx, turn, 0, &source.id, "Cancelled", None, false)
-            .await
-            .unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
+            &source.id,
+            "Cancelled",
+            None,
+            false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         assert!(db
             .pending_coordinator_watch_events(16)
@@ -1565,9 +1689,20 @@ mod tests {
             .unwrap();
         let turn = source_turn(&db, &ordinary.id, "ordinary-turn").await;
         let mut tx = db.pool().begin().await.unwrap();
-        record_terminal_event_tx(&mut tx, turn, 0, &ordinary.id, "Completed", None, false)
-            .await
-            .unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
+            &ordinary.id,
+            "Completed",
+            None,
+            false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         let ordinary_event_id = db.pending_coordinator_watch_events(16).await.unwrap()[0]
             .event_id
@@ -1775,9 +1910,20 @@ mod tests {
         db.watch_product_conversation(&product).await.unwrap();
         let turn = source_turn(&db, &source.id, "watched").await;
         let mut tx = db.pool().begin().await.unwrap();
-        record_terminal_event_tx(&mut tx, turn, 0, &source.id, "Completed", None, false)
-            .await
-            .unwrap();
+        record_terminal_event_tx(
+            &mut tx,
+            TerminalEventSource {
+                turn_id: turn,
+                generation: 0,
+            },
+            &source.id,
+            "Completed",
+            None,
+            false,
+            crate::conversation_goals::control::GoalControlInstallation::Disabled,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         let event_id = db.pending_coordinator_watch_events(16).await.unwrap()[0]
             .event_id
