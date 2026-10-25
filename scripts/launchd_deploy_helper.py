@@ -42,7 +42,7 @@ CURRENT_SCHEMA_REQUIRED_MIGRATIONS = {
     128: "product_creation_provisioning_stage",
 }
 # REQ-LDD-028: exact additive candidate registry; historical protected pins are independent.
-ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256 = "c3911ab5dcf05dc4c19472486ae463179948d692370976ed3c81ee6948445744"
+ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256 = "850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac"
 ORDINARY_SOURCE129_TARGET131_MIGRATIONS = (
     (129, "single_conversation_name_and_route_projection"),
     (130, "continuation_handoff_candidates"),

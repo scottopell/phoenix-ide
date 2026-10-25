@@ -21730,9 +21730,24 @@ mod steer_drain_detector_tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn conversation_runtime_dispatches_real_zero_and_normal_bash_waits() {
+        use tokio::io::AsyncReadExt;
+
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("runtime-started");
         let release = temp.path().join("release");
+        let ready_path = temp.path().join("ready");
+        nix::unistd::mkfifo(
+            &ready_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let mut ready = tokio::net::unix::pipe::OpenOptions::new()
+            .open_receiver(&ready_path)
+            .unwrap();
+        // Keep the reader from reporting EOF before the child opens its writer.
+        let ready_writer = tokio::net::unix::pipe::OpenOptions::new()
+            .open_sender(&ready_path)
+            .unwrap();
         let registry = Arc::new(crate::tools::BashHandleRegistry::new());
         let context = ConvContext::new(
             "runtime-real-bash-wait",
@@ -21759,7 +21774,7 @@ mod steer_drain_detector_tests {
             .run(
                 serde_json::json!({
                     "op": "run",
-                    "cmd": "printf x >> runtime-started; while [ ! -f release ]; do sleep 0.05; done",
+                    "cmd": "printf x >> runtime-started; printf r > ready; while [ ! -f release ]; do sleep 0.05; done",
                     "wait_seconds": 0
                 }),
                 setup_context.clone(),
@@ -21768,6 +21783,14 @@ mod steer_drain_detector_tests {
         let run_value: serde_json::Value = serde_json::from_str(run.output()).unwrap();
         assert_eq!(run_value["status"], "still_running");
         let handle = run_value["handle"].as_str().unwrap().to_string();
+        let mut ready_byte = [0];
+        tokio::time::timeout(Duration::from_secs(5), ready.read_exact(&mut ready_byte))
+            .await
+            .expect("bash child did not publish marker readiness")
+            .unwrap();
+        assert_eq!(ready_byte, *b"r");
+        drop(ready_writer);
+        drop(ready);
 
         let wait_zero = ToolCall::new(
             "runtime-wait-zero",

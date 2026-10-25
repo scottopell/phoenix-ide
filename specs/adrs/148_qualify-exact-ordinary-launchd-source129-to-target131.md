@@ -25,11 +25,15 @@ would silently invalidate the proof contracts they protect.
 ## Decision
 
 Choose option 3. Qualify only complete source129 to the complete registry whose
-SHA-256 is `c3911ab5dcf05dc4c19472486ae463179948d692370976ed3c81ee6948445744`.
+SHA-256 is `850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac`.
 Its final entries are 129 `single_conversation_name_and_route_projection`, 130
 `continuation_handoff_candidates`, 131 `request_capacity_diagnostics`.
 The staged helper owns pre-handoff admission; full registry bytes, digest, exact
 candidate and configuration remain immutable retained transaction evidence.
+Before merge, final qualification corrected the registry file's migration-tail
+assertion to include migrations 130 and 131. The digest above binds those final
+file bytes; the migration entries and ordinary interval policy did not change.
+Historical protected registry pins remain unchanged.
 
 Use the existing ordinary start-attempt checkpoint. Before candidate startup,
 unchanged-predecessor artifact rollback remains available. After startup is
