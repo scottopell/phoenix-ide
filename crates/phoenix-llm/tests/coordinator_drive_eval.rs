@@ -201,17 +201,25 @@ impl FakeWorld {
                     .ok_or("unknown_conversation")
             }),
             "send_conversation_message" => nonempty(input, "target").and_then(|id| {
-                let target = scenario.rows.iter().find_map(|row| {
-                    let current = row["current_transcript_id"].as_str()?;
-                    let stable = row["product_conversation_id"].as_str()?;
-                    (id == stable || id == current).then_some(stable)
-                }).filter(|target| *target != "@conv:coordinator" && scenario.conversations.contains_key(*target))
-                    .ok_or("unknown_or_coordinator_target")?;
+                let row = scenario.rows.iter().find(|row| {
+                    let current = row["current_transcript_id"].as_str();
+                    let stable = row["product_conversation_id"].as_str();
+                    stable == Some(id) || current == Some(id)
+                }).ok_or("unknown_or_coordinator_target")?;
+                let target = row["product_conversation_id"].as_str().ok_or("missing_target_id")?;
+                if target == "@conv:coordinator" || !scenario.conversations.contains_key(target) {
+                    return Err("unknown_or_coordinator_target");
+                }
+                let outcome = match row["state"].as_str() {
+                    Some("idle") => "delivered",
+                    Some("working") => "queued_as_steering",
+                    _ => return Err("unsupported_fixture_state"),
+                };
                 let message = nonempty(input, "message")?;
                 let message_id = nonempty(input, "message_id")?;
                 if !valid_uuid(message_id) { return Err("invalid_message_id"); }
-                self.actions.push(json!({"kind":"message_accepted_queued","target":id,"conversation_id":target,"message":message,"message_id":message_id}));
-                Ok(json!({"target":id,"conversation_id":target,"message_id":message_id,"status":"accepted_queued","execution_verified":false}))
+                self.actions.push(json!({"kind":outcome,"target":id,"conversation_id":target,"message":message,"message_id":message_id}));
+                Ok(json!({"target":id,"conversation_id":target,"message_id":message_id,"outcome":outcome}))
             }),
             "ask_user_question" => {
                 let questions = input.get("questions").and_then(Value::as_array).ok_or("missing_questions");
@@ -304,6 +312,30 @@ fn snapshot(messages: &[LlmMessage]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn create_fresh_output_directory(output: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(output)
+}
+
+#[test]
+fn output_directory_rejects_existing_evidence_without_overwriting() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("evidence");
+    create_fresh_output_directory(&output).unwrap();
+    let artifact = output.join("manifest.json");
+    std::fs::write(&artifact, b"original evidence").unwrap();
+    assert_eq!(
+        create_fresh_output_directory(&output).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"original evidence");
+    assert_eq!(
+        create_fresh_output_directory(&temp.path().join("missing-parent/output"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
 }
 
 fn persist(path: &Path, value: &Value) {
@@ -537,7 +569,43 @@ fn fake_tools_reject_unknown_and_wrong_targets() {
             .1
     );
     assert_eq!(world.actions.len(), 1);
-    assert_eq!(world.actions[0]["kind"], "message_accepted_queued");
+    assert_eq!(world.actions[0]["kind"], "delivered");
+}
+
+#[test]
+fn fake_send_distinguishes_idle_delivery_from_working_steering() {
+    let fixture = fixture();
+    let mut scenario = fixture.scenarios.into_iter().next().unwrap();
+    let mut world = FakeWorld::default();
+    let input = json!({"target":"@conv:owner","message":"Continue","message_id":TEST_MESSAGE_ID});
+
+    let (delivered, error) = world.dispatch(&scenario, "send_conversation_message", &input);
+    assert!(!error);
+    assert_eq!(
+        delivered,
+        json!({"target":"@conv:owner","conversation_id":"@conv:owner","message_id":TEST_MESSAGE_ID,"outcome":"delivered"})
+    );
+    scenario.rows[0]["state"] = json!("working");
+    let (queued, error) = world.dispatch(&scenario, "send_conversation_message", &input);
+    assert!(!error);
+    assert_eq!(
+        queued,
+        json!({"target":"@conv:owner","conversation_id":"@conv:owner","message_id":TEST_MESSAGE_ID,"outcome":"queued_as_steering"})
+    );
+    assert_eq!(
+        world
+            .actions
+            .iter()
+            .map(|action| action["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["delivered", "queued_as_steering"]
+    );
+
+    scenario.rows[0]["state"] = json!("unknown");
+    let (rejected, error) = world.dispatch(&scenario, "send_conversation_message", &input);
+    assert!(error);
+    assert_eq!(rejected["error"], "unsupported_fixture_state");
+    assert_eq!(world.actions.len(), 2);
 }
 
 #[test]
@@ -764,7 +832,8 @@ async fn coordinator_drive_eval() {
         variants.len() * scenarios.len() * repetitions <= 18,
         "at most 18 trials per invocation; select explicit variants/scenarios"
     );
-    std::fs::create_dir_all(output).expect("create output directory");
+    create_fresh_output_directory(output)
+        .expect("create fresh output directory (existing evidence is never reused)");
     let manifest = json!({"mode":mode,"model":model,"effort":effort,"repetitions":repetitions,"variants":variants,"scenarios":scenarios,"limits":{"max_provider_calls":CALL_LIMIT,"timeout_seconds":120,"max_output_tokens":OUTPUT_TOKENS},"fixture":serde_json::from_str::<Value>(FIXTURE).unwrap(),"expected_outcomes_file":"expected.json (not shown to model)"});
     persist(&output.join("manifest.json"), &manifest);
     if mode == "prepare" {

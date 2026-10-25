@@ -103,10 +103,6 @@ Run relevant checks through `./dev.py`, followed by the appropriate full validat
 
 No general eval platform, production experiment, broad autonomous authority grant, background scheduler, watch-delivery redesign, goal-system redesign, notification UI redesign, provider comparison, model fine-tuning, or universal design/complexity-review responsibility for Global.
 
-## Task tracking note
-
-This is an Explore-mode plain task brief because shell task allocation is read-only here. On approval, allocate the durable task record with `taskmd new` per repository convention and retain this brief's agreed scope; do not hand-allocate a numeric task ID.
-
 ## Execution evidence
 
 - Branch: `feat/coordinator-drive-eval`; initial frozen harness/fixture commit `0d7e78e46`.
@@ -114,5 +110,5 @@ This is an Explore-mode plain task brief because shell task allocation is read-o
 - Completed the full budget: 18 initial + 8 reserved follow-up synthetic trials, `gpt-6-astra` / high effort. No production mutations or real worker sends.
 - Raw traces and exact prompt/fixture manifests: `scripts/qa/coordinator-drive-eval/results/`; interpretation and limits: `scripts/qa/coordinator-drive-eval/RESULTS.md`.
 - Initial five-call cap censored five trials; initial quiet fixture did not represent a watch event. Both explicitly corrected/reported for the bounded follow-up, not counted as clean baseline failures. One follow-up provider timeout returned no usage.
-- Active button demonstrated useful queued owner follow-ups. Revised C2 candidate resolved mandatory-receipt conflict, stayed silent in both corrected watch-event samples, and advanced independent work before genuine AUQ decisions in both completed executive samples. Tiny directional comparison, not significance or end-to-end completion proof. Prose still long; awaiting the planned small blinded human style judgment before final selection.
-- Product button/system/continuation files remain unchanged. No merge, deployment, or completed-task claim. Remaining work: human prose preference, consolidate selected prompts/specs/tests, broad validation, independent review, PR and normal landing path. No further billed eval trials planned.
+- Active button demonstrated useful owner follow-up requests. Revised C2 candidate resolved mandatory-receipt conflict, stayed silent in both corrected watch-event samples, and advanced independent work before genuine AUQ decisions in both completed executive samples. Tiny directional comparison, not significance or end-to-end completion proof. Archived sends used synthetic generic `accepted_queued`, not production delivered/steering outcomes; the results do not qualify queue-reporting fidelity.
+- Human review rejected both representative procedural prose samples. The selected simpler problem → intervention → direction style is settled, and the button, both language prompts, continuation preference, specs and focused regressions are implemented in PR #976. Selected final wording was not live-evaluated. Full check is underway; exact review and green validation remain gates. Task stays in progress pending merge. No deployment or completed-task claim; no further billed eval trials planned.
