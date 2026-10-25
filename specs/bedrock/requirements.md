@@ -1542,3 +1542,22 @@ postcondition before cascade fires.
 **Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
 (`specs/tmux-integration/`), REQ-PROJ-WS-001
 (`specs/work-lifecycle/`), and REQ-GITREP-007 (`specs/git-repository/`).
+
+### REQ-BED-020a: Capacity Pressure Enters Real Handoff Generation
+
+WHEN a parent awaiting its next model request encounters reducible planned input pressure after permitted clearing, or an authoritative provider context rejection
+THE SYSTEM SHALL enter the existing durable continuation-summary operation independently of the completed-response ninety-percent threshold
+AND SHALL preserve already-persisted tool results without reexecuting their calls
+AND SHALL generate a tool-free handoff before exposing successor creation as ready.
+
+WHEN summary planning cannot retain its mandatory input and output reservation, or generation fails
+THE SYSTEM SHALL retain the existing recoverable continuation operation and original transcript
+AND SHALL expose the classified failure and supported retry or revised-input/model recovery
+AND SHALL NOT publish an error sentence as a generated handoff or recursively launch another compaction.
+
+THE SYSTEM SHALL use one handoff lifecycle for ordinary work and the Coordinator, with their respective existing handoff instructions
+AND SHALL protect the accepted predecessor handoff under REQ-BED-020 and instruct the summarizer to retain user corrections, known provenance, unresolved obligations, uncertainty, and retrieval references from selected input
+AND SHALL NOT claim lossless semantic preservation of omitted history or generated summaries
+AND SHALL NOT create a separately maintained decisions or obligations memory authority.
+
+A successful terminal response SHALL remain accepted under REQ-BED-019 even if a hypothetical subsequent request would need compaction. Successor admission, cancellation, automatic-continuation consent, restart ownership, and Close fencing remain governed by their existing contracts.

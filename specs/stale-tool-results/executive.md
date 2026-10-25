@@ -98,3 +98,5 @@ Its fraction is set at implementation against the deployed models' windows and
 recorded here once benchmarked. There is no `target_after_clear`: a sweep always
 clears the whole prefix outside the recency floor, so `keep_recent_rounds` alone
 bounds retention.
+
+REQ-STR-012 is specified, not qualified: source-locator retention and interpretation/provenance continuity need explicit regression evidence under task 44018. Existing monotonic clearing and recent-working-set constraints remain normative.

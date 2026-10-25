@@ -1208,14 +1208,29 @@ rule ParentCancelDuringLlmRequest {
 -- PARENT 3. NON-RETRYABLE ERROR (parent -> error)
 -- ===========================================================
 
+rule PlannedCapacityPressureRequiresCompaction {
+    when: ReducibleRequestPressure(conversation)
+    requires: conversation.core_status = llm_requesting
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.rejected_tool_calls.count = 0
+    ensures: conversation.retry_attempt = 1
+    ensures: ContinuationRequested(conversation, conversation.rejected_tool_calls)
+
+    @guidance
+        -- REQ-BED-020a, REQ-LLM-004j: this event means permitted clearing
+        -- has settled and retained history can be reduced. Completed tool
+        -- results remain persisted. The existing durable continuation owner
+        -- creates the operation identity; no provider call has been dispatched.
+}
+
 rule BackendRejectsContextExhausted {
     when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = llm_requesting
     requires: error_kind = context_exhausted
-    ensures: conversation.parent_status = context_exhausted
-    ensures: conversation.continuation_summary =
-        "Context limit reached before the turn could complete. " +
-        "Continue to compact and resume, or start a new conversation."
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.rejected_tool_calls.count = 0
+    ensures: conversation.retry_attempt = 1
+    ensures: ContinuationRequested(conversation, conversation.rejected_tool_calls)
 
     @guidance
         -- Checked before ParentLlmErrorNonRecoverable, mirroring
@@ -1224,12 +1239,11 @@ rule BackendRejectsContextExhausted {
         -- usage tracking did not trip the continuation threshold
         -- (ContextThresholdReachedParent, REQ-BED-019) — wrong declared
         -- context window, a tightened backend cap, or a large attachment
-        -- landing mid-turn. Both the internal-threshold and
-        -- backend-rejection paths must converge on context_exhausted so
-        -- the message-rejection / continuation-recovery precondition
-        -- (RejectMessageContextExhausted) is satisfiable. Routing through
-        -- `error` is unrecoverable: there is no transition out of the
-        -- error state into continuation, so the conversation is stranded.
+        -- landing mid-turn. REQ-BED-020a routes this through the existing
+        -- durable handoff operation; only a real generated summary can
+        -- reach the successor-ready context_exhausted state. Summary
+        -- planning failure retains recoverable continuation state, and
+        -- does not recursively generate another summary operation.
         -- Sub-agents are unaffected — they have no context_exhausted
         -- parent_status and keep SubAgentContextExhausted -> failed.
 }

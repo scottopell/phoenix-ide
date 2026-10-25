@@ -45,3 +45,9 @@ Tool availability is separated from retained declarations and historical calls. 
 **Progress:** All listed requirements complete.
 
 Active Responses exchanges retain original output envelopes, including assistant phase, through tool rounds, retry, and restart. Settled public history does not yet retain provider-owned assistant phase; that separate limitation is tracked in task 41010. Existing historical tools whose authentic declarations were never captured require catalog reconnection before valid replay.
+
+## Capacity-policy specification
+
+REQ-LLM-004j–004m and clarified REQ-LLM-004f are specified, not runtime-qualified. Task 44018 tracks implementation. Shared final-request accounting, bounded counting fallback, model-switch replanning and classified prefix diagnostics require implementation and acceptance. ADR-146 records the decisions; no production recovery is claimed.
+
+Independent specs-only review is recorded in `docs/reviews/context-capacity-spec-review.md`. Successor-fit admission and deterministic frozen-operation revision remain implementation gates; the policy package is a draft and must not be treated as fully specified runtime behavior.

@@ -14,3 +14,5 @@ Phoenix owns its local analytics model. Conversation history and `turn_usage` ar
 | REQ-AN-008 | Retry facts deferred until first-class use | Follow-up deferral task |
 | REQ-AN-009 | Outcome facts deferred until first-class use | Follow-up deferral task |
 | REQ-AN-010 | Export from projection | Trajectory-compatible export endpoint |
+
+REQ-AN-011 is specified, not delivered. Task 44018 extends existing request metrics and usage views with capacity accounting and intentional prefix-change explanations; existing TTFT/token/cache surfaces are not evidence that these additions exist.
