@@ -1562,6 +1562,12 @@ AND SHALL protect the accepted predecessor handoff under REQ-BED-020 and instruc
 AND SHALL NOT claim lossless semantic preservation of omitted history or generated summaries
 AND SHALL NOT create a separately maintained decisions or obligations memory authority.
 
+WHEN an authenticated user requests regeneration from a context-exhausted predecessor with no reserved successor
+THE SYSTEM SHALL generate a fresh real summary through the existing continuation operation
+AND SHALL preserve all original transcript and prior summary rows
+AND SHALL apply the ordinary product admission and Close fences
+AND SHALL reject regeneration after a successor is reserved, independently of the wording of the prior summary.
+
 A successful terminal response SHALL remain accepted under REQ-BED-019 even if a hypothetical subsequent request would need compaction. Successor admission, cancellation, automatic-continuation consent, restart ownership, and Close fencing remain governed by their existing contracts.
 
 ### REQ-BED-020b: Useful Successor Capacity and Explicit Handoff Revision
@@ -1580,6 +1586,12 @@ THE SYSTEM SHALL stop automatic progress without retrying an unchanged impossibl
 AND SHALL show the capacity breakdown, whether counts are measured or estimated, and a concrete reduction target
 AND SHALL offer manual handoff editing, explicitly authorized AI shortening, and an explicit model change when those actions are supported and can address the conflict
 AND SHALL distinguish an oversized handoff from irreducible required instructions that handoff editing cannot fix.
+
+WHEN an admitted explicit model change changes the selected model after a recoverable capacity conflict
+THE SYSTEM SHALL replan the retained continuation operation using the changed model and full output reservation
+AND SHALL retain the operation identity while advancing its attempt
+AND SHALL fence results from the replaced runtime
+AND SHALL NOT reauthorize an unchanged capacity plan merely because the same model was selected again.
 
 WHEN the user requests AI shortening
 THE SYSTEM SHALL preserve the original handoff and produce at most one candidate per explicit request

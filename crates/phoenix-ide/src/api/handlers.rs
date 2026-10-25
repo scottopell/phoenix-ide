@@ -5821,6 +5821,16 @@ async fn upgrade_conversation_model(
         }
     };
 
+    let capacity_replan_operation = match &effective_state {
+        ConvState::RecoverableContinuationFailure { failure }
+            if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
+                && conv.model.as_deref() != Some(req.model.as_str()) =>
+        {
+            Some(failure.request.operation_id.clone())
+        }
+        _ => None,
+    };
+
     // Update in DB
     state
         .runtime
@@ -5840,6 +5850,14 @@ async fn upgrade_conversation_model(
         .runtime
         .evict_runtime(&id, crate::runtime::EvictionReason::ModelUpgrade)
         .await;
+
+    if let Some(operation_id) = capacity_replan_operation {
+        state
+            .runtime
+            .admit_continuation_replan_after_model_change(&id, operation_id)
+            .await
+            .map_err(AppError::BadRequest)?;
+    }
 
     tracing::info!(
         conv_id = %id,
@@ -5864,6 +5882,15 @@ async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _product_admission = state
+        .runtime
+        .lock_product_message_admission(parent.product_conversation_id.as_str())
+        .await;
     let admission = state
         .runtime
         .mutation_admission(&id)

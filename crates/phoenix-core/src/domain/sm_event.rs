@@ -671,6 +671,9 @@ pub enum Event {
     UserTriggerContinuation {
         operation_id: String,
     },
+    UserReplanContinuation {
+        operation_id: String,
+    },
 
     // Task approval events (REQ-BED-028)
     /// User responded to a proposed task plan.
@@ -813,6 +816,7 @@ impl Event {
             Event::ContinuationFailed { .. } => "ContinuationFailed",
             Event::ContinuationError { .. } => "ContinuationError",
             Event::UserTriggerContinuation { .. } => "UserTriggerContinuation",
+            Event::UserReplanContinuation { .. } => "UserReplanContinuation",
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
@@ -936,6 +940,9 @@ pub enum CoreEvent {
         resets_at: Option<DateTime<Utc>>,
     },
     UserTriggerContinuation {
+        operation_id: String,
+    },
+    UserReplanContinuation {
         operation_id: String,
     },
     /// Drained steering entries to be persisted as `UserMessage`s mid-conversation.
@@ -1198,6 +1205,11 @@ impl TryFrom<Event> for ParentEvent {
                     operation_id,
                 }))
             }
+            Event::UserReplanContinuation { operation_id } => {
+                Ok(ParentEvent::Core(CoreEvent::UserReplanContinuation {
+                    operation_id,
+                }))
+            }
             Event::SteerDrainedUserMessages { entries } => {
                 Ok(ParentEvent::Core(CoreEvent::SteerDrainedUserMessages {
                     entries,
@@ -1419,6 +1431,11 @@ impl TryFrom<Event> for SubAgentEvent {
                     operation_id,
                 }))
             }
+            Event::UserReplanContinuation { operation_id } => {
+                Ok(SubAgentEvent::Core(CoreEvent::UserReplanContinuation {
+                    operation_id,
+                }))
+            }
             // Sub-agent-only events
             Event::PersistedSubAgentBootstrap => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::PersistedBootstrap,
@@ -1478,6 +1495,7 @@ impl CoreEvent {
             CoreEvent::ContinuationFailed { .. } => "ContinuationFailed",
             CoreEvent::ContinuationError { .. } => "ContinuationError",
             CoreEvent::UserTriggerContinuation { .. } => "UserTriggerContinuation",
+            CoreEvent::UserReplanContinuation { .. } => "UserReplanContinuation",
             CoreEvent::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
         }
     }

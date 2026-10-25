@@ -6697,14 +6697,50 @@ impl RuntimeManager {
         conversation_id: &str,
         operation_id: String,
     ) -> Result<(), String> {
+        self.admit_continuation_trigger(conversation_id, operation_id, false)
+            .await
+    }
+
+    pub(crate) async fn admit_continuation_replan_after_model_change(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        operation_id: String,
+    ) -> Result<(), String> {
+        self.admit_continuation_trigger(conversation_id, operation_id, true)
+            .await
+    }
+
+    async fn admit_continuation_trigger(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        operation_id: String,
+        revised_model: bool,
+    ) -> Result<(), String> {
+        let conversation = self
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if conversation.continued_in_conv_id.is_some() {
+            return Err(
+                "Cannot regenerate a handoff after a successor has been reserved".to_string(),
+            );
+        }
         let handle = self.get_or_create(conversation_id).await?;
         let initial_state = handle.state_rx.borrow().clone();
-        let eligible = matches!(initial_state, ConvState::Idle)
-            || matches!(
-                &initial_state,
-                ConvState::RecoverableContinuationFailure { failure }
-                    if failure.request.operation_id == operation_id
-            );
+        if matches!(&initial_state, ConvState::RecoverableContinuationFailure { failure }
+            if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict && !revised_model)
+        {
+            return Err("This capacity plan cannot fit unchanged. Review a revised handoff or explicitly change the model before replanning.".to_string());
+        }
+        let eligible = matches!(
+            initial_state,
+            ConvState::Idle | ConvState::ContextExhausted { .. }
+        ) || matches!(
+            &initial_state,
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.request.operation_id == operation_id
+        );
         if !eligible {
             return Err(format!(
                 "Cannot trigger continuation while conversation is {}",
@@ -6717,7 +6753,11 @@ impl RuntimeManager {
         handle
             .acknowledged_event_tx
             .send(AcknowledgedEventRequest {
-                event: Event::UserTriggerContinuation { operation_id },
+                event: if revised_model {
+                    Event::UserReplanContinuation { operation_id }
+                } else {
+                    Event::UserTriggerContinuation { operation_id }
+                },
                 acknowledgement: ack_tx,
                 retirement: retirement_rx,
             })
@@ -12024,6 +12064,75 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn continuation_retry_rejects_unchanged_capacity_conflict() {
+        let manager = Arc::new(test_manager().await);
+        let id = "fixed-capacity-admission";
+        manager
+            .db()
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                id,
+                &ConvState::RecoverableContinuationFailure {
+                    failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                            operation_id: "fixed".to_string(),
+                            rejected_tool_calls: vec![],
+                            attempt: 1,
+                        },
+                        error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+                        message: "cannot fit".to_string(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .admit_continuation_retry(id, "fixed".to_string())
+            .await
+            .unwrap_err()
+            .contains("cannot fit unchanged"));
+        assert!(matches!(
+            manager.db().get_conversation(id).await.unwrap().state,
+            ConvState::RecoverableContinuationFailure { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn continuation_regeneration_rejects_existing_successor() {
+        let manager = Arc::new(test_manager().await);
+        let id = "successor-recovery-admission";
+        manager
+            .db()
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                id,
+                &ConvState::ContextExhausted {
+                    summary: "legacy".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        manager.db().continue_conversation(id).await.unwrap();
+        assert!(manager
+            .admit_continuation_retry(id, "new".to_string())
+            .await
+            .unwrap_err()
+            .contains("successor"));
+        assert!(matches!(
+            manager.db().get_conversation(id).await.unwrap().state,
+            ConvState::ContextExhausted { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn continuation_retry_admission_waits_for_executor_acknowledgement() {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "retry-admission";
@@ -12057,11 +12166,22 @@ mod scope_liveness_tests {
             .await
             .unwrap();
         state_rx.changed().await.unwrap();
-        assert!(
-            matches!(state_rx.borrow().clone(), ConvState::AwaitingContinuation { request: persisted } if persisted.operation_id == request.operation_id)
-        );
-        assert!(
-            matches!(manager.db().get_conversation(conversation_id).await.unwrap().state, ConvState::AwaitingContinuation { request: persisted } if persisted.operation_id == request.operation_id)
+        let observed = state_rx.borrow().clone();
+        let accepted_request = match &observed {
+            ConvState::AwaitingContinuation { request } => request,
+            ConvState::RecoverableContinuationFailure { failure } => &failure.request,
+            other => panic!("retry admission must retain its operation: {other:?}"),
+        };
+        assert_eq!(accepted_request.operation_id, request.operation_id);
+        assert_eq!(accepted_request.attempt, 2);
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            observed
         );
     }
 

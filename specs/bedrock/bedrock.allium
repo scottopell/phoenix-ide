@@ -1616,8 +1616,8 @@ rule UserDismissesQuestion {
 -- PARENT 7. CONTEXT CONTINUATION (REQ-BED-019 through 024)
 -- ===========================================================
 
--- Manual continuation is user-gated only by idle status. The UI warning
--- threshold changes indicator styling; it does not hide this action.
+-- The UI warning threshold changes indicator styling; it does not hide
+-- manual continuation from an idle conversation.
 rule UserTriggersContinuation {
     when: UserTriggersContinuation(conversation, operation_id)
     requires: conversation.core_status = idle
@@ -1627,6 +1627,24 @@ rule UserTriggersContinuation {
     ensures: conversation.retry_attempt = 1
     ensures: ContinuationOperationPersisted(conversation, operation_id)
     ensures: ContinuationRequested(conversation, operation_id, {})
+}
+
+rule UserRegeneratesExhaustedContinuation {
+    when: UserTriggersContinuation(conversation, operation_id)
+    requires: conversation.parent_status = context_exhausted
+    requires: conversation.continued_in_conv_id = absent
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: conversation.rejected_tool_calls = {}
+    ensures: conversation.retry_attempt = 1
+    ensures: ContinuationOperationPersisted(conversation, operation_id)
+    ensures: ContinuationRequested(conversation, operation_id, {})
+
+    @guidance
+        -- Apply ordinary product mutation and Close admission before dispatch.
+        -- Preserve the transcript, including the prior summary boundary row.
+        -- Regeneration depends on lifecycle state and successor absence, never
+        -- on the wording or origin of the existing summary.
 }
 
 rule ContinuationSummaryReceived {
