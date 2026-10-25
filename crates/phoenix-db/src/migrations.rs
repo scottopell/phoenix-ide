@@ -15208,6 +15208,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (138, "federation_local_stop_acceptance"),
             (137, "goal_start_materialization_witness"),
             (136, "per_goal_execution_requests"),
             (135, "local_watch_goal_capture"),
