@@ -1,6 +1,6 @@
 # Isolated Coordinator drive evaluation
 
-Opt-in action evaluation, not a general evaluation platform. See [RESULTS.md](RESULTS.md) for the 18 initial plus 8 reserved follow-up trials, limitations, returned usage, and the pending human prose review.
+Opt-in action evaluation, not a general evaluation platform. See [RESULTS.md](RESULTS.md) for the 18 initial plus 8 reserved follow-up trials, limitations, returned usage, and the user's rejection of both representative prose samples.
 
 The ignored Rust integration test uses the real `ModelRegistry`/`LlmService` provider path but **never imports application tools**. Four deterministic fake tools inspect fixed synthetic rows/history, record accepted/queued owner messages, or suspend for a structured question. No SQL is executed; no real worker, process, mutation API, or database is reachable. Expected outcomes are kept separate from model-visible fixture data.
 
@@ -25,12 +25,12 @@ Each trial currently allows ten provider calls, 120 seconds per call, and 3072 o
 
 ## Variants
 
-- A: checkout-native coordinator prompt and exact baseline UI read-only button.
-- B: the same native prompt with a bounded active-coordination button in the four check-in cases.
+- A: frozen checkout-native coordinator prompt and exact evaluated read-only button.
+- B: the same frozen prompt with the evaluated bounded active-coordination button in the four check-in cases.
 - C: B plus initial appended principles.
 - C2: B plus revised consolidated principles, replacing the conflicting unconditional receipt-reporting rule.
 
-The subscription and continuation cases do **not** use the button; their A/B inputs are identical. The baseline is checkout-derived, not verified production-equivalent. Current fixtures are the revised follow-up fixtures; use recorded snapshots or the original commit for the original experiment. Do not silently compare changed fixtures, budgets, or baselines.
+The subscription and continuation cases do **not** use the button; their A/B inputs are identical. The baseline is checkout-derived, not verified production-equivalent. `baseline-system-prompt.txt` is copied from the initial A trial and remains the source for historical variant construction after production prompt edits; the fixture buttons also remain unchanged. The selected product wording is not a fifth evaluated variant. Current fixtures are the revised follow-up fixtures; use recorded snapshots or the original commit for the original experiment. Do not silently compare changed fixtures, budgets, or baselines.
 
 ## Deterministic regressions
 
@@ -40,7 +40,7 @@ cargo clippy -p phoenix-llm --test coordinator_drive_eval -- -D warnings
 python3 scripts/qa/coordinator-drive-eval/test_fixtures.py
 ```
 
-These cover fixture/rubric separation, baseline button parity, bounded calls, recorded raw responses/results, unknown tools/targets, no-effects AUQ batch rejection, question suspension, exact message anchors, end-of-history, and the revised receipt rule. They do not replace live behavioral evaluation or human review.
+These cover fixture/rubric separation, archived baseline parity, bounded calls, recorded raw responses/results, unknown tools/targets, no-effects AUQ batch rejection, question suspension, exact message anchors, end-of-history, and the archived revised receipt rule. They do not qualify the selected product wording or replace human review.
 
 ## Simulation limits
 

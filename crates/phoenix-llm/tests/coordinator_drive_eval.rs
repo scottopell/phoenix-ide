@@ -5,7 +5,6 @@ use phoenix_core::{
         provider_replay::{AnthropicReplayPayload, ProviderReplayUpdate},
         tool_availability::ToolAvailability,
     },
-    llm_language::{coordinator_prompt, LlmLanguage},
     runtime_env::PhoenixRuntimeEnvironment,
 };
 use phoenix_llm::{
@@ -18,6 +17,9 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 const FIXTURE: &str = include_str!("../../../scripts/qa/coordinator-drive-eval/fixtures.json");
 const BUTTON_SOURCE: &str = include_str!("../../../ui/src/pages/coordinatorBriefing.ts");
+// Exact system prompt carried in the initial A trial, not the evolving product prompt.
+const EVALUATED_BASELINE: &str =
+    include_str!("../../../scripts/qa/coordinator-drive-eval/baseline-system-prompt.txt");
 const CALL_LIMIT: usize = 10;
 const OUTPUT_TOKENS: u32 = 3072;
 
@@ -99,7 +101,7 @@ fn tools() -> Vec<ToolDefinition> {
 }
 
 fn system(variant: &Variant) -> String {
-    let mut prompt = coordinator_prompt(LlmLanguage::PhoenixNative).to_string();
+    let mut prompt = EVALUATED_BASELINE.trim_end_matches('\n').to_string();
     if variant.replace_receipt_rule {
         prompt = prompt.replace(
             "Message only when intervention is useful, report every target's committed result independently, and never imply recipient understanding, acknowledgement, execution, or completion.",
@@ -446,10 +448,25 @@ async fn run_trial(
 #[test]
 fn frozen_baseline_and_hidden_expectations() {
     let fixture = fixture();
-    assert!(BUTTON_SOURCE.contains(&format!(
-        "COORDINATOR_BRIEFING_PROMPT = '{}'",
-        fixture.variants["A"].button
-    )));
+    assert!(BUTTON_SOURCE.contains("label: 'Check in & drive'"));
+    assert!(BUTTON_SOURCE.contains("including idle owners"));
+    assert!(!BUTTON_SOURCE.contains("Do not send messages, change anything"));
+    let evaluated: Value = serde_json::from_str(include_str!(
+        "../../../scripts/qa/coordinator-drive-eval/results/initial/idle_owner-A-1.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        system(&fixture.variants["A"]),
+        evaluated["system_prompt"].as_str().unwrap()
+    );
+    let evaluated_c2: Value = serde_json::from_str(include_str!(
+        "../../../scripts/qa/coordinator-drive-eval/results/followup/quiet_subscription-C2-1.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        system(&fixture.variants["C2"]),
+        evaluated_c2["system_prompt"].as_str().unwrap()
+    );
     assert_eq!(fixture.variants["B"].button, fixture.variants["C"].button);
     assert!(fixture.variants["C"].principles.is_some());
     for id in ["quiet_subscription", "continuation_pause"] {

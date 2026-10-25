@@ -49,7 +49,7 @@ vi.mock('./ProductConversationPage', () => ({
         {globalShell?.stateBarExtension?.details}
       </div>
       {globalShell?.composerQuickAction && (
-        <button type="button" data-prompt={globalShell.composerQuickAction.prompt}>
+        <button type="button" aria-label={globalShell.composerQuickAction.label} data-prompt={globalShell.composerQuickAction.prompt}>
           {globalShell.composerQuickAction.compactLabel}
           <span className="sr-only">{globalShell.composerQuickAction.label}</span>
         </button>
@@ -197,14 +197,16 @@ describe('CoordinatorPage', () => {
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
   });
 
-  it('mounts only the shared conversation runtime with the briefing action', async () => {
+  it('wires the active check-in through the shared conversation runtime', async () => {
     renderPage();
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    const action = screen.getByRole('button', { name: /Brief me/ });
+    const action = screen.getByRole('button', { name: 'Check in & drive' });
     expect(action).toHaveAttribute('data-prompt', COORDINATOR_BRIEFING_PROMPT);
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('fresh current-work facts through query_database');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages, change anything, or start a polling loop.');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('including idle owners');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('resuming them within already-approved scope');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Respect later pauses and real decision gates');
+    expect(COORDINATOR_BRIEFING_PROMPT).not.toContain('Do not send messages');
 
     expect(screen.queryByRole('heading', { name: 'Coordinator' })).not.toBeInTheDocument();
     expect(screen.queryByRole('tablist', { name: 'Coordinator view' })).not.toBeInTheDocument();

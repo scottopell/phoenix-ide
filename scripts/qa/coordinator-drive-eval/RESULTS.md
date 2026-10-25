@@ -2,9 +2,9 @@
 
 ## Decision state
 
-Evaluation complete: 18 initial trials plus the 8 reserved follow-up trials. No further billed trials are planned. Human prose preference is pending before final prompt selection and product changes. The task remains in progress; no button/system/continuation changes have been shipped or deployed.
+Evaluation complete: 18 initial trials plus the eight reserved follow-up trials. The user rejected both representative reports as opaque and procedural, asking for problem → intervention → direction and limits only when material. The final product wording is informed by the experiment and that preference, not live-qualified by it. No further billed trials were run. The task remains in progress pending review and landing; nothing here claims deployment.
 
-Provisional direction: the active button earns its change; merely appending principles does not. The revised consolidated system candidate resolves a conflicting mandatory receipt-reporting sentence and appears useful for quiet event handling and executive orientation, but its prose remains long. Keep continuation generation/wrappers unchanged unless subsequent evidence warrants changing them: this experiment does not demonstrate a defect in the current continuation prompt.
+Selected direction: an active bounded check-in, compact owner-driving principles and conditional delivery reporting. Do not ship C2 verbatim: it exhibited useful coordination in the synthetic samples but failed the user's prose test. Only the continuation system summary receives a small reporting-preferences addition; generation/wrappers are unchanged. Neither that addition nor final product phrasing was live-tested.
 
 ## Method and boundaries
 
@@ -13,7 +13,7 @@ Provisional direction: the active button earns its change; merely appending prin
 - Six synthetic scenarios. Actual tool-call requests run through a deterministic in-memory dispatcher. No application tools, SQL engine, live DB, worker messaging, mutation API, shell execution, deployment, or production side effects exist in the evaluation.
 - Fake SQL returns fixed case rows regardless of query. This tests decisions using supplied facts, not SQL correctness. Fake sends record accepted/queued requests, not delivery, acknowledgement, execution, or completion. Fake AUQ is the sole tool in its response and suspends the trial.
 - Expected outcomes are separate from model-visible inputs. All initial/follow-up messages, system prompts, tool schemas, tool results, actions, termination, and returned usage are preserved under `results/`.
-- Four review axes: forward motion, authority judgment, communication judgment, understandability. Baseline instruction compliance is separate from desired product fitness: obeying the old read-only button is correct compliance, but does not drive work. Censored outcomes remain unknown rather than counted as refusals. Independent read-only reviews checked actions, authority, communication, and limitations; the user will judge representative prose with candidate labels hidden.
+- Four review axes: forward motion, authority judgment, communication judgment, understandability. Baseline instruction compliance is separate from desired product fitness: obeying the old read-only button is correct compliance, but does not drive work. Censored outcomes remain unknown rather than counted as refusals. Independent read-only reviews checked actions, authority, communication, and limitations; subsequent human review rejected both representative prose samples.
 
 ## Initial batch
 
@@ -73,4 +73,4 @@ Usage columns are reported provider fields, not additive billing categories. One
 
 ## Landing gate
 
-Obtain the user's blinded prose preference, then consolidate the smallest supported button/system change and align both language variants, normative active-check-in requirements, executive status, ADR as appropriate, UI wiring tests, and prompt/eval snapshot regressions. Run appropriate validation/review and the normal PR landing path. No production restart/deployment is authorized. Do not mark the entire task complete from this evaluation report.
+Human preference is settled: neither sample's procedural prose should ship. The product consolidation changes both language prompts, the active button, a minimal continuation-summary reporting preference, specs and regressions. A frozen copy of the initial A system prompt preserves historical A/B/C and C2 variant construction despite later production edits. Final wording is not another evaluated variant. Focused checks, independent review and the normal PR landing path remain; no production restart/deployment is authorized. Do not mark the task complete from synthetic results or source edits alone.
