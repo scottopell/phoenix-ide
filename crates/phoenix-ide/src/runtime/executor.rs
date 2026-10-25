@@ -2603,6 +2603,11 @@ where
         self
     }
 
+    pub(crate) fn with_model_route_switch(mut self, changed: bool) -> Self {
+        self.capacity_prefix_tracker = capacity::PrefixTracker::after_model_switch(changed);
+        self
+    }
+
     pub(crate) fn with_exhausted_maintenance(mut self, enabled: bool) -> Self {
         self.exhausted_maintenance = enabled;
         self
@@ -9750,8 +9755,21 @@ where
         Ok(None)
     }
 
-    #[allow(clippy::too_many_lines)] // Shared complete prompt and tool declaration assembly.
     async fn prepare_ordinary_overhead(
+        &mut self,
+    ) -> Result<(String, Vec<phoenix_llm::ToolDefinition>), String> {
+        let (mut system, tools) = self.prepare_overhead_without_recall().await?;
+        if let Some((service, binding)) = &self.previous_transcripts {
+            if let Some(orientation) = service.previous_transcripts_orientation(binding).await {
+                system.push_str("\n\n");
+                system.push_str(&orientation);
+            }
+        }
+        Ok((system, tools))
+    }
+
+    #[allow(clippy::too_many_lines)] // Shared complete prompt and tool declaration assembly.
+    async fn prepare_overhead_without_recall(
         &mut self,
     ) -> Result<(String, Vec<phoenix_llm::ToolDefinition>), String> {
         let tool_executor = self.tool_executor.clone();
@@ -9858,12 +9876,6 @@ where
                 "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
             );
         }
-        if let Some((service, binding)) = &self.previous_transcripts {
-            if let Some(orientation) = service.previous_transcripts_orientation(binding).await {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(&orientation);
-            }
-        }
         Ok((system_prompt, available_tools))
     }
 
@@ -9873,9 +9885,15 @@ where
         &mut self,
     ) -> Result<(String, Vec<phoenix_llm::ToolDefinition>), String> {
         let predecessor_turn = self.ordinary_turn_context.take();
-        let result = self.prepare_ordinary_overhead().await;
+        let result = self.prepare_overhead_without_recall().await;
         self.ordinary_turn_context = predecessor_turn;
-        result
+        let (mut system, tools) = result?;
+        if let Some((service, binding)) = &self.previous_transcripts {
+            let orientation = service.successor_transcripts_orientation(binding).await;
+            system.push_str("\n\n");
+            system.push_str(&orientation);
+        }
+        Ok((system, tools))
     }
 
     #[cfg(test)]
@@ -16323,6 +16341,98 @@ mod authoritative_user_message_effect_tests {
         let transcript = storage.get_messages(&conv).await.unwrap();
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].content, MessageContent::user(large_input));
+    }
+
+    #[tokio::test]
+    async fn first_successor_projection_matches_actual_recall_topology_at_handoff_limit() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        rt.context.execution_environment =
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                working_dir: directory.path().to_path_buf(),
+            };
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("conv-direct", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let service = crate::api::global_read::GlobalReadService::new(
+            db.clone(),
+            Arc::new(db.fts_retriever()),
+        );
+        rt = rt.with_previous_transcripts(
+            service.clone(),
+            crate::api::global_read::PreviousTranscriptsBinding::new(
+                root.product_conversation_id.clone(),
+                root.id.clone(),
+            ),
+        );
+        rt.state = ConvState::ContextExhausted {
+            summary: "handoff".into(),
+        };
+        let (root_system, _) = rt.prepare_ordinary_overhead().await.unwrap();
+        assert!(!root_system.contains("Predecessor transcript recall is available"));
+        let (projected_system, projected_tools) = rt.prepare_successor_overhead().await.unwrap();
+        assert!(projected_system.contains("Immediate predecessor: @transcript:conv-direct"));
+        assert_eq!(rt.prepare_ordinary_overhead().await.unwrap().0, root_system);
+
+        let review = rt
+            .review_handoff("handoff".into(), false, None)
+            .await
+            .unwrap();
+        let target = review.source.handoff_target_tokens().unwrap();
+        let mut length = target * CHARS_PER_TOKEN_ESTIMATE;
+        while estimate_successor_handoff_tokens(&"x".repeat(length)) > target {
+            length -= 1;
+        }
+        let handoff = "x".repeat(length);
+        assert_eq!(estimate_successor_handoff_tokens(&handoff), target);
+        let boundary_review = rt.review_handoff(handoff, false, None).await.unwrap();
+        assert!(boundary_review.source.fits());
+
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = 'context_exhausted' WHERE id = ?2",
+        )
+        .bind(serde_json::to_string(&rt.state).unwrap())
+        .bind(&root.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) =
+            db.continue_conversation(&root.id).await.unwrap()
+        else {
+            panic!("expected first continuation");
+        };
+        rt.context.conversation_id = successor.id.clone();
+        rt = rt.with_previous_transcripts(
+            service,
+            crate::api::global_read::PreviousTranscriptsBinding::new(
+                root.product_conversation_id,
+                successor.id,
+            ),
+        );
+        rt.ordinary_turn_context = None;
+        let (actual_system, actual_tools) = rt.prepare_ordinary_overhead().await.unwrap();
+        assert_eq!(projected_system, actual_system);
+        assert_eq!(
+            serde_json::to_value(projected_tools).unwrap(),
+            serde_json::to_value(&actual_tools).unwrap()
+        );
+        let actual_overhead = estimate_fixed_request_tokens(
+            &actual_system,
+            &phoenix_core::domain::tool_availability::ToolAvailability::all(actual_tools),
+        ) + MESSAGE_OVERHEAD_TOKENS;
+        assert_eq!(
+            boundary_review.source.required_overhead_tokens,
+            actual_overhead
+        );
+        assert_eq!(
+            rt.context.context_window - actual_overhead - rt.context.output_budget - target,
+            boundary_review.source.successor_working_room_tokens
+        );
     }
 
     #[tokio::test]

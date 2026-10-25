@@ -462,6 +462,17 @@ mod tests {
             RequestPlanOutcome::Ready,
             std::time::Instant::now(),
         );
+        let mut switched_tracker = PrefixTracker::after_model_switch(true);
+        switched_tracker.observe(&request, "new route", &mut plan, false, false, false);
+        assert_eq!(plan.prefix_comparison, PrefixComparison::Unknown);
+        assert_eq!(
+            plan.prefix_change_causes,
+            vec![PrefixChangeCause::ModelRouteSwitch]
+        );
+        switched_tracker.observe(&request, "new route", &mut plan, false, false, false);
+        assert_eq!(plan.prefix_comparison, PrefixComparison::Unchanged);
+        assert!(plan.prefix_change_causes.is_empty());
+        plan.prefix_comparison = PrefixComparison::Unknown;
         let mut tracker = PrefixTracker::default();
         tracker.observe(
             &request,
@@ -622,6 +633,7 @@ impl InputAccounting {
 #[derive(Default)]
 pub(super) struct PrefixTracker {
     previous: Option<PrefixSnapshot>,
+    pending_model_switch: bool,
 }
 struct PrefixSnapshot {
     system: u64,
@@ -648,6 +660,13 @@ fn fingerprint(value: &impl serde::Serialize) -> u64 {
 }
 
 impl PrefixTracker {
+    pub(super) fn after_model_switch(changed: bool) -> Self {
+        Self {
+            previous: None,
+            pending_model_switch: changed,
+        }
+    }
+
     pub(super) fn observe(
         &mut self,
         request: &LlmRequest,
@@ -688,6 +707,9 @@ impl PrefixTracker {
                 .collect(),
         };
         let mut causes = vec![];
+        if std::mem::take(&mut self.pending_model_switch) {
+            causes.push(PrefixChangeCause::ModelRouteSwitch);
+        }
         if clearing {
             causes.push(PrefixChangeCause::Clearing);
         }

@@ -220,9 +220,8 @@ pub struct SubAgentCancelRequest {
 /// message instead of always blaming a server restart (task 02710).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionReason {
-    /// The conversation's model was changed; the runtime is recreated so the
-    /// new model takes effect.
-    ModelUpgrade,
+    /// Recreate the runtime after a model or inference-configuration update.
+    ModelUpgrade { model_changed: bool },
     /// Async creation finished provisioning cwd/mode/model metadata; recreate
     /// any shell runtime so it uses the provisioned conversation row.
     CreationProvisioned,
@@ -724,20 +723,9 @@ pub struct RuntimeManager {
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
     aggregate_event_tx: broadcast::Sender<SseEvent>,
     startup_obligated_conversations: RwLock<HashSet<String>>,
-    /// Why each pending-eviction runtime was evicted, keyed by conversation
-    /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
-    /// by the next `get_or_create` so the auto-continue recovery message says
-    /// "model was upgraded" rather than "server restart" (task 02710). A plain
-    /// in-process server restart clears this map, so absence = server restart.
-    /// A set, not a map: model upgrade is currently the only eviction cause;
-    /// add a `HashMap<String, EvictionReason>` if a second cause appears.
-    ///
-    /// Lifetime is bounded and self-limiting: consumed by the next
-    /// `get_or_create`, dropped by `take_evicted_broadcaster` on hard-delete,
-    /// and the whole in-memory set is gone on process restart. Worst case is
-    /// a handful of small `String`s for conversations evicted-for-upgrade but
-    /// never re-accessed within one process lifetime — not worth a TTL.
-    evicted_model_upgrades: RwLock<HashSet<String>>,
+    /// Pending model-configuration evictions; each value records whether an
+    /// admitted model switch occurred before runtime recreation.
+    evicted_model_upgrades: RwLock<HashMap<String, bool>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
     spawn_rx: RwLock<Option<mpsc::Receiver<SubAgentSpawnRequest>>>,
@@ -2603,7 +2591,7 @@ impl RuntimeManager {
             evicted_broadcasters: RwLock::new(HashMap::new()),
             aggregate_event_tx,
             startup_obligated_conversations: RwLock::new(HashSet::new()),
-            evicted_model_upgrades: RwLock::new(HashSet::new()),
+            evicted_model_upgrades: RwLock::new(HashMap::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
@@ -6001,11 +5989,12 @@ impl RuntimeManager {
         // Consume any recorded model-upgrade eviction for this conversation.
         // Drives the wording of the auto-continue recovery message below
         // (task 02710).
-        let evicted_for_model_upgrade = self
+        let model_upgrade = self
             .evicted_model_upgrades
             .write()
             .await
             .remove(conversation_id);
+        let evicted_for_model_upgrade = model_upgrade.is_some();
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -6349,6 +6338,7 @@ impl RuntimeManager {
             .with_handoff_review_receiver(handoff_review_rx);
 
         let runtime = runtime
+            .with_model_route_switch(model_upgrade.unwrap_or(false))
             .with_exhausted_maintenance(exhausted_maintenance)
             .with_startup_llm_recovery(startup_llm_recovery)
             .with_startup_llm_recovery_ack(startup_llm_recovery_ack_tx)
@@ -6678,11 +6668,13 @@ impl RuntimeManager {
         // next get_or_create recreates the conversation with the new model and
         // its recovery message should name the real cause (task 02710).
         match reason {
-            EvictionReason::ModelUpgrade => {
+            EvictionReason::ModelUpgrade { model_changed } => {
                 self.evicted_model_upgrades
                     .write()
                     .await
-                    .insert(conversation_id.to_string());
+                    .entry(conversation_id.to_string())
+                    .and_modify(|changed| *changed |= model_changed)
+                    .or_insert(model_changed);
             }
             EvictionReason::CreationProvisioned
             | EvictionReason::SteeringReconciliation
@@ -16651,7 +16643,13 @@ mod scope_liveness_tests {
                 .unwrap();
             let original = mgr.get_or_create(id).await.unwrap();
             assert_eq!(*original.state_rx.borrow(), expected);
-            mgr.evict_runtime(id, EvictionReason::ModelUpgrade).await;
+            mgr.evict_runtime(
+                id,
+                EvictionReason::ModelUpgrade {
+                    model_changed: false,
+                },
+            )
+            .await;
             let recreated = mgr.get_or_create(id).await.unwrap();
             assert!(!Arc::ptr_eq(&original.identity, &recreated.identity));
             assert_eq!(*recreated.state_rx.borrow(), expected);

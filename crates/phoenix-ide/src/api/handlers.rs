@@ -5874,7 +5874,12 @@ async fn upgrade_conversation_model(
     // Evict the active runtime so it gets recreated with the new model
     state
         .runtime
-        .evict_runtime(&id, crate::runtime::EvictionReason::ModelUpgrade)
+        .evict_runtime(
+            &id,
+            crate::runtime::EvictionReason::ModelUpgrade {
+                model_changed: old_effective_model != req.model,
+            },
+        )
         .await;
 
     if capacity_replan_request.is_some() {
@@ -16862,7 +16867,12 @@ pub(crate) mod hard_delete_cascade_tests {
         drop(parent_rx);
         state
             .runtime
-            .evict_runtime("wl-parent", crate::runtime::EvictionReason::ModelUpgrade)
+            .evict_runtime(
+                "wl-parent",
+                crate::runtime::EvictionReason::ModelUpgrade {
+                    model_changed: false,
+                },
+            )
             .await;
 
         run_hard_delete_cascade(&state, "wl-parent")
@@ -17800,8 +17810,9 @@ mod upgrade_model_state_guard_tests {
         state.runtime.start_direct_turn_worker().await.unwrap();
         let id = "model-switch-dispatch";
         seed(&state, id).await;
-        for (index, (model, context, output)) in
-            [models[0], models[1], models[0]].into_iter().enumerate()
+        for (index, (model, context, output)) in [models[0], models[1], models[0], models[0]]
+            .into_iter()
+            .enumerate()
         {
             if index > 0 {
                 upgrade(&state, id, model).await.unwrap();
@@ -17813,7 +17824,7 @@ mod upgrade_model_state_guard_tests {
                 "Keep the correction and unfinished work.",
             )
             .await;
-            let plans = sqlx::query("SELECT model,context_window_tokens,output_reservation_tokens,outcome FROM request_capacity_plans WHERE conversation_id=? AND kind='ordinary' ORDER BY rowid")
+            let plans = sqlx::query("SELECT plan_id,model,context_window_tokens,output_reservation_tokens,outcome,prefix_comparison FROM request_capacity_plans WHERE conversation_id=? AND kind='ordinary' ORDER BY rowid")
                 .bind(id).fetch_all(state.db.pool()).await.unwrap();
             assert_eq!(plans.len(), index + 1);
             let plan = &plans[index];
@@ -17828,6 +17839,11 @@ mod upgrade_model_state_guard_tests {
             );
             assert_eq!(plan.get::<String, _>("outcome"), "ready");
             assert_eq!(requests.lock().unwrap()[index], (model.to_owned(), output));
+            assert_eq!(plan.get::<String, _>("prefix_comparison"), "unknown");
+            let causes: Vec<String> = sqlx::query_scalar(
+                "SELECT cause FROM request_prefix_change_causes WHERE plan_id=? AND cause='model_route_switch'",
+            ).bind(plan.get::<String, _>("plan_id")).fetch_all(state.db.pool()).await.unwrap();
+            assert_eq!(causes.len(), usize::from(index == 1 || index == 2));
         }
         upgrade(&state, id, models[1].0).await.unwrap();
         let pressure_input =
@@ -17835,7 +17851,7 @@ mod upgrade_model_state_guard_tests {
         ordinary_turn(&state, id, "downgrade-pressure", &pressure_input).await;
         assert_eq!(
             requests.lock().unwrap().len(),
-            4,
+            5,
             "ordinary overflow must enter one real summary request"
         );
         let plan = sqlx::query("SELECT model,context_window_tokens,output_reservation_tokens,outcome FROM request_capacity_plans WHERE conversation_id=? AND kind='ordinary' ORDER BY rowid DESC LIMIT 1")
@@ -17853,7 +17869,7 @@ mod upgrade_model_state_guard_tests {
             8_000
         );
         assert_eq!(summary_plan.get::<String, _>("outcome"), "ready");
-        assert_eq!(requests.lock().unwrap()[3], (models[1].0.to_owned(), 8_000));
+        assert_eq!(requests.lock().unwrap()[4], (models[1].0.to_owned(), 8_000));
         let messages = state.db.get_messages(id).await.unwrap();
         assert!(
             messages.iter().any(|message| matches!(
