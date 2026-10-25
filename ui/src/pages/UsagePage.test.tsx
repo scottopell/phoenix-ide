@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UsagePage } from './UsagePage';
@@ -19,6 +19,7 @@ vi.mock('../api', async () => {
 });
 
 const overview: UsageOverview = {
+  capacity: { sample_limit: 200, local_refusals: 0, comparable_input_count: 0, mean_local_prediction_error_tokens: null, recent: [] },
   generated_at: '2025-08-11T00:00:00+00:00',
   windows: {
     today: { input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, total_tokens: 0, turns: 1, cost: { estimated_usd: 0, pricing_known: true, unknown_turns: 0 } },
@@ -146,6 +147,18 @@ describe('UsagePage TTFT hero', () => {
     expect(screen.getByText('No token usage recorded yet.')).toBeInTheDocument();
     expect(screen.getByText('TTFT samples')).toBeInTheDocument();
     expect(screen.getByText('No-token success')).toBeInTheDocument();
+  });
+
+  it('shows capacity evidence in overview and conversation drilldown', async () => {
+    vi.mocked(api.usageOverview).mockResolvedValue({ ...overview, conversations: [{ root_conversation_id: 'conv', label: 'Capacity conversation', slug: null, project_id: null, started_at: '2026-10-25T00:00:00Z', worktree: null, totals: overview.windows.all }] });
+    vi.mocked(api.usageConversationDetail).mockResolvedValue({ root_conversation_id: 'conv', totals: overview.windows.all, turns: [], capacity: { ...overview.capacity, sample_limit: 25 } });
+    vi.mocked(api.analyticsTrajectoryExport).mockRejectedValue(new Error('export unavailable'));
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    await screen.findByText('Request capacity');
+    fireEvent.click(await screen.findByRole('button', { name: /Capacity conversation/ }));
+    await waitFor(() => expect(screen.getAllByText('Request capacity')).toHaveLength(2));
+    expect(screen.getByText(/up to 25/)).toBeInTheDocument();
+    expect(screen.getByText(/up to 200/)).toBeInTheDocument();
   });
 
   it('shows request failures', async () => {

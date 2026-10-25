@@ -14,5 +14,8 @@ Phoenix owns its local analytics model. Conversation history and `turn_usage` ar
 | REQ-AN-008 | Retry facts deferred until first-class use | Follow-up deferral task |
 | REQ-AN-009 | Outcome facts deferred until first-class use | Follow-up deferral task |
 | REQ-AN-010 | Export from projection | Trajectory-compatible export endpoint |
+| REQ-AN-011 | Explain capacity and cache boundaries | Relational prepared-plan diagnostics and existing `/usage` overview/conversation projections; expandable capacity UI |
 
-REQ-AN-011 is specified, not delivered. Task 44018 extends existing request metrics and usage views with capacity accounting and intentional prefix-change explanations; existing TTFT/token/cache surfaces are not evidence that these additions exist.
+REQ-AN-011 has source-ready backend diagnostics and a capacity section in the existing Usage overview and conversation drilldown. The UI labels its bounded recent sample, separates local refusals from unknown dispatch, distinguishes conservative local estimates, direct provider counts, and Anthropic estimates, and preserves missing observations separately from reported zero. Expandable details show full input/output allocation, reduction, comparable counting errors, planning time, provider TTFT, observed cache usage, known prefix-change causes, and exact preparation identity. Complete input already includes cached input. Prefix changes do not establish provider cache-miss causes or preserved understanding.
+
+Deterministic UI tests cover bounded sampling, missing versus zero usage/timing, complete-input accounting, local refusal versus unknown ready dispatch, multiple prefix-change causes, counting sources, and overview/drilldown integration. Shared typecheck/build and browser qualification remain integration gates; no production deployment, measured cache evaluation, or semantic-continuity acceptance is claimed. Task 44018 tracks the broader implementation and qualification.
