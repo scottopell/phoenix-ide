@@ -47,7 +47,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+mod capacity;
 mod continuation;
+use capacity::{CapacityDecision, RequestCapacity, SuccessorCapacity};
 #[cfg(test)]
 mod provider_tool_policy_tests;
 use continuation::{
@@ -1872,7 +1874,9 @@ fn sub_agent_terminal_cause(outcome: &SubAgentOutcome) -> phoenix_db::SubAgentTe
             crate::db::ErrorKind::TurnLimitExhausted => {
                 phoenix_db::SubAgentTerminalCause::TurnLimit
             }
-            crate::db::ErrorKind::ContextExhausted => {
+            crate::db::ErrorKind::ContextExhausted
+            | crate::db::ErrorKind::PlannedContextPressure
+            | crate::db::ErrorKind::ContextCapacityConflict => {
                 phoenix_db::SubAgentTerminalCause::ContextExhausted
             }
             crate::db::ErrorKind::SubAgentError => phoenix_db::SubAgentTerminalCause::SubmitError,
@@ -8096,7 +8100,6 @@ where
             .clone()
             .freeze_for_request()
             .map_err(|error| error.to_string())?;
-        let tool_executor = self.tool_executor.clone();
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -8119,28 +8122,8 @@ where
         let request_output_tokens = u32::try_from(self.context.output_budget).map_err(|_| {
             "Resolved output budget cannot be represented by provider APIs".to_string()
         })?;
-        let working_dir = self
-            .context
-            .execution_environment
-            .working_dir()
-            .map(Path::to_path_buf);
-        let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
-        let mode_context = self.context.mode_context.clone();
-        let has_approved_task_write_authority =
-            matches!(
-                self.context.resource_authority,
-                crate::work_scope::ResourceAuthority::Work
-            ) && matches!(mode_context, Some(ModeContext::Explore { .. }))
-                && self
-                    .storage
-                    .get_approved_task_objective(&self.context.conversation_id)
-                    .await?
-                    .is_some();
-        let llm_language = self.context.llm_language;
-        let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
-        let explore_bash = self.context.explore_bash;
         let request_tool_surface = tool_surface;
 
         // Token streaming channel (REQ-BED-025).
@@ -8168,92 +8151,7 @@ where
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // provider context are request authority, not task-local inputs.
-        let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
-        if let Some(tool) = available_tools
-            .iter_mut()
-            .find(|tool| tool.name == "spawn_agents")
-        {
-            let catalog = super::agent_execution::SpawnCatalog::resolve(
-                &self.agent_config,
-                self.llm_registry.available_execution_routes(),
-            );
-            *tool = catalog.tool_definition(
-                &self.context.model_id,
-                self.llm_registry.is_builtin_model(&self.context.model_id),
-            );
-            self.spawn_catalog = Some(catalog);
-            self.spawn_parent_parallel_work_qualified = Some(
-                self.llm_registry.is_builtin_model(&self.context.model_id)
-                    && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
-                        &self.context.model_id,
-                    ),
-            );
-        }
-        let prompt_authority = if matches!(mode_context, Some(ModeContext::Explore { .. }))
-            && !has_approved_task_write_authority
-        {
-            crate::work_scope::ResourceAuthority::Restricted
-        } else {
-            self.context.resource_authority
-        };
-        let explore_bash_capability = crate::system_prompt::explore_bash_prompt_capability(
-            prompt_authority,
-            mode_context.as_ref(),
-            explore_bash,
-        );
-        let mut system_prompt = if is_coordinator {
-            crate::system_prompt::build_coordinator_system_prompt(
-                llm_language,
-                tool_executor.coordinator_skill_catalog().as_ref(),
-            )
-        } else {
-            let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
-                OrdinaryTurnContext::discover(
-                    working_dir
-                        .as_deref()
-                        .expect("filesystem conversation has cwd"),
-                )
-            });
-            build_system_prompt_with_turn_context(
-                working_dir
-                    .as_deref()
-                    .expect("filesystem conversation has cwd"),
-                &tasks_dir_name,
-                is_sub_agent,
-                mode_context.as_ref(),
-                llm_language,
-                persona.as_deref(),
-                explore_bash_capability,
-                turn_context,
-            )
-        };
-        if is_coordinator {
-            crate::coordinator_home::append_context(
-                &mut system_prompt,
-                self.storage.coordinator_home_scope().await,
-            );
-        }
-        if is_sub_agent
-            && matches!(
-                self.context.resource_authority,
-                crate::work_scope::ResourceAuthority::Work
-            )
-        {
-            system_prompt.push_str(
-                "\n\nYou share this worktree with trusted collaborators. Preserve unrelated edits, inspect concurrent changes before overwriting them, and report conflicts, overlap, or uncertainty to the parent rather than silently replacing another agent's work.",
-            );
-        }
-        if has_approved_task_write_authority {
-            system_prompt.push_str(
-                "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
-            );
-        }
-        if let Some((service, binding)) = &self.previous_transcripts {
-            if let Some(orientation) = service.previous_transcripts_orientation(binding).await {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(&orientation);
-            }
-        }
+        let (system_prompt, available_tools) = self.prepare_ordinary_overhead().await?;
         let callable_names = request_tool_surface
             .callable_tools(available_tools.clone())
             .into_iter()
@@ -8353,7 +8251,7 @@ where
             ) {
                 return Ok(Some(Event::LlmError {
                     message: "Planned prompt and declared output budget exceed context capacity after permitted tool-result clearing; compact or revise the input.".into(),
-                    error_kind: crate::db::ErrorKind::ContextExhausted,
+                    error_kind: crate::db::ErrorKind::PlannedContextPressure,
                     attempt: retry_attempt, recovery_in_progress: false,
                     observed_at: Utc::now(), resets_at: None,
                 }));
@@ -9548,6 +9446,123 @@ where
         Ok(None)
     }
 
+    #[allow(clippy::too_many_lines)] // Shared complete prompt and tool declaration assembly.
+    async fn prepare_ordinary_overhead(
+        &mut self,
+    ) -> Result<(String, Vec<phoenix_llm::ToolDefinition>), String> {
+        let tool_executor = self.tool_executor.clone();
+        let working_dir = self
+            .context
+            .execution_environment
+            .working_dir()
+            .map(Path::to_path_buf);
+        let tasks_dir_name = self.context.tasks_dir_name.clone();
+        let is_sub_agent = self.context.is_sub_agent;
+        let mode_context = self.context.mode_context.clone();
+        let has_approved_task_write_authority =
+            matches!(
+                self.context.resource_authority,
+                crate::work_scope::ResourceAuthority::Work
+            ) && matches!(mode_context, Some(ModeContext::Explore { .. }))
+                && self
+                    .storage
+                    .get_approved_task_objective(&self.context.conversation_id)
+                    .await?
+                    .is_some();
+        let llm_language = self.context.llm_language;
+        let persona = self.context.persona.clone();
+        let is_coordinator = self.context.is_coordinator;
+        let explore_bash = self.context.explore_bash;
+
+        let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
+        if let Some(tool) = available_tools
+            .iter_mut()
+            .find(|tool| tool.name == "spawn_agents")
+        {
+            let catalog = super::agent_execution::SpawnCatalog::resolve(
+                &self.agent_config,
+                self.llm_registry.available_execution_routes(),
+            );
+            *tool = catalog.tool_definition(
+                &self.context.model_id,
+                self.llm_registry.is_builtin_model(&self.context.model_id),
+            );
+            self.spawn_catalog = Some(catalog);
+            self.spawn_parent_parallel_work_qualified = Some(
+                self.llm_registry.is_builtin_model(&self.context.model_id)
+                    && phoenix_core::subagent_qualification::supports_parallel_work_subagents(
+                        &self.context.model_id,
+                    ),
+            );
+        }
+        let prompt_authority = if matches!(mode_context, Some(ModeContext::Explore { .. }))
+            && !has_approved_task_write_authority
+        {
+            crate::work_scope::ResourceAuthority::Restricted
+        } else {
+            self.context.resource_authority
+        };
+        let explore_bash_capability = crate::system_prompt::explore_bash_prompt_capability(
+            prompt_authority,
+            mode_context.as_ref(),
+            explore_bash,
+        );
+        let mut system_prompt = if is_coordinator {
+            crate::system_prompt::build_coordinator_system_prompt(
+                llm_language,
+                tool_executor.coordinator_skill_catalog().as_ref(),
+            )
+        } else {
+            let turn_context = self.ordinary_turn_context.get_or_insert_with(|| {
+                OrdinaryTurnContext::discover(
+                    working_dir
+                        .as_deref()
+                        .expect("filesystem conversation has cwd"),
+                )
+            });
+            build_system_prompt_with_turn_context(
+                working_dir
+                    .as_deref()
+                    .expect("filesystem conversation has cwd"),
+                &tasks_dir_name,
+                is_sub_agent,
+                mode_context.as_ref(),
+                llm_language,
+                persona.as_deref(),
+                explore_bash_capability,
+                turn_context,
+            )
+        };
+        if is_coordinator {
+            crate::coordinator_home::append_context(
+                &mut system_prompt,
+                self.storage.coordinator_home_scope().await,
+            );
+        }
+        if is_sub_agent
+            && matches!(
+                self.context.resource_authority,
+                crate::work_scope::ResourceAuthority::Work
+            )
+        {
+            system_prompt.push_str(
+                "\n\nYou share this worktree with trusted collaborators. Preserve unrelated edits, inspect concurrent changes before overwriting them, and report conflicts, overlap, or uncertainty to the parent rather than silently replacing another agent's work.",
+            );
+        }
+        if has_approved_task_write_authority {
+            system_prompt.push_str(
+                "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
+            );
+        }
+        if let Some((service, binding)) = &self.previous_transcripts {
+            if let Some(orientation) = service.previous_transcripts_orientation(binding).await {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&orientation);
+            }
+        }
+        Ok((system_prompt, available_tools))
+    }
+
     /// Request continuation summary from LLM (REQ-BED-020)
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
     async fn request_continuation(
@@ -9569,7 +9584,11 @@ where
             }
             _ => None,
         };
-        let llm_client = Arc::clone(&self.llm_client);
+        let llm_client = self
+            .llm_client
+            .clone()
+            .freeze_for_request()
+            .map_err(|error| error.to_string())?;
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
@@ -9645,6 +9664,26 @@ where
                 );
             }
         };
+        let (ordinary_system, ordinary_tools) = self.prepare_ordinary_overhead().await?;
+        let successor_capacity = SuccessorCapacity {
+            context_window,
+            ordinary_overhead_tokens: estimate_fixed_request_tokens(
+                &ordinary_system,
+                &phoenix_core::domain::tool_availability::ToolAvailability::all(ordinary_tools),
+            )
+            .saturating_add(MESSAGE_OVERHEAD_TOKENS),
+            output_tokens: self.context.output_budget,
+        };
+        let handoff_target = match successor_capacity.handoff_budget() {
+            Ok(target) => target,
+            Err(error) => {
+                return Ok(Some(Event::ContinuationFailed {
+                    operation_id,
+                    error,
+                    error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+                }))
+            }
+        };
         let projection = &self
             .active_prompt_projection
             .as_ref()
@@ -9664,6 +9703,21 @@ where
         let policy = CompactionPolicy::for_coordinator(self.context.is_coordinator);
         let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
+        let next_compaction_overhead = estimate_text_tokens(&continuation_prompt)
+            .saturating_add(estimate_text_tokens(policy.system_prompt()))
+            .saturating_add(continuation_output_reserve)
+            .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS)
+            .saturating_add(CONTINUATION_SAFETY_MARGIN_TOKENS * 2);
+        let handoff_target =
+            handoff_target.min(context_window.saturating_sub(next_compaction_overhead));
+        if handoff_target == 0 {
+            return Ok(Some(Event::ContinuationFailed {
+                operation_id,
+                error: "Required compaction instructions and full output reservation leave no room for a reusable handoff. Revise required instructions or explicitly select a model with more input capacity.".to_string(),
+                error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+            }));
+        }
+        continuation_prompt.push_str(&format!("\n\nThe complete handoff must be at most {handoff_target} estimated successor-input tokens including encoded context (approximately {} UTF-8 bytes of summary text). Leave the successor working room; prioritize unresolved work, user intent/corrections, uncertainty and retrieval references over completed detail. Do not claim facts omitted from the selected input. A shorter useful handoff is preferred to filling the target.", handoff_target.saturating_sub(estimate_successor_handoff_tokens("")).saturating_mul(3)));
         let system_prompt = policy.system_prompt();
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
@@ -9693,6 +9747,25 @@ where
             + estimate_text_tokens(system_prompt)
             + continuation_output_reserve
             + CONTINUATION_SAFETY_MARGIN_TOKENS;
+        if (RequestCapacity {
+            context_window,
+            input_tokens: fixed_tokens
+                .saturating_sub(continuation_output_reserve)
+                .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS),
+            output_tokens: continuation_output_reserve,
+        })
+        .decide(
+            fixed_tokens
+                .saturating_sub(continuation_output_reserve)
+                .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS),
+        ) != CapacityDecision::Ready
+        {
+            return Ok(Some(Event::ContinuationFailed {
+                operation_id,
+                error: format!("Compaction instructions and output reservation cannot fit: estimated required {} tokens including {} output and {} planning headroom, context {context_window}. Select a model with more input capacity or revise required instructions.", fixed_tokens.saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS), continuation_output_reserve, CONTINUATION_MIN_HEADROOM_TOKENS),
+                error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+            }));
+        }
         let history_item_cap = continuation_limits.max_history_messages(1);
         let budget = match plan_with_handoff(
             messages,
@@ -9706,7 +9779,7 @@ where
                 return Ok(Some(Event::ContinuationFailed {
                     operation_id,
                     error,
-                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                    error_kind: crate::db::ErrorKind::ContextCapacityConflict,
                 }));
             }
         };
@@ -9819,12 +9892,30 @@ where
                         return;
                     }
 
-                    let _ = event_tx
-                        .send(Event::ContinuationResponse {
-                            operation_id,
-                            summary,
-                        })
-                        .await;
+                    let projected_handoff_tokens = estimate_successor_handoff_tokens(&summary);
+                    let validation = successor_capacity.validate(projected_handoff_tokens).and_then(|()| {
+                        if projected_handoff_tokens > handoff_target {
+                            Err(format!("The generated handoff needs an estimated {projected_handoff_tokens} tokens; the reusable handoff target is {handoff_target}. The next compaction must also retain this handoff with full output reservation. Review a shorter handoff or explicitly select a model with more available input capacity."))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if let Err(error) = validation {
+                        let _ = event_tx
+                            .send(Event::ContinuationFailed {
+                                operation_id,
+                                error,
+                                error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+                            })
+                            .await;
+                    } else {
+                        let _ = event_tx
+                            .send(Event::ContinuationResponse {
+                                operation_id,
+                                summary,
+                            })
+                            .await;
+                    }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Continuation LLM request failed");
@@ -10931,6 +11022,14 @@ use phoenix_core::llm_language::CONTINUATION_SYSTEM_PROMPT;
 /// Estimate the token cost of a string for the proactive budget. Ceiling
 /// division so a sub-`CHARS_PER_TOKEN_ESTIMATE` string still costs at least one
 /// token rather than rounding to zero.
+fn estimate_successor_handoff_tokens(summary: &str) -> usize {
+    estimate_text_tokens(
+        &crate::send_chat_service::generated_predecessor_context_projection(summary),
+    )
+    .saturating_add(estimate_text_tokens("[System-generated input]\n"))
+    .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+}
+
 fn estimate_text_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(CHARS_PER_TOKEN_ESTIMATE)
 }
@@ -11191,10 +11290,13 @@ fn dispatch_estimate_exceeds_context(
     output_budget: usize,
     context_window: usize,
 ) -> bool {
-    fixed_tokens
-        .saturating_add(estimate_messages_tokens(history))
-        .saturating_add(output_budget)
-        > context_window
+    RequestCapacity {
+        context_window,
+        input_tokens: fixed_tokens.saturating_add(estimate_messages_tokens(history)),
+        output_tokens: output_budget,
+    }
+    .decide(fixed_tokens)
+        != CapacityDecision::Ready
 }
 
 #[cfg(test)]
@@ -15016,6 +15118,110 @@ mod authoritative_user_message_effect_tests {
                 error_kind: crate::db::ErrorKind::InvalidRequest,
                 ..
             }] if operation_id == &request.operation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn preflight_pressure_below_completed_threshold_enters_real_compaction() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.context.context_window = 80_000;
+        rt.context.output_budget = 32_768;
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        let conv = rt.context.conversation_id.clone();
+        let large_input = "retained user context ".repeat(12_000);
+        storage
+            .add_message(
+                "retained",
+                &conv,
+                &MessageContent::user(&large_input),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        rt.event_tx = tx;
+        rt.event_rx = rx;
+        let event = rt
+            .execute_effect(Effect::RequestLlm)
+            .await
+            .unwrap()
+            .expect("preflight rejects before provider dispatch");
+        assert!(matches!(
+            event,
+            Event::LlmError {
+                error_kind: crate::db::ErrorKind::PlannedContextPressure,
+                ..
+            }
+        ));
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        rt.process_event(event).await.unwrap();
+        assert!(matches!(rt.state, ConvState::AwaitingContinuation { .. }));
+        rt.llm_task_handle
+            .take()
+            .expect("real compaction dispatched")
+            .await
+            .unwrap();
+        let calls = rt.llm_client.recorded_requests();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].tool_availability.declarations().is_empty());
+        assert_eq!(calls[0].max_tokens, 32_768);
+        let transcript = storage.get_messages(&conv).await.unwrap();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].content, MessageContent::user(large_input));
+    }
+
+    #[tokio::test]
+    async fn generated_handoff_that_crowds_successor_is_not_published_ready() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let summary = "unfinished work ".repeat(20_000);
+        rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text(summary)],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (tx, rx) = mpsc::channel(16);
+        rt.event_tx = tx;
+        rt.event_rx = rx;
+        rt.context.context_window = 100_000;
+        rt.context.output_budget = 32_768;
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "oversized-result".into(),
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        assert!(rt
+            .execute_effect(Effect::RequestContinuation { request })
+            .await
+            .unwrap()
+            .is_none());
+        rt.llm_task_handle.take().unwrap().await.unwrap();
+        let event = rt
+            .event_rx
+            .try_recv()
+            .expect("summary task settled before return");
+        assert!(matches!(
+            event,
+            Event::ContinuationFailed {
+                error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+                ..
+            }
+        ));
+        rt.process_event(event).await.unwrap();
+        assert!(matches!(
+            rt.state,
+            ConvState::RecoverableContinuationFailure { .. }
         ));
     }
 

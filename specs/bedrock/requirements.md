@@ -1568,6 +1568,8 @@ WHEN generating an ordinary continuation
 THE SYSTEM SHALL inherit the predecessor's selected model and route
 AND SHALL reserve that model's full declared output allowance
 AND SHALL budget the generated handoff against the successor's complete ordinary request, including instructions and tools
+AND SHALL retain at least 8,192 tokens of successor working room after the encoded handoff, complete ordinary instructions/tools, and full output reservation
+AND SHALL validate the encoded successor projection rather than the unencoded summary text
 AND SHALL require room for additional work rather than declare a successor ready merely because its opening request fits.
 
 WHEN protected input prevents the required successor working room

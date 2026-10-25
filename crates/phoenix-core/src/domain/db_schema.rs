@@ -755,6 +755,10 @@ pub enum ErrorKind {
     SubAgentError,
     /// Context window exhausted - not retryable
     ContextExhausted,
+    /// Required input and full output reservation cannot fit; input/model revision required.
+    ContextCapacityConflict,
+    /// Conservative local planning found reducible pressure before provider dispatch.
+    PlannedContextPressure,
     /// The model stopped at the request's output-token budget (Chat
     /// `finish_reason=length`, Responses `incomplete/max_output_tokens`,
     /// Anthropic `stop_reason=max_tokens`). Not auto-retried — an unchanged
@@ -790,6 +794,8 @@ impl ErrorKind {
             | Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
+            | Self::ContextCapacityConflict
+            | Self::PlannedContextPressure
             | Self::OutputTokensExhausted
             | Self::TurnLimitExhausted
             | Self::ContentFilter => AutoRetryPolicy::NoAutoRetry,
@@ -833,6 +839,8 @@ impl ErrorKind {
             Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
+            | Self::ContextCapacityConflict
+            | Self::PlannedContextPressure
             | Self::TurnLimitExhausted
             | Self::ContentFilter => UserResumePolicy::NotResumable,
         }
@@ -2103,9 +2111,10 @@ mod error_kind_tests {
             max_attempts: OVERLOAD_MAX_ATTEMPTS,
         };
         use ErrorKind::{
-            Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, InvalidResponse,
-            Network, PromptRejected, RateLimit, ServerError, ServerOverloaded, SubAgentError,
-            TimedOut, TurnLimitExhausted, UsageLimitReached,
+            Auth, Cancelled, ContentFilter, ContextCapacityConflict, ContextExhausted,
+            InvalidRequest, InvalidResponse, Network, PlannedContextPressure, PromptRejected,
+            RateLimit, ServerError, ServerOverloaded, SubAgentError, TimedOut, TurnLimitExhausted,
+            UsageLimitReached,
         };
 
         let cases = [
@@ -2147,6 +2156,16 @@ mod error_kind_tests {
             ),
             (
                 ContextExhausted,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                ContextCapacityConflict,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                PlannedContextPressure,
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::NotResumable,
             ),

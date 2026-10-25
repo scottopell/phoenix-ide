@@ -12171,7 +12171,9 @@ impl Database {
                             SubAgentOutcome::TimedOut => "timed_out",
                             SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
                                 ErrorKind::Cancelled => "cancelled",
-                                ErrorKind::ContextExhausted => "context_exhausted",
+                                ErrorKind::ContextExhausted
+                                | ErrorKind::PlannedContextPressure
+                                | ErrorKind::ContextCapacityConflict => "context_exhausted",
                                 ErrorKind::SubAgentError => "submit_error",
                                 ErrorKind::TurnLimitExhausted => "turn_limit",
                                 ErrorKind::Auth
@@ -12372,7 +12374,9 @@ impl Database {
                 SubAgentOutcome::TimedOut => "timed_out",
                 SubAgentOutcome::Failure { error_kind, .. } => match error_kind {
                     ErrorKind::Cancelled => "cancelled",
-                    ErrorKind::ContextExhausted => "context_exhausted",
+                    ErrorKind::ContextExhausted
+                    | ErrorKind::PlannedContextPressure
+                    | ErrorKind::ContextCapacityConflict => "context_exhausted",
                     ErrorKind::SubAgentError => "submit_error",
                     ErrorKind::TurnLimitExhausted => "turn_limit",
                     ErrorKind::Auth
