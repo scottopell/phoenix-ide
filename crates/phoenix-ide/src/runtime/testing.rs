@@ -616,6 +616,8 @@ type StoredSvgArtifacts = HashMap<
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
+    pub handoff_candidates: Mutex<Vec<crate::db::ContinuationHandoffCandidate>>,
+
     svg_artifacts: Mutex<StoredSvgArtifacts>,
     tool_admission_policies:
         Mutex<HashMap<String, phoenix_core::domain::tool_availability::ToolAvailability>>,
@@ -722,6 +724,7 @@ impl InMemoryStorage {
 
     pub fn new() -> Self {
         Self {
+            handoff_candidates: Mutex::new(Vec::new()),
             svg_artifacts: Mutex::new(HashMap::new()),
             tool_admission_policies: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
@@ -1269,6 +1272,17 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String> {
+        self.handoff_candidates
+            .lock()
+            .unwrap()
+            .push(candidate.clone());
+        Ok(())
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,

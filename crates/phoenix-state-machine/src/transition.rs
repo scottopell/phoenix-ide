@@ -947,10 +947,6 @@ pub fn transition_core(
             CoreState::RecoverableContinuationFailure { .. },
             CoreEvent::UserTriggerContinuation { .. },
         )
-        | (
-            CoreState::RecoverableContinuationFailure { .. },
-            CoreEvent::UserReplanContinuation { .. },
-        )
         | (CoreState::Idle, CoreEvent::UserTriggerContinuation { .. }) => {
             handle_core_continuation(state, context, event)
         }
@@ -966,10 +962,7 @@ pub fn transition_core(
         // intent ("summarize now") is either being served by the in-flight
         // path or no longer meaningful. Absorbing avoids the SSE-vs-click
         // race surfacing as an error to the user.
-        (
-            state,
-            CoreEvent::UserTriggerContinuation { .. } | CoreEvent::UserReplanContinuation { .. },
-        ) => {
+        (state, CoreEvent::UserTriggerContinuation { .. }) => {
             tracing::debug!(
                 state = state.variant_name(),
                 "Absorbing stale UserTriggerContinuation"
@@ -1300,7 +1293,6 @@ fn handle_core_tool_complete(
         | CoreEvent::ContinuationFailed { .. }
         | CoreEvent::ContinuationError { .. }
         | CoreEvent::UserTriggerContinuation { .. }
-        | CoreEvent::UserReplanContinuation { .. }
         | CoreEvent::SteerDrainedUserMessages { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
@@ -2175,8 +2167,21 @@ fn handle_core_error_retry(
     }
 }
 
-/// Handles continuation-related events: `LlmError`/`RetryTimeout` during
-/// `AwaitingContinuation`, and `UserTriggerContinuation` from Idle.
+/// Build the durable transition for an explicitly admitted changed-model replan.
+#[must_use]
+pub fn replan_continuation_failure(
+    failure: &RecoverableContinuationFailure,
+) -> CoreTransitionResult {
+    let mut request = failure.request.clone();
+    request.attempt += 1;
+    CoreTransitionResult::new(CoreState::AwaitingContinuation {
+        request: request.clone(),
+    })
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::notify_state_change())
+    .with_effect(Effect::RequestContinuation { request })
+}
+
 fn handle_core_continuation(
     state: &CoreState,
     context: &ConvContext,
@@ -2255,23 +2260,8 @@ fn handle_core_continuation(
         }
 
         (
-            CoreState::RecoverableContinuationFailure { failure },
-            CoreEvent::UserReplanContinuation { operation_id },
-        ) if failure.request.operation_id == operation_id => {
-            let mut request = failure.request.clone();
-            request.attempt += 1;
-            Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
-                request: request.clone(),
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::RequestContinuation { request }))
-        }
-
-        (
             CoreState::RecoverableContinuationFailure { .. },
-            CoreEvent::UserTriggerContinuation { operation_id }
-            | CoreEvent::UserReplanContinuation { operation_id },
+            CoreEvent::UserTriggerContinuation { operation_id },
         ) => {
             tracing::debug!(%operation_id, "Absorbing stale continuation trigger for continuation failure");
             Ok(CoreTransitionResult::new(state.clone()))
@@ -6484,37 +6474,18 @@ mod tests {
 
     #[test]
     fn authorized_model_replan_preserves_operation_and_advances_attempt() {
-        let state = ConvState::RecoverableContinuationFailure {
-            failure: RecoverableContinuationFailure {
-                request: ContinuationSummaryRequest {
-                    operation_id: "fixed".to_string(),
-                    rejected_tool_calls: vec![],
-                    attempt: 2,
-                },
-                error_kind: ErrorKind::ContextCapacityConflict,
-                message: "cannot fit".to_string(),
-            },
-        };
-        let stale = transition(
-            &state,
-            &test_context(),
-            Event::UserReplanContinuation {
-                operation_id: "other".to_string(),
-            },
-        )
-        .unwrap();
-        assert_eq!(stale.new_state, state);
-        assert!(stale.effects.is_empty());
-        let result = transition(
-            &state,
-            &test_context(),
-            Event::UserReplanContinuation {
+        let failure = RecoverableContinuationFailure {
+            request: ContinuationSummaryRequest {
                 operation_id: "fixed".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 2,
             },
-        )
-        .unwrap();
+            error_kind: ErrorKind::ContextCapacityConflict,
+            message: "cannot fit".to_string(),
+        };
+        let result = replan_continuation_failure(&failure);
         assert!(
-            matches!(result.new_state, ConvState::AwaitingContinuation { request } if request.operation_id == "fixed" && request.attempt == 3)
+            matches!(result.new_state, CoreState::AwaitingContinuation { request } if request.operation_id == "fixed" && request.attempt == 3)
         );
         assert!(result.effects.iter().any(|effect| matches!(effect, Effect::RequestContinuation { request } if request.operation_id == "fixed" && request.attempt == 3)));
     }

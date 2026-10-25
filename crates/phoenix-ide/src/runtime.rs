@@ -255,6 +255,74 @@ pub(crate) struct AcknowledgedEventRequest {
     pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HandoffCapacityStatus {
+    Ready { target_tokens: usize },
+    HandoffTooLarge { target_tokens: usize },
+    RequiredOverhead,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityCountingMethod {
+    ConservativeLocalEstimate,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HandoffCapacityReview {
+    pub counting_method: CapacityCountingMethod,
+    pub context_window_tokens: usize,
+    pub required_overhead_tokens: usize,
+    pub output_reservation_tokens: usize,
+    pub successor_working_room_tokens: usize,
+    pub handoff_tokens: usize,
+    pub status: HandoffCapacityStatus,
+}
+
+impl HandoffCapacityReview {
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        matches!(self.status, HandoffCapacityStatus::Ready { .. })
+    }
+    #[must_use]
+    pub fn handoff_target_tokens(&self) -> Option<usize> {
+        match self.status {
+            HandoffCapacityStatus::Ready { target_tokens }
+            | HandoffCapacityStatus::HandoffTooLarge { target_tokens } => Some(target_tokens),
+            HandoffCapacityStatus::RequiredOverhead => None,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HandoffShorteningResult {
+    NotRequested,
+    Generated {
+        candidate_id: String,
+        text: String,
+        capacity: HandoffCapacityReview,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct HandoffReviewResponse {
+    pub source: HandoffCapacityReview,
+    pub shortening: HandoffShorteningResult,
+}
+
+pub(crate) struct HandoffReviewRequest {
+    pub handoff: String,
+    pub shorten: bool,
+    pub source_candidate_id: Option<String>,
+    pub opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    pub response: oneshot::Sender<Result<HandoffReviewResponse, String>>,
+}
+
 pub struct TaskApprovalHandoffRequest {
     pub parent_conversation_id: String,
     pub approval: TaskApprovalHandoffData,
@@ -799,6 +867,7 @@ type SharedStartupLlmRecoveryReceipt = Arc<AsyncMutex<Option<StartupLlmRecoveryR
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
     pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedEventRequest>,
+    handoff_review_tx: Option<mpsc::Sender<HandoffReviewRequest>>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
@@ -5046,11 +5115,43 @@ impl RuntimeManager {
         self.get_or_create_inner(conversation_id, Some(owner)).await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn get_or_create_inner(
         self: &Arc<Self>,
         conversation_id: &str,
         inherited_authority: Option<AdmittedOperation>,
+    ) -> Result<ConversationHandle, String> {
+        self.get_or_create_inner_with_maintenance(conversation_id, inherited_authority, false)
+            .await
+    }
+
+    async fn get_or_create_continuation_maintenance(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<ConversationHandle, String> {
+        self.require_local_authority_admission()?;
+        if self
+            .try_get_handle(conversation_id)
+            .await
+            .is_some_and(|handle| {
+                matches!(
+                    *handle.state_rx.borrow(),
+                    ConvState::ContextExhausted { .. }
+                )
+            })
+        {
+            self.evict_runtime(conversation_id, EvictionReason::RecoveryReconciliation)
+                .await;
+        }
+        self.get_or_create_inner_with_maintenance(conversation_id, None, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_or_create_inner_with_maintenance(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        inherited_authority: Option<AdmittedOperation>,
+        exhausted_maintenance: bool,
     ) -> Result<ConversationHandle, String> {
         let mut inherited_authority = inherited_authority;
         loop {
@@ -5112,6 +5213,7 @@ impl RuntimeManager {
                         let result = Box::pin(worker_manager.materialize_runtime(
                             &worker_conversation_id,
                             Arc::clone(&worker_slot),
+                            exhausted_maintenance,
                         ))
                         .instrument(span.clone())
                         .await;
@@ -5668,6 +5770,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
         slot: Arc<RuntimeMaterializationSlot>,
+        exhausted_maintenance: bool,
     ) -> Result<ConversationHandle, String> {
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
@@ -6227,6 +6330,7 @@ impl RuntimeManager {
             None
         };
 
+        let (handoff_review_tx, handoff_review_rx) = mpsc::channel(1);
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
             initial_state.clone(),
@@ -6242,9 +6346,12 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         );
-        let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
+        let runtime = runtime
+            .with_acknowledged_event_receiver(acknowledged_event_rx)
+            .with_handoff_review_receiver(handoff_review_rx);
 
         let runtime = runtime
+            .with_exhausted_maintenance(exhausted_maintenance)
             .with_startup_llm_recovery(startup_llm_recovery)
             .with_startup_llm_recovery_ack(startup_llm_recovery_ack_tx)
             .with_state_updated_at(initial_state_updated_at)
@@ -6368,6 +6475,7 @@ impl RuntimeManager {
         let handle = ConversationHandle {
             event_tx: event_tx.clone(),
             acknowledged_event_tx: acknowledged_event_tx.clone(),
+            handoff_review_tx: Some(handoff_review_tx.clone()),
             turn_trigger: turn_trigger.clone(),
             broadcast_tx: broadcaster.clone(),
             identity: identity.clone(),
@@ -6406,6 +6514,7 @@ impl RuntimeManager {
                 ConversationHandle {
                     event_tx,
                     acknowledged_event_tx,
+                    handoff_review_tx: Some(handoff_review_tx),
                     turn_trigger,
                     broadcast_tx: broadcaster,
                     identity,
@@ -6511,6 +6620,7 @@ impl RuntimeManager {
             ConversationHandle {
                 event_tx,
                 acknowledged_event_tx,
+                handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
@@ -6536,6 +6646,7 @@ impl RuntimeManager {
             ConversationHandle {
                 event_tx,
                 acknowledged_event_tx,
+                handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
@@ -6692,29 +6803,106 @@ impl RuntimeManager {
         Ok(outcome)
     }
 
+    /// Evaluate a continuation with the current ordinary successor projection.
+    ///
+    /// # Errors
+    /// Returns admission, preparation, provider or local persistence failures.
+    pub async fn review_continuation_handoff(
+        self: &Arc<Self>,
+        id: &str,
+        handoff: String,
+        shorten: bool,
+    ) -> Result<HandoffReviewResponse, String> {
+        self.review_continuation_handoff_with_source(id, handoff, shorten, None, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext)
+            .await
+    }
+
+    /// Evaluate a continuation with the current ordinary successor projection.
+    ///
+    /// # Errors
+    /// Returns admission, preparation, provider or local persistence failures.
+    pub async fn review_continuation_handoff_with_source(
+        self: &Arc<Self>,
+        id: &str,
+        handoff: String,
+        shorten: bool,
+        source_candidate_id: Option<String>,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    ) -> Result<HandoffReviewResponse, String> {
+        self.execute_handoff_review(id, handoff, shorten, source_candidate_id, opening_authority)
+            .await
+    }
+
+    /// Evaluate a continuation with the current ordinary successor projection.
+    ///
+    /// # Errors
+    /// Returns admission, preparation, provider or local persistence failures.
+    pub async fn review_continuation_admission(
+        self: &Arc<Self>,
+        id: &str,
+        handoff: String,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    ) -> Result<HandoffReviewResponse, String> {
+        self.execute_handoff_review(id, handoff, false, None, opening_authority)
+            .await
+    }
+
+    async fn execute_handoff_review(
+        self: &Arc<Self>,
+        id: &str,
+        handoff: String,
+        shorten: bool,
+        source_candidate_id: Option<String>,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    ) -> Result<HandoffReviewResponse, String> {
+        let conversation = self
+            .db()
+            .get_conversation(id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if conversation.continued_in_conv_id.is_some() {
+            return Err(
+                "A successor already exists; review its accepted opening instead".to_string(),
+            );
+        }
+        let handle = self.get_or_create_continuation_maintenance(id).await?;
+        let sender = handle
+            .handoff_review_tx
+            .as_ref()
+            .ok_or("handoff review unavailable")?;
+        let (response, receipt) = oneshot::channel();
+        sender
+            .send(HandoffReviewRequest {
+                handoff,
+                shorten,
+                source_candidate_id,
+                opening_authority,
+                response,
+            })
+            .await
+            .map_err(|_| "handoff review runtime stopped".to_string())?;
+        let result = receipt
+            .await
+            .map_err(|_| "handoff review runtime stopped".to_string())?;
+        if matches!(conversation.state, ConvState::ContextExhausted { .. }) {
+            self.evict_runtime(id, EvictionReason::RecoveryReconciliation)
+                .await;
+            let runtimes = self.runtimes.read().await;
+            if !runtimes.contains_key(id) {
+                self.evicted_broadcasters
+                    .write()
+                    .await
+                    .entry(id.to_string())
+                    .or_insert_with(|| handle.broadcast_tx.clone());
+            }
+        }
+        result
+    }
+
     pub async fn admit_continuation_retry(
         self: &Arc<Self>,
         conversation_id: &str,
         operation_id: String,
-    ) -> Result<(), String> {
-        self.admit_continuation_trigger(conversation_id, operation_id, false)
-            .await
-    }
-
-    pub(crate) async fn admit_continuation_replan_after_model_change(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        operation_id: String,
-    ) -> Result<(), String> {
-        self.admit_continuation_trigger(conversation_id, operation_id, true)
-            .await
-    }
-
-    async fn admit_continuation_trigger(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        operation_id: String,
-        revised_model: bool,
     ) -> Result<(), String> {
         let conversation = self
             .db()
@@ -6726,10 +6914,12 @@ impl RuntimeManager {
                 "Cannot regenerate a handoff after a successor has been reserved".to_string(),
             );
         }
-        let handle = self.get_or_create(conversation_id).await?;
+        let handle = self
+            .get_or_create_continuation_maintenance(conversation_id)
+            .await?;
         let initial_state = handle.state_rx.borrow().clone();
         if matches!(&initial_state, ConvState::RecoverableContinuationFailure { failure }
-            if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict && !revised_model)
+            if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict )
         {
             return Err("This capacity plan cannot fit unchanged. Review a revised handoff or explicitly change the model before replanning.".to_string());
         }
@@ -6753,11 +6943,7 @@ impl RuntimeManager {
         handle
             .acknowledged_event_tx
             .send(AcknowledgedEventRequest {
-                event: if revised_model {
-                    Event::UserReplanContinuation { operation_id }
-                } else {
-                    Event::UserTriggerContinuation { operation_id }
-                },
+                event: Event::UserTriggerContinuation { operation_id },
                 acknowledgement: ack_tx,
                 retirement: retirement_rx,
             })
@@ -7050,6 +7236,7 @@ impl RuntimeManager {
         runtimes.get(conversation_id).map(|h| ConversationHandle {
             event_tx: h.event_tx.clone(),
             acknowledged_event_tx: h.acknowledged_event_tx.clone(),
+            handoff_review_tx: h.handoff_review_tx.clone(),
             turn_trigger: h.turn_trigger.clone(),
             broadcast_tx: h.broadcast_tx.clone(),
             identity: h.identity.clone(),
@@ -10747,6 +10934,7 @@ mod scope_liveness_tests {
             ConversationHandle {
                 event_tx,
                 acknowledged_event_tx,
+                handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
@@ -11086,6 +11274,7 @@ mod scope_liveness_tests {
             ConversationHandle {
                 event_tx,
                 acknowledged_event_tx,
+                handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
@@ -11234,6 +11423,7 @@ mod scope_liveness_tests {
             ConversationHandle {
                 event_tx,
                 acknowledged_event_tx,
+                handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0)
                     .with_fatal_local_authority_fence(Arc::clone(
@@ -12526,6 +12716,7 @@ mod scope_liveness_tests {
             ConversationHandle {
                 event_tx,
                 acknowledged_event_tx,
+                handoff_review_tx: None,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),

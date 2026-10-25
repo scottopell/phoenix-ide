@@ -120,6 +120,11 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String>;
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -794,6 +799,15 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String> {
+        (**self)
+            .save_continuation_handoff_candidate(candidate)
+            .await
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -1601,6 +1615,16 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String> {
+        self.db
+            .save_continuation_handoff_candidate(candidate)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,

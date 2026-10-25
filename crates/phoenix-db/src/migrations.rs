@@ -661,6 +661,28 @@ const MIGRATIONS: &[Migration] = &[
         name: "single_conversation_name_and_route_projection",
         sql: "",
     },
+    Migration {
+        version: 130,
+        name: "continuation_handoff_candidates",
+        sql: "CREATE TABLE continuation_handoff_candidates (
+            id TEXT PRIMARY KEY NOT NULL,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            operation_id TEXT,
+            source_attempt INTEGER CHECK(source_attempt >= 1),
+            exhausted_state_updated_at TEXT,
+            source_message_id TEXT REFERENCES messages(message_id) ON DELETE CASCADE,
+            source_candidate_id TEXT REFERENCES continuation_handoff_candidates(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            origin TEXT NOT NULL CHECK(origin IN ('oversized_summary', 'ai_shortening')),
+            candidate_text TEXT NOT NULL CHECK(length(trim(candidate_text)) > 0),
+            created_at TEXT NOT NULL,
+            CHECK(origin != 'oversized_summary' OR operation_id IS NOT NULL),
+            CHECK((operation_id IS NOT NULL AND source_attempt IS NOT NULL AND exhausted_state_updated_at IS NULL)
+                OR (operation_id IS NULL AND source_attempt IS NULL AND exhausted_state_updated_at IS NOT NULL)),
+            UNIQUE(conversation_id, ordinal),
+            CHECK(source_message_id IS NULL OR source_candidate_id IS NULL)
+        ); CREATE INDEX continuation_handoff_candidates_conversation ON continuation_handoff_candidates(conversation_id, ordinal);",
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");

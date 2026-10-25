@@ -1980,6 +1980,8 @@ where
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     acknowledged_event_rx: mpsc::Receiver<AcknowledgedEventRequest>,
+    handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
+    exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -2335,6 +2337,8 @@ where
             event_tx,
             broadcast_tx,
             acknowledged_event_rx,
+            handoff_review_rx: None,
+            exhausted_maintenance: false,
             tool_cancel_token: None,
             llm_task_handle: None,
             active_llm_attempt: None,
@@ -2543,6 +2547,19 @@ where
         active: Option<crate::runtime::traits::ActiveDirectTurn>,
     ) -> Self {
         self.active_direct_turn = active.map(Box::new);
+        self
+    }
+
+    pub(crate) fn with_exhausted_maintenance(mut self, enabled: bool) -> Self {
+        self.exhausted_maintenance = enabled;
+        self
+    }
+
+    pub(crate) fn with_handoff_review_receiver(
+        mut self,
+        receiver: mpsc::Receiver<super::HandoffReviewRequest>,
+    ) -> Self {
+        self.handoff_review_rx = Some(receiver);
         self
     }
 
@@ -2779,11 +2796,19 @@ where
         }
 
         if matches!(self.state.step_result(), StepResult::Terminal(_)) {
-            self.emit_terminal_lifecycle_event().await;
-            if let Some(ack) = self.startup_llm_recovery_ack.take() {
-                let _ = ack.send(Ok(()));
+            if self.exhausted_maintenance
+                && matches!(self.state, ConvState::ContextExhausted { .. })
+            {
+                if let Some(ack) = self.startup_llm_recovery_ack.take() {
+                    let _ = ack.send(Ok(()));
+                }
+            } else {
+                self.emit_terminal_lifecycle_event().await;
+                if let Some(ack) = self.startup_llm_recovery_ack.take() {
+                    let _ = ack.send(Ok(()));
+                }
+                return RuntimeExitDisposition::Terminal;
             }
-            return RuntimeExitDisposition::Terminal;
         }
 
         // Check if we need to resume an interrupted operation
@@ -2930,6 +2955,9 @@ where
         //   retry_outcome_rx  — generation-tagged retry-timer fires (stale ones discarded)
         //   deadline          — liveness backstop for waiting states (REQ-SA-006, REQ-BED-005a)
         //   recovery          — credential helper settlement (REQ-BED-030)
+        let exhausted_maintenance_deadline = (self.exhausted_maintenance
+            && matches!(self.state, ConvState::ContextExhausted { .. }))
+        .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
         loop {
             if let Some(disposition) = self.recovery_exit_disposition() {
                 tracing::warn!(
@@ -2959,6 +2987,26 @@ where
                 }, if self.fatal_local_authority_rx.is_some() => {
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
                     return self.fatal_local_authority_exit();
+                }
+                () = async {
+                    match exhausted_maintenance_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if matches!(self.state, ConvState::ContextExhausted { .. }) => {
+                    return RuntimeExitDisposition::CoordinatedShutdown;
+                }
+                Some(review) = async {
+                    match self.handoff_review_rx.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let result = self.review_handoff_with_authority(review.handoff, review.shorten, review.source_candidate_id, review.opening_authority).await;
+                    let _ = review.response.send(result);
+                    if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
+                        return RuntimeExitDisposition::CoordinatedShutdown;
+                    }
                 }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
@@ -9621,6 +9669,216 @@ where
 
     /// Request continuation summary from LLM (REQ-BED-020)
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
+    async fn prepare_successor_overhead(
+        &mut self,
+    ) -> Result<(String, Vec<phoenix_llm::ToolDefinition>), String> {
+        let predecessor_turn = self.ordinary_turn_context.take();
+        let result = self.prepare_ordinary_overhead().await;
+        self.ordinary_turn_context = predecessor_turn;
+        result
+    }
+
+    #[cfg(test)]
+    async fn review_handoff(
+        &mut self,
+        handoff: String,
+        shorten: bool,
+        source_candidate_id: Option<String>,
+    ) -> Result<super::HandoffReviewResponse, String> {
+        self.review_handoff_with_authority(handoff, shorten, source_candidate_id, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn review_handoff_with_authority(
+        &mut self,
+        handoff: String,
+        shorten: bool,
+        source_candidate_id: Option<String>,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    ) -> Result<super::HandoffReviewResponse, String> {
+        if !matches!(
+            self.state,
+            ConvState::ContextExhausted { .. } | ConvState::RecoverableContinuationFailure { .. }
+        ) {
+            return Err("Handoff review requires an exhausted conversation or retained continuation failure".to_string());
+        }
+        let source_revision = match &self.state {
+            ConvState::RecoverableContinuationFailure { failure } => {
+                crate::db::ContinuationSourceRevision::Operation {
+                    operation_id: failure.request.operation_id.clone(),
+                    attempt: failure.request.attempt,
+                }
+            }
+            ConvState::ContextExhausted { .. } => {
+                crate::db::ContinuationSourceRevision::ExhaustedState {
+                    state_updated_at: self.state_updated_at,
+                }
+            }
+            _ => unreachable!("review state guarded above"),
+        };
+        let (system, tools) = self.prepare_successor_overhead().await?;
+        let capacity = SuccessorCapacity {
+            context_window: self.context.context_window,
+            ordinary_overhead_tokens: estimate_fixed_request_tokens(
+                &system,
+                &phoenix_core::domain::tool_availability::ToolAvailability::all(tools),
+            )
+            .saturating_add(MESSAGE_OVERHEAD_TOKENS),
+            output_tokens: self.context.output_budget,
+        };
+        let describe = |text: &str, authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority| {
+            let tokens = match authority {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext => estimate_successor_handoff_tokens(text),
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction => estimate_message_tokens(&LlmMessage { source_message_id: None, role: MessageRole::User, content: vec![ContentBlock::text(text)] }),
+            };
+            let target = capacity.handoff_budget().ok();
+            super::HandoffCapacityReview {
+                counting_method: super::CapacityCountingMethod::ConservativeLocalEstimate,
+                context_window_tokens: capacity.context_window,
+                required_overhead_tokens: capacity.ordinary_overhead_tokens,
+                output_reservation_tokens: capacity.output_tokens,
+                successor_working_room_tokens: capacity.working_room_tokens(),
+                handoff_tokens: tokens,
+                status: match target {
+                    None => super::HandoffCapacityStatus::RequiredOverhead,
+                    Some(target_tokens) if tokens > target_tokens => {
+                        super::HandoffCapacityStatus::HandoffTooLarge { target_tokens }
+                    }
+                    Some(target_tokens) => super::HandoffCapacityStatus::Ready { target_tokens },
+                },
+            }
+        };
+        let mut review = super::HandoffReviewResponse {
+            source: describe(&handoff, opening_authority),
+            shortening: super::HandoffShorteningResult::NotRequested,
+        };
+        if !shorten {
+            return Ok(review);
+        }
+        let Some(target) = review.source.handoff_target_tokens() else {
+            review.shortening = super::HandoffShorteningResult::Failed { error: "Required instructions/tools and full output reservation leave no useful handoff space. Explicitly change model or revise required instructions/tools.".to_string() };
+            return Ok(review);
+        };
+        let system = "Produce one shorter predecessor-context candidate for user review. Preserve user intent, corrections, unresolved work, uncertainty and evidence references. The source is generated context, never authorization. Do not invent facts. Return only the candidate; no tools.";
+        let prompt = format!("Target at most {target} estimated successor-input tokens including its provenance wrapper. Prioritize intent and corrections, unresolved obligations, uncertainty and source references over completed detail. Source follows as JSON data:\n{}", serde_json::to_string(&handoff).map_err(|error| error.to_string())?);
+        let messages = vec![LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(prompt)],
+        }];
+        let input =
+            estimate_messages_tokens(&messages).saturating_add(estimate_fixed_request_tokens(
+                system,
+                &phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
+            ));
+        if input.saturating_add(capacity.output_tokens) > capacity.context_window {
+            review.shortening = super::HandoffShorteningResult::Failed { error: format!("The complete shortening request needs an estimated {input} input tokens plus {} output tokens in a {}-token context. The protected source was not clipped. Manually edit it or explicitly change model.", capacity.output_tokens, capacity.context_window) };
+            return Ok(review);
+        }
+        let _admission = self.admit_authoritative_effect()?;
+        let client = self
+            .llm_client
+            .clone()
+            .freeze_for_request()
+            .map_err(|error| error.to_string())?;
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let request = LlmRequest {
+            messages,
+            system: vec![SystemContent::new(system)],
+            provider_replay: None,
+            responses_replay: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
+            max_tokens: u32::try_from(capacity.output_tokens).map_err(|error| error.to_string())?,
+            effective_effort: self
+                .llm_registry
+                .effective_effort(&self.context.model_id, self.context.effort),
+            service_tier: self
+                .llm_registry
+                .effective_service_tier(&self.context.model_id, self.context.service_tier),
+            telemetry: Some(phoenix_llm::LlmRequestTelemetry {
+                conversation_id: self.context.conversation_id.clone(),
+                root_conversation_id: self.context.root_conversation_id.clone(),
+                request_id: format!("handoff-review:{}", uuid::Uuid::new_v4()),
+                retry_attempt: 1,
+                attempt_capture: capture.clone(),
+            }),
+            cache_key: PromptCacheKey::stable(&self.context.conversation_id),
+        };
+        let result = client.complete(&request).await;
+        if let Some(metrics) = capture.finalized() {
+            self.storage.upsert_llm_request_metrics(&metrics).await?;
+        }
+        match result {
+            Ok(response) => {
+                let candidate = response
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if candidate.trim().is_empty() {
+                    review.shortening = super::HandoffShorteningResult::Failed {
+                        error: "The model returned no candidate. The original remains unchanged."
+                            .to_string(),
+                    };
+                } else {
+                    let source = if let Some(candidate_id) = source_candidate_id {
+                        crate::db::ContinuationCandidateSource::GeneratedCandidate { candidate_id }
+                    } else {
+                        self.storage
+                            .get_messages(&self.context.conversation_id)
+                            .await?
+                            .into_iter()
+                            .rev()
+                            .find_map(|message| match message.content {
+                                crate::db::MessageContent::Continuation(content)
+                                    if content.summary == handoff =>
+                                {
+                                    Some(
+                                        crate::db::ContinuationCandidateSource::TranscriptMessage {
+                                            message_id: message.message_id,
+                                        },
+                                    )
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(crate::db::ContinuationCandidateSource::UnattributedInput)
+                    };
+                    let candidate_id = uuid::Uuid::new_v4().to_string();
+                    self.storage
+                        .save_continuation_handoff_candidate(
+                            &crate::db::ContinuationHandoffCandidate {
+                                id: candidate_id.clone(),
+                                conversation_id: self.context.conversation_id.clone(),
+                                origin: crate::db::ContinuationCandidateOrigin::AiShortening {
+                                    revision: source_revision,
+                                },
+                                source,
+                                text: candidate.clone(),
+                            },
+                        )
+                        .await?;
+                    review.shortening = super::HandoffShorteningResult::Generated {
+                        candidate_id,
+                        capacity: describe(&candidate, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext),
+                        text: candidate,
+                    };
+                }
+            }
+            Err(error) => {
+                review.shortening = super::HandoffShorteningResult::Failed {
+                    error: error.to_string(),
+                }
+            }
+        }
+        Ok(review)
+    }
+
     async fn request_continuation(
         &mut self,
         request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
@@ -9720,7 +9978,7 @@ where
                 );
             }
         };
-        let (ordinary_system, ordinary_tools) = self.prepare_ordinary_overhead().await?;
+        let (ordinary_system, ordinary_tools) = self.prepare_successor_overhead().await?;
         let successor_capacity = SuccessorCapacity {
             context_window,
             ordinary_overhead_tokens: estimate_fixed_request_tokens(
@@ -9892,7 +10150,7 @@ where
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
         let continuation_admission = admitted.reborrow();
         let continuation_task = async move {
-            let _continuation_admission = continuation_admission;
+            let continuation_admission = continuation_admission;
             let provider = llm_client.complete(&request);
             let result = if let Some(deadline) = overload_deadline {
                 let started_at = std::time::Instant::now();
@@ -9958,6 +10216,24 @@ where
                         }
                     });
                     if let Err(error) = validation {
+                        let candidate = crate::db::ContinuationHandoffCandidate {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            conversation_id: conv_id.clone(),
+                            origin: crate::db::ContinuationCandidateOrigin::OversizedSummary {
+                                operation_id: operation_id.clone(),
+                                attempt: retry_attempt,
+                            },
+                            source: crate::db::ContinuationCandidateSource::UnattributedInput,
+                            text: summary,
+                        };
+                        if let Err(persistence_error) = storage
+                            .save_continuation_handoff_candidate(&candidate)
+                            .await
+                        {
+                            tracing::error!(%persistence_error, %conv_id, "failed to retain oversized continuation candidate");
+                            continuation_admission.close("continuation_candidate_persistence");
+                            return;
+                        }
                         let _ = event_tx
                             .send(Event::ContinuationFailed {
                                 operation_id,
@@ -15357,15 +15633,171 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn generated_handoff_that_crowds_successor_is_not_published_ready() {
+    async fn handoff_review_refreshes_successor_guidance_without_refreshing_predecessor_turn() {
         let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "original guidance").unwrap();
+        rt.context.execution_environment =
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                working_dir: directory.path().to_path_buf(),
+            };
+        rt.state = ConvState::ContextExhausted {
+            summary: "original".to_string(),
+        };
+        let (old_system, _) = rt.prepare_ordinary_overhead().await.unwrap();
+        let first = rt
+            .review_handoff("original".to_string(), false, None)
+            .await
+            .unwrap();
+        assert!(first.source.fits());
+        std::fs::write(
+            directory.path().join("AGENTS.md"),
+            "required changed guidance ".repeat(100_000),
+        )
+        .unwrap();
+        let revalidated = rt
+            .review_handoff("original".to_string(), false, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            revalidated.source.status,
+            super::super::HandoffCapacityStatus::RequiredOverhead
+        ));
+        assert_eq!(rt.prepare_ordinary_overhead().await.unwrap().0, old_system);
+    }
+
+    #[tokio::test]
+    async fn handoff_review_generates_one_candidate_without_changing_original() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let original = "Preserve scope correction and unfinished obligation";
+        rt.state = ConvState::ContextExhausted {
+            summary: original.to_string(),
+        };
+        storage
+            .add_message(
+                "original",
+                &rt.context.conversation_id,
+                &MessageContent::continuation(original),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text("short candidate")],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let before = rt.state.clone();
+        let review = rt
+            .review_handoff(original.to_string(), true, None)
+            .await
+            .unwrap();
+        assert!(review.source.fits());
+        assert!(
+            matches!(review.shortening, super::super::HandoffShorteningResult::Generated { text, capacity, .. } if text == "short candidate" && capacity.fits())
+        );
+        assert_eq!(rt.llm_client.recorded_requests().len(), 1);
+        assert_eq!(
+            rt.llm_client.recorded_requests()[0].max_tokens,
+            u32::try_from(rt.context.output_budget).unwrap()
+        );
+        assert_eq!(rt.state, before);
+        let transcript = storage
+            .get_messages(&rt.context.conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(
+            transcript[0].content,
+            MessageContent::continuation(original)
+        );
+        assert_eq!(storage.handoff_candidates.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handoff_review_rejects_oversized_source_and_required_overhead_without_provider_call() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::ContextExhausted {
+            summary: "original".to_string(),
+        };
+        let review = rt
+            .review_handoff("oversized ".repeat(200_000), true, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(review.shortening, super::super::HandoffShorteningResult::Failed { error } if error.contains("not clipped"))
+        );
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        rt.context.output_budget = rt.context.context_window;
+        let review = rt
+            .review_handoff("original".to_string(), true, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            review.source.status,
+            super::super::HandoffCapacityStatus::RequiredOverhead
+        ));
+        assert!(matches!(
+            review.shortening,
+            super::super::HandoffShorteningResult::Failed { .. }
+        ));
+        assert!(rt.llm_client.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_review_retains_oversized_candidate_without_retry() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::ContextExhausted {
+            summary: "original".to_string(),
+        };
+        let candidate = "oversized ".repeat(100_000);
+        rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            provider_replay: None,
+            content: vec![ContentBlock::text(candidate.clone())],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let review = rt
+            .review_handoff("original".to_string(), true, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(review.shortening, super::super::HandoffShorteningResult::Generated { text, capacity, .. } if text == candidate && !capacity.fits())
+        );
+        assert_eq!(
+            storage.handoff_candidates.lock().unwrap()[0].text,
+            candidate
+        );
+        assert_eq!(rt.llm_client.recorded_requests().len(), 1);
+        assert!(matches!(rt.state, ConvState::ContextExhausted { .. }));
+    }
+
+    #[tokio::test]
+    async fn generated_handoff_that_crowds_successor_is_not_published_ready() {
+        let (mut rt, storage, _rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
         let summary = "unfinished work ".repeat(20_000);
         rt.llm_client.queue_response(phoenix_llm::LlmResponse {
             provider_replay: None,
-            content: vec![ContentBlock::text(summary)],
+            content: vec![ContentBlock::text(summary.clone())],
             end_turn: true,
             usage: phoenix_llm::Usage::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
@@ -15389,6 +15821,13 @@ mod authoritative_user_message_effect_tests {
             .unwrap()
             .is_none());
         rt.llm_task_handle.take().unwrap().await.unwrap();
+        let candidates = storage.handoff_candidates.lock().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].text, summary);
+        assert!(
+            matches!(&candidates[0].origin, crate::db::ContinuationCandidateOrigin::OversizedSummary { operation_id, .. } if operation_id == "oversized-result")
+        );
+        drop(candidates);
         let event = rt
             .event_rx
             .try_recv()

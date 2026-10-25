@@ -1044,10 +1044,34 @@ pub struct ConfirmCloseLossRetirementRequest {
     pub inspection_fingerprint: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HandoffReviewRequest {
+    pub handoff: String,
+    #[serde(default)]
+    pub source: ContinueHandoffSource,
+    #[serde(default)]
+    pub shorten: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContinueHandoffSource {
+    #[default]
+    Manual,
+    Summary {
+        message_id: String,
+    },
+    Candidate {
+        candidate_id: String,
+    },
+}
+
 /// Opening handoff submitted while creating a context continuation.
 #[derive(Debug, Deserialize)]
 pub struct ContinueConversationRequest {
     pub handoff: String,
+    #[serde(default)]
+    pub source: ContinueHandoffSource,
     /// Client-generated message identifier. The chat application service uses
     /// this to make retries idempotent.
     pub message_id: String,
@@ -1542,6 +1566,8 @@ pub struct ForkProposalListResponse {
 #[derive(Debug, Serialize)]
 pub struct ConflictErrorResponse {
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<crate::runtime::HandoffCapacityReview>,
     pub error_type: String,
     /// Dirty files on the main checkout (only for `dirty_main_checkout`)
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1564,6 +1590,7 @@ impl ConflictErrorResponse {
     pub fn new(error: impl Into<String>, error_type: impl Into<String>) -> Self {
         Self {
             error: error.into(),
+            capacity: None,
             error_type: error_type.into(),
             dirty_files: vec![],
             can_auto_stash: false,

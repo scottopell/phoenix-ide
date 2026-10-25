@@ -1579,6 +1579,7 @@ AND SHALL budget the generated handoff against the successor's complete ordinary
 AND SHALL reserve successor working room equal to the greater of 8,192 tokens or one quarter of the input space remaining after complete ordinary instructions/tools and full output reservation, rounding upward
 AND SHALL retain that working room after the projected handoff
 AND SHALL validate the complete successor projection rather than the summary text alone
+AND SHALL refresh successor-turn guidance and tool overhead again at admission without rewriting the predecessor's frozen turn guidance
 AND SHALL require room for additional work rather than declare a successor ready merely because its opening request fits.
 
 WHEN protected input prevents the required successor working room
@@ -1591,6 +1592,7 @@ WHEN an admitted explicit model change changes the selected model after a recove
 THE SYSTEM SHALL replan the retained continuation operation using the changed model and full output reservation
 AND SHALL retain the operation identity while advancing its attempt
 AND SHALL fence results from the replaced runtime
+AND SHALL commit the changed model settings and advanced continuation request owner atomically before runtime recreation, so restart resumes the admitted replan
 AND SHALL NOT reauthorize an unchanged capacity plan merely because the same model was selected again.
 
 WHEN the user requests AI shortening
@@ -1599,6 +1601,16 @@ AND SHALL instruct the rewriting model to prioritize user intent, corrections, u
 AND SHALL validate the candidate's size and successor working room independently of the model's claims
 AND SHALL require user review and explicit acceptance before replacing the active handoff
 AND SHALL retain the original when generation fails, the candidate remains oversized, or the user declines it.
+AND SHALL retain oversized generated summaries as reviewable candidates rather than discard their text
+AND SHALL persist candidates as immutable ordered children with their known source references and source revision
+AND SHALL reject generated-candidate acceptance after its continuation operation, attempt, or exhausted-source revision has changed
+AND SHALL preserve generated-context authority when accepting a generated summary or candidate; acceptance does not promote it into primary user authorization.
+
+WHEN a user explicitly supplies a revised handoff after a recoverable capacity conflict
+THE SYSTEM SHALL revalidate its successor capacity before reserving a successor
+AND SHALL atomically preserve the reviewed handoff as a continuation boundary alongside the successor reservation
+AND SHALL preserve all original transcript and review-candidate rows
+AND SHALL retain one-successor idempotence and product/Close admission fences.
 
 WHEN the shortening request itself cannot fit
 THE SYSTEM SHALL offer an explicit model change or manual editing rather than silently clip its protected source

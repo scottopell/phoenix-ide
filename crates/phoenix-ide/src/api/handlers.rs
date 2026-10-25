@@ -300,6 +300,14 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/trigger-continuation",
             post(trigger_continuation),
         )
+        .route(
+            "/api/conversations/:id/handoff-review",
+            post(review_continuation_handoff),
+        )
+        .route(
+            "/api/conversations/:id/handoff-candidates",
+            get(list_continuation_handoff_candidates),
+        )
         // Context continuation worktree transfer (REQ-BED-030)
         .route(
             "/api/conversations/:id/continue",
@@ -5821,12 +5829,28 @@ async fn upgrade_conversation_model(
         }
     };
 
-    let capacity_replan_operation = match &effective_state {
+    let old_effective_model = conv
+        .model
+        .clone()
+        .unwrap_or_else(|| state.llm_registry.default_model_id());
+    let capacity_replan_request = match &effective_state {
         ConvState::RecoverableContinuationFailure { failure }
             if failure.error_kind == crate::db::ErrorKind::ContextCapacityConflict
-                && conv.model.as_deref() != Some(req.model.as_str()) =>
+                && old_effective_model != req.model =>
         {
-            Some(failure.request.operation_id.clone())
+            let transition =
+                phoenix_state_machine::transition::replan_continuation_failure(failure);
+            match transition.new_state {
+                phoenix_core::domain::sm_state::CoreState::AwaitingContinuation { request } => {
+                    Some(request)
+                }
+                _ => {
+                    return Err(AppError::Internal(
+                        "Continuation replan did not produce its required request owner"
+                            .to_string(),
+                    ))
+                }
+            }
         }
         _ => None,
     };
@@ -5835,12 +5859,13 @@ async fn upgrade_conversation_model(
     state
         .runtime
         .db()
-        .update_conversation_model_and_effort(
+        .update_conversation_model_and_effort_with_replan(
             &id,
             &req.model,
             next_effort,
             next_service_tier,
             &connection,
+            capacity_replan_request.as_ref(),
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -5851,10 +5876,10 @@ async fn upgrade_conversation_model(
         .evict_runtime(&id, crate::runtime::EvictionReason::ModelUpgrade)
         .await;
 
-    if let Some(operation_id) = capacity_replan_operation {
+    if capacity_replan_request.is_some() {
         state
             .runtime
-            .admit_continuation_replan_after_model_change(&id, operation_id)
+            .get_or_create(&id)
             .await
             .map_err(AppError::BadRequest)?;
     }
@@ -5878,6 +5903,107 @@ fn continuation_operation_id(state: ConvState) -> String {
 }
 
 /// Manually trigger context continuation (REQ-BED-023)
+async fn list_continuation_handoff_candidates(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::db::ContinuationHandoffCandidate>>, AppError> {
+    state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    state
+        .db
+        .continuation_handoff_candidates(&id)
+        .await
+        .map(Json)
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+async fn review_continuation_handoff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<crate::api::types::HandoffReviewRequest>,
+) -> Result<Json<crate::runtime::HandoffReviewResponse>, AppError> {
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _product_admission = state
+        .runtime
+        .lock_product_message_admission(parent.product_conversation_id.as_str())
+        .await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
+    let _admission = admission.lock().await;
+    require_ordinary_mutation_admission(&state, &id, "handoff review").await?;
+    if req.handoff.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Handoff must not be empty".to_string(),
+        ));
+    }
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let opening_authority = match &req.source {
+        crate::api::types::ContinueHandoffSource::Manual => phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction,
+        crate::api::types::ContinueHandoffSource::Summary { .. } | crate::api::types::ContinueHandoffSource::Candidate { .. } => phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+    };
+    let source_candidate_id = match &req.source {
+        crate::api::types::ContinueHandoffSource::Manual => None,
+        crate::api::types::ContinueHandoffSource::Candidate { candidate_id } => {
+            let candidates = state
+                .db
+                .continuation_handoff_candidates(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            if !candidates.iter().any(|candidate| {
+                &candidate.id == candidate_id
+                    && candidate.text == req.handoff
+                    && candidate.origin.revision().is_current_for(&parent)
+            }) {
+                return Err(AppError::BadRequest(
+                    "Shortening source must match its current retained candidate".to_string(),
+                ));
+            }
+            Some(candidate_id.clone())
+        }
+        crate::api::types::ContinueHandoffSource::Summary { message_id } => {
+            let message = state
+                .db
+                .get_message_by_id_in_conversation(&id, message_id)
+                .await
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            if !matches!(&parent.state, ConvState::ContextExhausted { summary } if summary == &req.handoff)
+                || !matches!(message.content, crate::db::MessageContent::Continuation(content) if content.summary == req.handoff)
+            {
+                return Err(AppError::BadRequest(
+                    "Shortening source must match its current generated summary".to_string(),
+                ));
+            }
+            None
+        }
+    };
+    state
+        .runtime
+        .review_continuation_handoff_with_source(
+            &id,
+            req.handoff,
+            req.shorten,
+            source_candidate_id,
+            opening_authority,
+        )
+        .await
+        .map(Json)
+        .map_err(AppError::BadRequest)
+}
+
 async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6153,11 +6279,60 @@ async fn continue_conversation(
         .lock_product_message_admission(parent.product_conversation_id.as_str())
         .await;
 
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
+    let _mutation_admission = admission.lock().await;
+    let parent = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
     if req.handoff.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Continuation handoff must not be empty.".to_string(),
         ));
     }
+    let generated_context = if parent.continued_in_conv_id.is_some() {
+        false
+    } else {
+        match &req.source {
+            crate::api::types::ContinueHandoffSource::Manual => false,
+            crate::api::types::ContinueHandoffSource::Candidate { candidate_id } => {
+                let candidates = state
+                    .db
+                    .continuation_handoff_candidates(&id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                if !candidates.iter().any(|candidate| {
+                    &candidate.id == candidate_id
+                        && candidate.text == req.handoff
+                        && candidate.origin.revision().is_current_for(&parent)
+                }) {
+                    return Err(AppError::BadRequest("Accepted candidate must exactly match a retained generated preview. Submit edits as a separate manual handoff.".to_string()));
+                }
+                true
+            }
+            crate::api::types::ContinueHandoffSource::Summary { message_id } => {
+                let message = state
+                    .db
+                    .get_message_by_id_in_conversation(&id, message_id)
+                    .await
+                    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+                if !matches!(&parent.state, ConvState::ContextExhausted { summary } if summary == &req.handoff)
+                    || !matches!(message.content, crate::db::MessageContent::Continuation(content) if content.summary == req.handoff)
+                {
+                    return Err(AppError::BadRequest(
+                        "Accepted generated summary must exactly match its transcript row"
+                            .to_string(),
+                    ));
+                }
+                true
+            }
+        }
+    };
     let mut automatic_retry_phase = None;
     let _automatic_retry_authority = if req.retry_failed_automatic {
         Some(
@@ -6250,9 +6425,33 @@ async fn continue_conversation(
             continuation_message_id(req.message_id.clone())?,
             req.handoff,
             req.user_agent,
-            phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction,
+            if generated_context {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext
+            } else {
+                phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::UserAuthorizedInstruction
+            },
         )
     };
+
+    if parent.continued_in_conv_id.is_none() {
+        require_ordinary_mutation_admission(&state, &id, "continuation admission").await?;
+        let review = state
+            .runtime
+            .review_continuation_admission(&id, handoff.clone(), opening_authority)
+            .await
+            .map_err(AppError::BadRequest)?;
+        if !review.source.fits() {
+            let message = match review.source.status {
+                crate::runtime::HandoffCapacityStatus::RequiredOverhead => "Required instructions/tools and full output reservation leave no successor working room. Handoff editing and shortening cannot fix this overhead; explicitly change model or revise required instructions/tools.",
+                crate::runtime::HandoffCapacityStatus::HandoffTooLarge { .. } => "The supplied handoff leaves insufficient successor working room. Review the capacity target, edit the handoff, request one shortening candidate, or explicitly change model.",
+                crate::runtime::HandoffCapacityStatus::Ready { .. } => unreachable!("fit checked above"),
+            };
+            let mut conflict =
+                ConflictErrorResponse::new(message, "continuation_capacity_conflict");
+            conflict.capacity = Some(review.source);
+            return Err(AppError::Conflict(Box::new(conflict)));
+        }
+    }
 
     let (outcome, intent) = state
         .runtime
@@ -10487,8 +10686,14 @@ pub(crate) mod hard_delete_cascade_tests {
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
     pub(crate) async fn make_test_state() -> AppState {
+        make_test_state_with_llm(Arc::new(TestLlm)).await
+    }
+
+    pub(crate) async fn make_test_state_with_llm(
+        llm: Arc<dyn phoenix_llm::LlmService>,
+    ) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
-        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(TestLlm)));
+        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
@@ -20605,6 +20810,554 @@ mod lifecycle_handler_tests {
             .expect("body bytes");
         let payload: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(payload["hits"][0]["message_id"], "m-prefix");
+    }
+}
+
+#[cfg(test)]
+mod handoff_capacity_api_tests {
+    use super::hard_delete_cascade_tests::make_test_state;
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    struct SummaryLlm;
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for SummaryLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: vec![phoenix_llm::ContentBlock::text(
+                    "Fresh real summary: unfinished task and correction retained",
+                )],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "claude-sonnet-5"
+        }
+    }
+
+    async fn post(
+        state: &AppState,
+        id: &str,
+        action: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/conversations/{id}/{action}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn exhausted_ordinary_and_coordinator_rows_support_review_and_regeneration() {
+        for coordinator in [false, true] {
+            let state = super::hard_delete_cascade_tests::make_test_state_with_llm(
+                std::sync::Arc::new(SummaryLlm),
+            )
+            .await;
+            state.runtime.start_sub_agent_handler().await;
+            let conversation = if coordinator {
+                state
+                    .db
+                    .get_or_create_coordinator(
+                        None,
+                        phoenix_core::llm_language::LlmLanguage::default(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                state
+                    .db
+                    .create_conversation(
+                        "legacy-capacity",
+                        "legacy-capacity",
+                        "/tmp",
+                        true,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            };
+            state
+                .db
+                .add_message(
+                    "original-user",
+                    &conversation.id,
+                    &crate::db::MessageContent::user("Unfinished task and correction"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .add_message(
+                    "legacy-boundary",
+                    &conversation.id,
+                    &crate::db::MessageContent::continuation("legacy generic notice"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .update_conversation_state(
+                    &conversation.id,
+                    &ConvState::ContextExhausted {
+                        summary: "legacy generic notice".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            let mut events = state
+                .runtime
+                .conversation_broadcaster(&conversation.id)
+                .await
+                .subscribe();
+            let (status, body) = post(
+                &state,
+                &conversation.id,
+                "handoff-review",
+                serde_json::json!({"handoff":"short handoff", "shorten":false}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["shortening"]["kind"], "not_requested");
+            assert!(
+                state
+                    .runtime
+                    .try_get_handle(&conversation.id)
+                    .await
+                    .is_none(),
+                "one-shot review actor must be retired before the response"
+            );
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                    event,
+                    crate::runtime::SseEvent::ConversationBecameTerminal { .. }
+                )),
+                "review must not emit terminal lifecycle notifications"
+            );
+            let (status, body) = post(
+                &state,
+                &conversation.id,
+                "trigger-continuation",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap(),
+                        crate::runtime::SseEvent::ConversationBecameTerminal { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                completed.is_ok(),
+                "regenerated summary did not complete; coordinator={coordinator}, persisted={:?}",
+                state
+                    .db
+                    .get_conversation(&conversation.id)
+                    .await
+                    .unwrap()
+                    .state
+            );
+            let regenerated = state.db.get_conversation(&conversation.id).await.unwrap();
+            assert!(
+                matches!(regenerated.state, ConvState::ContextExhausted { summary } if summary == "Fresh real summary: unfinished task and correction retained")
+            );
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                    event,
+                    crate::runtime::SseEvent::ConversationBecameTerminal { .. }
+                )),
+                "regeneration completes with one terminal notification"
+            );
+            let messages = state.db.get_messages(&conversation.id).await.unwrap();
+            assert!(messages
+                .iter()
+                .any(|message| message.message_id == "original-user"));
+            assert!(messages
+                .iter()
+                .any(|message| message.message_id == "legacy-boundary"));
+            assert!(state
+                .db
+                .get_conversation(&conversation.id)
+                .await
+                .unwrap()
+                .continued_in_conv_id
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_capacity_routes_obey_close_fence() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("capacity-close", "capacity-close", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &phoenix_core::domain::close::TranscriptConversationId::parse(
+                    conversation.id.clone(),
+                )
+                .unwrap(),
+                "capacity-close-attempt",
+            )
+            .await
+            .unwrap();
+        for action in ["trigger-continuation", "handoff-review", "continue"] {
+            let (status, _) = post(
+                &state,
+                &conversation.id,
+                action,
+                serde_json::json!({"handoff":"original", "message_id":"opening", "shorten":true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{action}");
+        }
+        assert!(state
+            .db
+            .continuation_handoff_candidates(&conversation.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn already_reserved_successor_is_returned_without_revalidating_losing_handoff() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation(
+                "capacity-existing",
+                "capacity-existing",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let crate::db::ContinueOutcome::Created(successor) = state
+            .db
+            .continue_conversation(&conversation.id)
+            .await
+            .unwrap()
+        else {
+            panic!("created")
+        };
+        let (status, body) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"oversized ".repeat(200_000), "message_id":"losing-opening"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["conversation_id"], successor.id);
+        let (status, _) = post(
+            &state,
+            &conversation.id,
+            "trigger-continuation",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reviewed_candidate_acceptance_preserves_generated_authority_and_original_failure() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation(
+                "capacity-candidate",
+                "capacity-candidate",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let failure = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "failed-operation".to_string(),
+                    rejected_tool_calls: vec![],
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+                message: "too large".to_string(),
+            },
+        };
+        state
+            .db
+            .update_conversation_state(&conversation.id, &failure)
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "original-context",
+                &conversation.id,
+                &crate::db::MessageContent::user("original task"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .save_continuation_handoff_candidate(&crate::db::ContinuationHandoffCandidate {
+                id: "reviewed-candidate".to_string(),
+                conversation_id: conversation.id.clone(),
+                origin: crate::db::ContinuationCandidateOrigin::AiShortening {
+                    revision: crate::db::ContinuationSourceRevision::Operation {
+                        operation_id: "failed-operation".to_string(),
+                        attempt: 1,
+                    },
+                },
+                source: crate::db::ContinuationCandidateSource::UnattributedInput,
+                text: "short generated context".to_string(),
+            })
+            .await
+            .unwrap();
+        let (status, _) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"different text", "message_id":"opening", "source":{"kind":"candidate", "candidate_id":"reviewed-candidate"}})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+        let (status, body) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"short generated context", "message_id":"opening", "source":{"kind":"candidate", "candidate_id":"reviewed-candidate"}})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "accepted", "{body}");
+        let intent = state
+            .db
+            .continuation_dispatch_intent(&conversation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.opening_authority, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext);
+        assert_eq!(
+            state
+                .db
+                .get_conversation(&conversation.id)
+                .await
+                .unwrap()
+                .state,
+            failure
+        );
+        assert!(state
+            .db
+            .get_messages(&conversation.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.message_id == "original-context"));
+        let mut opening_events = state
+            .runtime
+            .conversation_broadcaster(&intent.successor_conversation_id)
+            .await
+            .subscribe();
+        crate::runtime::direct_turn_worker::dispatch_standalone(
+            state.runtime.clone(),
+            &intent.successor_conversation_id,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let crate::runtime::SseEvent::Message { message, .. } = opening_events.recv().await.unwrap() {
+                    if matches!(message.content, crate::db::MessageContent::Continuation(content) if content.summary == "short generated context") { break; }
+                }
+            }
+        }).await.expect("generated opening materializes through the durable turn worker");
+        let receipt = state
+            .db
+            .read_continuation_opening(&intent.successor_conversation_id)
+            .await
+            .unwrap();
+        assert!(matches!(receipt, crate::db::ContinuationOpeningRead::Accepted { opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext, .. }));
+    }
+
+    #[tokio::test]
+    async fn stale_generated_candidate_is_rejected_after_source_regeneration() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("stale-preview", "stale-preview", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "source-a".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let source_a = state.db.get_conversation(&conversation.id).await.unwrap();
+        state
+            .db
+            .save_continuation_handoff_candidate(&crate::db::ContinuationHandoffCandidate {
+                id: "stale-preview-a".to_string(),
+                conversation_id: conversation.id.clone(),
+                origin: crate::db::ContinuationCandidateOrigin::AiShortening {
+                    revision: crate::db::ContinuationSourceRevision::ExhaustedState {
+                        state_updated_at: source_a.state_updated_at,
+                    },
+                },
+                source: crate::db::ContinuationCandidateSource::UnattributedInput,
+                text: "candidate-a".to_string(),
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "source-b".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let (status, _) = post(&state, &conversation.id, "continue", serde_json::json!({"handoff":"candidate-a", "message_id":"opening", "source":{"kind":"candidate", "candidate_id":"stale-preview-a"}})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+        assert_eq!(
+            state
+                .db
+                .continuation_handoff_candidates(&conversation.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_admission_returns_typed_capacity_conflict_without_successor() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("capacity-admit", "capacity-admit", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: "original".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let oversized = "<".repeat(1_000_000);
+        state
+            .db
+            .update_conversation_state(
+                &conversation.id,
+                &ConvState::ContextExhausted {
+                    summary: oversized.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "large-generated-source",
+                &conversation.id,
+                &crate::db::MessageContent::continuation(oversized.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (status, body) = post(
+            &state,
+            &conversation.id,
+            "continue",
+            serde_json::json!({"handoff":oversized, "message_id":"opening", "source":{"kind":"summary", "message_id":"large-generated-source"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error_type"], "continuation_capacity_conflict");
+        assert_eq!(body["capacity"]["status"]["kind"], "handoff_too_large");
+        assert!(state
+            .db
+            .get_conversation(&conversation.id)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
     }
 }
 
