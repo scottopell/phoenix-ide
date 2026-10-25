@@ -109,13 +109,25 @@ impl CountingBudget {
         local_prediction: usize,
         input_limit: usize,
     ) -> InputAccounting {
+        self.account_before_reduction(client, request, local_prediction, input_limit, false)
+            .await
+    }
+
+    pub(super) async fn account_before_reduction(
+        &mut self,
+        client: &dyn LlmClient,
+        request: LlmRequest,
+        local_prediction: usize,
+        input_limit: usize,
+        proposed_reduction: bool,
+    ) -> InputAccounting {
         let mut accounting = InputAccounting {
             request,
             local_prediction,
             provider: None,
             fallback: None,
         };
-        if local_prediction <= input_limit {
+        if local_prediction <= input_limit && !proposed_reduction {
             accounting.fallback = Some(phoenix_llm::InputCountFallback::LocalReady);
             return accounting;
         }

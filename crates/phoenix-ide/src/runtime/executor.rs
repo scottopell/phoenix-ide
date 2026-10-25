@@ -8341,6 +8341,29 @@ where
                 &responses_replay,
             ));
         let mut counting = CountingBudget::new();
+        let clearing_room = self
+            .context
+            .context_window
+            .saturating_sub(self.context.output_budget)
+            .saturating_sub(trusted_token_reserve);
+        let reported_pressure = self.storage.get_last_turn_prompt_tokens(&conv_id).await.unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to read last-turn usage; holding proactive clearing watermark");
+            None
+        });
+        let prior_watermark = self.clear_watermark_cache.lock().unwrap().unwrap_or(0);
+        let proposed_sweep = plan_tool_result_clearing(
+            &self
+                .active_prompt_projection
+                .as_ref()
+                .expect("projection refreshed above")
+                .messages,
+            &self.clearable_names,
+            prior_watermark,
+            reported_pressure,
+            clearing_room,
+        )
+        .new_watermark
+            > prior_watermark;
         let planning_request = LlmRequest {
             system: vec![SystemContent::cached(&system_prompt)],
             messages: frozen_messages.clone(),
@@ -8354,29 +8377,46 @@ where
             cache_key: PromptCacheKey::stable(&conv_id),
         };
         let accounting = counting
-            .account(
+            .account_before_reduction(
                 llm_client.as_ref(),
                 planning_request,
                 fixed_tokens.saturating_add(estimate_messages_tokens(&frozen_messages)),
                 self.context
                     .context_window
                     .saturating_sub(self.context.output_budget),
+                proposed_sweep,
             )
             .await;
         let exceeds_capacity = accounting
             .occupancy()
             .saturating_add(self.context.output_budget)
             > self.context.context_window;
+        let sweep_pressure = accounting
+            .provider
+            .map(|count| i64::try_from(count.tokens()).unwrap_or(i64::MAX))
+            .or(reported_pressure);
+        let should_sweep = proposed_sweep
+            && sweep_pressure.is_some_and(|pressure| {
+                pressure
+                    > i64::try_from(clearing_room * CLEAR_TRIGGER_NUM / CLEAR_TRIGGER_DEN)
+                        .unwrap_or(i64::MAX)
+            });
         let mut planned_request = accounting.into_request();
-        if exceeds_capacity {
-            let input_budget = self
-                .context
-                .context_window
-                .saturating_sub(self.context.output_budget)
-                .saturating_sub(fixed_tokens)
-                .saturating_sub(trusted_token_reserve);
-            let pressure =
-                i64::try_from(estimate_messages_tokens(&frozen_messages)).unwrap_or(i64::MAX);
+        if exceeds_capacity || should_sweep {
+            let input_budget = if exceeds_capacity {
+                self.context
+                    .context_window
+                    .saturating_sub(self.context.output_budget)
+                    .saturating_sub(fixed_tokens)
+                    .saturating_sub(trusted_token_reserve)
+            } else {
+                clearing_room
+            };
+            let pressure = if exceeds_capacity {
+                Some(i64::try_from(estimate_messages_tokens(&frozen_messages)).unwrap_or(i64::MAX))
+            } else {
+                sweep_pressure
+            };
             frozen_messages = assemble_cleared_messages_with_pressure(
                 &self.storage,
                 &self.context.conversation_id,
@@ -8389,17 +8429,25 @@ where
                 &self.clearable_names,
                 input_budget,
                 &self.clear_watermark_cache,
-                Some(pressure),
+                pressure,
             )
             .await;
             overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
             planned_request.messages.clone_from(&frozen_messages);
-            if dispatch_estimate_exceeds_context(
-                fixed_tokens,
-                &frozen_messages,
-                self.context.output_budget,
-                self.context.context_window,
-            ) {
+            let clearing_changed = self
+                .clear_watermark_cache
+                .lock()
+                .unwrap()
+                .unwrap_or(prior_watermark)
+                > prior_watermark;
+            if (exceeds_capacity || clearing_changed)
+                && dispatch_estimate_exceeds_context(
+                    fixed_tokens,
+                    &frozen_messages,
+                    self.context.output_budget,
+                    self.context.context_window,
+                )
+            {
                 return Ok(Some(Event::LlmError {
                     message: "Planned prompt and declared output budget exceed context capacity after permitted tool-result clearing; compact or revise the input.".into(),
                     error_kind: crate::db::ErrorKind::PlannedContextPressure,
@@ -27224,6 +27272,128 @@ mod stale_tool_result_clearing_tests {
 
     fn clearable(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn ordinary_dispatch_applies_proactive_sweep_before_hard_capacity() {
+        use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
+        use phoenix_llm::{LlmError, LlmResponse, ProviderInputCount};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingClient {
+            inner: Arc<MockLlmClient>,
+            tokens: Option<usize>,
+            counts: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl LlmClient for CountingClient {
+            fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
+                Ok(self)
+            }
+            fn model_id(&self) -> &str {
+                "test-model"
+            }
+            async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+                self.inner.complete(request).await
+            }
+            async fn count_input(
+                &self,
+                request: &LlmRequest,
+            ) -> Result<Option<ProviderInputCount>, LlmError> {
+                self.counts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.max_tokens, 16_384);
+                assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, images, .. } if tool_use_id == "old-tool" && images.len() == 6)));
+                Ok(self
+                    .tokens
+                    .map(|tokens| ProviderInputCount::OpenAiCompleteInput { tokens }))
+            }
+        }
+        for (pressure, tokens, swept, counts) in [
+            (180_000, None, true, 1),
+            (180_000, Some(10_000), false, 1),
+            (1_000, None, false, 0),
+        ] {
+            let cwd = tempfile::TempDir::new().unwrap();
+            let conv = "ordinary-proactive-clearing";
+            let storage = Arc::new(InMemoryStorage::new());
+            let old = add_round(&storage, conv, "old", "read_file", 6).await;
+            for tag in ["r1", "r2", "r3"] {
+                add_round(&storage, conv, tag, "read_file", 1).await;
+            }
+            storage.set_last_prompt_tokens(conv, pressure);
+            let inner = Arc::new(MockLlmClient::new("test-model"));
+            inner.queue_response(LlmResponse::non_streaming(
+                vec![ContentBlock::text("done")],
+                true,
+                phoenix_llm::Usage::default(),
+            ));
+            let llm = Arc::new(CountingClient {
+                inner: inner.clone(),
+                tokens,
+                counts: AtomicUsize::new(0),
+            });
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let mut runtime = ConversationRuntime::new(
+                ConvContext::new(
+                    conv,
+                    cwd.path().to_path_buf(),
+                    "test-model",
+                    200_000,
+                    16_384,
+                ),
+                ConvState::LlmRequesting { attempt: 1 },
+                storage.clone(),
+                llm.clone(),
+                Arc::new(MockToolExecutor::new().with_clearable_tool("read_file")),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx,
+                SseBroadcaster::new(16, 0),
+            );
+            assert!(runtime
+                .execute_effect(Effect::RequestLlm)
+                .await
+                .unwrap()
+                .is_none());
+            runtime.llm_task_handle.take().unwrap().await.unwrap();
+            assert_eq!(
+                storage.get_clear_watermark(conv).await.unwrap(),
+                if swept { old } else { 0 }
+            );
+            assert_eq!(llm.counts.load(Ordering::SeqCst), counts);
+            let requests = inner.recorded_requests();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            let fixed =
+                estimate_fixed_request_tokens(&request.system[0].text, &request.tool_availability);
+            let original = render_messages(storage.get_all_messages(conv).iter(), &HashSet::new());
+            assert!(!dispatch_estimate_exceeds_context(
+                fixed, &original, 16_384, 200_000
+            ));
+            assert!(!dispatch_estimate_exceeds_context(
+                fixed,
+                &request.messages,
+                16_384,
+                200_000
+            ));
+            let images = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        images,
+                        ..
+                    } if tool_use_id == "old-tool" => Some(images.len()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(images, if swept { 0 } else { 6 });
+        }
     }
 
     /// Above the high-water mark, an old clearable round is swept: the watermark
