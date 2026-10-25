@@ -12363,8 +12363,24 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn continuation_retry_admission_waits_for_executor_acknowledgement() {
-        let manager = Arc::new(test_manager().await);
         let conversation_id = "retry-admission";
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let llm = Arc::new(PersistedStateRecordingLlm {
+            db: db.clone(),
+            conversation_id: conversation_id.to_string(),
+            observed_state: std::sync::Mutex::new(None),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let manager = Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone())),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
         let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
             operation_id: "retry-operation".to_string(),
             rejected_tool_calls: Vec::new(),
@@ -12398,7 +12414,6 @@ mod scope_liveness_tests {
         let observed = state_rx.borrow().clone();
         let accepted_request = match &observed {
             ConvState::AwaitingContinuation { request } => request,
-            ConvState::RecoverableContinuationFailure { failure } => &failure.request,
             other => panic!("retry admission must retain its operation: {other:?}"),
         };
         assert_eq!(accepted_request.operation_id, request.operation_id);
@@ -12412,6 +12427,17 @@ mod scope_liveness_tests {
                 .state,
             observed
         );
+        tokio::time::timeout(std::time::Duration::from_secs(30), llm.entered.notified())
+            .await
+            .expect("admitted continuation reaches provider");
+        assert_eq!(
+            llm.observed_state
+                .lock()
+                .expect("observed state lock")
+                .as_ref(),
+            Some(&observed)
+        );
+        llm.release.notify_one();
     }
 
     #[tokio::test]
