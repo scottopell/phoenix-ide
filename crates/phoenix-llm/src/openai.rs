@@ -13,6 +13,7 @@ use super::LlmError;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use phoenix_core::domain::llm_types::ProviderRequestTier;
+use phoenix_core::domain::llm_types::UsageObservation;
 use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
 use phoenix_core::domain::responses_replay::ResponsesResponseSet;
 use reqwest::header::HeaderMap;
@@ -247,10 +248,14 @@ pub async fn complete(
         LlmError::invalid_response("Failed to parse Responses API response")
     })?;
 
-    bind_responses_model(
+    let mut response = bind_responses_model(
         normalize_responses_api_response(responses_response)?,
         request_name.as_str(),
-    )
+    )?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| LlmError::invalid_response("Invalid response"))?;
+    response.usage_observation = UsageObservation::responses(&raw["usage"]);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +402,7 @@ impl ResponsesReasoningUsage {
 
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
+    usage_observation: UsageObservation,
     input_tokens: u32,
     output_tokens: u32,
     reasoning_usage: ResponsesReasoningUsage,
@@ -471,6 +477,7 @@ impl ResponsesStreamAccumulator {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            usage_observation: UsageObservation::default(),
             reasoning_usage: ResponsesReasoningUsage::Absent,
             cached_tokens: 0,
             cache_write_tokens: 0,
@@ -692,7 +699,7 @@ impl ResponsesStreamAccumulator {
                     self.model = model.to_string();
                 }
                 if let Some(usage) = v.pointer("/response/usage") {
-                    tracing::debug!(usage = %usage, "responses_api usage extracted");
+                    self.usage_observation = UsageObservation::responses(usage);
                     self.input_tokens = u32::try_from(
                         usage
                             .get("input_tokens")
@@ -848,6 +855,7 @@ impl ResponsesStreamAccumulator {
             },
             self.observed_non_reasoning_output,
         )?;
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -3446,7 +3454,11 @@ pub async fn complete_chat(
         LlmError::invalid_response("Failed to parse Chat Completions response")
     })?;
 
-    normalize_chat_response(chat_response, request_name.as_str())
+    let mut response = normalize_chat_response(chat_response, request_name.as_str())?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| LlmError::invalid_response("Invalid response"))?;
+    response.usage_observation = UsageObservation::chat(&raw["usage"]);
+    Ok(response)
 }
 
 /// Complete using the `OpenAI` Chat Completions API (streaming).
@@ -3900,6 +3912,7 @@ enum ChatVisibleKind {
 }
 
 struct ChatStreamAccumulator {
+    usage_observation: UsageObservation,
     content: String,
     visible_kind: Option<ChatVisibleKind>,
     choice_index: Option<usize>,
@@ -3966,6 +3979,7 @@ impl ChatStreamAccumulator {
         Self {
             content: String::new(),
             visible_kind: None,
+            usage_observation: UsageObservation::default(),
             choice_index: None,
             tool_calls: Vec::new(),
             usage: None,
@@ -3993,6 +4007,11 @@ impl ChatStreamAccumulator {
         }
         let now = Instant::now();
         self.telemetry.record_provider_event_at(now);
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(data) {
+            if raw.get("usage").is_some_and(|usage| !usage.is_null()) {
+                self.usage_observation = UsageObservation::chat(&raw["usage"]);
+            }
+        }
         let event: ChatStreamChunk = serde_json::from_str(data).map_err(|e| {
             LlmError::invalid_response(format!("Failed to parse chat SSE data: {e}"))
         })?;
@@ -4170,6 +4189,7 @@ impl ChatStreamAccumulator {
         };
         let mut response =
             chat_message_to_response(message, self.usage, "<streaming-chat-completions>")?;
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -5738,6 +5758,7 @@ mod tests {
         )]);
         let capture = crate::LlmAttemptCapture::new();
         request.telemetry = Some(crate::LlmRequestTelemetry {
+            capacity_plan_id: None,
             conversation_id: "deadline".to_string(),
             root_conversation_id: "deadline".to_string(),
             request_id: "deadline".to_string(),
@@ -8381,6 +8402,51 @@ mod tests {
             1,
             "terminal output must not duplicate completed items"
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_usage_observation_stream_missing_usage_differs_from_reported_zero() {
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!({"input_tokens":0,"output_tokens":0}),
+            serde_json::json!({"input_tokens":0,"output_tokens":0,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+            let item = serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]});
+            acc.process_event(
+                "response.output_item.done",
+                &serde_json::json!({"type":"response.output_item.done","item":item}).to_string(),
+                &tx,
+            )
+            .await
+            .unwrap();
+            let terminal = serde_json::json!({"type":"response.completed","response":{"usage":usage,"output":[item]}});
+            acc.process_event("response.completed", &terminal.to_string(), &tx)
+                .await
+                .unwrap();
+            let response = acc.into_response().unwrap();
+            assert_eq!(response.usage.input_tokens, 0);
+            assert_eq!(response.usage_observation.input_total, !usage.is_null());
+            assert_eq!(
+                response.usage_observation.cache_read,
+                usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .is_some()
+            );
+        }
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!({"prompt_tokens":0,"completion_tokens":0}),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = ChatStreamAccumulator::new(Instant::now(), &empty_request());
+            acc.process_event(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":usage}).to_string(),&tx).await.unwrap();
+            let response = acc.into_response().unwrap();
+            assert_eq!(response.usage.input_tokens, 0);
+            assert_eq!(response.usage_observation.input_total, !usage.is_null());
+            assert!(!response.usage_observation.cache_read);
+        }
     }
 
     #[test]

@@ -684,6 +684,7 @@ const MIGRATIONS: &[Migration] = &[
             CHECK(source_message_id IS NULL OR source_candidate_id IS NULL)
         ); CREATE INDEX continuation_handoff_candidates_conversation ON continuation_handoff_candidates(conversation_id, ordinal);",
     },
+    Migration { version: 131, name: "request_capacity_diagnostics", sql: include_str!("migrations/request_capacity.sql") },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");

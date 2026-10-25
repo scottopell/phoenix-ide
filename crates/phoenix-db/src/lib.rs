@@ -18,6 +18,8 @@ pub use coordinator_watches::{
     WatchSnapshot,
 };
 mod ddl;
+mod request_capacity;
+pub use request_capacity::CapacityDiagnosticRow;
 mod git_repository_reconciliation;
 mod message_attachments;
 mod svg_artifacts;
@@ -1143,6 +1145,7 @@ fn row_to_llm_request_metrics(row: &SqliteRow) -> DbResult<LlmRequestMetricsRow>
         retry_attempt,
         created_at: row.try_get("created_at")?,
         metrics: LlmAttemptMetrics {
+            capacity_plan_id: row.try_get("capacity_plan_id")?,
             conversation_id: row.try_get("conversation_id")?,
             root_conversation_id: row.try_get("root_conversation_id")?,
             request_id,
@@ -10931,6 +10934,8 @@ impl Database {
             .collect()
     }
 
+    /// # Errors
+    /// Returns an error if `SQLite` cannot update the selected model and effort.
     pub async fn update_conversation_model_and_effort(
         &self,
         id: &str,
@@ -14355,13 +14360,14 @@ impl Database {
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO llm_request_metrics (\
-             request_id, retry_attempt, conversation_id, root_conversation_id, provider, model, transport, total_duration_ms, \
+             capacity_plan_id, request_id, retry_attempt, conversation_id, root_conversation_id, provider, model, transport, total_duration_ms, \
              dispatch_to_first_provider_event_ms, dispatch_to_first_generation_event_ms, dispatch_to_first_visible_text_ms, \
              provider_event_count, generation_event_count, visible_text_event_count, max_provider_gap_ms, max_generation_gap_ms, \
              output_kind, stream_completed, outcome, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21) \
              ON CONFLICT(request_id, retry_attempt) DO NOTHING"
         )
+        .bind(&metrics.capacity_plan_id)
         .bind(&metrics.request_id)
         .bind(i64::from(metrics.retry_attempt))
         .bind(&metrics.conversation_id)
@@ -14397,7 +14403,7 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Vec<LlmRequestMetricsRow>> {
         let rows = sqlx::query(
-            "SELECT request_id, retry_attempt, conversation_id, root_conversation_id, provider, model, transport, total_duration_ms, \
+            "SELECT capacity_plan_id, request_id, retry_attempt, conversation_id, root_conversation_id, provider, model, transport, total_duration_ms, \
              dispatch_to_first_provider_event_ms, dispatch_to_first_generation_event_ms, dispatch_to_first_visible_text_ms, \
              provider_event_count, generation_event_count, visible_text_event_count, max_provider_gap_ms, max_generation_gap_ms, \
              output_kind, stream_completed, outcome, created_at \
@@ -14453,14 +14459,15 @@ impl Database {
         service_tier: ServiceTier,
         usage: &phoenix_core::domain::llm_types::Usage,
         first_byte_at: Option<DateTime<Utc>>,
+        attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
     ) -> DbResult<()> {
         let now_str = Utc::now().to_rfc3339();
         let first_byte_str = first_byte_at.map(|t| t.to_rfc3339());
         sqlx::query(
             "INSERT INTO turn_usage \
              (conversation_id, root_conversation_id, model, effort_source, effort_level, service_tier, \
-              input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, created_at, first_byte_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, created_at, first_byte_at, capacity_plan_id, request_id, retry_attempt, input_total_observed, output_observed, cache_write_observed, cache_read_observed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) ON CONFLICT(request_id, retry_attempt) WHERE request_id IS NOT NULL DO NOTHING",
         )
         .bind(conversation_id)
         .bind(root_conversation_id)
@@ -14475,6 +14482,13 @@ impl Database {
         .bind(usage.cache_read_tokens.cast_signed())
         .bind(&now_str)
         .bind(first_byte_str)
+        .bind(attempt.and_then(|a| a.capacity_plan_id.as_deref()))
+        .bind(attempt.map(|a| a.request_id.as_str()))
+        .bind(attempt.map(|a| a.retry_attempt))
+        .bind(attempt.map(|a| a.observation.input_total))
+        .bind(attempt.map(|a| a.observation.output))
+        .bind(attempt.map(|a| a.observation.cache_write))
+        .bind(attempt.map(|a| a.observation.cache_read))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -20246,6 +20260,7 @@ mod tests {
             ServiceTier::Standard,
             &usage,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -20258,6 +20273,7 @@ mod tests {
             ServiceTier::Fast,
             &usage,
             Some(observed),
+            None,
         )
         .await
         .unwrap();
@@ -20433,6 +20449,7 @@ mod tests {
             EffectiveEffort::native_unknown(),
             ServiceTier::Standard,
             &usage,
+            None,
             None,
         )
         .await
@@ -29937,6 +29954,7 @@ mod tests {
             .await
             .unwrap();
         let metric = LlmAttemptMetrics {
+            capacity_plan_id: None,
             conversation_id: "conv-timeout".to_string(),
             root_conversation_id: "conv-timeout".to_string(),
             request_id: "req-timeout".to_string(),
@@ -29981,6 +29999,7 @@ mod tests {
             .await
             .unwrap();
         let mut first = LlmAttemptMetrics {
+            capacity_plan_id: None,
             conversation_id: "conv-first-wins".to_string(),
             root_conversation_id: "conv-first-wins".to_string(),
             request_id: "req-first-wins".to_string(),
@@ -30014,6 +30033,7 @@ mod tests {
             .await
             .unwrap();
         db.upsert_llm_request_metrics(&LlmAttemptMetrics {
+            capacity_plan_id: None,
             conversation_id: "conv-ttft".to_string(),
             root_conversation_id: "conv-ttft".to_string(),
             request_id: "req-1".to_string(),
@@ -30039,6 +30059,7 @@ mod tests {
         .await
         .unwrap();
         db.upsert_llm_request_metrics(&LlmAttemptMetrics {
+            capacity_plan_id: None,
             conversation_id: "conv-ttft".to_string(),
             root_conversation_id: "conv-ttft".to_string(),
             request_id: "req-2".to_string(),
@@ -30065,6 +30086,7 @@ mod tests {
         .unwrap();
 
         let replacement = LlmAttemptMetrics {
+            capacity_plan_id: None,
             conversation_id: "conv-ttft".to_string(),
             root_conversation_id: "conv-ttft".to_string(),
             request_id: "req-1".to_string(),
@@ -31929,6 +31951,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one immutable-source recovery scenario with multiple candidate outcomes
     async fn continuation_recovery_candidates_are_immutable_ordered_children() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation(

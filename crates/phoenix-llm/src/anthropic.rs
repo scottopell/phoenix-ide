@@ -8,6 +8,7 @@ use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage,
 };
 use super::LlmError;
+use phoenix_core::domain::llm_types::UsageObservation;
 use phoenix_core::domain::provider_replay::{
     AnthropicPrivateBlock, AnthropicResponseIdentity, AnthropicResponseSet, ContentIndex,
     ProviderReplayUpdate,
@@ -73,7 +74,10 @@ fn count_sources_supported(value: &serde_json::Value) -> bool {
             fields.values().all(count_sources_supported)
         }
         serde_json::Value::Array(items) => items.iter().all(count_sources_supported),
-        _ => true,
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => true,
     }
 }
 
@@ -154,6 +158,7 @@ enum CurrentBlockKind {
 
 /// Accumulates state across Anthropic SSE stream events to assemble the final response.
 struct StreamAccumulator {
+    usage_observation: UsageObservation,
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
@@ -187,6 +192,7 @@ struct StreamAccumulator {
 impl StreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest, requested_fast: bool) -> Self {
         Self {
+            usage_observation: UsageObservation::default(),
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_tokens: 0,
@@ -243,6 +249,22 @@ impl StreamAccumulator {
                     .pointer("/message/model")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
+                self.usage_observation = UsageObservation {
+                    input_total: [
+                        "input_tokens",
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                    ]
+                    .iter()
+                    .all(|field| v["message"]["usage"][field].as_u64().is_some()),
+                    output: false,
+                    cache_write: v["message"]["usage"]["cache_creation_input_tokens"]
+                        .as_u64()
+                        .is_some(),
+                    cache_read: v["message"]["usage"]["cache_read_input_tokens"]
+                        .as_u64()
+                        .is_some(),
+                };
                 self.input_tokens = v
                     .pointer("/message/usage/input_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -276,6 +298,7 @@ impl StreamAccumulator {
                 if let Some(details) = v.pointer("/delta/stop_details") {
                     self.stop_details = serde_json::from_value(details.clone()).ok();
                 }
+                self.usage_observation.output |= v["usage"]["output_tokens"].as_u64().is_some();
                 self.output_tokens = v
                     .pointer("/usage/output_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -571,6 +594,7 @@ impl StreamAccumulator {
                 "Anthropic dropped preserved-thinking blocks after prefix mismatch"
             );
         }
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -1697,6 +1721,13 @@ fn normalize_response_with_diagnostics(
             cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
         },
     );
+    response.usage_observation = UsageObservation {
+        input_total: resp.usage.cache_creation_input_tokens.is_some()
+            && resp.usage.cache_read_input_tokens.is_some(),
+        output: true,
+        cache_write: resp.usage.cache_creation_input_tokens.is_some(),
+        cache_read: resp.usage.cache_read_input_tokens.is_some(),
+    };
     response.provider_replay = provider_replay;
     Ok(response)
 }
@@ -2917,6 +2948,50 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 7);
         assert_eq!(resp.usage.output_tokens, 11);
     }
+
+    #[tokio::test]
+    async fn capacity_usage_observation_anthropic_missing_cache_is_unknown_total() {
+        for cache_present in [false, true] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
+            let mut usage = serde_json::json!({"input_tokens":0});
+            if cache_present {
+                usage["cache_creation_input_tokens"] = 0.into();
+                usage["cache_read_input_tokens"] = 0.into();
+            }
+            acc.process_event(
+                "message_start",
+                &serde_json::json!({"message":{"id":"m","model":"claude-opus-5-5","usage":usage}})
+                    .to_string(),
+                &tx,
+            )
+            .await
+            .unwrap();
+            acc.process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text","text":"ok"}}"#,
+                &tx,
+            )
+            .await
+            .unwrap();
+            acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+                .await
+                .unwrap();
+            acc.process_event(
+                "message_delta",
+                r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
+                &tx,
+            )
+            .await
+            .unwrap();
+            let response = acc.into_response_with_diagnostics(None).unwrap();
+            assert_eq!(response.usage.context_window_used(), 0);
+            assert_eq!(response.usage_observation.input_total, cache_present);
+            assert_eq!(response.usage_observation.cache_read, cache_present);
+            assert!(response.usage_observation.output);
+        }
+    }
+
     #[test]
     fn counts_only_content_free_dropped_thinking_transformations() {
         let event = serde_json::json!({

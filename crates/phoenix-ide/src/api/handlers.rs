@@ -5742,6 +5742,7 @@ async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> 
 /// Allowed from `Idle`, `Error`, or `RecoverableContinuationFailure` -- cannot
 /// upgrade while an LLM request, tool execution, or other operation is in flight (see
 /// `ConvState::allows_model_change`).
+#[allow(clippy::too_many_lines)]
 async fn upgrade_conversation_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -10629,6 +10630,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 content: vec![],
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -17178,6 +17180,7 @@ mod regenerate_conversation_name_tests {
                 content: vec![ContentBlock::text(text)],
                 end_turn: true,
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -17629,6 +17632,7 @@ mod upgrade_model_state_guard_tests {
                 content: vec![ContentBlock::text("stub")],
                 end_turn: true,
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -20839,6 +20843,7 @@ mod handoff_capacity_api_tests {
                 )],
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -20871,6 +20876,7 @@ mod handoff_capacity_api_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // complete API recovery scenario
     async fn exhausted_ordinary_and_coordinator_rows_support_review_and_regeneration() {
         for coordinator in [false, true] {
             let state = super::hard_delete_cascade_tests::make_test_state_with_llm(
@@ -21121,6 +21127,7 @@ mod handoff_capacity_api_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // complete API recovery scenario
     async fn reviewed_candidate_acceptance_preserves_generated_authority_and_original_failure() {
         let state = make_test_state().await;
         let conversation = state

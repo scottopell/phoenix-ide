@@ -263,13 +263,7 @@ pub enum HandoffCapacityStatus {
     RequiredOverhead,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapacityCountingMethod {
-    ConservativeLocalEstimate,
-    OpenAiCompleteInput,
-    AnthropicEstimate,
-}
+pub type CapacityCountingMethod = phoenix_core::domain::request_capacity::InputCountingMethod;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HandoffCapacityReview {
@@ -10861,6 +10855,7 @@ mod scope_liveness_tests {
                 content: Vec::new(),
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
@@ -10891,6 +10886,7 @@ mod scope_liveness_tests {
                 content: Vec::new(),
                 end_turn: true,
                 usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }

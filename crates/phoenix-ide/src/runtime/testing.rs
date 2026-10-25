@@ -183,6 +183,7 @@ impl LlmClient for StreamingMockLlmClient {
             content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],
             end_turn: true,
             usage: phoenix_llm::Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
@@ -697,6 +698,7 @@ pub struct InMemoryStorage {
     metrics_write_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     llm_request_metrics: Mutex<Vec<phoenix_llm::LlmAttemptMetrics>>,
     turn_usages: Mutex<Vec<(String, phoenix_llm::Usage)>>,
+    pub capacity_plans: Mutex<Vec<phoenix_core::domain::request_capacity::RequestCapacityPlan>>,
     provider_replay_updates:
         Mutex<Vec<phoenix_core::domain::provider_replay::ProviderReplayUpdate>>,
     metrics_written: tokio::sync::Notify,
@@ -789,6 +791,7 @@ impl InMemoryStorage {
             metrics_write_release: Mutex::new(None),
             llm_request_metrics: Mutex::new(Vec::new()),
             turn_usages: Mutex::new(Vec::new()),
+            capacity_plans: Mutex::new(Vec::new()),
             provider_replay_updates: Mutex::new(Vec::new()),
             metrics_written: tokio::sync::Notify::new(),
             steering_drain_failures: Mutex::new(0),
@@ -2557,11 +2560,20 @@ impl StateStore for InMemoryStorage {
         _service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        _attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
     ) -> Result<(), String> {
         self.turn_usages
             .lock()
             .unwrap()
             .push((model.to_string(), usage.clone()));
+        Ok(())
+    }
+
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
+    ) -> Result<(), String> {
+        self.capacity_plans.lock().unwrap().push(plan.clone());
         Ok(())
     }
 
@@ -2921,6 +2933,7 @@ mod tests {
             content: vec![ContentBlock::text("Hello")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3009,6 +3022,7 @@ mod tests {
             content: vec![ContentBlock::text("Hello!")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3039,6 +3053,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 reasoning_tokens: Some(18),
             },
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         llm.queue_response(LlmResponse {
@@ -3046,6 +3061,7 @@ mod tests {
             content: vec![ContentBlock::text("next turn succeeded")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3139,6 +3155,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // Second response: text after tool
@@ -3147,6 +3164,7 @@ mod tests {
             content: vec![ContentBlock::text("Done!")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3200,6 +3218,7 @@ mod tests {
             content: vec![ContentBlock::text("Response that should be discarded")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3321,6 +3340,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // This response won't be used since tool is cancelled
@@ -3329,6 +3349,7 @@ mod tests {
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3442,6 +3463,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -3566,6 +3588,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -4299,6 +4322,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // After tool completes, LLM returns text
@@ -4307,6 +4331,7 @@ mod tests {
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
@@ -4423,6 +4448,7 @@ mod tests {
                 )],
                 end_turn: false,
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             });
         }
@@ -4995,6 +5021,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // Turn 2: a tool call (cooperative now), then...
@@ -5007,6 +5034,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // ...the post-tool LLM round returns a plain text answer → AgentDone.
@@ -5015,6 +5043,7 @@ mod tests {
             content: vec![ContentBlock::text("done with second tool")],
             end_turn: true,
             usage: Usage::default(),
+            usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
             stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 

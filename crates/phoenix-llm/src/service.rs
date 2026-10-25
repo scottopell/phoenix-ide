@@ -268,6 +268,23 @@ impl LlmService for LlmServiceImpl {
         &self.spec.id
     }
 
+    fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
+        use phoenix_core::domain::request_capacity::SafeRouteClass as R;
+        match self.spec.backend.api_format() {
+            ApiFormat::Anthropic if self.anthropic_base_url.is_none() => R::AnthropicDirect,
+            ApiFormat::Anthropic => R::AnthropicCompatible,
+            ApiFormat::OpenAIResponses if self.use_codex_backend => R::CodexAuth,
+            ApiFormat::OpenAIResponses if self.openai_responses_base_url.is_none() => {
+                R::OpenAiResponsesDirect
+            }
+            ApiFormat::OpenAIResponses => R::OpenAiResponsesCompatible,
+            ApiFormat::OpenAIChatCompletions if self.openai_chat_completions_base_url.is_none() => {
+                R::ChatCompletionsDirect
+            }
+            ApiFormat::OpenAIChatCompletions => R::ChatCompletionsCompatible,
+        }
+    }
+
     fn continuation_route_key(&self) -> String {
         let endpoint = match self.spec.backend.api_format() {
             ApiFormat::Anthropic => self
@@ -555,6 +572,7 @@ mod tests {
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: Some(crate::LlmRequestTelemetry {
+                capacity_plan_id: None,
                 conversation_id: "conversation".to_string(),
                 root_conversation_id: "root".to_string(),
                 request_id: "request".to_string(),

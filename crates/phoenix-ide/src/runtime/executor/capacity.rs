@@ -77,14 +77,43 @@ pub(super) struct CountingBudget {
 
 #[derive(Debug)]
 pub(super) struct InputAccounting {
+    plan_id: String,
     request: LlmRequest,
+    superseded_count: Option<SupersededInputCount>,
     pub(super) local_prediction: usize,
     pub(super) provider: Option<phoenix_llm::ProviderInputCount>,
     pub(super) fallback: Option<phoenix_llm::InputCountFallback>,
 }
 
 impl InputAccounting {
-    pub(super) fn into_request(self) -> LlmRequest {
+    pub(super) fn local(request: LlmRequest, local_prediction: usize) -> Self {
+        Self {
+            request,
+            plan_id: uuid::Uuid::new_v4().to_string(),
+            superseded_count: None,
+            local_prediction,
+            provider: None,
+            fallback: Some(phoenix_llm::InputCountFallback::LocalReady),
+        }
+    }
+    #[allow(clippy::needless_pass_by_value)] // consumes the discarded request so its count cannot be dispatched again
+    pub(super) fn with_superseded(mut self, previous: InputAccounting) -> Self {
+        self.superseded_count = Some(SupersededInputCount {
+            local_prediction_tokens: tokens(previous.local_prediction),
+            provider_input_tokens: previous.provider.map(|v| tokens(v.tokens())),
+            counting_method: count_method(previous.provider),
+            count_fallback: previous.fallback.map(fallback_reason),
+        });
+        self
+    }
+    pub(super) fn request(&self) -> &LlmRequest {
+        &self.request
+    }
+
+    pub(super) fn into_request(mut self) -> LlmRequest {
+        if let Some(telemetry) = &mut self.request.telemetry {
+            telemetry.capacity_plan_id = Some(self.plan_id);
+        }
         self.request
     }
 
@@ -123,6 +152,8 @@ impl CountingBudget {
     ) -> InputAccounting {
         let mut accounting = InputAccounting {
             request,
+            plan_id: uuid::Uuid::new_v4().to_string(),
+            superseded_count: None,
             local_prediction,
             provider: None,
             fallback: None,
@@ -150,11 +181,13 @@ impl CountingBudget {
             }
             Ok(Err(error)) => {
                 accounting.fallback = Some(phoenix_llm::InputCountFallback::Failed);
-                tracing::warn!(kind = ?error.kind, "input counting failed; using conservative local planning")
+                tracing::warn!(kind = ?error.kind, "input counting failed; using conservative local planning");
             }
             Err(_) => {
                 accounting.fallback = Some(phoenix_llm::InputCountFallback::TimedOut);
-                tracing::warn!("input counting deadline elapsed; using conservative local planning")
+                tracing::warn!(
+                    "input counting deadline elapsed; using conservative local planning"
+                );
             }
         }
         accounting
@@ -168,7 +201,7 @@ pub(super) async fn account_handoff(
     text: &str,
     authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
     review: &mut crate::runtime::HandoffCapacityReview,
-) {
+) -> InputAccounting {
     let rendered = if matches!(authority, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext) {
         format!(
             "[System-generated input]\n{}",
@@ -198,14 +231,7 @@ pub(super) async fn account_handoff(
         .await;
     if let Some(count) = evidence.provider {
         review.provider_input_tokens = Some(count.tokens());
-        review.counting_method = match count {
-            phoenix_llm::ProviderInputCount::OpenAiCompleteInput { .. } => {
-                crate::runtime::CapacityCountingMethod::OpenAiCompleteInput
-            }
-            phoenix_llm::ProviderInputCount::AnthropicEstimate { .. } => {
-                crate::runtime::CapacityCountingMethod::AnthropicEstimate
-            }
-        };
+        review.counting_method = count_method(Some(count));
         if count.tokens() <= input_limit {
             review.status = crate::runtime::HandoffCapacityStatus::Ready {
                 target_tokens: review
@@ -214,6 +240,7 @@ pub(super) async fn account_handoff(
             };
         }
     }
+    evidence
 }
 
 #[cfg(test)]
@@ -235,7 +262,7 @@ mod tests {
         ) -> Result<Arc<dyn LlmClient>, phoenix_llm::LlmError> {
             Ok(self)
         }
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "counter"
         }
         async fn complete(
@@ -295,9 +322,9 @@ mod tests {
             50
         );
         assert_eq!(counter.calls.load(Ordering::SeqCst), 0);
-        let counted = budget.account(&counter, request.clone(), 150, 100).await;
-        assert_eq!(counted.local_prediction, 150);
-        assert_eq!(counted.occupancy(), 10);
+        let evidence = budget.account(&counter, request.clone(), 150, 100).await;
+        assert_eq!(evidence.local_prediction, 150);
+        assert_eq!(evidence.occupancy(), 10);
         request
             .system
             .push(phoenix_llm::SystemContent::new("changed"));
@@ -402,5 +429,353 @@ mod tests {
         }
         .handoff_budget()
         .is_err());
+    }
+    #[test]
+    #[allow(clippy::too_many_lines)] // one cold/warm/change/order/privacy sequence
+    fn capacity_diagnostics_prefix_causes_are_multiple_and_content_free() {
+        let mut request = request();
+        request.messages.push(phoenix_llm::LlmMessage {
+            source_message_id: Some("old".into()),
+            role: phoenix_llm::MessageRole::User,
+            content: vec![phoenix_llm::ContentBlock::text("private body")],
+        });
+        let counter = Counter {
+            calls: AtomicUsize::new(0),
+            answer: 1,
+        };
+        let identity = phoenix_llm::LlmRequestTelemetry {
+            capacity_plan_id: None,
+            conversation_id: "test".into(),
+            root_conversation_id: "test".into(),
+            request_id: "plan".into(),
+            retry_attempt: 1,
+            attempt_capture: phoenix_llm::LlmAttemptCapture::new(),
+        };
+        let accounting = InputAccounting::local(request.clone(), 100);
+        let mut plan = accounting.plan(
+            &identity,
+            &counter,
+            RequestPlanKind::Ordinary,
+            272_000,
+            100,
+            InputReductionAction::None,
+            RequestPlanOutcome::Ready,
+            std::time::Instant::now(),
+        );
+        let mut tracker = PrefixTracker::default();
+        tracker.observe(
+            &request,
+            "https://secret:credential@private.example/account",
+            &mut plan,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(plan.prefix_comparison, PrefixComparison::Unknown);
+        request.messages.push(phoenix_llm::LlmMessage {
+            source_message_id: Some("new".into()),
+            role: phoenix_llm::MessageRole::User,
+            content: vec![phoenix_llm::ContentBlock::text("new activity")],
+        });
+        tracker.observe(
+            &request,
+            "https://secret:credential@private.example/account",
+            &mut plan,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(plan.prefix_comparison, PrefixComparison::Unchanged);
+        assert!(plan.prefix_change_causes.is_empty());
+        request.system.push(phoenix_llm::SystemContent::new(
+            "refreshed private guidance",
+        ));
+        request.tool_availability =
+            phoenix_core::domain::tool_availability::ToolAvailability::all(vec![
+                phoenix_llm::ToolDefinition {
+                    name: "tool".into(),
+                    description: "private tool description".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    defer_loading: false,
+                },
+            ]);
+        tracker.observe(
+            &request,
+            "different route secret",
+            &mut plan,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(plan.prefix_comparison, PrefixComparison::Changed);
+        for cause in [
+            PrefixChangeCause::Clearing,
+            PrefixChangeCause::GuidanceRefresh,
+            PrefixChangeCause::ToolPolicyChange,
+            PrefixChangeCause::ModelRouteSwitch,
+        ] {
+            assert!(plan.prefix_change_causes.contains(&cause));
+        }
+        request.messages.swap(0, 1);
+        tracker.observe(
+            &request,
+            "different route secret",
+            &mut plan,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(plan.prefix_comparison, PrefixComparison::Changed);
+        request.messages.push(phoenix_llm::LlmMessage {
+            source_message_id: None,
+            role: phoenix_llm::MessageRole::User,
+            content: vec![phoenix_llm::ContentBlock::text("source-less")],
+        });
+        tracker.observe(
+            &request,
+            "different route secret",
+            &mut plan,
+            false,
+            false,
+            false,
+        );
+        tracker.observe(
+            &request,
+            "different route secret",
+            &mut plan,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(plan.prefix_comparison, PrefixComparison::Unknown);
+        let persisted = serde_json::to_string(&plan).unwrap();
+        for secret in [
+            "private body",
+            "credential",
+            "private.example",
+            "private guidance",
+            "private tool description",
+            "different route secret",
+        ] {
+            assert!(!persisted.contains(secret));
+        }
+    }
+}
+
+use phoenix_core::domain::request_capacity::{
+    CountFallbackReason, InputCountingMethod, InputReductionAction, PrefixChangeCause,
+    PrefixComparison, RequestCapacityPlan, RequestPlanKind, RequestPlanOutcome,
+    SupersededInputCount,
+};
+
+fn tokens(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+impl InputAccounting {
+    #[allow(clippy::too_many_arguments)] // one immutable request accounting projection
+    pub(super) fn plan(
+        &self,
+        telemetry: &phoenix_llm::LlmRequestTelemetry,
+        client: &dyn LlmClient,
+        kind: RequestPlanKind,
+        context_window: usize,
+        initial_local: usize,
+        reduction_action: InputReductionAction,
+        outcome: RequestPlanOutcome,
+        started: std::time::Instant,
+    ) -> RequestCapacityPlan {
+        let (route_class, connection_id) = client.diagnostic_route();
+        RequestCapacityPlan {
+            plan_id: self.plan_id.clone(),
+            request_id: telemetry.request_id.clone(),
+            retry_attempt: telemetry.retry_attempt,
+            conversation_id: telemetry.conversation_id.clone(),
+            root_conversation_id: telemetry.root_conversation_id.clone(),
+            kind,
+            model: client.model_id().to_owned(),
+            route_class,
+            connection_id,
+            context_window_tokens: tokens(context_window),
+            output_reservation_tokens: self.request.max_tokens,
+            local_prediction_tokens: tokens(self.local_prediction),
+            provider_input_tokens: self.provider.map(|v| tokens(v.tokens())),
+            superseded_count: self.superseded_count.clone(),
+            counting_method: count_method(self.provider),
+            count_fallback: self.fallback.map(fallback_reason),
+            reduction_action,
+            reduced_local_tokens: tokens(initial_local.saturating_sub(self.local_prediction)),
+            outcome,
+            planning_duration_ms: tokens(
+                started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(usize::MAX),
+            ),
+            prefix_comparison: PrefixComparison::Unknown,
+            prefix_change_causes: vec![],
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct PrefixTracker {
+    previous: Option<PrefixSnapshot>,
+}
+struct PrefixSnapshot {
+    system: u64,
+    tools: u64,
+    route: u64,
+    messages: Vec<(String, u64)>,
+    complete_public_prefix: bool,
+}
+fn fingerprint(value: &impl serde::Serialize) -> u64 {
+    use std::hash::Hasher;
+    struct HashWriter(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(std::collections::hash_map::DefaultHasher::new());
+    serde_json::to_writer(&mut writer, value).expect("request component serializes");
+    writer.0.finish()
+}
+
+impl PrefixTracker {
+    pub(super) fn observe(
+        &mut self,
+        request: &LlmRequest,
+        route: &str,
+        plan: &mut RequestCapacityPlan,
+        clearing: bool,
+        compaction: bool,
+        readable_projection: bool,
+    ) {
+        let next = PrefixSnapshot {
+            system: fingerprint(
+                &request
+                    .system
+                    .iter()
+                    .map(|s| (&s.text, s.cache))
+                    .collect::<Vec<_>>(),
+            ),
+            tools: fingerprint(&(
+                request.tool_availability.declarations(),
+                request.tool_availability.callable_names(),
+                format!("{:?}", request.tool_availability.anthropic_changes()),
+            )),
+            route: fingerprint(&route),
+            complete_public_prefix: request
+                .messages
+                .iter()
+                .all(|m| m.source_message_id.is_some())
+                && request.provider_replay.is_none()
+                && request.responses_replay.is_empty(),
+            messages: request
+                .messages
+                .iter()
+                .filter_map(|m| {
+                    m.source_message_id
+                        .as_ref()
+                        .map(|id| (id.clone(), fingerprint(&m.content)))
+                })
+                .collect(),
+        };
+        let mut causes = vec![];
+        if clearing {
+            causes.push(PrefixChangeCause::Clearing);
+        }
+        if compaction && self.previous.is_none() {
+            causes.push(PrefixChangeCause::Compaction);
+            if readable_projection {
+                causes.push(PrefixChangeCause::ReadableProjection);
+            }
+        }
+        if let Some(previous) = &self.previous {
+            if previous.system != next.system {
+                causes.push(PrefixChangeCause::GuidanceRefresh);
+            }
+            if previous.tools != next.tools {
+                causes.push(PrefixChangeCause::ToolPolicyChange);
+            }
+            if previous.route != next.route {
+                causes.push(PrefixChangeCause::ModelRouteSwitch);
+            }
+            let changed = previous.system != next.system
+                || previous.tools != next.tools
+                || previous.route != next.route
+                || next.messages.get(..previous.messages.len())
+                    != Some(previous.messages.as_slice());
+            plan.prefix_comparison = if changed {
+                PrefixComparison::Changed
+            } else if previous.complete_public_prefix && next.complete_public_prefix {
+                PrefixComparison::Unchanged
+            } else {
+                PrefixComparison::Unknown
+            };
+        }
+        plan.prefix_change_causes = causes;
+        self.previous = Some(next);
+    }
+}
+
+impl InputAccounting {
+    pub(super) fn projection_plan(
+        &self,
+        conversation_id: &str,
+        root_conversation_id: &str,
+        client: &dyn LlmClient,
+        context_window: usize,
+        fits: bool,
+        started: std::time::Instant,
+    ) -> RequestCapacityPlan {
+        self.plan(
+            &phoenix_llm::LlmRequestTelemetry {
+                capacity_plan_id: None,
+                conversation_id: conversation_id.to_owned(),
+                root_conversation_id: root_conversation_id.to_owned(),
+                request_id: format!("successor-projection:{}", uuid::Uuid::new_v4()),
+                retry_attempt: 1,
+                attempt_capture: phoenix_llm::LlmAttemptCapture::new(),
+            },
+            client,
+            RequestPlanKind::SuccessorProjection,
+            context_window,
+            self.local_prediction,
+            InputReductionAction::None,
+            if fits {
+                RequestPlanOutcome::Ready
+            } else {
+                RequestPlanOutcome::CapacityConflict
+            },
+            started,
+        )
+    }
+}
+
+fn count_method(count: Option<phoenix_llm::ProviderInputCount>) -> InputCountingMethod {
+    match count {
+        None => InputCountingMethod::ConservativeLocalEstimate,
+        Some(phoenix_llm::ProviderInputCount::OpenAiCompleteInput { .. }) => {
+            InputCountingMethod::OpenAiCompleteInput
+        }
+        Some(phoenix_llm::ProviderInputCount::AnthropicEstimate { .. }) => {
+            InputCountingMethod::AnthropicEstimate
+        }
+    }
+}
+fn fallback_reason(reason: phoenix_llm::InputCountFallback) -> CountFallbackReason {
+    match reason {
+        phoenix_llm::InputCountFallback::LocalReady => CountFallbackReason::LocalReady,
+        phoenix_llm::InputCountFallback::BudgetSpent => CountFallbackReason::BudgetSpent,
+        phoenix_llm::InputCountFallback::Unavailable => CountFallbackReason::Unavailable,
+        phoenix_llm::InputCountFallback::Failed => CountFallbackReason::Failed,
+        phoenix_llm::InputCountFallback::TimedOut => CountFallbackReason::TimedOut,
     }
 }

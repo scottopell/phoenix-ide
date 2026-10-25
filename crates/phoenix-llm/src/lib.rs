@@ -228,6 +228,10 @@ pub trait LlmService: Send + Sync {
     /// Get the model ID
     fn model_id(&self) -> &str;
 
+    fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
+        phoenix_core::domain::request_capacity::SafeRouteClass::Unknown
+    }
+
     fn continuation_route_key(&self) -> String {
         self.model_id().to_owned()
     }
@@ -575,6 +579,10 @@ impl LlmService for LoggingService {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
+        self.inner.diagnostic_route_class()
     }
 
     fn continuation_route_key(&self) -> String {

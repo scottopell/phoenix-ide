@@ -648,6 +648,13 @@ pub trait StateStore: Send + Sync {
         service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
+    ) -> Result<(), String>;
+
+    /// Record one content-free prepared plan, including plans never dispatched.
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
     ) -> Result<(), String>;
 
     /// Record one content-free provider attempt for TTFT and stall analytics.
@@ -683,6 +690,18 @@ pub trait LlmClient: Send + Sync {
         Ok(None)
     }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError>;
+
+    fn diagnostic_route(
+        &self,
+    ) -> (
+        phoenix_core::domain::request_capacity::SafeRouteClass,
+        Option<String>,
+    ) {
+        (
+            phoenix_core::domain::request_capacity::SafeRouteClass::Unknown,
+            None,
+        )
+    }
 
     fn continuation_route_key(&self) -> Result<String, LlmError> {
         Ok(self.model_id().to_owned())
@@ -1429,6 +1448,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
     ) -> Result<(), String> {
         (**self)
             .insert_turn_usage(
@@ -1439,8 +1459,16 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 service_tier,
                 usage,
                 first_byte_at,
+                attempt,
             )
             .await
+    }
+
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
+    ) -> Result<(), String> {
+        (**self).insert_request_capacity_plan(plan).await
     }
 
     async fn upsert_llm_request_metrics(
@@ -1480,6 +1508,15 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         T::freeze_for_request(Arc::clone(self.as_ref()))
+    }
+
+    fn diagnostic_route(
+        &self,
+    ) -> (
+        phoenix_core::domain::request_capacity::SafeRouteClass,
+        Option<String>,
+    ) {
+        (**self).diagnostic_route()
     }
 
     fn continuation_route_key(&self) -> Result<String, LlmError> {
@@ -2794,6 +2831,7 @@ impl StateStore for DatabaseStorage {
         service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
     ) -> Result<(), String> {
         self.db
             .insert_turn_usage(
@@ -2804,7 +2842,18 @@ impl StateStore for DatabaseStorage {
                 service_tier,
                 usage,
                 first_byte_at,
+                attempt,
             )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
+    ) -> Result<(), String> {
+        self.db
+            .insert_request_capacity_plan(plan)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2889,6 +2938,10 @@ impl LlmClient for RegistryLlmClient {
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         Ok(Arc::new(FrozenServiceClient {
             service: self.service()?,
+            connection_id: self
+                .connection
+                .clone()
+                .or_else(|| self.registry.connection_for_model(&self.model_id)),
         }))
     }
 
@@ -2924,6 +2977,7 @@ impl LlmClient for RegistryLlmClient {
 }
 
 struct FrozenServiceClient {
+    connection_id: Option<String>,
     service: Arc<dyn phoenix_llm::LlmService>,
 }
 
@@ -2937,6 +2991,18 @@ impl LlmClient for FrozenServiceClient {
     }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         Ok(self)
+    }
+
+    fn diagnostic_route(
+        &self,
+    ) -> (
+        phoenix_core::domain::request_capacity::SafeRouteClass,
+        Option<String>,
+    ) {
+        (
+            self.service.diagnostic_route_class(),
+            self.connection_id.clone(),
+        )
     }
 
     fn continuation_route_key(&self) -> Result<String, LlmError> {
