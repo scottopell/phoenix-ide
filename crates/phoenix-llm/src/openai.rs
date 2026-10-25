@@ -53,6 +53,104 @@ fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
 // Responses API
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize)]
+struct ResponsesCountInput {
+    model: String,
+    input: Vec<ResponsesApiInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesApiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ResponsesToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+}
+
+impl From<ResponsesApiRequest> for ResponsesCountInput {
+    fn from(request: ResponsesApiRequest) -> Self {
+        let ResponsesApiRequest {
+            model,
+            input,
+            instructions,
+            tools,
+            reasoning,
+            tool_choice,
+            parallel_tool_calls,
+            max_output_tokens: _,
+            stream: _,
+            store: _,
+            prompt_cache_key: _,
+            prompt_cache_options: _,
+            service_tier: _,
+            include: _,
+            tags: _,
+        } = request;
+        Self {
+            model,
+            input,
+            instructions,
+            tools,
+            reasoning,
+            tool_choice,
+            parallel_tool_calls,
+        }
+    }
+}
+
+fn count_input_body(
+    spec: &ModelSpec,
+    request_name: &RequestModelName,
+    request: &LlmRequest,
+) -> Result<serde_json::Value, LlmError> {
+    validate_responses_replay(request, request_name.as_str())?;
+    let wire =
+        translate_to_responses_request_for_model(spec, request_name.as_str(), request, false, true);
+    serde_json::to_value(ResponsesCountInput::from(wire))
+        .map_err(|_| LlmError::invalid_request("Cannot serialize counting input"))
+}
+
+pub(crate) async fn count_input(
+    spec: &ModelSpec,
+    request_name: &RequestModelName,
+    api_key: &str,
+    custom_headers: &[(String, String)],
+    request: &LlmRequest,
+) -> Result<super::ProviderInputCount, LlmError> {
+    let body = count_input_body(spec, request_name, request)?;
+    let client = Client::new();
+    let mut builder = client
+        .post("https://api.openai.com/v1/responses/input_tokens")
+        .bearer_auth(api_key)
+        .header("content-type", "application/json");
+    for (key, value) in custom_headers {
+        builder = builder.header(key, value);
+    }
+    let response = builder
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| LlmError::network("Input count transport failed"))?;
+    if !response.status().is_success() {
+        return Err(LlmError::network(format!(
+            "Input count returned HTTP {}",
+            response.status()
+        )));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| LlmError::network("Invalid input count response"))?;
+    let tokens = value
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| LlmError::network("Missing input token count"))?;
+    Ok(super::ProviderInputCount::OpenAiCompleteInput { tokens })
+}
+
 /// Complete using the `OpenAI` Responses API.
 #[allow(clippy::too_many_arguments)]
 pub async fn complete(
@@ -5910,6 +6008,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn counting_body_reuses_generation_input_tools_and_restrictions() {
+        let spec = test_model_spec("gpt-6");
+        let name = RequestModelName::from("wire-model");
+        let mut request = restricted_request(&["bash"]);
+        request
+            .system
+            .push(super::super::types::SystemContent::cached(
+                "fixed instructions",
+            ));
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("history")],
+        });
+        let generation = serde_json::to_value(translate_to_backend_request_for_model(
+            &spec,
+            name.as_str(),
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        let count = count_input_body(&spec, &name, &request).unwrap();
+        for key in [
+            "model",
+            "input",
+            "instructions",
+            "tools",
+            "tool_choice",
+            "reasoning",
+            "text",
+        ] {
+            assert_eq!(count.get(key), generation.get(key), "{key}");
+        }
+        assert!(count.get("max_output_tokens").is_none());
+        assert_eq!(request.max_tokens, 16_384);
+        assert!(count["tools"].as_array().unwrap().len() >= 2);
+    }
+
     fn restricted_request(callable: &[&str]) -> LlmRequest {
         let mut request = empty_request();
         request.tool_availability = phoenix_core::domain::tool_availability::ToolAvailability::new(
@@ -6038,8 +6176,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(translated["input"], serde_json::Value::Array(expected));
+        let count = count_input_body(&test_model_spec("gpt-6"), &"gpt-6".into(), &request).unwrap();
+        assert_eq!(count["input"], translated["input"]);
+        assert!(count["input"].to_string().contains("encrypted_content"));
         request.messages[0].content.clear();
         assert!(validate_responses_replay(&request, "gpt-6").is_err());
+        assert!(count_input_body(&test_model_spec("gpt-6"), &"gpt-6".into(), &request).is_err());
     }
 
     #[test]

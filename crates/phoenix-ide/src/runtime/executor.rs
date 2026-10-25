@@ -49,7 +49,7 @@ use tracing::Instrument;
 
 mod capacity;
 mod continuation;
-use capacity::{CapacityDecision, RequestCapacity, SuccessorCapacity};
+use capacity::{CapacityDecision, CountingBudget, RequestCapacity, SuccessorCapacity};
 #[cfg(test)]
 mod provider_tool_policy_tests;
 use continuation::{
@@ -1386,6 +1386,33 @@ async fn assemble_cleared_messages<S: StateStore>(
         None,
     )
     .await
+}
+
+async fn render_existing_cleared_messages<S: StateStore>(
+    storage: &S,
+    conv_id: &str,
+    db_messages: &[crate::db::Message],
+    excluded_message_id: Option<&str>,
+    clearable_names: &std::collections::HashSet<String>,
+    watermark_cache: &std::sync::Mutex<Option<i64>>,
+) -> Vec<LlmMessage> {
+    let watermark = match storage.get_clear_watermark(conv_id).await {
+        Ok(watermark) => {
+            *watermark_cache.lock().unwrap() = Some(watermark);
+            watermark
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read clearing watermark; rendering cached prefix");
+            watermark_cache.lock().unwrap().unwrap_or(0)
+        }
+    };
+    let cleared = clearable_sequence_ids_through_watermark(db_messages, clearable_names, watermark);
+    render_messages(
+        db_messages
+            .iter()
+            .filter(|message| Some(message.message_id.as_str()) != excluded_message_id),
+        &cleared,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8162,7 +8189,7 @@ where
             .iter()
             .map(|result| estimate_text_tokens(&result.output))
             .sum::<usize>();
-        let mut frozen_messages = assemble_cleared_messages(
+        let mut frozen_messages = render_existing_cleared_messages(
             &self.storage,
             &self.context.conversation_id,
             &self
@@ -8172,10 +8199,6 @@ where
                 .messages,
             None,
             &self.clearable_names,
-            self.context
-                .context_window
-                .saturating_sub(self.context.output_budget)
-                .saturating_sub(trusted_token_reserve),
             &self.clear_watermark_cache,
         )
         .await;
@@ -8317,12 +8340,35 @@ where
                 provider_replay.as_ref(),
                 &responses_replay,
             ));
-        if dispatch_estimate_exceeds_context(
-            fixed_tokens,
-            &frozen_messages,
-            self.context.output_budget,
-            self.context.context_window,
-        ) {
+        let mut counting = CountingBudget::new();
+        let planning_request = LlmRequest {
+            system: vec![SystemContent::cached(&system_prompt)],
+            messages: frozen_messages.clone(),
+            provider_replay: provider_replay.clone(),
+            responses_replay: responses_replay.clone(),
+            tool_availability: tool_availability.clone(),
+            max_tokens: request_output_tokens,
+            effective_effort,
+            service_tier: effective_service_tier,
+            telemetry: None,
+            cache_key: PromptCacheKey::stable(&conv_id),
+        };
+        let accounting = counting
+            .account(
+                llm_client.as_ref(),
+                planning_request,
+                fixed_tokens.saturating_add(estimate_messages_tokens(&frozen_messages)),
+                self.context
+                    .context_window
+                    .saturating_sub(self.context.output_budget),
+            )
+            .await;
+        let exceeds_capacity = accounting
+            .occupancy()
+            .saturating_add(self.context.output_budget)
+            > self.context.context_window;
+        let mut planned_request = accounting.into_request();
+        if exceeds_capacity {
             let input_budget = self
                 .context
                 .context_window
@@ -8347,6 +8393,7 @@ where
             )
             .await;
             overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
+            planned_request.messages.clone_from(&frozen_messages);
             if dispatch_estimate_exceeds_context(
                 fixed_tokens,
                 &frozen_messages,
@@ -8362,27 +8409,15 @@ where
             }
         }
 
-        let messages = frozen_messages;
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
-
-        let request = LlmRequest {
-            system: vec![SystemContent::cached(&system_prompt)],
-            messages,
-            provider_replay,
-            responses_replay,
-            tool_availability,
-            max_tokens: request_output_tokens,
-            effective_effort,
-            service_tier: effective_service_tier,
-            telemetry: Some(phoenix_llm::LlmRequestTelemetry {
-                conversation_id: conv_id.clone(),
-                root_conversation_id: root_conv_id.clone(),
-                request_id: request_id.clone(),
-                retry_attempt,
-                attempt_capture: attempt_capture.clone(),
-            }),
-            cache_key: PromptCacheKey::stable(&conv_id),
-        };
+        planned_request.telemetry = Some(phoenix_llm::LlmRequestTelemetry {
+            conversation_id: conv_id.clone(),
+            root_conversation_id: root_conv_id.clone(),
+            request_id: request_id.clone(),
+            retry_attempt,
+            attempt_capture: attempt_capture.clone(),
+        });
+        let request = planned_request;
 
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
@@ -9717,6 +9752,31 @@ where
             _ => unreachable!("review state guarded above"),
         };
         let (system, tools) = self.prepare_successor_overhead().await?;
+        let client = self
+            .llm_client
+            .clone()
+            .freeze_for_request()
+            .map_err(|error| error.to_string())?;
+        let projection_request = LlmRequest {
+            system: vec![SystemContent::cached(&system)],
+            messages: vec![],
+            provider_replay: None,
+            responses_replay: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                tools.clone(),
+            ),
+            max_tokens: u32::try_from(self.context.output_budget)
+                .map_err(|error| error.to_string())?,
+            effective_effort: self
+                .llm_registry
+                .effective_effort(&self.context.model_id, self.context.effort),
+            service_tier: self
+                .llm_registry
+                .effective_service_tier(&self.context.model_id, self.context.service_tier),
+            telemetry: None,
+            cache_key: PromptCacheKey::stable(&self.context.conversation_id),
+        };
+        let mut counting = CountingBudget::new();
         let capacity = SuccessorCapacity {
             context_window: self.context.context_window,
             ordinary_overhead_tokens: estimate_fixed_request_tokens(
@@ -9739,6 +9799,7 @@ where
                 output_reservation_tokens: capacity.output_tokens,
                 successor_working_room_tokens: capacity.working_room_tokens(),
                 handoff_tokens: tokens,
+                provider_input_tokens: None,
                 status: match target {
                     None => super::HandoffCapacityStatus::RequiredOverhead,
                     Some(target_tokens) if tokens > target_tokens => {
@@ -9752,6 +9813,15 @@ where
             source: describe(&handoff, opening_authority),
             shortening: super::HandoffShorteningResult::NotRequested,
         };
+        capacity::account_handoff(
+            &mut counting,
+            client.as_ref(),
+            projection_request.clone(),
+            &handoff,
+            opening_authority,
+            &mut review.source,
+        )
+        .await;
         if !shorten {
             return Ok(review);
         }
@@ -9771,16 +9841,7 @@ where
                 system,
                 &phoenix_core::domain::tool_availability::ToolAvailability::all(vec![]),
             ));
-        if input.saturating_add(capacity.output_tokens) > capacity.context_window {
-            review.shortening = super::HandoffShorteningResult::Failed { error: format!("The complete shortening request needs an estimated {input} input tokens plus {} output tokens in a {}-token context. The protected source was not clipped. Manually edit it or explicitly change model.", capacity.output_tokens, capacity.context_window) };
-            return Ok(review);
-        }
         let _admission = self.admit_authoritative_effect()?;
-        let client = self
-            .llm_client
-            .clone()
-            .freeze_for_request()
-            .map_err(|error| error.to_string())?;
         let capture = phoenix_llm::LlmAttemptCapture::new();
         let request = LlmRequest {
             messages,
@@ -9806,6 +9867,25 @@ where
             }),
             cache_key: PromptCacheKey::stable(&self.context.conversation_id),
         };
+        let accounting = counting
+            .account(
+                client.as_ref(),
+                request,
+                input,
+                capacity
+                    .context_window
+                    .saturating_sub(capacity.output_tokens),
+            )
+            .await;
+        if accounting
+            .occupancy()
+            .saturating_add(capacity.output_tokens)
+            > capacity.context_window
+        {
+            review.shortening = super::HandoffShorteningResult::Failed { error: format!("The complete shortening request needs an estimated {input} input tokens plus {} output tokens in a {}-token context. The protected source was not clipped. Manually edit it or explicitly change model.", capacity.output_tokens, capacity.context_window) };
+            return Ok(review);
+        }
+        let request = accounting.into_request();
         let result = client.complete(&request).await;
         if let Some(metrics) = capture.finalized() {
             self.storage.upsert_llm_request_metrics(&metrics).await?;
@@ -9863,9 +9943,19 @@ where
                             },
                         )
                         .await?;
+                    let mut candidate_capacity = describe(&candidate, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext);
+                    capacity::account_handoff(
+                        &mut counting,
+                        client.as_ref(),
+                        projection_request,
+                        &candidate,
+                        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+                        &mut candidate_capacity,
+                    )
+                    .await;
                     review.shortening = super::HandoffShorteningResult::Generated {
                         candidate_id,
-                        capacity: describe(&candidate, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext),
+                        capacity: candidate_capacity,
                         text: candidate,
                     };
                 }
@@ -9919,7 +10009,7 @@ where
             _ => continuation_request_identity(&self.context.conversation_id, &operation_id),
         };
         let context_window = self.context.context_window;
-        let continuation_limits = self.llm_client.continuation_request_limits();
+        let continuation_limits = llm_client.continuation_request_limits();
         let model_id = self.context.model_id.clone();
         let explicit_effort = self.context.effort;
         let service_tier = self.context.service_tier;
@@ -9979,7 +10069,22 @@ where
             }
         };
         let (ordinary_system, ordinary_tools) = self.prepare_successor_overhead().await?;
-        let successor_capacity = SuccessorCapacity {
+        let successor_request = LlmRequest {
+            system: vec![SystemContent::cached(&ordinary_system)],
+            messages: vec![],
+            provider_replay: None,
+            responses_replay: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                ordinary_tools.clone(),
+            ),
+            max_tokens: output_token_limit,
+            effective_effort,
+            service_tier: effective_service_tier,
+            telemetry: None,
+            cache_key: PromptCacheKey::stable(&conv_id),
+        };
+        let mut counting = CountingBudget::new();
+        let mut successor_capacity = SuccessorCapacity {
             context_window,
             ordinary_overhead_tokens: estimate_fixed_request_tokens(
                 &ordinary_system,
@@ -9988,6 +10093,34 @@ where
             .saturating_add(MESSAGE_OVERHEAD_TOKENS),
             output_tokens: self.context.output_budget,
         };
+        if successor_capacity.handoff_budget().is_err() {
+            let mut required_request = successor_request.clone();
+            required_request.messages = vec![LlmMessage {
+                source_message_id: None,
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(format!(
+                    "[System-generated input]\n{}",
+                    crate::send_chat_service::generated_predecessor_context_projection("")
+                ))],
+            }];
+            let evidence = counting
+                .account(
+                    llm_client.as_ref(),
+                    required_request,
+                    successor_capacity
+                        .ordinary_overhead_tokens
+                        .saturating_add(estimate_successor_handoff_tokens("")),
+                    context_window
+                        .saturating_sub(continuation_output_reserve)
+                        .saturating_sub(capacity::SUCCESSOR_WORKING_ROOM_TOKENS),
+                )
+                .await;
+            if let Some(count) = evidence.provider {
+                // The complete empty-handoff projection is an upper bound on
+                // fixed overhead; no exact component decomposition is inferred.
+                successor_capacity.ordinary_overhead_tokens = count.tokens();
+            }
+        }
         let handoff_target = match successor_capacity.handoff_budget() {
             Ok(target) => target,
             Err(error) => {
@@ -10033,7 +10166,7 @@ where
         }
         continuation_prompt.push_str(&format!("\n\nThe complete handoff must be at most {handoff_target} estimated successor-input tokens including its readable provenance wrapper (approximately {} characters before escaping). Leave the successor working room; prioritize unresolved work, user intent/corrections, uncertainty and retrieval references over completed detail. Do not claim facts omitted from the selected input. A shorter useful handoff is preferred to filling the target.", handoff_target.saturating_sub(estimate_successor_handoff_tokens("")).saturating_mul(CHARS_PER_TOKEN_ESTIMATE)));
         let system_prompt = policy.system_prompt();
-        let frozen_messages = assemble_cleared_messages(
+        let frozen_messages = render_existing_cleared_messages(
             &self.storage,
             &conv_id,
             projection,
@@ -10042,7 +10175,6 @@ where
                 .as_ref()
                 .map(|handoff| handoff.message_id.as_str()),
             &self.clearable_names,
-            context_window,
             &self.clear_watermark_cache,
         )
         .await;
@@ -10061,18 +10193,66 @@ where
             + estimate_text_tokens(system_prompt)
             + continuation_output_reserve
             + CONTINUATION_SAFETY_MARGIN_TOKENS;
-        if (RequestCapacity {
-            context_window,
-            input_tokens: fixed_tokens
-                .saturating_sub(continuation_output_reserve)
-                .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS),
-            output_tokens: continuation_output_reserve,
-        })
-        .decide(
-            fixed_tokens
-                .saturating_sub(continuation_output_reserve)
-                .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS),
-        ) != CapacityDecision::Ready
+        let mut complete_messages = messages.clone();
+        if let Some(handoff) = &history.handoff {
+            complete_messages.insert(0, handoff.message.clone());
+        }
+        complete_messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(&continuation_prompt)],
+        });
+        let complete_request = LlmRequest {
+            messages: complete_messages,
+            system: vec![SystemContent::new(system_prompt)],
+            provider_replay: None,
+            responses_replay: vec![],
+            tool_availability: phoenix_core::domain::tool_availability::ToolAvailability::all(
+                vec![],
+            ),
+            max_tokens: output_token_limit,
+            effective_effort,
+            service_tier: effective_service_tier,
+            telemetry: None,
+            cache_key: PromptCacheKey::stable(&conv_id),
+        };
+        let local_input = fixed_tokens
+            .saturating_sub(continuation_output_reserve)
+            .saturating_add(estimate_messages_tokens(
+                &complete_request.messages[..complete_request.messages.len() - 1],
+            ));
+        let counted = counting
+            .account(
+                llm_client.as_ref(),
+                complete_request.clone(),
+                local_input,
+                context_window
+                    .saturating_sub(continuation_output_reserve)
+                    .saturating_sub(CONTINUATION_MIN_HEADROOM_TOKENS),
+            )
+            .await;
+        let complete_fits = counted.provider.is_some()
+            && counted
+                .occupancy()
+                .saturating_add(continuation_output_reserve)
+                .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS)
+                <= context_window
+            && continuation_limits
+                .max_history_messages(1)
+                .is_none_or(|cap| complete_request.messages.len() - 1 <= cap);
+        if !complete_fits
+            && (RequestCapacity {
+                context_window,
+                input_tokens: fixed_tokens
+                    .saturating_sub(continuation_output_reserve)
+                    .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS),
+                output_tokens: continuation_output_reserve,
+            })
+            .decide(
+                fixed_tokens
+                    .saturating_sub(continuation_output_reserve)
+                    .saturating_add(CONTINUATION_MIN_HEADROOM_TOKENS),
+            ) != CapacityDecision::Ready
         {
             return Ok(Some(Event::ContinuationFailed {
                 operation_id,
@@ -10081,20 +10261,59 @@ where
             }));
         }
         let history_item_cap = continuation_limits.max_history_messages(1);
-        let budget = match plan_with_handoff(
-            messages,
-            history.handoff.map(|handoff| handoff.message),
-            context_window,
-            fixed_tokens,
-            history_item_cap,
-        ) {
-            Ok(budget) => budget,
-            Err(error) => {
-                return Ok(Some(Event::ContinuationFailed {
-                    operation_id,
-                    error,
-                    error_kind: crate::db::ErrorKind::ContextCapacityConflict,
-                }));
+        let messages = if complete_fits {
+            messages
+        } else {
+            let cleared = assemble_cleared_messages(
+                &self.storage,
+                &conv_id,
+                projection,
+                history
+                    .handoff
+                    .as_ref()
+                    .map(|handoff| handoff.message_id.as_str()),
+                &self.clearable_names,
+                context_window,
+                &self.clear_watermark_cache,
+            )
+            .await;
+            cap_replayed_images(
+                project_recent_references(cleared, projection),
+                CONTINUATION_MAX_REPLAYED_IMAGES,
+            )
+        };
+        let budget = if complete_fits {
+            let mut retained = complete_request.messages.clone();
+            retained.pop();
+            ContinuationBudgetResult {
+                messages: retained,
+                input_budget: context_window.saturating_sub(fixed_tokens),
+                estimated_history_tokens: local_input,
+                headroom_tokens: context_window
+                    .saturating_sub(counted.occupancy())
+                    .saturating_sub(continuation_output_reserve),
+                minimum_headroom_satisfied: true,
+                dropped_for_item_cap: 0,
+                dropped_by_budget: 0,
+                trimmed_for_user_first: 0,
+                dropped_for_headroom: 0,
+            }
+        } else {
+            match plan_with_handoff(
+                messages,
+                history.handoff.map(|handoff| handoff.message),
+                context_window,
+                fixed_tokens,
+                history_item_cap,
+            ) {
+                Ok(budget) => budget,
+                Err(error) => {
+                    return Ok(Some(Event::ContinuationFailed {
+                        operation_id,
+                        error,
+                        error_kind: crate::db::ErrorKind::ContextCapacityConflict,
+                    }));
+                }
             }
         };
         tracing::debug!(
@@ -10121,7 +10340,7 @@ where
             content: vec![ContentBlock::text(&continuation_prompt)],
         });
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
-        let request = LlmRequest {
+        let mut request = LlmRequest {
             messages,
             system: vec![SystemContent::new(system_prompt)],
             provider_replay: None,
@@ -10146,6 +10365,12 @@ where
             // conv id keeps the cache cohort coherent.
             cache_key: PromptCacheKey::stable(&conv_id),
         };
+
+        if complete_fits {
+            let telemetry = request.telemetry.take();
+            request = counted.into_request();
+            request.telemetry = telemetry;
+        }
 
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
         let continuation_admission = admitted.reborrow();
@@ -10207,7 +10432,33 @@ where
                     }
 
                     let projected_handoff_tokens = estimate_successor_handoff_tokens(&summary);
-                    let validation = successor_capacity.validate(projected_handoff_tokens).and_then(|()| {
+                    let mut successor_review = super::HandoffCapacityReview {
+                        counting_method: super::CapacityCountingMethod::ConservativeLocalEstimate,
+                        context_window_tokens: context_window,
+                        required_overhead_tokens: successor_capacity.ordinary_overhead_tokens,
+                        output_reservation_tokens: successor_capacity.output_tokens,
+                        successor_working_room_tokens: successor_capacity.working_room_tokens(),
+                        handoff_tokens: projected_handoff_tokens,
+                        provider_input_tokens: None,
+                        status: match successor_capacity.validate(projected_handoff_tokens) {
+                            Ok(()) => super::HandoffCapacityStatus::Ready {
+                                target_tokens: handoff_target,
+                            },
+                            Err(_) => super::HandoffCapacityStatus::HandoffTooLarge {
+                                target_tokens: handoff_target,
+                            },
+                        },
+                    };
+                    capacity::account_handoff(
+                        &mut counting,
+                        llm_client.as_ref(),
+                        successor_request,
+                        &summary,
+                        phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext,
+                        &mut successor_review,
+                    )
+                    .await;
+                    let validation = (if successor_review.fits() { Ok(()) } else { successor_capacity.validate(projected_handoff_tokens) }).and_then(|()| {
                         let compaction_handoff_tokens = estimate_compaction_handoff_tokens(&summary);
                         if compaction_handoff_tokens > next_compaction_input_budget {
                             Err(format!("The generated handoff needs an estimated {compaction_handoff_tokens} tokens in its next compaction projection; that projection's target is {next_compaction_input_budget}. The next compaction must also retain this handoff with full output reservation. Review a shorter handoff or explicitly select a model with more available input capacity."))
@@ -14227,7 +14478,7 @@ mod dispatch_context_budget_tests {
                 assert!(matches!(
                     result,
                     Some(Event::LlmError {
-                        error_kind: crate::db::ErrorKind::ContextExhausted,
+                        error_kind: crate::db::ErrorKind::PlannedContextPressure,
                         ..
                     })
                 ));

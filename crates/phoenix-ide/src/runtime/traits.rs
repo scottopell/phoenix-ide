@@ -676,6 +676,12 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    async fn count_input(
+        &self,
+        _request: &LlmRequest,
+    ) -> Result<Option<phoenix_llm::ProviderInputCount>, LlmError> {
+        Ok(None)
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError>;
 
     fn continuation_route_key(&self) -> Result<String, LlmError> {
@@ -1466,6 +1472,12 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<phoenix_llm::ProviderInputCount>, LlmError> {
+        (**self).count_input(request).await
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         T::freeze_for_request(Arc::clone(self.as_ref()))
     }
@@ -2917,6 +2929,12 @@ struct FrozenServiceClient {
 
 #[async_trait]
 impl LlmClient for FrozenServiceClient {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<phoenix_llm::ProviderInputCount>, LlmError> {
+        self.service.count_input(request).await
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         Ok(self)
     }

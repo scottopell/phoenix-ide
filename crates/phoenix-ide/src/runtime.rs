@@ -267,6 +267,8 @@ pub enum HandoffCapacityStatus {
 #[serde(rename_all = "snake_case")]
 pub enum CapacityCountingMethod {
     ConservativeLocalEstimate,
+    OpenAiCompleteInput,
+    AnthropicEstimate,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -277,6 +279,8 @@ pub struct HandoffCapacityReview {
     pub output_reservation_tokens: usize,
     pub successor_working_room_tokens: usize,
     pub handoff_tokens: usize,
+    /// Component sizes remain local predictions; only this total is measured.
+    pub provider_input_tokens: Option<usize>,
     pub status: HandoffCapacityStatus,
 }
 

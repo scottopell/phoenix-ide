@@ -168,9 +168,47 @@ impl ContinuationRequestLimits {
     }
 }
 
+/// Provider counting evidence includes the endpoint's documented uncertainty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderInputCount {
+    OpenAiCompleteInput {
+        tokens: usize,
+    },
+    /// Anthropic describes this as an estimate and excludes prompt caching.
+    AnthropicEstimate {
+        tokens: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCountFallback {
+    LocalReady,
+    BudgetSpent,
+    Unavailable,
+    Failed,
+    TimedOut,
+}
+
+impl ProviderInputCount {
+    #[must_use]
+    pub const fn tokens(self) -> usize {
+        match self {
+            Self::OpenAiCompleteInput { tokens } | Self::AnthropicEstimate { tokens } => tokens,
+        }
+    }
+}
+
 /// Common interface for LLM providers
 #[async_trait]
 pub trait LlmService: Send + Sync {
+    /// Complete provider-rendered input occupancy, without a generation attempt.
+    async fn count_input(
+        &self,
+        _request: &LlmRequest,
+    ) -> Result<Option<ProviderInputCount>, LlmError> {
+        Ok(None)
+    }
+
     /// Make a non-streaming completion request
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
 
@@ -419,6 +457,12 @@ impl LoggingService {
 
 #[async_trait]
 impl LlmService for LoggingService {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<ProviderInputCount>, LlmError> {
+        self.inner.count_input(request).await
+    }
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, false);
         if self.streaming_transport == LlmTransport::InProcess {

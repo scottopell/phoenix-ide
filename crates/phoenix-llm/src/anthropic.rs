@@ -20,6 +20,129 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+#[derive(Serialize)]
+struct AnthropicCountInput {
+    model: String,
+    messages: Vec<AnthropicMessage>,
+    system: Vec<AnthropicSystemBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicToolEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinkingConfig>,
+}
+
+impl From<AnthropicRequest> for AnthropicCountInput {
+    fn from(request: AnthropicRequest) -> Self {
+        let AnthropicRequest {
+            model,
+            messages,
+            system,
+            tools,
+            thinking,
+            max_tokens: _,
+            output_config,
+            speed: _,
+            stream: _,
+            tags: _,
+        } = request;
+        let _generation_effort = output_config.map(|AnthropicOutputConfig { effort }| effort);
+        Self {
+            model,
+            messages,
+            system,
+            tools,
+            thinking,
+        }
+    }
+}
+
+fn count_sources_supported(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if matches!(
+                fields.get("type").and_then(serde_json::Value::as_str),
+                Some("image" | "document")
+            ) && fields
+                .get("source")
+                .and_then(|source| source.get("type"))
+                .and_then(serde_json::Value::as_str)
+                != Some("base64")
+            {
+                return false;
+            }
+            fields.values().all(count_sources_supported)
+        }
+        serde_json::Value::Array(items) => items.iter().all(count_sources_supported),
+        _ => true,
+    }
+}
+
+pub(crate) async fn count_input(
+    spec: &ModelSpec,
+    request_name: &super::models::RequestModelName,
+    auth: &super::ResolvedAuth,
+    custom_headers: &[(String, String)],
+    request: &LlmRequest,
+) -> Result<Option<super::ProviderInputCount>, LlmError> {
+    let fast = is_fast_mode(spec, None, request);
+    let binding = supports_thinking_binding(spec, None);
+    let native = supports_native_tool_changes(spec, None);
+    let mut wire = translate_request_with_tool_policy(spec, request, fast, binding, native)?;
+    wire.model = request_name.as_str().to_owned();
+    let body = serde_json::to_value(AnthropicCountInput::from(wire))
+        .map_err(|_| LlmError::invalid_request("Cannot serialize counting input"))?;
+    if !count_sources_supported(&body) || body.get("mcp_servers").is_some() {
+        return Ok(None);
+    }
+    // Server tools (including tool search) have no supported complete count.
+    if body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| tools.iter().any(|tool| tool.get("type").is_some()))
+    {
+        return Ok(None);
+    }
+    let mut builder = Client::new()
+        .post("https://api.anthropic.com/v1/messages/count_tokens")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json");
+    builder = match auth.style {
+        super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
+        super::AuthStyle::PlainBearer => builder.bearer_auth(&auth.credential),
+    };
+    let mut beta = anthropic_beta_tokens(false, fast, binding);
+    if native {
+        beta.push(INLINE_TOOLS_BETA);
+    }
+    if !beta.is_empty() {
+        builder = builder.header("anthropic-beta", beta.join(", "));
+    }
+    builder = apply_source_header(builder, custom_headers);
+    let response = builder
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| LlmError::network("Input count transport failed"))?;
+    if !response.status().is_success() {
+        return Err(LlmError::network(format!(
+            "Input count returned HTTP {}",
+            response.status()
+        )));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| LlmError::network("Invalid input count response"))?;
+    let tokens = value
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| LlmError::network("Missing input token count"))?;
+    Ok(Some(super::ProviderInputCount::AnthropicEstimate {
+        tokens,
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentBlockKind {
     None,
@@ -1906,6 +2029,33 @@ mod tests {
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
+    }
+
+    #[test]
+    fn counting_declines_unsupported_image_and_document_sources() {
+        for kind in ["image", "document"] {
+            for source in ["url", "file"] {
+                assert!(!count_sources_supported(
+                    &serde_json::json!({"messages":[{"content":[{"type":kind,"source":{"type":source}}]}]})
+                ));
+            }
+            assert!(count_sources_supported(
+                &serde_json::json!({"messages":[{"content":[{"type":kind,"source":{"type":"base64","data":"AA=="}}]}]})
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn counting_declines_whole_native_server_tool_request() {
+        let request = test_request_with_tools();
+        let auth = super::super::ResolvedAuth {
+            credential: "unused-test".into(),
+            style: super::super::AuthStyle::ApiKey,
+        };
+        let count = count_input(&test_spec(true), &"test-wire".into(), &auth, &[], &request)
+            .await
+            .unwrap();
+        assert_eq!(count, None);
     }
 
     fn tool_policy_request() -> LlmRequest {

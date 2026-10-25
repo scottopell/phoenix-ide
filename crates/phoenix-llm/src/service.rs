@@ -183,6 +183,34 @@ impl LlmServiceImpl {
 
 #[async_trait]
 impl LlmService for LlmServiceImpl {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<super::ProviderInputCount>, LlmError> {
+        if self.uses_official_openai_responses() {
+            let key = self.auth.resolve().await?.credential;
+            openai::count_input(
+                &self.spec,
+                &self.request_name,
+                &key,
+                &self.headers_for_provider(),
+                request,
+            )
+            .await
+            .map(Some)
+        } else if self.uses_official_anthropic() {
+            anthropic::count_input(
+                &self.spec,
+                &self.request_name,
+                &self.resolve_auth().await?,
+                &self.headers_for_provider(),
+                request,
+            )
+            .await
+        } else {
+            Ok(None)
+        }
+    }
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.begin_provider_attempt(request, self.attempt_transport(false));
         Box::pin(enforce_attempt_deadline(
