@@ -13,6 +13,7 @@ use super::LlmError;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use phoenix_core::domain::llm_types::ProviderRequestTier;
+use phoenix_core::domain::llm_types::UsageObservation;
 use phoenix_core::domain::provider_replay::ProviderReplayUpdate;
 use phoenix_core::domain::responses_replay::ResponsesResponseSet;
 use reqwest::header::HeaderMap;
@@ -52,6 +53,104 @@ fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 // Responses API
 // ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ResponsesCountInput {
+    model: String,
+    input: Vec<ResponsesApiInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesApiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ResponsesToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+}
+
+impl From<ResponsesApiRequest> for ResponsesCountInput {
+    fn from(request: ResponsesApiRequest) -> Self {
+        let ResponsesApiRequest {
+            model,
+            input,
+            instructions,
+            tools,
+            reasoning,
+            tool_choice,
+            parallel_tool_calls,
+            max_output_tokens: _,
+            stream: _,
+            store: _,
+            prompt_cache_key: _,
+            prompt_cache_options: _,
+            service_tier: _,
+            include: _,
+            tags: _,
+        } = request;
+        Self {
+            model,
+            input,
+            instructions,
+            tools,
+            reasoning,
+            tool_choice,
+            parallel_tool_calls,
+        }
+    }
+}
+
+fn count_input_body(
+    spec: &ModelSpec,
+    request_name: &RequestModelName,
+    request: &LlmRequest,
+) -> Result<serde_json::Value, LlmError> {
+    validate_responses_replay(request, request_name.as_str())?;
+    let wire =
+        translate_to_responses_request_for_model(spec, request_name.as_str(), request, false, true);
+    serde_json::to_value(ResponsesCountInput::from(wire))
+        .map_err(|_| LlmError::invalid_request("Cannot serialize counting input"))
+}
+
+pub(crate) async fn count_input(
+    spec: &ModelSpec,
+    request_name: &RequestModelName,
+    api_key: &str,
+    custom_headers: &[(String, String)],
+    request: &LlmRequest,
+) -> Result<super::ProviderInputCount, LlmError> {
+    let body = count_input_body(spec, request_name, request)?;
+    let client = Client::new();
+    let mut builder = client
+        .post("https://api.openai.com/v1/responses/input_tokens")
+        .bearer_auth(api_key)
+        .header("content-type", "application/json");
+    for (key, value) in custom_headers {
+        builder = builder.header(key, value);
+    }
+    let response = builder
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| LlmError::network("Input count transport failed"))?;
+    if !response.status().is_success() {
+        return Err(LlmError::network(format!(
+            "Input count returned HTTP {}",
+            response.status()
+        )));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| LlmError::network("Invalid input count response"))?;
+    let tokens = value
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| LlmError::network("Missing input token count"))?;
+    Ok(super::ProviderInputCount::OpenAiCompleteInput { tokens })
+}
 
 /// Complete using the `OpenAI` Responses API.
 #[allow(clippy::too_many_arguments)]
@@ -149,10 +248,14 @@ pub async fn complete(
         LlmError::invalid_response("Failed to parse Responses API response")
     })?;
 
-    bind_responses_model(
+    let mut response = bind_responses_model(
         normalize_responses_api_response(responses_response)?,
         request_name.as_str(),
-    )
+    )?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| LlmError::invalid_response("Invalid response"))?;
+    response.usage_observation = UsageObservation::responses(&raw["usage"]);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +402,7 @@ impl ResponsesReasoningUsage {
 
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
+    usage_observation: UsageObservation,
     input_tokens: u32,
     output_tokens: u32,
     reasoning_usage: ResponsesReasoningUsage,
@@ -373,6 +477,7 @@ impl ResponsesStreamAccumulator {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            usage_observation: UsageObservation::default(),
             reasoning_usage: ResponsesReasoningUsage::Absent,
             cached_tokens: 0,
             cache_write_tokens: 0,
@@ -594,7 +699,7 @@ impl ResponsesStreamAccumulator {
                     self.model = model.to_string();
                 }
                 if let Some(usage) = v.pointer("/response/usage") {
-                    tracing::debug!(usage = %usage, "responses_api usage extracted");
+                    self.usage_observation = UsageObservation::responses(usage);
                     self.input_tokens = u32::try_from(
                         usage
                             .get("input_tokens")
@@ -750,6 +855,7 @@ impl ResponsesStreamAccumulator {
             },
             self.observed_non_reasoning_output,
         )?;
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -3348,7 +3454,11 @@ pub async fn complete_chat(
         LlmError::invalid_response("Failed to parse Chat Completions response")
     })?;
 
-    normalize_chat_response(chat_response, request_name.as_str())
+    let mut response = normalize_chat_response(chat_response, request_name.as_str())?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| LlmError::invalid_response("Invalid response"))?;
+    response.usage_observation = UsageObservation::chat(&raw["usage"]);
+    Ok(response)
 }
 
 /// Complete using the `OpenAI` Chat Completions API (streaming).
@@ -3802,6 +3912,7 @@ enum ChatVisibleKind {
 }
 
 struct ChatStreamAccumulator {
+    usage_observation: UsageObservation,
     content: String,
     visible_kind: Option<ChatVisibleKind>,
     choice_index: Option<usize>,
@@ -3868,6 +3979,7 @@ impl ChatStreamAccumulator {
         Self {
             content: String::new(),
             visible_kind: None,
+            usage_observation: UsageObservation::default(),
             choice_index: None,
             tool_calls: Vec::new(),
             usage: None,
@@ -3895,6 +4007,11 @@ impl ChatStreamAccumulator {
         }
         let now = Instant::now();
         self.telemetry.record_provider_event_at(now);
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(data) {
+            if raw.get("usage").is_some_and(|usage| !usage.is_null()) {
+                self.usage_observation = UsageObservation::chat(&raw["usage"]);
+            }
+        }
         let event: ChatStreamChunk = serde_json::from_str(data).map_err(|e| {
             LlmError::invalid_response(format!("Failed to parse chat SSE data: {e}"))
         })?;
@@ -4072,6 +4189,7 @@ impl ChatStreamAccumulator {
         };
         let mut response =
             chat_message_to_response(message, self.usage, "<streaming-chat-completions>")?;
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -5640,6 +5758,7 @@ mod tests {
         )]);
         let capture = crate::LlmAttemptCapture::new();
         request.telemetry = Some(crate::LlmRequestTelemetry {
+            capacity_plan_id: None,
             conversation_id: "deadline".to_string(),
             root_conversation_id: "deadline".to_string(),
             request_id: "deadline".to_string(),
@@ -5910,6 +6029,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn counting_body_reuses_generation_input_tools_and_restrictions() {
+        let spec = test_model_spec("gpt-6");
+        let name = RequestModelName::from("wire-model");
+        let mut request = restricted_request(&["bash"]);
+        request
+            .system
+            .push(super::super::types::SystemContent::cached(
+                "fixed instructions",
+            ));
+        request.messages.push(LlmMessage {
+            source_message_id: None,
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("history")],
+        });
+        let generation = serde_json::to_value(translate_to_backend_request_for_model(
+            &spec,
+            name.as_str(),
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        let count = count_input_body(&spec, &name, &request).unwrap();
+        for key in [
+            "model",
+            "input",
+            "instructions",
+            "tools",
+            "tool_choice",
+            "reasoning",
+            "text",
+        ] {
+            assert_eq!(count.get(key), generation.get(key), "{key}");
+        }
+        assert!(count.get("max_output_tokens").is_none());
+        assert_eq!(request.max_tokens, 16_384);
+        assert!(count["tools"].as_array().unwrap().len() >= 2);
+    }
+
     fn restricted_request(callable: &[&str]) -> LlmRequest {
         let mut request = empty_request();
         request.tool_availability = phoenix_core::domain::tool_availability::ToolAvailability::new(
@@ -6038,8 +6197,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(translated["input"], serde_json::Value::Array(expected));
+        let count = count_input_body(&test_model_spec("gpt-6"), &"gpt-6".into(), &request).unwrap();
+        assert_eq!(count["input"], translated["input"]);
+        assert!(count["input"].to_string().contains("encrypted_content"));
         request.messages[0].content.clear();
         assert!(validate_responses_replay(&request, "gpt-6").is_err());
+        assert!(count_input_body(&test_model_spec("gpt-6"), &"gpt-6".into(), &request).is_err());
     }
 
     #[test]
@@ -8239,6 +8402,51 @@ mod tests {
             1,
             "terminal output must not duplicate completed items"
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_usage_observation_stream_missing_usage_differs_from_reported_zero() {
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!({"input_tokens":0,"output_tokens":0}),
+            serde_json::json!({"input_tokens":0,"output_tokens":0,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+            let item = serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]});
+            acc.process_event(
+                "response.output_item.done",
+                &serde_json::json!({"type":"response.output_item.done","item":item}).to_string(),
+                &tx,
+            )
+            .await
+            .unwrap();
+            let terminal = serde_json::json!({"type":"response.completed","response":{"usage":usage,"output":[item]}});
+            acc.process_event("response.completed", &terminal.to_string(), &tx)
+                .await
+                .unwrap();
+            let response = acc.into_response().unwrap();
+            assert_eq!(response.usage.input_tokens, 0);
+            assert_eq!(response.usage_observation.input_total, !usage.is_null());
+            assert_eq!(
+                response.usage_observation.cache_read,
+                usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .is_some()
+            );
+        }
+        for usage in [
+            serde_json::Value::Null,
+            serde_json::json!({"prompt_tokens":0,"completion_tokens":0}),
+        ] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = ChatStreamAccumulator::new(Instant::now(), &empty_request());
+            acc.process_event(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":usage}).to_string(),&tx).await.unwrap();
+            let response = acc.into_response().unwrap();
+            assert_eq!(response.usage.input_tokens, 0);
+            assert_eq!(response.usage_observation.input_total, !usage.is_null());
+            assert!(!response.usage_observation.cache_read);
+        }
     }
 
     #[test]

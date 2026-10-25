@@ -40,6 +40,9 @@ vi.mock('../api', async () => {
       getConversationUsage: vi.fn(() => Promise.resolve({ total_tokens: 0, turns: [] })),
       getConversationSlug: vi.fn(),
       continueConversation: vi.fn(),
+      handoffCandidates: vi.fn(() => Promise.resolve([])),
+      reviewHandoff: vi.fn(),
+      triggerContinuation: vi.fn(() => Promise.resolve({ success: true })),
       getSystemPrompt: vi.fn(() => Promise.resolve({ system_prompt: null })),
       getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
       getConversationTaskCount: vi.fn(() => Promise.resolve({ active: 0, closed: 0, blocked: 0, current: false })),
@@ -68,11 +71,12 @@ type ConnectionOptions = {
 };
 
 const authoritativeConversations = new Map<string, Conversation>();
+const authoritativeMessages = new Map<string, Message[]>();
 
 function makeConnectionInit(conversation: Conversation): InitPayload {
   return {
     conversation,
-    messages: [{ ...historyMessage, conversation_id: conversation.id }],
+    messages: (authoritativeMessages.get(conversation.id) ?? [historyMessage]).map((message) => ({ ...message, conversation_id: conversation.id })),
     opening: null, steeringMessages: [],
     phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
@@ -257,14 +261,16 @@ function renderPage(
   initialSearch = '',
   routePrefix: '/c' | '/global' = '/c',
   activeFocusScope = false,
+  messages: Message[] = [historyMessage],
 ) {
   authoritativeConversations.set(conversation.id, conversation);
+  authoritativeMessages.set(conversation.id, messages);
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
     type: 'set_initial_data',
     conversationId: conversation.id,
     conversation,
-    messages: [{ ...historyMessage, conversation_id: conversation.id }],
+    messages: messages.map((message) => ({ ...message, conversation_id: conversation.id })),
     phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
@@ -272,14 +278,14 @@ function renderPage(
 
   vi.mocked(api.getConversation).mockResolvedValue({
     conversation,
-    messages: [historyMessage],
+    messages,
     agent_working: false,
     presentation_mode: 'idle',
     context_window_size: 0,
   });
   vi.mocked(api.getConversationBySlug).mockResolvedValue({
     conversation,
-    messages: [historyMessage],
+    messages,
     agent_working: false,
     presentation_mode: 'idle',
     context_window_size: 0,
@@ -325,6 +331,7 @@ afterEach(() => {
   viewportFlags.isDesktop = true;
   viewportFlags.isWideDesktop = true;
   authoritativeConversations.clear();
+  authoritativeMessages.clear();
   vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -1248,6 +1255,38 @@ async function clickWhenEnabled(control: HTMLElement) {
 }
 
 describe('ConversationPage context exhausted handoff', () => {
+  it('continues generated text using its actual persisted continuation message identity', async () => {
+    vi.mocked(api.continueConversation).mockResolvedValue({ status: 'dispatch_failed', conversation_id: 'successor', error: 'Retain parent' });
+    renderPage(makeConversation({ state: { type: 'context_exhausted', summary: 'Generated summary' } }), slug, '', '/c', false, [
+      { ...historyMessage, message_id: 'persisted-continuation-row', message_type: 'continuation', content: { summary: 'Generated summary' } },
+    ]);
+    await clickWhenEnabled(await screen.findByRole('button', { name: 'Continue' }));
+    await waitFor(() => expect(api.continueConversation).toHaveBeenCalledWith(conversationId, expect.objectContaining({ handoff: 'Generated summary', source: { kind: 'summary', message_id: 'persisted-continuation-row' } })));
+  });
+
+  it('offers reviewed input and model guidance rather than unchanged retry on deterministic capacity failure', async () => {
+    renderPage(makeConversation({ state: { type: 'recoverable_continuation_failure', message: 'Protected input exceeds successor target', error_kind: 'context_capacity_conflict', operation_id: 'op', attempt: 1 } }));
+    expect(await screen.findByRole('region', { name: 'Continuation handoff recovery' })).toBeInTheDocument();
+    expect(screen.getByText('Protected input exceeds successor target')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry summary' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Regenerate handoff' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Check fit' })).toBeInTheDocument();
+    expect(screen.getByText(/conversation model selector/)).toBeInTheDocument();
+  });
+
+  it('keeps explicit retry for a transient continuation failure', async () => {
+    renderPage(makeConversation({ state: { type: 'recoverable_continuation_failure', message: 'Network interrupted', error_kind: 'network', operation_id: 'op', attempt: 1 } }));
+    const retry = await screen.findByRole('button', { name: 'Retry summary' });
+    await clickWhenEnabled(retry);
+    expect(api.triggerContinuation).toHaveBeenCalledWith(conversationId);
+  });
+
+  it('offers regeneration for an old exhausted notice without matching its text', async () => {
+    renderPage(makeConversation({ state: { type: 'context_exhausted', summary: 'Old generic notice' } }));
+    await clickWhenEnabled(await screen.findByRole('button', { name: 'Regenerate handoff' }));
+    expect(api.triggerContinuation).toHaveBeenCalledWith(conversationId);
+  });
+
   it('dispatch_failed keeps the edit on the parent for durable retry', async () => {
     vi.mocked(api.continueConversation).mockResolvedValue({
       status: 'dispatch_failed',

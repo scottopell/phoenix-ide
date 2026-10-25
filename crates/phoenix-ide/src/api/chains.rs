@@ -859,6 +859,7 @@ mod tests {
                     content: vec![ContentBlock::text("stub")],
                     end_turn: true,
                     usage: Usage::default(),
+                    usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                     stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
                 })
             }

@@ -2643,6 +2643,27 @@ mod tests {
         serde_json::from_str(output.output()).expect("response JSON")
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn settled_native_run_response(output: &ToolOutput, ctx: &ToolContext) -> Value {
+        let response = response_json(output);
+        if response["status"] == "exited" {
+            return response;
+        }
+        assert_eq!(response["status"], "still_running");
+        let handle_id = response["handle"].as_str().expect("live command handle");
+        let handle = lookup_handle(ctx, handle_id)
+            .await
+            .expect("owned native command handle");
+        let mut exit_rx = handle.exit_observer();
+        tokio::time::timeout(Duration::from_secs(10), exit_rx.wait_for(Option::is_some))
+            .await
+            .expect("native command lifecycle did not settle")
+            .expect("native command lifecycle observer closed");
+        response_json(
+            &terminal_or_panic_response(&handle, &ReadArgs::default(), true, false, None).await,
+        )
+    }
+
     #[cfg(unix)]
     fn native_launcher_available() -> bool {
         use std::os::unix::fs::PermissionsExt;
@@ -2940,7 +2961,7 @@ mod tests {
             },
         )
         .await;
-        let response = response_json(&output);
+        let response = settled_native_run_response(&output, &ctx).await;
         let (pid, probe) = probe_record
             .lock()
             .unwrap()
@@ -3112,7 +3133,7 @@ mod tests {
             },
         )
         .await;
-        let response = response_json(&output);
+        let response = settled_native_run_response(&output, &ctx).await;
         assert_eq!(response["status"], "exited");
         assert_eq!(response["exit_code"], 7);
         let combined_output = response["lines"]

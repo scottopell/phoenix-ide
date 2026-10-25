@@ -122,6 +122,20 @@ impl ContinuationApplicationService {
                 .runtime
                 .lock_product_message_admission(admission.product_conversation_id.as_str())
                 .await;
+            let review = self
+                .runtime
+                .review_continuation_handoff(
+                    &admission.predecessor_conversation_id,
+                    summary_content.summary.clone(),
+                    false,
+                )
+                .await?;
+            if !review.source.fits() {
+                return Err(format!(
+                    "Automatic continuation handoff no longer fits successor capacity: {:?}",
+                    review.source
+                ));
+            }
             match self
                 .runtime
                 .db()

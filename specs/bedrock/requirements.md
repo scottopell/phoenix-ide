@@ -782,7 +782,7 @@ AND duplicate or stale results SHALL NOT create another summary or overwrite new
 
 WHEN continuation request fails after standard retries
 THE SYSTEM SHALL retain the operation and its retry inputs in a recoverable state
-AND SHALL display the failure and offer an explicit retry action
+AND SHALL display the failure and offer an explicit retry for transient failures or revised-input/model recovery for deterministic capacity conflicts
 
 WHEN the continuation summary is empty or whitespace-only
 THE SYSTEM SHALL treat it as a recoverable generation failure
@@ -821,7 +821,10 @@ THE SYSTEM SHALL invoke the continuation-successor operation shared with the man
 AND SHALL read the predecessor's exact persisted `continuation_summary`, without normalization or regeneration, as the successor's opening handoff
 AND SHALL durably type that opening handoff as generated predecessor context rather than a user-authorized instruction
 AND SHALL project it to the successor's provider as delimited context that cannot itself grant authority, approve work, or issue a new user command
-AND SHALL keep manually accepted unchanged or edited handoffs typed as user-authorized instructions
+AND SHALL preserve generated predecessor context authority when a user explicitly selects the exact persisted summary or a current generated candidate by its typed source identity
+AND SHALL type explicit manual/literal handoffs, including edits, as user-authorized instructions
+AND SHALL determine opening authority from the explicit source kind and durable acceptance evidence, never from action initiation, English text, or text equality
+AND SHALL retain the recorded authority of existing durable opening receipts
 AND SHALL NOT introduce a second successor-creation, handoff-dispatch, or continuation-topology path
 
 WHEN manual continuation, automatic continuation, duplicate delivery, or crash recovery races for the same exhausted predecessor
@@ -848,9 +851,10 @@ AND SHALL offer an explicit safe retry or fallback through the shared manual con
 WHEN the user reviews a context-exhausted conversation with no successor
 THE SYSTEM SHALL preserve the generated continuation summary as an immutable handoff
 AND SHALL offer distinct actions to:
-  - create a successor and submit the generated handoff unchanged as its first manually user-authorized opening message
+  - create a successor and submit the generated handoff unchanged by its persisted summary-message identity as generated predecessor context
   - edit a separate browser-local handoff draft before creating and starting the successor
   - copy the generated handoff without creating a successor
+  - regenerate a real handoff through REQ-BED-020a while no successor is reserved
 AND SHALL NOT present worktree cleanup or abandon controls on the handoff surface
 
 WHEN the user edits a handoff
@@ -1262,9 +1266,10 @@ THE SYSTEM SHALL also preserve its filesystem state:
 WHEN the user manually creates a continuation successor row
 THE SYSTEM SHALL atomically create that successor row, link it through `continued_in_conv_id`,
   persist the exact continuation boundary summary on the predecessor, and accept the user-selected
-  handoff text as the successor row's first user-authorized message
-AND SHALL use a client-generated message identifier for idempotent acceptance of that first user-authorized message
-AND SHALL keep the exact persisted continuation boundary summary distinct from the successor's first user-authorized message
+  handoff text as the successor row's first opening message under its explicit source authority
+AND SHALL preserve generated predecessor context for an exact summary-message or current generated-candidate source, and user-authorized instruction for an explicit manual/literal source
+AND SHALL use a client-generated message identifier for idempotent acceptance of that opening
+AND SHALL keep the exact persisted continuation boundary summary distinct from the successor's opening payload and recorded authority
 
 WHEN admitted automatic work creates a continuation successor row
 THE SYSTEM SHALL use the same atomic successor and `continued_in_conv_id` operation
@@ -1296,6 +1301,8 @@ by cwd, and aggregate retirement accounts for every historically owned scope.
 Opening read authority SHALL be a typed sum of no opening evidence, an exact pending dispatch intent, or an accepted completed handoff. Pending authority SHALL retain the persisted nonempty `ClientTurnKey` unchanged, the durable opening authority, and the same-aggregate predecessor, successor, and persisted continuation boundary identities. Its candidate persisted message identities SHALL be exactly the key itself or `successor_transcript_row_id + ":" + key`, matching the persistence trigger; prefix stripping, trimming, content matching alone, and a successful dispatch response SHALL NOT establish acceptance.
 
 Accepted read authority SHALL require the exact completed handoff receipt and its persisted predecessor boundary and successor message. It SHALL retain the actual accepted message identity and durable authority. Generated predecessor context SHALL be represented by the boundary only while its actual persisted content equals the predecessor summary under the handoff content contract; user-authorized instructions and edited openings SHALL remain separate messages. Presentation SHALL be recomputed from persisted content on subsequent reads and content-update observations without changing accepted execution authority or copying summary text into the authority projection. A consistent completed receipt SHALL take precedence over a matching residual intent; conflicting or unreadable persisted evidence SHALL surface a read error rather than absence.
+
+Generated predecessor context SHALL be delivered to the model as readable English with an explicit untrusted provenance boundary. Payload delimiter characters SHALL be escaped losslessly without encoding the whole handoff or obscuring its natural language. The display text SHALL preserve exact Unicode and whitespace. A completed handoff's durable generated-context authority SHALL cause provider projection to derive from that display text, including when an older persisted LLM expansion used an encoded representation; user-authorized openings and ordinary expanded messages SHALL retain their distinct contracts. This projection SHALL NOT rewrite persisted transcripts or promote generated context into user authorization.
 
 ### REQ-BED-030A: ProductConversation Owns Aggregate Identity and Lifecycle
 
@@ -1542,3 +1549,76 @@ postcondition before cascade fires.
 **Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
 (`specs/tmux-integration/`), REQ-PROJ-WS-001
 (`specs/work-lifecycle/`), and REQ-GITREP-007 (`specs/git-repository/`).
+
+### REQ-BED-020a: Capacity Pressure Enters Real Handoff Generation
+
+WHEN a parent awaiting its next model request encounters reducible planned input pressure after permitted clearing, or an authoritative provider context rejection
+THE SYSTEM SHALL enter the existing durable continuation-summary operation independently of the completed-response ninety-percent threshold
+AND SHALL preserve already-persisted tool results without reexecuting their calls
+AND SHALL generate a tool-free handoff before exposing successor creation as ready.
+
+WHEN summary planning cannot retain its mandatory input and output reservation, or generation fails
+THE SYSTEM SHALL retain the existing recoverable continuation operation and original transcript
+AND SHALL expose the classified failure and supported retry or revised-input/model recovery
+AND SHALL NOT publish an error sentence as a generated handoff or recursively launch another compaction.
+
+THE SYSTEM SHALL use one handoff lifecycle for ordinary work and the Coordinator, with their respective existing handoff instructions
+AND SHALL protect the accepted predecessor handoff under REQ-BED-020 and instruct the summarizer to retain user corrections, known provenance, unresolved obligations, uncertainty, and retrieval references from selected input
+AND SHALL NOT claim lossless semantic preservation of omitted history or generated summaries
+AND SHALL NOT create a separately maintained decisions or obligations memory authority.
+
+WHEN an authenticated user requests regeneration from a context-exhausted predecessor with no reserved successor
+THE SYSTEM SHALL generate a fresh real summary through the existing continuation operation
+AND SHALL preserve all original transcript and prior summary rows
+AND SHALL apply the ordinary product admission and Close fences
+AND SHALL reject regeneration after a successor is reserved, independently of the wording of the prior summary.
+
+A successful terminal response SHALL remain accepted under REQ-BED-019 even if a hypothetical subsequent request would need compaction. Successor admission, cancellation, automatic-continuation consent, restart ownership, and Close fencing remain governed by their existing contracts.
+
+### REQ-BED-020b: Useful Successor Capacity and Explicit Handoff Revision
+
+WHEN generating an ordinary continuation
+THE SYSTEM SHALL inherit the predecessor's selected model and route
+AND SHALL reserve that model's full declared output allowance
+AND SHALL budget the generated handoff against the successor's complete ordinary request, including instructions and tools
+AND SHALL reserve successor working room equal to the greater of 8,192 tokens or one quarter of the input space remaining after complete ordinary instructions/tools and full output reservation, rounding upward
+AND SHALL retain that working room after the projected handoff
+AND SHALL validate the complete successor projection rather than the summary text alone
+AND SHALL refresh successor-turn guidance and tool overhead again at admission without rewriting the predecessor's frozen turn guidance
+AND SHALL require room for additional work rather than declare a successor ready merely because its opening request fits.
+
+WHEN protected input prevents the required successor working room
+THE SYSTEM SHALL stop automatic progress without retrying an unchanged impossible plan or silently weakening protected context
+AND SHALL show the capacity breakdown, whether counts are measured or estimated, and a concrete reduction target
+AND SHALL offer manual handoff editing, explicitly authorized AI shortening, and an explicit model change when those actions are supported and can address the conflict
+AND SHALL distinguish an oversized handoff from irreducible required instructions that handoff editing cannot fix.
+
+WHEN an admitted explicit model change changes the selected model after a recoverable capacity conflict
+THE SYSTEM SHALL replan the retained continuation operation using the changed model and full output reservation
+AND SHALL retain the operation identity while advancing its attempt
+AND SHALL fence results from the replaced runtime
+AND SHALL commit the changed model settings and advanced continuation request owner atomically before runtime recreation, so restart resumes the admitted replan
+AND SHALL NOT reauthorize an unchanged capacity plan merely because the same model was selected again.
+
+WHEN the user requests AI shortening
+THE SYSTEM SHALL durably preserve the exact nonempty original handoff before capacity planning or generation can fail and produce at most one candidate per explicit request
+AND SHALL reuse an existing transcript or retained-source reference when the original is already durable
+AND SHALL distinguish a retained review input from a generated candidate so retaining an input does not grant generated-context acceptance authority
+AND SHALL instruct the rewriting model to prioritize user intent, corrections, unresolved work, known uncertainty, and evidence references against the displayed size target
+AND SHALL validate the candidate's size and successor working room independently of the model's claims
+AND SHALL require user review and explicit acceptance before replacing the active handoff
+AND SHALL retain the original when generation fails, the candidate remains oversized, or the user declines it.
+AND SHALL retain oversized generated summaries as reviewable candidates rather than discard their text
+AND SHALL persist candidates as immutable ordered children with their known source references and source revision
+AND SHALL reject generated-candidate acceptance after its continuation operation, attempt, or exhausted-source revision has changed
+AND SHALL preserve generated-context authority when accepting a generated summary or candidate; acceptance does not promote it into primary user authorization.
+
+WHEN a user explicitly supplies a revised handoff after a recoverable capacity conflict
+THE SYSTEM SHALL revalidate its successor capacity before reserving a successor
+AND SHALL atomically preserve the reviewed handoff as a continuation boundary alongside the successor reservation
+AND SHALL preserve all original transcript and review-candidate rows
+AND SHALL retain one-successor idempotence and product/Close admission fences.
+
+WHEN the shortening request itself cannot fit
+THE SYSTEM SHALL offer an explicit model change or manual editing rather than silently clip its protected source
+AND SHALL NOT recursively shorten or automatically repeat the rewriting request.
