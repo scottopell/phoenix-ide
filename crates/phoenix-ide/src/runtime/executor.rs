@@ -8254,11 +8254,18 @@ where
         let dispatch_generation = self.llm_request_generation;
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
-        let llm_client = self
-            .llm_client
-            .clone()
-            .freeze_for_request()
-            .map_err(|error| error.to_string())?;
+        let request_id = overload_incident.as_ref().map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |(_, logical_request_id, _)| logical_request_id.clone(),
+        );
+        let llm_client = match self.llm_client.clone().freeze_for_request() {
+            Ok(client) => client,
+            Err(error) => {
+                let outcome = llm_error_to_outcome(error, &request_id, &self.context.model_id);
+                let _ = llm_outcome_tx.send((dispatch_generation, outcome)).await;
+                return Ok(None);
+            }
+        };
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -8302,10 +8309,6 @@ where
         // Message, producing a phantom streaming buffer on the
         // client (the "repeated message" bug).
         let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
-        let request_id = overload_incident.as_ref().map_or_else(
-            || uuid::Uuid::new_v4().to_string(),
-            |(_, logical_request_id, _)| logical_request_id.clone(),
-        );
 
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
@@ -10268,11 +10271,6 @@ where
             }
             _ => None,
         };
-        let llm_client = self
-            .llm_client
-            .clone()
-            .freeze_for_request()
-            .map_err(|error| error.to_string())?;
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
@@ -10287,6 +10285,18 @@ where
                 retry.logical_request_id.clone()
             }
             _ => continuation_request_identity(&self.context.conversation_id, &operation_id),
+        };
+        let llm_client = match self.llm_client.clone().freeze_for_request() {
+            Ok(client) => client,
+            Err(error) => {
+                return Ok(Some(continuation_error_to_event(
+                    error,
+                    operation_id,
+                    retry_attempt,
+                    &request_id,
+                    &self.context.model_id,
+                )));
+            }
         };
         let plan_telemetry = phoenix_llm::LlmRequestTelemetry {
             capacity_plan_id: None,
@@ -10933,45 +10943,13 @@ where
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Continuation LLM request failed");
-                    let event = if e.kind == phoenix_llm::LlmErrorKind::ServerOverloaded {
-                        let guidance = e.retry_after().map(|retry_after| match retry_after {
-                            phoenix_llm::RetryAfter::WithinLimit(duration) => {
-                                phoenix_core::domain::sm_state::OverloadRetryGuidance::WithinLimit(
-                                    duration,
-                                )
-                            }
-                            phoenix_llm::RetryAfter::ExceedsLimit(duration) => {
-                                phoenix_core::domain::sm_state::OverloadRetryGuidance::ExceedsLimit(
-                                    duration,
-                                )
-                            }
-                        });
-                        Event::ContinuationServerOverloaded {
-                            operation_id: operation_id.clone(),
-                            message: e.message.clone(),
-                            detected_at: Utc::now(),
-                            guidance,
-                            logical_request_id: request_id.clone(),
-                            model_id: model_id.clone(),
-                        }
-                    } else if e.recovery_in_progress {
-                        Event::LlmError {
-                            message: e.message.clone(),
-                            error_kind: llm_error_to_db_error(e.kind),
-                            attempt: retry_attempt,
-                            recovery_in_progress: true,
-                            observed_at: chrono::Utc::now(),
-                            resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
-                        }
-                    } else {
-                        Event::ContinuationError {
-                            operation_id,
-                            message: e.message.clone(),
-                            error_kind: llm_error_to_db_error(e.kind),
-                            observed_at: Utc::now(),
-                            resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
-                        }
-                    };
+                    let event = continuation_error_to_event(
+                        e,
+                        operation_id,
+                        retry_attempt,
+                        &request_id,
+                        &model_id,
+                    );
                     let _ = event_tx.send(event).await;
                 }
             }
@@ -13878,6 +13856,50 @@ fn render_rejected_tool_call(tool: &ToolCall) -> String {
     }
 }
 
+fn continuation_error_to_event(
+    error: phoenix_llm::LlmError,
+    operation_id: String,
+    retry_attempt: u32,
+    request_id: &str,
+    model_id: &str,
+) -> Event {
+    if error.kind == phoenix_llm::LlmErrorKind::ServerOverloaded {
+        let guidance = error.retry_after().map(|retry_after| match retry_after {
+            phoenix_llm::RetryAfter::WithinLimit(duration) => {
+                phoenix_core::domain::sm_state::OverloadRetryGuidance::WithinLimit(duration)
+            }
+            phoenix_llm::RetryAfter::ExceedsLimit(duration) => {
+                phoenix_core::domain::sm_state::OverloadRetryGuidance::ExceedsLimit(duration)
+            }
+        });
+        Event::ContinuationServerOverloaded {
+            operation_id,
+            message: error.message,
+            detected_at: Utc::now(),
+            guidance,
+            logical_request_id: request_id.to_string(),
+            model_id: model_id.to_string(),
+        }
+    } else if error.recovery_in_progress {
+        Event::LlmError {
+            message: error.message,
+            error_kind: llm_error_to_db_error(error.kind),
+            attempt: retry_attempt,
+            recovery_in_progress: true,
+            observed_at: chrono::Utc::now(),
+            resets_at: error.quota.as_ref().and_then(|quota| quota.resets_at),
+        }
+    } else {
+        Event::ContinuationError {
+            operation_id,
+            message: error.message,
+            error_kind: llm_error_to_db_error(error.kind),
+            observed_at: Utc::now(),
+            resets_at: error.quota.as_ref().and_then(|quota| quota.resets_at),
+        }
+    }
+}
+
 fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKind {
     // Explicit match arms — no catch-all. The compiler enforces exhaustiveness.
     match kind {
@@ -14094,6 +14116,121 @@ fn cleanup_worktree_if_present(
             %error,
             "terminal worktree cleanup failed; worktree may remain on disk"
         );
+    }
+}
+
+#[cfg(test)]
+mod unavailable_frozen_route_tests {
+    #![allow(clippy::large_futures)]
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockToolExecutor};
+    use crate::runtime::traits::RegistryLlmClient;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // ordinary and continuation paths share the real route fixture
+    async fn unavailable_frozen_route_settles_ordinary_and_continuation_failures() {
+        for (continuation, connection) in [
+            (false, None),
+            (true, None),
+            (false, Some("missing-connection")),
+            (true, Some("missing-connection")),
+        ] {
+            let expected_error = if connection.is_some() {
+                crate::db::ErrorKind::InvalidRequest
+            } else {
+                crate::db::ErrorKind::Network
+            };
+            let attempt = phoenix_core::domain::retry_policy::GENERIC_MAX_ATTEMPTS;
+            let storage = Arc::new(InMemoryStorage::new());
+            let registry = Arc::new(ModelRegistry::new_empty());
+            let llm = Arc::new(
+                RegistryLlmClient::new(registry.clone(), "missing-model".into())
+                    .with_connection(connection.map(str::to_string)),
+            );
+            let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "unavailable-route-operation".into(),
+                attempt,
+                rejected_tool_calls: vec![],
+            };
+            let state = if continuation {
+                ConvState::AwaitingContinuation {
+                    request: request.clone(),
+                }
+            } else {
+                ConvState::LlmRequesting { attempt }
+            };
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let mut runtime = ConversationRuntime::new(
+                ConvContext::new(
+                    "unavailable-route",
+                    std::path::PathBuf::from("/tmp"),
+                    "missing-model",
+                    200_000,
+                    16_384,
+                ),
+                state,
+                storage.clone(),
+                llm,
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                registry,
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx,
+                SseBroadcaster::new(16, 0),
+            );
+            runtime.llm_request_generation = 7;
+            if continuation {
+                let event = runtime
+                    .execute_effect(Effect::RequestContinuation {
+                        request: request.clone(),
+                    })
+                    .await
+                    .expect("route failure is a typed event")
+                    .expect("continuation failure event");
+                Box::pin(runtime.process_event(event)).await.unwrap();
+                assert!(
+                    matches!(&runtime.state, ConvState::RecoverableContinuationFailure { failure }
+                    if failure.request == request && failure.error_kind == expected_error)
+                );
+            } else {
+                assert!(runtime
+                    .execute_effect(Effect::RequestLlm)
+                    .await
+                    .unwrap()
+                    .is_none());
+                let (generation, outcome) = runtime
+                    .llm_outcome_rx
+                    .try_recv()
+                    .expect("route failure queued");
+                assert_eq!(generation, 8);
+                match (&outcome, connection) {
+                    (LlmOutcome::RequestRejected { message }, Some(_)) => {
+                        assert!(message.contains("missing-connection"));
+                    }
+                    (LlmOutcome::NetworkError { message }, None) => {
+                        assert!(message.contains("missing-model"));
+                    }
+                    other => panic!("wrong route failure classification: {other:?}"),
+                }
+                runtime
+                    .process_generation_tagged_llm_outcome(generation, outcome)
+                    .await;
+                assert!(matches!(
+                    &runtime.state,
+                    ConvState::Error { error_kind, .. } if error_kind == &expected_error
+                ));
+            }
+            assert_eq!(
+                storage.get_current_state("unavailable-route"),
+                Some(runtime.state.clone())
+            );
+            assert!(runtime.llm_task_handle.is_none());
+            assert!(runtime.active_llm_attempt.is_none());
+            assert!(storage.recorded_llm_request_metrics().is_empty());
+        }
     }
 }
 

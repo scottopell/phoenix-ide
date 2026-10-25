@@ -12021,7 +12021,7 @@ mod scope_liveness_tests {
                     request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
                         operation_id: "op-awaiting".to_string(),
                         rejected_tool_calls: Vec::new(),
-                        attempt: 1,
+                        attempt: phoenix_core::domain::retry_policy::GENERIC_MAX_ATTEMPTS,
                     },
                 },
             ),
@@ -12193,7 +12193,7 @@ mod scope_liveness_tests {
                     request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
                         operation_id: "op-coordinator".to_string(),
                         rejected_tool_calls: Vec::new(),
-                        attempt: 1,
+                        attempt: phoenix_core::domain::retry_policy::GENERIC_MAX_ATTEMPTS,
                     },
                 },
             )
@@ -12201,6 +12201,53 @@ mod scope_liveness_tests {
             .unwrap();
 
         assert_eq!(manager.resume_pending_continuations().await.unwrap(), 8);
+        for (id, operation_id) in [
+            ("awaiting-continuation", "op-awaiting"),
+            (coordinator.id.as_str(), "op-coordinator"),
+        ] {
+            let mut state_rx = manager
+                .runtimes
+                .read()
+                .await
+                .get(id)
+                .expect("startup materializes the continuation owner")
+                .state_rx
+                .clone();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    if matches!(
+                        &*state_rx.borrow_and_update(),
+                        ConvState::RecoverableContinuationFailure { failure }
+                            if failure.request.operation_id == operation_id
+                    ) {
+                        break;
+                    }
+                    state_rx
+                        .changed()
+                        .await
+                        .expect("continuation owner survives until failure settlement");
+                }
+            })
+            .await
+            .expect("startup continuation durably settles its unavailable route");
+            let ConvState::RecoverableContinuationFailure { failure } =
+                manager.db().get_conversation(id).await.unwrap().state
+            else {
+                panic!("startup must durably preserve the failed continuation operation");
+            };
+            assert_eq!(failure.request.operation_id, operation_id);
+            assert_eq!(failure.error_kind, crate::db::ErrorKind::Network);
+            assert_eq!(
+                failure.request.attempt,
+                phoenix_core::domain::retry_policy::GENERIC_MAX_ATTEMPTS
+            );
+            assert!(
+                failure
+                    .message
+                    .contains("is unavailable through its selected connection"),
+                "{failure:?}"
+            );
+        }
         let runtimes = manager.runtimes.read().await;
         assert!(runtimes.contains_key("awaiting-continuation"));
         assert!(runtimes.contains_key("recoverable-continuation"));
