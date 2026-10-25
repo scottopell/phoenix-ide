@@ -3680,6 +3680,28 @@ surface UserConversation {
         UserAcceptsGeneratedSummary(conversation, summary_message_id, new_conv, handoff_text, first_message_id)
             when conversation.parent_status = context_exhausted
                 and conversation.continued_in_conv_id = absent
+        UserRequestsHandoffShortening(conversation, source)
+            when (conversation.parent_status = context_exhausted
+                or conversation.core_status = recoverable_continuation_failure)
+                 and conversation.continued_in_conv_id = absent
+                 and (
+                    conversation.product_conversation.kind = coordinator
+                    or conversation.product_lifecycle = open
+                 )
+                 and not exists CloseObligation{product_conversation: conversation.product_conversation}
+                     where phase != completed
+        UserAcceptsGeneratedHandoffCandidate(conversation, candidate, new_conv, first_message_id)
+            when (conversation.parent_status = context_exhausted
+                or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation)))
+                 and conversation.continued_in_conv_id = absent
+                 and candidate_current_for(candidate, conversation)
+                 and successor_handoff_fits(conversation, candidate.text)
+                 and (
+                    conversation.product_conversation.kind = coordinator
+                    or conversation.product_lifecycle = open
+                 )
+                 and not exists CloseObligation{product_conversation: conversation.product_conversation}
+                     where phase != completed
         UserStartsManualContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
             when (conversation.parent_status = context_exhausted
                 or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation)))
