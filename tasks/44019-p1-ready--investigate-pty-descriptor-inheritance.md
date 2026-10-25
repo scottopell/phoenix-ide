@@ -1,0 +1,7 @@
+Investigate host PTY exhaustion and possible inherited-master retention in terminal spawning.
+
+Observed during context-capacity qualification: terminal handoff fixture fails at openpty with ENXIO before lifecycle assertions; an independent Python os.openpty call fails with the same host error. kern.tty.ptmx_max is 511. Read-only lsof inspection found many existing tmux processes holding multiple PTY masters, including masters shared across process families. This is evidence of exhaustion; it does not by itself prove a leak.
+
+Trace crates/phoenix-terminal/src/spawn.rs: spawn_pty opens a PTY, forks, closes the new master in the child and execs the shell/tmux client. No FD_CLOEXEC setting appears in that module. Determine whether unrelated existing PTY masters can survive subsequent child execs and keep retired terminals allocated. Add a regression that inspects descriptor inheritance and proves master lifetime after the owning terminal closes; preserve intended stdin/stdout/stderr and supported terminal reclaim.
+
+Do not terminate user sessions or raise host kernel limits as an automatic cleanup. Separate any product descriptor fix from explicitly authorized host-session cleanup. Current context-capacity work tracks this as an environment-blocked terminal gate and does not claim this suspected root cause is validated.
