@@ -19,7 +19,7 @@ together, replacing the image-only window whose tail-relative boundary rewrote
 recent context — and busted the prompt cache — every turn. Removal is governed by
 a persisted, monotonic per-conversation clear watermark that advances only in
 spaced, worthwhile sweeps under context pressure, so the cleared prefix is
-identical between sweeps and the cache stays warm; the recency floor keeps the
+identical between sweeps to permit cache reuse; the recency floor keeps the
 current turn's trailing-result breakpoint uncleared. Recoverability is a
 `Tool::clearable()` capability defaulting to false, so a new tool is never
 silently cleared.
@@ -39,6 +39,7 @@ silently cleared.
 | REQ-STR-009 | Apply Regardless of Model Provider | ✅ Complete |
 | REQ-STR-010 | Tune Retention Per Deployment | 🔄 In Progress |
 | REQ-STR-011 | Govern a Result's Images and Text Together | ✅ Complete |
+| REQ-STR-012 | Preserve Interpretation Without Duplicating Memory | Deterministic backend qualification |
 
 ## Scope Notes
 
@@ -99,4 +100,20 @@ recorded here once benchmarked. There is no `target_after_clear`: a sweep always
 clears the whole prefix outside the recency floor, so `keep_recent_rounds` alone
 bounds retention.
 
-REQ-STR-012 is specified, not qualified: source-locator retention and interpretation/provenance continuity need explicit regression evidence under task 44018. Existing monotonic clearing and recent-working-set constraints remain normative.
+REQ-STR-012 has deterministic backend coverage in
+`stale_tool_result_clearing_tests::render_placeholders_cleared_keeps_rest`:
+cleared text names the original persisted conversation/message/sequence, the
+producing ToolUse/ToolResult identity survives, text and images clear together,
+and selected assistant interpretation and user corrections remain verbatim.
+Repeated rendering is identical and the stored transcript is unchanged.
+`sweep_charges_all_markers_before_saturating_net_gain` rejects a sweep whose large
+result alone appears worthwhile but whose many small replacement markers erase
+the aggregate gain. Sweep metrics debit the actual rendered markers too.
+
+Existing watermark/failure/recency regressions cover monotonic removal and the
+working set. Handoff tests in the bedrock executive document qualify selected
+input and preservation instructions, not model understanding or lossless
+summarization. The transcript is the evidence authority; no parallel memory
+store or separate Coordinator retention mechanism is introduced. These are
+deterministic fixtures, not paid long-session evaluation or provider cache-hit
+measurements; deployment and production recovery are separate gates.

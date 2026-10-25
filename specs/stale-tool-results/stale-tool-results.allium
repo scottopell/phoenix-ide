@@ -27,11 +27,10 @@
 --           spec only guarantees the recency floor keeps the trailing
 --           result — the block the last-user-message breakpoint anchors
 --           on — uncleared). Continuation/summarization, the heavier
---           retention tier described in design.md.
+--           retention tier governed by specs/bedrock/requirements.md.
 --
 -- Normative companions:
---   specs/stale-tool-results/requirements.md — REQ-STR-001..011
---   specs/stale-tool-results/design.md       — watermark model, caching
+--   specs/stale-tool-results/requirements.md — REQ-STR-001..012
 --
 -- Cross-references:
 --   crates/phoenix-ide/src/runtime/executor.rs — dispatch_llm_request,
@@ -54,7 +53,7 @@
 
 -- The decision for one tool-result message in one assembled request.
 -- `kept` sends the persisted result body and images verbatim; `cleared`
--- replaces the body with a fixed placeholder and sends no images. The
+-- replaces the body with a stable source-locator marker and sends no images. The
 -- paired tool-call block is always retained regardless of verdict, so a
 -- cleared result is never a silent gap (REQ-STR-004).
 enum RetentionVerdict { kept | cleared }
@@ -93,7 +92,7 @@ enum RetentionVerdict { kept | cleared }
 -- feature exists to retire, so their image cost must drive the sweep
 -- decision; a text-only estimate would let a screenshot round contribute
 -- almost nothing and starve clearing in image-heavy sessions. This is
--- also the token figure freed if the result is cleared.
+-- original cost before subtracting the replacement marker cost.
 --
 -- `has_images` is true iff the persisted result carries image blocks. It
 -- separates "this result has images to preserve" from "images were
@@ -110,6 +109,7 @@ value ToolResultRendering {
     within_recency_floor: Boolean
     producing_tool_clearable: Boolean
     token_estimate: Integer
+    marker_token_estimate: Integer
     has_images: Boolean
     verdict: RetentionVerdict
     images_sent: Boolean
@@ -153,8 +153,9 @@ value ToolResultRendering {
 -- which is what a taken sweep actually frees.
 --
 -- `freed_tokens` is the tokens this assembly's sweep actually frees: the
--- sum of token_estimate over results newly cleared by advancing the
--- watermark to new_watermark. Zero on a turn that does not advance.
+-- aggregate original cost minus aggregate marker cost over results newly
+-- cleared by advancing the watermark, floored at zero after summing.
+-- Zero on a turn that does not advance.
 --
 -- `cleared_count` is the number of results newly cleared by this
 -- assembly's advance — logged alongside freed_tokens so an operator sees
@@ -216,14 +217,17 @@ actor HistoryAssembler {
 -- Allium has no formal helper-function construct; these are documented
 -- here so the identifiers the rules and invariants reference are not bare.
 --
--- clearable_tokens_between(a, lo, hi): the sum of token_estimate over the
+-- clearable_tokens_between(a, lo, hi): max(0, sum(token_estimate) minus
+--     sum(marker_token_estimate)) over the
 --     renderings r of assembly a for which lo < r.round_sequence_id <= hi
 --     AND r.producing_tool_clearable = true. It counts only results in the
 --     half-open round range that are recoverable; it EXCLUDES results
 --     already cleared on a prior turn (round_sequence_id <= lo), results
 --     whose tool is not clearable, and floor-protected results
 --     (round_sequence_id > floor_sequence_id, since hi never exceeds the
---     floor). token_estimate is image-aware, so image blocks count.
+--     floor). token_estimate is image-aware, so image blocks count. Marker
+--     costs include immutable conversation, message, and sequence identities;
+--     small results enlarged by markers reduce the aggregate sweep gain.
 --
 -- count_clearable_between(a, lo, hi): the same range and predicate as
 --     clearable_tokens_between, but counting renderings rather than
@@ -329,8 +333,9 @@ rule ToolResultCleared {
     ensures: r.images_sent = false
 
     @guidance
-        -- Clearing replaces the rendered ToolResult body with the fixed
-        -- placeholder "[tool result cleared to save context]" and emits no
+        -- Clearing replaces the rendered ToolResult body with a stable
+        -- marker identifying removal and its immutable persisted source
+        -- (conversation, message, sequence), and emits no
         -- image blocks; the paired assistant ToolUse block is left intact
         -- (REQ-STR-004). The persisted db::ToolContent is read-only here —
         -- the cleared form exists only in the Vec<LlmMessage> for this one

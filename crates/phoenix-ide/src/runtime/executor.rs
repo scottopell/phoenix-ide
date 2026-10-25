@@ -544,6 +544,13 @@ fn required_clear_gain_tokens(reported_prompt_tokens: i64) -> usize {
 /// `tool_use` block is preserved, so this is never a silent gap (REQ-STR-004).
 const CLEARED_TOOL_RESULT_PLACEHOLDER: &str = "[tool result cleared to save context]";
 
+fn cleared_tool_result_marker(message: &crate::db::Message) -> String {
+    format!(
+        "{CLEARED_TOOL_RESULT_PLACEHOLDER} [persisted source: conversation={}, message={}, sequence={}]",
+        message.conversation_id, message.message_id, message.sequence_id
+    )
+}
+
 /// Approximate wire token cost of one image block. A flattened-and-replayed
 /// image still costs a fixed block of tokens; this drives both the budget
 /// estimator and the clearing sweep so image-heavy rounds register their true
@@ -1208,6 +1215,7 @@ struct ToolResultFacts {
     round: usize,
     clearable: bool,
     token_estimate: usize,
+    marker_token_estimate: usize,
 }
 
 /// Image-aware token estimate for a persisted tool result: its text body plus a
@@ -1261,6 +1269,7 @@ fn collect_tool_result_facts(
                     round: current_round,
                     clearable: clearable_tool_names.contains(name),
                     token_estimate: estimate_tool_result_tokens(&tc.content, tc.images.len()),
+                    marker_token_estimate: estimate_text_tokens(&cleared_tool_result_marker(m)),
                 });
                 max_round = current_round;
             }
@@ -1291,11 +1300,16 @@ fn plan_tool_result_clearing(
 
     // Worthwhile-gain gate: tokens freeable by clearing every eligible result
     // (clearable, not yet cleared, outside the floor).
-    let eligible_freed: usize = results
+    let (eligible_original, eligible_markers) = results
         .iter()
         .filter(|f| f.clearable && f.sequence_id > prior_watermark && f.round < floor_first_round)
-        .map(|f| f.token_estimate)
-        .sum();
+        .fold((0usize, 0usize), |(original, markers), f| {
+            (
+                original + f.token_estimate,
+                markers + f.marker_token_estimate,
+            )
+        });
+    let eligible_freed = eligible_original.saturating_sub(eligible_markers);
 
     let trigger = context_window * CLEAR_TRIGGER_NUM / CLEAR_TRIGGER_DEN;
     let trigger = i64::try_from(trigger).unwrap_or(i64::MAX);
@@ -1320,14 +1334,19 @@ fn plan_tool_result_clearing(
         .filter(|f| f.clearable && f.sequence_id <= new_watermark)
         .map(|f| f.sequence_id)
         .collect();
-    let (freed_tokens, cleared_count) = results
+    let (original_tokens, marker_tokens, cleared_count) = results
         .iter()
         .filter(|f| {
             f.clearable && f.sequence_id > prior_watermark && f.sequence_id <= new_watermark
         })
-        .fold((0usize, 0usize), |(tok, cnt), f| {
-            (tok + f.token_estimate, cnt + 1)
+        .fold((0usize, 0usize, 0usize), |(original, markers, cnt), f| {
+            (
+                original + f.token_estimate,
+                markers + f.marker_token_estimate,
+                cnt + 1,
+            )
         });
+    let freed_tokens = original_tokens.saturating_sub(marker_tokens);
 
     ClearPlan {
         new_watermark,
@@ -1637,7 +1656,7 @@ fn render_messages<'a>(
                 // REQ-STR-011).
                 let (text, image_sources): (String, Vec<ImageSource>) =
                     if cleared_sequence_ids.contains(&msg.sequence_id) {
-                        (CLEARED_TOOL_RESULT_PLACEHOLDER.to_string(), Vec::new())
+                        (cleared_tool_result_marker(msg), Vec::new())
                     } else {
                         let sources = images
                             .iter()
@@ -27753,7 +27772,7 @@ mod stale_tool_result_clearing_tests {
             ) -> Result<Option<ProviderInputCount>, LlmError> {
                 self.counts.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(request.max_tokens, 16_384);
-                assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, images, .. } if tool_use_id == "old-tool" && images.len() == 6)));
+                assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, images, .. } if tool_use_id == "old-tool" && images.len() == 7)));
                 Ok(self
                     .tokens
                     .map(|tokens| ProviderInputCount::OpenAiCompleteInput { tokens }))
@@ -27767,7 +27786,7 @@ mod stale_tool_result_clearing_tests {
             let cwd = tempfile::TempDir::new().unwrap();
             let conv = "ordinary-proactive-clearing";
             let storage = Arc::new(InMemoryStorage::new());
-            let old = add_round(&storage, conv, "old", "read_file", 6).await;
+            let old = add_round(&storage, conv, "old", "read_file", 7).await;
             for tag in ["r1", "r2", "r3"] {
                 add_round(&storage, conv, tag, "read_file", 1).await;
             }
@@ -27883,7 +27902,7 @@ mod stale_tool_result_clearing_tests {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(images, if swept { 0 } else { 6 });
+            assert_eq!(images, if swept { 0 } else { 7 });
         }
     }
 
@@ -27917,6 +27936,12 @@ mod stale_tool_result_clearing_tests {
             );
         }
         assert!(plan.freed_tokens >= CLEAR_AT_LEAST_TOKENS);
+        let source = db.iter().find(|m| m.sequence_id == old).unwrap();
+        assert_eq!(
+            plan.freed_tokens,
+            estimate_tool_result_tokens("result body", 6)
+                .saturating_sub(estimate_text_tokens(&cleared_tool_result_marker(source)))
+        );
         assert_eq!(plan.cleared_count, 1);
     }
 
@@ -28151,7 +28176,7 @@ mod stale_tool_result_clearing_tests {
                 matches!(b,
                     ContentBlock::ToolResult { tool_use_id: id, content, images, .. }
                     if id == tool_use_id
-                        && content == CLEARED_TOOL_RESULT_PLACEHOLDER
+                        && content.starts_with(CLEARED_TOOL_RESULT_PLACEHOLDER)
                         && images.is_empty())
             })
         })
@@ -28318,6 +28343,25 @@ mod stale_tool_result_clearing_tests {
         let conv = "conv-render";
         let cleared_seq = add_round(&storage, conv, "old", "read_file", 2).await;
         add_round(&storage, conv, "new", "read_file", 2).await;
+        let interpretation = "Historical read suggested A; inference uncertain; choose B.";
+        add(
+            &storage,
+            conv,
+            MessageContent::Agent(vec![ContentBlock::text(interpretation)]),
+        )
+        .await;
+        storage
+            .add_message_with_seq_and_origin(
+                "correction",
+                conv,
+                6,
+                &MessageContent::user("Correction: keep B; C remains unresolved."),
+                None,
+                None,
+                &phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            )
+            .await
+            .unwrap();
 
         let db = storage.get_messages(conv).await.unwrap();
         let cleared: HashSet<i64> = std::iter::once(cleared_seq).collect();
@@ -28345,12 +28389,69 @@ mod stale_tool_result_clearing_tests {
         };
 
         let (cleared_body, cleared_imgs) = find("old-tool");
-        assert_eq!(cleared_body, CLEARED_TOOL_RESULT_PLACEHOLDER);
+        let source = db.iter().find(|m| m.sequence_id == cleared_seq).unwrap();
+        assert_eq!(cleared_body, cleared_tool_result_marker(source));
+        assert!(cleared_body.contains(&format!("conversation={conv}")));
+        assert!(cleared_body.contains(&format!("message={}", source.message_id)));
+        assert!(cleared_body.contains(&format!("sequence={cleared_seq}")));
         assert_eq!(cleared_imgs, 0, "cleared result emits no images");
+        assert!(msgs.iter().flat_map(|m| &m.content).any(|b| matches!(b,
+            ContentBlock::ToolUse { id, name, .. } if id == "old-tool" && name == "read_file"
+        )));
 
         let (kept_body, kept_imgs) = find("new-tool");
         assert_eq!(kept_body, "result body");
         assert_eq!(kept_imgs, 2, "kept result preserves its images");
+        assert!(msgs.iter().any(|m| m.role == MessageRole::Assistant
+            && m.content == vec![ContentBlock::text(interpretation)]));
+        assert!(msgs.iter().any(|m| m.content
+            == vec![ContentBlock::text(
+                "Correction: keep B; C remains unresolved."
+            )]));
+        let repeated = render_messages(&db, &cleared);
+        assert_eq!(repeated.len(), msgs.len());
+        for (again, original) in repeated.iter().zip(&msgs) {
+            assert_eq!(again.source_message_id, original.source_message_id);
+            assert_eq!(again.role, original.role);
+            assert_eq!(again.content, original.content);
+        }
+        assert_eq!(
+            serde_json::to_value(storage.get_messages(conv).await.unwrap()).unwrap(),
+            serde_json::to_value(&db).unwrap(),
+            "the exact stored transcript remains the evidence authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_charges_all_markers_before_saturating_net_gain() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "marker-net-gain";
+        add_round(&storage, conv, "large", "read_file", 6).await;
+        for i in 0..100 {
+            add_round(&storage, conv, &format!("tiny-{i}"), "read_file", 0).await;
+        }
+        for i in 0..KEEP_RECENT_ROUNDS {
+            add_round(&storage, conv, &format!("recent-{i}"), "read_file", 1).await;
+        }
+        let db = storage.get_messages(conv).await.unwrap();
+        let names = clearable(&["read_file"]);
+        let (facts, max_round) = collect_tool_result_facts(&db, &names);
+        let candidates: Vec<_> = facts
+            .iter()
+            .filter(|f| f.round < (max_round + 1 - KEEP_RECENT_ROUNDS))
+            .collect();
+        let original: usize = candidates.iter().map(|f| f.token_estimate).sum();
+        let markers: usize = candidates.iter().map(|f| f.marker_token_estimate).sum();
+        let incorrect_per_item: usize = candidates
+            .iter()
+            .map(|f| f.token_estimate.saturating_sub(f.marker_token_estimate))
+            .sum();
+        assert!(incorrect_per_item >= CLEAR_AT_LEAST_TOKENS);
+        assert!(original.saturating_sub(markers) < CLEAR_AT_LEAST_TOKENS);
+        let plan = plan_tool_result_clearing(&db, &names, 0, Some(12_000), 1_000);
+        assert_eq!(plan.new_watermark, 0);
+        assert_eq!(plan.freed_tokens, 0);
+        assert!(plan.cleared_sequence_ids.is_empty());
     }
 }
 

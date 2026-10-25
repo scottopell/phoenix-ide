@@ -82,3 +82,15 @@ The REQ-BED-030/ADR-026 correction preserves the selected parent's exact persist
 REQ-BED-020a is implemented in source: local planned pressure and provider context rejection enter the durable real-summary operation; deterministic capacity conflicts preserve the operation and original transcript. Authenticated regeneration supports exhausted ordinary and Coordinator rows without a successor, independently of prior summary wording. Focused backend qualification is in progress; full validation and production recovery remain unperformed. Task 44018 tracks delivery.
 
 REQ-BED-020b has backend implementation in source; UI delivery and full qualification remain pending. Shared ordinary overhead reserves the full selected-model output allowance plus max(8,192, ceil(remaining input / 4)) working tokens, refreshing successor guidance again at admission. The supported review API generates at most one explicitly requested candidate, persists immutable ordered candidate children with known source references/revisions, and preserves generated authority at explicit acceptance. Manual revised input and atomically committed model replanning recover deterministic conflicts. New nonempty shortening inputs are retained before planning or generation as immutable source-only review records; generated candidates refer to those records, and source-only records cannot enter generated acceptance. Migration 130 adds normalized review inputs and candidates; protected deployment qualification is pending. No production recovery or deployment acceptance is implied.
+
+Bounded retention/compaction qualification reuses
+`preflight_pressure_below_completed_threshold_enters_real_compaction`,
+`continuation_preserves_accepted_handoff_for_both_variants`,
+`existing_generated_handoff_reprojects_readable_text_by_durable_authority`, and
+`handoff_review_refreshes_successor_guidance_without_refreshing_predecessor_turn`.
+They check real summary dispatch, selected protected input and preservation
+instructions, readable generated context under durable provenance, and fresh
+successor guidance. Ordinary work and Coordinator retain their shared lifecycle
+and existing respective prompts. Assertions about input continuity do not prove
+that a generated summary understood or retained every fact; no lossless semantic
+preservation or live cache performance claim follows from these fixtures.

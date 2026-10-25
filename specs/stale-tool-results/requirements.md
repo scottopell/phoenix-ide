@@ -103,6 +103,10 @@ tokens freed exceed both an absolute minimum threshold and a minimum fraction of
 the prompt whose cached prefix is disturbed; otherwise THE SYSTEM SHALL remove
 nothing on that turn.
 
+The tokens freed SHALL be the aggregate original result cost minus the aggregate
+replacement marker cost, floored at zero after summing both costs. A replacement
+that enlarges a small result SHALL count against the sweep's total gain.
+
 ### REQ-STR-007 — Keep Reuse Savings Stable Across Turns
 
 **Rationale:** Reuse of previously-processed context is what makes a long
