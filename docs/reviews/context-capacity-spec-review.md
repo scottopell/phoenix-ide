@@ -45,3 +45,7 @@ Plan and spec draft are saved for review. Findings 2 and 4 are implementation bl
 ## Validation
 
 `./dev.py check --lanes spec-shape`, `./dev.py tasks validate`, and `git diff --check` pass. The modified Bedrock Allium file reports zero errors. Anthropic Allium reports two existing parser errors at the unchanged qualified contract references `fulfils llm/ToolHistoryIntegrity` and `demands llm/ProviderRequestProjection`; the base commit contains the identical constructs. No claim is made that the complete Allium corpus passes. Runtime tests were not run because this change is documentation only.
+
+## User resolution: findings 2 and 4 recovery direction
+
+2026-10-25 voice review approved same-model ordinary continuation and full output reservation, with successor working room beyond bare fit. Exceptional capacity conflict offers original-preserving manual editing, one user-requested AI shortening candidate reviewed before replacement, or explicit model change. No automatic rewrite loop; candidate and rewrite request must fit; no silent source clipping. REQ-BED-020b records this decision. The exact working-room target and revision/generation-fencing transitions remain implementation specification gates; 40% is not a normative threshold.

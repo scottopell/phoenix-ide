@@ -1561,3 +1561,28 @@ AND SHALL NOT claim lossless semantic preservation of omitted history or generat
 AND SHALL NOT create a separately maintained decisions or obligations memory authority.
 
 A successful terminal response SHALL remain accepted under REQ-BED-019 even if a hypothetical subsequent request would need compaction. Successor admission, cancellation, automatic-continuation consent, restart ownership, and Close fencing remain governed by their existing contracts.
+
+### REQ-BED-020b: Useful Successor Capacity and Explicit Handoff Revision
+
+WHEN generating an ordinary continuation
+THE SYSTEM SHALL inherit the predecessor's selected model and route
+AND SHALL reserve that model's full declared output allowance
+AND SHALL budget the generated handoff against the successor's complete ordinary request, including instructions and tools
+AND SHALL require room for additional work rather than declare a successor ready merely because its opening request fits.
+
+WHEN protected input prevents the required successor working room
+THE SYSTEM SHALL stop automatic progress without retrying an unchanged impossible plan or silently weakening protected context
+AND SHALL show the capacity breakdown, whether counts are measured or estimated, and a concrete reduction target
+AND SHALL offer manual handoff editing, explicitly authorized AI shortening, and an explicit model change when those actions are supported and can address the conflict
+AND SHALL distinguish an oversized handoff from irreducible required instructions that handoff editing cannot fix.
+
+WHEN the user requests AI shortening
+THE SYSTEM SHALL preserve the original handoff and produce at most one candidate per explicit request
+AND SHALL instruct the rewriting model to prioritize user intent, corrections, unresolved work, known uncertainty, and evidence references against the displayed size target
+AND SHALL validate the candidate's size and successor working room independently of the model's claims
+AND SHALL require user review and explicit acceptance before replacing the active handoff
+AND SHALL retain the original when generation fails, the candidate remains oversized, or the user declines it.
+
+WHEN the shortening request itself cannot fit
+THE SYSTEM SHALL offer an explicit model change or manual editing rather than silently clip its protected source
+AND SHALL NOT recursively shorten or automatically repeat the rewriting request.
