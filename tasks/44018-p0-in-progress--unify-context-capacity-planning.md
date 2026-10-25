@@ -26,7 +26,15 @@ User approved 2026-10-25 during voice review: ordinary continuation inherits the
 
 2026-10-25 voice review: the user does not select a numeric counting timeout. Check real supported provider routes during implementation and choose a reasonable finite deadline. REQ-LLM-004k retains one remote attempt across the logical planning operation, no retry, and visible local fallback; the numeric two-second proposal in earlier planning/review text is superseded. No new operator setting is implied.
 
-## Implementation progress and remaining gates
+## Current delivery gates
+
+Implementation, recovery/usage UI, real model-switch qualification and exact native launchd129-to131 qualification are complete in source. ADR-147 resolves manual-opening authority wording. The isolated terminal handoff test passes after narrowly scoped orphan cleanup; PTY headroom remains tracked separately in task44019.
+
+Two independent implementation review rounds are complete: round one's two findings were repaired in 3ab36bdc0 and regression-tested; round two reported no actionable findings on that full implementation. See docs/reviews/context-capacity-implementation-review.md for immutable targets and limitations. PR #977 tracks review and hosted checks.
+
+The full UI suite passes 4,100 tests across 186 files (two skipped); production UI build, TypeScript and lint pass. Historical fixture failures from adding migrations130/131 are corrected using immutable historical registry evidence; 185 systemd helper tests pass after the last fixture repair. The final complete ./dev.py check --all and hosted CI remain acceptance gates. Source review is not production acceptance: merge, native activation and supported repair of the two affected conversations remain pending. No production modifications have been made.
+
+## Implementation history (chronological)
 
 - Capacity/real compaction: 90f8f1262.
 - Readable English handoffs, including existing live generated openings, and useful successor room: 4d1b54395. User accepts the necessary cache miss; do not grandfather base64 model-visible projections. Stored original history is retained.
