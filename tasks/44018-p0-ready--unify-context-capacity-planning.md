@@ -21,3 +21,7 @@ See docs/reviews/context-capacity-spec-review.md for the independent specs-only 
 ## User decision: same-model continuation and exceptional shortening
 
 User approved 2026-10-25 during voice review: ordinary continuation inherits the model/route and full output reservation; handoffs must leave useful successor working room after complete ordinary overhead. Pathological protected-input pressure stops with explanatory counts and offers manual editing, one explicitly requested AI shortening candidate, or an explicit model change. Original is preserved; replacement requires review/acceptance; validate actual size; no automatic rewrite loop or clipping. Rewrite request must itself fit. REQ-BED-020b records behavior. The numeric working-room target remains to be specified before implementation; 40% reduction was illustrative, not selected. This settles the recovery product direction for finding 2 in the voice walkthrough (review report findings 2 and 4); transition and sizing details still need specification.
+
+## User decision: counting deadline is implementation-guided
+
+2026-10-25 voice review: the user does not select a numeric counting timeout. Check real supported provider routes during implementation and choose a reasonable finite deadline. REQ-LLM-004k retains one remote attempt across the logical planning operation, no retry, and visible local fallback; the numeric two-second proposal in earlier planning/review text is superseded. No new operator setting is implied.

@@ -53,3 +53,7 @@ Plan and spec draft are saved for review. Findings 2 and 4 are implementation bl
 ## Model-switch finding correction after implementation verification
 
 User challenged the mid-tool scenario. Read-only verification of the deployed baseline found `ConvState::allows_model_change` admits only Idle, Error and RecoverableContinuationFailure, and the API checks effective state. REQ-CONV-010h already prohibits queuing locked configuration changes; REQ-LLM-004c did not enumerate the states. The draft's next-request wording created the ambiguity. Added the exact admission whitelist to REQ-LLM-004c and cross-referenced it from 004l. No deferred-switch feature is required or authorized. Original finding 1 is a spec omission/draft regression, not an established runtime defect.
+
+## User resolution: finding 5 deadline
+
+2026-10-25 voice review delegates the numeric counting timeout to implementation informed by real provider routes. The normative contract requires a finite absolute timeout, at most one remote attempt per logical planning operation, no retry and visible local fallback; two seconds is no longer a requirement.

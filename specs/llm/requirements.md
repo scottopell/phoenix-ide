@@ -795,7 +795,7 @@ AND SHALL bind a count to the exact prepared request and selected route
 AND SHALL NOT treat model aliases, a shared API protocol, or public text tokenization alone as proof of complete request accounting.
 
 WHEN local planning would otherwise clear, compact, or reject input and the configured route explicitly supports input counting
-THE SYSTEM SHALL attempt at most one remote count across all candidates in one logical request-planning operation, including its clearing and handoff planning, with a two-second absolute timeout and no counting retry
+THE SYSTEM SHALL attempt at most one remote count across all candidates in one logical request-planning operation, including its clearing and handoff planning, with a finite absolute timeout and no counting retry
 AND SHALL use a supported count as planning evidence with any provider-documented uncertainty
 AND SHALL fall back to local planning on unavailable, failed, or timed-out counting without changing model, route, or credentials.
 

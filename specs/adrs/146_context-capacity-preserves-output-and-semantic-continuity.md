@@ -35,3 +35,7 @@ Preserve one transcript and existing handoff lifecycle. Keep ordinary project gu
 - [Bedrock requirements](../bedrock/requirements.md)
 - [Stale-result requirements](../stale-tool-results/requirements.md)
 - [Analytics requirements](../analytics/requirements.md)
+
+### Counting deadline clarification
+
+During same-day user review, the numeric two-second proposal was delegated to implementation based on real provider-route validation. The decision is a finite absolute timeout, one attempt across the logical planning operation and visible local fallback, with no new operator setting required.
