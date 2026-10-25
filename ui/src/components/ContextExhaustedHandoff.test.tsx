@@ -268,3 +268,16 @@ describe('recovery authority and submission ownership', () => {
     expect(localStorage.getItem('handoff-edit-draft:parent-1')).toContain('Original saved edit');
   });
 });
+
+
+describe('local review accounting', () => {
+  beforeEach(() => { localStorage.clear(); vi.restoreAllMocks(); vi.spyOn(api, 'handoffCandidates').mockResolvedValue([]); });
+  it('shows local input numerically without counting output or successor working room as input', async () => {
+    vi.spyOn(api, 'reviewHandoff').mockResolvedValue({ source: capacity(), shortening: { kind: 'not_requested' } });
+    renderHandoff();
+    fireEvent.click(screen.getByRole('button', { name: 'Check fit' }));
+    expect(await screen.findByText('Complete input (local estimate)')).toBeInTheDocument();
+    expect(screen.getByText('3,400 · instructions/tools + handoff')).toBeInTheDocument();
+    expect(screen.getByText('Provider complete input').nextElementSibling).toHaveTextContent('Not available');
+  });
+});

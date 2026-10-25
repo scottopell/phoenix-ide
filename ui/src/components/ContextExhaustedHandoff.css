@@ -247,8 +247,13 @@
 
 .handoff-capacity dl {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 4px 16px;
+}
+
+.handoff-capacity dt,
+.handoff-capacity dd {
+  overflow-wrap: anywhere;
 }
 
 .handoff-capacity dd {
@@ -263,5 +268,7 @@
 }
 
 .context-exhausted-handoff select {
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
 }

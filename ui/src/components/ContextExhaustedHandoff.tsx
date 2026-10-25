@@ -122,7 +122,8 @@ function CapacityBreakdown({ capacity }: { capacity: HandoffCapacityReview }) {
       <dt>Successor working room</dt><dd>{capacity.successor_working_room_tokens.toLocaleString()}</dd>
       <dt>Handoff (estimate)</dt><dd>{capacity.handoff_tokens.toLocaleString()}</dd>
       {capacity.status.kind !== 'required_overhead' && <><dt>Handoff target (estimate)</dt><dd>{capacity.status.target_tokens.toLocaleString()}</dd></>}
-      <dt>Complete input</dt><dd>{capacity.provider_input_tokens === null ? 'Local estimate' : capacity.provider_input_tokens.toLocaleString()} · {capacity.counting_method.replaceAll('_', ' ')}</dd>
+      <dt>Complete input (local estimate)</dt><dd>{(capacity.required_overhead_tokens + capacity.handoff_tokens).toLocaleString()} · instructions/tools + handoff</dd>
+      <dt>Provider complete input</dt><dd>{capacity.provider_input_tokens === null ? 'Not available' : capacity.provider_input_tokens.toLocaleString()} · {capacity.counting_method.replaceAll('_', ' ')}</dd>
     </dl>
     <p>Component sizes are local estimates, including when complete input is provider counted. Cached input still uses context.</p>
   </div>;
