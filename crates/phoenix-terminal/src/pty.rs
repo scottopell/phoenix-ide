@@ -167,7 +167,7 @@ mod tests {
         let mut status = 0;
         loop {
             // SAFETY: child is our exact child; this call reaps it before returning.
-            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            let waited = unsafe { libc::waitpid(child, &raw mut status, 0) };
             if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
