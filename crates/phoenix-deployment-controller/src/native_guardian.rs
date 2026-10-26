@@ -3226,6 +3226,7 @@ mod native_sampling_snapshot_tests {
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 assert_eq!(read_frame::<Request>(&mut peer).unwrap(), Request::Snapshot);
+                // test-timing-allow: response latency beyond the former 250 ms budget is the regression under test, not readiness synchronization.
                 std::thread::sleep(Duration::from_millis(350));
                 write_frame(&mut peer, &Response::Snapshot(snapshot)).unwrap();
             });

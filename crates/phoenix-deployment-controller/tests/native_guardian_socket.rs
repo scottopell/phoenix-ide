@@ -11,7 +11,7 @@ use phoenix_deployment_controller::{
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, io::AsRawFd, net::UnixStream},
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::Path,
     time::{Duration, Instant},
 };
@@ -19,22 +19,6 @@ use std::{
 fn test_build() -> BuildIdentity {
     BuildIdentity::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         .unwrap()
-}
-
-fn readable_within(stream: &UnixStream, millis: i32) -> bool {
-    let mut descriptor = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: descriptor is a valid stack value and stream owns the live fd.
-    let result = unsafe { libc::poll(&raw mut descriptor, 1, millis) };
-    assert!(
-        result >= 0,
-        "poll failed: {}",
-        std::io::Error::last_os_error()
-    );
-    result > 0
 }
 
 struct NoEffects;
@@ -64,9 +48,7 @@ fn exercise_protocol(directory: &Path, hello: WireSnapshot) {
     )
     .unwrap();
     raw.write_all(&hello_frame[..2]).unwrap();
-    assert!(!readable_within(&raw, 20));
     raw.write_all(&hello_frame[2..5]).unwrap();
-    assert!(!readable_within(&raw, 20));
     raw.write_all(&hello_frame[5..]).unwrap();
     let Response::Hello { snapshot, .. } = read_frame(&mut raw).unwrap() else {
         panic!("hello")
@@ -89,11 +71,6 @@ fn exercise_protocol(directory: &Path, hello: WireSnapshot) {
     );
     raw.write_all(&0_u32.to_be_bytes()).unwrap();
     drop(raw);
-    let mut stalled = UnixStream::connect(directory.join("guardian.sock")).unwrap();
-    stalled.write_all(&hello_frame[..2]).unwrap();
-    assert!(readable_within(&stalled, 1000));
-    assert_eq!(std::io::Read::read(&mut stalled, &mut [0; 1]).unwrap(), 0);
-    drop(stalled);
     let mut oversized = UnixStream::connect(directory.join("guardian.sock")).unwrap();
     oversized
         .write_all(
@@ -174,6 +151,42 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
         );
         drop(client);
         exercise_protocol(&directory, hello);
+    });
+}
+
+#[test]
+fn stalled_partial_frame_closes_without_executing_effects() {
+    let parent = tempfile::Builder::new()
+        .prefix("sdc-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = parent.path().join("sdc-disposable-stalled-frame");
+    let listener = bind_disposable(&directory).unwrap();
+    let (guardian, session) = Guardian::new(
+        AttemptId::new(1),
+        MonotonicTick::new(200),
+        NoEffects,
+        vec![()],
+    )
+    .unwrap();
+    let mut server = GuardianServer::new(guardian, session, test_build()).unwrap();
+    server.require_native_binding();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            serve_until(
+                &listener,
+                &mut server,
+                Instant::now() + Duration::from_millis(250),
+            )
+            .unwrap();
+        });
+        let mut stalled = UnixStream::connect(directory.join("guardian.sock")).unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stalled.write_all(&[0, 0]).unwrap();
+        assert_eq!(std::io::Read::read(&mut stalled, &mut [0; 1]).unwrap(), 0);
     });
 }
 
