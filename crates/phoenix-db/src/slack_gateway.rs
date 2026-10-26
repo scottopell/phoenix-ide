@@ -603,8 +603,6 @@ pub(crate) async fn record_slack_question_tx(
     };
     sqlx::query("UPDATE slack_gateway_questions SET retired_reason='Native question is no longer current' WHERE transcript_id=?1 AND answered_by IS NULL AND retired_reason IS NULL AND (?2 IS NULL OR question_id!=?2)")
         .bind(transcript).bind(&current).execute(&mut **tx).await?;
-    sqlx::query("UPDATE slack_gateway_native_outcomes SET processed=1 WHERE transcript_id=?1 AND kind='question' AND processed=0 AND (?2 IS NULL OR question_id!=?2)")
-        .bind(transcript).bind(&current).execute(&mut **tx).await?;
     sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure='Clarification is no longer current; no message was sent' WHERE response_kind='clarification' AND state IN ('pending','known_unsent') AND return_id IN (SELECT return_id FROM slack_gateway_questions WHERE transcript_id=?1 AND retired_reason IS NOT NULL)")
         .bind(transcript).execute(&mut **tx).await?;
     let super::ConvState::AwaitingUserResponse {
@@ -672,7 +670,19 @@ impl Database {
             let private = event.try_get::<String, _>("request_kind")? == "briefing";
             let already:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns r USING(return_id) WHERE c.request_id=?1)").bind(&request).fetch_one(&mut *tx).await?;
             if !already {
-                let text = if private {
+                let current_question = if kind == "question" {
+                    slack_question_is_current_tx(
+                        &mut tx,
+                        &event.try_get::<String, _>("transcript_id")?,
+                        &event.try_get::<String, _>("question_id")?,
+                    )
+                    .await?
+                } else {
+                    false
+                };
+                let text = if kind == "question" && !current_question {
+                    "Phoenix: this clarification is no longer current. Open Phoenix for details; further discussion there stays private.".into()
+                } else if private {
                     match kind.as_str() {
                         "Completed" => "Phoenix: your briefing is ready",
                         "question" => "Phoenix: your briefing needs your input",
@@ -696,11 +706,11 @@ impl Database {
                     slack_thread_response_tx(&mut tx, &binding, &id, &text, phoenix_origin).await?
                 };
                 sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING")
-                    .bind(&id).bind(&binding).bind(&occurrence).bind(destination).bind(&text).bind(if kind=="question" {"clarification"}else if private {"notice"}else{"failure"}).bind(chrono::Utc::now().timestamp_micros()).execute(&mut *tx).await?;
+                    .bind(&id).bind(&binding).bind(&occurrence).bind(destination).bind(&text).bind(if current_question {"clarification"}else if private {"notice"}else{"failure"}).bind(chrono::Utc::now().timestamp_micros()).execute(&mut *tx).await?;
                 let id: String = sqlx::query_scalar("SELECT return_id FROM slack_gateway_returns WHERE binding_id=?1 AND occurrence_key=?2 AND destination=?3")
                     .bind(&binding).bind(&occurrence).bind(destination).fetch_one(&mut *tx).await?;
                 sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES (?1,?2) ON CONFLICT DO NOTHING").bind(&id).bind(&request).execute(&mut *tx).await?;
-                if kind == "question" {
+                if current_question {
                     sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING").bind(&id).bind(event.try_get::<String,_>("question_id")?).bind(event.try_get::<String,_>("transcript_id")?).execute(&mut *tx).await?;
                 }
             }
@@ -756,6 +766,25 @@ impl Database {
     }
 }
 
+async fn slack_question_is_current_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transcript: &str,
+    question: &str,
+) -> DbResult<bool> {
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM conversations WHERE id=?1")
+        .bind(transcript)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    let state: super::ConvState =
+        serde_json::from_str(&state).map_err(|e| DbError::Serialization(e.to_string()))?;
+    Ok(
+        matches!(state, super::ConvState::AwaitingUserResponse { request_authority, .. } if request_authority.request_id().is_some_and(|id| id.to_string()==question)),
+    )
+}
+
 async fn slack_thread_response_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     binding: &str,
@@ -764,7 +793,7 @@ async fn slack_thread_response_tx(
     phoenix_origin: &str,
 ) -> DbResult<String> {
     let product: Option<String> =
-        sqlx::query_scalar("SELECT product_id FROM slack_gateway_bindings WHERE binding_id=?1")
+        sqlx::query_scalar("SELECT p.id FROM slack_gateway_bindings b LEFT JOIN product_conversations p ON p.id=b.product_id WHERE b.binding_id=?1")
             .bind(binding)
             .fetch_one(&mut **tx)
             .await?;
@@ -1683,8 +1712,19 @@ mod tests {
             .await
             .unwrap();
         db.slack_eyes_confirmed(&request.request_id).await.unwrap();
-        sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body) VALUES (?1,'question','question',?2,'question','[{\"header\":\"Repo\",\"question\":\"Which repository?\",\"options\":[],\"multi_select\":false}]')")
-            .bind(&request.request_id).bind(&conv.id).execute(db.pool()).await.unwrap();
+        let authority = phoenix_core::domain::sm_state::QuestionRequestAuthority::new();
+        db.update_conversation_state(
+            &conv.id,
+            &phoenix_core::domain::sm_state::ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "question-tool".into(),
+                request_authority: authority.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body) VALUES (?1,'question','question',?2,?3,'[{\"header\":\"Repo\",\"question\":\"Which repository?\",\"options\":[],\"multi_select\":false}]')")
+            .bind(&request.request_id).bind(&conv.id).bind(authority.request_id().unwrap().to_string()).execute(db.pool()).await.unwrap();
         db.process_slack_native_outcomes("https://phoenix.example/")
             .await
             .unwrap();
@@ -1784,34 +1824,120 @@ mod tests {
         .expect("confirmed handoff must not strand account switching");
     }
 
+    // REQ-SG-012/013: a private answer before materialization cannot erase the duty.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn question_settled_before_materialization_owes_only_a_generic_linked_handoff() {
+        use phoenix_core::domain::sm_state::{ConvState, QuestionRequestAuthority};
+        for replaced in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conv = db
+                .create_conversation("early", "early", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let source = source("100.000", SlackRequestKind::Explicit);
+            db.accept_slack_source(&source, false).await.unwrap();
+            let request = db
+                .slack_requests(&source.workspace, &source.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            db.slack_bind_product(&request.binding_id, conv.product_conversation_id.as_str())
+                .await
+                .unwrap();
+            db.slack_mark_admitted(&request.request_id, &conv.id)
+                .await
+                .unwrap();
+            let original = QuestionRequestAuthority::new();
+            db.update_conversation_state(
+                &conv.id,
+                &ConvState::AwaitingUserResponse {
+                    questions: vec![],
+                    tool_use_id: "original".into(),
+                    request_authority: original.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body) VALUES (?1,'original','question',?2,?3,'[{\"header\":\"Old\",\"question\":\"Stale confidential question\",\"options\":[],\"multi_select\":false}]')")
+                .bind(&request.request_id).bind(&conv.id).bind(original.request_id().unwrap().to_string()).execute(db.pool()).await.unwrap();
+            let state = if replaced {
+                ConvState::AwaitingUserResponse {
+                    questions: vec![],
+                    tool_use_id: "private-question".into(),
+                    request_authority: QuestionRequestAuthority::new(),
+                }
+            } else {
+                ConvState::Idle
+            };
+            db.update_conversation_state(&conv.id, &state)
+                .await
+                .unwrap();
+            db.process_slack_native_outcomes("https://phoenix.example")
+                .await
+                .unwrap();
+            let outputs = db
+                .slack_returns(&source.workspace, &source.owner)
+                .await
+                .unwrap();
+            assert_eq!(outputs.len(), 1);
+            assert!(outputs[0].text.contains("no longer current"));
+            assert!(!outputs[0].text.contains("Stale confidential question"));
+            assert!(outputs[0]
+                .text
+                .ends_with(&format!("/c/{}", conv.product_conversation_id)));
+            assert_eq!(outputs[0].request_ids, vec![request.request_id]);
+            db.update_conversation_state(&conv.id, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.process_slack_native_outcomes("https://changed.example")
+                .await
+                .unwrap();
+            let repeated = db
+                .slack_returns(&source.workspace, &source.owner)
+                .await
+                .unwrap();
+            assert_eq!(repeated.len(), 1);
+            assert_eq!(repeated[0].state, SlackReturnState::Pending);
+            assert_eq!(repeated[0].text, outputs[0].text);
+        }
+    }
+
     // REQ-SG-012: a rejected creation has no conversation to link yet.
     #[tokio::test]
     async fn admission_failure_links_to_its_exact_return_status() {
-        let db = Database::open_in_memory().await.unwrap();
-        let source = source("100.000", SlackRequestKind::Explicit);
-        db.accept_slack_source(&source, false).await.unwrap();
-        let request = db
-            .slack_requests(&source.workspace, &source.owner)
+        for unavailable_product in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let source = source("100.000", SlackRequestKind::Explicit);
+            db.accept_slack_source(&source, false).await.unwrap();
+            let request = db
+                .slack_requests(&source.workspace, &source.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            if unavailable_product {
+                db.slack_bind_product(&request.binding_id, "deleted-product")
+                    .await
+                    .unwrap();
+            }
+            db.fail_slack_before_admission(
+                &request.request_id,
+                "creation unavailable",
+                "https://phoenix.example/",
+            )
             .await
-            .unwrap()
-            .remove(0);
-        db.fail_slack_before_admission(
-            &request.request_id,
-            "creation unavailable",
-            "https://phoenix.example/",
-        )
-        .await
-        .unwrap();
-        let output = db
-            .slack_returns(&source.workspace, &source.owner)
-            .await
-            .unwrap()
-            .remove(0);
-        assert!(output.text.ends_with(&format!(
-            "https://phoenix.example/settings/slack#slack-return-{}",
-            output.return_id
-        )));
-        assert_eq!(output.request_ids, vec![request.request_id]);
+            .unwrap();
+            let output = db
+                .slack_returns(&source.workspace, &source.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            assert!(output.text.ends_with(&format!(
+                "https://phoenix.example/settings/slack#slack-return-{}",
+                output.return_id
+            )));
+            assert_eq!(output.request_ids, vec![request.request_id]);
+        }
     }
 
     #[tokio::test]

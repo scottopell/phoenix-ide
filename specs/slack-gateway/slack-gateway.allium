@@ -147,6 +147,8 @@ entity ReturnObligation {
         -- duty when confirmed. Slack triggers never answer native questions;
         -- native discussion does not inherit the original publication authority.
         -- Gateway-generated text and links are frozen when the return is created.
+        -- A question settled before handoff still owes a generic linked explanation,
+        -- without publishing the stale question or private answer.
 
     invariant NonemptyCoverage {
         request in covered_requests

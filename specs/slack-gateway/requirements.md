@@ -130,6 +130,8 @@ WHEN clarification is required, THE SYSTEM SHALL post it in that thread, durably
 
 THE SYSTEM SHALL include a Phoenix deep link in gateway-generated clarifications and explanations: the stable conversation route when one exists, otherwise the specific return's status route. The gateway SHALL durably freeze that complete outgoing text, including the link, when creating its return obligation and reuse it for a known-unsent retry. The assignment SHALL encourage the agent to link its Phoenix conversation when useful in an intentional answer.
 
+WHEN a native question has been answered, replaced or become unavailable before its response is materialized, THE SYSTEM SHALL retain the request's response duty and create a generic linked handoff explanation rather than publish the stale question or private follow-up content.
+
 **Rationale:** An explicit Slack invocation should not disappear into an agent that silently decides to say nothing.
 
 ### REQ-SG-013 — Publish only request-bound output

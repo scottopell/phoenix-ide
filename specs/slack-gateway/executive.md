@@ -173,5 +173,12 @@ Allium and structural/timing checks pass. The preceding public head
 passed every required hosted check; the revised head still needs automatic
 review and CI. The approved local pilot remains on its separately pinned build.
 
+The handoff also retains an explanation when the native question settles before
+outbox materialization. Its generic text excludes stale questions and private
+answers; unavailable conversation links fall back to the exact return status.
+The expanded 255-case MCP/gateway run and final 18-case database run pass,
+including resolution/replacement-before-materialization and missing-product
+link coverage. Clippy, formatting, Allium and structural/timing checks pass.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.
