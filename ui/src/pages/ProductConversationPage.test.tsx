@@ -607,7 +607,7 @@ describe('ProductConversationPage', () => {
     for (const [direction, expectedRoute] of [
       ['history back', '/c/pc-1'],
       ['history forward', '/c/pc-1?source_transcript=row-1'],
-    ]) {
+    ] as const) {
       fireEvent.click(screen.getByRole('button', { name: direction }));
       await waitFor(() => expect(screen.getByTestId('history-location').textContent).toBe(expectedRoute));
       expect(screen.getByTestId('product-conversation-page')).toBe(owner);
