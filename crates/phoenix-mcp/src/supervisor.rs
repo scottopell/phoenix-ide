@@ -83,6 +83,20 @@ pub(crate) struct CallOutcome {
     pub(crate) recovery: CallRecovery,
 }
 
+pub(crate) struct CallFailure {
+    pub(crate) error: McpOneShotError,
+    pub(crate) completion: Option<oneshot::Receiver<Result<CallOutcome, McpOneShotError>>>,
+}
+
+impl From<McpOneShotError> for CallFailure {
+    fn from(error: McpOneShotError) -> Self {
+        Self {
+            error,
+            completion: None,
+        }
+    }
+}
+
 pub(crate) struct DefinitionsOutcome {
     pub(crate) epoch: u64,
     pub(crate) result: Result<Vec<McpToolDef>, McpRequestError>,
@@ -222,7 +236,28 @@ impl SupervisorHandle {
         cancel: CancellationToken,
         expected_schema: Option<Value>,
     ) -> Result<CallOutcome, McpOneShotError> {
-        let (reply, receive) = oneshot::channel();
+        self.call_bound_retaining_completion(
+            config,
+            expected_epoch,
+            tool,
+            arguments,
+            cancel,
+            expected_schema,
+        )
+        .await
+        .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn call_bound_retaining_completion(
+        &self,
+        config: McpServerConfig,
+        expected_epoch: Option<u64>,
+        tool: String,
+        arguments: Value,
+        cancel: CancellationToken,
+        expected_schema: Option<Value>,
+    ) -> Result<CallOutcome, CallFailure> {
+        let (reply, mut receive) = oneshot::channel();
         let deadline = tokio::time::Instant::now()
             .checked_add(self.snapshot().config.tool_call_timeout())
             .ok_or_else(|| {
@@ -242,19 +277,27 @@ impl SupervisorHandle {
         };
         tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(McpOneShotError::NotDispatched("MCP tool call cancelled".into())),
+            () = cancel.cancelled() => return Err(McpOneShotError::NotDispatched("MCP tool call cancelled".into()).into()),
             () = tokio::time::sleep_until(deadline) => {
-                return Err(McpOneShotError::NotDispatched("MCP tool call timed out while enqueueing".into()));
+                return Err(McpOneShotError::NotDispatched("MCP tool call timed out while enqueueing".into()).into());
             }
             result = self.mailbox.send(command) => result.map_err(|_| McpOneShotError::NotDispatched(stopped()))?,
         }
-        tokio::select! {
+        let completed = tokio::select! {
             biased;
-            result = receive => result.unwrap_or_else(|_| Err(McpOneShotError::Uncertain(stopped()))),
-            () = tokio::time::sleep_until(deadline) => {
-                call_cancel.cancel();
-                Err(McpOneShotError::Uncertain("MCP tool call timed out".into()))
-            }
+            result = &mut receive => Some(result),
+            () = tokio::time::sleep_until(deadline) => None,
+        };
+        if let Some(result) = completed {
+            result
+                .unwrap_or_else(|_| Err(McpOneShotError::Uncertain(stopped())))
+                .map_err(Into::into)
+        } else {
+            call_cancel.cancel();
+            Err(CallFailure {
+                error: McpOneShotError::Uncertain("MCP tool call timed out".into()),
+                completion: Some(receive),
+            })
         }
     }
 

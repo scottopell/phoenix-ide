@@ -1285,6 +1285,10 @@ deferred ReAuthCallRetry    -- see: crates/phoenix-tools/src/mcp.rs
     -- path. Schema-bound calls re-check their admitted definition after recovery
     -- and return unavailable instead of replaying against a changed definition.
     -- Durable external-delivery callers may select single-attempt execution.
+    -- A caller deadline does not discard the eventual cancellation outcome:
+    -- its typed recovery evidence still restores the original connection for
+    -- later callers, without replaying the abandoned operation. A queued cancel
+    -- or cancellation-safe transport provides no reason to replace a connection.
     -- That port validates readiness and the selected schema but never replays
     -- a dispatched call after a transport/auth failure; it returns uncertainty
     -- to the caller while leaving recovery for later calls available.

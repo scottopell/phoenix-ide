@@ -95,6 +95,8 @@ crash-like I/O failure before retrying an ordinary replay-eligible failed call o
 WHEN a durable external-delivery caller selects single-attempt execution,
 THE SYSTEM SHALL preserve ready-state and discovered-schema validation but SHALL NOT replay a dispatched call after a transport or authentication failure. The caller SHALL receive the failure so it can retain uncertain delivery evidence; connection recovery for later calls SHALL remain available.
 
+WHEN that caller's response deadline expires, THE SYSTEM SHALL retain the eventual classified cancellation outcome for connection recovery without extending the caller's deadline or replaying its operation. Only cancellation evidence requiring transport reestablishment SHALL trigger that recovery; a queued cancellation or cancellation-safe transport SHALL NOT cause unnecessary replacement.
+
 **Rationale:** A local subprocess can crash; transparent respawn keeps its
 tools usable without operator intervention. Stderr drain prevents the child
 blocking on a full pipe.

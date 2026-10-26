@@ -3529,43 +3529,49 @@ impl McpClientManager {
         }
         let handle = binding.handle.clone();
         let config = binding.config.clone();
-        let outcome = handle
-            .call_bound(
-                config.clone(),
+        let outcome = match handle
+            .call_bound_retaining_completion(
+                config,
                 Some(binding.epoch),
                 tool_name.to_string(),
                 arguments,
                 CancellationToken::new(),
                 Some(expected_schema),
             )
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                if let Some(completion) = failure.completion {
+                    let manager = Arc::clone(self);
+                    let binding = binding.clone();
+                    self.spawn_background(async move {
+                        if let Ok(Ok(outcome)) = completion.await {
+                            manager
+                                .recover_one_shot_connection(
+                                    &binding,
+                                    outcome.epoch,
+                                    outcome.recovery,
+                                )
+                                .await;
+                        }
+                    });
+                }
+                return Err(failure.error);
+            }
+        };
         // Restore the connection for later callers without replaying this call.
         // In particular, an expired OAuth session must not remain stranded just
         // because the caller requires exact per-dispatch accounting.
         if !matches!(outcome.recovery, CallRecovery::None) {
             let manager = Arc::clone(self);
-            let name = server_name.to_string();
+            let binding = binding.clone();
             let epoch = outcome.epoch;
             let recovery = outcome.recovery;
-            let invocation_config = config;
             self.spawn_background(async move {
-                match recovery {
-                    CallRecovery::OAuth(kind) => {
-                        let _ = manager
-                            .recover_oauth_for_config(
-                                &name,
-                                &handle,
-                                epoch,
-                                kind,
-                                &invocation_config,
-                            )
-                            .await;
-                    }
-                    CallRecovery::Transport | CallRecovery::CancelledTransport => {
-                        let _ = manager.recover_actor(&name, &handle, epoch, None).await;
-                    }
-                    CallRecovery::None => {}
-                }
+                manager
+                    .recover_one_shot_connection(&binding, epoch, recovery)
+                    .await;
             });
         }
         outcome.result.map_err(|e| match e {
@@ -3577,6 +3583,33 @@ impl McpClientManager {
                 McpOneShotError::Uncertain(other.into_message(server_name))
             }
         })
+    }
+
+    async fn recover_one_shot_connection(
+        self: &Arc<Self>,
+        binding: &McpConnectionBinding,
+        epoch: u64,
+        recovery: CallRecovery,
+    ) {
+        match recovery {
+            CallRecovery::OAuth(kind) => {
+                let _ = self
+                    .recover_oauth_for_config(
+                        &binding.server_name,
+                        &binding.handle,
+                        epoch,
+                        kind,
+                        &binding.config,
+                    )
+                    .await;
+            }
+            CallRecovery::Transport | CallRecovery::CancelledTransport => {
+                let _ = self
+                    .recover_actor(&binding.server_name, &binding.handle, epoch, None)
+                    .await;
+            }
+            CallRecovery::None => {}
+        }
     }
 
     /// # Errors
@@ -5728,6 +5761,7 @@ mod tests {
         script: std::sync::Mutex<std::collections::VecDeque<ScriptedExchange>>,
         requests: Arc<std::sync::Mutex<Vec<(String, Value, Duration)>>>,
         notifications: Arc<std::sync::Mutex<Vec<Value>>>,
+        cancel_requires_reestablish: bool,
     }
 
     struct RetryShutdownTransport {
@@ -5849,6 +5883,10 @@ mod tests {
             true
         }
 
+        fn requires_reestablish_after_cancel(&self) -> bool {
+            self.cancel_requires_reestablish
+        }
+
         async fn shutdown(&self) -> Result<(), TransportError> {
             Ok(())
         }
@@ -5861,12 +5899,21 @@ mod tests {
         script: Vec<ScriptedExchange>,
         config: McpServerConfig,
     ) -> (McpServer, RequestLog, NotificationLog) {
+        fake_server_with_cancel_policy(script, config, false)
+    }
+
+    fn fake_server_with_cancel_policy(
+        script: Vec<ScriptedExchange>,
+        config: McpServerConfig,
+        cancel_requires_reestablish: bool,
+    ) -> (McpServer, RequestLog, NotificationLog) {
         let requests: RequestLog = Arc::default();
         let notifications: NotificationLog = Arc::default();
         let transport = FakeTransport {
             script: std::sync::Mutex::new(script.into()),
             requests: Arc::clone(&requests),
             notifications: Arc::clone(&notifications),
+            cancel_requires_reestablish,
         };
         let server = McpServer {
             name: "fake".to_string(),
@@ -6073,6 +6120,56 @@ mod tests {
                 1,
                 "a dispatch must not be replayed during recovery: {name}"
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_attempt_deadline_observes_cancel_recovery_without_replaying() {
+        for invalidates_transport in [false, true] {
+            let (server, requests, _) = fake_server_with_cancel_policy(
+                vec![delayed_exchange(
+                    Ok(serde_json::json!({"content":[]})),
+                    60_000,
+                )],
+                McpServerConfig::Stdio {
+                    command: "unused".into(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    tool_call_timeout: Duration::from_millis(10),
+                },
+                invalidates_transport,
+            );
+            let schema = serde_json::json!({"type":"object"});
+            *server.tools.write().unwrap() = vec![McpToolDef {
+                name: "post".into(),
+                description: String::new(),
+                input_schema: schema.clone(),
+            }];
+            let handle = server_handle(server);
+            let epoch = handle.snapshot().epoch;
+            let manager = Arc::new(McpClientManager::new());
+            manager
+                .servers
+                .write()
+                .await
+                .insert("fake".into(), handle.clone());
+            assert!(matches!(
+                manager
+                    .call_tool_once("fake", "post", serde_json::json!({}), schema)
+                    .await,
+                Err(McpOneShotError::Uncertain(_))
+            ));
+            tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+                .await
+                .expect("late cancellation recovery must settle without another call");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            if invalidates_transport {
+                assert!(handle.snapshot().epoch > epoch);
+                assert!(!handle.snapshot().is_ready());
+            } else {
+                assert_eq!(handle.snapshot().epoch, epoch);
+                assert!(handle.snapshot().is_ready());
+            }
         }
     }
 

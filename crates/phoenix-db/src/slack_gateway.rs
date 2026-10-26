@@ -489,7 +489,7 @@ impl Database {
         Ok(actual)
     }
     pub async fn slack_returns(&self, workspace: &str, owner: &str) -> DbResult<Vec<SlackReturn>> {
-        Ok(sqlx::query(sqlx::AssertSqlSafe(format!("SELECT o.return_id,o.created_at_unix_micros,o.binding_id,o.text,o.destination,o.state,o.notification_receipt,o.notification_url,o.notification_inspect_after_us,o.notification_command,o.failure,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p JOIN conversations c ON c.product_conversation_id=p.id WHERE p.id=b.product_id AND {ORDINARY_PRODUCT_ROUTE_PREDICATE})) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")))
+        Ok(sqlx::query(sqlx::AssertSqlSafe(format!("SELECT o.return_id,o.created_at_unix_micros,o.binding_id,o.text,o.destination,o.state,o.notification_receipt,o.notification_url,o.notification_inspect_after_us,o.notification_command,o.failure,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_conversations p JOIN conversations c ON c.product_conversation_id=p.id WHERE p.id=b.product_id AND {ORDINARY_PRODUCT_ROUTE_PREDICATE}) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")))
             .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,created_at_us:r.try_get("created_at_unix_micros")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_url:r.try_get("notification_url")?,notification_inspect_after_us:r.try_get("notification_inspect_after_us")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
     }
     pub async fn slack_begin_return(&self, id: &str, attempt: &str) -> DbResult<bool> {
@@ -3017,16 +3017,45 @@ mod tests {
             assert_eq!(text.contains("/c/"), available);
             tx.rollback().await.unwrap();
         }
-        sqlx::query("DELETE FROM conversations WHERE id=?1")
-            .bind(&product.id)
-            .execute(db.pool())
+        db.update_conversation_state(
+            &product.id,
+            &super::super::ConvState::ContextExhausted {
+                summary: "fixture".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let super::super::ContinueOutcome::Created(successor) =
+            db.continue_conversation(&product.id).await.unwrap()
+        else {
+            panic!("expected native successor");
+        };
+        db.delete_conversation(&product.id).await.unwrap();
+        let creation_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM product_creation_jobs WHERE request_id=?1)",
+        )
+        .bind(&request.creation_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!creation_exists);
+        assert!(db
+            .resolve_ordinary_product_conversation(product.product_conversation_id.as_str())
             .await
-            .unwrap();
-        sqlx::query("DELETE FROM product_conversations WHERE id=?1")
-            .bind(product.product_conversation_id.as_str())
-            .execute(db.pool())
-            .await
-            .unwrap();
+            .is_ok());
+        assert!(
+            db.slack_requests(&source.workspace, &source.owner)
+                .await
+                .unwrap()[0]
+                .conversation_available
+        );
+        assert!(
+            db.slack_returns(&source.workspace, &source.owner)
+                .await
+                .unwrap()[0]
+                .published
+        );
+        db.delete_conversation(&successor.id).await.unwrap();
         let deleted = db
             .slack_requests(&source.workspace, &source.owner)
             .await

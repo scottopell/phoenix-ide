@@ -192,6 +192,8 @@ THE SYSTEM SHALL expose gateway-created work as ordinary Phoenix conversations w
 
 Conversation links SHALL use the native ordinary-route eligibility boundary, including completed publication. A reserved identity or physical product row during pending or failed initial delivery SHALL NOT imply a routable conversation. Until eligible, generated handoff links SHALL target the exact return status.
 
+Removing a predecessor transcript or its original creation job SHALL NOT invalidate a conversation link when a remaining live successor satisfies that same native route boundary.
+
 THE SYSTEM SHALL use shared internal application services for conversation creation, target resolution, attributed admission, and outcome reads, extracting shared operations from HTTP handlers where necessary. It SHALL reuse the configured MCP client for Slack operations and SHALL NOT duplicate permission, execution, or conversation lifecycle ownership in the gateway.
 
 Owner-facing setup SHALL use Phoenix's light/dark themes and remain usable at narrow widths. Private notification configuration SHALL be summarized separately from its launcher's name; advanced editing SHALL expose the complete program-and-arguments array, preserve exact argument values, and explain which existing retries retain their original operation.

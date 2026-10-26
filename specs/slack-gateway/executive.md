@@ -298,5 +298,17 @@ the controlled discovery backlog remains sixteen calls across two passes. No
 migration or additional persisted state is introduced. Normal automatic review
 and exact-head hosted CI remain required; production is not redeployed.
 
+Private conversation-link availability now uses the shared native route predicate
+without requiring retention of the original creation job. A native continuation
+and predecessor-deletion regression verifies that the successor stays linkable
+after that job is removed. Single-attempt MCP deadlines retain the supervisor's
+eventual cancellation outcome for background connection recovery, using its typed
+recovery classification and existing epoch fences without replaying the call.
+Queued/cancellation-safe outcomes do not force replacement. All 610 affected Rust
+tests pass, including the paused-clock recovery regression; final Clippy,
+formatting, Allium and structural checks pass. No migration, permission mode or
+additional persisted state is added. Normal automatic review and exact-head
+hosted CI remain required; the production pilot is not redeployed.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.
