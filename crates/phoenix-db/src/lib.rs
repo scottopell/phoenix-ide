@@ -11713,11 +11713,13 @@ impl Database {
     }
 
     async fn hard_delete_conversation_tx(
-        connection: &mut sqlx::SqliteConnection,
+        tx: &mut Transaction<'_, Sqlite>,
         conversation_id: &str,
         observer: sqlite_telemetry::ParentSqliteObserver<'_>,
         creation_cleanup_claim: Option<(&CreationCleanupJob, i64, &str)>,
     ) -> DbResult<(bool, bool)> {
+        slack_gateway::recover_completed_slack_outcomes_tx(tx, Some(conversation_id)).await?;
+        let connection = &mut **tx;
         let Some(product_conversation_id) = Self::delete_conversation_row_with_dependents(
             connection,
             conversation_id,

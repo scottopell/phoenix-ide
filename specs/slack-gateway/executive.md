@@ -275,5 +275,16 @@ local check types pass; the final six Rust/model/structural checks also pass on
 the final source. Fresh exact-head hosted CI and review remain required. The
 production pilot remains unchanged.
 
+Fresh pending notices now enter due ordering at their existing creation timestamp,
+so overdue retries and receipt checks retain an opportunity during new arrivals.
+Deletion and normal reconciliation share completion-checkpoint recovery; deletion
+captures completed work before removing its evidence and cancels only the
+unfinished remainder. A failed completion capture rolls back deletion. All 608
+affected Rust tests pass, and final Clippy, formatting, Allium and structural
+checks pass. The UI is unchanged from its validated source. No migration or
+additional persisted state is introduced. Normal per-push automatic review and
+exact-head hosted CI remain the final qualification checks; unavailable review
+verdict metadata is reported separately from posted findings and thread resolution.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

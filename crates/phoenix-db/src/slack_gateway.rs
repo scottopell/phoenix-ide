@@ -127,6 +127,8 @@ impl SlackReturnState {
 #[derive(Debug, Clone, Serialize)]
 pub struct SlackReturn {
     pub return_id: String,
+    #[serde(skip_serializing)]
+    pub created_at_us: i64,
     pub binding_id: String,
     pub workspace: String,
     pub owner: String,
@@ -487,8 +489,8 @@ impl Database {
         Ok(actual)
     }
     pub async fn slack_returns(&self, workspace: &str, owner: &str) -> DbResult<Vec<SlackReturn>> {
-        Ok(sqlx::query(sqlx::AssertSqlSafe(format!("SELECT o.return_id,o.binding_id,o.text,o.destination,o.state,o.notification_receipt,o.notification_url,o.notification_inspect_after_us,o.notification_command,o.failure,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p JOIN conversations c ON c.product_conversation_id=p.id WHERE p.id=b.product_id AND {ORDINARY_PRODUCT_ROUTE_PREDICATE})) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")))
-            .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_url:r.try_get("notification_url")?,notification_inspect_after_us:r.try_get("notification_inspect_after_us")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
+        Ok(sqlx::query(sqlx::AssertSqlSafe(format!("SELECT o.return_id,o.created_at_unix_micros,o.binding_id,o.text,o.destination,o.state,o.notification_receipt,o.notification_url,o.notification_inspect_after_us,o.notification_command,o.failure,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p JOIN conversations c ON c.product_conversation_id=p.id WHERE p.id=b.product_id AND {ORDINARY_PRODUCT_ROUTE_PREDICATE})) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")))
+            .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,created_at_us:r.try_get("created_at_unix_micros")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_url:r.try_get("notification_url")?,notification_inspect_after_us:r.try_get("notification_inspect_after_us")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
     }
     pub async fn slack_begin_return(&self, id: &str, attempt: &str) -> DbResult<bool> {
         Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2 WHERE return_id=?1 AND destination='thread' AND state IN ('pending','known_unsent') AND (response_kind<>'clarification' OR NOT EXISTS(SELECT 1 FROM slack_gateway_questions q WHERE q.return_id=?1 AND (q.retired_reason IS NOT NULL OR NOT EXISTS(SELECT 1 FROM conversations c WHERE c.id=q.transcript_id))))").bind(id).bind(attempt).execute(self.pool()).await?.rows_affected()==1)
@@ -593,6 +595,19 @@ impl Database {
 
 /// Capture exact native evidence inside the native persistence transaction.
 /// This is not a second execution state machine or a transcript-tail watcher.
+pub(crate) async fn recover_completed_slack_outcomes_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    transcript: Option<&str>,
+) -> DbResult<()> {
+    let completed: Vec<String> = sqlx::query_scalar("SELECT c.id FROM conversations c JOIN steering_execution_occurrences o ON o.conversation_id=c.id JOIN messages m ON m.conversation_id=c.id AND m.message_id=o.message_id WHERE (?1 IS NULL OR c.id=?1) AND c.state_kind IN ('idle','terminal','completed') AND EXISTS(SELECT 1 FROM messages candidate WHERE candidate.conversation_id=c.id AND candidate.origin_slack_request_id IS NOT NULL) AND o.source_kind IN ('steering','seeded_fork','interaction_response') AND EXISTS(SELECT 1 FROM messages answer WHERE answer.conversation_id=c.id AND answer.message_type='agent' AND answer.sequence_id>m.sequence_id) AND NOT EXISTS(SELECT 1 FROM durable_turns t WHERE t.conversation_id=c.id AND t.owns_conversation=1)")
+        .bind(transcript).fetch_all(&mut **tx).await?;
+    for transcript in completed {
+        crate::record_initial_execution_outcome_tx(tx, &transcript, &super::ConvState::Idle)
+            .await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn record_slack_deleted_product_conn(
     connection: &mut sqlx::SqliteConnection,
     product: &str,
@@ -813,16 +828,7 @@ impl Database {
     pub async fn process_slack_native_outcomes(&self, phoenix_origin: &str) -> DbResult<()> {
         let mut tx = self.pool().begin().await?;
         replace_retired_slack_clarifications_tx(&mut tx, phoenix_origin).await?;
-        let completed: Vec<String> = sqlx::query_scalar("SELECT c.id FROM conversations c JOIN steering_execution_occurrences o ON o.conversation_id=c.id JOIN messages m ON m.conversation_id=c.id AND m.message_id=o.message_id WHERE c.state_kind IN ('idle','terminal','completed') AND EXISTS(SELECT 1 FROM messages candidate WHERE candidate.conversation_id=c.id AND candidate.origin_slack_request_id IS NOT NULL) AND o.source_kind IN ('steering','seeded_fork','interaction_response') AND EXISTS(SELECT 1 FROM messages answer WHERE answer.conversation_id=c.id AND answer.message_type='agent' AND answer.sequence_id>m.sequence_id) AND NOT EXISTS(SELECT 1 FROM durable_turns t WHERE t.conversation_id=c.id AND t.owns_conversation=1)")
-            .fetch_all(&mut *tx).await?;
-        for transcript in completed {
-            crate::record_initial_execution_outcome_tx(
-                &mut tx,
-                &transcript,
-                &super::ConvState::Idle,
-            )
-            .await?;
-        }
+        recover_completed_slack_outcomes_tx(&mut tx, None).await?;
         let events=sqlx::query("SELECT e.request_id,e.occurrence_key,e.kind,e.transcript_id,e.context_exhausted,e.question_id,e.question_body,r.binding_id,r.kind AS request_kind,r.source_url FROM slack_gateway_native_outcomes e JOIN slack_gateway_requests r USING(request_id) WHERE e.processed=0").fetch_all(&mut *tx).await?;
         for event in events {
             let request: String = event.try_get("request_id")?;
@@ -2763,6 +2769,101 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deletion_preserves_a_completed_briefing_checkpoint_and_rolls_back_capture_failure() {
+        use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("checkpoint", "checkpoint", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let source = source("100.000", SlackRequestKind::Briefing);
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.slack_bind_product(
+            &request.binding_id,
+            conversation.product_conversation_id.as_str(),
+        )
+        .await
+        .unwrap();
+        db.slack_mark_admitted(&request.request_id, &conversation.id)
+            .await
+            .unwrap();
+        db.add_message_with_seq_and_origin(
+            "checkpoint-input",
+            &conversation.id,
+            1,
+            &MessageContent::user("briefing"),
+            None,
+            None,
+            &InputOrigin::SlackGateway {
+                request_id: request.request_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        db.add_message_with_seq(
+            "checkpoint-answer",
+            &conversation.id,
+            2,
+            &MessageContent::agent(vec![]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let checkpoint: String = sqlx::query_scalar(
+            "SELECT message_id FROM steering_execution_occurrences WHERE conversation_id=?1",
+        )
+        .bind(&conversation.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(checkpoint, "checkpoint-input");
+        sqlx::raw_sql("CREATE TRIGGER fail_completed_capture BEFORE INSERT ON slack_gateway_native_outcomes WHEN NEW.kind='Completed' BEGIN SELECT RAISE(ABORT,'fixture capture failure'); END;").execute(db.pool()).await.unwrap();
+        assert!(db.delete_conversation(&conversation.id).await.is_err());
+        assert!(db.get_conversation(&conversation.id).await.is_ok());
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM steering_execution_occurrences WHERE conversation_id=?1)",
+        )
+        .bind(&conversation.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(retained);
+        sqlx::raw_sql("DROP TRIGGER fail_completed_capture")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.delete_conversation(&conversation.id).await.unwrap();
+        db.process_slack_native_outcomes("https://phoenix.example")
+            .await
+            .unwrap();
+        db.process_slack_native_outcomes("https://phoenix.example")
+            .await
+            .unwrap();
+        let kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT kind FROM slack_gateway_native_outcomes WHERE request_id=?1",
+        )
+        .bind(&request.request_id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(kinds, vec!["Completed"]);
+        let outputs = db
+            .slack_returns(&source.workspace, &source.owner)
+            .await
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].text.contains("briefing is ready"));
+        assert!(!outputs[0].published);
+        assert!(db.get_conversation(&conversation.id).await.is_err());
     }
 
     #[tokio::test]

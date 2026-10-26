@@ -109,6 +109,8 @@ contract NativeReconciliationPort {
         -- may start at most one submission or inspection; a not-due row consumes
         -- no slot. Shared deadline ordering allows other due notices to progress
         -- while a definitely-unsent submission or pending inspection is deferred.
+        -- Fresh notices enter that ordering at their creation time, so a stream
+        -- of new submissions cannot always outrank an overdue retained deadline.
         -- Local admission/outcome reconciliation and ready return work receive
         -- an opportunity before a discovery burst. The result reports success;
         -- an error is recorded and does not authorize duplicate work. A failed

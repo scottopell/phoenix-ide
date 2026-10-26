@@ -75,6 +75,8 @@ entity Gateway {
         -- Deleting the last live primary transcript atomically captures a terminal
         -- cancellation for unfinished admitted work. A live successor keeps its
         -- lifecycle; deleting completed work does not create a second notice.
+        -- Native completion checkpoints are recovered before deletion removes
+        -- their evidence; cancellation applies only to the unfinished remainder.
 }
 
 -- Provisioning and continuation are owned by the native creation/lifecycle specs.

@@ -415,9 +415,11 @@ async fn dispatch_returns(
         (
             priority,
             if priority == 1 {
-                output.notification_inspect_after_us
+                output
+                    .notification_inspect_after_us
+                    .unwrap_or(output.created_at_us)
             } else {
-                None
+                0
             },
         )
     });
@@ -887,6 +889,11 @@ mod tests {
             }
         }
         let slack = Slack::new(state.mcp_manager.clone(), &c);
+        dispatch_returns(&state, &c, &slack, false).await.unwrap();
+        assert!(
+            !trace.exists(),
+            "the overdue frozen retry precedes newly pending notices"
+        );
         for expected in 1..=2 {
             dispatch_returns(&state, &c, &slack, false).await.unwrap();
             assert_eq!(
@@ -894,8 +901,6 @@ mod tests {
                 expected
             );
         }
-        // The oldest definitely-unsent notice is due after the two fresh notices.
-        dispatch_returns(&state, &c, &slack, false).await.unwrap();
         let outputs = state
             .db
             .slack_returns(&c.workspace, &c.owner)
