@@ -170,7 +170,7 @@ async fn startup_recovery_retries_a_database_failure_without_restarting_phoenix(
         .remove(0);
     state
         .db
-        .fail_slack_before_admission(&r.request_id, "fixture failure")
+        .fail_slack_before_admission(&r.request_id, "fixture failure", "https://phoenix.example")
         .await
         .unwrap();
     state.db.slack_eyes_confirmed(&r.request_id).await.unwrap();
@@ -806,7 +806,11 @@ async fn acknowledgment_throttle_is_reported_as_backoff() {
         .remove(0);
     state
         .db
-        .fail_slack_before_admission(&request.request_id, "fixture refusal")
+        .fail_slack_before_admission(
+            &request.request_id,
+            "fixture refusal",
+            "https://phoenix.example",
+        )
         .await
         .unwrap();
     let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);

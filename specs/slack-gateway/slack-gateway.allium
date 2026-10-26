@@ -141,6 +141,13 @@ entity ReturnObligation {
     delivery_proof: String when state = confirmed
     failure_reason: String when state = failed
 
+    @invariant ClarificationHandoff
+        -- REQ-SG-012/013. A clarification response links to the ordinary Phoenix
+        -- conversation for an answer. It satisfies the automatic Slack response
+        -- duty when confirmed. Slack triggers never answer native questions;
+        -- native discussion does not inherit the original publication authority.
+        -- Gateway-generated text and links are frozen when the return is created.
+
     invariant NonemptyCoverage {
         request in covered_requests
     }
@@ -281,6 +288,7 @@ rule OweExplicitResponse {
     requires: outcome.kind in {answer, clarification, failure, cancelled, empty_completion}
     let covered = request.gateway.requests where status = admitted and observation.kind = explicit_request and binding_key = request.binding_key and admission in outcome.covered_admissions
     requires: covered.count = outcome.covered_admissions.count
+    requires: not request.gateway.returns.any(r => r.kind = thread_reply and request in r.covered_requests)
     requires: not request.gateway.returns.any(r => r.kind = thread_reply and r.destination_key = request.binding_key and r.occurrence_key = outcome.occurrence_key)
     ensures: ReturnObligation.created(
         request: request,

@@ -7,6 +7,8 @@ submit an explicit local agent request using a fire-prefixed message or fire on
 their own message. Work remains an ordinary Phoenix conversation with native
 permissions. Replies are intentional, source-bound and deduplicated. Discovery
 covers four calendar dates and establishes a non-executing initial baseline.
+Clarifications link to the ordinary Phoenix conversation for answers. That
+handoff ends the automatic Slack response; native discussion stays private.
 
 ## Technical summary
 
@@ -43,7 +45,7 @@ an owner-configured local executable using a versioned stdin/stdout protocol.
 ## Evidence and limits
 
 The prototype completed private prefix, own-reaction, other-author briefing,
-thread reuse, exact native question/answer, intentional publication, generic
+thread reuse, intentional publication, generic
 private notification and retained-state deduplication checks. Source IDs,
 workspace identities, recipient details, helper commands and provider-specific
 operational records remain outside the public repository. Private prototype
@@ -152,8 +154,15 @@ separately from the bounded operator pilot.
 Live automatic continuation and longer soak coverage remain unqualified until
 exercised. They are follow-up confidence work rather than an invented unlimited
 SLO for a bounded personal pilot. External shared-channel send limitations remain.
-Public PR review and remaining full-suite CI are in progress. The separately
-approved bounded local acceptance sequence and native-client simulator CI passed.
+The clarification handoff replaces Slack answer inference with deep links into
+Phoenix. Unsubmitted persisted question associations are rejected, native
+answers retain their ordinary UI contract, and confirmed handoffs close the
+original automatic response duty without inheriting private discussion.
+All 254 affected MCP/gateway tests pass, including the handoff, pending-question
+admission, exact status-link and frozen-link retry regressions. Clippy,
+formatting, Allium and structural/timing checks pass. The preceding public head
+passed every required hosted check; the revised head still needs automatic
+review and CI. The approved local pilot remains on its separately pinned build.
 
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

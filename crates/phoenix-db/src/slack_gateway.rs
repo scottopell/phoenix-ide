@@ -183,7 +183,7 @@ impl Database {
             }
         }
         let outstanding: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND (r.eyes_confirmed=0 OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.response_kind<>'clarification' AND o.state IN ('confirmed','failed')))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
+            "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND (r.eyes_confirmed=0 OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.state IN ('confirmed','failed')))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
         ).bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
         if outstanding {
             return Err(DbError::Serialization("Cannot change the Slack account while accepted work or return delivery is outstanding; finish that work using its original account first".into()));
@@ -273,35 +273,6 @@ impl Database {
         }
         sqlx::query("INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,source_url,binding_id,accepted_at_unix_micros,input_id,context,observed_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)")
             .bind(&request).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(&source.thread_ts).bind(if baseline {"baseline"}else{source.kind.as_str()}).bind(&source.instruction).bind(&source.source_url).bind(if baseline {None}else{Some(&binding)}).bind(chrono::Utc::now().timestamp_micros()).bind(uuid::Uuid::new_v4().to_string()).bind(&source.context).bind(source.observed_at_unix_micros).execute(&mut *tx).await?;
-        if !baseline && source.kind == SlackRequestKind::Explicit {
-            let candidates=sqlx::query("SELECT DISTINCT q.question_id,q.transcript_id,o.delivery_proof FROM slack_gateway_questions q JOIN slack_gateway_returns o USING(return_id) WHERE o.binding_id=?1 AND o.state='confirmed' AND q.answered_by IS NULL AND q.retired_reason IS NULL").bind(&binding).fetch_all(&mut *tx).await?;
-            let mut targets = std::collections::BTreeSet::new();
-            for q in candidates {
-                let proof: String = q.try_get("delivery_proof")?;
-                let stamp = serde_json::from_str::<serde_json::Value>(&proof)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("message_ts")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
-                if stamp.is_some_and(|ts| source.message_ts > ts) {
-                    targets.insert((
-                        q.try_get::<String, _>("question_id")?,
-                        q.try_get::<String, _>("transcript_id")?,
-                    ));
-                }
-            }
-            if targets.len() > 1 {
-                reject_slack_request_tx(&mut tx,&request,"Ambiguous clarification: several posted questions are unanswered; answer the current question in Phoenix").await?;
-            } else if targets.len() == 1 {
-                let (question, transcript) = targets
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| DbError::Serialization("missing question target".into()))?;
-                sqlx::query("UPDATE slack_gateway_requests SET question_id=?2,question_transcript=?3 WHERE request_id=?1").bind(&request).bind(question).bind(transcript).execute(&mut *tx).await?;
-            }
-        }
         tx.commit().await?;
         Ok(SlackSourceAcceptance::Recorded)
     }
@@ -404,7 +375,7 @@ impl Database {
         let binding =
             binding.ok_or_else(|| DbError::Serialization("missing response binding".into()))?;
         for request in request_ids {
-            let answered: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=?1 AND o.response_kind!='clarification' AND NOT (o.binding_id=?2 AND o.occurrence_key=?3 AND o.destination=?4))")
+            let answered: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=?1 AND NOT (o.binding_id=?2 AND o.occurrence_key=?3 AND o.destination=?4))")
                 .bind(request).bind(&binding).bind(&occurrence).bind(destination).fetch_one(&mut *tx).await?;
             if answered {
                 return Err(DbError::Serialization(
@@ -596,17 +567,12 @@ async fn requests_for_native_input(
           AND member.sequence_id>=anchor.sequence_id
           AND member.sequence_id<COALESCE((SELECT MIN(sequence_id) FROM messages answer WHERE answer.conversation_id=?1 AND answer.message_type='agent' AND answer.sequence_id>anchor.sequence_id),9223372036854775807)
           AND NOT EXISTS(SELECT 1 FROM steering_messages pending WHERE pending.conversation_id=member.conversation_id AND pending.message_id=member.message_id)
-        UNION SELECT coverage.request_id FROM messages m
-        JOIN slack_gateway_requests answer ON answer.request_id=m.origin_slack_request_id
-        JOIN slack_gateway_questions q ON q.question_id=answer.question_id AND q.transcript_id=answer.question_transcript
-        JOIN slack_gateway_return_coverage coverage ON coverage.return_id=q.return_id
-        WHERE m.conversation_id=?1 AND m.message_id=?2
         UNION SELECT e.request_id FROM slack_gateway_native_outcomes e
         JOIN completed_continuation_handoffs h ON h.predecessor_conversation_id=e.transcript_id
         JOIN automatic_continuation_admissions a ON a.predecessor_conversation_id=h.predecessor_conversation_id
         WHERE h.successor_conversation_id=?1 AND h.accepted_successor_message_id=?2 AND h.opening_authority='generated_predecessor_context'
           AND e.context_exhausted=1 AND a.phase NOT IN ('failed','superseded')
-          AND NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage rc JOIN slack_gateway_returns o USING(return_id) WHERE rc.request_id=e.request_id AND o.response_kind!='clarification')")
+          AND NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage rc JOIN slack_gateway_returns o USING(return_id) WHERE rc.request_id=e.request_id)")
         .bind(transcript).bind(message).fetch_all(&mut **tx).await?)
 }
 
@@ -666,7 +632,7 @@ pub(crate) async fn record_slack_question_tx(
 
 impl Database {
     /// Materialize replies/notices from transactionally captured native occurrences.
-    pub async fn process_slack_native_outcomes(&self) -> DbResult<()> {
+    pub async fn process_slack_native_outcomes(&self, phoenix_origin: &str) -> DbResult<()> {
         let mut tx = self.pool().begin().await?;
         let completed: Vec<String> = sqlx::query_scalar("SELECT c.id FROM conversations c JOIN steering_execution_occurrences o ON o.conversation_id=c.id JOIN messages m ON m.conversation_id=c.id AND m.message_id=o.message_id WHERE c.state_kind IN ('idle','terminal','completed') AND EXISTS(SELECT 1 FROM messages candidate WHERE candidate.conversation_id=c.id AND candidate.origin_slack_request_id IS NOT NULL) AND o.source_kind IN ('steering','seeded_fork','interaction_response') AND EXISTS(SELECT 1 FROM messages answer WHERE answer.conversation_id=c.id AND answer.message_type='agent' AND answer.sequence_id>m.sequence_id) AND NOT EXISTS(SELECT 1 FROM durable_turns t WHERE t.conversation_id=c.id AND t.owns_conversation=1)")
             .fetch_all(&mut *tx).await?;
@@ -704,8 +670,8 @@ impl Database {
                 }
             }
             let private = event.try_get::<String, _>("request_kind")? == "briefing";
-            let already:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns r USING(return_id) WHERE c.request_id=?1 AND r.response_kind!='clarification')").bind(&request).fetch_one(&mut *tx).await?;
-            if kind == "question" || !already {
+            let already:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns r USING(return_id) WHERE c.request_id=?1)").bind(&request).fetch_one(&mut *tx).await?;
+            if !already {
                 let text = if private {
                     match kind.as_str() {
                         "Completed" => "Phoenix: your briefing is ready",
@@ -717,14 +683,20 @@ impl Database {
                     let questions: Vec<phoenix_core::domain::sm_state::UserQuestion> =
                         serde_json::from_str(&event.try_get::<String, _>("question_body")?)
                             .map_err(|e| DbError::Serialization(e.to_string()))?;
-                    questions.iter().map(|q|format!("{}: {}\n{}",q.header,q.question,q.options.iter().map(|o|o.label.as_str()).collect::<Vec<_>>().join(" / "))).collect::<Vec<_>>().join("\n\n")+"\n\nReply with a fire prefix (or react fire on your own answer). For several questions use one `Header: answer` line per question."
+                    questions.iter().map(|q|format!("{}: {}\n{}",q.header,q.question,q.options.iter().map(|o|o.label.as_str()).collect::<Vec<_>>().join(" / "))).collect::<Vec<_>>().join("\n\n")+"\n\nAnswer in Phoenix using the link below. Replies and reactions in Slack do not answer this question. Further discussion in Phoenix stays private."
                 } else {
                     match kind.as_str(){"Completed"=>"Phoenix finished this request without selecting a Slack answer. Open its Phoenix conversation for details or send an explicit follow-up.","Cancelled"=>"Phoenix execution was cancelled. Send a new explicit message to request further work.",_=>"Phoenix execution stopped with an error. Open its Phoenix conversation for details."}.into()
                 };
                 let binding: String = event.try_get("binding_id")?;
                 let destination = if private { "private" } else { "thread" };
+                let id = uuid::Uuid::new_v4().to_string();
+                let text = if private {
+                    text
+                } else {
+                    slack_thread_response_tx(&mut tx, &binding, &id, &text, phoenix_origin).await?
+                };
                 sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING")
-                    .bind(uuid::Uuid::new_v4().to_string()).bind(&binding).bind(&occurrence).bind(destination).bind(&text).bind(if kind=="question" {"clarification"}else if private {"notice"}else{"failure"}).bind(chrono::Utc::now().timestamp_micros()).execute(&mut *tx).await?;
+                    .bind(&id).bind(&binding).bind(&occurrence).bind(destination).bind(&text).bind(if kind=="question" {"clarification"}else if private {"notice"}else{"failure"}).bind(chrono::Utc::now().timestamp_micros()).execute(&mut *tx).await?;
                 let id: String = sqlx::query_scalar("SELECT return_id FROM slack_gateway_returns WHERE binding_id=?1 AND occurrence_key=?2 AND destination=?3")
                     .bind(&binding).bind(&occurrence).bind(destination).fetch_one(&mut *tx).await?;
                 sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES (?1,?2) ON CONFLICT DO NOTHING").bind(&id).bind(&request).execute(&mut *tx).await?;
@@ -737,9 +709,14 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
-    pub async fn fail_slack_before_admission(&self, request: &str, reason: &str) -> DbResult<()> {
+    pub async fn fail_slack_before_admission(
+        &self,
+        request: &str,
+        reason: &str,
+        phoenix_origin: &str,
+    ) -> DbResult<()> {
         let mut tx = self.pool().begin().await?;
-        reject_slack_request_tx(&mut tx, request, reason).await?;
+        reject_slack_request_tx(&mut tx, request, reason, phoenix_origin).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -779,16 +756,44 @@ impl Database {
     }
 }
 
+async fn slack_thread_response_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    binding: &str,
+    return_id: &str,
+    text: &str,
+    phoenix_origin: &str,
+) -> DbResult<String> {
+    let product: Option<String> =
+        sqlx::query_scalar("SELECT product_id FROM slack_gateway_bindings WHERE binding_id=?1")
+            .bind(binding)
+            .fetch_one(&mut **tx)
+            .await?;
+    let origin = phoenix_origin.trim_end_matches('/');
+    let url = product.map_or_else(
+        || format!("{origin}/settings/slack#slack-return-{return_id}"),
+        |product| format!("{origin}/c/{product}"),
+    );
+    Ok(format!("{text}\n\nOpen in Phoenix: {url}"))
+}
+
 async fn reject_slack_request_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     request: &str,
     reason: &str,
+    phoenix_origin: &str,
 ) -> DbResult<()> {
     let row=sqlx::query("SELECT binding_id,kind FROM slack_gateway_requests WHERE request_id=?1 AND admission_state='accepted'").bind(request).fetch_optional(&mut **tx).await?;
     if let Some(r) = row {
         sqlx::query("UPDATE slack_gateway_requests SET admission_state='rejected',failure=?2 WHERE request_id=?1").bind(request).bind(reason).execute(&mut **tx).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,'failure',?6)").bind(&id).bind(r.try_get::<String,_>("binding_id")?).bind(format!("rejected:{request}")).bind(if r.try_get::<String,_>("kind")?=="briefing" {"private"}else{"thread"}).bind("Phoenix could not admit this request. Open Phoenix for the recorded reason; send a new message after resolving it.").bind(chrono::Utc::now().timestamp_micros()).execute(&mut **tx).await?;
+        let binding: String = r.try_get("binding_id")?;
+        let text = "Phoenix could not admit this request. Open Phoenix to answer any pending question or inspect the recorded reason; send a new Slack request after resolving it.";
+        let text = if r.try_get::<String, _>("kind")? == "briefing" {
+            text.to_string()
+        } else {
+            slack_thread_response_tx(tx, &binding, &id, text, phoenix_origin).await?
+        };
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,'failure',?6)").bind(&id).bind(r.try_get::<String,_>("binding_id")?).bind(format!("rejected:{request}")).bind(if r.try_get::<String,_>("kind")?=="briefing" {"private"}else{"thread"}).bind(text).bind(chrono::Utc::now().timestamp_micros()).execute(&mut **tx).await?;
         sqlx::query(
             "INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES (?1,?2)",
         )
@@ -868,9 +873,13 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        db.fail_slack_before_admission(&request.request_id, "fixture failure")
-            .await
-            .unwrap();
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "fixture failure",
+            "https://phoenix.example",
+        )
+        .await
+        .unwrap();
         db.slack_eyes_confirmed(&request.request_id).await.unwrap();
         assert!(db.set_slack_configuration(&other).await.is_err());
         sqlx::query(
@@ -1040,8 +1049,12 @@ mod tests {
                 .await
                 .unwrap();
             }
-            db.process_slack_native_outcomes().await.unwrap();
-            db.process_slack_native_outcomes().await.unwrap();
+            db.process_slack_native_outcomes("https://phoenix.example")
+                .await
+                .unwrap();
+            db.process_slack_native_outcomes("https://phoenix.example")
+                .await
+                .unwrap();
             let returns = db
                 .slack_returns("example.slack.com", "UOWNER")
                 .await
@@ -1135,9 +1148,13 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        db.fail_slack_before_admission(&request.request_id, "fixture refusal")
-            .await
-            .unwrap();
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "fixture refusal",
+            "https://phoenix.example",
+        )
+        .await
+        .unwrap();
         for (table, column) in [
             ("slack_gateway_requests", "accepted_at_unix_micros"),
             ("slack_gateway_requests", "observed_at_unix_micros"),
@@ -1168,9 +1185,13 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        db.fail_slack_before_admission(&request.request_id, "fixture refusal")
-            .await
-            .unwrap();
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "fixture refusal",
+            "https://phoenix.example",
+        )
+        .await
+        .unwrap();
         let output = db
             .slack_returns(&source.workspace, &source.owner)
             .await
@@ -1255,9 +1276,13 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        db.fail_slack_before_admission(&request.request_id, "fixture refusal")
-            .await
-            .unwrap();
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "fixture refusal",
+            "https://phoenix.example",
+        )
+        .await
+        .unwrap();
         let output = db
             .slack_returns(&source.workspace, &source.owner)
             .await
@@ -1363,7 +1388,9 @@ mod tests {
             db.update_conversation_state(&conv.id, &ConvState::LlmRequesting { attempt: 1 })
                 .await
                 .unwrap();
-            db.process_slack_native_outcomes().await.unwrap();
+            db.process_slack_native_outcomes("https://phoenix.example")
+                .await
+                .unwrap();
             assert!(db
                 .slack_returns(&source.workspace, &source.owner)
                 .await
@@ -1404,8 +1431,12 @@ mod tests {
                 .unwrap();
                 assert_eq!(captured, 1);
             }
-            db.process_slack_native_outcomes().await.unwrap();
-            db.process_slack_native_outcomes().await.unwrap();
+            db.process_slack_native_outcomes("https://phoenix.example")
+                .await
+                .unwrap();
+            db.process_slack_native_outcomes("https://phoenix.example")
+                .await
+                .unwrap();
             let outputs = db
                 .slack_returns(&source.workspace, &source.owner)
                 .await
@@ -1490,7 +1521,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.process_slack_native_outcomes().await.unwrap();
+        db.process_slack_native_outcomes("https://phoenix.example")
+            .await
+            .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM slack_gateway_native_outcomes WHERE kind='question'"
@@ -1525,7 +1558,9 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        db.process_slack_native_outcomes().await.unwrap();
+        db.process_slack_native_outcomes("https://phoenix.example")
+            .await
+            .unwrap();
         assert!(db
             .slack_returns(&source.workspace, &source.owner)
             .await
@@ -1557,7 +1592,9 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        db.process_slack_native_outcomes().await.unwrap();
+        db.process_slack_native_outcomes("https://phoenix.example")
+            .await
+            .unwrap();
         assert!(db
             .slack_returns(&source.workspace, &source.owner)
             .await
@@ -1569,7 +1606,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.process_slack_native_outcomes().await.unwrap();
+        db.process_slack_native_outcomes("https://phoenix.example")
+            .await
+            .unwrap();
         let outputs = db
             .slack_returns(&source.workspace, &source.owner)
             .await
@@ -1578,127 +1617,132 @@ mod tests {
         assert_eq!(outputs[0].destination, "thread");
     }
 
+    // REQ-SG-012: Slack ordering never answers a native clarification.
     #[tokio::test]
-    async fn ambiguous_posted_questions_reject_without_native_admission_and_clear_on_private_answer(
-    ) {
-        let db = Database::open_in_memory().await.unwrap();
-        let conv = db
-            .create_conversation("questions", "questions", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        let original = source("100.000", SlackRequestKind::Explicit);
-        db.accept_slack_source(&original, false).await.unwrap();
-        let first = db
-            .slack_requests(&original.workspace, &original.owner)
-            .await
-            .unwrap()
-            .remove(0);
-        db.slack_bind_product(&first.binding_id, conv.product_conversation_id.as_str())
-            .await
-            .unwrap();
-        for id in ["q1", "q2"] {
-            sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at_unix_micros) VALUES (?1,?2,?1,'thread','Question','clarification','confirmed','{\"message_ts\":\"101.000\"}',1)").bind(id).bind(&first.binding_id).execute(db.pool()).await.unwrap();
-            sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id) VALUES (?1,?1,?2)").bind(id).bind(&conv.id).execute(db.pool()).await.unwrap();
+    async fn later_slack_requests_never_infer_a_question_answer() {
+        for count in [1, 2] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conv = db
+                .create_conversation("questions", "questions", "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let original = source("100.000", SlackRequestKind::Explicit);
+            db.accept_slack_source(&original, false).await.unwrap();
+            let first = db
+                .slack_requests(&original.workspace, &original.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            db.slack_bind_product(&first.binding_id, conv.product_conversation_id.as_str())
+                .await
+                .unwrap();
+            for n in 0..count {
+                let id = format!("q{n}");
+                sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at_unix_micros) VALUES (?1,?2,?1,'thread','Question','clarification','confirmed','{\"message_ts\":\"101.000\"}',1)").bind(&id).bind(&first.binding_id).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id) VALUES (?1,?1,?2)").bind(&id).bind(&conv.id).execute(db.pool()).await.unwrap();
+            }
+            let mut next = source("102.000", SlackRequestKind::Explicit);
+            next.instruction = "deploy staging".into();
+            db.accept_slack_source(&next, false).await.unwrap();
+            let accepted = db
+                .slack_requests(&original.workspace, &original.owner)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(accepted.source.instruction, "deploy staging");
+            assert_eq!(accepted.binding_id, first.binding_id);
+            assert!(accepted.question_id.is_none());
+            assert!(accepted.question_transcript.is_none());
+            assert!(accepted.failure.is_none());
+            assert!(!accepted.admitted);
         }
-        db.accept_slack_source(&source("102.000", SlackRequestKind::Explicit), false)
-            .await
-            .unwrap();
-        let rejected = db
-            .slack_requests(&original.workspace, &original.owner)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert!(!rejected.admitted);
-        assert!(rejected
-            .failure
-            .unwrap()
-            .contains("Ambiguous clarification"));
-        let outputs = db
-            .slack_returns(&original.workspace, &original.owner)
-            .await
-            .unwrap();
-        assert!(outputs.iter().any(
-            |o| o.request_ids == vec![rejected.request_id.clone()] && o.destination == "thread"
-        ));
-        db.update_conversation_state(&conv.id, &phoenix_core::domain::sm_state::ConvState::Idle)
-            .await
-            .unwrap();
-        db.accept_slack_source(&source("103.000", SlackRequestKind::Explicit), false)
-            .await
-            .unwrap();
-        let future = db
-            .slack_requests(&original.workspace, &original.owner)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert!(future.failure.is_none());
-        assert!(future.question_id.is_none());
     }
 
+    // REQ-SG-012/013: the handoff ends automatic publication for this request.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Follow one clarification through answer correlation, private isolation, and the next question's shared coverage.
-    async fn clarification_answer_retains_original_coverage_without_private_inheritance() {
+    #[allow(clippy::too_many_lines)]
+    async fn clarification_handoff_freezes_link_and_does_not_inherit_private_discussion() {
         use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
         let db = Database::open_in_memory().await.unwrap();
         let conv = db
-            .create_conversation("question", "question", "/tmp", true, None, None)
+            .create_conversation("handoff", "handoff", "/tmp", true, None, None)
             .await
             .unwrap();
         let original = source("100.000", SlackRequestKind::Explicit);
         db.accept_slack_source(&original, false).await.unwrap();
-        let first = db
+        let request = db
             .slack_requests(&original.workspace, &original.owner)
             .await
             .unwrap()
             .remove(0);
-        db.slack_bind_product(&first.binding_id, conv.product_conversation_id.as_str())
+        db.slack_bind_product(&request.binding_id, conv.product_conversation_id.as_str())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,state,delivery_proof,created_at_unix_micros) VALUES ('question-return',?1,'question','thread','Which label?','clarification','confirmed','{\"message_ts\":\"101.000\"}',1)")
-            .bind(&first.binding_id).execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) VALUES ('question-return',?1)").bind(&first.request_id).execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id) VALUES ('question-return','exact-question',?1)").bind(&conv.id).execute(db.pool()).await.unwrap();
-        db.accept_slack_source(&source("102.000", SlackRequestKind::Explicit), false)
+        db.slack_mark_admitted(&request.request_id, &conv.id)
             .await
             .unwrap();
-        let answer = db
-            .slack_requests(&original.workspace, &original.owner)
+        db.slack_eyes_confirmed(&request.request_id).await.unwrap();
+        sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body) VALUES (?1,'question','question',?2,'question','[{\"header\":\"Repo\",\"question\":\"Which repository?\",\"options\":[],\"multi_select\":false}]')")
+            .bind(&request.request_id).bind(&conv.id).execute(db.pool()).await.unwrap();
+        db.process_slack_native_outcomes("https://phoenix.example/")
+            .await
+            .unwrap();
+        let output = db
+            .slack_returns(&original.workspace, &original.owner)
             .await
             .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(answer.question_id.as_deref(), Some("exact-question"));
-        // This native input is persisted only after ordinary exact-question validation.
-        // Correlation must already work before the gateway marks answered_by on return.
-        db.add_message_with_seq_and_origin(
-            &answer.input_id,
-            &conv.id,
-            1,
-            &MessageContent::user("one"),
+            .remove(0);
+        assert!(output.text.contains("Which repository?"));
+        assert!(output.text.contains("Answer in Phoenix"));
+        assert!(output.text.ends_with(&format!(
+            "https://phoenix.example/c/{}",
+            conv.product_conversation_id
+        )));
+        assert_eq!(output.request_ids, vec![request.request_id.clone()]);
+        assert!(db
+            .slack_begin_return(&output.return_id, "first")
+            .await
+            .unwrap());
+        db.slack_finish_return(
+            &output.return_id,
+            "first",
+            SlackReturnState::KnownUnsent,
             None,
             None,
-            &InputOrigin::SlackGateway {
-                request_id: answer.request_id.clone(),
-            },
+            Some("not dispatched"),
         )
         .await
         .unwrap();
-        let mut tx = db.pool().begin().await.unwrap();
-        let mut covered = requests_for_native_input(&mut tx, &conv.id, &answer.input_id)
+        db.process_slack_native_outcomes("https://changed.example")
             .await
             .unwrap();
-        covered.sort();
-        let mut expected = vec![first.request_id, answer.request_id];
-        expected.sort();
-        assert_eq!(covered, expected);
-        tx.rollback().await.unwrap();
+        assert_eq!(
+            db.slack_returns(&original.workspace, &original.owner)
+                .await
+                .unwrap()[0]
+                .text,
+            output.text
+        );
+        assert!(db
+            .slack_begin_return(&output.return_id, "retry")
+            .await
+            .unwrap());
+        db.slack_finish_return(
+            &output.return_id,
+            "retry",
+            SlackReturnState::Confirmed,
+            Some("proof"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         db.add_message_with_seq_and_origin(
-            "private",
+            "private-answer",
             &conv.id,
-            2,
-            &MessageContent::user("Private follow-up"),
+            1,
+            &MessageContent::user("Use private-repo"),
             None,
             None,
             &InputOrigin::UserApi,
@@ -1706,35 +1750,68 @@ mod tests {
         .await
         .unwrap();
         let mut tx = db.pool().begin().await.unwrap();
-        assert!(requests_for_native_input(&mut tx, &conv.id, "private")
+        assert!(
+            requests_for_native_input(&mut tx, &conv.id, "private-answer")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        record_slack_native_outcome_tx(
+            &mut tx,
+            &conv.id,
+            "private-answer",
+            "private-complete",
+            "Completed",
+            false,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        db.process_slack_native_outcomes("https://changed.example")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.slack_returns(&original.workspace, &original.owner)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.set_slack_configuration(
+            r#"{"enabled":false,"workspace":"other.slack.com","owner":"UOTHER"}"#,
+        )
+        .await
+        .expect("confirmed handoff must not strand account switching");
+    }
+
+    // REQ-SG-012: a rejected creation has no conversation to link yet.
+    #[tokio::test]
+    async fn admission_failure_links_to_its_exact_return_status() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = source("100.000", SlackRequestKind::Explicit);
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
             .await
             .unwrap()
-            .is_empty());
-        tx.rollback().await.unwrap();
-        for request in &expected {
-            sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body) VALUES (?1,'next-question','question',?2,'next-question','[]')")
-                .bind(request).bind(&conv.id).execute(db.pool()).await.unwrap();
-        }
-        db.process_slack_native_outcomes().await.unwrap();
-        let mut coverage: Vec<String> = sqlx::query_scalar("SELECT c.request_id FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE o.occurrence_key='next-question'")
-            .fetch_all(db.pool()).await.unwrap();
-        coverage.sort();
-        assert_eq!(coverage, expected);
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM slack_gateway_returns WHERE occurrence_key='next-question'",
+            .remove(0);
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "creation unavailable",
+            "https://phoenix.example/",
         )
-        .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(count, 1);
-        db.process_slack_native_outcomes().await.unwrap();
-        let repeated: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM slack_gateway_returns WHERE occurrence_key='next-question'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(repeated, 1);
+        let output = db
+            .slack_returns(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(output.text.ends_with(&format!(
+            "https://phoenix.example/settings/slack#slack-return-{}",
+            output.return_id
+        )));
+        assert_eq!(output.request_ids, vec![request.request_id]);
     }
 
     #[tokio::test]

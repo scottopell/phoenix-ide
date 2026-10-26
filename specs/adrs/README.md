@@ -183,6 +183,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [146](146_bound-discovery-and-refresh-new-explicit-requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
 | [147](147_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Accepted | REQ-SG-015 |
 | [148](148_slack-gateway-uses-native-conversation-services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
+| [149](149_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Accepted | REQ-SG-012/013 |
 
 ## For agents: which decisions bind your task
 

@@ -40,9 +40,13 @@ Set the timezone before initialization; once its first sweep has started,
 changing the timezone requires that initialization finish first.
 
 Same-thread explicit requests reuse one ordinary conversation. Untriggered
-Slack replies do not wake it. Native questions return to Slack and require a
-new explicit trigger to answer. Phoenix follow-ups remain private unless an
-intentional Slack answer is selected for a new Slack request.
+Slack replies do not wake it. Clarifications return to Slack with an
+“Open in Phoenix” deep link: answer the question in that Phoenix conversation.
+Slack messages and reactions do not answer native questions. While a question
+blocks ordinary admission, new explicit requests receive an explanation and
+the Phoenix link. The clarification completes the automatic Slack response;
+further discussion in Phoenix remains private. Send a new explicit Slack
+request when you want another intentional answer published there.
 
 Discovery runs once per minute. A bounded newest-prefix-page check can find a
 new explicit request while an older sweep continues. Search indexing, saved
