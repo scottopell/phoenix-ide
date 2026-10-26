@@ -4151,6 +4151,7 @@ _LANE_DEFS = [
     ("ast-grep", {"UI", "RUST", "ASTGREP"}, "structural lint rules over ui/src/ + crates/"),
     ("allium", {"SPECS"}, "allium spec validation"),
     ("spec-shape", {"SPECS"}, "spEARS v2 artifact-shape validation"),
+    ("devpy", {"DEVTOOLS", "RUST"}, "dev.py orchestration and deployment tests"),
     # spec-anchors cross-validates REQ-* anchors in code against specs/, so a
     # change to either side can orphan or satisfy an anchor.
     ("spec-anchors", {"SPECS", "RUST", "UI"}, "REQ-* anchor cross-validation"),
@@ -4167,6 +4168,7 @@ _CI_LANE_GROUPS = {
     "rust": {"rust", "cargo-fmt"},
     "clippy": {"clippy"},
     "e2e": {"e2e"},
+    "devpy": {"devpy"},
     "ui": {"tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"},
     "fast": {"task"},
 }
@@ -4179,6 +4181,44 @@ _LANE_TO_CI_GROUP = {
 
 _LANE_ALIASES = {
     "fast": {"task"},
+    "devpy": {"devpy"},
+}
+
+_DEVPY_DEPENDENCY_PREFIXES = (
+    "scripts/",
+    "tests/devpy/",
+    "tests/integration/",
+    "skills/phoenix-adversarial-review/",
+    "specs/api/",
+    "specs/builtin-skills/",
+    "specs/global-recall/",
+    "crates/phoenix-skills/src/builtin/",
+)
+_DEVPY_DEPENDENCY_PATHS = {
+    ".agents/skills/phoenix-adversarial-review",
+    ".python-version",
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/phoenix-core/src/domain/sm_state.rs",
+    "crates/phoenix-core/src/llm_language.rs",
+    "crates/phoenix-db/src/migrations.rs",
+    "crates/phoenix-ide/Cargo.toml",
+    "crates/phoenix-ide/src/api/handlers.rs",
+    "crates/phoenix-ide/src/api/types.rs",
+    "crates/phoenix-ide/src/runtime/executor.rs",
+    "crates/phoenix-ide/src/runtime/executor/continuation.rs",
+    "crates/phoenix-ide/src/send_chat_service.rs",
+    "crates/phoenix-ide/src/system_prompt.rs",
+    "crates/phoenix-skills/src/builtin.rs",
+    "crates/phoenix-state-machine/src/transition.rs",
+    "pyproject.toml",
+    "rust-toolchain.toml",
+    "specs/adrs/113_coordinator-api-recipes-are-non-exhaustive.md",
+    "specs/compatibility/requirements.md",
+    "ui/package.json",
+    "ui/src/api.ts",
+    "ui/src/components/QuestionPanel.tsx",
+    "uv.lock",
 }
 
 
@@ -4211,16 +4251,10 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("TASKS")
         if p.startswith("specs/"):
             cats.add("SPECS")
-        if p.startswith("tests/devpy/"):
-            cats.add("SPECS")
+        if p in _DEVPY_DEPENDENCY_PATHS or p.startswith(_DEVPY_DEPENDENCY_PREFIXES):
+            cats.add("DEVTOOLS")
         if p in {"scripts/check_rust_test_timing.py", "scripts/check_manual_sql_transactions.py"}:
-            cats.update({"ASTGREP", "SPECS"})
-        if p in {
-            "scripts/check_profile_command.py",
-            "scripts/check_profile_report.py",
-            "scripts/python_unittest_profile.py",
-        }:
-            cats.add("SPECS")
+            cats.add("ASTGREP")
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
         if p.startswith("tests/e2e/") or p == "phoenix-client.py":
@@ -6392,15 +6426,17 @@ def cmd_check(
                 results.append(("spec shape", 0, elapsed, detail))
             reporter.step_done("spec-shape", "spec shape", 0, elapsed)
             finish_profile(0)
-            unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
-            if profile_work and _CHECK_PROFILE is not None:
-                unittest_cmd = [
-                    sys.executable,
-                    str(ROOT / "scripts" / "python_unittest_profile.py"),
-                    "discover",
-                    "tests/devpy",
-                ]
-            run_step("dev.py unit tests", unittest_cmd)
+
+    def check_devpy():
+        unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+        if profile_work and _CHECK_PROFILE is not None:
+            unittest_cmd = [
+                sys.executable,
+                str(ROOT / "scripts" / "python_unittest_profile.py"),
+                "discover",
+                "tests/devpy",
+            ]
+        run_step("dev.py unit tests", unittest_cmd)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
@@ -6700,6 +6736,7 @@ def cmd_check(
         ("ast-grep", check_ast_grep),
         ("allium", check_allium),
         ("spec-shape", check_spec_shape),
+        ("devpy", check_devpy),
         ("spec-anchors", check_spec_anchors),
         ("pkglock", check_package_lock_clean),
         ("e2e", lane_e2e),
@@ -7521,7 +7558,8 @@ _GRAPH_LANE_STEPS = {
     "vitest": ["vitest run"],
     "ast-grep": ["structural rules over ui/src/ + crates/"],
     "allium": ["allium analyse specs/*/*.allium"],
-    "spec-shape": ["spEARS v2 artifact-shape validation", "python unittest discover tests/devpy"],
+    "spec-shape": ["spEARS v2 artifact-shape validation"],
+    "devpy": ["python unittest discover tests/devpy"],
     "spec-anchors": ["REQ-* anchor cross-validation"],
     "e2e": ["uv run tests/e2e/run.py (real binary)"],
     "cargo-fmt": ["cargo fmt --check"],
@@ -7533,6 +7571,7 @@ _GRAPH_CATEGORY_LABELS = {
     "UI": "UI · ui/",
     "TASKS": "TASKS · tasks/",
     "SPECS": "SPECS · specs/",
+    "DEVTOOLS": "DEVTOOLS · dev.py tests and dependencies",
     "ASTGREP": "ASTGREP · ast-grep-rules/",
     "E2E": "E2E · tests/e2e/",
     "SELF": "SELF · dev.py/.github workflows",
