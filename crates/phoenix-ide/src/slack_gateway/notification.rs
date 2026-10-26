@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub(super) const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 #[derive(Serialize)]
 struct Request<'a> {
     version: u8,
@@ -160,7 +162,7 @@ async fn call(command: &[String], request: Request<'_>) -> Result<Response, Noti
         })?;
     let mut stdin = child.stdin.take().ok_or("Missing notification input")?;
     let stdout = child.stdout.take().ok_or("Missing notification output")?;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+    let result = tokio::time::timeout(COMMAND_TIMEOUT, async {
         stdin
             .write_all(&payload)
             .await

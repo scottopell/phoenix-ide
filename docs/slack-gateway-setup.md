@@ -121,6 +121,10 @@ The initial delivery check can run on the next recovery pass. Pending results
 and inspection errors defer another check for at least thirty seconds after
 completion, with that deadline retained across restart. Activity shows the
 earliest next check; terminal outcomes stop inspection.
+The pre-call reservation covers the maximum command duration and cooldown even
+if recording the result fails. Ready thread replies go first; each recovery pass
+starts at most one submitted-notice inspection, considering earlier deadlines
+before later ones so other due notices can progress.
 It must not echo credentials, private findings, raw provider headers or request
 bodies. The process timeout is 45 seconds and output is capped at 64 KiB.
 

@@ -517,9 +517,15 @@ impl Database {
         id: &str,
         receipt: &str,
         now_us: i64,
+        maximum_duration: std::time::Duration,
     ) -> DbResult<bool> {
+        let duration_us = i64::try_from(maximum_duration.as_micros()).map_err(|_| {
+            DbError::Serialization(
+                "Notification inspection duration exceeds timestamp range".into(),
+            )
+        })?;
         Ok(sqlx::query("UPDATE slack_gateway_returns SET notification_inspect_after_us=?4 WHERE return_id=?1 AND notification_receipt=?2 AND destination='private' AND state='submitted' AND (notification_inspect_after_us IS NULL OR notification_inspect_after_us<=?3)")
-            .bind(id).bind(receipt).bind(now_us).bind(now_us.saturating_add(NOTIFICATION_INSPECTION_INTERVAL_US)).execute(self.pool()).await?.rows_affected()==1)
+            .bind(id).bind(receipt).bind(now_us).bind(now_us.saturating_add(duration_us).saturating_add(NOTIFICATION_INSPECTION_INTERVAL_US)).execute(self.pool()).await?.rows_affected()==1)
     }
     pub async fn slack_observe_notification_return(
         &self,
@@ -1455,13 +1461,47 @@ mod tests {
         .unwrap();
         let now = chrono::Utc::now().timestamp_micros();
         assert!(!db
-            .slack_begin_notification_inspection(&output.return_id, "wrong", now)
+            .slack_begin_notification_inspection(
+                &output.return_id,
+                "wrong",
+                now,
+                std::time::Duration::from_secs(45)
+            )
             .await
             .unwrap());
         assert!(db
-            .slack_begin_notification_inspection(&output.return_id, "receipt", now)
+            .slack_begin_notification_inspection(
+                &output.return_id,
+                "receipt",
+                now,
+                std::time::Duration::from_secs(45)
+            )
             .await
             .unwrap());
+        sqlx::query("CREATE TRIGGER refuse_inspection_completion BEFORE UPDATE ON slack_gateway_returns WHEN NEW.failure='fixture timeout' BEGIN SELECT RAISE(ABORT,'transient completion write failure'); END").execute(db.pool()).await.unwrap();
+        assert!(db
+            .slack_observe_notification_return(
+                &output.return_id,
+                "receipt",
+                SlackNotificationObservation::ReadFailed {
+                    reason: "fixture timeout".into()
+                }
+            )
+            .await
+            .is_err());
+        assert!(!db
+            .slack_begin_notification_inspection(
+                &output.return_id,
+                "receipt",
+                now + 45_000_000,
+                std::time::Duration::from_secs(45)
+            )
+            .await
+            .unwrap());
+        sqlx::query("DROP TRIGGER refuse_inspection_completion")
+            .execute(db.pool())
+            .await
+            .unwrap();
         db.slack_observe_notification_return(
             &output.return_id,
             "receipt",
@@ -1485,11 +1525,21 @@ mod tests {
             .await
             .unwrap();
         assert!(!db
-            .slack_begin_notification_inspection(&output.return_id, "receipt", now + 1)
+            .slack_begin_notification_inspection(
+                &output.return_id,
+                "receipt",
+                now + 1,
+                std::time::Duration::from_secs(45)
+            )
             .await
             .unwrap());
         assert!(db
-            .slack_begin_notification_inspection(&output.return_id, "receipt", deadline)
+            .slack_begin_notification_inspection(
+                &output.return_id,
+                "receipt",
+                deadline,
+                std::time::Duration::from_secs(45)
+            )
             .await
             .unwrap());
         db.slack_observe_notification_return(
@@ -1505,7 +1555,8 @@ mod tests {
             .slack_begin_notification_inspection(
                 &output.return_id,
                 "receipt",
-                deadline + NOTIFICATION_INSPECTION_INTERVAL_US
+                deadline + NOTIFICATION_INSPECTION_INTERVAL_US,
+                std::time::Duration::from_secs(45)
             )
             .await
             .unwrap());

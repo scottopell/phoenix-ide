@@ -405,16 +405,36 @@ async fn dispatch_returns(
     identity_verified: bool,
 ) -> Result<(), String> {
     // Outbox dispatch is separate from discovery/admission; never reruns a turn.
-    for output in state
+    let mut outputs = state
         .db
         .slack_returns(&c.workspace, &c.owner)
         .await
-        .map_err(err)?
-    {
+        .map_err(err)?;
+    outputs.sort_by_key(|output| {
+        let priority = if output.destination == "thread" {
+            0
+        } else if output.state == phoenix_db::SlackReturnState::Submitted {
+            2
+        } else {
+            1
+        };
+        (
+            priority,
+            if priority == 2 {
+                output.notification_inspect_after_us
+            } else {
+                None
+            },
+        )
+    });
+    let mut inspected_private = false;
+    for output in outputs {
         if output.state == phoenix_db::SlackReturnState::Submitted
             && output.destination == "private"
         {
-            reconcile_notification_submission(state, &output).await?;
+            if !inspected_private {
+                inspected_private = reconcile_notification_submission(state, &output).await?;
+            }
             continue;
         }
         if !matches!(output.state.as_str(), "pending" | "known_unsent") {
@@ -531,7 +551,7 @@ async fn dispatch_returns(
 async fn reconcile_notification_submission(
     state: &AppState,
     output: &phoenix_db::SlackReturn,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if let Some(instance) = &output.notification_receipt {
         if !state
             .db
@@ -539,11 +559,12 @@ async fn reconcile_notification_submission(
                 &output.return_id,
                 instance,
                 chrono::Utc::now().timestamp_micros(),
+                super::notification::COMMAND_TIMEOUT,
             )
             .await
             .map_err(err)?
         {
-            return Ok(());
+            return Ok(false);
         }
         let observed = super::notification::observe(output)
             .await
@@ -555,8 +576,9 @@ async fn reconcile_notification_submission(
             .slack_observe_notification_return(&output.return_id, instance, observed)
             .await
             .map_err(err)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 enum ReturnAttempt {
     Thread,
@@ -785,6 +807,134 @@ mod tests {
         ProviderStreamTelemetry, Usage,
     };
     use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One trace proves reply priority, the inspection cap, and progress across retained notices.
+    async fn ready_thread_reply_precedes_one_fair_submitted_notice_inspection_per_pass() {
+        use std::io::Write;
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("operations");
+        let c = Config {
+            enabled: false,
+            mcp_server: "fixture".into(),
+            owner: "UFIXTURE".into(),
+            workspace: "fixture.slack.com".into(),
+            timezone: "UTC".into(),
+            phoenix_url: "https://phoenix.example".into(),
+            notification_command: None,
+        };
+        for n in 0..3 {
+            let source = phoenix_db::SlackSource {
+                workspace: c.workspace.clone(),
+                owner: c.owner.clone(),
+                channel: "CFIXTURE".into(),
+                message_ts: format!("100.{:06}", n + 1),
+                thread_ts: "100.000000".into(),
+                source_url: "https://fixture.slack.com/source".into(),
+                instruction: "fixture".into(),
+                context: "quoted".into(),
+                observed_at_unix_micros: 1,
+                kind: if n < 2 {
+                    SlackRequestKind::Briefing
+                } else {
+                    SlackRequestKind::Explicit
+                },
+                trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
+            };
+            state.db.accept_slack_source(&source, false).await.unwrap();
+            let request = state
+                .db
+                .slack_requests(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.source.message_ts == source.message_ts)
+                .unwrap();
+            state
+                .db
+                .fail_slack_before_admission(&request.request_id, "fixture", &c.phoenix_url)
+                .await
+                .unwrap();
+            if n < 2 {
+                let output = state
+                    .db
+                    .slack_returns(&c.workspace, &c.owner)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.request_ids.contains(&request.request_id))
+                    .unwrap();
+                let receipt = format!("receipt-{n}");
+                let response = serde_json::json!({"version":1,"notification_id":output.return_id,"owner":c.owner,"receipt":receipt,"state":"submitted"}).to_string();
+                let command = vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "cat >/dev/null; printf 'inspect-{n}\\n' >> '{}'; printf '%s' '{response}'",
+                        trace.display()
+                    ),
+                ];
+                state
+                    .db
+                    .slack_begin_notification_return(
+                        &output.return_id,
+                        "attempt",
+                        &command,
+                        "https://phoenix.example/frozen",
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                state
+                    .db
+                    .slack_finish_return(
+                        &output.return_id,
+                        "attempt",
+                        phoenix_db::SlackReturnState::Submitted,
+                        None,
+                        Some(&receipt),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let path = trace.clone();
+        let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+        slack.fixture = Some(Arc::new(move |tool, _| {
+            assert_eq!(tool, "slack_send_message");
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "thread"
+            )
+            .unwrap();
+            Ok(
+                serde_json::json!({"message_link":"https://fixture.slack.com/archives/CFIXTURE/p200000001?thread_ts=100.000000","message_context":{"channel_id":"CFIXTURE","message_ts":"200.000001"}}),
+            )
+        }));
+        dispatch_returns(&state, &c, &slack, true).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&trace)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["thread", "inspect-0"]
+        );
+        dispatch_returns(&state, &c, &slack, true).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&trace)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["thread", "inspect-0", "inspect-1"]
+        );
+        dispatch_returns(&state, &c, &slack, true).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&trace).unwrap().lines().count(), 3);
+    }
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // Compare pending and failed adapter reads through the same durable recovery sequence.
     async fn pending_and_failed_notification_inspections_wait_for_the_persisted_deadline() {

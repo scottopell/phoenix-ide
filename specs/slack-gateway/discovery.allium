@@ -104,6 +104,11 @@ contract NativeReconciliationPort {
     reconcile: (gateway: lifecycle/Gateway) -> Boolean
 
     @invariant AcceptedWorkFirst
+        -- Ready thread responses receive their dispatch opportunity before
+        -- submitted-notice inspection. A serialized reconciliation opportunity
+        -- may start at most one such inspection; a not-due row consumes no slot.
+        -- Due notice selection must allow later notices to progress rather than
+        -- repeatedly prefer an older pending notice whose deadline was renewed.
         -- Local admission/outcome reconciliation and ready return work receive
         -- an opportunity before a discovery burst. The result reports success;
         -- an error is recorded and does not authorize duplicate work. A failed

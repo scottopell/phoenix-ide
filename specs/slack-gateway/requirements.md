@@ -180,6 +180,8 @@ The first private notification attempt SHALL atomically persist its exact progra
 
 Submitted-notification inspection SHALL reserve a persisted next-inspection deadline before invoking the local adapter. The initial inspection MAY occur on the next service opportunity; pending results and inspection errors SHALL defer the next inspection by at least thirty seconds after completion. The deadline SHALL survive same-version restart and remain scoped to the exact return and submission receipt. Frequent local recovery passes SHALL NOT bypass it. Terminal notification outcomes SHALL stop inspection.
 
+The pre-call reservation SHALL cover the adapter's maximum call duration plus its completion cooldown, including when the completion write fails. Ready thread replies SHALL receive their dispatch opportunity before submitted-notification inspections. A serialized reconciliation opportunity SHALL start at most one such inspection, without allowing an older pending notice to starve other due notices.
+
 **Rationale:** A provider-neutral receipt can notify the owner without exposing private findings or coupling the gateway to a particular notification service.
 
 ### REQ-SG-016 — Keep the native experience inspectable

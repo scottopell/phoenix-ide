@@ -254,5 +254,14 @@ affected Rust tests pass, along with the full UI suite and final Clippy, model,
 formatting and structural checks. Fresh hosted CI and automatic review remain
 required for this batch; the production pilot has not been upgraded.
 
+Slow inspection now reserves through the adapter's canonical 45-second timeout
+plus cooldown, retaining a safe guard when recording completion fails. Ready
+thread replies dispatch first; each reconciliation pass starts at most one
+submitted-notice inspection, using earliest deadlines to let other due notices
+progress. The completion-write failure and multi-notice ordering regressions
+pass within all 434 affected Rust tests. Clippy, formatting, Allium and structural
+checks pass. This refinement adds no migration; exact-head hosted CI and review
+remain required before qualification is complete.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

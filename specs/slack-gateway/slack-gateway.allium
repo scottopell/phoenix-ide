@@ -451,10 +451,12 @@ rule ReserveNotificationInspection {
     requires: obligation.state = submitted
     requires: obligation.notification_receipt = instance
     requires: obligation.next_notification_inspection_at = null or obligation.next_notification_inspection_at <= now
-    ensures: obligation.next_notification_inspection_at = now + 30.seconds
+    ensures: obligation.next_notification_inspection_at = now + 45.seconds + 30.seconds
     @guidance
         -- Reserve before invoking the adapter. Retained deadlines prevent a
         -- restart or a frequent local recovery pass from starting another read.
+        -- Reserve through the adapter's maximum 45-second call plus cooldown,
+        -- so a failed completion write cannot leave an already-expired guard.
 }
 
 rule DeferNotificationInspection {
