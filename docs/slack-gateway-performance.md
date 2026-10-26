@@ -32,8 +32,10 @@ Larger search pages and caching identity across passes have not been introduced.
 ## Delivery and idle behavior
 
 Native conversation fixtures exercise intentional reply selection, the durable
-outbox and post-commit wakeup. Two queued replies use six logical calls and no
-trigger searches, including the identity-only workspace lookup. Local timings
+outbox and post-commit wakeup. Two queued replies use eight logical calls across
+two immediate service passes and no trigger searches, including independent
+identity/workspace verification on each active pass. Each pass starts at most one
+thread send before giving other gateway work its opportunity. Local timings
 exclude Slack network time. One hundred idle recovery
 checks make no MCP calls; production recovery checks occur every two seconds.
 

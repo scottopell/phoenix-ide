@@ -424,6 +424,7 @@ async fn dispatch_returns(
         )
     });
     let mut called_private = false;
+    let mut called_thread = false;
     for output in outputs {
         if output.destination == "private" && called_private {
             continue;
@@ -437,7 +438,9 @@ async fn dispatch_returns(
         if !matches!(output.state.as_str(), "pending" | "known_unsent") {
             continue;
         }
-        if output.destination == "thread" && (!identity_verified || !slack.can_call()) {
+        if output.destination == "thread"
+            && (called_thread || !identity_verified || !slack.can_call())
+        {
             continue;
         }
         // Missing notification command is visibly pending and is safe to resume.
@@ -453,6 +456,7 @@ async fn dispatch_returns(
         };
         match dispatch {
             ReturnAttempt::Thread => {
+                called_thread = true;
                 match slack
                     .send(&output.channel, &output.thread_ts, &output.text)
                     .await
@@ -939,7 +943,7 @@ mod tests {
             phoenix_url: "https://phoenix.example".into(),
             notification_command: None,
         };
-        for n in 0..3 {
+        for n in 0..4 {
             let source = phoenix_db::SlackSource {
                 workspace: c.workspace.clone(),
                 owner: c.owner.clone(),
@@ -1017,6 +1021,7 @@ mod tests {
         }
         let path = trace.clone();
         let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+        let sends = std::sync::atomic::AtomicUsize::new(1);
         slack.fixture = Some(Arc::new(move |tool, _| {
             assert_eq!(tool, "slack_send_message");
             writeln!(
@@ -1028,8 +1033,9 @@ mod tests {
                 "thread"
             )
             .unwrap();
+            let n = sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(
-                serde_json::json!({"message_link":"https://fixture.slack.com/archives/CFIXTURE/p200000001?thread_ts=100.000000","message_context":{"channel_id":"CFIXTURE","message_ts":"200.000001"}}),
+                serde_json::json!({"message_link":format!("https://fixture.slack.com/archives/CFIXTURE/p200{n:06}?thread_ts=100.000000"),"message_context":{"channel_id":"CFIXTURE","message_ts":format!("200.{n:06}")}}),
             )
         }));
         dispatch_returns(&state, &c, &slack, true).await.unwrap();
@@ -1046,10 +1052,10 @@ mod tests {
                 .unwrap()
                 .lines()
                 .collect::<Vec<_>>(),
-            vec!["thread", "inspect-0", "inspect-1"]
+            vec!["thread", "inspect-0", "thread", "inspect-1"]
         );
         dispatch_returns(&state, &c, &slack, true).await.unwrap();
-        assert_eq!(std::fs::read_to_string(&trace).unwrap().lines().count(), 3);
+        assert_eq!(std::fs::read_to_string(&trace).unwrap().lines().count(), 4);
     }
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // Compare pending and failed adapter reads through the same durable recovery sequence.
@@ -1624,6 +1630,18 @@ mod tests {
         }));
         let started = std::time::Instant::now();
         tick(&state, &c, &slack, Pass::Delivery).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.state == phoenix_db::SlackReturnState::Confirmed)
+                .count(),
+            1
+        );
+        tick(&state, &c, &slack, Pass::Delivery).await.unwrap();
         println!(
             "READY_DELIVERY queued=2 calls={} pages={} elapsed_ms={}",
             slack.calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -1641,6 +1659,7 @@ mod tests {
             .all(|r| r.state == phoenix_db::SlackReturnState::Confirmed));
         assert_eq!(slack.pages.load(std::sync::atomic::Ordering::Relaxed), 0);
         let calls = slack.calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(calls, 8);
         tick(&state, &c, &slack, Pass::Delivery).await.unwrap();
         assert_eq!(
             slack.calls.load(std::sync::atomic::Ordering::Relaxed),

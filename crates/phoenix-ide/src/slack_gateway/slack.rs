@@ -739,7 +739,7 @@ fn parse_page(v: &Value, c: &Config) -> Result<Page, String> {
             observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
         });
     }
-    if hits.is_empty() && !results.contains("No results found") {
+    if hits.is_empty() && results.trim() != "No results found" {
         return Err("Unrecognized Slack search format".into());
     }
     Ok(Page { hits, cursor })
@@ -1537,6 +1537,31 @@ mod tests {
         assert_eq!(strip_fire("  🔥 ask"), Some(" ask"));
         assert!(strip_fire("quote 🔥 ask").is_none());
         assert_eq!(strip_fire(":fire: ask"), Some(" ask"));
+    }
+    #[test]
+    fn empty_search_requires_the_exact_connector_sentinel() {
+        for results in ["No results found", "  No results found\n"] {
+            assert!(parse_page(
+                &json!({"results":results,"pagination_info":"End of results"}),
+                &config()
+            )
+            .unwrap()
+            .hits
+            .is_empty());
+        }
+        for results in [
+            "",
+            "Error: No results found was expected",
+            "No results found; response truncated",
+            "No results",
+            "Quoted: No results found",
+        ] {
+            assert!(parse_page(
+                &json!({"results":results,"pagination_info":"End of results"}),
+                &config()
+            )
+            .is_err());
+        }
     }
     #[test]
     fn search_keeps_exact_thread_and_requires_pagination() {

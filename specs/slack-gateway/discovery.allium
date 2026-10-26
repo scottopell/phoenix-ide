@@ -92,6 +92,9 @@ contract SlackDiscoveryPort {
         -- Prefix and owner-reaction searches cover the accessible eligible
         -- window. Their search boundary is retained for each ongoing sweep;
         -- source validation still rejects messages that have aged out.
+        -- An empty search is established only by the exact connector sentinel,
+        -- with surrounding whitespace allowed. Unrecognized or truncated text
+        -- containing that phrase does not authorize advancing page progress.
         -- Search observes current provider state, not a stable snapshot or an
         -- event log. Completion proves pagination ended, not that later arrivals
         -- or late indexing have been observed. Removed triggers may be missed.
@@ -104,7 +107,9 @@ contract NativeReconciliationPort {
     reconcile: (gateway: lifecycle/Gateway) -> Boolean
 
     @invariant AcceptedWorkFirst
-        -- Ready thread responses receive their dispatch opportunity before
+        -- Each reconciliation opportunity starts at most one thread-delivery
+        -- attempt; remaining replies retain their opportunity on later passes.
+        -- The eligible thread-delivery attempt receives its opportunity before
         -- any private notification command. A serialized reconciliation opportunity
         -- may start at most one submission or inspection; a not-due row consumes
         -- no slot. Shared deadline ordering allows other due notices to progress

@@ -286,5 +286,17 @@ additional persisted state is introduced. Normal per-push automatic review and
 exact-head hosted CI remain the final qualification checks; unavailable review
 verdict metadata is reported separately from posted findings and thread resolution.
 
+Empty search results now require the exact connector sentinel (with surrounding
+whitespace allowed); malformed explanations containing that phrase remain
+retryable. Each service pass starts at most one thread-delivery attempt before
+private notification and acknowledgment/discovery opportunities. All 609 affected
+Rust tests pass, along with final Clippy, formatting, structural and model checks.
+The native two-reply fixture confirms eight logical calls across two immediate
+passes, zero discovery pages, and no calls on the following idle pass. This adds
+two identity-verification calls relative to dispatching both replies in one pass;
+the controlled discovery backlog remains sixteen calls across two passes. No
+migration or additional persisted state is introduced. Normal automatic review
+and exact-head hosted CI remain required; production is not redeployed.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.
