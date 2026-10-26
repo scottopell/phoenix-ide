@@ -182,6 +182,8 @@ THE SYSTEM SHALL pass notification content through a versioned input protocol ra
 
 THE SYSTEM SHALL expose gateway-created work as ordinary Phoenix conversations with source Slack links, the accepted request, and a private-briefing or source-thread reply destination. It SHALL show request acceptance, admission, output, and delivery failures without requiring a separate Slack inbox or dedicated agent runtime.
 
+Conversation links SHALL use the native ordinary-route eligibility boundary, including completed publication. A reserved identity or physical product row during pending or failed initial delivery SHALL NOT imply a routable conversation. Until eligible, generated handoff links SHALL target the exact return status.
+
 THE SYSTEM SHALL use shared internal application services for conversation creation, target resolution, attributed admission, and outcome reads, extracting shared operations from HTTP handlers where necessary. It SHALL reuse the configured MCP client for Slack operations and SHALL NOT duplicate permission, execution, or conversation lifecycle ownership in the gateway.
 
 **Rationale:** The owner can understand and continue the work through the native conversation interface while adapters remain replaceable.
@@ -195,6 +197,8 @@ THE SYSTEM SHALL NOT promise a fixed discovery latency or complete event capture
 Ready responses SHALL be reconciled independently of waiting for the next discovery interval. Their Slack operations SHALL share the gateway's finite call allowance and persisted retry deadline with discovery. Previously recorded source identities, including baseline identities, SHALL be skipped before fetching additional source context. Pagination SHALL preserve progress for both trigger searches without allowing one search to starve the other.
 
 The gateway's owner-facing read-access inspection SHALL share that allowance, serialization and persisted retry deadline, without accepting triggers or advancing discovery. Direct agent or manual MCP tool calls are outside this gateway allowance.
+
+Inspection SHALL report sampled hits and verified sources for each query, and distinguish successful search from demonstrated source and reaction reads. Empty or unverified samples SHALL be inconclusive about read access. Accepted sources SHALL retain verified prefix/reaction provenance independently of request kind; historical unknown provenance SHALL NOT be inferred from message age or used for prefix-age metrics.
 
 Ready return delivery SHALL receive an opportunity before acknowledgment retries can exhaust allowance or introduce a new provider delay. Retry deadlines SHALL apply to the configured owner/workspace, rather than another retained account. Non-throttling discovery failures SHALL be reported as failed rather than provider backoff. A startup recovery failure SHALL remain visible and be retried without requiring a Phoenix restart; no external work SHALL begin before that recovery succeeds.
 

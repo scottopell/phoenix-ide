@@ -1,6 +1,7 @@
 //! Normalized Slack acceptance and return evidence (REQ-SG-005/007/011/013).
 #![allow(clippy::missing_errors_doc)]
 use super::{Database, DbError, DbResult};
+use crate::product_conversation_read::ORDINARY_PRODUCT_ROUTE_PREDICATE;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -21,6 +22,31 @@ impl SlackRequestKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackTriggerKind {
+    Prefix,
+    Reaction,
+    UnknownHistorical,
+}
+impl SlackTriggerKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::Reaction => "reaction",
+            Self::UnknownHistorical => "unknown_historical",
+        }
+    }
+    fn decode(value: &str) -> Result<Self, sqlx::Error> {
+        match value {
+            "prefix" => Ok(Self::Prefix),
+            "reaction" => Ok(Self::Reaction),
+            "unknown_historical" => Ok(Self::UnknownHistorical),
+            _ => Err(sqlx::Error::Decode("Invalid Slack trigger kind".into())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackSource {
     pub workspace: String,
@@ -33,6 +59,7 @@ pub struct SlackSource {
     pub context: String,
     pub observed_at_unix_micros: i64,
     pub kind: SlackRequestKind,
+    pub trigger_kind: SlackTriggerKind,
 }
 /// Evidence needed before a discovery page can advance past a verified source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +74,7 @@ pub struct SlackRequest {
     pub binding_id: String,
     pub creation_id: String,
     pub product_id: Option<String>,
-    pub product_exists: bool,
+    pub conversation_available: bool,
     pub input_id: String,
     pub transcript_id: Option<String>,
     pub admitted: bool,
@@ -128,7 +155,7 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
         creation_id: r.try_get("creation_id")?,
         input_id: r.try_get("input_id")?,
         product_id: r.try_get("product_id")?,
-        product_exists: r.try_get("product_exists")?,
+        conversation_available: r.try_get("conversation_available")?,
         transcript_id: r.try_get("transcript_id")?,
         admitted: r.try_get::<String, _>("admission_state")? == "admitted",
         accepted_at_us: r.try_get("accepted_at_unix_micros")?,
@@ -137,6 +164,7 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
         question_id: r.try_get("question_id")?,
         question_transcript: r.try_get("question_transcript")?,
         source: SlackSource {
+            trigger_kind: SlackTriggerKind::decode(&r.try_get::<String, _>("trigger_kind")?)?,
             workspace: r.try_get("workspace")?,
             owner: r.try_get("owner")?,
             channel: r.try_get("channel")?,
@@ -287,6 +315,11 @@ impl Database {
             tx.rollback().await?;
             return Ok(SlackSourceAcceptance::Recorded);
         }
+        if source.trigger_kind == SlackTriggerKind::UnknownHistorical {
+            return Err(DbError::Serialization(
+                "New Slack sources require verified trigger provenance".into(),
+            ));
+        }
         let request = uuid::Uuid::new_v4().to_string();
         let binding = if source.kind == SlackRequestKind::Explicit && !baseline {
             sqlx::query_scalar::<_,String>("SELECT binding_id FROM slack_gateway_bindings WHERE workspace=?1 AND owner=?2 AND channel=?3 AND thread_ts=?4 AND kind='explicit'")
@@ -298,8 +331,8 @@ impl Database {
             sqlx::query("INSERT INTO slack_gateway_bindings(binding_id,workspace,owner,channel,thread_ts,kind,creation_id) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(binding_id) DO NOTHING")
                 .bind(&binding).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.thread_ts).bind(source.kind.as_str()).bind(uuid::Uuid::new_v4().to_string()).execute(&mut *tx).await?;
         }
-        sqlx::query("INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,source_url,binding_id,accepted_at_unix_micros,input_id,context,observed_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,COALESCE((SELECT first_observed_at_unix_micros FROM slack_gateway_observations WHERE workspace=?2 AND owner=?3 AND channel=?4 AND message_ts=?5),?14))")
-            .bind(&request).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(&source.thread_ts).bind(if baseline {"baseline"}else{source.kind.as_str()}).bind(&source.instruction).bind(&source.source_url).bind(if baseline {None}else{Some(&binding)}).bind(chrono::Utc::now().timestamp_micros()).bind(uuid::Uuid::new_v4().to_string()).bind(&source.context).bind(source.observed_at_unix_micros).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO slack_gateway_requests(request_id,workspace,owner,channel,message_ts,thread_ts,kind,instruction,source_url,binding_id,accepted_at_unix_micros,input_id,context,observed_at_unix_micros,trigger_kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,COALESCE((SELECT first_observed_at_unix_micros FROM slack_gateway_observations WHERE workspace=?2 AND owner=?3 AND channel=?4 AND message_ts=?5),?14),?15)")
+            .bind(&request).bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).bind(&source.thread_ts).bind(if baseline {"baseline"}else{source.kind.as_str()}).bind(&source.instruction).bind(&source.source_url).bind(if baseline {None}else{Some(&binding)}).bind(chrono::Utc::now().timestamp_micros()).bind(uuid::Uuid::new_v4().to_string()).bind(&source.context).bind(source.observed_at_unix_micros).bind(source.trigger_kind.as_str()).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM slack_gateway_observations WHERE workspace=?1 AND owner=?2 AND channel=?3 AND message_ts=?4")
             .bind(&source.workspace).bind(&source.owner).bind(&source.channel).bind(&source.message_ts).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -310,7 +343,8 @@ impl Database {
         workspace: &str,
         owner: &str,
     ) -> DbResult<Vec<SlackRequest>> {
-        Ok(sqlx::query("SELECT r.*, b.creation_id, b.product_id, EXISTS(SELECT 1 FROM product_conversations p WHERE p.id=b.product_id) AS product_exists FROM slack_gateway_requests r JOIN slack_gateway_bindings b USING(binding_id) WHERE r.workspace=?1 AND r.owner=?2 ORDER BY r.accepted_at_unix_micros")
+        // Interpolation is limited to native routing's static predicate; inputs stay bound.
+        Ok(sqlx::query(sqlx::AssertSqlSafe(format!("SELECT r.*, b.creation_id, b.product_id, EXISTS(SELECT 1 FROM product_conversations p JOIN conversations c ON c.product_conversation_id=p.id WHERE p.id=b.product_id AND {ORDINARY_PRODUCT_ROUTE_PREDICATE}) AS conversation_available FROM slack_gateway_requests r JOIN slack_gateway_bindings b USING(binding_id) WHERE r.workspace=?1 AND r.owner=?2 ORDER BY r.accepted_at_unix_micros")))
             .bind(workspace).bind(owner).try_map(|r| request_row(&r)).fetch_all(self.pool()).await?)
     }
     pub async fn slack_bind_product(&self, binding: &str, product: &str) -> DbResult<()> {
@@ -436,7 +470,7 @@ impl Database {
         Ok(actual)
     }
     pub async fn slack_returns(&self, workspace: &str, owner: &str) -> DbResult<Vec<SlackReturn>> {
-        Ok(sqlx::query("SELECT o.*,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p WHERE p.id=b.product_id)) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")
+        Ok(sqlx::query(sqlx::AssertSqlSafe(format!("SELECT o.*,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p JOIN conversations c ON c.product_conversation_id=p.id WHERE p.id=b.product_id AND {ORDINARY_PRODUCT_ROUTE_PREDICATE})) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")))
             .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
     }
     pub async fn slack_begin_return(&self, id: &str, attempt: &str) -> DbResult<bool> {
@@ -879,10 +913,11 @@ async fn slack_thread_response_tx(
     text: &str,
     phoenix_origin: &str,
 ) -> DbResult<String> {
+    // Use the same static route predicate as native resolution, with bound identity.
     let product: Option<String> =
-        sqlx::query_scalar("SELECT p.id FROM slack_gateway_bindings b LEFT JOIN product_conversations p ON p.id=b.product_id WHERE b.binding_id=?1")
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT p.id FROM slack_gateway_bindings b JOIN product_conversations p ON p.id=b.product_id JOIN conversations c ON c.product_conversation_id=p.id WHERE b.binding_id=?1 AND {ORDINARY_PRODUCT_ROUTE_PREDICATE} LIMIT 1")))
             .bind(binding)
-            .fetch_one(&mut **tx)
+            .fetch_optional(&mut **tx)
             .await?;
     let origin = phoenix_origin.trim_end_matches('/');
     let url = product.map_or_else(
@@ -1452,8 +1487,31 @@ mod tests {
             instruction: "investigate".into(),
             context: "quoted source".into(),
             observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
+            trigger_kind: if kind == SlackRequestKind::Explicit {
+                SlackTriggerKind::Prefix
+            } else {
+                SlackTriggerKind::Reaction
+            },
             kind,
         }
+    }
+    #[tokio::test]
+    async fn source_identity_retains_first_verified_trigger_provenance() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut source = source("100.000001", SlackRequestKind::Explicit);
+        source.trigger_kind = SlackTriggerKind::Reaction;
+        db.accept_slack_source(&source, false).await.unwrap();
+        source.trigger_kind = SlackTriggerKind::Prefix;
+        db.accept_slack_source(&source, false).await.unwrap();
+        let stored = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].source.trigger_kind, SlackTriggerKind::Reaction);
+        source.message_ts = "100.000002".into();
+        source.trigger_kind = SlackTriggerKind::UnknownHistorical;
+        assert!(db.accept_slack_source(&source, false).await.is_err());
     }
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // Keep terminal checkpoint and recovery assertions together for each fixture.
@@ -2337,7 +2395,8 @@ mod tests {
 
     // REQ-SG-012: a rejected creation has no conversation to link yet.
     #[tokio::test]
-    async fn request_status_links_require_a_currently_existing_product() {
+    #[allow(clippy::too_many_lines)] // One lifecycle fixture compares status and generated links with native routing.
+    async fn request_status_links_require_native_publication() {
         let db = Database::open_in_memory().await.unwrap();
         let source = source("100.000", SlackRequestKind::Explicit);
         db.accept_slack_source(&source, false).await.unwrap();
@@ -2355,7 +2414,7 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(pending.product_id.as_deref(), Some("reserved-product"));
-        assert!(!pending.product_exists);
+        assert!(!pending.conversation_available);
         db.fail_slack_before_admission(
             &request.request_id,
             "creation failed",
@@ -2367,7 +2426,7 @@ mod tests {
             !db.slack_requests(&source.workspace, &source.owner)
                 .await
                 .unwrap()[0]
-                .product_exists
+                .conversation_available
         );
         let product = db
             .create_conversation("linked", "linked", "/tmp", true, None, None)
@@ -2383,8 +2442,54 @@ mod tests {
             db.slack_requests(&source.workspace, &source.owner)
                 .await
                 .unwrap()[0]
-                .product_exists
+                .conversation_available
         );
+        sqlx::query("INSERT INTO product_creation_jobs(request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros, published_product_id, published_conversation_id, provisioning_stage, stage_updated_at_unix_micros, objective_origin) VALUES (?1,?2,'/tmp','','phoenix-native','delivery_pending',1,1,?2,?3,'bootstrap_initial_turn',1,'user_api')")
+            .bind(&request.creation_id).bind(product.product_conversation_id.as_str()).bind(&product.id).execute(db.pool()).await.unwrap();
+        for (status, available) in [
+            ("delivery_pending", false),
+            ("delivery_failed", false),
+            ("published", true),
+        ] {
+            sqlx::query("UPDATE product_creation_jobs SET status=?1 WHERE request_id=?2")
+                .bind(status)
+                .bind(&request.creation_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.resolve_ordinary_product_conversation(product.product_conversation_id.as_str())
+                    .await
+                    .is_ok(),
+                available
+            );
+            assert_eq!(
+                db.slack_requests(&source.workspace, &source.owner)
+                    .await
+                    .unwrap()[0]
+                    .conversation_available,
+                available
+            );
+            assert_eq!(
+                db.slack_returns(&source.workspace, &source.owner)
+                    .await
+                    .unwrap()[0]
+                    .published,
+                available
+            );
+            let mut tx = db.pool().begin().await.unwrap();
+            let text = slack_thread_response_tx(
+                &mut tx,
+                &request.binding_id,
+                "test-return",
+                "test",
+                "https://phoenix.example",
+            )
+            .await
+            .unwrap();
+            assert_eq!(text.contains("/c/"), available);
+            tx.rollback().await.unwrap();
+        }
         sqlx::query("DELETE FROM conversations WHERE id=?1")
             .bind(&product.id)
             .execute(db.pool())
@@ -2404,7 +2509,7 @@ mod tests {
             deleted.product_id,
             Some(product.product_conversation_id.to_string())
         );
-        assert!(!deleted.product_exists);
+        assert!(!deleted.conversation_available);
     }
 
     #[tokio::test]

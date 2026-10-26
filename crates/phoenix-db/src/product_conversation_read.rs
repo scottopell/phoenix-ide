@@ -10,6 +10,9 @@ use tracing::Instrument;
 
 use crate::{CloseProjection, Database, DbError, DbResult, MessageContent, MessageType};
 
+// Shared by native routing and integrations that offer native conversation links.
+pub(crate) const ORDINARY_PRODUCT_ROUTE_PREDICATE: &str = "p.kind = 'ordinary' AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProductConversation {
     pub product_conversation_id: ProductConversationId,
@@ -433,19 +436,16 @@ impl Database {
         &self,
         reference: &str,
     ) -> DbResult<ResolvedProductConversation> {
-        let row = sqlx::query(
+        // Only the shared static predicate is interpolated; the reference stays bound.
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT c.product_conversation_id, c.id
              FROM conversations c
              JOIN product_conversations p ON p.id = c.product_conversation_id
-             WHERE p.kind = 'ordinary'
-               AND c.runtime_role = 'user'
-               AND c.parent_conversation_id IS NULL
-               AND NOT EXISTS (SELECT 1 FROM product_creation_jobs creation
-                   WHERE creation.product_conversation_id = p.id AND creation.status <> 'published')
+             WHERE {ORDINARY_PRODUCT_ROUTE_PREDICATE}
                AND (p.id = ?1 OR c.id = ?1 OR c.slug = ?1)
              ORDER BY CASE WHEN p.id = ?1 THEN 0 WHEN c.id = ?1 THEN 1 ELSE 2 END, c.id ASC
              LIMIT 1",
-        )
+        )))
         .bind(reference)
         .fetch_optional(&self.pool)
         .await?;

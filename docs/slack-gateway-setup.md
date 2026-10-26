@@ -10,8 +10,10 @@ an existing MCP server, your Slack user ID, the exact workspace permalink host,
 your IANA timezone and the Phoenix origin, such as `https://phoenix.example`
 or `https://localhost:8031`, without a path, query or fragment.
 Slack owner IDs beginning with either `U` or `W` are supported.
-The read-access check verifies identity
-and source access without accepting requests or changing Slack.
+The read-access check verifies identity and samples both discovery queries
+without accepting requests or changing Slack. It reports sampled hits and
+verified sources; empty or unverified samples are inconclusive about source
+access. Reaction access is reported only after an actual successful read.
 It shares the gateway's call allowance and provider retry deadline, so an
 exhausted allowance or active retry delay can postpone the check.
 
@@ -38,6 +40,10 @@ dates in your timezone. Leave fire attached until eyes appears. Removing fire
 after acceptance does not cancel native work.
 Set the timezone before initialization; once its first sweep has started,
 changing the timezone requires that initialization finish first.
+
+Status separates observed-to-accept delay from prefix-message age at observation.
+Message age is shown only for verified prefix triggers; historical requests with
+unknown trigger provenance do not acquire a guessed measurement.
 
 Same-thread explicit requests reuse one ordinary conversation. Untriggered
 Slack replies do not wake it. Clarifications return to Slack with an
@@ -120,8 +126,8 @@ Keep only one Phoenix instance watching the same owner.
 Disabling discovery stops new acceptance while accepted work continues.
 Unknown external outcomes remain visible for inspection rather than resend.
 Source-verification failures remain visible in settings and retain their page
-for retry. Gateway status offers a conversation link only while that product
-exists; pending creation, creation failures and deleted targets remain inspectable
+for retry. Gateway status offers a conversation link only while native routing
+can open the published conversation; pending or failed initial delivery and deleted targets remain inspectable
 on the status page.
 Production activation must qualify its actual installed schema transition and
 preserve installed configuration and credentials. See the feature executive

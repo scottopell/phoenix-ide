@@ -72,6 +72,11 @@ contract SlackDiscoveryPort {
         -- An unverified actor is not verified absence: a reaction-dependent
         -- candidate retains its page for retry. An independently verified owner
         -- prefix can authorize the source without that reaction evidence.
+        -- Unambiguous owner prefixes require no reaction read. A possible
+        -- connector footer still needs metadata to isolate literal source text;
+        -- unavailable metadata retains that candidate for retry.
+        -- Persist verified trigger provenance independently of request kind;
+        -- historical unknown provenance cannot imply prefix-message age.
         -- A source reply must also be observed under its claimed root; the
         -- search permalink alone does not establish that return destination.
         -- Eligibility uses the current and preceding three calendar dates in
@@ -80,6 +85,8 @@ contract SlackDiscoveryPort {
         -- Candidate instruction evidence contains the exact source body, without
         -- child replies. Reaction-shaped owner text is retained; stripping a
         -- connector reaction trailer requires independent reaction evidence.
+        -- Context labels distinguish bounded top-level discussion from a
+        -- reply's parent-plus-exact-reply scope and expose pagination/truncation.
 
     @invariant QueryBoundary
         -- Prefix and owner-reaction searches cover the accessible eligible

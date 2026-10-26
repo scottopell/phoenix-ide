@@ -57,7 +57,7 @@ adversarial author review found and fixed inactive acceptance being mistaken
 for recorded evidence and acknowledgment throttling losing its backoff status.
 These author reviews are not independent sign-off or a formal liveness proof.
 
-The public candidate adds migrations 132 and 133 after upstream's migration 131, replaces
+The public candidate adds migrations 132–134 after upstream's migration 131, replaces
 the personal notifier with a provider-neutral command, and adds bounded
 newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
 Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
@@ -118,7 +118,7 @@ provide automatic database rollback or qualify a generic 127-to-130 route.
 That pilot's migration 130 is the pre-publication Slack allocation. Upstream
 subsequently assigned 130 and 131 to continuation/capacity data; this branch
 allocates Slack at 132 while preserving the upstream migrations and Slack SQL,
-then adds first-observation metadata at 133.
+then adds first-observation metadata at 133 and trigger provenance at 134.
 The pilot ledger is not the public candidate's ledger. No direct upgrade from
 that pilot to the merged candidate is qualified; it requires separate offline
 reconciliation and validation before any later production deployment.
@@ -216,6 +216,20 @@ conversation links for reserved, failed or deleted targets. All 400 affected
 MCP/gateway, migration and creation-replay tests pass, along with full UI tests,
 type checking, linting, Clippy, formatting, Allium and structural/timing checks.
 Exact-head hosted CI and automatic review remain open for this batch.
+
+The following review extends link eligibility to the native route's publication
+boundary, shared by status, thread handoffs and private notice links. Verified
+prefixes no longer depend on reaction access unless a possible connector footer
+needs independent metadata to isolate literal owner text; unavailable metadata
+retains that candidate for retry. Migration 134 preserves verified prefix or
+reaction provenance, while historical rows remain unknown. Status exposes
+prefix-message age only for known prefixes, reports empty read-access samples
+as inconclusive, and distinguishes top-level discussion from parent-plus-reply
+context. All 427 affected MCP/gateway, native-route, migration and creation-replay
+tests pass, along with full UI tests, the final eight settings regressions, type
+checking, linting, Clippy, formatting, Allium and structural/timing checks.
+This batch requires new exact-head hosted CI and automatic review;
+the separately pinned production pilot has not been upgraded.
 
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

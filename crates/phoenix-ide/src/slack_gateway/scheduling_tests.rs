@@ -154,6 +154,7 @@ async fn startup_recovery_retries_a_database_failure_without_restarting_phoenix(
         context: "fixture".into(),
         observed_at_unix_micros: 1,
         kind: phoenix_db::SlackRequestKind::Briefing,
+        trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
     };
     // Seed accepted work before pausing its discovery configuration.
     state.db.accept_slack_source(&source, false).await.unwrap();
@@ -258,6 +259,7 @@ async fn ready_reply_precedes_exhausting_or_throttled_eyes_retries() {
                 context: "fixture".into(),
                 observed_at_unix_micros: 1,
                 kind: phoenix_db::SlackRequestKind::Explicit,
+                trigger_kind: phoenix_db::SlackTriggerKind::Prefix,
             };
             state.db.accept_slack_source(&source, false).await.unwrap();
         }
@@ -421,6 +423,7 @@ async fn backlog() -> Backlog {
                 context: "fixture".into(),
                 observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
                 kind: phoenix_db::SlackRequestKind::Briefing,
+                trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
             }
         })
         .collect();
@@ -467,6 +470,7 @@ async fn deleted_hit_does_not_block_baseline_or_a_later_page() {
         context: "context".into(),
         observed_at_unix_micros: 1,
         kind: phoenix_db::SlackRequestKind::Briefing,
+        trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
     });
     let fixture = reaction_fixture(sources.to_vec(), Arc::new(Mutex::new(Vec::new())));
     let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);

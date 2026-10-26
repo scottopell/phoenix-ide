@@ -99,6 +99,7 @@ async fn inspect_reads(
     let after =
         (chrono::Utc::now().with_timezone(&tz).date_naive() - chrono::Days::new(4)).to_string();
     let mut checks = Vec::new();
+    let mut reaction_read_verified = false;
     for reactions in [false, true] {
         let page = slack
             .search(c, reactions, None, &after)
@@ -106,18 +107,25 @@ async fn inspect_reads(
             .map_err(AppError::BadRequest)?;
         let mut verified = 0;
         for hit in &page.hits {
-            if slack
+            if let Some(source) = slack
                 .source(c, hit, reactions)
                 .await
                 .map_err(AppError::BadRequest)?
-                .is_some()
             {
                 verified += 1;
+                if source.reaction_read_verified {
+                    reaction_read_verified = true;
+                } else if !reaction_read_verified {
+                    reaction_read_verified = slack
+                        .inspect_reaction_access(c, hit)
+                        .await
+                        .map_err(AppError::BadRequest)?;
+                }
             }
         }
         checks.push(serde_json::json!({"query":if reactions {"fire reactions"} else {"owner fire messages"},"first_page_hits":page.hits.len(),"verified_sources":verified,"more_pages":page.cursor.is_some()}));
     }
     Ok(Json(
-        serde_json::json!({"owner_verified":true,"checks":checks,"calls":slack.calls.load(std::sync::atomic::Ordering::Relaxed),"gateway_activated":false}),
+        serde_json::json!({"owner_verified":true,"checks":checks,"reaction_read_verified":reaction_read_verified,"calls":slack.calls.load(std::sync::atomic::Ordering::Relaxed),"gateway_activated":false}),
     ))
 }

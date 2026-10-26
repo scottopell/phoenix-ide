@@ -56,8 +56,9 @@ allowance as ordinary catch-up. It needs twelve remaining calls: at most four
 for its page, four for a catch-up page and four reserved for accepted work.
 First opportunity alternates between refresh and saved work. Probe evidence
 cannot advance saved cursors or establish full-window/baseline completion.
-The fresh candidate's exact source, independent reaction metadata and context
-reads share that bound. A literal reaction-shaped instruction line is preserved.
+The fresh candidate's exact source and context reads share that bound. A possible
+connector reaction footer also needs independent reaction metadata; unambiguous
+owner prefixes skip that read. A literal reaction-shaped instruction line is preserved.
 
 Qualification records the focused scenarios and observed call counts in the
 feature executive summary. A failed probe may leave other saved pages able to

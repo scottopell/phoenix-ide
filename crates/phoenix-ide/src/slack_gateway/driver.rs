@@ -787,6 +787,7 @@ mod tests {
                 context: "quoted".into(),
                 observed_at_unix_micros: 1,
                 kind: SlackRequestKind::Briefing,
+                trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
             };
             state.db.accept_slack_source(&source, false).await.unwrap();
             let request = state
@@ -884,6 +885,7 @@ mod tests {
             context: "quoted".into(),
             observed_at_unix_micros: 1,
             kind: SlackRequestKind::Explicit,
+            trigger_kind: phoenix_db::SlackTriggerKind::Prefix,
         };
         state.db.accept_slack_source(&source, false).await.unwrap();
         let request = state
@@ -1053,6 +1055,7 @@ mod tests {
                 context: "Quoted fixture source".into(),
                 observed_at_unix_micros: chrono::Utc::now().timestamp_micros(),
                 kind: SlackRequestKind::Explicit,
+                trigger_kind: phoenix_db::SlackTriggerKind::Prefix,
             };
             state.db.accept_slack_source(&source, false).await.unwrap();
             let request = state
@@ -1288,6 +1291,7 @@ mod tests {
                 context: "quoted".into(),
                 observed_at_unix_micros: 1,
                 kind: SlackRequestKind::Explicit,
+                trigger_kind: phoenix_db::SlackTriggerKind::Prefix,
             };
             state.db.accept_slack_source(&source, false).await.unwrap();
             let request = state
@@ -1369,6 +1373,7 @@ mod tests {
                 } else {
                     SlackRequestKind::Explicit
                 },
+                trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
             };
             state.db.accept_slack_source(&source, false).await.unwrap();
             let request = state
@@ -1483,6 +1488,7 @@ mod tests {
             context: "quoted".into(),
             observed_at_unix_micros: 1,
             kind: SlackRequestKind::Explicit,
+            trigger_kind: phoenix_db::SlackTriggerKind::Prefix,
         };
         state
             .db

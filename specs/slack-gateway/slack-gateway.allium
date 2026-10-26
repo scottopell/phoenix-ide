@@ -45,6 +45,7 @@ external entity VerifiedObservation {
     actor: String
     author: String
     kind: RequestKind
+    trigger_kind: prefix | reaction
     binding_key: String
     instruction: String
     eligible: Boolean

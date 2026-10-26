@@ -699,6 +699,11 @@ const MIGRATIONS: &[Migration] = &[
             PRIMARY KEY(workspace,owner,channel,message_ts)
         );",
     },
+    Migration {
+        version: 134,
+        name: "slack_gateway_trigger_provenance",
+        sql: "ALTER TABLE slack_gateway_requests ADD COLUMN trigger_kind TEXT NOT NULL DEFAULT 'unknown_historical' CHECK(trigger_kind IN ('prefix','reaction','unknown_historical'));",
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -12515,6 +12520,34 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn slack_trigger_provenance_preserves_historical_unknowns() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE slack_gateway_requests(request_id TEXT PRIMARY KEY, kind TEXT, context TEXT, observed_at_unix_micros INTEGER); INSERT INTO slack_gateway_requests VALUES('old','explicit','unchanged',17);").execute(&pool).await.unwrap();
+        let migration = MIGRATIONS.iter().find(|m| m.version == 134).unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
+        let row: (String, String, i64, String) = sqlx::query_as("SELECT kind,context,observed_at_unix_micros,trigger_kind FROM slack_gateway_requests WHERE request_id='old'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            row,
+            (
+                "explicit".into(),
+                "unchanged".into(),
+                17,
+                "unknown_historical".into()
+            )
+        );
+        assert!(
+            sqlx::query("UPDATE slack_gateway_requests SET trigger_kind='guessed'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn migration_119_retains_retry_pending_plan_outbox_trigger_after_table_rebuild() {
         let db = crate::Database::open_in_memory().await.unwrap();
         let count: i64 = sqlx::query_scalar(
@@ -14428,6 +14461,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (134, "slack_gateway_trigger_provenance"),
             (133, "slack_gateway_first_observation"),
             (132, "slack_gateway"),
             (131, "request_capacity_diagnostics"),
@@ -19762,7 +19796,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (130, 'temporarily_skip_continuation_handoff_candidates'),
                     (131, 'temporarily_skip_request_capacity_diagnostics'),
                     (132, 'temporarily_skip_slack_gateway'),
-                    (133, 'temporarily_skip_slack_gateway_first_observation')",
+                    (133, 'temporarily_skip_slack_gateway_first_observation'),
+                    (134, 'temporarily_skip_slack_gateway_trigger_provenance')",
         )
         .execute(&pool)
         .await
@@ -20633,7 +20668,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (130, 'temporarily_skip_continuation_handoff_candidates'),
                     (131, 'temporarily_skip_request_capacity_diagnostics'),
                     (132, 'temporarily_skip_slack_gateway'),
-                    (133, 'temporarily_skip_slack_gateway_first_observation')",
+                    (133, 'temporarily_skip_slack_gateway_first_observation'),
+                    (134, 'temporarily_skip_slack_gateway_trigger_provenance')",
         )
         .execute(pool)
         .await

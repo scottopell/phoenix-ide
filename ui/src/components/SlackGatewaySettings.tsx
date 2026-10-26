@@ -7,7 +7,7 @@ interface Config {
 interface GatewayStatus {
   config: Config | null;
   scan?: { status: string; last_scan_at_unix_micros: number | null; last_error: string | null; baseline_complete: boolean; calls_last_pass: number; pages_last_pass: number; retry_at_us: number | null } | null;
-  requests: { request_id: string; product_id: string | null; product_exists: boolean; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; failure: string | null; source: { source_url: string; kind: string; observed_at_unix_micros: number; message_ts: string } }[];
+  requests: { request_id: string; product_id: string | null; conversation_available: boolean; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; failure: string | null; source: { source_url: string; kind: string; trigger_kind: 'prefix' | 'reaction' | 'unknown_historical'; observed_at_unix_micros: number; message_ts: string } }[];
   returns: { return_id: string; state: string; destination: string; request_ids: string[]; failure: string | null; notification_receipt: string | null }[];
 }
 const initial = (): Config => ({ enabled: false, mcp_server: '', owner: '', workspace: '', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, phoenix_url: window.location.origin, notification_command: null });
@@ -39,7 +39,10 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
       const r = await fetch('/api/slack-gateway/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
       const s = await r.json();
       if (!r.ok) throw Error(s.error ?? 'Slack read check failed');
-      setReadCheck(`Owner verified; both discovery queries passed (${s.calls} MCP calls). No requests accepted or Slack changes made.`);
+      const checks: { query: string; first_page_hits: number; verified_sources: number; more_pages: boolean }[] = s.checks ?? [];
+      const demonstrated = checks.length === 2 && checks.every(c => c.verified_sources > 0) && s.reaction_read_verified === true;
+      const samples = checks.map(c => `${c.query}: ${c.first_page_hits} sampled hit(s), ${c.verified_sources} verified source(s)${c.more_pages ? ', more pages available' : ''}`).join('; ');
+      setReadCheck(`Owner verified. ${demonstrated ? 'Sampled source and reaction reads demonstrated' : 'Inconclusive: source and reaction access not fully demonstrated'}. ${samples} (${s.calls} MCP calls). No requests accepted or Slack changes made.`);
     } catch (e) { setError(e instanceof Error ? e.message : 'Slack unavailable'); }
     finally { setBusy(false); }
   }
@@ -63,7 +66,7 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
         {status.scan?.last_scan_at_unix_micros && <p>Last complete scan: {new Date(status.scan.last_scan_at_unix_micros / 1000).toLocaleString()}</p>}
         <p>Last pass: {status.scan?.calls_last_pass ?? 0} MCP tool calls, {status.scan?.pages_last_pass ?? 0} search pages. {status.scan?.retry_at_us && <>Retry after {new Date(status.scan.retry_at_us / 1000).toLocaleString()}.</>}</p>
         <p>Reaction-add latency is unavailable from Slack search. A missing notification command leaves private notices pending.</p>
-        <ul>{status.requests.map(r => <li key={r.request_id}><a href={r.source.source_url} target="_blank" rel="noreferrer">Slack {r.source.kind}</a> · {r.failure ?? (r.admitted ? 'Admitted' : 'Accepted')} · 👀 {r.eyes_confirmed ? 'confirmed' : 'pending'} · observed-to-accept {Math.max(0, (r.accepted_at_us - r.source.observed_at_unix_micros) / 1000).toFixed(0)} ms{r.product_exists && r.product_id && <> · <a href={`/c/${r.product_id}`}>Open Phoenix</a></>}</li>)}</ul>
+        <ul>{status.requests.map(r => <li key={r.request_id}><a href={r.source.source_url} target="_blank" rel="noreferrer">Slack {r.source.kind}</a> · {r.failure ?? (r.admitted ? 'Admitted' : 'Accepted')} · 👀 {r.eyes_confirmed ? 'confirmed' : 'pending'} · observed-to-accept {Math.max(0, (r.accepted_at_us - r.source.observed_at_unix_micros) / 1000).toFixed(0)} ms{r.source.trigger_kind === 'prefix' && <> · prefix-message age at observation {Math.max(0, r.source.observed_at_unix_micros / 1000 - Number(r.source.message_ts) * 1000).toFixed(0)} ms</>}{r.conversation_available && r.product_id && <> · <a href={`/c/${r.product_id}`}>Open Phoenix</a></>}</li>)}</ul>
         <ul>{status.returns.map(r => <li key={r.return_id} id={'slack-return-' + r.return_id}>{r.destination} reply: {r.state} · covers {r.request_ids.length} request(s){r.failure && <> · {r.failure}</>}{r.notification_receipt && <> · Receipt: {r.notification_receipt}</>}</li>)}</ul>
       </>}
     </>}

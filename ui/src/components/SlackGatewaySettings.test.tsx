@@ -4,16 +4,16 @@ import { SlackGatewaySettings } from './SlackGatewaySettings';
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
-it('offers a conversation link only while the status API confirms that product exists', async () => {
-  let productExists = false;
+it('offers a conversation link only while the status API confirms native route availability', async () => {
+  let conversationAvailable = false;
   let failure: string | null = null;
   vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => ({
     ok: true,
     json: async () => ({
       config: null,
-      requests: [{ request_id: 'request', product_id: 'reserved-product', product_exists: productExists,
+      requests: [{ request_id: 'request', product_id: 'reserved-product', conversation_available: conversationAvailable,
         admitted: false, accepted_at_us: 1, eyes_confirmed: false, failure,
-        source: { source_url: 'https://example.slack.com/source', kind: 'briefing', observed_at_unix_micros: 1, message_ts: '1.000001' } }],
+        source: { source_url: 'https://example.slack.com/source', kind: 'briefing', trigger_kind: 'reaction', observed_at_unix_micros: 1, message_ts: '1.000001' } }],
       returns: [],
     }),
   })));
@@ -21,13 +21,40 @@ it('offers a conversation link only while the status API confirms that product e
   await screen.findByRole('link', { name: 'Slack briefing' });
   expect(screen.queryByRole('link', { name: 'Open Phoenix' })).toBeNull();
 
-  productExists = true;
+  conversationAvailable = true;
   fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
   expect((await screen.findByRole('link', { name: 'Open Phoenix' })).getAttribute('href')).toBe('/c/reserved-product');
 
-  productExists = false;
+  conversationAvailable = false;
   failure = 'Conversation unavailable';
   fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
   await waitFor(() => expect(screen.queryByRole('link', { name: 'Open Phoenix' })).toBeNull());
   expect(screen.getByText(/Conversation unavailable/)).toBeTruthy();
+});
+
+it.each([
+  [[], false, false],
+  [[{ query: 'owner fire messages', first_page_hits: 1, verified_sources: 0 }, { query: 'fire reactions', first_page_hits: 0, verified_sources: 0 }], false, false],
+  [[{ query: 'owner fire messages', first_page_hits: 1, verified_sources: 1 }, { query: 'fire reactions', first_page_hits: 1, verified_sources: 1 }], false, false],
+  [[{ query: 'owner fire messages', first_page_hits: 1, verified_sources: 1 }, { query: 'fire reactions', first_page_hits: 1, verified_sources: 1 }], true, true],
+])('reports only demonstrated read capabilities', async (checks, reactionReadVerified, demonstrated) => {
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => ({ ok: true, json: async () => url.endsWith('/inspect')
+    ? { owner_verified: true, checks, reaction_read_verified: reactionReadVerified, calls: 4 }
+    : { config: null, requests: [], returns: [] } })));
+  render(<SlackGatewaySettings standalone />);
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Check Slack read access' }).hasAttribute('disabled')).toBe(false));
+  fireEvent.click(screen.getByRole('button', { name: 'Check Slack read access' }));
+  const status = await screen.findByRole('status');
+  expect(status.textContent).toContain(demonstrated ? 'Sampled source and reaction reads demonstrated' : 'Inconclusive');
+  expect(status.textContent).not.toContain('both discovery queries passed');
+});
+
+it.each(['prefix', 'reaction', 'unknown_historical'])('only exposes message age for known prefixes: %s', async triggerKind => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config: null, returns: [], requests: [{ request_id: 'request', product_id: null, conversation_available: false,
+    admitted: false, accepted_at_us: 3000000, eyes_confirmed: false, failure: null,
+    source: { source_url: 'https://example.slack.com/source', kind: 'explicit', trigger_kind: triggerKind, observed_at_unix_micros: 2000000, message_ts: '1.000001' } }] }) }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByRole('link', { name: 'Slack explicit' });
+  expect(screen.getByText(/observed-to-accept 1000 ms/)).toBeTruthy();
+  expect(screen.queryByText(/prefix-message age at observation 1000 ms/) !== null).toBe(triggerKind === 'prefix');
 });

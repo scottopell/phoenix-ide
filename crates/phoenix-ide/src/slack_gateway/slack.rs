@@ -39,6 +39,7 @@ pub(super) struct VerifiedSource {
     pub source: SlackSource,
     pub author: String,
     pub body: String,
+    pub reaction_read_verified: bool,
 }
 enum SourceRead {
     Thread,
@@ -132,7 +133,7 @@ impl Slack {
             && CALL_LIMIT.saturating_sub(self.window_calls.load(Ordering::Relaxed)) >= 8
     }
     pub fn can_refresh(&self) -> bool {
-        // One prefix page costs search + two source reads + reaction metadata. Preserve
+        // A prefix page can cost search + two source reads + reaction metadata. Preserve
         // another whole catch-up page and the four-call accepted-work reserve.
         self.retry_after.load(Ordering::Relaxed) == 0
             && CALL_LIMIT.saturating_sub(self.window_calls.load(Ordering::Relaxed)) >= 12
@@ -294,16 +295,12 @@ impl Slack {
         if !reaction && (author != c.owner || strip_fire(raw).is_none()) {
             return Ok(None);
         }
-        let Some(r) = self
-            .source_read(
-                SourceRead::Reactions,
-                json!({"channel_id":hit.channel,"message_ts":hit.ts}),
-            )
-            .await?
+        let owner_prefix = author == c.owner && strip_fire(raw).is_some();
+        let Some((reactions, reaction_read_verified)) =
+            self.source_reactions(c, hit, raw, owner_prefix).await?
         else {
             return Ok(None);
         };
-        let reactions = ReactionEvidence::parse(field(&r, "result")?, &c.owner)?;
         let body = reactions.message_body(raw)?;
         let prefix = strip_fire(&body);
         if (author != c.owner || prefix.is_none()) && !reactions.owner_fire.is_present()? {
@@ -337,6 +334,11 @@ impl Slack {
         let coverage = field(&v, "pagination_info").unwrap_or("Context pagination unavailable");
         let truncated = thread.chars().count() > 16000;
         let bounded = thread.chars().take(16000).collect::<String>();
+        let scope = if hit.root == hit.ts {
+            "top-level source and bounded thread discussion; requested message limit 100"
+        } else {
+            "parent and exact source reply only"
+        };
         let source = SlackSource {
             workspace: c.workspace.clone(),
             owner: c.owner.clone(),
@@ -347,16 +349,71 @@ impl Slack {
             observed_at_unix_micros: hit.observed_at_unix_micros,
             instruction,
             context: format!(
-                "Bounded Slack discussion; reply sources include the parent and exact reply only; coverage: {coverage}; gateway character truncation: {truncated}\n{}",
+                "Bounded Slack discussion; {scope}; coverage: {coverage}; gateway character truncation: {truncated}\n{}",
                 serde_json::to_string(&bounded).map_err(|e| e.to_string())?
             ),
             kind,
+            trigger_kind: if owner_prefix { phoenix_db::SlackTriggerKind::Prefix } else { phoenix_db::SlackTriggerKind::Reaction },
         };
         Ok(Some(VerifiedSource {
             source,
             author,
             body,
+            reaction_read_verified,
         }))
+    }
+    async fn source_reactions(
+        &self,
+        c: &Config,
+        hit: &Hit,
+        raw: &str,
+        owner_prefix: bool,
+    ) -> Result<Option<(ReactionEvidence, bool)>, String> {
+        // Only a possible connector footer needs independent reaction metadata.
+        // Literal owner text shaped like that footer must remain distinguishable.
+        let needs_reactions = !owner_prefix
+            || raw
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with("Reactions: "));
+        let reactions = if needs_reactions {
+            let Some(r) = self
+                .source_read(
+                    SourceRead::Reactions,
+                    json!({"channel_id":hit.channel,"message_ts":hit.ts}),
+                )
+                .await?
+            else {
+                if owner_prefix {
+                    return Err(
+                        "Reaction metadata unavailable; cannot isolate possible source footer yet"
+                            .into(),
+                    );
+                }
+                return Ok(None);
+            };
+            ReactionEvidence::parse(field(&r, "result")?, &c.owner)?
+        } else {
+            ReactionEvidence {
+                counts: std::collections::BTreeMap::default(),
+                owner_fire: OwnerFire::Absent,
+            }
+        };
+
+        Ok(Some((reactions, needs_reactions)))
+    }
+    pub async fn inspect_reaction_access(&self, c: &Config, hit: &Hit) -> Result<bool, String> {
+        let Some(value) = self
+            .source_read(
+                SourceRead::Reactions,
+                json!({"channel_id":hit.channel,"message_ts":hit.ts}),
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        ReactionEvidence::parse(field(&value, "result")?, &c.owner)?;
+        Ok(true)
     }
     pub async fn eyes(&self, channel: &str, ts: &str) -> Result<(), String> {
         match self
@@ -982,6 +1039,57 @@ mod tests {
         .is_err());
     }
     #[tokio::test]
+    async fn owner_prefix_is_independent_of_reaction_access_but_footer_is_not() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = config();
+        for (footer, reaction_query) in [(false, false), (false, true), (true, false)] {
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            let ts = format!("{}.000001", chrono::Utc::now().timestamp());
+            let stamp = ts.clone();
+            slack.fixture = Some(Arc::new(move |tool, _| match tool {
+                "slack_read_thread" => Ok(
+                    json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {stamp}\n🔥 investigate{}\n\nNo thread messsages\n", if footer {"\nReactions: fire (1)"} else {""}),"pagination_info":"There are no more messages in this thread."}),
+                ),
+                "slack_get_reactions" => {
+                    assert!(
+                        footer,
+                        "Unambiguous prefix must not require reaction access"
+                    );
+                    Ok(json!({"ok":false,"method":"reactions.get","error":"access_denied"}))
+                }
+                _ => panic!("Unexpected tool"),
+            }));
+            let hit = Hit {
+                channel: "C123".into(),
+                ts: ts.clone(),
+                root: ts,
+                url: "source".into(),
+                observed_at_unix_micros: 1,
+            };
+            let result = slack.source(&c, &hit, reaction_query).await;
+            if footer {
+                assert!(
+                    result.is_err(),
+                    "Ambiguous footer must retain candidate for retry"
+                );
+            } else {
+                let verified = result.unwrap().unwrap();
+                assert_eq!(verified.source.instruction, "investigate");
+                assert_eq!(
+                    verified.source.trigger_kind,
+                    phoenix_db::SlackTriggerKind::Prefix
+                );
+                assert!(!verified.reaction_read_verified);
+                assert!(verified
+                    .source
+                    .context
+                    .contains("top-level source and bounded thread discussion"));
+                assert!(!verified.source.context.contains("exact source reply only"));
+            }
+            assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
+        }
+    }
+    #[tokio::test]
     async fn ambiguous_reactors_need_retry_unless_an_independent_owner_prefix_authorizes() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let c = config();
@@ -1091,7 +1199,7 @@ mod tests {
                 observed_at_unix_micros: 1,
             };
             assert_eq!(slack.source(&c, &hit, false).await.is_ok(), matches);
-            assert_eq!(slack.calls.load(Ordering::Relaxed), 3);
+            assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
         }
     }
 
@@ -1162,7 +1270,7 @@ mod tests {
                     }
                     match tool {
                         "slack_read_thread" => Ok(
-                            json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {ts}\n🔥 ask\nReactions: fire (1)\n\nNo thread messsages\n"),"pagination_info":"There are no more messages in this thread."}),
+                            json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {ts}\nplain ask\nReactions: fire (1)\n\nNo thread messsages\n"),"pagination_info":"There are no more messages in this thread."}),
                         ),
                         "slack_get_reactions" => Ok(
                             json!({"result":"Reactions on message:\n\n:fire: × 1 — Owner (UOWNER)"}),
