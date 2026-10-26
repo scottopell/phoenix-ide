@@ -156,6 +156,15 @@ fn private_socket_fences_on_eof_and_protocol_failure_but_accepts_replacement() {
 
 #[test]
 fn stalled_partial_frame_closes_without_executing_effects() {
+    exercise_stalled_frame(Duration::from_millis(250), false);
+}
+
+#[test]
+fn frame_timeout_preserves_listener_for_replacement() {
+    exercise_stalled_frame(Duration::from_secs(8), true);
+}
+
+fn exercise_stalled_frame(lifetime: Duration, replace_after_timeout: bool) {
     let parent = tempfile::Builder::new()
         .prefix("sdc-")
         .tempdir_in("/tmp")
@@ -174,12 +183,7 @@ fn stalled_partial_frame_closes_without_executing_effects() {
     server.require_native_binding();
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            serve_until(
-                &listener,
-                &mut server,
-                Instant::now() + Duration::from_millis(250),
-            )
-            .unwrap();
+            serve_until(&listener, &mut server, Instant::now() + lifetime).unwrap();
         });
         let mut stalled = UnixStream::connect(directory.join("guardian.sock")).unwrap();
         stalled
@@ -187,6 +191,15 @@ fn stalled_partial_frame_closes_without_executing_effects() {
             .unwrap();
         stalled.write_all(&[0, 0]).unwrap();
         assert_eq!(std::io::Read::read(&mut stalled, &mut [0; 1]).unwrap(), 0);
+        drop(stalled);
+        if replace_after_timeout {
+            let mut replacement =
+                GuardianClient::connect_with_build(&directory, test_build()).unwrap();
+            assert_eq!(
+                replacement.hello().unwrap().state,
+                WireState::DetachedFenced
+            );
+        }
     });
 }
 
