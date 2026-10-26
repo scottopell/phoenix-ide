@@ -207,5 +207,15 @@ migration and creation-replay tests pass, as do the final 71 gateway cases and
 Clippy, formatting, Allium and structural/timing checks. These fixes still need
 new exact-head hosted CI and automatic review; the pilot remains separately pinned.
 
+Source verification also distinguishes an unverified reactor list from verified
+absence: ambiguous lists retain their discovery page and first-observation time
+for retry, while an independently verified owner prefix remains sufficient.
+Only structured rejection of the relevant source-read operation establishes
+unavailability. Gateway status now derives actual product existence and hides
+conversation links for reserved, failed or deleted targets. All 400 affected
+MCP/gateway, migration and creation-replay tests pass, along with full UI tests,
+type checking, linting, Clippy, formatting, Allium and structural/timing checks.
+Exact-head hosted CI and automatic review remain open for this batch.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

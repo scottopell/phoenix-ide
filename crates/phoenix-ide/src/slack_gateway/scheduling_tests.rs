@@ -472,7 +472,7 @@ async fn deleted_hit_does_not_block_baseline_or_a_later_page() {
     let mut slack = slack::Slack::new(state.mcp_manager.clone(), &c);
     slack.fixture = Some(Arc::new(move |tool, args| {
         if tool == "slack_read_thread" && args["channel_id"] == "CDELETED" {
-            Err("message_not_found".into())
+            Ok(json!({"ok":false,"error":"message_not_found","method":"conversations.replies"}))
         } else {
             fixture(tool, args)
         }
@@ -941,6 +941,59 @@ struct LatePrefixBacklog {
     config: Config,
     fixture: Arc<slack::FixtureCall>,
     prefix_reads: Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[tokio::test]
+async fn ambiguous_reaction_evidence_retains_the_page_for_verified_retry() {
+    let Backlog {
+        state,
+        config: c,
+        fixture,
+        ..
+    } = backlog().await;
+    let base = fixture.clone();
+    let mut uncertain = slack::Slack::new(state.mcp_manager.clone(), &c);
+    uncertain.fixture = Some(Arc::new(move |tool, args| {
+        if tool == "slack_get_reactions" {
+            Ok(
+                json!({"result":"Reactions on message:\n\n:fire: × 1 — Owner (UOWNER), Other (UOTHER)"}),
+            )
+        } else {
+            base(tool, args)
+        }
+    }));
+    assert!(driver::discover(&state, &c, &uncertain)
+        .await
+        .unwrap_err()
+        .contains("reaction evidence"));
+    let page =
+        sqlx::query("SELECT cursor,complete FROM slack_gateway_discovery WHERE kind='reaction'")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(page.get::<String, _>("cursor"), "6");
+    assert!(!page.get::<bool, _>("complete"));
+    assert!(state
+        .db
+        .slack_requests(&c.workspace, &c.owner)
+        .await
+        .unwrap()
+        .is_empty());
+    let first: i64 =
+        sqlx::query_scalar("SELECT first_observed_at_unix_micros FROM slack_gateway_observations")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+    let mut verified = slack::Slack::new(state.mcp_manager.clone(), &c);
+    verified.fixture = Some(fixture);
+    driver::discover(&state, &c, &verified).await.unwrap();
+    let requests = state
+        .db
+        .slack_requests(&c.workspace, &c.owner)
+        .await
+        .unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].source.observed_at_unix_micros, first);
 }
 
 async fn late_prefix_backlog() -> LatePrefixBacklog {

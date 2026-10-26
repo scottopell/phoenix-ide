@@ -47,6 +47,7 @@ pub struct SlackRequest {
     pub binding_id: String,
     pub creation_id: String,
     pub product_id: Option<String>,
+    pub product_exists: bool,
     pub input_id: String,
     pub transcript_id: Option<String>,
     pub admitted: bool,
@@ -127,6 +128,7 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
         creation_id: r.try_get("creation_id")?,
         input_id: r.try_get("input_id")?,
         product_id: r.try_get("product_id")?,
+        product_exists: r.try_get("product_exists")?,
         transcript_id: r.try_get("transcript_id")?,
         admitted: r.try_get::<String, _>("admission_state")? == "admitted",
         accepted_at_us: r.try_get("accepted_at_unix_micros")?,
@@ -308,7 +310,7 @@ impl Database {
         workspace: &str,
         owner: &str,
     ) -> DbResult<Vec<SlackRequest>> {
-        Ok(sqlx::query("SELECT r.*, b.creation_id, b.product_id FROM slack_gateway_requests r JOIN slack_gateway_bindings b USING(binding_id) WHERE r.workspace=?1 AND r.owner=?2 ORDER BY r.accepted_at_unix_micros")
+        Ok(sqlx::query("SELECT r.*, b.creation_id, b.product_id, EXISTS(SELECT 1 FROM product_conversations p WHERE p.id=b.product_id) AS product_exists FROM slack_gateway_requests r JOIN slack_gateway_bindings b USING(binding_id) WHERE r.workspace=?1 AND r.owner=?2 ORDER BY r.accepted_at_unix_micros")
             .bind(workspace).bind(owner).try_map(|r| request_row(&r)).fetch_all(self.pool()).await?)
     }
     pub async fn slack_bind_product(&self, binding: &str, product: &str) -> DbResult<()> {
@@ -2334,6 +2336,77 @@ mod tests {
     }
 
     // REQ-SG-012: a rejected creation has no conversation to link yet.
+    #[tokio::test]
+    async fn request_status_links_require_a_currently_existing_product() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = source("100.000", SlackRequestKind::Explicit);
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.slack_bind_product(&request.binding_id, "reserved-product")
+            .await
+            .unwrap();
+        let pending = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(pending.product_id.as_deref(), Some("reserved-product"));
+        assert!(!pending.product_exists);
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "creation failed",
+            "https://phoenix.example",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !db.slack_requests(&source.workspace, &source.owner)
+                .await
+                .unwrap()[0]
+                .product_exists
+        );
+        let product = db
+            .create_conversation("linked", "linked", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE slack_gateway_bindings SET product_id=?2 WHERE binding_id=?1")
+            .bind(&request.binding_id)
+            .bind(product.product_conversation_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            db.slack_requests(&source.workspace, &source.owner)
+                .await
+                .unwrap()[0]
+                .product_exists
+        );
+        sqlx::query("DELETE FROM conversations WHERE id=?1")
+            .bind(&product.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM product_conversations WHERE id=?1")
+            .bind(product.product_conversation_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let deleted = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            deleted.product_id,
+            Some(product.product_conversation_id.to_string())
+        );
+        assert!(!deleted.product_exists);
+    }
+
     #[tokio::test]
     async fn admission_failure_links_to_its_exact_return_status() {
         for unavailable_product in [false, true] {

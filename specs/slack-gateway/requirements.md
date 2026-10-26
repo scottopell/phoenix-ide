@@ -18,6 +18,8 @@ Before acknowledgments or replies, actor and workspace evidence SHALL refer to o
 
 WHEN a message or reaction is considered as a trigger, THE SYSTEM SHALL confirm the source and triggering actor through Slack and accept only the configured owner's action. A message from another user, an app-authored message, or a gateway-authored message SHALL NOT count as the owner's instruction merely because its words name Phoenix or its displayed author resembles the owner. For reactions, the triggering actor is the reacting user, independently of the source message's author; an app-authored source MAY supply briefing context but SHALL NOT become an owner-authored explicit instruction.
 
+An incomplete or ambiguous reactor list SHALL remain unverified rather than establish the owner's absence. A reaction-dependent candidate SHALL retain its discovery page for verified retry. A separately verified owner-authored fire prefix SHALL remain sufficient without reaction evidence, independently of the query that found the source.
+
 **Rationale:** An unrelated Slack participant must not gain execution authority over the owner's machine and credentials.
 
 ### REQ-SG-002 — Recognize three explicit gestures
@@ -39,6 +41,8 @@ THE SYSTEM SHALL discover eligible messages in channels, private channels, direc
 WHEN service resumes after downtime, THE SYSTEM SHALL discover still-present, unhandled eligible triggers within that window. A newly added reaction on an eligible older message SHALL remain discoverable independently of the last discovery time. Discovery SHALL follow available result pages without treating an incomplete search as proof that no further triggers exist.
 
 THE SYSTEM SHALL NOT promise discovery of removed-before-observation reactions, deleted or inaccessible messages, or source messages outside the window. Window expiry SHALL NOT cancel accepted work.
+
+Definitive source unavailability SHALL require structured rejection evidence for the relevant source-read operation. An opaque error token, unqualified envelope or unrelated lookup failure SHALL retain the candidate and page for retry.
 
 **Rationale:** Friday's messages remain eligible on Monday without requiring an unbounded history scan or a false event-replay guarantee.
 
@@ -133,6 +137,8 @@ WHEN one native execution consumes a queued batch containing several Slack input
 WHEN clarification is required, THE SYSTEM SHALL post it in that thread, durably associate that clarification with the exact native question identity, and direct the owner to answer through a deep link to the ordinary Phoenix conversation. The confirmed clarification handoff SHALL satisfy the request's automatic Slack response obligation; subsequent native discussion SHALL remain private unless separately authorized for publication by a new explicit request. Slack triggers SHALL remain ordinary requests and SHALL NOT answer native questions. WHEN the native conversation cannot accept a new request while awaiting an answer, THE SYSTEM SHALL explain that the owner must answer in Phoenix without changing the pending question or treating the new request as an answer. Persisted question associations SHALL NOT authorize unsubmitted Slack answers.
 
 THE SYSTEM SHALL include a Phoenix deep link in gateway-generated clarifications and explanations: the stable conversation route when one exists, otherwise the specific return's status route. The gateway SHALL durably freeze that complete outgoing text, including the link, when creating its return obligation and reuse it for a known-unsent retry. The assignment SHALL encourage the agent to link its Phoenix conversation when useful in an intentional answer.
+
+Owner-facing status SHALL distinguish a reserved product identity from an existing conversation and SHALL offer a conversation link only when that product currently exists. Pending, failed or deleted targets SHALL remain inspectable through gateway status.
 
 WHEN a native question has been answered, replaced or become unavailable before its message-post attempt, THE SYSTEM SHALL retain the request's response duty and create a generic linked handoff explanation rather than publish the stale question or private follow-up content. A materialized pending or known-unsent clarification SHALL be retired and replaced by a distinct return carrying the same source, coverage and destination; the original frozen text SHALL remain intact. This replacement SHALL NOT resend or replace an attempting, confirmed or uncertain external operation.
 

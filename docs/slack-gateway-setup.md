@@ -119,6 +119,10 @@ leave discovery enabled or pause it according to the owner's activation choice.
 Keep only one Phoenix instance watching the same owner.
 Disabling discovery stops new acceptance while accepted work continues.
 Unknown external outcomes remain visible for inspection rather than resend.
+Source-verification failures remain visible in settings and retain their page
+for retry. Gateway status offers a conversation link only while that product
+exists; pending creation, creation failures and deleted targets remain inspectable
+on the status page.
 Production activation must qualify its actual installed schema transition and
 preserve installed configuration and credentials. See the feature executive
 summary for current qualification status.

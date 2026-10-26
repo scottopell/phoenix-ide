@@ -40,6 +40,10 @@ pub(super) struct VerifiedSource {
     pub author: String,
     pub body: String,
 }
+enum SourceRead {
+    Thread,
+    Reactions,
+}
 impl Slack {
     #[cfg(test)]
     pub fn new(manager: Arc<McpClientManager>, c: &Config) -> Self {
@@ -222,9 +226,37 @@ impl Slack {
         hit: &Hit,
         reaction: bool,
     ) -> Result<Option<VerifiedSource>, String> {
-        match self.available_source(c, hit, reaction).await {
-            Err(error) if source_unavailable(&error) => Ok(None),
-            result => result,
+        self.available_source(c, hit, reaction).await
+    }
+    async fn source_read(&self, read: SourceRead, args: Value) -> Result<Option<Value>, String> {
+        let (tool, methods): (&str, &[&str]) = match read {
+            SourceRead::Thread => (
+                "slack_read_thread",
+                &["conversations.history", "conversations.replies"],
+            ),
+            SourceRead::Reactions => ("slack_get_reactions", &["reactions.get"]),
+        };
+        match self.call_classified(tool, args).await {
+            Ok(value) => Ok(Some(value)),
+            Err(error)
+                if methods.iter().any(|method| {
+                    operation_rejection(&error, method).is_some_and(|value| {
+                        matches!(
+                            value.get("error").and_then(Value::as_str),
+                            Some(
+                                "message_not_found"
+                                    | "thread_not_found"
+                                    | "channel_not_found"
+                                    | "not_in_channel"
+                                    | "access_denied"
+                            )
+                        )
+                    })
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.message().to_owned()),
         }
     }
     async fn available_source(
@@ -249,7 +281,7 @@ impl Slack {
             return Ok(None);
         }
         let (oldest, latest) = source_bounds(&hit.ts)?;
-        let exact=self.call("slack_read_thread",json!({"channel_id":hit.channel,"message_ts":hit.ts,"oldest":oldest,"latest":latest,"limit":1,"response_format":"detailed"})).await?;
+        let Some(exact)=self.source_read(SourceRead::Thread,json!({"channel_id":hit.channel,"message_ts":hit.ts,"oldest":oldest,"latest":latest,"limit":1,"response_format":"detailed"})).await? else {return Ok(None);};
         if field(&exact, "pagination_info")?.trim() != "There are no more messages in this thread."
         {
             return Err("Exact source read is incomplete".into());
@@ -262,16 +294,19 @@ impl Slack {
         if !reaction && (author != c.owner || strip_fire(raw).is_none()) {
             return Ok(None);
         }
-        let r = self
-            .call(
-                "slack_get_reactions",
+        let Some(r) = self
+            .source_read(
+                SourceRead::Reactions,
                 json!({"channel_id":hit.channel,"message_ts":hit.ts}),
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         let reactions = ReactionEvidence::parse(field(&r, "result")?, &c.owner)?;
         let body = reactions.message_body(raw)?;
         let prefix = strip_fire(&body);
-        if !reactions.owner_fire && (reaction || author != c.owner || prefix.is_none()) {
+        if (author != c.owner || prefix.is_none()) && !reactions.owner_fire.is_present()? {
             return Ok(None);
         }
         let mut context_args = json!({"channel_id":hit.channel,"message_ts":hit.root,"limit":100,"response_format":"detailed"});
@@ -280,7 +315,9 @@ impl Slack {
             context_args["oldest"] = json!(oldest);
             context_args["latest"] = json!(latest);
         }
-        let v = self.call("slack_read_thread", context_args).await?;
+        let Some(v) = self.source_read(SourceRead::Thread, context_args).await? else {
+            return Ok(None);
+        };
         let thread = field(&v, "messages")?;
         thread_source(thread, &hit.root)?;
         if hit.root != hit.ts {
@@ -352,21 +389,6 @@ impl Slack {
         })
     }
 }
-fn source_unavailable(error: &str) -> bool {
-    error
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|code| {
-            matches!(
-                code,
-                "message_not_found"
-                    | "thread_not_found"
-                    | "channel_not_found"
-                    | "not_in_channel"
-                    | "access_denied"
-            )
-        })
-}
-
 fn source_bounds(ts: &str) -> Result<(String, String), String> {
     validate_ts(ts)?;
     let (seconds, fraction) = ts.split_once('.').ok_or("Invalid Slack timestamp")?;
@@ -683,14 +705,31 @@ fn thread_source(thread: &str, ts: &str) -> Result<(String, String), String> {
     Ok((author.into(), lines.next().unwrap_or("").into()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerFire {
+    Present,
+    Absent,
+    Unverified,
+}
+impl OwnerFire {
+    fn is_present(self) -> Result<bool, String> {
+        match self {
+            Self::Present => Ok(true),
+            Self::Absent => Ok(false),
+            Self::Unverified => {
+                Err("Owner reaction evidence is incomplete or ambiguous; retry verification".into())
+            }
+        }
+    }
+}
 struct ReactionEvidence {
     counts: std::collections::BTreeMap<String, u64>,
-    owner_fire: bool,
+    owner_fire: OwnerFire,
 }
 impl ReactionEvidence {
     fn parse(text: &str, owner: &str) -> Result<Self, String> {
         let mut counts = std::collections::BTreeMap::new();
-        let mut owner_fire = false;
+        let mut owner_fire = OwnerFire::Absent;
         if text.trim() == "No reactions found on this message." {
             return Ok(Self { counts, owner_fire });
         }
@@ -719,10 +758,17 @@ impl ReactionEvidence {
                     .then_some((id, users.len() - tail.len()))
                 })
                 .collect();
-            owner_fire |= name == "fire"
-                && u64::try_from(members.len()).ok() == Some(count)
-                && members.last().is_some_and(|(_, end)| *end == users.len())
-                && members.iter().any(|(id, _)| *id == owner);
+            if name == "fire" {
+                owner_fire = if u64::try_from(members.len()).ok() != Some(count)
+                    || members.last().is_none_or(|(_, end)| *end != users.len())
+                {
+                    OwnerFire::Unverified
+                } else if members.iter().any(|(id, _)| *id == owner) {
+                    OwnerFire::Present
+                } else {
+                    OwnerFire::Absent
+                };
+            }
         }
         if counts.is_empty() {
             return Err("Empty reaction evidence".into());
@@ -871,18 +917,19 @@ mod tests {
 
     #[test]
     fn reactor_authority_uses_only_unambiguous_member_ids() {
-        for users in [
-            "Mallory (UOWNER) (UOTHER)",
-            "Mallory (UOWNER), Fake (UOTHER)",
-            "Owner (UOWNER), Other (UOTHER)",
+        for (users, expected) in [
+            ("Mallory (UOWNER) (UOTHER)", OwnerFire::Absent),
+            ("Mallory (UOWNER), Fake (UOTHER)", OwnerFire::Unverified),
+            ("Owner (UOWNER), Other (UOTHER)", OwnerFire::Unverified),
         ] {
-            assert!(
-                !ReactionEvidence::parse(
+            assert_eq!(
+                ReactionEvidence::parse(
                     &format!("Reactions on message:\n\n:fire: × 1 — {users}"),
                     "UOWNER"
                 )
                 .unwrap()
-                .owner_fire
+                .owner_fire,
+                expected
             );
         }
         for users in [
@@ -891,44 +938,87 @@ mod tests {
             "Doe, Jane (UOWNER), Other, Person (UOTHER)",
             "Döe, Jäne (UOWNER), Other (UOTHER)",
         ] {
-            assert!(
+            assert_eq!(
                 ReactionEvidence::parse(
                     &format!("Reactions on message:\n\n:fire: × 2 — {users}"),
                     "UOWNER"
                 )
                 .unwrap()
-                .owner_fire
+                .owner_fire,
+                OwnerFire::Present
             );
         }
-        assert!(
+        assert_eq!(
             ReactionEvidence::parse(
                 "Reactions on message:\n\n:fire: × 1 — Enterprise (WOWNER)",
                 "WOWNER"
             )
             .unwrap()
-            .owner_fire
+            .owner_fire,
+            OwnerFire::Present
         );
-        assert!(
+        assert_eq!(
             ReactionEvidence::parse(
                 "Reactions on message:\n\n:fire: × 1 — Doe, Jane (UOWNER)",
                 "UOWNER"
             )
             .unwrap()
-            .owner_fire
+            .owner_fire,
+            OwnerFire::Present
         );
-        assert!(
-            !ReactionEvidence::parse(
+        assert_eq!(
+            ReactionEvidence::parse(
                 "Reactions on message:\n\n:fire: × 1 — Mallory (UOWNER), invalid tail",
                 "UOWNER"
             )
             .unwrap()
-            .owner_fire
+            .owner_fire,
+            OwnerFire::Unverified
         );
         assert!(ReactionEvidence::parse(
             "Reactions on message:\n\n:fire: × 1 — Owner (UOWNER)\n:fire: × 1 — Other (UOTHER)",
             "UOWNER"
         )
         .is_err());
+    }
+    #[tokio::test]
+    async fn ambiguous_reactors_need_retry_unless_an_independent_owner_prefix_authorizes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = config();
+        for (prefix, reaction) in [(true, true), (true, false), (false, true)] {
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            let ts = format!("{}.000001", chrono::Utc::now().timestamp());
+            let stamp = ts.clone();
+            slack.fixture = Some(Arc::new(move |tool, _| match tool {
+                "slack_get_reactions" => Ok(
+                    json!({"result":"Reactions on message:\n\n:fire: × 1 — Owner (UOWNER), Other (UOTHER)"}),
+                ),
+                "slack_read_thread" => Ok(
+                    json!({"messages":format!("=== THREAD PARENT MESSAGE ===\nFrom: Owner (UOWNER)\nTime: fixture\nMessage TS: {stamp}\n{}\nReactions: fire (1)\n\nNo thread messsages\n", if prefix {"🔥 explicit request"} else {"plain request"}),"pagination_info":"There are no more messages in this thread."}),
+                ),
+                _ => panic!("Unexpected tool"),
+            }));
+            let hit = Hit {
+                channel: "C123".into(),
+                ts: ts.clone(),
+                root: ts,
+                url: "source".into(),
+                observed_at_unix_micros: 1,
+            };
+            let result = slack.source(&c, &hit, reaction).await;
+            if prefix {
+                assert_eq!(
+                    result.unwrap().unwrap().source.instruction,
+                    "explicit request"
+                );
+            } else {
+                assert!(result.err().unwrap().contains("reaction evidence"));
+            }
+            assert_eq!(
+                slack.calls.load(Ordering::Relaxed),
+                if prefix { 3 } else { 2 }
+            );
+        }
     }
     #[tokio::test]
     async fn existing_eyes_require_operation_specific_rejection_evidence() {
@@ -1031,12 +1121,17 @@ mod tests {
         let c = config();
         for error in [
             "message_not_found",
+            "thread_not_found",
             "channel_not_found",
             "not_in_channel",
+            "access_denied",
             "transport unavailable",
             "429 ratelimited",
         ] {
-            for fail_on in 1..=3 {
+            for (proof, fail_on) in ["qualified", "opaque", "wrong_method", "transport"]
+                .into_iter()
+                .flat_map(|proof| (1..=3).map(move |call| (proof, call)))
+            {
                 let ts = format!("{}.000001", chrono::Utc::now().timestamp());
                 let hit = Hit {
                     channel: "C123".into(),
@@ -1049,7 +1144,21 @@ mod tests {
                 let calls = Arc::new(AtomicU32::new(0));
                 slack.fixture = Some(Arc::new(move |tool, _| {
                     if calls.fetch_add(1, Ordering::Relaxed) + 1 == fail_on {
-                        return Err(error.into());
+                        if proof == "transport" {
+                            return Err(error.into());
+                        }
+                        let mut value = json!({"error":error});
+                        if proof != "opaque" {
+                            value["ok"] = json!(false);
+                            value["method"] = json!(if proof == "wrong_method" {
+                                "users.info"
+                            } else if tool == "slack_get_reactions" {
+                                "reactions.get"
+                            } else {
+                                "conversations.replies"
+                            });
+                        }
+                        return Ok(value);
                     }
                     match tool {
                         "slack_read_thread" => Ok(
@@ -1062,7 +1171,9 @@ mod tests {
                     }
                 }));
                 let result = slack.source(&c, &hit, true).await;
-                if source_unavailable(error) {
+                if proof == "qualified"
+                    && !["transport unavailable", "429 ratelimited"].contains(&error)
+                {
                     assert!(result.unwrap().is_none());
                 } else {
                     assert!(result.is_err());

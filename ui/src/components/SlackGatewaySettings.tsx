@@ -7,7 +7,7 @@ interface Config {
 interface GatewayStatus {
   config: Config | null;
   scan?: { status: string; last_scan_at_unix_micros: number | null; last_error: string | null; baseline_complete: boolean; calls_last_pass: number; pages_last_pass: number; retry_at_us: number | null } | null;
-  requests: { request_id: string; product_id: string | null; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; failure: string | null; source: { source_url: string; kind: string; observed_at_unix_micros: number; message_ts: string } }[];
+  requests: { request_id: string; product_id: string | null; product_exists: boolean; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; failure: string | null; source: { source_url: string; kind: string; observed_at_unix_micros: number; message_ts: string } }[];
   returns: { return_id: string; state: string; destination: string; request_ids: string[]; failure: string | null; notification_receipt: string | null }[];
 }
 const initial = (): Config => ({ enabled: false, mcp_server: '', owner: '', workspace: '', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, phoenix_url: window.location.origin, notification_command: null });
@@ -63,7 +63,7 @@ export function SlackGatewaySettings({ standalone = false }: { standalone?: bool
         {status.scan?.last_scan_at_unix_micros && <p>Last complete scan: {new Date(status.scan.last_scan_at_unix_micros / 1000).toLocaleString()}</p>}
         <p>Last pass: {status.scan?.calls_last_pass ?? 0} MCP tool calls, {status.scan?.pages_last_pass ?? 0} search pages. {status.scan?.retry_at_us && <>Retry after {new Date(status.scan.retry_at_us / 1000).toLocaleString()}.</>}</p>
         <p>Reaction-add latency is unavailable from Slack search. A missing notification command leaves private notices pending.</p>
-        <ul>{status.requests.map(r => <li key={r.request_id}><a href={r.source.source_url} target="_blank" rel="noreferrer">Slack {r.source.kind}</a> · {r.failure ?? (r.admitted ? 'Admitted' : 'Accepted')} · 👀 {r.eyes_confirmed ? 'confirmed' : 'pending'} · observed-to-accept {Math.max(0, (r.accepted_at_us - r.source.observed_at_unix_micros) / 1000).toFixed(0)} ms{r.product_id && <> · <a href={`/c/${r.product_id}`}>Open Phoenix</a></>}</li>)}</ul>
+        <ul>{status.requests.map(r => <li key={r.request_id}><a href={r.source.source_url} target="_blank" rel="noreferrer">Slack {r.source.kind}</a> · {r.failure ?? (r.admitted ? 'Admitted' : 'Accepted')} · 👀 {r.eyes_confirmed ? 'confirmed' : 'pending'} · observed-to-accept {Math.max(0, (r.accepted_at_us - r.source.observed_at_unix_micros) / 1000).toFixed(0)} ms{r.product_exists && r.product_id && <> · <a href={`/c/${r.product_id}`}>Open Phoenix</a></>}</li>)}</ul>
         <ul>{status.returns.map(r => <li key={r.return_id} id={'slack-return-' + r.return_id}>{r.destination} reply: {r.state} · covers {r.request_ids.length} request(s){r.failure && <> · {r.failure}</>}{r.notification_receipt && <> · Receipt: {r.notification_receipt}</>}</li>)}</ul>
       </>}
     </>}

@@ -52,6 +52,8 @@ contract SlackDiscoveryPort {
         -- is either already recorded, positively rejected, or represented by a
         -- verified eligible observation. A positively established deleted or
         -- inaccessible source is ineligible, without marking its identity handled.
+        -- Unavailability requires structured rejection of the relevant source-read
+        -- operation. Opaque codes and unrelated lookup failures remain retryable.
         -- Transient failures, partial reads, parser errors, and failed identity
         -- verification cannot produce completed PageEvidence.
         -- Candidate first-observation time is persisted before verification,
@@ -67,6 +69,9 @@ contract SlackDiscoveryPort {
         -- reactor entries, never a token embedded in a rendered display name.
         -- Display-name commas are not member boundaries. Complete terminal IDs
         -- and the declared member count must agree; duplicate emoji rows are invalid.
+        -- An unverified actor is not verified absence: a reaction-dependent
+        -- candidate retains its page for retry. An independently verified owner
+        -- prefix can authorize the source without that reaction evidence.
         -- A source reply must also be observed under its claimed root; the
         -- search permalink alone does not establish that return destination.
         -- Eligibility uses the current and preceding three calendar dates in
