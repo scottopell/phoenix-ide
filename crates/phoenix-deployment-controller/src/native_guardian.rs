@@ -250,7 +250,7 @@ impl crate::guardian_ipc::NativeEvidenceReader for SqliteNativeEvidenceReader {
 }
 
 const SOCKET_NAME: &str = "guardian.sock";
-const IO_SLICE: Duration = Duration::from_millis(250);
+const CONTROL_RESPONSE_BUDGET: Duration = Duration::from_secs(2);
 const EFFECT_RESPONSE_SLICE: Duration = Duration::from_secs(2);
 
 fn permission_denied() -> io::Error {
@@ -560,7 +560,7 @@ fn serve_until_with_ack_response_barrier<E: GuardianExecutor>(
                     }
                     let mut frame = DeadlineStream {
                         stream: &mut stream,
-                        deadline: (Instant::now() + IO_SLICE).min(until),
+                        deadline: (Instant::now() + CONTROL_RESPONSE_BUDGET).min(until),
                     };
                     if serve_frame(&mut frame, server, &mut ack_response_barrier, until).is_err() {
                         break;
@@ -946,7 +946,7 @@ impl GuardianClient {
         })
     }
     fn exchange(&mut self, request: &Request) -> Result<Response, ClientError> {
-        self.exchange_with_slice(request, IO_SLICE)
+        self.exchange_with_slice(request, CONTROL_RESPONSE_BUDGET)
     }
 
     fn exchange_with_slice(
@@ -3213,6 +3213,51 @@ mod native_sampling_snapshot_tests {
         snapshot.state = crate::guardian_ipc::WireState::Reconciling;
         snapshot.session.generation = binding.current_session().generation.get();
         (dir, store, candidate, snapshot, issue)
+    }
+
+    #[test]
+    fn ordinary_control_response_may_take_longer_than_legacy_slice() {
+        let (_dir, _store, _candidate, snapshot, _issue) = recovered_candidate_fixture();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                assert_eq!(read_frame::<Request>(&mut peer).unwrap(), Request::Snapshot);
+                std::thread::sleep(Duration::from_millis(350));
+                write_frame(&mut peer, &Response::Snapshot(snapshot)).unwrap();
+            });
+            let mut client = GuardianClient {
+                stream: Some(stream),
+                build: BuildIdentity::compiled(),
+                verified_snapshot: None,
+            };
+            assert!(matches!(
+                client.exchange(&Request::Snapshot),
+                Ok(Response::Snapshot(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn expired_control_budget_times_out_and_drops_connection() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut client = GuardianClient {
+            stream: Some(stream),
+            build: BuildIdentity::compiled(),
+            verified_snapshot: None,
+        };
+        let outcome = client.exchange_with_slice(&Request::Snapshot, Duration::ZERO);
+        assert!(matches!(outcome,
+            Err(ClientError::Codec(crate::guardian_ipc::CodecError::Io(ref error)))
+                if error.kind() == io::ErrorKind::TimedOut));
+        assert!(client.stream.is_none());
+        let mut byte = [0];
+        assert_eq!(io::Read::read(&mut peer, &mut byte).unwrap(), 0);
     }
 
     #[test]
