@@ -58,3 +58,25 @@ it.each(['prefix', 'reaction', 'unknown_historical'])('only exposes message age 
   expect(screen.getByText(/observed-to-accept 1000 ms/)).toBeTruthy();
   expect(screen.queryByText(/prefix-message age at observation 1000 ms/) !== null).toBe(triggerKind === 'prefix');
 });
+
+it('edits the full notification command without losing arguments when replacing its launcher', async () => {
+  const command = ['/usr/bin/uv', 'run', '/opt/notifier/notify.py', '--label', 'private notice'];
+  const config = { enabled: false, mcp_server: 'slack', owner: 'UOWNER', workspace: 'example.slack.com', timezone: 'UTC', phoenix_url: 'https://phoenix.example', notification_command: command };
+  let submitted: typeof config | undefined;
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, options?: RequestInit) => {
+    if (options?.method === 'PUT') submitted = JSON.parse(String(options.body));
+    return { ok: true, json: async () => ({ config: submitted ?? config, requests: [], returns: [] }) };
+  }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText('Configured');
+  fireEvent.click(screen.getByText('Edit notification command'));
+  const launcher = screen.getByLabelText('Program or launcher');
+  expect((launcher as HTMLInputElement).value).toBe('/usr/bin/uv');
+  fireEvent.change(launcher, { target: { value: '' } });
+  expect((screen.getByLabelText('Argument 2') as HTMLInputElement).value).toBe('/opt/notifier/notify.py');
+  fireEvent.change(launcher, { target: { value: '/opt/bin/uv' } });
+  fireEvent.change(screen.getByLabelText('Argument 4'), { target: { value: 'private notice with spaces\nand a newline' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await screen.findByText('Settings saved.');
+  expect(submitted?.notification_command).toEqual(['/opt/bin/uv', 'run', '/opt/notifier/notify.py', '--label', 'private notice with spaces\nand a newline']);
+});

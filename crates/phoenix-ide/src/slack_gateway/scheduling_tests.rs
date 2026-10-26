@@ -187,6 +187,7 @@ async fn startup_recovery_retries_a_database_failure_without_restarting_phoenix(
             &output.return_id,
             "fixture-attempt",
             &["/fixture/notify".into()],
+            "https://phoenix.example/frozen",
         )
         .await
         .unwrap();

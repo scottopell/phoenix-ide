@@ -136,9 +136,9 @@ WHEN one native execution consumes a queued batch containing several Slack input
 
 WHEN clarification is required, THE SYSTEM SHALL post it in that thread, durably associate that clarification with the exact native question identity, and direct the owner to answer through a deep link to the ordinary Phoenix conversation. The confirmed clarification handoff SHALL satisfy the request's automatic Slack response obligation; subsequent native discussion SHALL remain private unless separately authorized for publication by a new explicit request. Slack triggers SHALL remain ordinary requests and SHALL NOT answer native questions. WHEN the native conversation cannot accept a new request while awaiting an answer, THE SYSTEM SHALL explain that the owner must answer in Phoenix without changing the pending question or treating the new request as an answer. Persisted question associations SHALL NOT authorize unsubmitted Slack answers.
 
-THE SYSTEM SHALL include a Phoenix deep link in gateway-generated clarifications and explanations: the stable conversation route when one exists, otherwise the specific return's status route. The gateway SHALL durably freeze that complete outgoing text, including the link, when creating its return obligation and reuse it for a known-unsent retry. The assignment SHALL encourage the agent to link its Phoenix conversation when useful in an intentional answer.
+THE SYSTEM SHALL include a Phoenix deep link in gateway-generated clarifications and explanations: the stable conversation route when one exists, otherwise the specific return's status route. For source-thread returns, the gateway SHALL durably freeze that complete outgoing text, including the link, when creating its return obligation and reuse it for a known-unsent retry. The assignment SHALL encourage the agent to link its Phoenix conversation when useful in an intentional answer.
 
-Owner-facing status SHALL distinguish a reserved product identity from an existing conversation and SHALL offer a conversation link only when that product currently exists. Pending, failed or deleted targets SHALL remain inspectable through gateway status.
+Owner-facing status SHALL distinguish a reserved product identity from a native-route-eligible published conversation and SHALL offer a conversation link only while native routing can resolve it. Pending, failed or deleted targets SHALL remain inspectable through gateway status.
 
 WHEN a native question has been answered, replaced or become unavailable before its message-post attempt, THE SYSTEM SHALL retain the request's response duty and create a generic linked handoff explanation rather than publish the stale question or private follow-up content. A materialized pending or known-unsent clarification SHALL be retired and replaced by a distinct return carrying the same source, coverage and destination; the original frozen text SHALL remain intact. This replacement SHALL NOT resend or replace an attempting, confirmed or uncertain external operation.
 
@@ -176,6 +176,8 @@ Each captured briefing occurrence SHALL retain its own notification obligation; 
 
 THE SYSTEM SHALL pass notification content through a versioned input protocol rather than interpolate it into command arguments. Provider authentication SHALL remain the local command's responsibility; supplied credentials SHALL NOT be persisted in gateway settings. Before submission, the command and destination identity SHALL be frozen with the attempt. Later inspection SHALL use that frozen command and verify the exact notification, owner, and submission receipt. The system SHALL distinguish submission from confirmed delivery and SHALL NOT claim that confirmation proves a desktop or mobile notification was displayed. Missing configuration, authentication failure, throttling, and uncertain notification outcomes SHALL remain visible in Phoenix without rerunning the agent.
 
+The first private notification attempt SHALL atomically persist its exact program, arguments and Phoenix target URL before launch. Known-unsent retries and same-version restart SHALL reuse that operation despite later settings or publication changes, including removal of the current command. Historical definitely-unsent notices lacking their original URL SHALL fail visibly rather than reconstruct a destination from current settings; existing submitted receipts SHALL remain inspectable with their retained command.
+
 **Rationale:** A provider-neutral receipt can notify the owner without exposing private findings or coupling the gateway to a particular notification service.
 
 ### REQ-SG-016 — Keep the native experience inspectable
@@ -185,6 +187,8 @@ THE SYSTEM SHALL expose gateway-created work as ordinary Phoenix conversations w
 Conversation links SHALL use the native ordinary-route eligibility boundary, including completed publication. A reserved identity or physical product row during pending or failed initial delivery SHALL NOT imply a routable conversation. Until eligible, generated handoff links SHALL target the exact return status.
 
 THE SYSTEM SHALL use shared internal application services for conversation creation, target resolution, attributed admission, and outcome reads, extracting shared operations from HTTP handlers where necessary. It SHALL reuse the configured MCP client for Slack operations and SHALL NOT duplicate permission, execution, or conversation lifecycle ownership in the gateway.
+
+Owner-facing setup SHALL use Phoenix's light/dark themes and remain usable at narrow widths. Private notification configuration SHALL be summarized separately from its launcher's name; advanced editing SHALL expose the complete program-and-arguments array, preserve exact argument values, and explain which existing retries retain their original operation.
 
 **Rationale:** The owner can understand and continue the work through the native conversation interface while adapters remain replaceable.
 

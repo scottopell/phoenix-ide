@@ -704,6 +704,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_gateway_trigger_provenance",
         sql: "ALTER TABLE slack_gateway_requests ADD COLUMN trigger_kind TEXT NOT NULL DEFAULT 'unknown_historical' CHECK(trigger_kind IN ('prefix','reaction','unknown_historical'));",
     },
+    Migration {
+        version: 135,
+        name: "slack_gateway_frozen_notification_target",
+        sql: "-- Old unsent operations lack their original URL; never invent one from current settings.
+        ALTER TABLE slack_gateway_returns ADD COLUMN notification_url TEXT CHECK(notification_url IS NULL OR length(trim(notification_url))>0);
+        UPDATE slack_gateway_returns SET state='failed',failure='Historical notification retry lacks its original destination URL; automatic retry stopped' || CASE WHEN failure IS NOT NULL THEN ': ' || failure ELSE '' END WHERE destination='private' AND state='known_unsent';
+        CREATE TRIGGER slack_gateway_notification_operation_immutable BEFORE UPDATE OF notification_command,notification_url ON slack_gateway_returns
+        WHEN (OLD.notification_command IS NOT NULL AND NEW.notification_command IS NOT OLD.notification_command) OR (OLD.notification_url IS NOT NULL AND NEW.notification_url IS NOT OLD.notification_url)
+        BEGIN SELECT RAISE(ABORT,'notification operation is immutable'); END;",
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -12520,6 +12530,42 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn historical_notification_retries_never_guess_a_missing_target() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE slack_gateway_returns(return_id TEXT PRIMARY KEY,destination TEXT,state TEXT,notification_command TEXT,failure TEXT); INSERT INTO slack_gateway_returns VALUES('retry','private','known_unsent','[\"/old/notify\"]',NULL),('submitted','private','submitted','[\"/old/notify\"]',NULL),('pending','private','pending',NULL,NULL),('thread','thread','known_unsent',NULL,NULL);").execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATIONS.iter().find(|m| m.version == 135).unwrap().sql)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT return_id,state,notification_url FROM slack_gateway_returns ORDER BY return_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("pending".into(), "pending".into(), None),
+                ("retry".into(), "failed".into(), None),
+                ("submitted".into(), "submitted".into(), None),
+                ("thread".into(), "known_unsent".into(), None)
+            ]
+        );
+        assert!(sqlx::query_scalar::<_, String>(
+            "SELECT failure FROM slack_gateway_returns WHERE return_id='retry'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .contains("original destination URL"));
+    }
+
+    #[tokio::test]
     async fn slack_trigger_provenance_preserves_historical_unknowns() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -14461,6 +14507,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (135, "slack_gateway_frozen_notification_target"),
             (134, "slack_gateway_trigger_provenance"),
             (133, "slack_gateway_first_observation"),
             (132, "slack_gateway"),
@@ -19797,7 +19844,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (131, 'temporarily_skip_request_capacity_diagnostics'),
                     (132, 'temporarily_skip_slack_gateway'),
                     (133, 'temporarily_skip_slack_gateway_first_observation'),
-                    (134, 'temporarily_skip_slack_gateway_trigger_provenance')",
+                    (134, 'temporarily_skip_slack_gateway_trigger_provenance'),
+                    (135, 'temporarily_skip_slack_gateway_frozen_notification_target')",
         )
         .execute(&pool)
         .await
@@ -20669,7 +20717,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (131, 'temporarily_skip_request_capacity_diagnostics'),
                     (132, 'temporarily_skip_slack_gateway'),
                     (133, 'temporarily_skip_slack_gateway_first_observation'),
-                    (134, 'temporarily_skip_slack_gateway_trigger_provenance')",
+                    (134, 'temporarily_skip_slack_gateway_trigger_provenance'),
+                    (135, 'temporarily_skip_slack_gateway_frozen_notification_target')",
         )
         .execute(pool)
         .await

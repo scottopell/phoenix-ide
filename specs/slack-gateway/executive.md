@@ -57,7 +57,7 @@ adversarial author review found and fixed inactive acceptance being mistaken
 for recorded evidence and acknowledgment throttling losing its backoff status.
 These author reviews are not independent sign-off or a formal liveness proof.
 
-The public candidate adds migrations 132–134 after upstream's migration 131, replaces
+The public candidate adds migrations 132–135 after upstream's migration 131, replaces
 the personal notifier with a provider-neutral command, and adds bounded
 newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
 Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
@@ -118,7 +118,8 @@ provide automatic database rollback or qualify a generic 127-to-130 route.
 That pilot's migration 130 is the pre-publication Slack allocation. Upstream
 subsequently assigned 130 and 131 to continuation/capacity data; this branch
 allocates Slack at 132 while preserving the upstream migrations and Slack SQL,
-then adds first-observation metadata at 133 and trigger provenance at 134.
+then adds first-observation metadata at 133, trigger provenance at 134, and
+frozen notification targets at 135.
 The pilot ledger is not the public candidate's ledger. No direct upgrade from
 that pilot to the merged candidate is qualified; it requires separate offline
 reconciliation and validation before any later production deployment.
@@ -230,6 +231,18 @@ tests pass, along with full UI tests, the final eight settings regressions, type
 checking, linting, Clippy, formatting, Allium and structural/timing checks.
 This batch requires new exact-head hosted CI and automatic review;
 the separately pinned production pilot has not been upgraded.
+
+Private notification attempts now atomically freeze the command and target URL;
+known-unsent retries reuse that exact operation after settings changes or a
+database reopen. Migration 135 fails historical unsent notices with missing
+target evidence visibly, preserving their earlier failure reason and leaving
+submitted receipts inspectable. Settings now use the shared theme, responsive
+sections, status badges and an advanced editor for every command argument.
+All 429 affected Rust tests pass. Full UI tests and all ten local check types
+pass, including the final Clippy, model and structural checks. Synthetic desktop,
+mobile and dark-mode browser checks found no overflow or unexpected API calls;
+keyboard toggling and command disclosure passed. Fresh hosted CI and automatic
+review remain required; these changes are not deployed by the pilot evidence.
 
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

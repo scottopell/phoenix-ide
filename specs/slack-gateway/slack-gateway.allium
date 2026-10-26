@@ -20,6 +20,11 @@ enum ReturnKind { thread_reply | private_notice }
 enum ReturnState { pending | attempting | submitted | confirmed | known_unsent | uncertain | failed }
 enum BindingState { reserved | ready | failed | closed }
 
+external entity NotificationOperation {
+    command_identity: String  -- Identity of the exact local program and arguments.
+    url: String
+}
+
 external entity NativeAdmission {
     request_key: String
     product_id: String
@@ -144,6 +149,7 @@ entity ReturnObligation {
     state: ReturnState
     attempt_key: String?
     notification_receipt: String?
+    notification_operation: NotificationOperation?
     delivery_proof: String when state = confirmed
     failure_reason: String when state = failed
 
@@ -152,9 +158,16 @@ entity ReturnObligation {
         -- conversation for an answer. It satisfies the automatic Slack response
         -- duty when confirmed. Slack triggers never answer native questions;
         -- native discussion does not inherit the original publication authority.
-        -- Gateway-generated text and links are frozen when the return is created.
+        -- Thread handoff text and links are frozen when the return is created.
         -- A question settled before handoff still owes a generic linked explanation,
         -- without publishing the stale question or private answer.
+
+    @invariant NotificationRetryIdentity
+        -- A private command and URL are captured atomically at its first attempt.
+        -- Known-unsent retries and restart retain that exact operation despite
+        -- settings or publication changes. Removing the current command does not
+        -- retarget accepted retries. Historical known-unsent notices missing
+        -- their original URL fail visibly rather than guess current settings.
 
     invariant NonemptyCoverage {
         request in covered_requests
@@ -286,6 +299,7 @@ rule RecordBeforeAdmissionFailure {
         state: pending,
         attempt_key: null,
         notification_receipt: null
+        notification_operation: null
     )
 }
 
@@ -313,6 +327,7 @@ rule OweExplicitResponse {
         state: pending,
         attempt_key: null,
         notification_receipt: null
+        notification_operation: null
     )
 }
 
@@ -335,6 +350,7 @@ rule OweBriefingNotice {
         state: pending,
         attempt_key: null,
         notification_receipt: null
+        notification_operation: null
     )
 }
 
@@ -361,6 +377,7 @@ rule ReplaceRetiredClarification {
         state: pending,
         attempt_key: null,
         notification_receipt: null
+        notification_operation: null
     )
     @guidance
         -- Retirement is exact native-question evidence. The replacement contains
@@ -375,8 +392,19 @@ rule ReplaceRetiredClarification {
 rule BeginReturnAttempt {
     when: DispatchReturn(obligation, attempt)
     requires: obligation.state in {pending, known_unsent}
+    requires: obligation.kind = thread_reply
     ensures: obligation.state = attempting
     ensures: obligation.attempt_key = attempt
+}
+
+rule BeginNotificationAttempt {
+    when: DispatchNotification(obligation, attempt, operation)
+    requires: obligation.kind = private_notice
+    requires: obligation.state in {pending, known_unsent}
+    requires: (obligation.state = pending and obligation.notification_operation = null) or obligation.notification_operation = operation
+    ensures: obligation.state = attempting
+    ensures: obligation.attempt_key = attempt
+    ensures: obligation.notification_operation = operation
 }
 
 rule ConfirmSlackReply {
@@ -458,6 +486,7 @@ rule ReportUnavailableThread {
         state: pending,
         attempt_key: null,
         notification_receipt: null
+        notification_operation: null
     )
     @guidance
         -- The current message-post attempt has structured rejection evidence

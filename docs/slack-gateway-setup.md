@@ -20,11 +20,18 @@ exhausted allowance or active retry delay can postpone the check.
 Finish outstanding work before switching the configured owner or workspace.
 Pausing discovery still lets accepted work and its deliveries finish.
 
-Optional private notifications use an owner-configured executable. Configure
-its absolute path in settings, or an executable-plus-arguments JSON array in
+Optional private notifications use an owner-configured local command. The settings
+summary shows whether it is configured; expand “Edit notification command” to
+view or edit its program and every argument. A launcher such as uv is distinct
+from the notification script passed in its arguments. Configure
+the absolute executable path there, or an executable-plus-arguments JSON array in
 `notification_command` through the settings API. Keep provider credentials and
 personal routing outside this repository. See [notification protocol](#notification-protocol).
-Missing notification configuration leaves private notices visibly pending.
+Missing notification configuration leaves new private notices visibly pending.
+The first delivery attempt freezes the command and Phoenix link together.
+Later settings changes affect new deliveries; known-unsent retries retain their
+original operation, including after restart. Historical retries without a
+retained target fail visibly rather than guess a new link.
 
 ## Gestures and initialization
 

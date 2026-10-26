@@ -415,98 +415,105 @@ async fn dispatch_returns(
             continue;
         }
         // Missing notification command is visibly pending and is safe to resume.
-        if output.destination == "private" && c.notification_command.is_none() {
+        if output.destination == "private"
+            && output.notification_command.is_none()
+            && c.notification_command.is_none()
+        {
             continue;
         }
         let attempt = uuid::Uuid::new_v4().to_string();
-        if !begin_return(state, c, &output, &attempt).await? {
+        let Some(dispatch) = begin_return(state, c, &output, &attempt).await? else {
             continue;
-        }
-        if output.destination == "thread" {
-            match slack
-                .send(&output.channel, &output.thread_ts, &output.text)
-                .await
-            {
-                Ok(proof) => state
-                    .db
-                    .slack_finish_return(
-                        &output.return_id,
-                        &attempt,
-                        phoenix_db::SlackReturnState::Confirmed,
-                        Some(&proof),
-                        None,
-                        None,
-                    )
+        };
+        match dispatch {
+            ReturnAttempt::Thread => {
+                match slack
+                    .send(&output.channel, &output.thread_ts, &output.text)
                     .await
-                    .map_err(err)?,
-                Err(e) if super::slack::destination_unavailable(&e) => {
-                    state
+                {
+                    Ok(proof) => state
                         .db
-                        .slack_fail_return_with_notice(&output.return_id, &attempt, e.message())
+                        .slack_finish_return(
+                            &output.return_id,
+                            &attempt,
+                            phoenix_db::SlackReturnState::Confirmed,
+                            Some(&proof),
+                            None,
+                            None,
+                        )
                         .await
-                        .map_err(err)?;
+                        .map_err(err)?,
+                    Err(e) if super::slack::destination_unavailable(&e) => {
+                        state
+                            .db
+                            .slack_fail_return_with_notice(&output.return_id, &attempt, e.message())
+                            .await
+                            .map_err(err)?;
+                    }
+                    Err(e) => state
+                        .db
+                        .slack_finish_return(
+                            &output.return_id,
+                            &attempt,
+                            if matches!(e, phoenix_tools::mcp::McpOneShotError::NotDispatched(_))
+                                || super::slack::rate_rejection_proves_unsent(&e)
+                            {
+                                phoenix_db::SlackReturnState::KnownUnsent
+                            } else {
+                                phoenix_db::SlackReturnState::Uncertain
+                            },
+                            None,
+                            None,
+                            Some(e.message()),
+                        )
+                        .await
+                        .map_err(err)?,
                 }
-                Err(e) => state
-                    .db
-                    .slack_finish_return(
-                        &output.return_id,
-                        &attempt,
-                        if matches!(e, phoenix_tools::mcp::McpOneShotError::NotDispatched(_))
-                            || super::slack::rate_rejection_proves_unsent(&e)
-                        {
-                            phoenix_db::SlackReturnState::KnownUnsent
-                        } else {
-                            phoenix_db::SlackReturnState::Uncertain
-                        },
-                        None,
-                        None,
-                        Some(e.message()),
-                    )
-                    .await
-                    .map_err(err)?,
             }
-        } else {
-            match super::notification::notify(c, &output).await {
-                Ok(super::notification::Submission::Submitted { receipt }) => state
-                    .db
-                    .slack_finish_return(
-                        &output.return_id,
-                        &attempt,
-                        phoenix_db::SlackReturnState::Submitted,
-                        None,
-                        Some(&receipt),
-                        None,
-                    )
-                    .await
-                    .map_err(err)?,
-                Ok(super::notification::Submission::Failed { receipt, reason }) => state
-                    .db
-                    .slack_finish_return(
-                        &output.return_id,
-                        &attempt,
-                        phoenix_db::SlackReturnState::Failed,
-                        None,
-                        Some(&receipt),
-                        Some(&reason),
-                    )
-                    .await
-                    .map_err(err)?,
-                Err(e) => state
-                    .db
-                    .slack_finish_return(
-                        &output.return_id,
-                        &attempt,
-                        if matches!(e, super::notification::NotificationError::NotDispatched(_)) {
-                            phoenix_db::SlackReturnState::KnownUnsent
-                        } else {
-                            phoenix_db::SlackReturnState::Uncertain
-                        },
-                        None,
-                        None,
-                        Some(e.message()),
-                    )
-                    .await
-                    .map_err(err)?,
+            ReturnAttempt::Notification(operation) => {
+                match super::notification::notify(&output, &operation).await {
+                    Ok(super::notification::Submission::Submitted { receipt }) => state
+                        .db
+                        .slack_finish_return(
+                            &output.return_id,
+                            &attempt,
+                            phoenix_db::SlackReturnState::Submitted,
+                            None,
+                            Some(&receipt),
+                            None,
+                        )
+                        .await
+                        .map_err(err)?,
+                    Ok(super::notification::Submission::Failed { receipt, reason }) => state
+                        .db
+                        .slack_finish_return(
+                            &output.return_id,
+                            &attempt,
+                            phoenix_db::SlackReturnState::Failed,
+                            None,
+                            Some(&receipt),
+                            Some(&reason),
+                        )
+                        .await
+                        .map_err(err)?,
+                    Err(e) => state
+                        .db
+                        .slack_finish_return(
+                            &output.return_id,
+                            &attempt,
+                            if matches!(e, super::notification::NotificationError::NotDispatched(_))
+                            {
+                                phoenix_db::SlackReturnState::KnownUnsent
+                            } else {
+                                phoenix_db::SlackReturnState::Uncertain
+                            },
+                            None,
+                            None,
+                            Some(e.message()),
+                        )
+                        .await
+                        .map_err(err)?,
+                }
             }
         }
     }
@@ -530,30 +537,37 @@ async fn reconcile_notification_submission(
     }
     Ok(())
 }
+enum ReturnAttempt {
+    Thread,
+    Notification(phoenix_db::SlackNotificationOperation),
+}
 async fn begin_return(
     state: &AppState,
     c: &Config,
     output: &phoenix_db::SlackReturn,
     attempt: &str,
-) -> Result<bool, String> {
+) -> Result<Option<ReturnAttempt>, String> {
     if output.destination == "private" {
+        let command = output
+            .notification_command
+            .as_deref()
+            .or(c.notification_command.as_deref())
+            .ok_or("Private notification command is not configured")?;
+        let url = super::notification::target_url(c, output).map_err(|e| e.message().to_owned())?;
         state
             .db
-            .slack_begin_notification_return(
-                &output.return_id,
-                attempt,
-                c.notification_command
-                    .as_deref()
-                    .ok_or("Private notification command is not configured")?,
-            )
+            .slack_begin_notification_return(&output.return_id, attempt, command, &url)
             .await
+            .map(|operation| operation.map(ReturnAttempt::Notification))
+            .map_err(err)
     } else {
         state
             .db
             .slack_begin_return(&output.return_id, attempt)
             .await
+            .map(|begun| begun.then_some(ReturnAttempt::Thread))
+            .map_err(err)
     }
-    .map_err(err)
 }
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -758,8 +772,9 @@ mod tests {
             let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
             let directory = tempfile::tempdir().unwrap();
             let executable = directory.path().join("notify");
+            let payload = directory.path().join("payload.json");
             let response = r#"{"version":1,"notification_id":"rejected","owner":"UFIXTURE","receipt":"rejection-receipt","state":"failed","reason":"Recipient disabled"}"#.replace("\"failed\"", if repair_launch {"\"submitted\""} else {"\"failed\""});
-            let c = Config {
+            let mut c = Config {
                 enabled: false,
                 mcp_server: "fixture".into(),
                 owner: "UFIXTURE".into(),
@@ -809,14 +824,32 @@ mod tests {
                     .remove(0);
                 assert_eq!(unsent.state, phoenix_db::SlackReturnState::KnownUnsent);
                 assert!(unsent.notification_receipt.is_none());
+                assert_eq!(
+                    unsent.notification_url.as_deref(),
+                    Some("https://localhost:8043/settings/slack#slack-return-rejected")
+                );
+                c.phoenix_url = "https://replacement.example".into();
+                c.notification_command = None;
+                dispatch_returns(&state, &c, &slack, false).await.unwrap();
+                c.notification_command = Some(vec!["/replacement/notifier".into()]);
                 std::fs::write(
                     &executable,
-                    format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{response}'\n"),
+                    format!(
+                        "#!/bin/sh\ncat > '{}'\nprintf '%s' '{response}'\n",
+                        payload.display()
+                    ),
                 )
                 .unwrap();
                 std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
                     .unwrap();
                 dispatch_returns(&state, &c, &slack, false).await.unwrap();
+                let captured: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&payload).unwrap()).unwrap();
+                assert_eq!(
+                    captured["url"],
+                    "https://localhost:8043/settings/slack#slack-return-rejected"
+                );
+                assert_eq!(captured["text"], "ready");
             }
             let output = state
                 .db

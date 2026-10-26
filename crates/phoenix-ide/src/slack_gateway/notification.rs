@@ -1,6 +1,6 @@
 //! Provider-neutral owner notification command. Credentials stay in the local adapter.
 use super::Config;
-use phoenix_db::{SlackNotificationObservation, SlackReturn};
+use phoenix_db::{SlackNotificationObservation, SlackNotificationOperation, SlackReturn};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,11 +60,11 @@ impl From<&str> for NotificationError {
     }
 }
 
-pub(super) async fn notify(
-    c: &Config,
-    output: &SlackReturn,
-) -> Result<Submission, NotificationError> {
-    let url = if output.published {
+pub(super) fn target_url(c: &Config, output: &SlackReturn) -> Result<String, NotificationError> {
+    if let Some(url) = &output.notification_url {
+        return Ok(url.clone());
+    }
+    Ok(if output.published {
         let product = output.product_id.as_deref().ok_or_else(|| {
             NotificationError::NotDispatched("Published notice has no conversation identity".into())
         })?;
@@ -75,20 +75,22 @@ pub(super) async fn notify(
             c.phoenix_url.trim_end_matches('/'),
             output.return_id
         )
-    };
+    })
+}
+
+pub(super) async fn notify(
+    output: &SlackReturn,
+    operation: &SlackNotificationOperation,
+) -> Result<Submission, NotificationError> {
     let response = call(
-        c.notification_command.as_deref().ok_or_else(|| {
-            NotificationError::NotDispatched(
-                "Private notification command is not configured".into(),
-            )
-        })?,
+        &operation.command,
         Request {
             version: 1,
             notification_id: &output.return_id,
             owner: &output.owner,
             operation: Operation::Submit {
                 text: &output.text,
-                url: &url,
+                url: &operation.url,
             },
         },
     )
