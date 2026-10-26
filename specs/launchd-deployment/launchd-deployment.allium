@@ -1,10 +1,11 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
--- Requirement traceability: REQ-LDD-001 through REQ-LDD-025
+-- Requirement traceability: REQ-LDD-001 through REQ-LDD-028
 -- REQ-LDD-019–022 admit prepared sources at exact 123 or exact 128 with
 -- exact target 128; one exact prepared candidate additionally admits prefix114.
 -- The protected published-release admission remains separate exact 114 -> 128.
--- REQ-LDD-023 admits ordinary pending migrations only at exact 123 -> 128.
+-- REQ-LDD-023/028 admit ordinary pending migrations at exact 123 -> 128
+-- or the independent exact 129 -> 131 registry qualification.
 
 config {
     transition_timeout_seconds: Integer = 30
@@ -394,7 +395,8 @@ external entity TargetService {
 -- ordinary_forward_boundary_qualified(transaction) -> Boolean
 --   Only ordinary local HEAD or published release deployment with an exact
 --   complete migration-123 source ledger and exact migration-128 candidate
---   registry with the named 126/127/128 entries defined by current_schema_preflight_is_valid.
+--   registry with the named 126/127/128 entries defined by current_schema_preflight_is_valid,
+--   or exact complete source129 to exact target131 under REQ-LDD-028/REQ-COMP-019.
 --   The complete registry and SHA-256 digest are immutable evidence bound to the
 --   candidate identity/configuration and helper, re-verified before activation
 --   and forward recovery. Pre-handoff admission executes the hash/path-bound
@@ -405,7 +407,7 @@ external entity TargetService {
 --   pending migrations. An absent path includes a switch from a predecessor's
 --   different database: captured predecessor configuration still governs ordinary
 --   artifact rollback. An existing database is guarded even on first install.
---   Ordinary pending migrations require ordinary_forward_boundary_qualified (exact 123 -> 128).
+--   Ordinary pending migrations require ordinary_forward_boundary_qualified (exact 123 -> 128 or exact 129 -> 131).
 --   Protected exact 114 -> 128 admission does not qualify an ordinary interval.
 --   Unknown or unqualified pending intervals reject before runtime disruption.
 -- OrdinaryPendingMigrationsRejected(transaction)
@@ -422,7 +424,8 @@ external entity TargetService {
 --   Explicit operator authorization, matching ownership claim and retained
 --   transaction/helper, exact candidate binary/configuration, immutable complete
 --   registry and SHA-256 digest, stopped target and exclusive operation lock all
---   re-verify before startup.
+--   re-verify before startup. For REQ-LDD-028, the ledger is the exact complete
+--   source129, partial130 or target131 prefix of its hash-qualified registry.
 -- ordinary_forward_failure_fenced(transaction) -> Boolean
 --   Candidate teardown is attempted and the target remains stopped when possible;
 --   failure to confirm stop is reported explicitly, never treated as safe to
@@ -1104,7 +1107,7 @@ rule RecoverUnchangedCurrentSchemaSource {
 -- CurrentSchemaSnapshotNotReplayed(transaction)
 --   Finalization does not restore or replay the audit snapshot.
 -- OrdinaryForwardCandidateStartupRequested(transaction)
---   Exact 123 -> 128 ordinary activation is about to attempt candidate startup.
+--   Exact 123 -> 128 or exact 129 -> 131 ordinary activation attempts candidate startup.
 -- OrdinaryForwardActivationFailed(transaction, failure)
 --   Candidate startup or health failed, or absence of a start attempt is unproven.
 -- OrdinaryForwardResumeRequested(transaction)
@@ -1122,8 +1125,8 @@ rule FenceFailedOrdinaryForwardActivation {
     ensures: DurableStatusWritten(transaction)
 
     @guidance
-        -- A failed or unknown start may have committed migrations 126/127/128 or
-        -- coordinator-home initialization. Stop the candidate where possible;
+        -- A failed or unknown start may have committed migrations 126/127/128,
+        -- coordinator-home initialization, or additive migrations130/131. Stop the candidate where possible;
         -- never bootstrap the predecessor or clear the claim on uncertainty.
 }
 

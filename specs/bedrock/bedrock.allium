@@ -346,6 +346,7 @@ entity Conversation {
 
     -- Context tracking (REQ-BED-012)
     context_usage_ratio: Decimal
+    model: String
     model_context_window: Integer
     resolved_model_id: String
 
@@ -1208,14 +1209,29 @@ rule ParentCancelDuringLlmRequest {
 -- PARENT 3. NON-RETRYABLE ERROR (parent -> error)
 -- ===========================================================
 
+rule PlannedCapacityPressureRequiresCompaction {
+    when: ReducibleRequestPressure(conversation)
+    requires: conversation.core_status = llm_requesting
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.rejected_tool_calls.count = 0
+    ensures: conversation.retry_attempt = 1
+    ensures: ContinuationRequested(conversation, conversation.rejected_tool_calls)
+
+    @guidance
+        -- REQ-BED-020a, REQ-LLM-004j: this event means permitted clearing
+        -- has settled and retained history can be reduced. Completed tool
+        -- results remain persisted. The existing durable continuation owner
+        -- creates the operation identity; no provider call has been dispatched.
+}
+
 rule BackendRejectsContextExhausted {
     when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = llm_requesting
     requires: error_kind = context_exhausted
-    ensures: conversation.parent_status = context_exhausted
-    ensures: conversation.continuation_summary =
-        "Context limit reached before the turn could complete. " +
-        "Continue to compact and resume, or start a new conversation."
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.rejected_tool_calls.count = 0
+    ensures: conversation.retry_attempt = 1
+    ensures: ContinuationRequested(conversation, conversation.rejected_tool_calls)
 
     @guidance
         -- Checked before ParentLlmErrorNonRecoverable, mirroring
@@ -1224,12 +1240,11 @@ rule BackendRejectsContextExhausted {
         -- usage tracking did not trip the continuation threshold
         -- (ContextThresholdReachedParent, REQ-BED-019) — wrong declared
         -- context window, a tightened backend cap, or a large attachment
-        -- landing mid-turn. Both the internal-threshold and
-        -- backend-rejection paths must converge on context_exhausted so
-        -- the message-rejection / continuation-recovery precondition
-        -- (RejectMessageContextExhausted) is satisfiable. Routing through
-        -- `error` is unrecoverable: there is no transition out of the
-        -- error state into continuation, so the conversation is stranded.
+        -- landing mid-turn. REQ-BED-020a routes this through the existing
+        -- durable handoff operation; only a real generated summary can
+        -- reach the successor-ready context_exhausted state. Summary
+        -- planning failure retains recoverable continuation state, and
+        -- does not recursively generate another summary operation.
         -- Sub-agents are unaffected — they have no context_exhausted
         -- parent_status and keep SubAgentContextExhausted -> failed.
 }
@@ -1602,8 +1617,8 @@ rule UserDismissesQuestion {
 -- PARENT 7. CONTEXT CONTINUATION (REQ-BED-019 through 024)
 -- ===========================================================
 
--- Manual continuation is user-gated only by idle status. The UI warning
--- threshold changes indicator styling; it does not hide this action.
+-- The UI warning threshold changes indicator styling; it does not hide
+-- manual continuation from an idle conversation.
 rule UserTriggersContinuation {
     when: UserTriggersContinuation(conversation, operation_id)
     requires: conversation.core_status = idle
@@ -1613,6 +1628,24 @@ rule UserTriggersContinuation {
     ensures: conversation.retry_attempt = 1
     ensures: ContinuationOperationPersisted(conversation, operation_id)
     ensures: ContinuationRequested(conversation, operation_id, {})
+}
+
+rule UserRegeneratesExhaustedContinuation {
+    when: UserTriggersContinuation(conversation, operation_id)
+    requires: conversation.parent_status = context_exhausted
+    requires: conversation.continued_in_conv_id = absent
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: conversation.rejected_tool_calls = {}
+    ensures: conversation.retry_attempt = 1
+    ensures: ContinuationOperationPersisted(conversation, operation_id)
+    ensures: ContinuationRequested(conversation, operation_id, {})
+
+    @guidance
+        -- Apply ordinary product mutation and Close admission before dispatch.
+        -- Preserve the transcript, including the prior summary boundary row.
+        -- Regeneration depends on lifecycle state and successor absence, never
+        -- on the wording or origin of the existing summary.
 }
 
 rule ContinuationSummaryReceived {
@@ -1786,13 +1819,67 @@ rule ProtectedContinuationHandoffDoesNotFit {
     @guidance
         -- Emit before provider dispatch. Do not truncate the protected handoff
         -- or dispatch a secondary summarization to make it fit. The shared
-        -- failure transition retains the operation and offers explicit retry.
+        -- failure transition retains the operation. An unchanged deterministic
+        -- capacity conflict requires revised input or an explicit model change.
+}
+
+rule RejectUnchangedCapacityRetry {
+    when: UserTriggersContinuation(conversation, operation_id)
+    requires: conversation.core_status = recoverable_continuation_failure
+    requires: continuation_capacity_conflict(conversation)
+    ensures: ContinuationAdmissionRejected(conversation, operation_id)
+    ensures: conversation.core_status = previous(conversation.core_status)
+}
+
+rule ChangedModelReplansCapacityFailure {
+    when: AdmittedContinuationModelChanged(conversation, selected_model)
+    requires: conversation.core_status = recoverable_continuation_failure
+    requires: continuation_capacity_conflict(conversation)
+    requires: selected_model != conversation.model
+    ensures: conversation.model = selected_model
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.retry_attempt = previous(conversation.retry_attempt) + 1
+    ensures: conversation.continuation_operation_id = previous(conversation.continuation_operation_id)
+    ensures: ContinuationRequested(conversation, conversation.continuation_operation_id, conversation.rejected_tool_calls)
+
+    @guidance
+        -- Commit model settings and the advanced request owner in one transaction
+        -- before replacing the runtime. Startup resumes that persisted owner.
+}
+
+rule UserRequestsOneHandoffShortening {
+    when: UserRequestsHandoffShortening(conversation, source)
+    requires: conversation.parent_status = context_exhausted
+        or conversation.core_status = recoverable_continuation_failure
+    requires: shortening_request_fits(conversation, source)
+    ensures: OneHandoffShorteningAttemptRuns(conversation, source)
+    @guidance
+        -- Count the full protected source, rewrite instructions and full selected
+        -- model output reservation. Never clip, retry or recursively rewrite.
+        -- Persist one generated result as an immutable candidate with source
+        -- references and the current operation/attempt or exhausted revision.
+        -- The original transcript and accepted handoff are unchanged.
+}
+
+rule ShorteningRequestCannotFit {
+    when: UserRequestsHandoffShortening(conversation, source)
+    requires: not shortening_request_fits(conversation, source)
+    ensures: HandoffShorteningRejectedWithoutProviderCall(conversation, source)
+}
+
+rule UserAcceptsCurrentGeneratedCandidate {
+    when: UserAcceptsGeneratedHandoffCandidate(conversation, candidate, new_conv, first_message_id)
+    requires: candidate_current_for(candidate, conversation)
+    requires: successor_handoff_fits(conversation, candidate.text)
+    requires: conversation.continued_in_conv_id = absent
+    ensures: ContinuationSuccessorOperationRuns(conversation, new_conv, candidate.text, first_message_id, generated_predecessor_context)
 }
 
 rule UserRetriesContinuation {
     when: UserTriggersContinuation(conversation, operation_id)
     requires: conversation.core_status = recoverable_continuation_failure
     requires: conversation.continuation_operation_id = operation_id
+    requires: not continuation_capacity_conflict(conversation)
     ensures: conversation.core_status = awaiting_continuation
     ensures: conversation.continuation_operation_id = operation_id
     ensures: conversation.retry_attempt = previous(conversation.retry_attempt) + 1
@@ -1903,9 +1990,11 @@ rule IgnoreStaleOrDuplicateContinuationResult {
     ensures: ContinuationResultIgnored(conversation, operation_id)
 }
 
-rule UserStartsContinuationConversation {
-    when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+rule UserStartsManualContinuationConversation {
+    when: UserStartsManualContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
+        or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation))
+    requires: successor_handoff_fits(conversation, handoff_text)
     requires: conversation.continued_in_conv_id = absent
     requires:
         conversation.product_conversation.kind = coordinator
@@ -1920,6 +2009,20 @@ rule UserStartsContinuationConversation {
         user_authorized_instruction)
 }
 
+-- REQ-BED-020b/021/030: a human starts the action; the typed source owns authority.
+rule UserAcceptsCurrentGeneratedSummary {
+    when: UserAcceptsGeneratedSummary(conversation, summary_message_id, new_conv, handoff_text, first_message_id)
+    requires: conversation.parent_status = context_exhausted
+    requires: exact_current_summary_source(conversation, summary_message_id, handoff_text)
+    requires: successor_handoff_fits(conversation, handoff_text)
+    requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_conversation.kind = coordinator
+        or conversation.product_lifecycle = open
+    requires: not exists CloseObligation{product_conversation: conversation.product_conversation}
+        where phase != completed
+    ensures: ContinuationSuccessorOperationRuns(conversation, new_conv, handoff_text, first_message_id, generated_predecessor_context)
+}
+
 rule ContinuationSuccessorOperationCommits {
     when: ContinuationSuccessorOperationRuns(
         conversation,
@@ -1928,6 +2031,8 @@ rule ContinuationSuccessorOperationCommits {
         first_message_id,
         opening_authority)
     requires: conversation.parent_status = context_exhausted
+        or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation))
+    requires: successor_handoff_fits(conversation, handoff_text)
     requires: conversation.continued_in_conv_id = absent
     requires:
         conversation.product_conversation.kind = coordinator
@@ -1951,6 +2056,18 @@ rule ContinuationSuccessorOperationCommits {
         opening_authority)
 }
 
+rule ReviewedCapacityHandoffBecomesBoundary {
+    when: ContinuationSuccessorOperationRuns(conversation, new_conv, handoff_text, first_message_id, opening_authority)
+    requires: conversation.core_status = recoverable_continuation_failure
+    requires: continuation_capacity_conflict(conversation)
+    requires: conversation.continued_in_conv_id = absent
+    ensures: ReviewedContinuationBoundaryAndReservationCommitAtomically(conversation, new_conv, handoff_text, opening_authority)
+    @guidance
+        -- Preserve prior transcript rows and candidates. Persist the reviewed
+        -- boundary in the same transaction as the one-successor reservation so
+        -- accepted opening provenance is recoverable without a missing boundary.
+}
+
 rule ContinuationHandoffBecomesBoundary {
     when: ContinuationSuccessorOperationRuns(
         conversation,
@@ -1971,8 +2088,8 @@ rule ContinuationHandoffBecomesBoundary {
     @guidance
         -- The exact persisted continuation summary becomes the one visible
         -- boundary at the predecessor/successor join. The user-selected handoff
-        -- text is accepted atomically as the successor's first user message via
-        -- the client-generated first_message_id, and the boundary summary is not
+        -- text and explicit source authority are accepted atomically as the
+        -- successor opening via first_message_id, and the boundary summary is not
         -- duplicated as an ordinary transcript message on either side.
 }
 
@@ -2853,6 +2970,26 @@ rule ModeChangeNotification {
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
 --
+--   continuation_capacity_conflict(conversation: Parent) -> Boolean
+--       The retained failure is classified ContextCapacityConflict.
+--   successor_handoff_fits(conversation: Parent, text: String) -> Boolean
+--       Shared ordinary-request accounting with fresh successor-turn guidance,
+--       tools, source framing and full output reservation leaves the required
+--       successor working room after text. Cached predecessor guidance is not
+--       the authority for a successor's new turn.
+--   shortening_request_fits(conversation: Parent, source: String) -> Boolean
+--       Complete protected rewrite source, instructions and full output reserve
+--       fit the selected model's context without clipping or another rewrite.
+--   exact_current_summary_source(conversation: Parent, message_id: String, text: String) -> Boolean
+--       The explicit summary source identifies the current predecessor's persisted
+--       continuation message and its exact text. Literal equality alone does not
+--       select this source or grant generated-context authority.
+--   candidate_current_for(candidate, conversation: Parent) -> Boolean
+--       Exact retained generated candidate text and owning conversation match;
+--       its operation/attempt or exhausted-state timestamp equals the current
+--       source revision. A source-only review_input is never generated. A stale
+--       candidate remains history, not an acceptance.
+--
 --   ApprovalAdoptionPersistedAtomically(
 --       conversation: Parent
 --   ) -> Boolean
@@ -3020,8 +3157,14 @@ rule ModeChangeNotification {
 --       True exactly when the shared continuation operation durably accepts one
 --       opening payload with one authority kind. Provider projection delimits
 --       generated_predecessor_context so it cannot grant authority, approve work,
---       or issue a new user command; user_authorized_instruction retains manual
---       Continue semantics.
+--       or issue a new user command. Generated context is readable English with
+--       losslessly escaped delimiters, preserving exact display Unicode/whitespace.
+--       Durable generated-context receipts govern live projection even when old
+--       persisted expansions encode the text; transcripts are not rewritten and a
+--       cache miss is accepted. Explicit manual/literal sources retain
+--       user_authorized_instruction, even when their bytes equal generated text.
+--       Existing completed receipts retain their recorded authority; neither
+--       English wording nor human initiation can reclassify them.
 --
 --   SuccessorOpeningAcceptedExactlyOnce(
 --       successor: Parent,
@@ -3531,9 +3674,37 @@ surface UserConversation {
             when conversation.parent_status = awaiting_user_response
              and request_id = conversation.pending_question_authority.request_id
         UserTriggersContinuation(conversation, operation_id)
-            when conversation.core_status in { idle, recoverable_continuation_failure }
-        UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+            when conversation.core_status = idle
+                or (conversation.core_status = recoverable_continuation_failure and not continuation_capacity_conflict(conversation))
+                or (conversation.parent_status = context_exhausted and conversation.continued_in_conv_id = absent)
+        UserAcceptsGeneratedSummary(conversation, summary_message_id, new_conv, handoff_text, first_message_id)
             when conversation.parent_status = context_exhausted
+                and conversation.continued_in_conv_id = absent
+        UserRequestsHandoffShortening(conversation, source)
+            when (conversation.parent_status = context_exhausted
+                or conversation.core_status = recoverable_continuation_failure)
+                 and conversation.continued_in_conv_id = absent
+                 and (
+                    conversation.product_conversation.kind = coordinator
+                    or conversation.product_lifecycle = open
+                 )
+                 and not exists CloseObligation{product_conversation: conversation.product_conversation}
+                     where phase != completed
+        UserAcceptsGeneratedHandoffCandidate(conversation, candidate, new_conv, first_message_id)
+            when (conversation.parent_status = context_exhausted
+                or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation)))
+                 and conversation.continued_in_conv_id = absent
+                 and candidate_current_for(candidate, conversation)
+                 and successor_handoff_fits(conversation, candidate.text)
+                 and (
+                    conversation.product_conversation.kind = coordinator
+                    or conversation.product_lifecycle = open
+                 )
+                 and not exists CloseObligation{product_conversation: conversation.product_conversation}
+                     where phase != completed
+        UserStartsManualContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+            when (conversation.parent_status = context_exhausted
+                or (conversation.core_status = recoverable_continuation_failure and continuation_capacity_conflict(conversation)))
                  and conversation.continued_in_conv_id = absent
                  and (
                     conversation.product_conversation.kind = coordinator

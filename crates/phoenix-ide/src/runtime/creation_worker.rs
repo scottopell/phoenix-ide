@@ -3152,10 +3152,9 @@ mod product_creation_delivery_replay_tests {
         );
     }
 
-    fn initialized_product_repository() -> tempfile::TempDir {
-        // Selected working directories reject symlink segments, including macOS /var.
-        // ast-grep-ignore: no-direct-temp-dir-reads -- test fixture uses the canonical host temp root.
-        let repo = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    fn initialized_product_repository() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = directory.path().canonicalize().unwrap();
         for args in [
             vec!["init", "--initial-branch=main"],
             vec!["config", "user.name", "Product Creation Test"],
@@ -3179,9 +3178,9 @@ mod product_creation_delivery_replay_tests {
                 "user work",
             ],
         ] {
-            crate::git_ops::run_git(repo.path(), &args).unwrap();
+            crate::git_ops::run_git(repo.as_path(), &args).unwrap();
         }
-        repo
+        (directory, repo)
     }
 
     fn product_repository_refs(repo: &Path) -> String {
@@ -3199,14 +3198,14 @@ mod product_creation_delivery_replay_tests {
 
     #[tokio::test]
     async fn product_worker_materializes_persisted_pin_detached_without_changing_refs() {
-        let repo = initialized_product_repository();
+        let (_directory, repo) = initialized_product_repository();
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
-        let mut claimed = accept_and_claim_product_at(&db, "git-pin", repo.path()).await;
-        let (oid, base) = strict_product_creation_pin(repo.path()).unwrap();
+        let mut claimed = accept_and_claim_product_at(&db, "git-pin", repo.as_path()).await;
+        let (oid, base) = strict_product_creation_pin(repo.as_path()).unwrap();
         assert_eq!(base, "main");
         assert_ne!(
-            crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"])
+            crate::git_ops::run_git(repo.as_path(), &["rev-parse", "HEAD"])
                 .unwrap()
                 .trim(),
             oid
@@ -3225,8 +3224,9 @@ mod product_creation_delivery_replay_tests {
         let persisted_oid = claimed.job.pin_exact_checkout_oid.clone().unwrap();
         assert_eq!(persisted_oid, oid);
         // Move main after pin persistence so re-resolving the branch cannot pass this test.
-        crate::git_ops::run_git(repo.path(), &["update-ref", "refs/heads/main", "HEAD"]).unwrap();
-        let before = product_repository_refs(repo.path());
+        crate::git_ops::run_git(repo.as_path(), &["update-ref", "refs/heads/main", "HEAD"])
+            .unwrap();
+        let before = product_repository_refs(repo.as_path());
         assert_eq!(
             before.lines().count(),
             3,
@@ -3235,10 +3235,11 @@ mod product_creation_delivery_replay_tests {
         assert!(before.contains("refs/heads/main "));
         assert!(before.contains("refs/heads/user-work "));
         assert!(before.contains("refs/tags/protected-tag "));
-        let original_head = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let original_head =
+            crate::git_ops::run_git(repo.as_path(), &["rev-parse", "HEAD"]).unwrap();
         assert_ne!(original_head.trim(), persisted_oid);
         let worktree = deterministic_worktree_path(
-            repo.path().to_str().unwrap(),
+            repo.as_path().to_str().unwrap(),
             claimed.job.product_conversation_id.as_str(),
         );
         let result = Box::pin(process_product_creation_until_closed(&manager, claimed)).await;
@@ -3257,13 +3258,13 @@ mod product_creation_delivery_replay_tests {
             persisted_oid
         );
         assert!(crate::git_ops::run_git(&worktree, &["symbolic-ref", "-q", "HEAD"]).is_err());
-        assert_eq!(product_repository_refs(repo.path()), before);
+        assert_eq!(product_repository_refs(repo.as_path()), before);
         assert_eq!(
-            crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap(),
+            crate::git_ops::run_git(repo.as_path(), &["rev-parse", "HEAD"]).unwrap(),
             original_head
         );
         assert_eq!(
-            crate::git_ops::run_git(repo.path(), &["symbolic-ref", "HEAD"])
+            crate::git_ops::run_git(repo.as_path(), &["symbolic-ref", "HEAD"])
                 .unwrap()
                 .trim(),
             "refs/heads/user-work"
@@ -3273,14 +3274,14 @@ mod product_creation_delivery_replay_tests {
     #[tokio::test]
     async fn cancellation_while_waiting_for_repository_lock_fences_late_pin_and_stage() {
         use phoenix_db::ProductCreationProvisioningStage as Stage;
-        let repo = initialized_product_repository();
-        let before_refs = product_repository_refs(repo.path());
-        let lock = RepositoryMutationLock::acquire(repo.path()).unwrap();
+        let (_directory, repo) = initialized_product_repository();
+        let before_refs = product_repository_refs(repo.as_path());
+        let lock = RepositoryMutationLock::acquire(repo.as_path()).unwrap();
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
-        let claimed = accept_and_claim_product_at(&db, "cancel-lock", repo.path()).await;
+        let claimed = accept_and_claim_product_at(&db, "cancel-lock", repo.as_path()).await;
         let worktree = deterministic_worktree_path(
-            repo.path().to_str().unwrap(),
+            repo.as_path().to_str().unwrap(),
             claimed.job.product_conversation_id.as_str(),
         );
         let worker = tokio::spawn({
@@ -3342,7 +3343,7 @@ mod product_creation_delivery_replay_tests {
             .unwrap()
             .is_empty());
         assert!(!worktree.exists());
-        assert_eq!(product_repository_refs(repo.path()), before_refs);
+        assert_eq!(product_repository_refs(repo.as_path()), before_refs);
         let mut stage = Stage::ResolveStartingPin;
         assert!(checkpoint_product_creation_stage(
             &manager,
@@ -3365,8 +3366,8 @@ mod product_creation_delivery_replay_tests {
     async fn direct_product_creation_advances_noop_phases_in_sequence() {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
-        // ast-grep-ignore: no-direct-temp-dir-reads -- test fixture uses the canonical host temp root.
-        let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
         sqlx::raw_sql(
             "CREATE TABLE observed_creation_stages (stage TEXT NOT NULL);
              CREATE TRIGGER observe_creation_stage AFTER UPDATE OF provisioning_stage
@@ -3382,7 +3383,7 @@ mod product_creation_delivery_replay_tests {
             "direct-stages",
             &ProductCreationIntent {
                 origin: phoenix_db::ProductCreationOrigin::UserApi,
-                cwd: directory.path().to_string_lossy().into_owned(),
+                cwd: cwd.to_string_lossy().into_owned(),
                 objective: "inspect".to_string(),
                 model: None,
                 effort: None,

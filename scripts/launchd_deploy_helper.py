@@ -41,6 +41,13 @@ CURRENT_SCHEMA_REQUIRED_MIGRATIONS = {
     127: "coordinator_owned_work_scope_home",
     128: "product_creation_provisioning_stage",
 }
+# REQ-LDD-028: exact additive candidate registry; historical protected pins are independent.
+ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256 = "850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac"
+ORDINARY_SOURCE129_TARGET131_MIGRATIONS = (
+    (129, "single_conversation_name_and_route_projection"),
+    (130, "continuation_handoff_candidates"),
+    (131, "request_capacity_diagnostics"),
+)
 MINIMUM_FREE_AFTER_RESERVATION_BYTES = 20 * 1024 * 1024 * 1024
 CURRENT_SCHEMA_GROWTH_MARGIN_MIN_BYTES = 1024 * 1024 * 1024
 CURRENT_SCHEMA_GROWTH_MARGIN_MAX_BYTES = 8 * 1024 * 1024 * 1024
@@ -1060,6 +1067,15 @@ def database_logical_digest(path: Path) -> str:
         raise ActivationError("could not digest SQLite database") from exc
 
 
+def ordinary_forward_target(ordinary: OrdinaryForwardMigration, registry: Path) -> tuple[tuple[int, str], ...]:
+    if ordinary.migration_registry_sha256 == ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256:
+        target = migration_registry(registry, qualified_current_target=False)
+        if target[-3:] != ORDINARY_SOURCE129_TARGET131_MIGRATIONS:
+            raise ActivationError("ordinary candidate registry differs from qualified target131")
+        return target
+    return migration_registry(registry)
+
+
 def ordinary_forward_policy_applies(manifest: Manifest) -> bool:
     ordinary = manifest.ordinary_forward_migration
     if ordinary is None:
@@ -1074,6 +1090,13 @@ def ordinary_forward_policy_applies(manifest: Manifest) -> bool:
     target = migration_registry(registry, qualified_current_target=False)
     if ledger == target:
         return False
+    if ordinary.migration_registry_sha256 == ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256:
+        target = ordinary_forward_target(ordinary, registry)
+        source = tuple(item for item in target if item[0] <= 129)
+        if ledger != source:
+            raise ActivationError("ordinary pending migration interval is not qualified; expected exact source129 ledger")
+        validate_database(database)
+        return True
     if not ledger or ledger[-1][0] != CURRENT_SCHEMA_BASELINE_VERSION:
         raise ActivationError("ordinary pending migration interval is not qualified; use an explicit protected upgrade")
     validate_current_schema_database(database, registry)
@@ -4403,6 +4426,14 @@ def resume_forward(manifest: Manifest) -> str:
         validate_manifest_mode(manifest)
         if manifest.ordinary_forward_migration is None:
             raise ActivationError("forward recovery requires an ordinary forward transaction")
+        ordinary = manifest.ordinary_forward_migration
+        registry = verify_staged(ordinary.migration_registry_path, ordinary.migration_registry_sha256, "ordinary candidate migration registry")
+        target = ordinary_forward_target(ordinary, registry)
+        if ordinary.migration_registry_sha256 == ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256:
+            ledger = database_ledger(Path(ordinary.database_path))
+            if ledger not in tuple(target[:length] for length in range(len(target) - 2, len(target) + 1)):
+                raise ActivationError("forward recovery requires exact source129, partial130 or target131 ledger")
+            validate_database(Path(ordinary.database_path))
         old_helper = subprocess.run(
             ["launchctl", "print", f"gui/{manifest.uid}/{manifest.helper_label}"],
             capture_output=True,

@@ -1,4 +1,4 @@
-# ADR-148: Slack ingress uses native conversation services
+# ADR-153: Slack ingress uses native conversation services
 
 - **Status:** Accepted
 - **Date:** 2026-10-23

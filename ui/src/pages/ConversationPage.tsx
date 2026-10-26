@@ -1,7 +1,7 @@
 import { conversationGroundingContext } from '../components/FileExplorer/groundingContext';
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type ContinueHandoffSource, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -1978,11 +1978,13 @@ function ConversationPageContent({
 
   const openExistingContinuation = useCallback(async () => {
     if (!conversation?.id || convStateForChildren.type !== 'context_exhausted') return;
+    const ownerGeneration = conversationRouteOwnerRef.current.generation;
     const res = await api.continueConversation(conversation.id, {
       handoff: convStateForChildren.summary,
       message_id: generateUUID(),
       user_agent: navigator.userAgent,
     });
+    if (conversationRouteOwnerRef.current.generation !== ownerGeneration) return;
     if (res.status === 'dispatch_failed') {
       throw new Error(res.error ?? 'The continuation exists, but its opening handoff could not be sent. Retry from this page.');
     }
@@ -1990,13 +1992,16 @@ function ConversationPageContent({
     navigate(`${routePrefix}/${res.conversation_id}`);
   }, [conversation?.id, convStateForChildren, navigate, routePrefix, showInfo]);
 
-  const handleContextExhaustedContinue = useCallback(async (handoff: string) => {
+  const handleContextExhaustedContinue = useCallback(async (handoff: string, source: ContinueHandoffSource) => {
     if (!conversation?.id) throw new Error('Conversation is unavailable.');
+    const ownerGeneration = conversationRouteOwnerRef.current.generation;
     const res = await api.continueConversation(conversation.id, {
       handoff,
+      source,
       message_id: generateUUID(),
       user_agent: navigator.userAgent,
     });
+    if (conversationRouteOwnerRef.current.generation !== ownerGeneration) return 'dispatch_failed' as const;
     if (res.status === 'dispatch_failed') {
       showError(res.error ?? 'The continuation was created, but its opening handoff could not be sent. Retry the durable handoff from this page.');
       return res.status;
@@ -2383,7 +2388,7 @@ function ConversationPageContent({
           </div>
         </div>
       )}
-      {convStateForChildren.type === 'recoverable_continuation_failure' && (
+      {convStateForChildren.type === 'recoverable_continuation_failure' && convStateForChildren.error_kind !== 'context_capacity_conflict' && (
         <div className="context-exhausted-banner context-exhausted-banner--expanded">
           <div className="context-exhausted-summary">
             <div className="error-body-title">Continuation summary failed</div>
@@ -2401,10 +2406,19 @@ function ConversationPageContent({
           </div>
         </div>
       )}
-      {convStateForChildren.type === 'context_exhausted' && (
+      {(convStateForChildren.type === 'context_exhausted' || (convStateForChildren.type === 'recoverable_continuation_failure' && convStateForChildren.error_kind === 'context_capacity_conflict')) && (
         <ContextExhaustedHandoff
+          key={conversation.id}
+          capacityConflict={convStateForChildren.type === 'recoverable_continuation_failure'}
+          failureMessage={convStateForChildren.type === 'recoverable_continuation_failure' ? convStateForChildren.message : ''}
+          recoveryRevision={convStateForChildren.type === 'recoverable_continuation_failure' ? `${convStateForChildren.operation_id}:${convStateForChildren.attempt}` : conversation.state_updated_at ?? ''}
+          generatedSource={(() => {
+            const message = [...atom.messages].reverse().find((row) => row.message_type === 'continuation' && row.conversation_id === conversation.id);
+            return message ? { kind: 'summary' as const, message_id: message.message_id } : null;
+          })()}
+          onRegenerate={handleTriggerContinuation}
           parentId={conversation.id}
-          generatedHandoff={convStateForChildren.summary}
+          generatedHandoff={convStateForChildren.type === 'context_exhausted' ? convStateForChildren.summary : ''}
           continuedInConvId={conversation.continued_in_conv_id}
           disabled={isArchived}
           onOpenExisting={async () => {

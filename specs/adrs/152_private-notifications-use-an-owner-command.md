@@ -1,4 +1,4 @@
-# ADR-147: Private notifications use an owner command
+# ADR-152: Private notifications use an owner command
 
 - **Status:** Accepted
 - **Date:** 2026-10-23

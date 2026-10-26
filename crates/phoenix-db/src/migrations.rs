@@ -663,6 +663,30 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 130,
+        name: "continuation_handoff_candidates",
+        sql: "CREATE TABLE continuation_handoff_candidates (
+            id TEXT PRIMARY KEY NOT NULL,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            operation_id TEXT,
+            source_attempt INTEGER CHECK(source_attempt >= 1),
+            exhausted_state_updated_at TEXT,
+            source_message_id TEXT REFERENCES messages(message_id) ON DELETE CASCADE,
+            source_candidate_id TEXT REFERENCES continuation_handoff_candidates(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            origin TEXT NOT NULL CHECK(origin IN ('oversized_summary', 'ai_shortening', 'review_input')),
+            candidate_text TEXT NOT NULL CHECK(length(trim(candidate_text)) > 0),
+            created_at TEXT NOT NULL,
+            CHECK(origin != 'oversized_summary' OR operation_id IS NOT NULL),
+            CHECK(origin != 'review_input' OR (source_message_id IS NULL AND source_candidate_id IS NULL)),
+            CHECK((operation_id IS NOT NULL AND source_attempt IS NOT NULL AND exhausted_state_updated_at IS NULL)
+                OR (operation_id IS NULL AND source_attempt IS NULL AND exhausted_state_updated_at IS NOT NULL)),
+            UNIQUE(conversation_id, ordinal),
+            CHECK(source_message_id IS NULL OR source_candidate_id IS NULL)
+        ); CREATE INDEX continuation_handoff_candidates_conversation ON continuation_handoff_candidates(conversation_id, ordinal);",
+    },
+    Migration { version: 131, name: "request_capacity_diagnostics", sql: include_str!("migrations/request_capacity.sql") },
+    Migration {
+        version: 132,
         name: "slack_gateway",
         sql: include_str!("migrations/slack_gateway.sql"),
     },
@@ -14395,7 +14419,9 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (130, "slack_gateway"),
+            (132, "slack_gateway"),
+            (131, "request_capacity_diagnostics"),
+            (130, "continuation_handoff_candidates"),
             (129, "single_conversation_name_and_route_projection"),
             (128, "product_creation_provisioning_stage"),
             (127, "coordinator_owned_work_scope_home"),
@@ -19723,7 +19749,9 @@ with tempfile.TemporaryDirectory() as directory:
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
                     (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
-                    (130, 'temporarily_skip_slack_gateway')",
+                    (130, 'temporarily_skip_continuation_handoff_candidates'),
+                    (131, 'temporarily_skip_request_capacity_diagnostics'),
+                    (132, 'temporarily_skip_slack_gateway')",
         )
         .execute(&pool)
         .await
@@ -20591,7 +20619,9 @@ with tempfile.TemporaryDirectory() as directory:
                     (127, 'temporarily_skip_coordinator_owned_work_scope_home'),
                     (128, 'temporarily_skip_product_creation_provisioning_stage'),
                     (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
-                    (130, 'temporarily_skip_slack_gateway')",
+                    (130, 'temporarily_skip_continuation_handoff_candidates'),
+                    (131, 'temporarily_skip_request_capacity_diagnostics'),
+                    (132, 'temporarily_skip_slack_gateway')",
         )
         .execute(pool)
         .await

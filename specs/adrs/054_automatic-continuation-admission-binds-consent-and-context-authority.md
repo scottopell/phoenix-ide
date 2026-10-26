@@ -1,6 +1,6 @@
 # ADR-054: Automatic continuation admission binds consent and context authority
 
-- **Status:** Accepted
+- **Status:** Accepted; blanket manual-intent authority clause superseded by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md)
 - **Date:** 2026-09-18
 - **Affects:** REQ-BED-021, REQ-API-029, REQ-CONV-024
 

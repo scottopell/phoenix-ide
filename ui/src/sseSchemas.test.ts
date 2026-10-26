@@ -939,3 +939,10 @@ it.each(bashLaunchOutcomes)('validates no-handle launch outcome $status / $launc
     expect(v.safeParse(BashResponseSchema, { ...response, descendants }).success).toBe(false);
   }
 });
+
+
+describe('capacity classification wire values', () => {
+  it.each(['context_capacity_conflict', 'planned_context_pressure'])('accepts the classified %s failure', (kind) => {
+    expect(v.safeParse(SseStateChangeDataSchema, { sequence_id: 1, state: { type: 'recoverable_continuation_failure', message: 'Capacity stopped', error_kind: kind, operation_id: 'op', attempt: 1 }, presentation_mode: 'error', state_updated_at: '2026-10-25T00:00:00Z', error: { kind, can_auto_retry: false, can_user_resume: false } }).success).toBe(true);
+  });
+});

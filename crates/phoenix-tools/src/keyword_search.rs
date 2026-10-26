@@ -458,6 +458,7 @@ impl KeywordSearchTool {
             effective_effort: selection.effective_effort,
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
+                capacity_plan_id: None,
                 conversation_id: ctx.conversation_id.clone(),
                 root_conversation_id: ctx.root_conversation_id.clone(),
                 request_id: uuid::Uuid::new_v4().to_string(),

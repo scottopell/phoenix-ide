@@ -57,7 +57,7 @@ adversarial author review found and fixed inactive acceptance being mistaken
 for recorded evidence and acknowledgment throttling losing its backoff status.
 These author reviews are not independent sign-off or a formal liveness proof.
 
-The public candidate adds migration 130 after upstream's migration 129, replaces
+The public candidate adds migration 132 after upstream's migration 131, replaces
 the personal notifier with a provider-neutral command, and adds bounded
 newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
 Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
@@ -115,6 +115,12 @@ An explicitly approved manual offline cutover installed that candidate while
 preserving installed configuration except the version value. This operator
 pilot does not expand any automated deployment controller's qualified intervals,
 provide automatic database rollback or qualify a generic 127-to-130 route.
+That pilot's migration 130 is the pre-publication Slack allocation. Upstream
+subsequently assigned 130 and 131 to continuation/capacity data; this branch
+allocates Slack at 132 while preserving the upstream migrations and Slack SQL.
+The pilot ledger is not the public candidate's ledger. No direct upgrade from
+that pilot to the merged candidate is qualified; it requires separate offline
+reconciliation and validation before any later production deployment.
 
 Production initialization completed without executing historical triggers. Two
 sequential explicit private-thread requests each produced exactly one native
@@ -158,9 +164,12 @@ The clarification handoff replaces Slack answer inference with deep links into
 Phoenix. Unsubmitted persisted question associations are rejected, native
 answers retain their ordinary UI contract, and confirmed handoffs close the
 original automatic response duty without inheriting private discussion.
-All 254 affected MCP/gateway tests pass, including the handoff, pending-question
-admission, exact status-link and frozen-link retry regressions. Clippy,
-formatting, Allium and structural/timing checks pass. The preceding public head
+After upstream reconciliation, all 387 MCP/gateway, migration and creation
+delivery-replay tests pass, including the handoff, pending-question admission,
+exact status-link and frozen-link retry regressions. All 235 deployment tests
+pass with byte-exact historical registry fixtures and refusal of the newer
+candidate by the protected target-131 route. Clippy, formatting, TypeScript,
+Allium and structural/timing checks pass. The preceding public head
 passed every required hosted check; the revised head still needs automatic
 review and CI. The approved local pilot remains on its separately pinned build.
 

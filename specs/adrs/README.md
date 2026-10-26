@@ -179,11 +179,16 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [142](142_ordinary-skill-catalog-is-executor-turn-local.md) | Ordinary skill catalog advertisement is executor-turn-local | Accepted | REQ-SK-007, REQ-SK-008, REQ-SK-009 |
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
-| [145](145_slack-owner-gestures-bind-intentional-returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
-| [146](146_bound-discovery-and-refresh-new-explicit-requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
-| [147](147_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Accepted | REQ-SG-015 |
-| [148](148_slack-gateway-uses-native-conversation-services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
-| [149](149_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Accepted | REQ-SG-012/013 |
+| [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
+| [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |
+| [147](147_readable-generated-handoffs-retain-source-authority.md) | Readable generated handoffs retain explicit source authority | Accepted; partially supersedes 054 | REQ-BED-020b/021/030, REQ-LLM-004m |
+| [146](146_context-capacity-preserves-output-and-semantic-continuity.md) | Shared capacity planning preserves output headroom and semantic continuity | Accepted | REQ-LLM-004f/004j–004m, REQ-BED-020a, REQ-STR-012, REQ-AN-011 |
+| [145](145_coordinator-check-in-drives-scoped-work.md) | Coordinator check-ins drive scoped work and report outcomes | Accepted | REQ-GR-010, REQ-GR-011, REQ-GR-013 |
+| [150](150_slack-owner-gestures-bind-intentional-returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
+| [151](151_bound-discovery-and-refresh-new-explicit-requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
+| [152](152_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Accepted | REQ-SG-015 |
+| [153](153_slack-gateway-uses-native-conversation-services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
+| [154](154_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Accepted | REQ-SG-012/013 |
 
 ## For agents: which decisions bind your task
 
@@ -355,3 +360,7 @@ ADR-000 (adopt spEARS v2 for new work)
   Never edit an accepted decision to match later reality.
 - **After adding an ADR,** add its row here and update the task-routing table if
   the decision should be consulted for a common kind of work.
+
+Capacity planning across ordinary requests, handoffs and model switches is governed by [ADR-146](146_context-capacity-preserves-output-and-semantic-continuity.md), affecting REQ-LLM-004f/004j–004m, REQ-BED-020a, REQ-STR-012 and REQ-AN-011.
+
+Generated handoff readability and explicit source authority are governed by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md); automatic initiation remains governed by ADR-054.

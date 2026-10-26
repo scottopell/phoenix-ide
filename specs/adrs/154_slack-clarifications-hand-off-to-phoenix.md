@@ -1,4 +1,4 @@
-# ADR-149: Slack clarifications hand off to Phoenix
+# ADR-154: Slack clarifications hand off to Phoenix
 
 - **Status:** Accepted
 - **Date:** 2026-10-26

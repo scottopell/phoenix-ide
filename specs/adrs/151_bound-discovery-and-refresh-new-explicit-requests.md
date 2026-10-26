@@ -1,4 +1,4 @@
-# ADR-146: Bound discovery and refresh new explicit requests
+# ADR-151: Bound discovery and refresh new explicit requests
 
 - **Status:** Accepted
 - **Date:** 2026-10-23

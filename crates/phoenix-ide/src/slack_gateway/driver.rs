@@ -962,6 +962,7 @@ mod tests {
                 content,
                 end_turn: used || ids.is_empty(),
                 usage: Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
                 stream_telemetry: ProviderStreamTelemetry::non_streaming(),
             })
         }

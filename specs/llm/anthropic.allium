@@ -377,7 +377,8 @@ rule AnthropicCacheBreakpointsPlaced {
         -- deferred tools the request has at most two cache anchors.
         -- The wire max_tokens is the request's resolved output budget
         -- (llm/LlmRequest.max_tokens, REQ-LLM-004f) — the model's declared
-        -- supported output maximum clamped by remaining context. Anthropic
+        -- supported output maximum approved by capacity planning. Translation
+        -- does not shrink the reservation to fit retained input. Anthropic
         -- requires the field, so a built-in model must declare a verified
         -- maximum and an operator-configured model missing one is a config
         -- error; Phoenix does not substitute an invented numeric default.

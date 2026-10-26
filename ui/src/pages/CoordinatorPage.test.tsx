@@ -49,7 +49,7 @@ vi.mock('./ProductConversationPage', () => ({
         {globalShell?.stateBarExtension?.details}
       </div>
       {globalShell?.composerQuickAction && (
-        <button type="button" data-prompt={globalShell.composerQuickAction.prompt}>
+        <button type="button" aria-label={globalShell.composerQuickAction.label} data-prompt={globalShell.composerQuickAction.prompt}>
           {globalShell.composerQuickAction.compactLabel}
           <span className="sr-only">{globalShell.composerQuickAction.label}</span>
         </button>
@@ -197,14 +197,26 @@ describe('CoordinatorPage', () => {
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
   });
 
-  it('mounts only the shared conversation runtime with the briefing action', async () => {
+  it('wires the active check-in through the shared conversation runtime', async () => {
     renderPage();
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    const action = screen.getByRole('button', { name: /Brief me/ });
+    const action = screen.getByRole('button', { name: 'Check in & drive' });
     expect(action).toHaveAttribute('data-prompt', COORDINATOR_BRIEFING_PROMPT);
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('fresh current-work facts through query_database');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages, change anything, or start a polling loop.');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('including idle owners, but intervene selectively');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Leave healthy progressing work alone');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('do not assume idle owners are stalled');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('do not expand authority or reset prior decisions, pauses or gates');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Recover unanswered user decisions from history');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('verify each is still unresolved and material');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Advance independent authorized work first');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('ask_user_question with context and a recommendation');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Brief me first on what still needs my input');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('the problem, what you did, and where delivery goes next');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('not a fixed report template');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('through existing owners within verified standing authority');
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not wait indefinitely for owner replies');
+    expect(COORDINATOR_BRIEFING_PROMPT).not.toContain('Do not send messages');
 
     expect(screen.queryByRole('heading', { name: 'Coordinator' })).not.toBeInTheDocument();
     expect(screen.queryByRole('tablist', { name: 'Coordinator view' })).not.toBeInTheDocument();

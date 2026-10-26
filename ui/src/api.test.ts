@@ -643,3 +643,23 @@ describe('conversation-view response transport', () => {
     expect(url.searchParams.get('open_id')).toBe(open);
   });
 });
+
+
+describe('explicit handoff review sources', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it('threads summary, manual, and candidate sources without inferring authority from text', async () => {
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal('fetch', fetch);
+    for (const source of [{ kind: 'manual' as const }, { kind: 'summary' as const, message_id: 'actual-message' }, { kind: 'candidate' as const, candidate_id: 'reviewed-candidate' }]) {
+      await api.reviewHandoff('parent', { handoff: 'Same literal bytes', source, shorten: true });
+      expect(JSON.parse(fetch.mock.calls.at(-1)![1].body)).toEqual({ handoff: 'Same literal bytes', source, shorten: true });
+      await api.continueConversation('parent', { handoff: 'Same literal bytes', source, message_id: 'opening' });
+      expect(JSON.parse(fetch.mock.calls.at(-1)![1].body)).toEqual({ handoff: 'Same literal bytes', source, message_id: 'opening' });
+    }
+  });
+  it('retains typed capacity diagnostics on a 409 review conflict', async () => {
+    const detail = { error: 'Too large', error_type: 'continuation_capacity_conflict', capacity: { status: { kind: 'required_overhead' } } };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 409, json: async () => detail }));
+    await expect(api.reviewHandoff('parent', { handoff: 'Draft', source: { kind: 'manual' } })).rejects.toMatchObject({ detail });
+  });
+});

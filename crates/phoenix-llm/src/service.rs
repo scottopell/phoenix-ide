@@ -183,6 +183,34 @@ impl LlmServiceImpl {
 
 #[async_trait]
 impl LlmService for LlmServiceImpl {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<super::ProviderInputCount>, LlmError> {
+        if self.uses_official_openai_responses() {
+            let key = self.auth.resolve().await?.credential;
+            openai::count_input(
+                &self.spec,
+                &self.request_name,
+                &key,
+                &self.headers_for_provider(),
+                request,
+            )
+            .await
+            .map(Some)
+        } else if self.uses_official_anthropic() {
+            anthropic::count_input(
+                &self.spec,
+                &self.request_name,
+                &self.resolve_auth().await?,
+                &self.headers_for_provider(),
+                request,
+            )
+            .await
+        } else {
+            Ok(None)
+        }
+    }
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.begin_provider_attempt(request, self.attempt_transport(false));
         Box::pin(enforce_attempt_deadline(
@@ -238,6 +266,23 @@ impl LlmService for LlmServiceImpl {
 
     fn model_id(&self) -> &str {
         &self.spec.id
+    }
+
+    fn diagnostic_route_class(&self) -> phoenix_core::domain::request_capacity::SafeRouteClass {
+        use phoenix_core::domain::request_capacity::SafeRouteClass as R;
+        match self.spec.backend.api_format() {
+            ApiFormat::Anthropic if self.anthropic_base_url.is_none() => R::AnthropicDirect,
+            ApiFormat::Anthropic => R::AnthropicCompatible,
+            ApiFormat::OpenAIResponses if self.use_codex_backend => R::CodexAuth,
+            ApiFormat::OpenAIResponses if self.openai_responses_base_url.is_none() => {
+                R::OpenAiResponsesDirect
+            }
+            ApiFormat::OpenAIResponses => R::OpenAiResponsesCompatible,
+            ApiFormat::OpenAIChatCompletions if self.openai_chat_completions_base_url.is_none() => {
+                R::ChatCompletionsDirect
+            }
+            ApiFormat::OpenAIChatCompletions => R::ChatCompletionsCompatible,
+        }
     }
 
     fn continuation_route_key(&self) -> String {
@@ -527,6 +572,7 @@ mod tests {
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: Some(crate::LlmRequestTelemetry {
+                capacity_plan_id: None,
                 conversation_id: "conversation".to_string(),
                 root_conversation_id: "root".to_string(),
                 request_id: "request".to_string(),

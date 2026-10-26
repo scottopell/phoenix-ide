@@ -1,0 +1,5 @@
+Local ./dev.py check --all runs real gated bash lifecycle tests without supplying PHOENIX_BASH_LAUNCH_TEST_EXE. The test-support fallback resolves the libtest executable, which does not implement the native --bash-launch-v1 protocol. This produced false local failures in runtime bash-wait and Coordinator owned-home qualification; the same tests pass with a valid native Phoenix launcher.
+
+Make local check own the native fixture prerequisite or explicitly enforce/document it without silently skipping real runtime tests. CI already builds the native fixture and sets PHOENIX_BASH_LAUNCH_TEST_EXE plus PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1 in .github/workflows/ci.yml. Preserve candidate/source identity and the shared worker budget; do not assume an arbitrary stale target/debug binary is qualified. Add a focused harness regression and keep production bash launch behavior unchanged.
+
+Interim qualification uses the CI environment variables with the existing native launcher. Context-capacity task44018 addresses its source changes separately; this is a development-harness follow-up.

@@ -1580,6 +1580,40 @@ impl ModelRegistry {
         }
     }
 
+    /// Inject built-in model routes with bounded fixture limits, without credentials.
+    ///
+    /// # Panics
+    /// Panics for empty fixtures, unknown built-in IDs, mismatched service IDs,
+    /// or output limits outside the supplied context window.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test_with_model_limits(
+        models: Vec<(&str, Arc<dyn LlmService>, usize, u32)>,
+    ) -> Self {
+        let registry = Self::new_empty();
+        models
+            .first()
+            .expect("at least one fixture model")
+            .0
+            .clone_into(&mut registry.default_model.write().unwrap());
+        registry.specs.write().unwrap().clear();
+        for (id, service, context, output) in models {
+            assert_eq!(id, service.model_id());
+            assert!(output > 0 && (output as usize) < context);
+            let mut spec = all_models().into_iter().find(|spec| spec.id == id).unwrap();
+            spec.context_window = context;
+            spec.max_output_tokens = output;
+            spec.effort_capabilities = super::EffortCapabilities::Unknown;
+            registry.specs.write().unwrap().insert(id.to_owned(), spec);
+            registry
+                .services
+                .write()
+                .unwrap()
+                .insert(id.to_owned(), service);
+        }
+        registry
+    }
+
     /// Get a mid-tier "Sonnet-class" model balanced for cost vs accuracy.
     ///
     /// Used by chain Q&A (REQ-CHN-006) where the same model identifier is
