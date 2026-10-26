@@ -1,4 +1,34 @@
-Investigate host PTY exhaustion and possible inherited-master retention in terminal spawning.
+Prevent terminal PTY descriptors surviving into unrelated executables.
+
+## Confirmed mechanism and fix scope
+
+`spawn_pty` allocates inheritable master/slave descriptors through `openpty`.
+`terminal_ws::build_pty_io` also creates an inheritable relay master through
+`libc::dup`. The terminal child closes only its newly allocated endpoints before
+exec, leaving earlier terminals' descriptors eligible for inheritance.
+
+REQ-TERM-024 requires atomic close-on-exec allocation for both PTY endpoints and
+relay copies. Cover raw fork/exec inheritance with a deliberately inheritable
+positive control, endpoint flags, relay flags, and existing usable-stdio/reclaim
+tests. Do not introduce a global spawn lock or alter disconnect policy.
+
+## Host investigation and authorized cleanup, 2026-10-26
+
+Read-only enumeration found 47 durable Phoenix tmux servers with 364 panes,
+plus three reachable temporary test servers and 62 servers whose `/private/tmp/ptt-*`
+directories and sockets were deleted. Every one of those 62 had only one sleeping
+zsh child, no child jobs, and only its original listening Unix socket (no clients).
+Fresh per-process revalidation preceded SIGTERM to those exact servers; all 62
+servers and 62 shells exited. Distinct open PTY slave devices fell from 508 to
+446, and an immediately closed allocation probe succeeded. All 47 durable
+servers and 364 panes remained reachable. Kernel limits were unchanged.
+
+The 62 abandoned tests explain 62 occupied PTYs. Shared master holders are
+additional retention evidence, not proof that every remaining PTY is leaked.
+The production descriptor fix does not revoke descriptors already inherited by
+existing processes; no existing user session is terminated by this work.
+
+## Earlier investigation
 
 Observed during context-capacity qualification: terminal handoff fixture fails at openpty with ENXIO before lifecycle assertions; an independent Python os.openpty call fails with the same host error. kern.tty.ptmx_max is 511. Read-only lsof inspection found many existing tmux processes holding multiple PTY masters, including masters shared across process families. This is evidence of exhaustion; it does not by itself prove a leak.
 

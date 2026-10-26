@@ -244,7 +244,7 @@ config {
 --   - ConversationBecameTerminal — cross-spec trigger emitted by bedrock rules;
 --     the per-spec analyser cannot see cross-spec providers.
 
--- REQ-TERM-001, REQ-TERM-002, REQ-TERM-WS-001: Terminal opened, PTY spawned
+-- REQ-TERM-001, REQ-TERM-002, REQ-TERM-024, REQ-TERM-WS-001: Terminal opened, PTY spawned
 rule TerminalOpened {
     -- A UserOpensTerminal is keyed by resource identity. Ordinary Work cwd
     -- resolves from the persisted environment, not the opaque ID payload.
@@ -263,13 +263,17 @@ rule TerminalOpened {
 
     @guidance
         -- Spawn sequence (run in spawn_blocking or before async handoff):
-        --   1. openpty() → master_fd + slave_fd
+        --   1. Allocate master_fd and slave_fd with atomic close-on-exec
+        --      protection (REQ-TERM-024); no inheritable allocation window.
         --   2. fork()
         --      [child]:
         --        setsid()                      new session, child is leader
         --        ioctl(slave_fd, TIOCSCTTY, 0) slave becomes controlling tty
         --        dup2(slave_fd, 0/1/2)         slave is stdin, stdout, stderr
         --        close(slave_fd)               fd already dup'd
+        --        close(master_fd)              child does not own a master
+        --        Only slave-backed stdio survives exec; other terminals'
+        --        masters and relay copies remain close-on-exec.
         --        chdir(spawn_cwd_for_scope(scope))
         --        --   Work(id) -> persisted environment effective path (REQ-BED-010)
         --        --   Unattached(id) -> fallback transcript cwd
@@ -357,8 +361,9 @@ rule DuplicateConnectionReclaimsSession {
         --      reading the same PTY master fd.
         --   4. Reset stop_tx to StopReason::Running before the new relay
         --      subscribes so it does not observe the stale Detach.
-        --   5. Build a fresh PtyMasterIo via dup(master_fd) — each relay
-        --      owns its own fd so drops don't affect the master.
+        --   5. Build a fresh PtyMasterIo via an atomic close-on-exec
+        --      duplicate of master_fd (REQ-TERM-024). Each relay owns its
+        --      own fd so drops don't affect the registered master.
         --   6. Start a new relay reusing the existing CommandTracker so
         --      mid-command output continues streaming.
         --   7. The handler holds the OwnedSemaphorePermit for the relay's

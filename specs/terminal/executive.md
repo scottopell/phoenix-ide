@@ -82,6 +82,7 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | REQ-TERM-012: Terminal torn down with WorkScope | ✅ Done | src/terminal/ws.rs:teardown watcher (per-scope dispatch) |
 | REQ-TERM-013: WebSocket endpoint authentication | ✅ Done | src/api/auth.rs middleware |
 | REQ-TERM-014: Output channel backpressure | ✅ Done | src/terminal/ws.rs:OUTPUT_BUF bounded reads |
+| REQ-TERM-024: Terminal descriptor isolation | Implementation in progress | Atomic close-on-exec allocation and relay duplication; exec-inheritance regression required. |
 | REQ-TERM-WS-001: Terminal sessions keyed by WorkScope | ✅ Done | src/terminal/session.rs:ActiveTerminals; src/work_scope.rs |
 
 ## Detached-child reaping candidate
@@ -118,5 +119,5 @@ normative open question or silent policy rewrite is introduced here.
 Legacy `design.md` also describes reader-owned reaping and disconnect teardown;
 it is not an accurate guide to this candidate's observer ownership. Its broader
 lifecycle reconciliation belongs to that separate disposition, not this patch.
-Descriptor inheritance and cancelled-spawn publication gaps are separately
-recorded in task 08669 and are outside this candidate.
+Descriptor inheritance is tracked by REQ-TERM-024 and task 44019. The
+cancelled-spawn publication gap remains separately recorded in task 08669.
