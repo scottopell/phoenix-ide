@@ -4,6 +4,8 @@ use super::{Database, DbError, DbResult};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+const RETIRED_QUESTION_HANDOFF: &str = "Phoenix: this clarification is no longer current. Open Phoenix for details; further discussion there stays private.";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SlackRequestKind {
@@ -183,7 +185,7 @@ impl Database {
             }
         }
         let outstanding: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND (r.eyes_confirmed=0 OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.state IN ('confirmed','failed')))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
+            "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND (r.eyes_confirmed=0 OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.state IN ('confirmed','failed')) OR (r.kind='briefing' AND r.admission_state<>'rejected' AND NOT EXISTS(SELECT 1 FROM slack_gateway_native_outcomes e JOIN slack_gateway_return_coverage c ON c.request_id=e.request_id JOIN slack_gateway_returns o USING(return_id) WHERE e.request_id=r.request_id AND e.kind IN ('Completed','Cancelled','Failed') AND e.processed=1 AND o.occurrence_key=e.occurrence_key AND o.state IN ('confirmed','failed'))))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
         ).bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
         if outstanding {
             return Err(DbError::Serialization("Cannot change the Slack account while accepted work or return delivery is outstanding; finish that work using its original account first".into()));
@@ -436,7 +438,7 @@ impl Database {
             .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
     }
     pub async fn slack_begin_return(&self, id: &str, attempt: &str) -> DbResult<bool> {
-        Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2 WHERE return_id=?1 AND destination='thread' AND state IN ('pending','known_unsent')").bind(id).bind(attempt).execute(self.pool()).await?.rows_affected()==1)
+        Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2 WHERE return_id=?1 AND destination='thread' AND state IN ('pending','known_unsent') AND (response_kind<>'clarification' OR NOT EXISTS(SELECT 1 FROM slack_gateway_questions q WHERE q.return_id=?1 AND (q.retired_reason IS NOT NULL OR NOT EXISTS(SELECT 1 FROM conversations c WHERE c.id=q.transcript_id))))").bind(id).bind(attempt).execute(self.pool()).await?.rows_affected()==1)
     }
     pub async fn slack_begin_notification_return(
         &self,
@@ -446,7 +448,7 @@ impl Database {
     ) -> DbResult<bool> {
         let frozen =
             serde_json::to_string(command).map_err(|e| DbError::Serialization(e.to_string()))?;
-        Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2,notification_command=?3 WHERE return_id=?1 AND destination='private' AND state IN ('pending','known_unsent')")
+        Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2,notification_command=?3 WHERE return_id=?1 AND destination='private' AND state IN ('pending','known_unsent') AND (response_kind<>'clarification' OR NOT EXISTS(SELECT 1 FROM slack_gateway_questions q WHERE q.return_id=?1 AND (q.retired_reason IS NOT NULL OR NOT EXISTS(SELECT 1 FROM conversations c WHERE c.id=q.transcript_id))))")
             .bind(id).bind(attempt).bind(frozen).execute(self.pool()).await?.rows_affected()==1)
     }
     pub async fn slack_observe_notification_return(
@@ -628,8 +630,6 @@ pub(crate) async fn record_slack_question_tx(
     };
     sqlx::query("UPDATE slack_gateway_questions SET retired_reason='Native question is no longer current' WHERE transcript_id=?1 AND answered_by IS NULL AND retired_reason IS NULL AND (?2 IS NULL OR question_id!=?2)")
         .bind(transcript).bind(&current).execute(&mut **tx).await?;
-    sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure='Clarification is no longer current; no message was sent' WHERE response_kind='clarification' AND state IN ('pending','known_unsent') AND return_id IN (SELECT return_id FROM slack_gateway_questions WHERE transcript_id=?1 AND retired_reason IS NOT NULL)")
-        .bind(transcript).execute(&mut **tx).await?;
     let super::ConvState::AwaitingUserResponse {
         questions,
         request_authority,
@@ -653,10 +653,63 @@ pub(crate) async fn record_slack_question_tx(
     Ok(())
 }
 
+async fn replace_retired_slack_clarifications_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    phoenix_origin: &str,
+) -> DbResult<()> {
+    let pending = sqlx::query("SELECT return_id,binding_id,destination FROM slack_gateway_returns WHERE response_kind='clarification' AND state IN ('pending','known_unsent')")
+        .fetch_all(&mut **tx).await?;
+    for output in pending {
+        let old: String = output.try_get("return_id")?;
+        let questions = sqlx::query("SELECT transcript_id,question_id,retired_reason IS NOT NULL AS retired FROM slack_gateway_questions WHERE return_id=?1")
+            .bind(&old).fetch_all(&mut **tx).await?;
+        let mut retired = false;
+        for question in questions {
+            retired |= question.try_get::<bool, _>("retired")?
+                || !slack_question_is_current_tx(
+                    tx,
+                    &question.try_get::<String, _>("transcript_id")?,
+                    &question.try_get::<String, _>("question_id")?,
+                )
+                .await?;
+        }
+        if !retired {
+            continue;
+        }
+        let binding: String = output.try_get("binding_id")?;
+        let destination: String = output.try_get("destination")?;
+        let replacement = uuid::Uuid::new_v4().to_string();
+        let text = if destination == "thread" {
+            slack_thread_response_tx(
+                tx,
+                &binding,
+                &replacement,
+                RETIRED_QUESTION_HANDOFF,
+                phoenix_origin,
+            )
+            .await?
+        } else {
+            RETIRED_QUESTION_HANDOFF.to_string()
+        };
+        sqlx::query("INSERT INTO slack_gateway_returns(return_id,binding_id,occurrence_key,destination,text,response_kind,created_at_unix_micros) VALUES (?1,?2,?3,?4,?5,?6,?7)")
+            .bind(&replacement).bind(&binding).bind(format!("retired-clarification:{old}")).bind(&destination).bind(text).bind(if destination=="thread" {"failure"}else{"notice"}).bind(chrono::Utc::now().timestamp_micros()).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO slack_gateway_return_coverage(return_id,request_id) SELECT ?2,request_id FROM slack_gateway_return_coverage WHERE return_id=?1")
+            .bind(&old).bind(&replacement).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO slack_gateway_questions(return_id,question_id,transcript_id,retired_reason) SELECT ?2,question_id,transcript_id,'Native question is no longer current' FROM slack_gateway_questions WHERE return_id=?1")
+            .bind(&old).bind(&replacement).execute(&mut **tx).await?;
+        sqlx::query("UPDATE slack_gateway_questions SET retired_reason='Native question is no longer current' WHERE return_id=?1 AND retired_reason IS NULL")
+            .bind(&old).execute(&mut **tx).await?;
+        sqlx::query("UPDATE slack_gateway_returns SET state='failed',failure='Undelivered clarification retired; generic handoff queued' WHERE return_id=?1")
+            .bind(&old).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 impl Database {
     /// Materialize replies/notices from transactionally captured native occurrences.
     pub async fn process_slack_native_outcomes(&self, phoenix_origin: &str) -> DbResult<()> {
         let mut tx = self.pool().begin().await?;
+        replace_retired_slack_clarifications_tx(&mut tx, phoenix_origin).await?;
         let completed: Vec<String> = sqlx::query_scalar("SELECT c.id FROM conversations c JOIN steering_execution_occurrences o ON o.conversation_id=c.id JOIN messages m ON m.conversation_id=c.id AND m.message_id=o.message_id WHERE c.state_kind IN ('idle','terminal','completed') AND EXISTS(SELECT 1 FROM messages candidate WHERE candidate.conversation_id=c.id AND candidate.origin_slack_request_id IS NOT NULL) AND o.source_kind IN ('steering','seeded_fork','interaction_response') AND EXISTS(SELECT 1 FROM messages answer WHERE answer.conversation_id=c.id AND answer.message_type='agent' AND answer.sequence_id>m.sequence_id) AND NOT EXISTS(SELECT 1 FROM durable_turns t WHERE t.conversation_id=c.id AND t.owns_conversation=1)")
             .fetch_all(&mut *tx).await?;
         for transcript in completed {
@@ -713,7 +766,7 @@ impl Database {
                     false
                 };
                 let text = if kind == "question" && !current_question {
-                    "Phoenix: this clarification is no longer current. Open Phoenix for details; further discussion there stays private.".into()
+                    RETIRED_QUESTION_HANDOFF.into()
                 } else if private {
                     match kind.as_str() {
                         "Completed" => "Phoenix: your briefing is ready",
@@ -1859,9 +1912,17 @@ mod tests {
     // REQ-SG-012/013: a private answer before materialization cannot erase the duty.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn question_settled_before_materialization_owes_only_a_generic_linked_handoff() {
+    async fn retired_questions_preserve_generic_handoffs_before_and_after_materialization() {
         use phoenix_core::domain::sm_state::{ConvState, QuestionRequestAuthority};
-        for replaced in [false, true] {
+        for (replaced, preexisting) in [false, true].into_iter().flat_map(|replaced| {
+            [
+                None,
+                Some(SlackReturnState::Pending),
+                Some(SlackReturnState::KnownUnsent),
+                Some(SlackReturnState::Uncertain),
+            ]
+            .map(move |state| (replaced, state))
+        }) {
             let db = Database::open_in_memory().await.unwrap();
             let conv = db
                 .create_conversation("early", "early", "/tmp", true, None, None)
@@ -1893,6 +1954,35 @@ mod tests {
             .unwrap();
             sqlx::query("INSERT INTO slack_gateway_native_outcomes(request_id,occurrence_key,kind,transcript_id,question_id,question_body) VALUES (?1,'original','question',?2,?3,'[{\"header\":\"Old\",\"question\":\"Stale confidential question\",\"options\":[],\"multi_select\":false}]')")
                 .bind(&request.request_id).bind(&conv.id).bind(original.request_id().unwrap().to_string()).execute(db.pool()).await.unwrap();
+            let old = if let Some(state) = preexisting {
+                db.process_slack_native_outcomes("https://phoenix.example")
+                    .await
+                    .unwrap();
+                let old = db
+                    .slack_returns(&source.workspace, &source.owner)
+                    .await
+                    .unwrap()
+                    .remove(0);
+                if state != SlackReturnState::Pending {
+                    assert!(db
+                        .slack_begin_return(&old.return_id, "attempt")
+                        .await
+                        .unwrap());
+                    db.slack_finish_return(
+                        &old.return_id,
+                        "attempt",
+                        state,
+                        None,
+                        None,
+                        Some("fixture result"),
+                    )
+                    .await
+                    .unwrap();
+                }
+                Some(old)
+            } else {
+                None
+            };
             let state = if replaced {
                 ConvState::AwaitingUserResponse {
                     questions: vec![],
@@ -1905,6 +1995,12 @@ mod tests {
             db.update_conversation_state(&conv.id, &state)
                 .await
                 .unwrap();
+            if let Some(old) = &old {
+                assert!(!db
+                    .slack_begin_return(&old.return_id, "stale snapshot")
+                    .await
+                    .unwrap());
+            }
             db.process_slack_native_outcomes("https://phoenix.example")
                 .await
                 .unwrap();
@@ -1912,13 +2008,31 @@ mod tests {
                 .slack_returns(&source.workspace, &source.owner)
                 .await
                 .unwrap();
-            assert_eq!(outputs.len(), 1);
-            assert!(outputs[0].text.contains("no longer current"));
-            assert!(!outputs[0].text.contains("Stale confidential question"));
-            assert!(outputs[0]
+            if preexisting == Some(SlackReturnState::Uncertain) {
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].state, SlackReturnState::Uncertain);
+                continue;
+            }
+            assert_eq!(outputs.len(), 1 + usize::from(old.is_some()));
+            if let Some(old) = &old {
+                let retired = outputs
+                    .iter()
+                    .find(|r| r.return_id == old.return_id)
+                    .unwrap();
+                assert_eq!(retired.state, SlackReturnState::Failed);
+                assert_eq!(retired.text, old.text);
+                assert_eq!(retired.request_ids, vec![request.request_id.clone()]);
+            }
+            let generic = outputs
+                .iter()
+                .find(|r| r.state == SlackReturnState::Pending)
+                .unwrap();
+            assert!(generic.text.contains("no longer current"));
+            assert!(!generic.text.contains("Stale confidential question"));
+            assert!(generic
                 .text
                 .ends_with(&format!("/c/{}", conv.product_conversation_id)));
-            assert_eq!(outputs[0].request_ids, vec![request.request_id]);
+            assert_eq!(generic.request_ids, vec![request.request_id]);
             db.update_conversation_state(&conv.id, &ConvState::Idle)
                 .await
                 .unwrap();
@@ -1929,9 +2043,13 @@ mod tests {
                 .slack_returns(&source.workspace, &source.owner)
                 .await
                 .unwrap();
-            assert_eq!(repeated.len(), 1);
-            assert_eq!(repeated[0].state, SlackReturnState::Pending);
-            assert_eq!(repeated[0].text, outputs[0].text);
+            assert_eq!(repeated.len(), outputs.len());
+            let retry = repeated
+                .iter()
+                .find(|r| r.return_id == generic.return_id)
+                .unwrap();
+            assert_eq!(retry.state, SlackReturnState::Pending);
+            assert_eq!(retry.text, generic.text);
         }
     }
 
@@ -2124,6 +2242,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn briefing_notices_are_deduplicated_by_occurrence() {
         use phoenix_core::domain::sm_state::{ConvState, QuestionRequestAuthority};
         for terminal in ["Completed", "Failed"] {
@@ -2133,6 +2252,7 @@ mod tests {
                 .await
                 .unwrap();
             let source = source("100.000", SlackRequestKind::Briefing);
+            db.set_slack_configuration(&serde_json::json!({"workspace":source.workspace,"owner":source.owner,"enabled":true}).to_string()).await.unwrap();
             db.accept_slack_source(&source, false).await.unwrap();
             let request = db
                 .slack_requests(&source.workspace, &source.owner)
@@ -2140,6 +2260,13 @@ mod tests {
                 .unwrap()
                 .remove(0);
             let authority = QuestionRequestAuthority::new();
+            db.slack_bind_product(&request.binding_id, conv.product_conversation_id.as_str())
+                .await
+                .unwrap();
+            db.slack_mark_admitted(&request.request_id, &conv.id)
+                .await
+                .unwrap();
+            db.slack_eyes_confirmed(&request.request_id).await.unwrap();
             db.update_conversation_state(
                 &conv.id,
                 &ConvState::AwaitingUserResponse {
@@ -2162,6 +2289,13 @@ mod tests {
                 .remove(0);
             assert!(notice.text.contains("needs your input"));
             sqlx::query("UPDATE slack_gateway_returns SET state='confirmed',delivery_proof='fixture' WHERE return_id=?1").bind(&notice.return_id).execute(db.pool()).await.unwrap();
+            let other_owner =
+                serde_json::json!({"workspace":source.workspace,"owner":"UOTHER","enabled":false})
+                    .to_string();
+            let other_workspace = serde_json::json!({"workspace":"other.slack.com","owner":source.owner,"enabled":false}).to_string();
+            for changed in [&other_owner, &other_workspace] {
+                assert!(db.set_slack_configuration(changed).await.is_err());
+            }
             db.update_conversation_state(&conv.id, &ConvState::Idle)
                 .await
                 .unwrap();
@@ -2175,6 +2309,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(outputs.len(), 2);
+            assert!(db.set_slack_configuration(&other_owner).await.is_err());
+            sqlx::query("UPDATE slack_gateway_returns SET state='confirmed',delivery_proof='terminal fixture' WHERE state='pending'").execute(db.pool()).await.unwrap();
+            db.set_slack_configuration(&other_owner).await.unwrap();
             assert!(outputs.iter().all(|r| r.destination == "private"));
             assert!(outputs
                 .iter()

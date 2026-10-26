@@ -323,7 +323,7 @@ impl Slack {
     }
     pub async fn eyes(&self, channel: &str, ts: &str) -> Result<(), String> {
         match self
-            .call(
+            .call_classified(
                 "slack_add_reaction",
                 json!({"channel_id":channel,"message_ts":ts,"emoji":"eyes"}),
             )
@@ -331,13 +331,13 @@ impl Slack {
         {
             Ok(_) => Ok(()),
             Err(error)
-                if error
-                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .any(|code| code == "already_reacted") =>
+                if operation_rejection(&error, "reactions.add").is_some_and(|value| {
+                    value.get("error").and_then(Value::as_str) == Some("already_reacted")
+                }) =>
             {
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.message().to_owned()),
         }
     }
     pub async fn send(
@@ -475,6 +475,11 @@ fn send_evidence(
         .ok_or("Invalid timestamp boundary")?;
     let ts = format!("{seconds}.{micros}");
     if stamp != ts
+        || parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "thread_ts")
+            .count()
+            != 1
         || !parsed
             .query_pairs()
             .any(|(k, v)| k == "thread_ts" && v == root)
@@ -526,6 +531,19 @@ pub(super) fn rate_rejection_proves_unsent(error: &McpOneShotError) -> bool {
         .is_some_and(|code| matches!(code.as_str(), "ratelimited" | "rate_limited"))
 }
 fn post_rejection_code(error: &McpOneShotError) -> Option<String> {
+    let value = operation_rejection(error, "chat.postMessage")?;
+    ["message_link", "message_context", "ts", "message_ts"]
+        .iter()
+        .all(|key| value.get(key).is_none_or(Value::is_null))
+        .then(|| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+}
+fn operation_rejection(error: &McpOneShotError, method: &str) -> Option<Value> {
     let McpOneShotError::ToolRejected(message) = error else {
         return None;
     };
@@ -533,19 +551,8 @@ fn post_rejection_code(error: &McpOneShotError) -> Option<String> {
         return None;
     };
     (value.get("ok").and_then(Value::as_bool) == Some(false)
-        // A tool can perform a post followed by a permalink lookup. A generic
-        // rate error does not prove which operation was rejected.
-        && value.get("method").and_then(Value::as_str) == Some("chat.postMessage")
-        && ["message_link", "message_context", "ts", "message_ts"]
-            .iter()
-            .all(|key| value.get(key).is_none_or(Value::is_null)))
-    .then(|| {
-        value
-            .get("error")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
-    .flatten()
+        && value.get("method").and_then(Value::as_str) == Some(method))
+    .then_some(value)
 }
 pub(super) fn strip_fire(text: &str) -> Option<&str> {
     let t = text.trim_start();
@@ -699,23 +706,23 @@ impl ReactionEvidence {
                 .ok_or("Invalid reaction evidence")?;
             let (count, users) = rest.split_once(" — ").ok_or("Missing reaction users")?;
             let count: u64 = count.parse().map_err(|_| "Invalid reaction count")?;
-            counts.insert(name.to_string(), count);
-            let members: Option<Vec<&str>> = users
-                .split(", ")
-                .map(|entry| {
-                    entry
-                        .rsplit_once(" (")
-                        .and_then(|(_, id)| id.strip_suffix(')'))
-                        .filter(|id| {
-                            (id.starts_with('U') || id.starts_with('W'))
-                                && id.chars().all(|c| c.is_ascii_alphanumeric())
-                        })
+            if counts.insert(name.to_string(), count).is_some() {
+                return Err("Duplicate reaction evidence".into());
+            }
+            let members: Vec<(&str, usize)> = users
+                .match_indices(" (")
+                .filter_map(|(start, _)| {
+                    let (id, tail) = users.get(start + 2..)?.split_once(')')?;
+                    ((id.starts_with('U') || id.starts_with('W'))
+                        && id.chars().all(|c| c.is_ascii_alphanumeric())
+                        && (tail.is_empty() || tail.starts_with(", ")))
+                    .then_some((id, users.len() - tail.len()))
                 })
                 .collect();
             owner_fire |= name == "fire"
-                && members.is_some_and(|ids| {
-                    u64::try_from(ids.len()).ok() == Some(count) && ids.contains(&owner)
-                });
+                && u64::try_from(members.len()).ok() == Some(count)
+                && members.last().is_some_and(|(_, end)| *end == users.len())
+                && members.iter().any(|(id, _)| *id == owner);
         }
         if counts.is_empty() {
             return Err("Empty reaction evidence".into());
@@ -881,6 +888,8 @@ mod tests {
         for users in [
             "Owner (UOWNER), Other (UOTHER)",
             "Other (UOTHER), Owner (UOWNER)",
+            "Doe, Jane (UOWNER), Other, Person (UOTHER)",
+            "Döe, Jäne (UOWNER), Other (UOTHER)",
         ] {
             assert!(
                 ReactionEvidence::parse(
@@ -899,6 +908,50 @@ mod tests {
             .unwrap()
             .owner_fire
         );
+        assert!(
+            ReactionEvidence::parse(
+                "Reactions on message:\n\n:fire: × 1 — Doe, Jane (UOWNER)",
+                "UOWNER"
+            )
+            .unwrap()
+            .owner_fire
+        );
+        assert!(
+            !ReactionEvidence::parse(
+                "Reactions on message:\n\n:fire: × 1 — Mallory (UOWNER), invalid tail",
+                "UOWNER"
+            )
+            .unwrap()
+            .owner_fire
+        );
+        assert!(ReactionEvidence::parse(
+            "Reactions on message:\n\n:fire: × 1 — Owner (UOWNER)\n:fire: × 1 — Other (UOTHER)",
+            "UOWNER"
+        )
+        .is_err());
+    }
+    #[tokio::test]
+    async fn existing_eyes_require_operation_specific_rejection_evidence() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        for (result, confirmed) in [
+            (
+                json!({"ok":false,"error":"already_reacted","method":"reactions.add"}),
+                true,
+            ),
+            (json!({"error":"already_reacted"}), false),
+            (json!({"ok":false,"error":"already_reacted"}), false),
+            (
+                json!({"ok":false,"error":"already_reacted","method":"reactions.get"}),
+                false,
+            ),
+        ] {
+            let mut slack = Slack::new(state.mcp_manager.clone(), &config());
+            slack.fixture = Some(Arc::new(move |tool, _| {
+                assert_eq!(tool, "slack_add_reaction");
+                Ok(result.clone())
+            }));
+            assert_eq!(slack.eyes("C123", "100.000001").await.is_ok(), confirmed);
+        }
     }
     #[tokio::test]
     async fn reply_source_requires_independent_membership_in_the_claimed_root() {
@@ -1162,6 +1215,17 @@ mod tests {
             "1791232500.000000"
         )
         .is_err());
+        for extra in ["1791232501.000000", "1791232500.000000"] {
+            let mut ambiguous = receipt.clone();
+            ambiguous["message_link"] = json!(format!(
+                "{}&thread_ts={extra}",
+                receipt["message_link"].as_str().unwrap()
+            ));
+            assert!(
+                send_evidence(&ambiguous, "example.slack.com", "C123", "1791232500.000000")
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn retry_directives_are_preserved() {

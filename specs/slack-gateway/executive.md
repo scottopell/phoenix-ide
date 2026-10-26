@@ -195,5 +195,17 @@ read can fail, the final 70-case gateway suite passes. Clippy, formatting,
 Allium and structural/timing checks pass. These revisions still need exact-head
 automated review and hosted CI; they are not deployed by the pilot evidence.
 
+The next review closes account switching after a briefing's needs-input notice,
+validates comma-containing reactor names without trusting embedded identity
+tokens, requires operation-specific evidence for already-present eyes and
+rejects ambiguous thread-root receipts. Retired, definitely-unsent clarification
+returns retain their frozen text and are replaced by separate generic handoffs
+with the same source association, coverage and destination. Atomic attempt
+admission prevents a stale snapshot from sending the old question; uncertain
+and confirmed operations are not replaced. All 397 affected MCP/gateway,
+migration and creation-replay tests pass, as do the final 71 gateway cases and
+Clippy, formatting, Allium and structural/timing checks. These fixes still need
+new exact-head hosted CI and automatic review; the pilot remains separately pinned.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

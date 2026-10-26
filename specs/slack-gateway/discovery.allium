@@ -65,6 +65,8 @@ contract SlackDiscoveryPort {
         -- author are verified independently of untrusted message prose.
         -- Reaction ownership uses actual terminal member IDs in unambiguous
         -- reactor entries, never a token embedded in a rendered display name.
+        -- Display-name commas are not member boundaries. Complete terminal IDs
+        -- and the declared member count must agree; duplicate emoji rows are invalid.
         -- A source reply must also be observed under its claimed root; the
         -- search permalink alone does not establish that return destination.
         -- Eligibility uses the current and preceding three calendar dates in

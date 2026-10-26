@@ -60,6 +60,8 @@ WHEN discovery repeats the same source message, including both a prefix and an o
 
 WHEN an owner or workspace change would leave another account's accepted work or delivery obligations outstanding, THE SYSTEM SHALL refuse that change until those obligations settle. Disabling discovery or repairing the same account's connection SHALL preserve and continue accepted work.
 
+A briefing's confirmed needs-input notice SHALL NOT establish terminal lifecycle evidence. An account change SHALL remain blocked until creation/admission rejection or a captured terminal briefing occurrence has its corresponding return settled.
+
 **Rationale:** Polling, overlapping gestures, edits, and restarts must not execute the same request twice or change what was accepted.
 
 ### REQ-SG-006 — Acknowledge durable acceptance with eyes only
@@ -67,6 +69,8 @@ WHEN an owner or workspace change would leave another account's accepted work or
 WHEN request acceptance is durable, THE SYSTEM SHALL attempt to add `:eyes:` to the triggering source message. THE SYSTEM SHALL NOT add it before acceptance is durable or use it to claim that work is running, complete, or delivered.
 
 WHEN adding eyes fails, THE SYSTEM SHALL retain the accepted request and retry the acknowledgment independently of execution. Removing fire after acceptance SHALL NOT cancel the request. Gateway progress SHALL NOT add completion, waiting, or failure reactions.
+
+An already-present acknowledgment SHALL require structured rejection evidence identifying the add-reaction operation. An unqualified error token SHALL NOT confirm the acknowledgment.
 
 **Rationale:** One small acknowledgment tells the owner when they can remove their discovery gesture safely.
 
@@ -130,7 +134,7 @@ WHEN clarification is required, THE SYSTEM SHALL post it in that thread, durably
 
 THE SYSTEM SHALL include a Phoenix deep link in gateway-generated clarifications and explanations: the stable conversation route when one exists, otherwise the specific return's status route. The gateway SHALL durably freeze that complete outgoing text, including the link, when creating its return obligation and reuse it for a known-unsent retry. The assignment SHALL encourage the agent to link its Phoenix conversation when useful in an intentional answer.
 
-WHEN a native question has been answered, replaced or become unavailable before its response is materialized, THE SYSTEM SHALL retain the request's response duty and create a generic linked handoff explanation rather than publish the stale question or private follow-up content.
+WHEN a native question has been answered, replaced or become unavailable before its message-post attempt, THE SYSTEM SHALL retain the request's response duty and create a generic linked handoff explanation rather than publish the stale question or private follow-up content. A materialized pending or known-unsent clarification SHALL be retired and replaced by a distinct return carrying the same source, coverage and destination; the original frozen text SHALL remain intact. This replacement SHALL NOT resend or replace an attempting, confirmed or uncertain external operation.
 
 **Rationale:** An explicit Slack invocation should not disappear into an agent that silently decides to say nothing.
 
@@ -141,6 +145,8 @@ THE SYSTEM SHALL publish the answer, clarification, or failure selected for the 
 THE SYSTEM SHALL instruct the agent to return the invocation's automatic answer and clarifications through the gateway-owned return path rather than independently post them with Slack tools. A separately and explicitly requested Slack side effect SHALL remain governed by ordinary task authorization and permissions; this assignment-level division of reply ownership SHALL NOT introduce tool restrictions or a new permission mode.
 
 THE SYSTEM SHALL retain each output's exact native source and Slack destination, distinguish queued, confirmed, failed, and uncertain delivery, and preserve output obligations across same-version restart. A known-unsent operation MAY be retried within a bounded retry policy. An operation whose external outcome is unknown SHALL be reconciled or exposed as uncertain rather than blindly resent or declared delivered. An unavailable destination SHALL NOT be replaced by a different public channel.
+
+Thread-delivery evidence SHALL identify exactly one source root. Duplicate or conflicting root parameters SHALL NOT confirm delivery.
 
 Terminal destination rejection SHALL require structured rejection evidence for the message-post operation with no accepted-message identity. An opaque destination-error token or a failure from a later lookup SHALL remain uncertain. An external attempt whose final persistence write fails SHALL be reconciled on a later serialized service pass without requiring a restart or repeating the external operation.
 

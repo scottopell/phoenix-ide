@@ -47,6 +47,9 @@ blocks ordinary admission, new explicit requests receive an explanation and
 the Phoenix link. The clarification completes the automatic Slack response;
 further discussion in Phoenix remains private. Send a new explicit Slack
 request when you want another intentional answer published there.
+If you answer or replace a question before its clarification is sent, Phoenix
+queues a generic linked explanation instead of the stale question. An uncertain
+send remains visible for inspection.
 
 Discovery runs once per minute. A bounded newest-prefix-page check can find a
 new explicit request while an older sweep continues. Search indexing, saved

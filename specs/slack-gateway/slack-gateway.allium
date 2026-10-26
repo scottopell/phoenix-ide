@@ -29,7 +29,7 @@ external entity NativeAdmission {
 external entity NativeOutcome {
     covered_admissions: Set<NativeAdmission>
     occurrence_key: String
-    kind: answer | clarification | failure | briefing_ready | cancelled | empty_completion
+    kind: answer | clarification | retired_clarification | failure | briefing_ready | cancelled | empty_completion
     public_response: String
 }
 
@@ -61,6 +61,11 @@ entity Gateway {
     requests: AcceptedRequest with gateway = this
     returns: ReturnObligation with request.gateway = this
     bindings: ConversationBinding with gateway = this
+
+    @invariant AccountWorkContinuity
+        -- A needs-input notice does not settle an active briefing lifecycle.
+        -- Changing owner/workspace requires terminal briefing evidence and its
+        -- corresponding settled notice, or a settled creation/admission rejection.
 }
 
 -- Provisioning and continuation are owned by the native creation/lifecycle specs.
@@ -205,6 +210,10 @@ rule EyesConfirmed {
     when: EyesReactionConfirmed(request)
     requires: request.acknowledgment = pending
     ensures: request.acknowledgment = confirmed
+    @guidance
+        -- Confirmation requires successful add-reaction evidence or a structured
+        -- reactions.add rejection proving the acknowledgment already exists.
+        -- An opaque already_reacted token does not confirm the operation.
 }
 
 -- REQ-SG-007/011. The existing native service owns creation and admission.
@@ -287,7 +296,7 @@ rule OweExplicitResponse {
     requires: request.status = admitted
     requires: request.observation.kind = explicit_request
     requires: request.admission in outcome.covered_admissions
-    requires: outcome.kind in {answer, clarification, failure, cancelled, empty_completion}
+    requires: outcome.kind in {answer, clarification, retired_clarification, failure, cancelled, empty_completion}
     let covered = request.gateway.requests where status = admitted and observation.kind = explicit_request and binding_key = request.binding_key and admission in outcome.covered_admissions
     requires: covered.count = outcome.covered_admissions.count
     requires: not request.gateway.returns.any(r => r.kind = thread_reply and request in r.covered_requests)
@@ -312,7 +321,7 @@ rule OweBriefingNotice {
     requires: request.status = admitted
     requires: request.observation.kind = briefing
     requires: outcome.covered_admissions = {request.admission}
-    requires: outcome.kind in {briefing_ready, clarification, failure, cancelled, empty_completion}
+    requires: outcome.kind in {briefing_ready, clarification, retired_clarification, failure, cancelled, empty_completion}
     requires: not request.gateway.returns.any(r => r.request = request and r.occurrence_key = outcome.occurrence_key)
     ensures: ReturnObligation.created(
         request: request,
@@ -326,6 +335,39 @@ rule OweBriefingNotice {
         attempt_key: null,
         notification_receipt: null
     )
+}
+
+-- REQ-SG-012/013. A retired, definitely-unsent question still owes an explanation.
+rule ReplaceRetiredClarification {
+    when: UndeliveredClarificationRetired(obligation, replacement)
+    requires: obligation.state in {pending, known_unsent}
+    requires: obligation.native_outcome != null
+    requires: obligation.native_outcome.kind = clarification
+    requires: replacement.kind = retired_clarification
+    requires: replacement.covered_admissions = obligation.native_outcome.covered_admissions
+    requires: replacement.occurrence_key != obligation.occurrence_key
+    requires: not obligation.request.gateway.returns.any(r => r.kind = obligation.kind and r.destination_key = obligation.destination_key and r.occurrence_key = replacement.occurrence_key)
+    ensures: obligation.state = failed
+    ensures: obligation.failure_reason = "Undelivered clarification retired; generic handoff queued"
+    ensures: ReturnObligation.created(
+        request: obligation.request,
+        covered_requests: obligation.covered_requests,
+        native_outcome: replacement,
+        occurrence_key: replacement.occurrence_key,
+        kind: obligation.kind,
+        destination_key: obligation.destination_key,
+        text: replacement.public_response,
+        state: pending,
+        attempt_key: null,
+        notification_receipt: null
+    )
+    @guidance
+        -- Retirement is exact native-question evidence. The replacement contains
+        -- only a generic explanation and frozen Phoenix link. It retains the
+        -- predecessor's source-question association and exact request coverage.
+        -- The original outgoing text stays intact; replacement is a new operation.
+        -- A stale-question snapshot cannot begin an external attempt. Attempting,
+        -- confirmed and uncertain writes are never replaced by this rule.
 }
 
 -- REQ-SG-013. Record attempt identity before the external operation.
@@ -474,6 +516,8 @@ contract NativeRuntimePort {
         -- Clarification follow-ups include the original admission only when the
         -- selected response explicitly covers that original request as well.
         -- A request omitted from that set retains its separate response duty.
+        -- retired_clarification projects exact question-retirement evidence,
+        -- not a new admission or permission to publish a private native answer.
         -- Positive external readback identifies the exact return obligation and
         -- attempt; notification proof also matches its retained instance identity.
 }
@@ -495,6 +539,7 @@ surface GatewayBoundary {
         RequestFailedBeforeAdmission(request, reason, response)
         RequestOutcomeObserved(request, outcome)
         BriefingOutcomeObserved(request, outcome, notice)
+        UndeliveredClarificationRetired(obligation, replacement)
         DispatchReturn(obligation, attempt)
         SlackReplyConfirmed(obligation, attempt, message_identity)
         NotificationSubmissionConfirmed(obligation, attempt, instance)
