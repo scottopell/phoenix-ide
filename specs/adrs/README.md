@@ -180,6 +180,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
+| [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |
 | [147](147_readable-generated-handoffs-retain-source-authority.md) | Readable generated handoffs retain explicit source authority | Accepted; partially supersedes 054 | REQ-BED-020b/021/030, REQ-LLM-004m |
 | [146](146_context-capacity-preserves-output-and-semantic-continuity.md) | Shared capacity planning preserves output headroom and semantic continuity | Accepted | REQ-LLM-004f/004j–004m, REQ-BED-020a, REQ-STR-012, REQ-AN-011 |

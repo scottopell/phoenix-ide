@@ -272,10 +272,13 @@ THE SYSTEM SHALL NOT automatically inject current activity facts into its system
 WHEN the user requests a check-in through the composer action
 THE SYSTEM SHALL submit a normal message requesting a broad fresh check of commissioned work and selective intervention through established owners within verified standing scope and approvals
 AND SHALL direct the Coordinator to leave healthy progressing work alone, avoid redundant nudges, replanning or assignments merely to demonstrate activity, and not infer that an idle owner is stalled
+AND SHALL direct the Coordinator to investigate blocked or waiting owners before treating them as healthy or stalled, take the smallest recovery step allowed by existing authority through the established owner, and verify resumed work rather than message acceptance; progress elsewhere SHALL NOT discharge a blocked obligation
+AND SHALL reconcile later decisions and completed work before reviving questions or replaying earlier answers
 AND SHALL direct the Coordinator to recover unanswered user decisions from history and verify that each remains unresolved and material before prioritizing user input, while advancing independent authorized work first
 AND SHALL preserve prior decisions, corrections, pauses and gates; a repeated check-in SHALL NOT itself expand authority or reset them
 AND SHALL distinguish requested action and message acceptance from verified completion without requiring an announcement for every routine delivery
-AND SHALL lead the check-in briefing with still-needed user input, presenting genuine choices through `ask_user_question` with context and a recommendation, then explain material changes as problem, intervention and delivery direction in plain English, with useful links and grounded status where appropriate, without requiring a fixed report template or announcements for factual watch events
+AND SHALL lead the check-in briefing with still-needed user input, presenting genuine choices through `ask_user_question` with context and a recommendation, then explain what changed, why it matters and what happens next in concrete language understandable without intervening history, naming the actual work rather than opaque coordination labels, with useful links and grounded status where appropriate, without requiring a fixed report template or announcements for factual watch events
+AND SHALL include compact hypothetical bad-versus-good wording examples in both language-specific system prompts, distinguishing requests from verified outcomes without treating examples as incident facts
 AND SHALL include process or evidence limits when material to understanding or a decision, without indefinite polling or waiting for all owners to finish
 
 ---
