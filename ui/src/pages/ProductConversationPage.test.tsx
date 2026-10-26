@@ -601,13 +601,15 @@ describe('ProductConversationPage', () => {
     const citation = screen.getByRole('link', { name: 'Exact chapter' });
     expect(citation).toHaveAttribute('href', '/transcript?source_transcript=row-1');
     fireEvent.click(citation);
-    await waitFor(() => expect(screen.getByTestId('product-conversation-page')).toBeVisible());
+    await waitFor(() => expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1?source_transcript=row-1'));
     expect(screen.getByTestId('product-conversation-page')).toBe(owner);
-    expect(screen.getByTestId('history-location').textContent).toBe('/c/pc-1?source_transcript=row-1');
     expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
-    for (const direction of ['history back', 'history forward']) {
+    for (const [direction, expectedRoute] of [
+      ['history back', '/c/pc-1'],
+      ['history forward', '/c/pc-1?source_transcript=row-1'],
+    ]) {
       fireEvent.click(screen.getByRole('button', { name: direction }));
-      await waitFor(() => expect(owner).toBeVisible());
+      await waitFor(() => expect(screen.getByTestId('history-location').textContent).toBe(expectedRoute));
       expect(screen.getByTestId('product-conversation-page')).toBe(owner);
       expect(screen.getByTestId('message-order')).toHaveTextContent('local-acquired');
     }
