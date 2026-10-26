@@ -142,7 +142,7 @@ entity ReturnObligation {
     failure_reason: String when state = failed
 
     @invariant ClarificationHandoff
-        -- REQ-SG-012/013. A clarification response links to the ordinary Phoenix
+        -- REQ-SG-012/013. An explicit-request clarification links to the ordinary Phoenix
         -- conversation for an answer. It satisfies the automatic Slack response
         -- duty when confirmed. Slack triggers never answer native questions;
         -- native discussion does not inherit the original publication authority.
@@ -382,6 +382,9 @@ rule InterruptedExternalAttempt {
     when: RecoverInterruptedReturn(obligation)
     requires: obligation.state = attempting
     ensures: obligation.state = uncertain
+    @guidance
+        -- Recovery runs between serialized passes as well as after restart.
+        -- No live in-flight operation is reclassified by its own pass.
 }
 
 -- Positive readback evidence, not a timeout, resolves an uncertain attempt.
@@ -397,7 +400,7 @@ rule ReconcileConfirmedReturn {
 rule ReportUnavailableThread {
     when: ThreadDestinationUnavailable(obligation, reason, notice_key, notice)
     requires: obligation.kind = thread_reply
-    requires: obligation.state in {pending, known_unsent, uncertain}
+    requires: obligation.state = attempting
     requires: not obligation.request.gateway.returns.any(r => r.kind = private_notice and r.occurrence_key = notice_key)
     ensures: obligation.state = failed
     ensures: obligation.failure_reason = reason
@@ -413,6 +416,10 @@ rule ReportUnavailableThread {
         attempt_key: null,
         notification_receipt: null
     )
+    @guidance
+        -- The current message-post attempt has structured rejection evidence
+        -- with no accepted message identity. Opaque errors and later lookup
+        -- failures do not establish destination rejection for this operation.
 }
 
 rule ReconcileUnsentReturn {

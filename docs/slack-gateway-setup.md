@@ -58,6 +58,9 @@ support; an unavailable destination is surfaced rather than silently replaced.
 Replies retry a rate limit only when structured evidence identifies rejection
 of `chat.postMessage`. An opaque error or failed later permalink lookup stays
 uncertain, since the post may already exist.
+The same proof is required before declaring a destination unavailable. If final
+delivery persistence fails after a send, a later service pass exposes the attempt
+as uncertain without sending it again or requiring a Phoenix restart.
 
 ## Notification protocol
 

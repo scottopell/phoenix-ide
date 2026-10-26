@@ -142,6 +142,8 @@ THE SYSTEM SHALL instruct the agent to return the invocation's automatic answer 
 
 THE SYSTEM SHALL retain each output's exact native source and Slack destination, distinguish queued, confirmed, failed, and uncertain delivery, and preserve output obligations across same-version restart. A known-unsent operation MAY be retried within a bounded retry policy. An operation whose external outcome is unknown SHALL be reconciled or exposed as uncertain rather than blindly resent or declared delivered. An unavailable destination SHALL NOT be replaced by a different public channel.
 
+Terminal destination rejection SHALL require structured rejection evidence for the message-post operation with no accepted-message identity. An opaque destination-error token or a failure from a later lookup SHALL remain uncertain. An external attempt whose final persistence write fails SHALL be reconciled on a later serialized service pass without requiring a restart or repeating the external operation.
+
 An explicit structured send rejection proving rate-limit refusal MAY establish known-unsent status and SHALL retain its retry delay. The evidence SHALL identify rejection of the message-post operation itself. A transport-level rate error, opaque tool error, unqualified operation failure, or failure after a possible accepted post SHALL NOT establish that proof.
 
 **Rationale:** The owner needs intentional replies and truthful delivery state, not accidental transcript publication or duplicate posts after a lost network response.
@@ -157,6 +159,8 @@ WHEN the configured Slack transport forbids replying to an external shared chann
 ### REQ-SG-015 — Deliver private notices through an owner-configured command
 
 WHEN a briefing is ready, requires owner input, or fails during creation, admission, or execution, THE SYSTEM SHALL submit a private notification with its Phoenix conversation link or, before publication, its exact request-status link through an owner-configured local command. The command SHALL deliver only to the configured owner. Notifications SHALL contain a short readiness, needs-input, or failure message and the relevant link rather than private investigation content or credentials.
+
+Each captured briefing occurrence SHALL retain its own notification obligation; a prior needs-input notice SHALL NOT suppress a later captured ready or failure occurrence.
 
 THE SYSTEM SHALL pass notification content through a versioned input protocol rather than interpolate it into command arguments. Provider authentication SHALL remain the local command's responsibility; supplied credentials SHALL NOT be persisted in gateway settings. Before submission, the command and destination identity SHALL be frozen with the attempt. Later inspection SHALL use that frozen command and verify the exact notification, owner, and submission receipt. The system SHALL distinguish submission from confirmed delivery and SHALL NOT claim that confirmation proves a desktop or mobile notification was displayed. Missing configuration, authentication failure, throttling, and uncertain notification outcomes SHALL remain visible in Phoenix without rerunning the agent.
 
@@ -181,6 +185,8 @@ Ready responses SHALL be reconciled independently of waiting for the next discov
 The gateway's owner-facing read-access inspection SHALL share that allowance, serialization and persisted retry deadline, without accepting triggers or advancing discovery. Direct agent or manual MCP tool calls are outside this gateway allowance.
 
 Ready return delivery SHALL receive an opportunity before acknowledgment retries can exhaust allowance or introduce a new provider delay. Retry deadlines SHALL apply to the configured owner/workspace, rather than another retained account. Non-throttling discovery failures SHALL be reported as failed rather than provider backoff. A startup recovery failure SHALL remain visible and be retried without requiring a Phoenix restart; no external work SHALL begin before that recovery succeeds.
+
+Candidate first-observation time SHALL be persisted by workspace, owner, channel and message identity before source verification. A transient verification failure SHALL preserve that time across retries and same-version restart; acceptance SHALL transfer it into the immutable request. This metadata SHALL NOT authorize a request or mark the source handled. Acceptance or a handled ineligible observation SHALL retire the candidate metadata. Metadata older than seven days MAY expire because its source is outside the four-calendar-date eligibility window.
 
 WHEN initialization is complete and the saved prefix search has advanced, THE SYSTEM SHALL offer a bounded newest-prefix-page check independently of that saved position, subject to the shared allowance, backoff and discovery time bounds. It SHALL preserve capacity for catch-up and accepted work, alternate which class receives the first opportunity, and use the same source-verification and immutable acceptance boundary for both paths. A freshness observation SHALL NOT advance saved positions, establish full-window completion, or bypass initialization. This check SHALL NOT promise that all newly indexed messages are observed on that opportunity; full catch-up remains responsible for the rest of the window.
 

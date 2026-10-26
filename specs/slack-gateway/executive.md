@@ -57,7 +57,7 @@ adversarial author review found and fixed inactive acceptance being mistaken
 for recorded evidence and acknowledgment throttling losing its backoff status.
 These author reviews are not independent sign-off or a formal liveness proof.
 
-The public candidate adds migration 132 after upstream's migration 131, replaces
+The public candidate adds migrations 132 and 133 after upstream's migration 131, replaces
 the personal notifier with a provider-neutral command, and adds bounded
 newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
 Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
@@ -117,7 +117,8 @@ pilot does not expand any automated deployment controller's qualified intervals,
 provide automatic database rollback or qualify a generic 127-to-130 route.
 That pilot's migration 130 is the pre-publication Slack allocation. Upstream
 subsequently assigned 130 and 131 to continuation/capacity data; this branch
-allocates Slack at 132 while preserving the upstream migrations and Slack SQL.
+allocates Slack at 132 while preserving the upstream migrations and Slack SQL,
+then adds first-observation metadata at 133.
 The pilot ledger is not the public candidate's ledger. No direct upgrade from
 that pilot to the merged candidate is qualified; it requires separate offline
 reconciliation and validation before any later production deployment.
@@ -179,6 +180,20 @@ answers; unavailable conversation links fall back to the exact return status.
 The expanded 255-case MCP/gateway run and final 18-case database run pass,
 including resolution/replacement-before-materialization and missing-product
 link coverage. Clippy, formatting, Allium and structural/timing checks pass.
+
+Further review hardening retires settled continuation exhaustion events and
+handles deleted lifecycle sources without blocking other gateway work. Private
+briefing notices deduplicate per captured occurrence. A later serialized pass
+reconciles orphaned external attempts without resending; terminal destination
+failure requires structured message-post rejection. Reactor verification reads
+actual terminal member IDs rather than display-name tokens. Migration 133
+retains first observation across candidate-verification retries and transfers
+it atomically on acceptance; its metadata grants no request authority.
+All 395 affected MCP/gateway, migration and creation-replay tests pass. After
+retaining observation times for the entire returned page before any candidate
+read can fail, the final 70-case gateway suite passes. Clippy, formatting,
+Allium and structural/timing checks pass. These revisions still need exact-head
+automated review and hosted CI; they are not deployed by the pilot evidence.
 
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

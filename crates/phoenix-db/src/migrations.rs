@@ -690,6 +690,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_gateway",
         sql: include_str!("migrations/slack_gateway.sql"),
     },
+    Migration {
+        version: 133,
+        name: "slack_gateway_first_observation",
+        sql: "CREATE TABLE slack_gateway_observations (
+            workspace TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL, message_ts TEXT NOT NULL,
+            first_observed_at_unix_micros INTEGER NOT NULL CHECK(typeof(first_observed_at_unix_micros)='integer' AND first_observed_at_unix_micros>=0),
+            PRIMARY KEY(workspace,owner,channel,message_ts)
+        );",
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -14419,6 +14428,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (133, "slack_gateway_first_observation"),
             (132, "slack_gateway"),
             (131, "request_capacity_diagnostics"),
             (130, "continuation_handoff_candidates"),
@@ -19751,7 +19761,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
                     (130, 'temporarily_skip_continuation_handoff_candidates'),
                     (131, 'temporarily_skip_request_capacity_diagnostics'),
-                    (132, 'temporarily_skip_slack_gateway')",
+                    (132, 'temporarily_skip_slack_gateway'),
+                    (133, 'temporarily_skip_slack_gateway_first_observation')",
         )
         .execute(&pool)
         .await
@@ -20621,7 +20632,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (129, 'temporarily_skip_single_conversation_name_and_route_projection'),
                     (130, 'temporarily_skip_continuation_handoff_candidates'),
                     (131, 'temporarily_skip_request_capacity_diagnostics'),
-                    (132, 'temporarily_skip_slack_gateway')",
+                    (132, 'temporarily_skip_slack_gateway'),
+                    (133, 'temporarily_skip_slack_gateway_first_observation')",
         )
         .execute(pool)
         .await

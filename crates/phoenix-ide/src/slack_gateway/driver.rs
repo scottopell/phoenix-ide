@@ -22,6 +22,7 @@ pub(super) async fn tick(
     pass: Pass,
 ) -> Result<(), String> {
     c.validate()?;
+    state.db.slack_recover_returns().await.map_err(err)?;
     let calls_before = slack.calls.load(std::sync::atomic::Ordering::Relaxed);
     let discovering = matches!(pass, Pass::Discovery { .. }) && c.enabled;
     let needs_slack = if discovering {
@@ -141,6 +142,11 @@ pub(super) async fn discover_ordered(
     slack: &Slack,
     reactions_first: bool,
 ) -> Result<(), String> {
+    sqlx::query("DELETE FROM slack_gateway_observations WHERE first_observed_at_unix_micros<?1")
+        .bind((chrono::Utc::now() - chrono::Duration::days(7)).timestamp_micros())
+        .execute(state.db.pool())
+        .await
+        .map_err(err)?;
     let baseline = state
         .db
         .slack_baseline_complete(&c.workspace, &c.owner)
@@ -259,6 +265,7 @@ async fn accept_page_sources(
     reactions: bool,
     baseline: bool,
 ) -> Result<bool, String> {
+    let mut candidates = Vec::new();
     for hit in &page.hits {
         if state
             .db
@@ -273,6 +280,20 @@ async fn accept_page_sources(
         {
             continue;
         }
+        state
+            .db
+            .slack_observe_source(
+                &c.workspace,
+                &c.owner,
+                &hit.channel,
+                &hit.ts,
+                hit.observed_at_unix_micros,
+            )
+            .await
+            .map_err(err)?;
+        candidates.push(hit);
+    }
+    for hit in candidates {
         if let Some(verified) = slack.source(c, hit, reactions).await? {
             if state
                 .db
@@ -286,6 +307,11 @@ async fn accept_page_sources(
                 .await
                 .map_err(err)?
             {
+                state
+                    .db
+                    .slack_forget_observation(&c.workspace, &c.owner, &hit.channel, &hit.ts)
+                    .await
+                    .map_err(err)?;
                 continue;
             }
             let source = verified.source;
@@ -305,6 +331,12 @@ async fn accept_page_sources(
             if acceptance == SlackSourceAcceptance::Inactive {
                 return Ok(false);
             }
+        } else {
+            state
+                .db
+                .slack_forget_observation(&c.workspace, &c.owner, &hit.channel, &hit.ts)
+                .await
+                .map_err(err)?;
         }
     }
     Ok(true)
@@ -407,13 +439,10 @@ async fn dispatch_returns(
                     )
                     .await
                     .map_err(err)?,
-                Err(
-                    phoenix_tools::mcp::McpOneShotError::Uncertain(message)
-                    | phoenix_tools::mcp::McpOneShotError::ToolRejected(message),
-                ) if super::slack::destination_unavailable(&message) => {
+                Err(e) if super::slack::destination_unavailable(&e) => {
                     state
                         .db
-                        .slack_fail_return_with_notice(&output.return_id, &attempt, &message)
+                        .slack_fail_return_with_notice(&output.return_id, &attempt, e.message())
                         .await
                         .map_err(err)?;
                 }
@@ -1182,6 +1211,242 @@ mod tests {
             slack.calls.load(std::sync::atomic::Ordering::Relaxed),
             calls
         );
+    }
+
+    #[tokio::test]
+    async fn first_candidate_failure_preserves_observation_of_the_entire_page() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let c = Config {
+            enabled: true,
+            mcp_server: "fixture".into(),
+            owner: "UFIXTURE".into(),
+            workspace: "fixture.slack.com".into(),
+            timezone: "America/New_York".into(),
+            phoenix_url: "https://phoenix.example".into(),
+            notification_command: None,
+        };
+        let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+        slack.fixture = Some(Arc::new(|_, _| Err("fixture source read failed".into())));
+        let seconds = chrono::Utc::now().timestamp();
+        let timestamps = [format!("{seconds}.000001"), format!("{seconds}.000002")];
+        let page = Page {
+            hits: timestamps
+                .iter()
+                .map(|ts| super::super::slack::Hit {
+                    channel: "CFIXTURE".into(),
+                    ts: ts.clone(),
+                    root: ts.clone(),
+                    url: format!(
+                        "https://fixture.slack.com/archives/CFIXTURE/p{}",
+                        ts.replace('.', "")
+                    ),
+                    observed_at_unix_micros: 100,
+                })
+                .collect(),
+            cursor: None,
+        };
+        assert!(accept_page_sources(&state, &c, &slack, &page, true, true)
+            .await
+            .is_err());
+        let observed: Vec<(String, i64)> = sqlx::query_as("SELECT message_ts,first_observed_at_unix_micros FROM slack_gateway_observations ORDER BY message_ts").fetch_all(state.db.pool()).await.unwrap();
+        assert_eq!(
+            observed,
+            timestamps
+                .into_iter()
+                .map(|ts| (ts, 100))
+                .collect::<Vec<_>>()
+        );
+        assert!(state
+            .db
+            .slack_requests(&c.workspace, &c.owner)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn opaque_destination_errors_remain_uncertain_without_failure_notice() {
+        for qualified in [false, true] {
+            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let c = Config {
+                enabled: false,
+                mcp_server: "fixture".into(),
+                owner: "UFIXTURE".into(),
+                workspace: "fixture.slack.com".into(),
+                timezone: "America/New_York".into(),
+                phoenix_url: "https://phoenix.example".into(),
+                notification_command: None,
+            };
+            let source = phoenix_db::SlackSource {
+                workspace: c.workspace.clone(),
+                owner: c.owner.clone(),
+                channel: "CFIXTURE".into(),
+                message_ts: "100.000001".into(),
+                thread_ts: "100.000000".into(),
+                source_url: "https://fixture.slack.com/archives/CFIXTURE/p100000001".into(),
+                instruction: "fixture".into(),
+                context: "quoted".into(),
+                observed_at_unix_micros: 1,
+                kind: SlackRequestKind::Explicit,
+            };
+            state.db.accept_slack_source(&source, false).await.unwrap();
+            let request = state
+                .db
+                .slack_requests(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            state
+                .db
+                .fail_slack_before_admission(&request.request_id, "fixture refusal", &c.phoenix_url)
+                .await
+                .unwrap();
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            slack.fixture = Some(Arc::new(move |tool, _| {
+                assert_eq!(tool, "slack_send_message");
+                Ok(if qualified {
+                    serde_json::json!({"ok":false,"error":"channel_not_found","method":"chat.postMessage"})
+                } else {
+                    serde_json::json!({"error":"channel_not_found"})
+                })
+            }));
+            dispatch_returns(&state, &c, &slack, true).await.unwrap();
+            let outputs = state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap();
+            let thread = outputs.iter().find(|r| r.destination == "thread").unwrap();
+            assert_eq!(
+                thread.state,
+                if qualified {
+                    phoenix_db::SlackReturnState::Failed
+                } else {
+                    phoenix_db::SlackReturnState::Uncertain
+                }
+            );
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|r| r.destination == "private")
+                    .count(),
+                usize::from(qualified)
+            );
+            dispatch_returns(&state, &c, &slack, true).await.unwrap();
+            assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    // REQ-SG-011/013: an abandoned write is exposed without another external send.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn final_state_write_failure_is_reconciled_without_restart_or_resend() {
+        for private in [false, true] {
+            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("sends");
+            let mut c = Config {
+                enabled: false,
+                mcp_server: "fixture".into(),
+                owner: "UFIXTURE".into(),
+                workspace: "fixture.slack.com".into(),
+                timezone: "America/New_York".into(),
+                phoenix_url: "https://phoenix.example".into(),
+                notification_command: None,
+            };
+            let source = phoenix_db::SlackSource {
+                workspace: c.workspace.clone(),
+                owner: c.owner.clone(),
+                channel: "CFIXTURE".into(),
+                message_ts: "100.000001".into(),
+                thread_ts: "100.000000".into(),
+                source_url: "https://fixture.slack.com/archives/CFIXTURE/p100000001".into(),
+                instruction: "fixture".into(),
+                context: "quoted".into(),
+                observed_at_unix_micros: 1,
+                kind: if private {
+                    SlackRequestKind::Briefing
+                } else {
+                    SlackRequestKind::Explicit
+                },
+            };
+            state.db.accept_slack_source(&source, false).await.unwrap();
+            let request = state
+                .db
+                .slack_requests(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            state
+                .db
+                .fail_slack_before_admission(&request.request_id, "fixture refusal", &c.phoenix_url)
+                .await
+                .unwrap();
+            state
+                .db
+                .slack_eyes_confirmed(&request.request_id)
+                .await
+                .unwrap();
+            let output = state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            if private {
+                let response = serde_json::json!({"version":1,"notification_id":output.return_id,"owner":c.owner,"receipt":"receipt","state":"submitted"});
+                c.notification_command = Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("cat >/dev/null; printf x >> \"$1\"; printf '%s' '{response}'"),
+                    "fixture".into(),
+                    marker.to_str().unwrap().into(),
+                ]);
+            }
+            let posts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let count = posts.clone();
+            let mut slack = Slack::new(state.mcp_manager.clone(), &c);
+            slack.fixture = Some(Arc::new(move |tool, _| {
+                assert_eq!(tool, "slack_send_message");
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(
+                    serde_json::json!({"message_link":"https://fixture.slack.com/archives/CFIXTURE/p200000001?thread_ts=100.000000","message_context":{"channel_id":"CFIXTURE","message_ts":"200.000001"}}),
+                )
+            }));
+            sqlx::query("CREATE TRIGGER reject_final_return_state BEFORE UPDATE OF state ON slack_gateway_returns WHEN OLD.state='attempting' AND NEW.state<>'attempting' BEGIN SELECT RAISE(ABORT,'injected final write failure'); END")
+                .execute(state.db.pool()).await.unwrap();
+            assert!(dispatch_returns(&state, &c, &slack, true).await.is_err());
+            assert_eq!(
+                state
+                    .db
+                    .slack_returns(&c.workspace, &c.owner)
+                    .await
+                    .unwrap()[0]
+                    .state,
+                phoenix_db::SlackReturnState::Attempting
+            );
+            sqlx::query("DROP TRIGGER reject_final_return_state")
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            tick(&state, &c, &slack, Pass::Delivery).await.unwrap();
+            assert_eq!(
+                state
+                    .db
+                    .slack_returns(&c.workspace, &c.owner)
+                    .await
+                    .unwrap()[0]
+                    .state,
+                phoenix_db::SlackReturnState::Uncertain
+            );
+            if private {
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+            }
+            assert_eq!(
+                posts.load(std::sync::atomic::Ordering::Relaxed),
+                u32::from(!private)
+            );
+        }
     }
 
     // REQ-SG-012: neither a fresh trigger nor a stored association answers a question.

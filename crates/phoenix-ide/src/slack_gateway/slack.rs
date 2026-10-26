@@ -419,22 +419,20 @@ fn retry_seconds(error: &str) -> Option<u64> {
     }
     None
 }
-pub(super) fn destination_unavailable(error: &str) -> bool {
-    error
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|code| {
-            matches!(
-                code,
-                "channel_not_found"
-                    | "is_archived"
-                    | "not_in_channel"
-                    | "restricted_action"
-                    | "restricted_action_thread_locked"
-                    | "restricted_action_read_only_channel"
-                    | "restricted_action_non_threadable_channel"
-                    | "posting_to_general_channel_denied"
-            )
-        })
+pub(super) fn destination_unavailable(error: &McpOneShotError) -> bool {
+    post_rejection_code(error).is_some_and(|code| {
+        matches!(
+            code.as_str(),
+            "channel_not_found"
+                | "is_archived"
+                | "not_in_channel"
+                | "restricted_action"
+                | "restricted_action_thread_locked"
+                | "restricted_action_read_only_channel"
+                | "restricted_action_non_threadable_channel"
+                | "posting_to_general_channel_denied"
+        )
+    })
 }
 fn send_evidence(
     value: &Value,
@@ -524,23 +522,30 @@ fn classify_tool_value(value: Value) -> Result<Value, McpOneShotError> {
     Ok(value)
 }
 pub(super) fn rate_rejection_proves_unsent(error: &McpOneShotError) -> bool {
+    post_rejection_code(error)
+        .is_some_and(|code| matches!(code.as_str(), "ratelimited" | "rate_limited"))
+}
+fn post_rejection_code(error: &McpOneShotError) -> Option<String> {
     let McpOneShotError::ToolRejected(message) = error else {
-        return false;
+        return None;
     };
     let Ok(value) = serde_json::from_str::<Value>(message) else {
-        return false;
+        return None;
     };
-    value.get("ok").and_then(Value::as_bool) == Some(false)
-        && matches!(
-            value.get("error").and_then(Value::as_str),
-            Some("ratelimited" | "rate_limited")
-        )
+    (value.get("ok").and_then(Value::as_bool) == Some(false)
         // A tool can perform a post followed by a permalink lookup. A generic
         // rate error does not prove which operation was rejected.
         && value.get("method").and_then(Value::as_str) == Some("chat.postMessage")
         && ["message_link", "message_context", "ts", "message_ts"]
             .iter()
-            .all(|key| value.get(key).is_none_or(Value::is_null))
+            .all(|key| value.get(key).is_none_or(Value::is_null)))
+    .then(|| {
+        value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+    .flatten()
 }
 pub(super) fn strip_fire(text: &str) -> Option<&str> {
     let t = text.trim_start();
@@ -693,11 +698,24 @@ impl ReactionEvidence {
                 .and_then(|l| l.split_once(": × "))
                 .ok_or("Invalid reaction evidence")?;
             let (count, users) = rest.split_once(" — ").ok_or("Missing reaction users")?;
-            counts.insert(
-                name.to_string(),
-                count.parse().map_err(|_| "Invalid reaction count")?,
-            );
-            owner_fire |= name == "fire" && users.contains(&format!("({owner})"));
+            let count: u64 = count.parse().map_err(|_| "Invalid reaction count")?;
+            counts.insert(name.to_string(), count);
+            let members: Option<Vec<&str>> = users
+                .split(", ")
+                .map(|entry| {
+                    entry
+                        .rsplit_once(" (")
+                        .and_then(|(_, id)| id.strip_suffix(')'))
+                        .filter(|id| {
+                            (id.starts_with('U') || id.starts_with('W'))
+                                && id.chars().all(|c| c.is_ascii_alphanumeric())
+                        })
+                })
+                .collect();
+            owner_fire |= name == "fire"
+                && members.is_some_and(|ids| {
+                    u64::try_from(ids.len()).ok() == Some(count) && ids.contains(&owner)
+                });
         }
         if counts.is_empty() {
             return Err("Empty reaction evidence".into());
@@ -821,9 +839,66 @@ mod tests {
             "restricted_action_read_only_channel",
             "restricted_action_non_threadable_channel",
         ] {
-            assert!(destination_unavailable(&format!("Slack API error: {code}")));
+            let rejected = McpOneShotError::ToolRejected(
+                json!({"ok":false,"method":"chat.postMessage","error":code}).to_string(),
+            );
+            assert!(destination_unavailable(&rejected));
+            for error in [
+                McpOneShotError::Uncertain(json!({"error":code}).to_string()),
+                McpOneShotError::ToolRejected(json!({"ok":false,"error":code}).to_string()),
+                McpOneShotError::ToolRejected(
+                    json!({"ok":false,"method":"chat.getPermalink","error":code}).to_string(),
+                ),
+                McpOneShotError::ToolRejected(
+                    json!({"ok":false,"method":"chat.postMessage","error":code,"ts":"200.000001"})
+                        .to_string(),
+                ),
+            ] {
+                assert!(!destination_unavailable(&error));
+            }
         }
-        assert!(!destination_unavailable("transport response lost"));
+        assert!(!destination_unavailable(&McpOneShotError::Uncertain(
+            "transport response lost".into()
+        )));
+    }
+
+    #[test]
+    fn reactor_authority_uses_only_unambiguous_member_ids() {
+        for users in [
+            "Mallory (UOWNER) (UOTHER)",
+            "Mallory (UOWNER), Fake (UOTHER)",
+            "Owner (UOWNER), Other (UOTHER)",
+        ] {
+            assert!(
+                !ReactionEvidence::parse(
+                    &format!("Reactions on message:\n\n:fire: × 1 — {users}"),
+                    "UOWNER"
+                )
+                .unwrap()
+                .owner_fire
+            );
+        }
+        for users in [
+            "Owner (UOWNER), Other (UOTHER)",
+            "Other (UOTHER), Owner (UOWNER)",
+        ] {
+            assert!(
+                ReactionEvidence::parse(
+                    &format!("Reactions on message:\n\n:fire: × 2 — {users}"),
+                    "UOWNER"
+                )
+                .unwrap()
+                .owner_fire
+            );
+        }
+        assert!(
+            ReactionEvidence::parse(
+                "Reactions on message:\n\n:fire: × 1 — Enterprise (WOWNER)",
+                "WOWNER"
+            )
+            .unwrap()
+            .owner_fire
+        );
     }
     #[tokio::test]
     async fn reply_source_requires_independent_membership_in_the_claimed_root() {

@@ -862,6 +862,11 @@ async fn failed_candidate_verification_retains_page_until_retry() {
         }
     }));
     assert!(driver::discover(&state, &c, &failing).await.is_err());
+    let first_observed: i64 =
+        sqlx::query_scalar("SELECT first_observed_at_unix_micros FROM slack_gateway_observations")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
     let row =
         sqlx::query("SELECT cursor,complete FROM slack_gateway_discovery WHERE kind='reaction'")
             .fetch_one(state.db.pool())
@@ -894,6 +899,15 @@ async fn failed_candidate_verification_retains_page_until_retry() {
     assert_eq!(scan.get::<String, _>("status"), "failed");
     assert!(scan.get::<Option<i64>, _>("retry_at_us").is_none());
     assert!(scan.get::<Option<String>, _>("last_error").is_some());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT first_observed_at_unix_micros FROM slack_gateway_observations"
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap(),
+        first_observed
+    );
     let mut resumed = slack::Slack::new(state.mcp_manager.clone(), &c);
     resumed.fixture = Some(fixture);
     driver::discover(&state, &c, &resumed).await.unwrap();
@@ -905,6 +919,20 @@ async fn failed_candidate_verification_retains_page_until_retry() {
             .unwrap()
             .len(),
         1
+    );
+    let accepted = state
+        .db
+        .slack_requests(&c.workspace, &c.owner)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(accepted.source.observed_at_unix_micros, first_observed);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM slack_gateway_observations")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap(),
+        0
     );
 }
 

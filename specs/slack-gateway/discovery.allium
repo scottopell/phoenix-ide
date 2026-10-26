@@ -54,11 +54,17 @@ contract SlackDiscoveryPort {
         -- inaccessible source is ineligible, without marking its identity handled.
         -- Transient failures, partial reads, parser errors, and failed identity
         -- verification cannot produce completed PageEvidence.
+        -- Candidate first-observation time is persisted before verification,
+        -- independently of authority and handled identity. Retries and restart
+        -- preserve it until acceptance transfers it or ineligibility retires it.
+        -- Metadata older than seven days is outside source eligibility and may expire.
         -- Before candidate context/reaction reads, consult the lifecycle's
         -- recorded source identities (accepted and baseline) and own-output
         -- evidence. Recorded sources are skipped without those extra reads.
         -- The configured workspace, owner actor, exact message identity and
         -- author are verified independently of untrusted message prose.
+        -- Reaction ownership uses actual terminal member IDs in unambiguous
+        -- reactor entries, never a token embedded in a rendered display name.
         -- A source reply must also be observed under its claimed root; the
         -- search permalink alone does not establish that return destination.
         -- Eligibility uses the current and preceding three calendar dates in
@@ -96,6 +102,10 @@ contract NativeReconciliationPort {
         -- retries, so failed or throttled eyes cannot perpetually starve an answer.
         -- Startup recovery errors remain visible and are retried before external
         -- work; they do not permanently stop the gateway task.
+        -- Every serialized recovery opportunity also retires orphaned attempting
+        -- writes as uncertain after final persistence failure, without resending.
+        -- Settled continuation handoffs retire predecessor exhaustion processing;
+        -- a deleted lifecycle source cannot block reconciliation of other requests.
         -- An idle recovery opportunity performs no Slack calls or searches.
 
     @invariant WakeupsAreHints
