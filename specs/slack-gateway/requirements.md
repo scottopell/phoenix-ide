@@ -164,6 +164,8 @@ An explicit structured send rejection proving rate-limit refusal MAY establish k
 
 WHEN an accepted request cannot be fulfilled because its source or target is unavailable, THE SYSTEM SHALL preserve the request and report the concrete reason through its available native and private notification surfaces. It SHALL NOT silently resurrect a closed conversation, redirect a binding to an unrelated conversation, or discard accepted work as if it had never been requested.
 
+Deleting the last live primary transcript of a bound conversation SHALL atomically capture a terminal cancellation for unfinished admitted requests. A remaining live successor SHALL retain its work; deleting already-completed work SHALL NOT generate another terminal notice. Required notices and uncertain external attempts SHALL remain outstanding until settled before an account change.
+
 WHEN the configured Slack transport forbids replying to an external shared channel, THE SYSTEM SHALL expose that limitation and SHALL NOT claim to have replied there. A transport failure SHALL NOT be reported as a completed investigation or successful delivery.
 
 **Rationale:** Lifecycle boundaries and access failures must remain visible rather than producing misleading success or hidden replacement work.
@@ -180,7 +182,7 @@ The first private notification attempt SHALL atomically persist its exact progra
 
 Submitted-notification inspection SHALL reserve a persisted next-inspection deadline before invoking the local adapter. The initial inspection MAY occur on the next service opportunity; pending results and inspection errors SHALL defer the next inspection by at least thirty seconds after completion. The deadline SHALL survive same-version restart and remain scoped to the exact return and submission receipt. Frequent local recovery passes SHALL NOT bypass it. Terminal notification outcomes SHALL stop inspection.
 
-The pre-call reservation SHALL cover the adapter's maximum call duration plus its completion cooldown, including when the completion write fails. Ready thread replies SHALL receive their dispatch opportunity before submitted-notification inspections. A serialized reconciliation opportunity SHALL start at most one such inspection, without allowing an older pending notice to starve other due notices.
+The pre-call reservation SHALL cover the adapter's maximum call duration plus its completion cooldown, including when the completion write fails. Ready thread replies SHALL receive their dispatch opportunity before private notification commands. A serialized reconciliation opportunity SHALL start at most one private command, whether submission or inspection. Definitely-unsent private submissions SHALL defer retry by at least thirty seconds after completion, retained across restart. Deferred attempts SHALL NOT prevent other due notices from progressing.
 
 **Rationale:** A provider-neutral receipt can notify the owner without exposing private findings or coupling the gateway to a particular notification service.
 

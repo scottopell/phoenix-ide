@@ -263,5 +263,17 @@ pass within all 434 affected Rust tests. Clippy, formatting, Allium and structur
 checks pass. This refinement adds no migration; exact-head hosted CI and review
 remain required before qualification is complete.
 
+Private submissions and inspections now share one command slot per pass, after
+ready thread replies. Definitely-unsent submissions reuse the retained deadline
+for a thirty-second retry delay, allowing other due notices to progress without
+another migration. Deleting the last live primary transcript atomically captures
+cancellation for unfinished admitted work; live successors and completed outcomes
+remain intact. Required notices must still settle before account changes. All
+607 affected gateway, MCP, routing, migration and deletion tests pass, including
+deletion rollback and native continuation coverage. The full UI suite and all ten
+local check types pass; the final six Rust/model/structural checks also pass on
+the final source. Fresh exact-head hosted CI and review remain required. The
+production pilot remains unchanged.
+
 See [setup](../../docs/slack-gateway-setup.md),
 [measurements](../../docs/slack-gateway-performance.md), and the two Allium files.

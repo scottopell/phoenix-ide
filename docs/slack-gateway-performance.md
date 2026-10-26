@@ -56,9 +56,10 @@ performs one inspection across four immediate recovery passes, then one more
 after advancing the deadline; this measures logical adapter calls, not live
 provider requests. Terminal source-loss acknowledgment evidence also prevents
 repeated impossible add-reaction calls without changing the accepted task.
-Ready thread replies are dispatched before submitted-notice inspection. Each
-service pass starts at most one such inspection, ordered by the earliest retained
-deadline. A trace fixture with two older submitted notices and a newer ready
+Ready thread replies are dispatched before private notification commands. Each
+service pass starts at most one submission or inspection, ordered by the earliest
+retained deadline. Definitely-unsent submissions also defer retry for thirty
+seconds so a failed launch does not monopolize later passes. A trace fixture with two older submitted notices and a newer ready
 reply sends the reply first, inspects one notice, then inspects the other on the
 next pass. The initial reservation covers the 45-second maximum command duration
 plus thirty seconds, so a failed completion write cannot permit an early retry.

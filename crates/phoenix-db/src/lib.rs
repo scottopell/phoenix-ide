@@ -11665,6 +11665,8 @@ impl Database {
         if deleted.rows_affected() == 0 {
             return Ok(None);
         }
+        slack_gateway::record_slack_deleted_product_conn(connection, &membership, conversation_id)
+            .await?;
         retrieval::fts_delete_conversation_conn(&mut *connection, conversation_id, observer)
             .await?;
         Ok(Some(membership))

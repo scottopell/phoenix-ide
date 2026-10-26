@@ -72,6 +72,9 @@ entity Gateway {
         -- A needs-input notice does not settle an active briefing lifecycle.
         -- Changing owner/workspace requires terminal briefing evidence and its
         -- corresponding settled notice, or a settled creation/admission rejection.
+        -- Deleting the last live primary transcript atomically captures a terminal
+        -- cancellation for unfinished admitted work. A live successor keeps its
+        -- lifecycle; deleting completed work does not create a second notice.
 }
 
 -- Provisioning and continuation are owned by the native creation/lifecycle specs.
@@ -151,7 +154,7 @@ entity ReturnObligation {
     attempt_key: String?
     notification_receipt: String?
     notification_operation: NotificationOperation?
-    next_notification_inspection_at: Timestamp?
+    next_notification_call_at: Timestamp?
     delivery_proof: String when state = confirmed
     failure_reason: String when state = failed
 
@@ -314,7 +317,7 @@ rule RecordBeforeAdmissionFailure {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_inspection_at: null
+        next_notification_call_at: null
     )
 }
 
@@ -343,7 +346,7 @@ rule OweExplicitResponse {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_inspection_at: null
+        next_notification_call_at: null
     )
 }
 
@@ -367,7 +370,7 @@ rule OweBriefingNotice {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_inspection_at: null
+        next_notification_call_at: null
     )
 }
 
@@ -395,7 +398,7 @@ rule ReplaceRetiredClarification {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_inspection_at: null
+        next_notification_call_at: null
     )
     @guidance
         -- Retirement is exact native-question evidence. The replacement contains
@@ -420,6 +423,7 @@ rule BeginNotificationAttempt {
     requires: obligation.kind = private_notice
     requires: obligation.state in {pending, known_unsent}
     requires: (obligation.state = pending and obligation.notification_operation = null) or obligation.notification_operation = operation
+    requires: obligation.next_notification_call_at = null or obligation.next_notification_call_at <= now
     ensures: obligation.state = attempting
     ensures: obligation.attempt_key = attempt
     ensures: obligation.notification_operation = operation
@@ -442,7 +446,7 @@ rule RecordNotificationSubmission {
     requires: obligation.attempt_key = attempt
     ensures: obligation.state = submitted
     ensures: obligation.notification_receipt = instance
-    ensures: obligation.next_notification_inspection_at = null
+    ensures: obligation.next_notification_call_at = null
 }
 
 rule ReserveNotificationInspection {
@@ -450,8 +454,8 @@ rule ReserveNotificationInspection {
     requires: obligation.kind = private_notice
     requires: obligation.state = submitted
     requires: obligation.notification_receipt = instance
-    requires: obligation.next_notification_inspection_at = null or obligation.next_notification_inspection_at <= now
-    ensures: obligation.next_notification_inspection_at = now + 45.seconds + 30.seconds
+    requires: obligation.next_notification_call_at = null or obligation.next_notification_call_at <= now
+    ensures: obligation.next_notification_call_at = now + 45.seconds + 30.seconds
     @guidance
         -- Reserve before invoking the adapter. Retained deadlines prevent a
         -- restart or a frequent local recovery pass from starting another read.
@@ -464,7 +468,7 @@ rule DeferNotificationInspection {
     requires: obligation.kind = private_notice
     requires: obligation.state = submitted
     requires: obligation.notification_receipt = instance
-    ensures: obligation.next_notification_inspection_at = now + 30.seconds
+    ensures: obligation.next_notification_call_at = now + 30.seconds
     @guidance
         -- Pending results and read errors schedule from completion; neither
         -- reruns the agent, resubmits the notice, nor confirms delivery.
@@ -477,7 +481,7 @@ rule ConfirmNotificationDelivery {
     requires: obligation.notification_receipt = instance
     ensures: obligation.state = confirmed
     ensures: obligation.delivery_proof = delivery_proof
-    ensures: obligation.next_notification_inspection_at = null
+    ensures: obligation.next_notification_call_at = null
 }
 
 rule RecordKnownUnsent {
@@ -485,6 +489,7 @@ rule RecordKnownUnsent {
     requires: obligation.state = attempting
     requires: obligation.attempt_key = attempt
     ensures: obligation.state = known_unsent
+    ensures: obligation.next_notification_call_at = if obligation.kind = private_notice: now + 30.seconds else: null
 }
 
 rule RecordUncertainReturn {
@@ -532,7 +537,7 @@ rule ReportUnavailableThread {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_inspection_at: null
+        next_notification_call_at: null
     )
     @guidance
         -- The current message-post attempt has structured rejection evidence

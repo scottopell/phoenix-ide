@@ -411,30 +411,25 @@ async fn dispatch_returns(
         .await
         .map_err(err)?;
     outputs.sort_by_key(|output| {
-        let priority = if output.destination == "thread" {
-            0
-        } else if output.state == phoenix_db::SlackReturnState::Submitted {
-            2
-        } else {
-            1
-        };
+        let priority = u8::from(output.destination != "thread");
         (
             priority,
-            if priority == 2 {
+            if priority == 1 {
                 output.notification_inspect_after_us
             } else {
                 None
             },
         )
     });
-    let mut inspected_private = false;
+    let mut called_private = false;
     for output in outputs {
+        if output.destination == "private" && called_private {
+            continue;
+        }
         if output.state == phoenix_db::SlackReturnState::Submitted
             && output.destination == "private"
         {
-            if !inspected_private {
-                inspected_private = reconcile_notification_submission(state, &output).await?;
-            }
+            called_private = reconcile_notification_submission(state, &output).await?;
             continue;
         }
         if !matches!(output.state.as_str(), "pending" | "known_unsent") {
@@ -500,6 +495,7 @@ async fn dispatch_returns(
                 }
             }
             ReturnAttempt::Notification(operation) => {
+                called_private = true;
                 match super::notification::notify(&output, &operation).await {
                     Ok(super::notification::Submission::Submitted { receipt }) => state
                         .db
@@ -807,6 +803,121 @@ mod tests {
         ProviderStreamTelemetry, Usage,
     };
     use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One outbox trace covers the shared slot and progress past a failed frozen command.
+    async fn private_submissions_share_one_slot_and_unsent_retries_do_not_starve_new_notices() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("submissions");
+        let c = Config {
+            enabled: false,
+            mcp_server: "fixture".into(),
+            owner: "UFIXTURE".into(),
+            workspace: "fixture.slack.com".into(),
+            timezone: "UTC".into(),
+            phoenix_url: "https://phoenix.example".into(),
+            notification_command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "cat >/dev/null; printf 'submit\\n' >> '{}'; exit 1",
+                    trace.display()
+                ),
+            ]),
+        };
+        for n in 0..3 {
+            let source = phoenix_db::SlackSource {
+                workspace: c.workspace.clone(),
+                owner: c.owner.clone(),
+                channel: "CFIXTURE".into(),
+                message_ts: format!("100.{n:06}"),
+                thread_ts: "100.000000".into(),
+                source_url: "https://fixture.slack.com/source".into(),
+                instruction: String::new(),
+                context: "quoted".into(),
+                observed_at_unix_micros: 1,
+                kind: SlackRequestKind::Briefing,
+                trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
+            };
+            state.db.accept_slack_source(&source, false).await.unwrap();
+            let request = state
+                .db
+                .slack_requests(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.source.message_ts == source.message_ts)
+                .unwrap();
+            state
+                .db
+                .fail_slack_before_admission(&request.request_id, "fixture", &c.phoenix_url)
+                .await
+                .unwrap();
+            if n == 0 {
+                let output = state
+                    .db
+                    .slack_returns(&c.workspace, &c.owner)
+                    .await
+                    .unwrap()
+                    .remove(0);
+                state
+                    .db
+                    .slack_begin_notification_return(
+                        &output.return_id,
+                        "fixture",
+                        &[directory.path().join("missing").to_str().unwrap().into()],
+                        "https://phoenix.example/frozen",
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                state
+                    .db
+                    .slack_finish_return(
+                        &output.return_id,
+                        "fixture",
+                        phoenix_db::SlackReturnState::KnownUnsent,
+                        None,
+                        None,
+                        Some("not launched"),
+                    )
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE slack_gateway_returns SET notification_inspect_after_us=0 WHERE return_id=?1").bind(&output.return_id).execute(state.db.pool()).await.unwrap();
+            }
+        }
+        let slack = Slack::new(state.mcp_manager.clone(), &c);
+        for expected in 1..=2 {
+            dispatch_returns(&state, &c, &slack, false).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&trace).unwrap().lines().count(),
+                expected
+            );
+        }
+        // The oldest definitely-unsent notice is due after the two fresh notices.
+        dispatch_returns(&state, &c, &slack, false).await.unwrap();
+        let outputs = state
+            .db
+            .slack_returns(&c.workspace, &c.owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|r| r.state == phoenix_db::SlackReturnState::Uncertain)
+                .count(),
+            2
+        );
+        let unsent = outputs
+            .iter()
+            .find(|r| r.state == phoenix_db::SlackReturnState::KnownUnsent)
+            .unwrap();
+        assert!(
+            unsent.notification_inspect_after_us.unwrap() > chrono::Utc::now().timestamp_micros()
+        );
+        dispatch_returns(&state, &c, &slack, false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&trace).unwrap().lines().count(), 2);
+    }
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // One trace proves reply priority, the inspection cap, and progress across retained notices.
     async fn ready_thread_reply_precedes_one_fair_submitted_notice_inspection_per_pass() {
@@ -1122,6 +1233,9 @@ mod tests {
                 .unwrap();
                 std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
                     .unwrap();
+                dispatch_returns(&state, &c, &slack, false).await.unwrap();
+                assert!(!payload.exists());
+                sqlx::query("UPDATE slack_gateway_returns SET notification_inspect_after_us=0 WHERE return_id='rejected'").execute(state.db.pool()).await.unwrap();
                 dispatch_returns(&state, &c, &slack, false).await.unwrap();
                 let captured: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&payload).unwrap()).unwrap();
