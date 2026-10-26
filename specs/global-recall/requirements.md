@@ -270,10 +270,12 @@ WHEN the Coordinator dispatches a model request
 THE SYSTEM SHALL NOT automatically inject current activity facts into its system instructions or conversation context
 
 WHEN the user requests a check-in through the composer action
-THE SYSTEM SHALL submit a normal message requesting fresh whole-stack facts, including idle commissioned work, and bounded routine coordination through established owners within verified standing scope and approvals
-AND SHALL request supporting history where needed, advancement of independent authorized work before asking a genuine user decision, and respect for later corrections, pauses and gates
+THE SYSTEM SHALL submit a normal message requesting a broad fresh check of commissioned work and selective intervention through established owners within verified standing scope and approvals
+AND SHALL direct the Coordinator to leave healthy progressing work alone, avoid redundant nudges, replanning or assignments merely to demonstrate activity, and not infer that an idle owner is stalled
+AND SHALL direct the Coordinator to recover unanswered user decisions from history and verify that each remains unresolved and material before prioritizing user input, while advancing independent authorized work first
+AND SHALL preserve prior decisions, corrections, pauses and gates; a repeated check-in SHALL NOT itself expand authority or reset them
 AND SHALL distinguish requested action and message acceptance from verified completion without requiring an announcement for every routine delivery
-AND SHALL request a plain-English account of the problem, intervention and direction for each relevant workstream, with grouped links and useful grounded status or rough progress where appropriate
+AND SHALL lead the check-in briefing with still-needed user input, presenting genuine choices through `ask_user_question` with context and a recommendation, then explain material changes as problem, intervention and delivery direction in plain English, with useful links and grounded status where appropriate, without requiring a fixed report template or announcements for factual watch events
 AND SHALL include process or evidence limits when material to understanding or a decision, without indefinite polling or waiting for all owners to finish
 
 ---
