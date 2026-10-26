@@ -41,6 +41,12 @@ pub(super) struct VerifiedSource {
     pub body: String,
     pub reaction_read_verified: bool,
 }
+#[derive(Debug)]
+pub(super) enum Acknowledgment {
+    Confirmed,
+    Unavailable(String),
+}
+
 enum SourceRead {
     Thread,
     Reactions,
@@ -415,7 +421,7 @@ impl Slack {
         ReactionEvidence::parse(field(&value, "result")?, &c.owner)?;
         Ok(true)
     }
-    pub async fn eyes(&self, channel: &str, ts: &str) -> Result<(), String> {
+    pub async fn eyes(&self, channel: &str, ts: &str) -> Result<Acknowledgment, String> {
         match self
             .call_classified(
                 "slack_add_reaction",
@@ -423,15 +429,28 @@ impl Slack {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(Acknowledgment::Confirmed),
             Err(error)
                 if operation_rejection(&error, "reactions.add").is_some_and(|value| {
                     value.get("error").and_then(Value::as_str) == Some("already_reacted")
                 }) =>
             {
-                Ok(())
+                Ok(Acknowledgment::Confirmed)
             }
-            Err(error) => Err(error.message().to_owned()),
+            Err(error) => {
+                if let Some(value) = operation_rejection(&error, "reactions.add") {
+                    if let Some(
+                        code @ ("message_not_found" | "channel_not_found" | "not_in_channel"
+                        | "access_denied"),
+                    ) = value.get("error").and_then(Value::as_str)
+                    {
+                        return Ok(Acknowledgment::Unavailable(format!(
+                            "Slack acknowledgment unavailable: {code}"
+                        )));
+                    }
+                }
+                Err(error.message().to_owned())
+            }
         }
     }
     pub async fn send(
@@ -1037,6 +1056,37 @@ mod tests {
             "UOWNER"
         )
         .is_err());
+    }
+    #[tokio::test]
+    async fn acknowledgment_source_loss_requires_qualified_add_reaction_rejection() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        for code in [
+            "message_not_found",
+            "channel_not_found",
+            "not_in_channel",
+            "access_denied",
+        ] {
+            for proof in ["qualified", "opaque", "wrong_method", "transport"] {
+                let mut slack = Slack::new(state.mcp_manager.clone(), &config());
+                slack.fixture = Some(Arc::new(move |tool, _| {
+                    assert_eq!(tool, "slack_add_reaction");
+                    if proof == "transport" {
+                        return Err(code.into());
+                    }
+                    Ok(match proof {
+                        "qualified" => json!({"ok":false,"method":"reactions.add","error":code}),
+                        "wrong_method" => json!({"ok":false,"method":"reactions.get","error":code}),
+                        _ => json!({"error":code}),
+                    })
+                }));
+                let result = slack.eyes("C123", "100.000001").await;
+                if proof == "qualified" {
+                    assert!(matches!(result, Ok(Acknowledgment::Unavailable(_))));
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
     }
     #[tokio::test]
     async fn owner_prefix_is_independent_of_reaction_access_but_footer_is_not() {

@@ -15,7 +15,7 @@ use "../conversation_atom/conversation_atom.allium" as native
 
 enum RequestKind { briefing | explicit_request }
 enum RequestState { accepted | admitted | rejected }
-enum AcknowledgmentState { pending | confirmed }
+enum AcknowledgmentState { pending | confirmed | unavailable }
 enum ReturnKind { thread_reply | private_notice }
 enum ReturnState { pending | attempting | submitted | confirmed | known_unsent | uncertain | failed }
 enum BindingState { reserved | ready | failed | closed }
@@ -105,6 +105,7 @@ entity AcceptedRequest {
     instruction_snapshot: String
     status: RequestState
     acknowledgment: AcknowledgmentState
+    acknowledgment_failure: String?
     admission: NativeAdmission when status = admitted
     rejection_reason: String when status = rejected
     duty: ResponseDuty with request = this
@@ -150,6 +151,7 @@ entity ReturnObligation {
     attempt_key: String?
     notification_receipt: String?
     notification_operation: NotificationOperation?
+    next_notification_inspection_at: Timestamp?
     delivery_proof: String when state = confirmed
     failure_reason: String when state = failed
 
@@ -212,6 +214,7 @@ rule AcceptVerifiedSource {
         instruction_snapshot: observation.instruction,
         status: accepted,
         acknowledgment: pending
+        acknowledgment_failure: null
     )
     ensures: ResponseDuty.created(
         request: AcceptedRequest{gateway: gateway, observation: observation},
@@ -228,6 +231,17 @@ rule EyesConfirmed {
         -- Confirmation requires successful add-reaction evidence or a structured
         -- reactions.add rejection proving the acknowledgment already exists.
         -- An opaque already_reacted token does not confirm the operation.
+}
+
+rule EyesUnavailable {
+    when: AcknowledgmentSourceUnavailable(request, reason)
+    requires: request.acknowledgment = pending
+    ensures: request.acknowledgment = unavailable
+    ensures: request.acknowledgment_failure = reason
+    @guidance
+        -- Requires structured rejection of reactions.add proving source loss.
+        -- Opaque, unrelated and transient errors retain pending acknowledgment.
+        -- This settles only acknowledgment, never execution or response duties.
 }
 
 -- REQ-SG-007/011. The existing native service owns creation and admission.
@@ -300,6 +314,7 @@ rule RecordBeforeAdmissionFailure {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
+        next_notification_inspection_at: null
     )
 }
 
@@ -328,6 +343,7 @@ rule OweExplicitResponse {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
+        next_notification_inspection_at: null
     )
 }
 
@@ -351,6 +367,7 @@ rule OweBriefingNotice {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
+        next_notification_inspection_at: null
     )
 }
 
@@ -378,6 +395,7 @@ rule ReplaceRetiredClarification {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
+        next_notification_inspection_at: null
     )
     @guidance
         -- Retirement is exact native-question evidence. The replacement contains
@@ -424,6 +442,30 @@ rule RecordNotificationSubmission {
     requires: obligation.attempt_key = attempt
     ensures: obligation.state = submitted
     ensures: obligation.notification_receipt = instance
+    ensures: obligation.next_notification_inspection_at = null
+}
+
+rule ReserveNotificationInspection {
+    when: InspectSubmittedNotification(obligation, instance)
+    requires: obligation.kind = private_notice
+    requires: obligation.state = submitted
+    requires: obligation.notification_receipt = instance
+    requires: obligation.next_notification_inspection_at = null or obligation.next_notification_inspection_at <= now
+    ensures: obligation.next_notification_inspection_at = now + 30.seconds
+    @guidance
+        -- Reserve before invoking the adapter. Retained deadlines prevent a
+        -- restart or a frequent local recovery pass from starting another read.
+}
+
+rule DeferNotificationInspection {
+    when: NotificationInspectionPendingOrReadFailed(obligation, instance)
+    requires: obligation.kind = private_notice
+    requires: obligation.state = submitted
+    requires: obligation.notification_receipt = instance
+    ensures: obligation.next_notification_inspection_at = now + 30.seconds
+    @guidance
+        -- Pending results and read errors schedule from completion; neither
+        -- reruns the agent, resubmits the notice, nor confirms delivery.
 }
 
 rule ConfirmNotificationDelivery {
@@ -433,6 +475,7 @@ rule ConfirmNotificationDelivery {
     requires: obligation.notification_receipt = instance
     ensures: obligation.state = confirmed
     ensures: obligation.delivery_proof = delivery_proof
+    ensures: obligation.next_notification_inspection_at = null
 }
 
 rule RecordKnownUnsent {
@@ -487,6 +530,7 @@ rule ReportUnavailableThread {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
+        next_notification_inspection_at: null
     )
     @guidance
         -- The current message-post attempt has structured rejection evidence

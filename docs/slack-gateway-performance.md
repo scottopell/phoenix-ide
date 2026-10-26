@@ -47,6 +47,16 @@ again after a duplicate-check poll. This sample does not establish a latency
 distribution or a matched before/after comparison. Personal source identifiers
 and operational records are retained outside the public repository.
 
+## Notification inspection and acknowledgments
+
+Private notification inspections use a separate persisted thirty-second minimum
+interval after pending results or read errors. Frequent local recovery passes
+do not start another adapter command before that deadline. The local fixture
+performs one inspection across four immediate recovery passes, then one more
+after advancing the deadline; this measures logical adapter calls, not live
+provider requests. Terminal source-loss acknowledgment evidence also prevents
+repeated impossible add-reaction calls without changing the accepted task.
+
 ## Newest-prefix refresh
 
 The additional head probe reads one newest prefix page only when a retained

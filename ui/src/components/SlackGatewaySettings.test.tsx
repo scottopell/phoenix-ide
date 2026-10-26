@@ -80,3 +80,17 @@ it('edits the full notification command without losing arguments when replacing 
   await screen.findByText('Settings saved.');
   expect(submitted?.notification_command).toEqual(['/opt/bin/uv', 'run', '/opt/notifier/notify.py', '--label', 'private notice with spaces\nand a newline']);
 });
+
+it('keeps acknowledgment failure separate from native work and shows deferred delivery checks', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config: null,
+    requests: [{ request_id: 'request', product_id: null, conversation_available: false, admitted: true, accepted_at_us: 2, eyes_confirmed: false, eyes_failure: 'Slack acknowledgment unavailable: message_not_found', failure: null,
+      source: { source_url: 'https://example.slack.com/source', kind: 'briefing', trigger_kind: 'reaction', observed_at_unix_micros: 1, message_ts: '1.000001' } }],
+    returns: [{ return_id: 'notice', state: 'submitted', destination: 'private', request_ids: ['request'], failure: null, notification_receipt: 'receipt', notification_inspect_after_us: 30000000 }],
+  }) }));
+  render(<SlackGatewaySettings standalone />);
+  await screen.findByText('Slack acknowledgment unavailable: message_not_found');
+  expect(screen.getByText('Admitted')).toBeTruthy();
+  expect(screen.getByText(/👀 unavailable/)).toBeTruthy();
+  expect(screen.getByText(/Next delivery check after/)).toBeTruthy();
+  expect(screen.queryByText('Failed')).toBeNull();
+});

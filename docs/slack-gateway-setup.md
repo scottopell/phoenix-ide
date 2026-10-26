@@ -45,6 +45,9 @@ ready before using triggers; gestures observed during initialization can be
 absorbed by the baseline. Searches cover today and the previous three calendar
 dates in your timezone. Leave fire attached until eyes appears. Removing fire
 after acceptance does not cancel native work.
+If the source disappears before eyes can be added, Phoenix records the
+acknowledgment as unavailable in Activity and stops retrying that reaction.
+The accepted task and its response still continue independently.
 Set the timezone before initialization; once its first sweep has started,
 changing the timezone requires that initialization finish first.
 
@@ -114,6 +117,10 @@ Inspection returns the same version, notification ID, owner and receipt. State
 is `submitted`, `delivered` with nonempty `proof`, or `failed` with a sanitized
 `reason`. The adapter must verify its actual recipient and exact delivery
 operation before returning proof; a service accepting a request is insufficient.
+The initial delivery check can run on the next recovery pass. Pending results
+and inspection errors defer another check for at least thirty seconds after
+completion, with that deadline retained across restart. Activity shows the
+earliest next check; terminal outcomes stop inspection.
 It must not echo credentials, private findings, raw provider headers or request
 bodies. The process timeout is 45 seconds and output is capped at 64 KiB.
 

@@ -72,7 +72,7 @@ A briefing's confirmed needs-input notice SHALL NOT establish terminal lifecycle
 
 WHEN request acceptance is durable, THE SYSTEM SHALL attempt to add `:eyes:` to the triggering source message. THE SYSTEM SHALL NOT add it before acceptance is durable or use it to claim that work is running, complete, or delivered.
 
-WHEN adding eyes fails, THE SYSTEM SHALL retain the accepted request and retry the acknowledgment independently of execution. Removing fire after acceptance SHALL NOT cancel the request. Gateway progress SHALL NOT add completion, waiting, or failure reactions.
+WHEN adding eyes fails ambiguously or transiently, THE SYSTEM SHALL retain the accepted request and retry the acknowledgment independently of execution. A structured add-reaction rejection establishing source deletion or inaccessibility SHALL instead persist a visible terminal acknowledgment failure and stop those retries. This settles only the acknowledgment for account-switch checks; native work and return obligations SHALL remain intact. Removing fire after acceptance SHALL NOT cancel the request. Gateway progress SHALL NOT add completion, waiting, or failure reactions.
 
 An already-present acknowledgment SHALL require structured rejection evidence identifying the add-reaction operation. An unqualified error token SHALL NOT confirm the acknowledgment.
 
@@ -177,6 +177,8 @@ Each captured briefing occurrence SHALL retain its own notification obligation; 
 THE SYSTEM SHALL pass notification content through a versioned input protocol rather than interpolate it into command arguments. Provider authentication SHALL remain the local command's responsibility; supplied credentials SHALL NOT be persisted in gateway settings. Before submission, the command and destination identity SHALL be frozen with the attempt. Later inspection SHALL use that frozen command and verify the exact notification, owner, and submission receipt. The system SHALL distinguish submission from confirmed delivery and SHALL NOT claim that confirmation proves a desktop or mobile notification was displayed. Missing configuration, authentication failure, throttling, and uncertain notification outcomes SHALL remain visible in Phoenix without rerunning the agent.
 
 The first private notification attempt SHALL atomically persist its exact program, arguments and Phoenix target URL before launch. Known-unsent retries and same-version restart SHALL reuse that operation despite later settings or publication changes, including removal of the current command. Historical definitely-unsent notices lacking their original URL SHALL fail visibly rather than reconstruct a destination from current settings; existing submitted receipts SHALL remain inspectable with their retained command.
+
+Submitted-notification inspection SHALL reserve a persisted next-inspection deadline before invoking the local adapter. The initial inspection MAY occur on the next service opportunity; pending results and inspection errors SHALL defer the next inspection by at least thirty seconds after completion. The deadline SHALL survive same-version restart and remain scoped to the exact return and submission receipt. Frequent local recovery passes SHALL NOT bypass it. Terminal notification outcomes SHALL stop inspection.
 
 **Rationale:** A provider-neutral receipt can notify the owner without exposing private findings or coupling the gateway to a particular notification service.
 

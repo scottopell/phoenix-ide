@@ -106,7 +106,9 @@ async fn reconciliation_work(state: &AppState, c: &Config) -> Result<Option<bool
         .slack_returns(&c.workspace, &c.owner)
         .await
         .map_err(err)?;
-    let needs_slack = requests.iter().any(|r| !r.eyes_confirmed)
+    let needs_slack = requests
+        .iter()
+        .any(|r| !r.eyes_confirmed && r.eyes_failure.is_none())
         || outputs.iter().any(|r| {
             r.destination == "thread"
                 && matches!(
@@ -115,18 +117,16 @@ async fn reconciliation_work(state: &AppState, c: &Config) -> Result<Option<bool
                         | phoenix_db::SlackReturnState::KnownUnsent
                 )
         });
-    if requests
-        .iter()
-        .all(|r| (r.admitted || r.failure.is_some()) && r.eyes_confirmed)
-        && outputs.iter().all(|r| {
-            !matches!(
-                r.state,
-                phoenix_db::SlackReturnState::Pending
-                    | phoenix_db::SlackReturnState::KnownUnsent
-                    | phoenix_db::SlackReturnState::Submitted
-            )
-        })
-    {
+    if requests.iter().all(|r| {
+        (r.admitted || r.failure.is_some()) && (r.eyes_confirmed || r.eyes_failure.is_some())
+    }) && outputs.iter().all(|r| {
+        !matches!(
+            r.state,
+            phoenix_db::SlackReturnState::Pending
+                | phoenix_db::SlackReturnState::KnownUnsent
+                | phoenix_db::SlackReturnState::Submitted
+        )
+    }) {
         return Ok(None);
     }
     Ok(Some(needs_slack))
@@ -369,14 +369,23 @@ async fn reconcile_work(
     // before an already-ready answer gets its delivery opportunity.
     dispatch_returns(state, c, slack, identity_verified).await?;
     for request in &requests {
-        if identity_verified && slack.can_call() && !request.eyes_confirmed {
+        if identity_verified
+            && slack.can_call()
+            && !request.eyes_confirmed
+            && request.eyes_failure.is_none()
+        {
             match slack
                 .eyes(&request.source.channel, &request.source.message_ts)
                 .await
             {
-                Ok(()) => state
+                Ok(super::slack::Acknowledgment::Confirmed) => state
                     .db
                     .slack_eyes_confirmed(&request.request_id)
+                    .await
+                    .map_err(err)?,
+                Ok(super::slack::Acknowledgment::Unavailable(reason)) => state
+                    .db
+                    .slack_eyes_unavailable(&request.request_id, &reason)
                     .await
                     .map_err(err)?,
                 Err(error) => {
@@ -524,6 +533,18 @@ async fn reconcile_notification_submission(
     output: &phoenix_db::SlackReturn,
 ) -> Result<(), String> {
     if let Some(instance) = &output.notification_receipt {
+        if !state
+            .db
+            .slack_begin_notification_inspection(
+                &output.return_id,
+                instance,
+                chrono::Utc::now().timestamp_micros(),
+            )
+            .await
+            .map_err(err)?
+        {
+            return Ok(());
+        }
         let observed = super::notification::observe(output)
             .await
             .unwrap_or_else(
@@ -764,6 +785,115 @@ mod tests {
         ProviderStreamTelemetry, Usage,
     };
     use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Compare pending and failed adapter reads through the same durable recovery sequence.
+    async fn pending_and_failed_notification_inspections_wait_for_the_persisted_deadline() {
+        for fails in [false, true] {
+            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let directory = tempfile::tempdir().unwrap();
+            let counter = directory.path().join("inspections");
+            let c = Config {
+                enabled: false,
+                mcp_server: "fixture".into(),
+                owner: "UFIXTURE".into(),
+                workspace: "fixture.slack.com".into(),
+                timezone: "UTC".into(),
+                phoenix_url: "https://phoenix.example".into(),
+                notification_command: None,
+            };
+            let source = phoenix_db::SlackSource {
+                workspace: c.workspace.clone(),
+                owner: c.owner.clone(),
+                channel: "CFIXTURE".into(),
+                message_ts: "100.000001".into(),
+                thread_ts: "100.000001".into(),
+                source_url: "https://fixture.slack.com/source".into(),
+                instruction: String::new(),
+                context: "quoted".into(),
+                observed_at_unix_micros: 1,
+                kind: SlackRequestKind::Briefing,
+                trigger_kind: phoenix_db::SlackTriggerKind::Reaction,
+            };
+            state.db.accept_slack_source(&source, false).await.unwrap();
+            let request = state
+                .db
+                .slack_requests(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            state
+                .db
+                .fail_slack_before_admission(&request.request_id, "fixture", &c.phoenix_url)
+                .await
+                .unwrap();
+            let output = state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            let response = serde_json::json!({"version":1,"notification_id":output.return_id,"owner":c.owner,"receipt":"receipt","state":"submitted"}).to_string();
+            let command = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "cat >/dev/null; printf 'inspection\\n' >> '{}'; printf '%s' '{response}'; {}",
+                    counter.display(),
+                    if fails { "exit 1" } else { "exit 0" }
+                ),
+            ];
+            state
+                .db
+                .slack_begin_notification_return(
+                    &output.return_id,
+                    "attempt",
+                    &command,
+                    "https://phoenix.example/frozen",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .db
+                .slack_finish_return(
+                    &output.return_id,
+                    "attempt",
+                    phoenix_db::SlackReturnState::Submitted,
+                    None,
+                    Some("receipt"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let slack = Slack::new(state.mcp_manager.clone(), &c);
+            for _ in 0..4 {
+                dispatch_returns(&state, &c, &slack, false).await.unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(&counter).unwrap().lines().count(),
+                1
+            );
+            let retained = state
+                .db
+                .slack_returns(&c.workspace, &c.owner)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(retained.state, phoenix_db::SlackReturnState::Submitted);
+            assert_eq!(retained.failure.is_some(), fails);
+            assert!(
+                retained.notification_inspect_after_us.unwrap()
+                    > chrono::Utc::now().timestamp_micros()
+            );
+            sqlx::query("UPDATE slack_gateway_returns SET notification_inspect_after_us=0 WHERE return_id=?1").bind(&output.return_id).execute(state.db.pool()).await.unwrap();
+            dispatch_returns(&state, &c, &slack, false).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&counter).unwrap().lines().count(),
+                2
+            );
+            assert_eq!(slack.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // Compare the two command-dispatch boundaries using the same outbox fixture.
     async fn notifier_rejection_is_terminal_but_unlaunched_commands_resume_after_repair() {

@@ -5,6 +5,8 @@ use crate::product_conversation_read::ORDINARY_PRODUCT_ROUTE_PREDICATE;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+const NOTIFICATION_INSPECTION_INTERVAL_US: i64 = 30_000_000;
+
 const RETIRED_QUESTION_HANDOFF: &str = "Phoenix: this clarification is no longer current. Open Phoenix for details; further discussion there stays private.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +82,7 @@ pub struct SlackRequest {
     pub admitted: bool,
     pub accepted_at_us: i64,
     pub eyes_confirmed: bool,
+    pub eyes_failure: Option<String>,
     pub failure: Option<String>,
     pub question_id: Option<String>,
     pub question_transcript: Option<String>,
@@ -137,6 +140,7 @@ pub struct SlackReturn {
     pub notification_receipt: Option<String>,
     pub notification_command: Option<Vec<String>>,
     pub notification_url: Option<String>,
+    pub notification_inspect_after_us: Option<i64>,
     pub failure: Option<String>,
     pub product_id: Option<String>,
 }
@@ -167,6 +171,7 @@ fn request_row(r: &sqlx::sqlite::SqliteRow) -> Result<SlackRequest, sqlx::Error>
         admitted: r.try_get::<String, _>("admission_state")? == "admitted",
         accepted_at_us: r.try_get("accepted_at_unix_micros")?,
         eyes_confirmed: r.try_get("eyes_confirmed")?,
+        eyes_failure: r.try_get("eyes_failure")?,
         failure: r.try_get("failure")?,
         question_id: r.try_get("question_id")?,
         question_transcript: r.try_get("question_transcript")?,
@@ -222,7 +227,7 @@ impl Database {
             }
         }
         let outstanding: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND (r.eyes_confirmed=0 OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.state IN ('confirmed','failed')) OR (r.kind='briefing' AND r.admission_state<>'rejected' AND NOT EXISTS(SELECT 1 FROM slack_gateway_native_outcomes e JOIN slack_gateway_return_coverage c ON c.request_id=e.request_id JOIN slack_gateway_returns o USING(return_id) WHERE e.request_id=r.request_id AND e.kind IN ('Completed','Cancelled','Failed') AND e.processed=1 AND o.occurrence_key=e.occurrence_key AND o.state IN ('confirmed','failed'))))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
+            "SELECT EXISTS(SELECT 1 FROM slack_gateway_requests r WHERE r.kind<>'baseline' AND (r.workspace<>?1 OR r.owner<>?2) AND ((r.eyes_confirmed=0 AND r.eyes_failure IS NULL) OR NOT EXISTS(SELECT 1 FROM slack_gateway_return_coverage c JOIN slack_gateway_returns o USING(return_id) WHERE c.request_id=r.request_id AND o.state IN ('confirmed','failed')) OR (r.kind='briefing' AND r.admission_state<>'rejected' AND NOT EXISTS(SELECT 1 FROM slack_gateway_native_outcomes e JOIN slack_gateway_return_coverage c ON c.request_id=e.request_id JOIN slack_gateway_returns o USING(return_id) WHERE e.request_id=r.request_id AND e.kind IN ('Completed','Cancelled','Failed') AND e.processed=1 AND o.occurrence_key=e.occurrence_key AND o.state IN ('confirmed','failed'))))) OR EXISTS(SELECT 1 FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE (b.workspace<>?1 OR b.owner<>?2) AND o.state NOT IN ('confirmed','failed'))"
         ).bind(workspace).bind(owner).fetch_one(&mut *tx).await?;
         if outstanding {
             return Err(DbError::Serialization("Cannot change the Slack account while accepted work or return delivery is outstanding; finish that work using its original account first".into()));
@@ -363,10 +368,14 @@ impl Database {
         Ok(())
     }
     pub async fn slack_eyes_confirmed(&self, request: &str) -> DbResult<()> {
-        sqlx::query("UPDATE slack_gateway_requests SET eyes_confirmed=1 WHERE request_id=?1")
+        sqlx::query("UPDATE slack_gateway_requests SET eyes_confirmed=1 WHERE request_id=?1 AND eyes_failure IS NULL")
             .bind(request)
             .execute(self.pool())
             .await?;
+        Ok(())
+    }
+    pub async fn slack_eyes_unavailable(&self, request: &str, reason: &str) -> DbResult<()> {
+        sqlx::query("UPDATE slack_gateway_requests SET eyes_failure=?2 WHERE request_id=?1 AND eyes_confirmed=0 AND eyes_failure IS NULL").bind(request).bind(reason).execute(self.pool()).await?;
         Ok(())
     }
     /// One return per native occurrence; coverage is checked and persisted atomically.
@@ -478,7 +487,7 @@ impl Database {
     }
     pub async fn slack_returns(&self, workspace: &str, owner: &str) -> DbResult<Vec<SlackReturn>> {
         Ok(sqlx::query(sqlx::AssertSqlSafe(format!("SELECT o.*,b.workspace,b.owner,b.channel,b.thread_ts,b.product_id, EXISTS(SELECT 1 FROM product_creation_jobs j WHERE j.request_id=b.creation_id AND j.status='published' AND EXISTS(SELECT 1 FROM product_conversations p JOIN conversations c ON c.product_conversation_id=p.id WHERE p.id=b.product_id AND {ORDINARY_PRODUCT_ROUTE_PREDICATE})) AS published, (SELECT json_group_array(request_id) FROM slack_gateway_return_coverage c WHERE c.return_id=o.return_id) AS request_ids FROM slack_gateway_returns o JOIN slack_gateway_bindings b USING(binding_id) WHERE b.workspace=?1 AND b.owner=?2 ORDER BY o.created_at_unix_micros")))
-            .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_url:r.try_get("notification_url")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
+            .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,notification_url:r.try_get("notification_url")?,notification_inspect_after_us:r.try_get("notification_inspect_after_us")?,notification_command:r.try_get::<Option<String>,_>("notification_command")?.map(|s|serde_json::from_str(&s).map_err(|e|sqlx::Error::Decode(e.into()))).transpose()?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
     }
     pub async fn slack_begin_return(&self, id: &str, attempt: &str) -> DbResult<bool> {
         Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2 WHERE return_id=?1 AND destination='thread' AND state IN ('pending','known_unsent') AND (response_kind<>'clarification' OR NOT EXISTS(SELECT 1 FROM slack_gateway_questions q WHERE q.return_id=?1 AND (q.retired_reason IS NOT NULL OR NOT EXISTS(SELECT 1 FROM conversations c WHERE c.id=q.transcript_id))))").bind(id).bind(attempt).execute(self.pool()).await?.rows_affected()==1)
@@ -503,6 +512,15 @@ impl Database {
         })
         .transpose()
     }
+    pub async fn slack_begin_notification_inspection(
+        &self,
+        id: &str,
+        receipt: &str,
+        now_us: i64,
+    ) -> DbResult<bool> {
+        Ok(sqlx::query("UPDATE slack_gateway_returns SET notification_inspect_after_us=?4 WHERE return_id=?1 AND notification_receipt=?2 AND destination='private' AND state='submitted' AND (notification_inspect_after_us IS NULL OR notification_inspect_after_us<=?3)")
+            .bind(id).bind(receipt).bind(now_us).bind(now_us.saturating_add(NOTIFICATION_INSPECTION_INTERVAL_US)).execute(self.pool()).await?.rows_affected()==1)
+    }
     pub async fn slack_observe_notification_return(
         &self,
         id: &str,
@@ -517,8 +535,13 @@ impl Database {
                 ("submitted", None, Some(reason))
             }
         };
-        sqlx::query("UPDATE slack_gateway_returns SET state=?3,delivery_proof=?4,failure=?5 WHERE return_id=?1 AND notification_receipt=?2 AND destination='private' AND state='submitted'")
-            .bind(id).bind(instance).bind(state).bind(proof).bind(error).execute(self.pool()).await?;
+        let next = (state == "submitted").then(|| {
+            chrono::Utc::now()
+                .timestamp_micros()
+                .saturating_add(NOTIFICATION_INSPECTION_INTERVAL_US)
+        });
+        sqlx::query("UPDATE slack_gateway_returns SET state=?3,delivery_proof=?4,failure=?5,notification_inspect_after_us=?6 WHERE return_id=?1 AND notification_receipt=?2 AND destination='private' AND state='submitted'")
+            .bind(id).bind(instance).bind(state).bind(proof).bind(error).bind(next).execute(self.pool()).await?;
         Ok(())
     }
     pub async fn slack_finish_return(
@@ -1018,6 +1041,51 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn unavailable_acknowledgment_is_terminal_without_discarding_work() {
+        let db = Database::open_in_memory().await.unwrap();
+        let source = source("100.000", SlackRequestKind::Briefing);
+        let original =
+            serde_json::json!({"workspace":source.workspace,"owner":source.owner,"enabled":true})
+                .to_string();
+        db.set_slack_configuration(&original).await.unwrap();
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "fixture refusal",
+            "https://phoenix.example",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE slack_gateway_returns SET state='failed',failure='fixture terminal delivery'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let other =
+            serde_json::json!({"workspace":"other.slack.com","owner":"UOTHER","enabled":false})
+                .to_string();
+        assert!(db.set_slack_configuration(&other).await.is_err());
+        db.slack_eyes_unavailable(&request.request_id, "message_not_found")
+            .await
+            .unwrap();
+        db.slack_eyes_confirmed(&request.request_id).await.unwrap();
+        let retained = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(retained.request_id, request.request_id);
+        assert!(!retained.eyes_confirmed);
+        assert_eq!(retained.eyes_failure.as_deref(), Some("message_not_found"));
+        db.set_slack_configuration(&other).await.unwrap();
+    }
+    #[tokio::test]
     async fn account_switch_cannot_orphan_accepted_work() {
         let db = Database::open_in_memory().await.unwrap();
         let source = source("100.000", SlackRequestKind::Briefing);
@@ -1341,6 +1409,112 @@ mod tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keep receipt fencing and restart observations on one outbox fixture.
+    async fn notification_inspection_deadline_survives_reopen_and_is_receipt_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("inspection.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let source = source("100.000", SlackRequestKind::Briefing);
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.fail_slack_before_admission(&request.request_id, "fixture", "https://phoenix.example")
+            .await
+            .unwrap();
+        let output = db
+            .slack_returns(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.slack_begin_notification_return(
+            &output.return_id,
+            "attempt",
+            &["/fixture/notify".into()],
+            "https://phoenix.example/frozen",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        db.slack_finish_return(
+            &output.return_id,
+            "attempt",
+            SlackReturnState::Submitted,
+            None,
+            Some("receipt"),
+            None,
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_micros();
+        assert!(!db
+            .slack_begin_notification_inspection(&output.return_id, "wrong", now)
+            .await
+            .unwrap());
+        assert!(db
+            .slack_begin_notification_inspection(&output.return_id, "receipt", now)
+            .await
+            .unwrap());
+        db.slack_observe_notification_return(
+            &output.return_id,
+            "receipt",
+            SlackNotificationObservation::ReadFailed {
+                reason: "fixture timeout".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let retained = db
+            .slack_returns(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        let deadline = retained.notification_inspect_after_us.unwrap();
+        assert!(deadline >= now + NOTIFICATION_INSPECTION_INTERVAL_US);
+        assert_eq!(retained.failure.as_deref(), Some("fixture timeout"));
+        db.pool().close().await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        assert!(!db
+            .slack_begin_notification_inspection(&output.return_id, "receipt", now + 1)
+            .await
+            .unwrap());
+        assert!(db
+            .slack_begin_notification_inspection(&output.return_id, "receipt", deadline)
+            .await
+            .unwrap());
+        db.slack_observe_notification_return(
+            &output.return_id,
+            "receipt",
+            SlackNotificationObservation::Delivered {
+                proof: "exact proof".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .slack_begin_notification_inspection(
+                &output.return_id,
+                "receipt",
+                deadline + NOTIFICATION_INSPECTION_INTERVAL_US
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .slack_returns(&source.workspace, &source.owner)
+            .await
+            .unwrap()[0]
+            .notification_inspect_after_us
+            .is_none());
     }
     #[tokio::test]
     async fn unsent_notification_retry_retains_command_and_target_after_reopen() {

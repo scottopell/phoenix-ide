@@ -714,6 +714,12 @@ const MIGRATIONS: &[Migration] = &[
         WHEN (OLD.notification_command IS NOT NULL AND NEW.notification_command IS NOT OLD.notification_command) OR (OLD.notification_url IS NOT NULL AND NEW.notification_url IS NOT OLD.notification_url)
         BEGIN SELECT RAISE(ABORT,'notification operation is immutable'); END;",
     },
+    Migration {
+        version: 136,
+        name: "slack_gateway_delivery_retry_bounds",
+        sql: "ALTER TABLE slack_gateway_requests ADD COLUMN eyes_failure TEXT CHECK(eyes_failure IS NULL OR (eyes_confirmed=0 AND length(trim(eyes_failure))>0));
+        ALTER TABLE slack_gateway_returns ADD COLUMN notification_inspect_after_us INTEGER CHECK(notification_inspect_after_us IS NULL OR (typeof(notification_inspect_after_us)='integer' AND notification_inspect_after_us>=0));",
+    },
 ];
 
 const WAKE_FEATURE_RETIREMENT_SQL: &str = include_str!("migrations/wake_feature_retirement.sql");
@@ -14507,6 +14513,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (136, "slack_gateway_delivery_retry_bounds"),
             (135, "slack_gateway_frozen_notification_target"),
             (134, "slack_gateway_trigger_provenance"),
             (133, "slack_gateway_first_observation"),
@@ -19845,7 +19852,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (132, 'temporarily_skip_slack_gateway'),
                     (133, 'temporarily_skip_slack_gateway_first_observation'),
                     (134, 'temporarily_skip_slack_gateway_trigger_provenance'),
-                    (135, 'temporarily_skip_slack_gateway_frozen_notification_target')",
+                    (135, 'temporarily_skip_slack_gateway_frozen_notification_target'),
+                    (136, 'temporarily_skip_slack_gateway_delivery_retry_bounds')",
         )
         .execute(&pool)
         .await
@@ -20718,7 +20726,8 @@ with tempfile.TemporaryDirectory() as directory:
                     (132, 'temporarily_skip_slack_gateway'),
                     (133, 'temporarily_skip_slack_gateway_first_observation'),
                     (134, 'temporarily_skip_slack_gateway_trigger_provenance'),
-                    (135, 'temporarily_skip_slack_gateway_frozen_notification_target')",
+                    (135, 'temporarily_skip_slack_gateway_frozen_notification_target'),
+                    (136, 'temporarily_skip_slack_gateway_delivery_retry_bounds')",
         )
         .execute(pool)
         .await
