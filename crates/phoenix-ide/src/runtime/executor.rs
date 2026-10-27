@@ -25712,10 +25712,10 @@ mod goal_report_cancellation_checkpoint_tests {
                 .unwrap();
             assert!(matches!(
                 &row.content,
-                MessageContent::Tool(content)
-                    if content.tool_use_id == result.tool_use_id
-                        && content.content == result.output()
-                        && !content.is_error
+                MessageContent::Tool(tool_content)
+                    if tool_content.tool_use_id == result.tool_use_id
+                        && tool_content.content == result.output()
+                        && !tool_content.is_error
             ));
             let result = FinalizedToolResult::new(
                 &assistant.message_id,
