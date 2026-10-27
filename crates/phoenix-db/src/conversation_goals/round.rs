@@ -173,13 +173,19 @@ pub(crate) async fn write_round_tx(
             persist_finalized_round_tx(tx, assistant, results).await?;
             Ok((results.to_vec(), false))
         }
-        ToolRoundWrite::Pending { execution, results } => {
-            finalize_round_tx(
-                tx,
-                &GoalRoundCheckpoint { assistant, execution, results, state, state_updated_at },
-                policies,
-            ).await.map_err(db_error)
-        }
+        ToolRoundWrite::Pending { execution, results } => finalize_round_tx(
+            tx,
+            &GoalRoundCheckpoint {
+                assistant,
+                execution,
+                results,
+                state,
+                state_updated_at,
+            },
+            policies,
+        )
+        .await
+        .map_err(db_error),
     }
 }
 
@@ -386,10 +392,17 @@ impl Database {
         checkpoint: &GoalRoundCheckpoint<'_>,
     ) -> DbResult<CommittedGoalRound> {
         self.persist_tool_round_state_and_replay_input(
-            &checkpoint.assistant.conversation_id, checkpoint.assistant,
-            ToolRoundWrite::Pending { execution: checkpoint.execution, results: checkpoint.results },
-            checkpoint.state, checkpoint.state_updated_at, None,
-        ).await
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            checkpoint.state,
+            checkpoint.state_updated_at,
+            None,
+        )
+        .await
     }
 
     /// Commit a pending report round, selected state and provider replay atomically.
@@ -402,10 +415,17 @@ impl Database {
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> DbResult<CommittedGoalRound> {
         self.persist_tool_round_state_and_replay_input(
-            &checkpoint.assistant.conversation_id, checkpoint.assistant,
-            ToolRoundWrite::Pending { execution: checkpoint.execution, results: checkpoint.results },
-            checkpoint.state, checkpoint.state_updated_at, Some(update),
-        ).await
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            checkpoint.state,
+            checkpoint.state_updated_at,
+            Some(update),
+        )
+        .await
     }
 
     /// Commit report evidence and the existing terminal obligation without projecting state.
@@ -421,12 +441,19 @@ impl Database {
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
     ) -> DbResult<CommittedGoalTerminalRound> {
         if i64::try_from(obligation.turn_id.0).ok() != Some(execution.turn_id()) {
-            return Err(DbError::Serialization("goal report terminal turn differs".into()));
+            return Err(DbError::Serialization(
+                "goal report terminal turn differs".into(),
+            ));
         }
         self.persist_tool_round_with_terminal_obligation_input_at_cut(
-            &assistant.conversation_id, assistant, ToolRoundWrite::Pending { execution, results },
-            obligation, replay, crate::TerminalEvidenceTransactionCut::None,
-        ).await
+            &assistant.conversation_id,
+            assistant,
+            ToolRoundWrite::Pending { execution, results },
+            obligation,
+            replay,
+            crate::TerminalEvidenceTransactionCut::None,
+        )
+        .await
     }
 }
 

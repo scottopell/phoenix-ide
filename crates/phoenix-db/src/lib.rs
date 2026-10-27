@@ -10277,21 +10277,22 @@ impl Database {
         assistant: &Message,
         tool_results: &[Message],
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
+        if conversation_id != assistant.conversation_id {
+            return Err(DbError::Serialization(
+                "tool round transcript differs".into(),
+            ));
         }
-
-        // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
-        // `updated_at` so list-ordering stays current.
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let replayed =
+            conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
+                .await?;
+        if !replayed {
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(Utc::now().to_rfc3339())
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -10333,10 +10334,14 @@ impl Database {
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         self.persist_tool_round_state_and_replay_input(
-            conversation_id, assistant,
+            conversation_id,
+            assistant,
             conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
-            state, state_updated_at, None,
-        ).await?;
+            state,
+            state_updated_at,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -10354,10 +10359,14 @@ impl Database {
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<()> {
         self.persist_tool_round_with_terminal_obligation_input_at_cut(
-            conversation_id, assistant,
+            conversation_id,
+            assistant,
             conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
-            obligation, None, cut,
-        ).await?;
+            obligation,
+            None,
+            cut,
+        )
+        .await?;
         Ok(())
     }
 
@@ -10390,16 +10399,24 @@ impl Database {
             .fetch_optional(&mut *tx)
             .await?;
             if owner.as_deref() != Some(conversation_id) {
-                return Err(DbError::Serialization("goal terminal conversation differs".into()));
+                return Err(DbError::Serialization(
+                    "goal terminal conversation differs".into(),
+                ));
             }
         }
         let (results, replayed) = round::write_round_tx(
-            &mut tx, conversation_id, assistant, input,
-            &obligation.projection.state, obligation.projection.state_updated_at,
+            &mut tx,
+            conversation_id,
+            assistant,
+            input,
+            &obligation.projection.state,
+            obligation.projection.state_updated_at,
             self.goal_write_policies(),
-        ).await?;
+        )
+        .await?;
         if !replayed {
-            workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
+            workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation)
+                .await?;
             if let Some(update) = replay {
                 provider_replay::apply_replay_tx(&mut tx, conversation_id, update).await?;
             }

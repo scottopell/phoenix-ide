@@ -29,7 +29,9 @@ pub(crate) fn validate_goal_round_replay(
         ProviderReplayUpdate::Clear => true,
     };
     if !matches {
-        return Err(DbError::Serialization("goal round replay owner differs".into()));
+        return Err(DbError::Serialization(
+            "goal round replay owner differs".into(),
+        ));
     }
     Ok(())
 }
@@ -87,11 +89,19 @@ impl Database {
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let (results, replayed) = round::write_round_tx(
-            &mut tx, conversation_id, assistant, input, state, state_updated_at, self.goal_write_policies(),
-        ).await?;
-        let (state, state_updated_at) = round::selected_state_tx(
-            &mut tx, conversation_id, state, state_updated_at, replayed,
-        ).await.map_err(round::db_error)?;
+            &mut tx,
+            conversation_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
+            self.goal_write_policies(),
+        )
+        .await?;
+        let (state, state_updated_at) =
+            round::selected_state_tx(&mut tx, conversation_id, state, state_updated_at, replayed)
+                .await
+                .map_err(round::db_error)?;
         if !replayed {
             if let Some(update) = update {
                 apply_replay_tx(&mut tx, conversation_id, update).await?;
@@ -99,13 +109,22 @@ impl Database {
         }
         if cut == Some(CanonicalCommitCut::BeforeCanonicalCommit) {
             tx.rollback().await?;
-            return Err(DbError::Serialization("injected before canonical commit".into()));
+            return Err(DbError::Serialization(
+                "injected before canonical commit".into(),
+            ));
         }
         tx.commit().await?;
         if cut == Some(CanonicalCommitCut::AfterCanonicalCommit) {
-            return Err(DbError::Serialization("injected after canonical commit".into()));
+            return Err(DbError::Serialization(
+                "injected after canonical commit".into(),
+            ));
         }
-        Ok(round::CommittedGoalRound { results, state, state_updated_at, replayed })
+        Ok(round::CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        })
     }
 }
 
@@ -258,10 +277,14 @@ impl Database {
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> DbResult<()> {
         self.persist_tool_round_state_and_replay_input(
-            conversation_id, assistant,
+            conversation_id,
+            assistant,
             crate::conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
-            state, state_updated_at, Some(update),
-        ).await?;
+            state,
+            state_updated_at,
+            Some(update),
+        )
+        .await?;
         Ok(())
     }
 

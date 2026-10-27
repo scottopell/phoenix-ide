@@ -11,8 +11,8 @@ use phoenix_core::domain::tool_result_identity::tool_result_message_id;
 use sqlx::Row;
 
 use super::{
-    GoalChange, GoalDbError, GoalError, GoalHistoryEntry, GoalState, GoalTimestampUs, GoalTx,
-    Result, apply_goal_tx, binding_tx, retry_tx,
+    apply_goal_tx, binding_tx, retry_tx, GoalChange, GoalDbError, GoalError, GoalHistoryEntry,
+    GoalState, GoalTimestampUs, GoalTx, Result,
 };
 
 pub(super) async fn verify_source_tx(
@@ -246,7 +246,7 @@ pub(crate) async fn finalize_report_tx(
 
 #[cfg(test)]
 mod tests {
-    use super::{GoalDbError, GoalError, semantic_refusal};
+    use super::{semantic_refusal, GoalDbError, GoalError};
 
     #[test]
     fn only_typed_semantic_refusals_become_report_errors() {

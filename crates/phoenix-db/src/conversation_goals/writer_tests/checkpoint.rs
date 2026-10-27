@@ -460,6 +460,60 @@ async fn after_canonical_commit_cut_retains_report_and_replays_without_duplicate
 }
 
 #[tokio::test]
+async fn finalized_report_success_cannot_bypass_the_pending_checkpoint_path() {
+    let (db, owner, round) = report_fixture().await;
+    let committed = round.commit(&db).await.unwrap();
+    let before = evidence(&db, &owner, &round).await;
+    assert!(db
+        .persist_tool_round(
+            &round.assistant.conversation_id,
+            &round.assistant,
+            &committed.results,
+        )
+        .await
+        .is_err());
+    assert!(db
+        .persist_tool_round_and_state(
+            &round.assistant.conversation_id,
+            &round.assistant,
+            &committed.results,
+            &ConvState::Idle,
+            round.timestamp + Duration::seconds(1),
+        )
+        .await
+        .is_err());
+    assert_eq!(evidence(&db, &owner, &round).await, before);
+}
+
+#[tokio::test]
+async fn terminal_report_checkpoint_requires_the_admitted_turn() {
+    let (db, owner, round) = report_fixture().await;
+    let obligation = crate::workflow::DirectTurnTerminalObligationInput {
+        turn_id: phoenix_workflow::TurnId(u64::try_from(round.execution.turn_id() + 1).unwrap()),
+        expected_generation: 0,
+        terminal: phoenix_workflow::TurnTerminal::Cancelled,
+        projection: crate::workflow::PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: round.timestamp,
+        },
+        response_message_id: None,
+    };
+    let before = evidence(&db, &owner, &round).await;
+    let error = db
+        .persist_goal_tool_round_with_terminal_obligation(
+            &round.assistant,
+            round.execution,
+            &round.results,
+            &obligation,
+            Some(&round.replay()),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("goal terminal turn differs"));
+    assert_eq!(evidence(&db, &owner, &round).await, before);
+}
+
+#[tokio::test]
 async fn terminal_obligation_conflict_rolls_back_accepted_report_and_replay() {
     let (db, owner, round) = report_fixture().await;
     let generation: i64 =
