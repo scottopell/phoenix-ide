@@ -239,8 +239,8 @@ impl Database {
         &self,
         owner: &ProductConversationId,
     ) -> Result<Option<GoalHistoryEntry>> {
-        self.get_ordinary_product_conversation(owner).await?;
         let mut tx = self.pool().begin().await?;
+        Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
         let Some(snapshot) = current_tx(&mut tx, owner).await? else {
             tx.commit().await?;
             return Ok(None);
