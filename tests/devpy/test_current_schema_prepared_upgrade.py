@@ -5761,7 +5761,8 @@ class OrdinarySource129To131Tests(unittest.TestCase):
                     paths = [database, Path(manifest.target_binary), Path(manifest.target_plist),
                              Path(manifest.candidate_binary), Path(manifest.candidate_plist),
                              Path(manifest.rollback_binary), Path(manifest.rollback_plist),
-                             Path(manifest.active_path), Path(manifest.deployed_sha_path)]
+                             Path(manifest.active_path), Path(manifest.deployed_sha_path),
+                             Path(manifest.status_path)]
                     before = {path: path.read_bytes() if path.exists() else None for path in paths}
                     ledger = helper.database_ledger(database)
                     with self.assertRaisesRegex(helper.ActivationError, "not qualified"):
@@ -5772,7 +5773,6 @@ class OrdinarySource129To131Tests(unittest.TestCase):
                     launchctl.assert_not_called()
                     self.assertEqual(helper.database_ledger(database), ledger)
                     self.assertEqual({path: path.read_bytes() if path.exists() else None for path in paths}, before)
-                    self.assertFalse(Path(manifest.status_path).exists())
 
     def test_changed_registry_and_source_names_reject_before_stop(self) -> None:
         for mutation in ("missing", "newer", "name", "bytes", "source"):

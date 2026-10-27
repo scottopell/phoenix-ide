@@ -21255,7 +21255,7 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         stamp_migration_versions(
-            &pool,
+            pool,
             &[
                 70, 71, 72, 73, 74, 91, 92, 93, 95, 100, 101, 102, 103, 108, 111, 113, 119, 120,
                 122, 123, 124, 125, 126, 127, 128, 129,
