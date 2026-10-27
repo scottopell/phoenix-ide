@@ -59,13 +59,13 @@ fn disposition(state: &GoalState) -> GoalDisposition {
 }
 
 fn snapshot(row: &SqliteRow) -> Result<GoalSnapshot> {
-    Ok(GoalSnapshot {
-        owner: product(row.try_get("owner_id")?)?,
-        goal_id: GoalId::parse(row.try_get::<String, _>("goal_id")?)?,
-        version: GoalVersion::parse(row.try_get("version")?)?,
-        objective: text(row.try_get("objective")?)?,
-        state: read_state(row)?,
-    })
+    Ok(GoalSnapshot::new(
+        product(row.try_get("owner_id")?)?,
+        GoalId::parse(row.try_get::<String, _>("goal_id")?)?,
+        GoalVersion::parse(row.try_get("version")?)?,
+        text(row.try_get("objective")?)?,
+        read_state(row)?,
+    )?)
 }
 
 async fn history_tx(
@@ -187,25 +187,26 @@ async fn history_entry(tx: &mut GoalTx<'_>, row: &SqliteRow) -> Result<GoalHisto
     let kind: String = row.try_get("change_kind")?;
     let change = match kind.as_str() {
         "create" => GoalChange::Create {
-            goal_id: snapshot.goal_id.clone(),
-            objective: snapshot.objective.clone(),
+            goal_id: snapshot.goal_id().clone(),
+            objective: snapshot.objective().clone(),
         },
         "state" => GoalChange::SetDisposition {
-            goal_id: snapshot.goal_id.clone(),
-            disposition: disposition(&snapshot.state),
+            goal_id: snapshot.goal_id().clone(),
+            disposition: disposition(snapshot.state()),
         },
         "report" => GoalChange::Report {
             binding: binding_tx(tx, row.try_get("report_turn_id")?)
                 .await?
                 .ok_or(GoalDbError::Integrity("report binding"))?,
-            disposition: disposition(&snapshot.state),
+            disposition: disposition(snapshot.state()),
         },
         _ => return Err(GoalDbError::Integrity("change kind")),
     };
-    Ok(GoalHistoryEntry {
-        mutation: GoalMutation {
-            owner: snapshot.owner.clone(),
-            expected_version: GoalVersion::parse(snapshot.version.get() - 1)?,
+    Ok(GoalHistoryEntry::new(
+        snapshot.clone(),
+        GoalMutation {
+            owner: snapshot.owner().clone(),
+            expected_version: GoalVersion::parse(snapshot.version().get() - 1)?,
             action_id: text(row.try_get("action_id")?)?,
             attribution: GoalAttribution {
                 requested_by: read_actor(tx, row.try_get("requested_actor_id")?).await?,
@@ -213,9 +214,8 @@ async fn history_entry(tx: &mut GoalTx<'_>, row: &SqliteRow) -> Result<GoalHisto
             },
             change,
         },
-        snapshot,
-        recorded_at_us: GoalTimestampUs::parse(row.try_get("recorded_at_us")?)?,
-    })
+        GoalTimestampUs::parse(row.try_get("recorded_at_us")?)?,
+    )?)
 }
 
 impl Database {
@@ -247,12 +247,12 @@ impl Database {
         };
         let row = sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE h.owner_id=? AND h.version=?")
             .bind(owner.as_str())
-            .bind(snapshot.version.get())
+            .bind(snapshot.version().get())
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(GoalDbError::Integrity("current goal history missing"))?;
         let entry = history_entry(&mut tx, &row).await?;
-        if entry.snapshot != snapshot {
+        if entry.snapshot() != &snapshot {
             return Err(GoalDbError::Integrity("current goal history mismatch"));
         }
         tx.commit().await?;
@@ -336,16 +336,16 @@ mod tests {
             .bind(owner.as_str()).execute(db.pool()).await.unwrap();
 
         let current = db.conversation_goal(&owner).await.unwrap().unwrap();
-        assert_eq!(current.objective.as_str(), "objective");
+        assert_eq!(current.objective().as_str(), "objective");
         let entry = db.conversation_goal_current_entry(&owner).await.unwrap().unwrap();
-        assert_eq!(entry.snapshot, current);
-        assert_eq!(entry.recorded_at_us.get(), 1234);
-        assert!(matches!(entry.mutation.attribution.requested_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
-        assert!(matches!(entry.mutation.attribution.applied_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
+        assert_eq!(entry.snapshot(), &current);
+        assert_eq!(entry.recorded_at_us().get(), 1234);
+        assert!(matches!(entry.mutation().attribution.requested_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
+        assert!(matches!(entry.mutation().attribution.applied_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
         let history = db.conversation_goal_history(&owner, GoalVersion::INITIAL).await.unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].snapshot, current);
-        assert_eq!(history[0].mutation.action_id.as_str(), "action-1");
+        assert_eq!(history[0].snapshot(), &current);
+        assert_eq!(history[0].mutation().action_id.as_str(), "action-1");
     }
 
     #[tokio::test]
@@ -435,11 +435,54 @@ mod tests {
             .unwrap();
 
         let current = current_tx(&mut tx, &owner).await.unwrap().unwrap();
-        assert_eq!(current.objective.as_str(), "objective");
+        assert_eq!(current.objective().as_str(), "objective");
         let history = history_tx(&mut tx, &owner, GoalVersion::INITIAL).await.unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].snapshot, current);
-        assert_eq!(history[0].recorded_at_us.get(), 100);
+        assert_eq!(history[0].snapshot(), &current);
+        assert_eq!(history[0].recorded_at_us().get(), 100);
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_reads_are_oldest_first_and_capped_at_one_hundred() {
+        let pool = test_pool().await;
+        sqlx::query("CREATE TABLE conversation_goal_ids (goal_id TEXT, owner_id TEXT, objective TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE conversation_goal_history (owner_id TEXT, version INTEGER, goal_id TEXT, state TEXT, reason TEXT, change_kind TEXT, action_id TEXT, requested_actor_id INTEGER, applied_actor_id INTEGER, recorded_at_us INTEGER, report_turn_id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, host_action_id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("INSERT INTO conversation_goal_ids VALUES ('goal', 'owner', 'objective')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'generated_host', 'host-action')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for version in 1..=101_i64 {
+            sqlx::query("INSERT INTO conversation_goal_history VALUES ('owner', ?, 'goal', 'underway', NULL, 'create', ?, 1, 1, ?, NULL)")
+                .bind(version)
+                .bind(format!("action-{version}"))
+                .bind(version)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let owner = ProductConversationId::parse("owner").unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let entries = history_tx(&mut tx, &owner, GoalVersion::INITIAL).await.unwrap();
+        assert_eq!(entries.len(), 100);
+        assert_eq!(entries.first().unwrap().snapshot().version().get(), 1);
+        assert_eq!(entries.last().unwrap().snapshot().version().get(), 100);
         tx.rollback().await.unwrap();
     }
 
