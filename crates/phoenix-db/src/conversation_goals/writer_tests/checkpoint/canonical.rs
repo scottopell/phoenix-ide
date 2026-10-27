@@ -174,7 +174,12 @@ async fn retained_canonical_identity_rejects_changed_state_time_and_replay_comma
             },
             match &round.assistant.content {
                 MessageContent::Agent(blocks) => blocks.clone(),
-                _ => unreachable!(),
+                MessageContent::User(_)
+                | MessageContent::Tool(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_)
+                | MessageContent::Skill(_) => unreachable!(),
             },
             vec![],
         )

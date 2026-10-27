@@ -742,39 +742,51 @@ mod tests {
         );
     }
 
+    async fn evidence(
+        db: &Database,
+        transcript: &str,
+        owner: &ProductConversationId,
+    ) -> serde_json::Value {
+        use phoenix_core::domain::conversation_goal::GoalVersion;
+
+        type ReceiptEvidence = (String, Vec<u8>, String, String, Option<Vec<u8>>);
+        let state: (String, String, String, String) = sqlx::query_as(
+            "SELECT state,state_kind,state_updated_at,updated_at FROM conversations WHERE id=?",
+        )
+        .bind(transcript)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let receipts: Vec<ReceiptEvidence> = sqlx::query_as(
+            "SELECT assistant_message_id,selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256 FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
+        )
+        .bind(transcript)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        serde_json::json!({
+            "state": state,
+            "messages": db.get_messages(transcript).await.unwrap(),
+            "receipts": receipts,
+            "goal": db.conversation_goal(owner).await.unwrap(),
+            "history": db.conversation_goal_history(owner, GoalVersion::INITIAL).await.unwrap(),
+            "events": format!("{:?}", db.pending_coordinator_watch_events(16).await.unwrap()),
+        })
+    }
+
+    async fn assert_checkpoint_not_terminal(db: &Database, turn: u64) {
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
+    }
+
     #[tokio::test]
     async fn checkpoint_without_provider_replay_persists_approval_event_atomically() {
-        use phoenix_core::domain::conversation_goal::GoalVersion;
         use phoenix_core::domain::db_schema::{Message, MessageContent, MessageType};
-
-        async fn evidence(
-            db: &Database,
-            transcript: &str,
-            owner: &ProductConversationId,
-        ) -> serde_json::Value {
-            let state: (String, String, String, String) = sqlx::query_as(
-                "SELECT state,state_kind,state_updated_at,updated_at FROM conversations WHERE id=?",
-            )
-            .bind(transcript)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-            let receipts: Vec<(String, Vec<u8>, String, String, Option<Vec<u8>>)> = sqlx::query_as(
-                "SELECT assistant_message_id,selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256 FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
-            )
-            .bind(transcript)
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-            serde_json::json!({
-                "state": state,
-                "messages": db.get_messages(transcript).await.unwrap(),
-                "receipts": receipts,
-                "goal": db.conversation_goal(owner).await.unwrap(),
-                "history": db.conversation_goal_history(owner, GoalVersion::INITIAL).await.unwrap(),
-                "events": format!("{:?}", db.pending_coordinator_watch_events(16).await.unwrap()),
-            })
-        }
 
         let db = Database::open_in_memory().await.unwrap();
         let source = db
@@ -873,13 +885,7 @@ mod tests {
             db.pending_coordinator_watch_events(16).await.unwrap().len(),
             1
         );
-        let terminal: Option<String> =
-            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
-                .bind(i64::try_from(turn).unwrap())
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert!(terminal.is_none());
+        assert_checkpoint_not_terminal(&db, turn).await;
     }
 
     #[tokio::test]
