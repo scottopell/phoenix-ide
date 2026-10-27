@@ -66,10 +66,10 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    # 5 setup/network + 20 native + 72 check + 10 musl + 2 evidence + 4 post-actions.
+    # 5 setup/network + 20 native + 82 check + 10 musl + 2 evidence + 4 post-actions.
     # Setup/network and musl are planning estimates, not completion guarantees.
-    # Check: 60.5 Rust watchdog + 10 normal fmt + 1.5 probes/teardown/report.
-    timeout-minutes: 113
+    # Check: 70.5 Rust watchdog + 10 normal fmt + 1.5 probes/teardown/report.
+    timeout-minutes: 123
     env:
       PYTHONUNBUFFERED: "1"
       PHOENIX_DEV_TRACE_ENDPOINT: "off"
@@ -79,7 +79,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
-      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "2400"
+      PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "3000"
       PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
       PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
     steps:
@@ -128,7 +128,7 @@ jobs:
             --identity step:ci:native-launcher -- cargo build -j 1 -p phoenix_ide --bin phoenix_ide
           test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
       - name: ./dev.py check (rust,cargo-fmt)
-        timeout-minutes: 72
+        timeout-minutes: 82
         run: ./dev.py check --lanes rust,cargo-fmt --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
       - name: Check production feature on musl
         timeout-minutes: 10

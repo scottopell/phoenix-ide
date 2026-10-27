@@ -59,7 +59,10 @@ before stopping a service.
 The pre-integration 1,200-test developer-tool run had three environment-sensitive
 failures; all three pass with native Bash/OpenSSL and the shared Cargo target
 override removed. The full developer-tool run was not repeated. Hosted CI and
-posted review feedback remain gates for the integrated head.
+posted review feedback remain gates for the integrated head. The first hosted
+Rust run passed 5,120 tests before its forty-minute test cap terminated the rest,
+without an assertion failure. CI gives the expanded suite fifty minutes, with
+matching finite watchdog and job bounds; hosted qualification is pending.
 
 ## Production boundary
 
