@@ -272,7 +272,13 @@ fn report_outcomes_keep_valid_wire_and_reject_non_report_states() {
 fn historical_non_create_receipts_require_a_positive_predecessor_version() {
     let current = initial();
     let timestamp = GoalTimestampUs::parse(123).unwrap();
-    let initial_create = create(0, "goal");
+    let initial_create = mutation(
+        0,
+        GoalChange::Create {
+            goal_id: current.goal_id().clone(),
+            objective: current.objective().clone(),
+        },
+    );
     let receipt = GoalHistoryEntry::new(current.clone(), initial_create, timestamp).unwrap();
     assert_eq!(
         serde_json::from_value::<GoalHistoryEntry>(serde_json::to_value(&receipt).unwrap())
@@ -282,7 +288,13 @@ fn historical_non_create_receipts_require_a_positive_predecessor_version() {
     for command in [
         set(&current, GoalDisposition::Blocked(text("access"))),
         report(&current),
-        create(current.version().get(), "replacement"),
+        mutation(
+            current.version().get(),
+            GoalChange::Create {
+                goal_id: GoalId::parse("replacement").unwrap(),
+                objective: text("replacement objective"),
+            },
+        ),
     ] {
         let snapshot = command.advance(Some(&current)).unwrap();
         let receipt = GoalHistoryEntry::new(snapshot.clone(), command.clone(), timestamp).unwrap();
