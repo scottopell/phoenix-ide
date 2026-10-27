@@ -150,6 +150,10 @@ fn goal_error(error: GoalDbError) -> AppError {
             )))
         }
         error @ GoalDbError::Domain(_) => AppError::BadRequest(error.to_string()),
-        error => AppError::Internal(error.to_string()),
+        error @ (GoalDbError::BindingConflict
+        | GoalDbError::Control(_)
+        | GoalDbError::DuplicateGoalId
+        | GoalDbError::Sqlx(_)
+        | GoalDbError::Integrity(_)) => AppError::Internal(error.to_string()),
     }
 }
