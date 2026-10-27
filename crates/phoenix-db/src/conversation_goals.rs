@@ -407,10 +407,10 @@ async fn apply_goal_tx(
     if let Some(transcript) = expected_transcript {
         match &mutation.change {
             GoalChange::Report { binding, .. } => {
-                admission::require_live_report_tx(tx, binding, transcript).await?
+                admission::require_live_report_tx(tx, binding, transcript).await?;
             }
             GoalChange::Create { .. } | GoalChange::SetDisposition { .. } => {
-                admission::require_settled_tx(tx, mutation, transcript).await?
+                admission::require_settled_tx(tx, mutation, transcript).await?;
             }
         }
     }

@@ -367,17 +367,9 @@ fn runtime_input(transcript: &str, key: &str) -> crate::workflow::AcceptAuthorit
 async fn request_projection_replay_causal_conflict_and_creation_time_limit() {
     let db = fixture().await;
     let (transcript, owner) = ordinary(&db, "request-owner").await;
+    let mutation = create(&owner, GoalVersion::INITIAL, "request-goal", "create");
     let goal = db
-        .apply_conversation_goal(
-            &create(
-                &owner,
-                GoalVersion::INITIAL,
-                "request-goal",
-                "create-request-goal",
-            ),
-            &transcript,
-            at(),
-        )
+        .apply_conversation_goal(&mutation, &transcript, at())
         .await
         .unwrap();
     release(&db, &owner).await;

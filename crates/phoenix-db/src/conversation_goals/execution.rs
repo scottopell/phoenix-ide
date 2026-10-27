@@ -163,26 +163,6 @@ fn decode(row: &SqliteRow) -> super::Result<GoalRequestAdmission> {
     })
 }
 
-pub(crate) async fn latest_request_tx(
-    tx: &mut GoalTx<'_>,
-    execution: GoalExecution,
-) -> Result<Option<GoalRequestAdmission>> {
-    sqlx::query(
-        "SELECT r.*,c.checkpoint_key FROM conversation_goal_requests r
-         LEFT JOIN conversation_goal_request_checkpoints c USING(request_id)
-         WHERE r.historical_turn_id=? AND r.historical_workflow_id=?
-         ORDER BY r.ordinal DESC LIMIT 1",
-    )
-    .bind(execution.turn_id())
-    .bind(execution.workflow_id())
-    .fetch_optional(&mut **tx)
-    .await?
-    .as_ref()
-    .map(decode)
-    .transpose()
-    .map_err(GoalRequestError::from)
-}
-
 /// Reads retained identity/causal-slot evidence without requiring a live turn.
 ///
 /// # Errors
@@ -296,43 +276,6 @@ pub async fn append_request_tx(
         live_turn_id: Some(intent.execution.turn_id()),
         checkpoint: None,
     })
-}
-
-pub(crate) async fn require_live_request_tx(
-    tx: &mut GoalTx<'_>,
-    intent: &GoalRequestIntent,
-    transcript: &str,
-) -> Result<()> {
-    super::admission::require_target_tx(tx, intent.goal().owner(), transcript).await?;
-    super::control::require_current_control_tx(tx, intent.goal().owner(), intent.execution)
-        .await
-        .map_err(GoalDbError::from)?;
-    let binding = super::binding_tx(tx, intent.execution.turn_id())
-        .await?
-        .ok_or(GoalRequestError::Detached)?;
-    let current = super::current_tx(tx, intent.goal().owner())
-        .await?
-        .ok_or(GoalRequestError::Revoked)?;
-    if binding.execution() != intent.execution
-        || binding.observation()
-            != &phoenix_core::domain::conversation_goal::GoalAdmissionObservation::Goal(
-                intent.goal().clone(),
-            )
-        || current.fence() != *intent.goal()
-        || current.state() != &phoenix_core::domain::conversation_goal::GoalState::Underway
-    {
-        return Err(GoalRequestError::Revoked);
-    }
-    let queued: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM steering_messages WHERE conversation_id=?)",
-    )
-    .bind(transcript)
-    .fetch_one(&mut **tx)
-    .await?;
-    if queued {
-        return Err(GoalRequestError::QueuedInput);
-    }
-    Ok(())
 }
 
 /// Adds immutable checkpoint evidence to the caller's uncommitted transaction.

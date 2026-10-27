@@ -281,7 +281,7 @@ impl Database {
         let current = current_tx(&mut tx, &input.owner).await?;
         let observed = current
             .as_ref()
-            .map_or(GoalVersion::INITIAL, |goal| goal.version());
+            .map_or(GoalVersion::INITIAL, super::GoalSnapshot::version);
         if observed != input.expected_version || host_gate_busy {
             let reason = if observed == input.expected_version {
                 GoalUserRefusal::Busy
