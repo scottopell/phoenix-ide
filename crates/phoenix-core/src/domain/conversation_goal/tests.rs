@@ -224,7 +224,7 @@ fn history_reconstruction_checks_local_transition_without_live_authority() {
 
 #[test]
 fn history_reconstruction_rejects_impossible_local_attribution() {
-    fn rejects(snapshot: &GoalSnapshot, mutation: GoalMutation) {
+    fn rejects(snapshot: &GoalSnapshot, mutation: &GoalMutation) {
         let recorded_at_us = GoalTimestampUs::parse(123).unwrap();
         assert!(GoalHistoryEntry::new(snapshot.clone(), mutation.clone(), recorded_at_us).is_err());
         let wire = serde_json::json!({
@@ -271,7 +271,7 @@ fn history_reconstruction_rejects_impossible_local_attribution() {
     ] {
         let mut invalid = create.clone();
         invalid.attribution.applied_by = applied;
-        rejects(&snapshot, invalid);
+        rejects(&snapshot, &invalid);
     }
     let mut wrong_command = create;
     let state_control = GoalActor::UserControl {
@@ -283,26 +283,26 @@ fn history_reconstruction_rejects_impossible_local_attribution() {
         requested_by: state_control.clone(),
         applied_by: state_control,
     };
-    rejects(&snapshot, wrong_command);
+    rejects(&snapshot, &wrong_command);
 
     let report = report(&snapshot);
     let result = report.advance(Some(&snapshot)).unwrap();
     let mut wrong_actor = report.clone();
     wrong_actor.attribution.requested_by = user();
-    rejects(&result, wrong_actor);
+    rejects(&result, &wrong_actor);
     let mut wrong_execution = report.clone();
     if let GoalActor::OwningAgent(source) = &mut wrong_execution.attribution.requested_by {
         source.execution = GoalExecution::parse(1, 3).unwrap();
     }
-    rejects(&result, wrong_execution);
+    rejects(&result, &wrong_execution);
     let mut wrong_owner = report.clone();
     if let GoalActor::OwningAgent(source) = &mut wrong_owner.attribution.requested_by {
         source.product_conversation_id = ProductConversationId::parse("other").unwrap();
     }
-    rejects(&result, wrong_owner);
+    rejects(&result, &wrong_owner);
     let mut unbound = set(&snapshot, GoalDisposition::Complete(text("done")));
     unbound.attribution.requested_by = report.attribution.requested_by;
-    rejects(&result, unbound);
+    rejects(&result, &unbound);
 }
 
 #[test]
