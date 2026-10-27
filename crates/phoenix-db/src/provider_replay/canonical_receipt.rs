@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn responses_receipt_hashes_whole_payload_and_canonicalizes_nested_objects() {
-        use phoenix_core::domain::provider_replay::ResponsesResponseSet;
+        use phoenix_core::domain::responses_replay::ResponsesResponseSet;
         let state = ConvState::LlmRequesting { attempt: 1 };
         let timestamp = Utc::now();
         let mut left = ResponsesResponseSet {

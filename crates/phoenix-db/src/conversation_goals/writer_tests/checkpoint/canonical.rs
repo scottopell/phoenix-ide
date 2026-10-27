@@ -71,14 +71,21 @@ async fn plain_round_cannot_claim_any_canonical_checkpoint() {
 #[tokio::test]
 async fn report_messages_without_canonical_receipt_cannot_claim_state_or_replay() {
     let (db, owner, round) = report_fixture().await;
-    db.persist_goal_tool_round(
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    crate::conversation_goals::round::write_round_tx(
+        &mut tx,
+        &round.assistant.conversation_id,
         &round.assistant,
-        round.execution,
-        &round.results,
+        crate::conversation_goals::round::RoundResults::Pending {
+            execution: round.execution,
+            results: &round.results,
+        },
         round.timestamp,
+        db.goal_write_policies(),
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     let before = evidence(&db, &owner, &round).await;
     assert!(db
         .persist_goal_tool_round_and_state(&round.checkpoint())
@@ -116,7 +123,10 @@ async fn exact_canonical_retry_preserves_newer_state_and_private_replay() {
         retry.state_updated_at.to_rfc3339(),
         before["state"][2].as_str().unwrap()
     );
-    assert_eq!(retry.results, first.results);
+    assert_eq!(
+        serde_json::to_value(&retry.results).unwrap(),
+        serde_json::to_value(&first.results).unwrap()
+    );
     assert_eq!(evidence(&db, &owner, &round).await, before);
     assert_eq!(receipt_count(&db).await, 1);
 }
