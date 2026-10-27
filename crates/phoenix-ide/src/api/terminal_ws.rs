@@ -23,7 +23,7 @@ use phoenix_terminal::session::{
     ActiveTerminals, Dims, RelayTeardownOwnership, StopReason, TerminalHandle,
 };
 use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
-use std::{os::unix::io::FromRawFd, sync::Arc, time::Duration};
+use std::{os::fd::BorrowedFd, sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// How long to wait for the sitting relay to release the `attach_permit`
@@ -572,18 +572,16 @@ fn detach_only(conversation_id: &str, arc_handle: Arc<TerminalHandle>) {
     tracing::info!(conv_id = %conversation_id, "Terminal WS detached; shell preserved for reclaim");
 }
 
-/// Build a `PtyMasterIo` backed by a fresh `dup()` of `master_fd_raw`.
+/// Build a `PtyMasterIo` backed by an independently owned master descriptor.
 /// Each relay holds its own dup so dropping the relay's fd doesn't close
 /// the registry's master fd.
 fn build_pty_io(master_fd_raw: std::os::unix::io::RawFd) -> Result<PtyMasterIo, String> {
     set_nonblocking(master_fd_raw).map_err(|e| format!("set_nonblocking: {e}"))?;
-    // SAFETY: master_fd_raw is owned by the registry for the lifetime of
-    // the relay; the dup'd fd is owned by the returned OwnedFd.
-    let raw = unsafe { libc::dup(master_fd_raw) };
-    if raw < 0 {
-        return Err(format!("dup: {}", std::io::Error::last_os_error()));
-    }
-    let pty_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) };
+    // SAFETY: the caller retains the registry's master during this clone.
+    let master = unsafe { BorrowedFd::borrow_raw(master_fd_raw) };
+    let pty_fd = master
+        .try_clone_to_owned()
+        .map_err(|error| format!("clone PTY master: {error}"))?;
     PtyMasterIo::new(pty_fd).map_err(|e| format!("AsyncFd: {e}"))
 }
 
@@ -634,6 +632,25 @@ mod reclaim_tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::{watch, Semaphore};
+
+    #[tokio::test]
+    async fn relay_descriptor_is_close_on_exec_and_independently_owned() {
+        use std::os::fd::AsRawFd;
+        let (source, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let relay = super::build_pty_io(source.as_raw_fd()).unwrap();
+        let clone = relay.0.get_ref().as_raw_fd();
+        assert_ne!(clone, source.as_raw_fd());
+        // SAFETY: source and relay own their respective descriptors.
+        let flags = unsafe { libc::fcntl(clone, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "relay descriptor is inheritable"
+        );
+        drop(relay);
+        assert!(unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
 
     /// Build a `TerminalHandle`-shaped value suitable for reclaim tests.
     /// We reuse the real struct but back `master_fd` with `/dev/null` since

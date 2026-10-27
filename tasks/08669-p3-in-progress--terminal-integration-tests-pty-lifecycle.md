@@ -57,11 +57,10 @@ part of this pass.
    reconcile requirements, Allium, legacy `specs/terminal/design.md`, and tests
    together. Do not silently rewrite policy or claim REQ-TERM-008 complete as
    part of the detached-exit fix.
-2. **Descriptor inheritance.** `terminal_ws::build_pty_io` uses raw `libc::dup`,
-   which clears `FD_CLOEXEC` on the duplicate. That relay-owned PTY master can
-   cross a later exec boundary. Track a separate inheritance fix and regression;
-   independent child observation does not fix inherited descriptors. No
-   implementation is authorized in this slice.
+2. **Descriptor inheritance.** Separate task 44019 owns atomic close-on-exec
+   PTY allocation and relay duplication under REQ-TERM-024, with cross-exec
+   regressions. Independent child observation alone does not fix inherited
+   descriptors; this remains outside the detached-exit slice.
 3. **Cancelled-spawn reservation/publication.** `terminal_ws::acquire_handle`
    calls `ActiveTerminals::reserve_spawn`, awaits planning and
    `tokio::task::spawn_blocking` around `spawn_pty`, then publishes through
