@@ -36,6 +36,7 @@ pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
     PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
+pub mod conversation_goals;
 mod conversation_name;
 mod product_conversation_read;
 pub mod retrieval;
