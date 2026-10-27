@@ -23,7 +23,7 @@ async fn obligation(db: &Database, round: &ReportRound) -> DirectTurnTerminalObl
     }
 }
 
-fn ordinary_round(round: &mut ReportRound) {
+pub(super) fn ordinary_round(round: &mut ReportRound) {
     round.assistant.content = MessageContent::Agent(vec![ContentBlock::ToolUse {
         id: "checkpoint-call".into(),
         name: "search".into(),

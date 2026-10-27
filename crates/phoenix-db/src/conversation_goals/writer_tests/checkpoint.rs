@@ -16,6 +16,7 @@ use phoenix_core::domain::provider_replay::{
 use phoenix_core::domain::sm_state::ConvState;
 use phoenix_core::domain::tool_result_identity::tool_result_message_id;
 
+mod canonical;
 mod terminal;
 
 struct ReportRound {

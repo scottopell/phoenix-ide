@@ -11,6 +11,8 @@ use phoenix_core::domain::db_schema::Message;
 use phoenix_core::domain::provider_replay::{AnthropicReplayPayload, ProviderReplayUpdate};
 use sqlx::Row;
 
+mod canonical_receipt;
+
 pub(crate) fn validate_goal_round_replay(
     assistant: &Message,
     update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -88,6 +90,7 @@ impl Database {
             }
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let receipt = canonical_receipt::CanonicalReceipt::new(state, state_updated_at, update)?;
         let (results, replayed) = round::write_round_tx(
             &mut tx,
             conversation_id,
@@ -98,6 +101,11 @@ impl Database {
             self.goal_write_policies(),
         )
         .await?;
+        if replayed {
+            receipt
+                .verify(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
+        }
         let (state, state_updated_at) =
             round::selected_state_tx(&mut tx, conversation_id, state, state_updated_at, replayed)
                 .await
@@ -106,6 +114,11 @@ impl Database {
             if let Some(update) = update {
                 apply_replay_tx(&mut tx, conversation_id, update).await?;
             }
+        }
+        if !replayed {
+            receipt
+                .insert(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
         }
         if cut == Some(CanonicalCommitCut::BeforeCanonicalCommit) {
             tx.rollback().await?;

@@ -734,6 +734,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "federation_local_stop_acceptance",
         sql: include_str!("federation_subscriptions/local_stop_acceptance.sql"),
     },
+    Migration {
+        version: 141,
+        name: "canonical_tool_round_receipts",
+        sql: include_str!("provider_replay/canonical_receipt.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -14965,6 +14970,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (141, "canonical_tool_round_receipts"),
             (140, "federation_local_stop_acceptance"),
             (139, "goal_start_materialization_witness"),
             (138, "per_goal_execution_requests"),
