@@ -155,6 +155,7 @@ entity ReturnObligation {
     text: String
     state: ReturnState
     attempt_key: String?
+    thread_attempts: Integer
     notification_receipt: String?
     notification_operation: NotificationOperation?
     delivery_proof: String when state = confirmed
@@ -179,6 +180,11 @@ entity ReturnObligation {
         request in covered_requests
     }
 
+    invariant BoundedThreadRetries {
+        thread_attempts >= 0 and thread_attempts <= config.thread_attempt_limit
+        and (state = known_unsent implies thread_attempts < config.thread_attempt_limit)
+    }
+
     transitions state {
         pending -> attempting
         pending -> failed
@@ -194,6 +200,10 @@ entity ReturnObligation {
         uncertain -> failed
         terminal: submitted, confirmed, failed
     }
+}
+
+config {
+    thread_attempt_limit: Integer = 3
 }
 
 -- REQ-SG-001/002/004/005. Baseline completion and eligibility are preconditions,
@@ -234,6 +244,9 @@ rule EyesConfirmed {
     when: EyesReactionConfirmed(request)
     requires: request.acknowledgment = attempting
     ensures: request.acknowledgment = confirmed
+    @guidance
+        -- A negative response, including missing or malformed error detail,
+        -- cannot confirm eyes except for operation-qualified already-present evidence.
 }
 
 rule EyesUnconfirmed {
@@ -314,6 +327,7 @@ rule RecordBeforeAdmissionFailure {
         text: response,
         state: pending,
         attempt_key: null,
+        thread_attempts: 0,
         notification_receipt: null
         notification_operation: null
     )
@@ -342,6 +356,7 @@ rule OweExplicitResponse {
         text: outcome.public_response,
         state: pending,
         attempt_key: null,
+        thread_attempts: 0,
         notification_receipt: null
         notification_operation: null
     )
@@ -365,6 +380,7 @@ rule OweBriefingNotice {
         text: notice,
         state: pending,
         attempt_key: null,
+        thread_attempts: 0,
         notification_receipt: null
         notification_operation: null
     )
@@ -375,8 +391,10 @@ rule BeginReturnAttempt {
     when: DispatchReturn(obligation, attempt)
     requires: obligation.state in {pending, known_unsent}
     requires: obligation.kind = thread_reply
+    requires: obligation.thread_attempts < config.thread_attempt_limit
     ensures: obligation.state = attempting
     ensures: obligation.attempt_key = attempt
+    ensures: obligation.thread_attempts = obligation.thread_attempts + 1
 }
 
 rule BeginNotificationAttempt {
@@ -422,7 +440,21 @@ rule RecordKnownUnsent {
     requires: obligation.kind = thread_reply
     requires: obligation.state = attempting
     requires: obligation.attempt_key = attempt
+    requires: obligation.thread_attempts < config.thread_attempt_limit
     ensures: obligation.state = known_unsent
+}
+
+rule ExhaustUnsentThreadReturn {
+    when: ExternalOperationNotSent(obligation, attempt)
+    requires: obligation.kind = thread_reply
+    requires: obligation.state = attempting
+    requires: obligation.attempt_key = attempt
+    requires: obligation.thread_attempts = config.thread_attempt_limit
+    ensures: obligation.state = failed
+    ensures: obligation.failure_reason = "Thread reply exhausted its definitely-unsent attempt allowance"
+    @guidance
+        -- Atomically queue one separate private failure notice with the same
+        -- request coverage. Native work is not rerun and the thread duty settles.
 }
 
 rule RecordUncertainReturn {
@@ -469,6 +501,7 @@ rule ReportUnavailableThread {
         text: notice,
         state: pending,
         attempt_key: null,
+        thread_attempts: 0,
         notification_receipt: null
         notification_operation: null
     )
@@ -482,7 +515,17 @@ rule ReconcileUnsentReturn {
     when: ExternalNonDeliveryProven(obligation)
     requires: obligation.kind = thread_reply
     requires: obligation.state = uncertain
+    requires: obligation.thread_attempts < config.thread_attempt_limit
     ensures: obligation.state = known_unsent
+}
+
+rule ReconcileExhaustedUnsentReturn {
+    when: ExternalNonDeliveryProven(obligation)
+    requires: obligation.kind = thread_reply
+    requires: obligation.state = uncertain
+    requires: obligation.thread_attempts = config.thread_attempt_limit
+    ensures: obligation.state = failed
+    ensures: obligation.failure_reason = "Thread reply exhausted its definitely-unsent attempt allowance"
 }
 
 rule RecordReturnFailure {

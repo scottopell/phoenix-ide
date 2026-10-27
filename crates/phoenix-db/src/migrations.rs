@@ -769,6 +769,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE slack_gateway_requests ADD COLUMN eyes_failure TEXT CHECK(eyes_failure IS NULL OR (eyes_confirmed=0 AND length(trim(eyes_failure))>0));
         ALTER TABLE slack_gateway_returns ADD COLUMN notification_inspect_after_us INTEGER CHECK(notification_inspect_after_us IS NULL OR (typeof(notification_inspect_after_us)='integer' AND notification_inspect_after_us>=0));",
     },
+    Migration {
+        version: 146,
+        name: "slack_gateway_thread_attempt_bound",
+        sql: "ALTER TABLE slack_gateway_returns ADD COLUMN thread_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(typeof(thread_attempt_count)='integer' AND thread_attempt_count BETWEEN 0 AND 3);
+        UPDATE slack_gateway_returns SET thread_attempt_count=1 WHERE destination='thread' AND attempt_id IS NOT NULL;",
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13172,6 +13178,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_thread_attempt_bound_preserves_retained_claims() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE slack_gateway_returns(return_id TEXT PRIMARY KEY,destination TEXT,attempt_id TEXT);
+            INSERT INTO slack_gateway_returns VALUES('pending','thread',NULL),('thread','thread','old-attempt'),('private','private','old-command');")
+            .execute(&pool).await.unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "slack_gateway_thread_attempt_bound")
+            .unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT return_id,thread_attempt_count FROM slack_gateway_returns ORDER BY return_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("pending".into(), 0),
+                ("private".into(), 0),
+                ("thread".into(), 1)
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn slack_trigger_provenance_preserves_historical_unknowns() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -15085,6 +15122,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (146, "slack_gateway_thread_attempt_bound"),
             (145, "slack_gateway_delivery_retry_bounds"),
             (144, "slack_gateway_frozen_notification_target"),
             (143, "slack_gateway_trigger_provenance"),

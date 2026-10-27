@@ -74,6 +74,8 @@ WHEN request acceptance is durable, THE SYSTEM SHALL attempt to add `:eyes:` to 
 
 THE SYSTEM SHALL make at most one bounded acknowledgment attempt per accepted request, recording the attempt before invoking Slack. Success or an operation-qualified already-present response SHALL confirm eyes. Rejection, timeout, interruption, or an ambiguous response SHALL remain visible without automatic retry. A crash after claiming the attempt MAY leave eyes absent. The absence of eyes SHALL NOT imply that work was not accepted.
 
+An explicit negative Slack response SHALL remain unconfirmed even when its error detail is missing or malformed; only operation-qualified already-present evidence MAY establish confirmation from a negative response.
+
 Acknowledgment failure SHALL NOT cancel native work, suppress a reply, or block an account change. Removing fire after acceptance SHALL NOT cancel the request. Gateway progress SHALL NOT add completion, waiting, or failure reactions.
 
 **Rationale:** One small acknowledgment tells the owner when they can remove their discovery gesture safely.
@@ -150,7 +152,7 @@ THE SYSTEM SHALL publish the answer, clarification, or failure selected for the 
 
 THE SYSTEM SHALL instruct the agent to return the invocation's automatic answer and clarifications through the gateway-owned return path rather than independently post them with Slack tools. A separately and explicitly requested Slack side effect SHALL remain governed by ordinary task authorization and permissions; this assignment-level division of reply ownership SHALL NOT introduce tool restrictions or a new permission mode.
 
-THE SYSTEM SHALL retain each output's exact native source and Slack destination, distinguish queued, confirmed, failed, and uncertain delivery, and preserve output obligations across same-version restart. A known-unsent operation MAY be retried within a bounded retry policy. An operation whose external outcome is unknown SHALL be reconciled or exposed as uncertain rather than blindly resent or declared delivered. An unavailable destination SHALL NOT be replaced by a different public channel.
+THE SYSTEM SHALL retain each output's exact native source and Slack destination, distinguish queued, confirmed, failed, and uncertain delivery, and preserve output obligations across same-version restart. A known-unsent thread operation MAY be retried within three total durably claimed attempts, including pre-dispatch failures. Exhaustion SHALL record an explicit delivery failure and queue one separate best-effort private notice with the same request coverage, without rerunning native work or retaining a retry/account-change lock. An operation whose external outcome is unknown SHALL be reconciled or exposed as uncertain rather than blindly resent or declared delivered. An unavailable destination SHALL NOT be replaced by a different public channel.
 
 Thread-delivery evidence SHALL identify exactly one source root. Duplicate or conflicting root parameters SHALL NOT confirm delivery.
 

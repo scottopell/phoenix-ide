@@ -8,6 +8,7 @@ use sqlx::Row;
 const EYES_OUTCOME_UNKNOWN: &str =
     "Acknowledgment outcome unknown; the one-time attempt is not retried";
 const CLARIFICATION_HANDOFF: &str = "Phoenix needs your input. Continue in Phoenix:";
+const THREAD_ATTEMPT_LIMIT: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -486,7 +487,7 @@ impl Database {
             .bind(workspace).bind(owner).try_map(|r:sqlx::sqlite::SqliteRow|Ok(SlackReturn{return_id:r.try_get("return_id")?,created_at_us:r.try_get("created_at_unix_micros")?,binding_id:r.try_get("binding_id")?,workspace:r.try_get("workspace")?,owner:r.try_get("owner")?,channel:r.try_get("channel")?,thread_ts:r.try_get("thread_ts")?,text:r.try_get("text")?,destination:r.try_get("destination")?,published:r.try_get("published")?,request_ids:serde_json::from_str(&r.try_get::<String,_>("request_ids")?).map_err(|e|sqlx::Error::Decode(e.into()))?,state:SlackReturnState::decode(&r.try_get::<String,_>("state")?)?,notification_receipt:r.try_get("notification_receipt")?,failure:r.try_get("failure")?,product_id:r.try_get("product_id")?})).fetch_all(self.pool()).await?)
     }
     pub async fn slack_begin_return(&self, id: &str, attempt: &str) -> DbResult<bool> {
-        Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2 WHERE return_id=?1 AND destination='thread' AND state IN ('pending','known_unsent') AND (response_kind<>'clarification' OR NOT EXISTS(SELECT 1 FROM slack_gateway_questions q WHERE q.return_id=?1))").bind(id).bind(attempt).execute(self.pool()).await?.rows_affected()==1)
+        Ok(sqlx::query("UPDATE slack_gateway_returns SET state='attempting',attempt_id=?2,thread_attempt_count=thread_attempt_count+1 WHERE return_id=?1 AND destination='thread' AND state IN ('pending','known_unsent') AND thread_attempt_count<?3 AND (response_kind<>'clarification' OR NOT EXISTS(SELECT 1 FROM slack_gateway_questions q WHERE q.return_id=?1))").bind(id).bind(attempt).bind(THREAD_ATTEMPT_LIMIT).execute(self.pool()).await?.rows_affected()==1)
     }
     pub async fn slack_begin_notification_return(
         &self,
@@ -514,6 +515,16 @@ impl Database {
         receipt: Option<&str>,
         error: Option<&str>,
     ) -> DbResult<()> {
+        if state == SlackReturnState::KnownUnsent {
+            let exhausted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slack_gateway_returns WHERE return_id=?1 AND attempt_id=?2 AND state='attempting' AND destination='thread' AND thread_attempt_count>=?3)")
+                .bind(id).bind(attempt).bind(THREAD_ATTEMPT_LIMIT).fetch_one(self.pool()).await?;
+            if exhausted {
+                return self.slack_fail_return_with_notice(id, attempt, &format!(
+                    "Thread reply stopped after {THREAD_ATTEMPT_LIMIT} definitely-unsent attempts: {}",
+                    error.unwrap_or("Slack did not accept the reply")
+                )).await;
+            }
+        }
         sqlx::query("UPDATE slack_gateway_returns SET state=CASE WHEN destination='private' AND ?3='known_unsent' THEN 'failed' ELSE ?3 END,delivery_proof=?4,notification_receipt=?5,failure=?6 WHERE return_id=?1 AND attempt_id=?2 AND state='attempting'").bind(id).bind(attempt).bind(state.as_str()).bind(proof).bind(receipt).bind(error).execute(self.pool()).await?;
         Ok(())
     }
@@ -1319,6 +1330,122 @@ mod tests {
                     "{table}.{column} accepted {invalid}"
                 );
             }
+        }
+    }
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One retained operation verifies exhaustion and coverage across reopen.
+    async fn unsent_thread_replies_exhaust_their_bound_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reply.db");
+        let mut db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let source = source("100.000", SlackRequestKind::Explicit);
+        db.accept_slack_source(&source, false).await.unwrap();
+        let request = db
+            .slack_requests(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .remove(0);
+        db.fail_slack_before_admission(
+            &request.request_id,
+            "fixture refusal",
+            "https://phoenix.example",
+        )
+        .await
+        .unwrap();
+        let output = db
+            .slack_returns(&source.workspace, &source.owner)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|o| o.destination == "thread")
+            .unwrap();
+        for number in 1..=THREAD_ATTEMPT_LIMIT {
+            let attempt = format!("attempt-{number}");
+            assert!(db
+                .slack_begin_return(&output.return_id, &attempt)
+                .await
+                .unwrap());
+            assert!(!db
+                .slack_begin_return(&output.return_id, "concurrent")
+                .await
+                .unwrap());
+            db.slack_finish_return(
+                &output.return_id,
+                &attempt,
+                SlackReturnState::KnownUnsent,
+                None,
+                None,
+                Some("not dispatched"),
+            )
+            .await
+            .unwrap();
+            db.pool().close().await;
+            db = Database::open(path.to_str().unwrap()).await.unwrap();
+            db.slack_recover_returns().await.unwrap();
+            let retained = db
+                .slack_returns(&source.workspace, &source.owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|o| o.return_id == output.return_id)
+                .unwrap();
+            assert_eq!(
+                retained.state,
+                if number < THREAD_ATTEMPT_LIMIT {
+                    SlackReturnState::KnownUnsent
+                } else {
+                    SlackReturnState::Failed
+                }
+            );
+            assert_eq!(retained.text, output.text);
+            assert_eq!(retained.request_ids, output.request_ids);
+        }
+        assert!(!db
+            .slack_begin_return(&output.return_id, "fourth")
+            .await
+            .unwrap());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT thread_attempt_count FROM slack_gateway_returns WHERE return_id=?1",
+        )
+        .bind(&output.return_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, THREAD_ATTEMPT_LIMIT);
+        let notices = db
+            .slack_returns(&source.workspace, &source.owner)
+            .await
+            .unwrap();
+        let failure = notices
+            .iter()
+            .find(|o| o.return_id == output.return_id)
+            .unwrap();
+        assert!(failure
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("3 definitely-unsent attempts"));
+        let private: Vec<_> = notices
+            .iter()
+            .filter(|o| o.destination == "private")
+            .collect();
+        assert_eq!(private.len(), 1);
+        assert_eq!(private[0].request_ids, output.request_ids);
+        db.set_slack_configuration(
+            r#"{"workspace":"other.slack.com","owner":"UOTHER","enabled":false}"#,
+        )
+        .await
+        .unwrap();
+        for invalid in ["-1", "4", "1.5", "'invalid'"] {
+            assert!(sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE slack_gateway_returns SET thread_attempt_count={invalid}"
+            )))
+            .execute(db.pool())
+            .await
+            .is_err());
         }
     }
     #[tokio::test]

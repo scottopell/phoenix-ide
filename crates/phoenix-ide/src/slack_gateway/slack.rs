@@ -597,12 +597,13 @@ fn decode_result(raw: &str) -> Result<Value, McpOneShotError> {
     classify_tool_value(value)
 }
 fn classify_tool_value(value: Value) -> Result<Value, McpOneShotError> {
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(McpOneShotError::ToolRejected(value.to_string()));
+    }
     if let Some(error) = value.get("error").and_then(Value::as_str) {
-        return Err(if value.get("ok").and_then(Value::as_bool) == Some(false) {
-            McpOneShotError::ToolRejected(value.to_string())
-        } else {
-            McpOneShotError::Uncertain(format!("Slack API error: {error}"))
-        });
+        return Err(McpOneShotError::Uncertain(format!(
+            "Slack API error: {error}"
+        )));
     }
     Ok(value)
 }
@@ -1134,6 +1135,20 @@ mod tests {
     async fn existing_eyes_require_operation_specific_rejection_evidence() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         for (result, confirmed) in [
+            (json!({"ok":true}), true),
+            (json!({"ok":false,"method":"reactions.add"}), false),
+            (
+                json!({"ok":false,"method":"reactions.add","error":null}),
+                false,
+            ),
+            (
+                json!({"ok":false,"method":"reactions.add","error":42}),
+                false,
+            ),
+            (
+                json!({"ok":false,"method":"reactions.add","error":{}}),
+                false,
+            ),
             (
                 json!({"ok":false,"error":"already_reacted","method":"reactions.add"}),
                 true,

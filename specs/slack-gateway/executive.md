@@ -37,7 +37,10 @@ inspection or automatic retry. Eyes is claimed once before calling Slack; failur
 or interruption cannot retry it. These signals never block an otherwise settled
 account change. Clarifications contain only a generic Phoenix handoff and link;
 question bodies and options remain native. Thread replies retain durable delivery
-and exact request coverage.
+and exact request coverage. They have at most three durably claimed attempts,
+including pre-dispatch failures; definitely-unsent exhaustion records failure and
+queues one private notice. Negative acknowledgment envelopes remain unconfirmed
+when their error detail is missing or malformed.
 
 Deleted runtime code includes receipt inspection, inspection scheduling, private
 retry handling, question-text rendering and question-retirement synchronization.
@@ -56,6 +59,12 @@ Clippy, formatting, Allium and structural checks. Ten protected deployment
 controller tests pass, including rejection of the unqualified current registry
 before stopping a service.
 
+The follow-up retry-bound and negative-acknowledgment changes pass all 83 focused
+gateway/ledger tests, one additional retained-claim migration regression, and
+seven final static checks. Retry exhaustion across reopen preserves text and
+coverage, creates one private failure notice, and releases the account-change lock;
+the existing readiness/rate-limit fixture confirms delivery on the last allowance.
+
 The pre-integration 1,200-test developer-tool run had three environment-sensitive
 failures; all three pass with native Bash/OpenSSL and the shared Cargo target
 override removed. The full developer-tool run was not repeated. Hosted CI and
@@ -71,12 +80,12 @@ routing, credentials, provider adapters and private operational records stay out
 the public repository. The redesigned settings and later hardening are not claimed
 deployed by pilot evidence.
 
-Public migrations 141–145 follow upstream migration 140; the pilot used a distinct
+Public migrations 141–146 follow upstream migration 140; the pilot used a distinct
 pre-publication migration-130 ledger. Direct pilot-to-public upgrade is unqualified
 and requires offline reconciliation plus paired rollback qualification. Protected
 deployment limits remain intact. No merge, new deployment or live integration
 writes are implied by local tests or this simplification.
 
-The unmerged Slack migrations follow upstream's 132–140 registry at 141–145.
+The unmerged Slack migrations follow upstream's 132–140 registry at 141–146.
 The Slack origin CHECK preserves upstream remote attribution. Earlier prototype
 and pre-integration development ledgers are not qualified direct upgrade sources.
