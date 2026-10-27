@@ -169,6 +169,13 @@ async fn evidence(
             .fetch_one(db.pool())
             .await
             .unwrap();
+    let receipts: Vec<(String, Vec<u8>, String, String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT assistant_message_id,selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256
+         FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
+    ).bind(transcript).fetch_all(db.pool()).await.unwrap();
+    let replay_head: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT model,response_id,payload FROM active_provider_replay_state WHERE conversation_id=?",
+    ).bind(transcript).fetch_optional(db.pool()).await.unwrap();
     serde_json::json!({
         "goal": db.conversation_goal(owner).await.unwrap(),
         "history": db.conversation_goal_history(owner, GoalVersion::INITIAL).await.unwrap(),
@@ -177,6 +184,8 @@ async fn evidence(
         "state": state,
         "replay": db.load_provider_replay_state(transcript).await.unwrap(),
         "obligations": obligations,
+        "receipts": receipts,
+        "replay_head": replay_head,
     })
 }
 

@@ -238,3 +238,96 @@ async fn canonical_receipt_rolls_back_before_commit_and_survives_after_commit_fa
         }
     }
 }
+
+async fn seed_anthropic(db: &Database, round: &ReportRound, set: AnthropicResponseSet) {
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    crate::provider_replay::apply_replay_tx(
+        &mut tx,
+        &round.assistant.conversation_id,
+        &ProviderReplayUpdate::Anthropic(set),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn new_canonical_round_rejects_rewritten_anthropic_response_identity_atomically() {
+    for field in ["model", "owner", "private", "public"] {
+        let (db, owner, round) = report_fixture().await;
+        let ProviderReplayUpdate::Anthropic(mut retained) = round.replay() else {
+            unreachable!()
+        };
+        match field {
+            "model" => retained.identity.model = "older-model".into(),
+            "owner" => retained.owner_message_id = "older-assistant".into(),
+            "private" => retained.private_blocks.clear(),
+            "public" => {
+                retained.public_content = vec![ContentBlock::Text {
+                    text: "older public text".into(),
+                }]
+            }
+            _ => unreachable!(),
+        }
+        seed_anthropic(&db, &round, retained).await;
+        let before = evidence(&db, &owner, &round).await;
+        let error = round.commit(&db).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Anthropic response identity differs"),
+            "{field}: {error}"
+        );
+        assert_eq!(evidence(&db, &owner, &round).await, before, "{field}");
+        assert_eq!(receipt_count(&db).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn new_canonical_round_accepts_exact_anthropic_identity_without_rewinding_active_head() {
+    let (db, owner, round) = report_fixture().await;
+    let ProviderReplayUpdate::Anthropic(original) = round.replay() else {
+        unreachable!()
+    };
+    seed_anthropic(&db, &round, original.clone()).await;
+    let mut newer = original;
+    newer.identity.response_id = "newer-response".into();
+    newer.identity.model = "newer-model".into();
+    newer.owner_message_id = "newer-assistant".into();
+    seed_anthropic(&db, &round, newer).await;
+    let before = evidence(&db, &owner, &round).await;
+    assert!(!round.commit(&db).await.unwrap().replayed);
+    let after = evidence(&db, &owner, &round).await;
+    assert_eq!(after["replay_head"], before["replay_head"]);
+    assert_eq!(after["replay"], before["replay"]);
+    assert_eq!(receipt_count(&db).await, 1);
+    assert_eq!(
+        after["history"].as_array().unwrap().len(),
+        before["history"].as_array().unwrap().len() + 1
+    );
+}
+
+#[tokio::test]
+async fn new_canonical_round_appends_a_new_anthropic_response_identity() {
+    let (db, owner, round) = report_fixture().await;
+    let ProviderReplayUpdate::Anthropic(mut earlier) = round.replay() else {
+        unreachable!()
+    };
+    earlier.identity.response_id = "earlier-response".into();
+    earlier.owner_message_id = "earlier-assistant".into();
+    seed_anthropic(&db, &round, earlier.clone()).await;
+    assert!(!round.commit(&db).await.unwrap().replayed);
+    let replay = db
+        .load_provider_replay_state(&round.assistant.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ProviderReplayUpdate::Anthropic(current) = round.replay() else {
+        unreachable!()
+    };
+    assert_eq!(replay.response_sets, vec![earlier, current.clone()]);
+    let after = evidence(&db, &owner, &round).await;
+    assert_eq!(after["replay_head"][0], current.identity.model);
+    assert_eq!(after["replay_head"][1], current.identity.response_id);
+    assert_eq!(receipt_count(&db).await, 1);
+}

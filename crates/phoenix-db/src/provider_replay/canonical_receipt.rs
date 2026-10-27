@@ -7,7 +7,7 @@ use sqlx::{Row, Sqlite, Transaction};
 use crate::{DbError, DbResult};
 
 #[derive(Debug, PartialEq)]
-pub(super) struct CanonicalReceipt {
+pub(crate) struct CanonicalReceipt {
     state_hash: Vec<u8>,
     state_updated_at: String,
     replay_kind: &'static str,
@@ -27,7 +27,7 @@ fn command_hash(domain: &[u8], value: &impl Serialize) -> DbResult<Vec<u8>> {
 }
 
 impl CanonicalReceipt {
-    pub(super) fn new(
+    pub(crate) fn new(
         state: &ConvState,
         timestamp: DateTime<Utc>,
         replay: Option<&ProviderReplayUpdate>,
@@ -52,7 +52,7 @@ impl CanonicalReceipt {
         })
     }
 
-    pub(super) async fn verify(
+    pub(crate) async fn verify(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         conversation_id: &str,
@@ -80,7 +80,7 @@ impl CanonicalReceipt {
         Ok(())
     }
 
-    pub(super) async fn insert(
+    pub(crate) async fn insert(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         conversation_id: &str,

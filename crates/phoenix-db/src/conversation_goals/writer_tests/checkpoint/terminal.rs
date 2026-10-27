@@ -115,24 +115,157 @@ async fn ordinary_terminal_replay_verifies_identity_and_preserves_newer_state() 
         .await
         .unwrap();
     let before = evidence(&db, &owner, &round).await;
-    db.persist_tool_round_with_terminal_obligation(
+    db.persist_tool_round_with_terminal_obligation_input_at_cut(
         &round.assistant.conversation_id,
         &round.assistant,
-        &committed.results,
+        ToolRoundWrite::Finalized(&committed.results),
         &obligation,
+        Some(&round.replay()),
+        crate::TerminalEvidenceTransactionCut::None,
     )
     .await
     .unwrap();
     assert_eq!(evidence(&db, &owner, &round).await, before);
     obligation.expected_generation += 1;
     assert!(db
-        .persist_tool_round_with_terminal_obligation(
+        .persist_tool_round_with_terminal_obligation_input_at_cut(
             &round.assistant.conversation_id,
             &round.assistant,
-            &committed.results,
+            ToolRoundWrite::Finalized(&committed.results),
             &obligation,
+            Some(&round.replay()),
+            crate::TerminalEvidenceTransactionCut::None,
         )
         .await
         .is_err());
+    assert_eq!(evidence(&db, &owner, &round).await, before);
+}
+
+#[tokio::test]
+async fn terminal_retries_bind_full_replay_command_without_rewinding_newer_evidence() {
+    for ordinary in [false, true] {
+        let (db, owner, mut round) = report_fixture().await;
+        if ordinary {
+            ordinary_round(&mut round);
+        }
+        let obligation = obligation(&db, &round).await;
+        terminal_commit(&db, &round, &obligation).await.unwrap();
+        db.update_conversation_state(
+            &round.assistant.conversation_id,
+            &ConvState::LlmRequesting { attempt: 9 },
+        )
+        .await
+        .unwrap();
+        db.clear_provider_replay_state(&round.assistant.conversation_id)
+            .await
+            .unwrap();
+        let before = evidence(&db, &owner, &round).await;
+        assert_eq!(before["receipts"].as_array().unwrap().len(), 1);
+        assert!(
+            terminal_commit(&db, &round, &obligation)
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(evidence(&db, &owner, &round).await, before);
+        let ProviderReplayUpdate::Anthropic(mut changed) = round.replay() else {
+            unreachable!()
+        };
+        changed.identity.model = "changed-model".into();
+        for replay in [
+            Some(ProviderReplayUpdate::Anthropic(changed)),
+            None,
+            Some(ProviderReplayUpdate::Clear),
+        ] {
+            let error = db
+                .persist_goal_tool_round_with_terminal_obligation(
+                    &round.assistant,
+                    round.execution,
+                    &round.results,
+                    &obligation,
+                    replay.as_ref(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("canonical checkpoint command differs"));
+            assert_eq!(evidence(&db, &owner, &round).await, before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_receipt_and_obligation_share_before_and_after_commit_cuts() {
+    use crate::TerminalEvidenceTransactionCut;
+    for ordinary in [false, true] {
+        for (cut, retained) in [
+            (TerminalEvidenceTransactionCut::BeforeCommit, false),
+            (TerminalEvidenceTransactionCut::AfterCommit, true),
+        ] {
+            let (db, owner, mut round) = report_fixture().await;
+            if ordinary {
+                ordinary_round(&mut round);
+            }
+            let obligation = obligation(&db, &round).await;
+            let before = evidence(&db, &owner, &round).await;
+            assert!(db
+                .persist_tool_round_with_terminal_obligation_input_at_cut(
+                    &round.assistant.conversation_id,
+                    &round.assistant,
+                    ToolRoundWrite::Pending {
+                        execution: round.execution,
+                        results: &round.results
+                    },
+                    &obligation,
+                    Some(&round.replay()),
+                    cut,
+                )
+                .await
+                .is_err());
+            let after = evidence(&db, &owner, &round).await;
+            assert_eq!(after["obligations"], i64::from(retained));
+            assert_eq!(
+                after["receipts"].as_array().unwrap().len(),
+                usize::from(retained)
+            );
+            if retained {
+                assert!(
+                    terminal_commit(&db, &round, &obligation)
+                        .await
+                        .unwrap()
+                        .replayed
+                );
+                assert_eq!(evidence(&db, &owner, &round).await, after);
+            } else {
+                assert_eq!(after, before);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_to_canonical_requires_the_identical_projection_and_replay_command() {
+    let (db, owner, round) = report_fixture().await;
+    let obligation = obligation(&db, &round).await;
+    terminal_commit(&db, &round, &obligation).await.unwrap();
+    let before = evidence(&db, &owner, &round).await;
+    assert!(round
+        .commit(&db)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("canonical checkpoint command differs"));
+    let checkpoint = GoalRoundCheckpoint {
+        state: &obligation.projection.state,
+        state_updated_at: obligation.projection.state_updated_at,
+        ..round.checkpoint()
+    };
+    assert!(
+        db.persist_canonical_checkpoint(&checkpoint, Some(&round.replay()))
+            .await
+            .unwrap()
+            .replayed
+    );
     assert_eq!(evidence(&db, &owner, &round).await, before);
 }

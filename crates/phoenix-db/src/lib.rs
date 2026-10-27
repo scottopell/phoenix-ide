@@ -10381,6 +10381,11 @@ impl Database {
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<conversation_goals::round::CommittedGoalTerminalRound> {
         use conversation_goals::round;
+        let receipt = provider_replay::CanonicalReceipt::new(
+            &obligation.projection.state,
+            obligation.projection.state_updated_at,
+            replay,
+        )?;
         if matches!(&input, round::ToolRoundWrite::Pending { .. }) {
             if let Some(update) = replay {
                 provider_replay::validate_goal_round_replay(assistant, update)?;
@@ -10416,10 +10421,18 @@ impl Database {
         .await?;
         round::persist_round_terminal_obligation_tx(&mut tx, conversation_id, obligation, replayed)
             .await?;
+        if replayed {
+            receipt
+                .verify(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
+        }
         if !replayed {
             if let Some(update) = replay {
                 provider_replay::apply_replay_tx(&mut tx, conversation_id, update).await?;
             }
+            receipt
+                .insert(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
             sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
                 .bind(Utc::now().to_rfc3339())
                 .bind(conversation_id)

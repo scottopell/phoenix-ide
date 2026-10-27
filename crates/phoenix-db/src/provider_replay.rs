@@ -12,6 +12,7 @@ use phoenix_core::domain::provider_replay::{AnthropicReplayPayload, ProviderRepl
 use sqlx::Row;
 
 mod canonical_receipt;
+pub(crate) use canonical_receipt::CanonicalReceipt;
 
 pub(crate) fn validate_goal_round_replay(
     assistant: &Message,
@@ -519,12 +520,18 @@ pub(crate) async fn apply_replay_tx(
                     DbError::Serialization(format!("provider replay validation: {error}"))
                 })?
                 .map_or_else(Vec::new, |payload| payload.response_sets);
-            if !sets
+            if let Some(retained) = sets
                 .iter()
-                .any(|set| set.identity.response_id == response.identity.response_id)
+                .find(|set| set.identity.response_id == response.identity.response_id)
             {
-                sets.push(response.clone());
+                if retained != response {
+                    return Err(DbError::Serialization(
+                        "Anthropic response identity differs".into(),
+                    ));
+                }
+                return Ok(());
             }
+            sets.push(response.clone());
             let payload = AnthropicReplayPayload::new(sets)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             let json = serde_json::to_string(&payload)
