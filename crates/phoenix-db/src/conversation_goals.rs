@@ -13,8 +13,28 @@ use crate::Database;
 
 type GoalTx<'a> = Transaction<'a, Sqlite>;
 
+mod admission;
+pub mod control;
+pub mod execution;
+pub mod user_commands;
+
+#[cfg(test)]
+mod writer_tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum GoalDbError {
+    #[error("goal execution binding conflicts with its retained admission")]
+    BindingConflict,
+    #[error("goal mutation requires a settled turn boundary")]
+    Busy,
+    #[error("goal owner or current transcript changed during admission")]
+    TargetChanged,
+    #[error(transparent)]
+    Control(#[from] control::ControlError),
+    #[error("goal action identity was already used for another mutation")]
+    RetryConflict,
+    #[error("goal identity is already retained")]
+    DuplicateGoalId,
     #[error(transparent)]
     Admission(#[from] crate::DbError),
     #[error(transparent)]
@@ -216,6 +236,302 @@ async fn history_entry(tx: &mut GoalTx<'_>, row: &SqliteRow) -> Result<GoalHisto
         },
         GoalTimestampUs::parse(row.try_get("recorded_at_us")?)?,
     )?)
+}
+
+fn state_columns(state: &GoalState) -> (&'static str, Option<&str>) {
+    match state {
+        GoalState::Underway => ("underway", None),
+        GoalState::Blocked(reason) => ("blocked", Some(reason.as_str())),
+        GoalState::Suspended(reason) => ("suspended", Some(reason.as_str())),
+        GoalState::Complete(reason) => ("complete", Some(reason.as_str())),
+        GoalState::Exhausted(reason) => ("exhausted", Some(reason.as_str())),
+    }
+}
+
+async fn insert_actor(
+    tx: &mut GoalTx<'_>,
+    owner: &ProductConversationId,
+    actor: &GoalActor,
+    result_version: GoalVersion,
+) -> Result<i64> {
+    if let GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) = actor {
+        let row = sqlx::query(
+            "SELECT message_type,content FROM messages WHERE conversation_id=? AND message_id=?",
+        )
+        .bind(source.transcript_id.as_str())
+        .bind(source.message_id.as_str())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(GoalDbError::Integrity("source message missing"))?;
+        let kind: String = row.try_get("message_type")?;
+        let blocks: Vec<phoenix_core::domain::llm_types::ContentBlock> =
+            serde_json::from_str(&row.try_get::<String, _>("content")?)
+                .map_err(|_| GoalDbError::Integrity("source tool message content"))?;
+        if kind != "agent" || !blocks.iter().any(|block| matches!(block,
+            phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. } if id == source.tool_use_id.as_str())) {
+            return Err(GoalDbError::Integrity("source tool call mismatch"));
+        }
+    }
+    let (kind, source_product, transcript, workflow, turn, message, tool, host) = match actor {
+        GoalActor::UserControl {
+            principal_id,
+            request_id,
+            command,
+        } => {
+            let command = match command {
+                GoalUserCommandKind::Create => "create",
+                GoalUserCommandKind::State => "state",
+            };
+            let existing: Option<i64> = sqlx::query_scalar("SELECT actor_id FROM conversation_goal_actors WHERE kind='user_control' AND owner_id=?1 AND control_principal_id=?2 AND control_request_id=?3 AND control_command=?4 AND control_result_version=?5")
+                .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
+                .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
+                .fetch_optional(&mut **tx).await?;
+            if let Some(existing) = existing {
+                return Ok(existing);
+            }
+            return Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,control_principal_id,control_request_id,control_command,control_result_version) VALUES (?1,'user_control',?2,?3,?4,?5)")
+                .bind(owner.as_str()).bind(principal_id.as_bytes().as_slice())
+                .bind(request_id.as_bytes().as_slice()).bind(command).bind(result_version.get())
+                .execute(&mut **tx).await?.last_insert_rowid());
+        }
+        GoalActor::UserApi {
+            transcript_id,
+            message_id,
+        } => (
+            "user_api",
+            None,
+            Some(transcript_id.as_str()),
+            None,
+            None,
+            Some(message_id.as_str()),
+            None,
+            None,
+        ),
+        GoalActor::GeneratedHost { action_id } => (
+            "generated_host",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(action_id.as_str()),
+        ),
+        GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) => (
+            if matches!(actor, GoalActor::OwningAgent(_)) {
+                "owning_agent"
+            } else {
+                "coordinator"
+            },
+            Some(source.product_conversation_id.as_str()),
+            Some(source.transcript_id.as_str()),
+            Some(source.execution.workflow_id()),
+            Some(source.execution.turn_id()),
+            Some(source.message_id.as_str()),
+            Some(source.tool_use_id.as_str()),
+            None,
+        ),
+    };
+    Ok(sqlx::query("INSERT INTO conversation_goal_actors (owner_id,kind,source_product_id,transcript_id,workflow_id,turn_id,message_id,tool_use_id,host_action_id) VALUES (?,?,?,?,?,?,?,?,?)")
+        .bind(owner.as_str()).bind(kind).bind(source_product).bind(transcript)
+        .bind(workflow).bind(turn).bind(message).bind(tool).bind(host)
+        .execute(&mut **tx).await?.last_insert_rowid())
+}
+
+async fn retry_tx(
+    tx: &mut GoalTx<'_>,
+    mutation: &GoalMutation,
+) -> Result<Option<GoalHistoryEntry>> {
+    if let Some(row) = sqlx::query("SELECT h.*, g.objective FROM conversation_goal_history h JOIN conversation_goal_ids g USING (goal_id,owner_id) WHERE owner_id=? AND action_id=?")
+        .bind(mutation.owner.as_str()).bind(mutation.action_id.as_str())
+        .fetch_optional(&mut **tx).await? {
+        let previous = history_entry(tx, &row).await?;
+        if previous.mutation() != mutation { return Err(GoalDbError::RetryConflict); }
+        return Ok(Some(previous));
+    }
+    Ok(None)
+}
+
+async fn action_is_claimed_tx(tx: &mut GoalTx<'_>, mutation: &GoalMutation) -> Result<bool> {
+    for actor in [
+        &mutation.attribution.requested_by,
+        &mutation.attribution.applied_by,
+    ] {
+        if let GoalActor::OwningAgent(source) | GoalActor::Coordinator(source) = actor {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM conversation_goal_actors
+                 WHERE kind IN ('owning_agent','coordinator') AND source_product_id=?
+                   AND transcript_id=? AND workflow_id=? AND turn_id=? AND message_id=? AND tool_use_id=?)",
+            )
+            .bind(source.product_conversation_id.as_str()).bind(source.transcript_id.as_str())
+            .bind(source.execution.workflow_id()).bind(source.execution.turn_id())
+            .bind(source.message_id.as_str()).bind(source.tool_use_id.as_str())
+            .fetch_one(&mut **tx).await?;
+            if exists {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn apply_goal_tx(
+    tx: &mut GoalTx<'_>,
+    mutation: &GoalMutation,
+    expected_transcript: Option<&str>,
+    at: GoalTimestampUs,
+    policies: execution::GoalWritePolicies,
+) -> Result<GoalHistoryEntry> {
+    if let Some(previous) = retry_tx(tx, mutation).await? {
+        return Ok(previous);
+    }
+    if action_is_claimed_tx(tx, mutation).await? {
+        return Err(GoalDbError::RetryConflict);
+    }
+    if let GoalChange::Create { goal_id, .. } = &mutation.change {
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_goal_ids WHERE goal_id=?)",
+        )
+        .bind(goal_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if retained {
+            return Err(GoalDbError::DuplicateGoalId);
+        }
+    }
+    if let (control::GoalControlInstallation::Installed, GoalChange::Report { binding, .. }) =
+        (policies.control, &mutation.change)
+    {
+        control::require_current_control_tx(tx, binding.owner(), binding.execution()).await?;
+    }
+    if let Some(transcript) = expected_transcript {
+        match &mutation.change {
+            GoalChange::Report { binding, .. } => {
+                admission::require_live_report_tx(tx, binding, transcript).await?
+            }
+            GoalChange::Create { .. } | GoalChange::SetDisposition { .. } => {
+                admission::require_settled_tx(tx, mutation, transcript).await?
+            }
+        }
+    }
+    let current = current_tx(tx, &mutation.owner).await?;
+    let next = mutation.advance(current.as_ref())?;
+    let (kind, report_turn) = match &mutation.change {
+        GoalChange::Create { goal_id, objective } => {
+            sqlx::query(
+                "INSERT INTO conversation_goal_ids (goal_id,owner_id,objective) VALUES (?,?,?)",
+            )
+            .bind(goal_id.as_str())
+            .bind(mutation.owner.as_str())
+            .bind(objective.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                if matches!(&error, sqlx::Error::Database(db) if db.is_unique_violation()) {
+                    GoalDbError::DuplicateGoalId
+                } else {
+                    GoalDbError::Sqlx(error)
+                }
+            })?;
+            execution::capture_created_limit_tx(tx, policies.execution, goal_id).await?;
+            ("create", None)
+        }
+        GoalChange::SetDisposition { .. } => ("state", None),
+        GoalChange::Report { binding, .. } => {
+            if binding_tx(tx, binding.execution().turn_id())
+                .await?
+                .as_ref()
+                != Some(binding)
+            {
+                return Err(GoalDbError::BindingConflict);
+            }
+            ("report", Some(binding.execution().turn_id()))
+        }
+    };
+    let requester = insert_actor(
+        tx,
+        &mutation.owner,
+        &mutation.attribution.requested_by,
+        next.version(),
+    )
+    .await?;
+    let applier = insert_actor(
+        tx,
+        &mutation.owner,
+        &mutation.attribution.applied_by,
+        next.version(),
+    )
+    .await?;
+    let (state, reason) = state_columns(next.state());
+    sqlx::query("INSERT INTO conversation_goal_history (owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(next.owner().as_str()).bind(next.version().get()).bind(next.goal_id().as_str())
+        .bind(state).bind(reason).bind(mutation.action_id.as_str()).bind(kind).bind(report_turn)
+        .bind(requester).bind(applier).bind(at.get()).execute(&mut **tx).await?;
+    Ok(GoalHistoryEntry::new(next, mutation.clone(), at)?)
+}
+
+pub(crate) async fn capture_goal_at_new_turn_tx(
+    tx: &mut GoalTx<'_>,
+    execution: GoalExecution,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO conversation_goal_bindings (turn_id,workflow_id,owner_id,observed_version,goal_id)
+         SELECT t.turn_id,t.workflow_id,p.id,h.version,
+             CASE WHEN h.state='underway' THEN h.goal_id ELSE NULL END
+         FROM durable_turns t JOIN conversations c ON c.id=t.conversation_id
+         JOIN product_conversations p ON p.id=c.product_conversation_id
+         LEFT JOIN conversation_goal_history h ON h.owner_id=p.id
+             AND h.version=(SELECT MAX(version) FROM conversation_goal_history WHERE owner_id=p.id)
+         WHERE t.turn_id=? AND t.workflow_id=? AND p.kind='ordinary'",
+    ).bind(execution.turn_id()).bind(execution.workflow_id()).execute(&mut **tx).await?;
+    Ok(())
+}
+
+impl Database {
+    /// # Errors
+    /// Rejects conflicting action reuse and malformed persisted data or database failures.
+    pub async fn accepted_conversation_goal_mutation(
+        &self,
+        mutation: &GoalMutation,
+    ) -> Result<Option<GoalHistoryEntry>> {
+        let mut tx = self.pool().begin().await?;
+        let accepted = retry_tx(&mut tx, mutation).await?;
+        tx.commit().await?;
+        Ok(accepted)
+    }
+    /// # Errors
+    /// Rejects busy/changed targets, stale versions, retained IDs, invalid attribution or storage failures.
+    pub async fn apply_conversation_goal(
+        &self,
+        mutation: &GoalMutation,
+        expected_transcript: &str,
+        at: GoalTimestampUs,
+    ) -> Result<GoalHistoryEntry> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(previous) = retry_tx(&mut tx, mutation).await? {
+            tx.commit().await?;
+            return Ok(previous);
+        }
+        let accepted = apply_goal_tx(
+            &mut tx,
+            mutation,
+            Some(expected_transcript),
+            at,
+            self.goal_write_policies(),
+        )
+        .await?;
+        if !matches!(&mutation.change, GoalChange::Report { .. }) {
+            crate::coordinator_watches::goal_facts::settled_change_tx(
+                &mut tx,
+                self.goal_control_installation,
+                &accepted,
+                expected_transcript,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(accepted)
+    }
 }
 
 impl Database {

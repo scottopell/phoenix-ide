@@ -50,6 +50,7 @@ pub enum EventOutcome {
     Cancelled,
     AwaitingUserResponse,
     AwaitingTaskApproval,
+    GoalChanged,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -78,6 +79,7 @@ impl From<WatchEventPresentation> for EventPresentationPayload {
                 WatchOutcome::Cancelled => EventOutcome::Cancelled,
                 WatchOutcome::AwaitingUserResponse => EventOutcome::AwaitingUserResponse,
                 WatchOutcome::AwaitingTaskApproval => EventOutcome::AwaitingTaskApproval,
+                WatchOutcome::GoalChanged => EventOutcome::GoalChanged,
             },
             provenance: match event.provenance {
                 WatchEventProvenance::Subscription => EventProvenance::Subscription,
