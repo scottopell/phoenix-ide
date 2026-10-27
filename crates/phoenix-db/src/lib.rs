@@ -30274,7 +30274,7 @@ mod tests {
             "conv-tr",
             11,
             Utc::now(),
-            phoenix_core::domain::db_schema::ToolResult::success(
+            &phoenix_core::domain::db_schema::ToolResult::success(
                 "tool-a".into(),
                 "output a".into(),
             ),
@@ -30284,7 +30284,7 @@ mod tests {
             "conv-tr",
             12,
             Utc::now(),
-            phoenix_core::domain::db_schema::ToolResult::success(
+            &phoenix_core::domain::db_schema::ToolResult::success(
                 "tool-b".into(),
                 "output b".into(),
             ),
@@ -30437,7 +30437,7 @@ mod tests {
             "conv-checkpoint-cuts",
             21,
             Utc::now(),
-            phoenix_core::domain::db_schema::ToolResult::cancelled("tool".into(), "cancelled"),
+            &phoenix_core::domain::db_schema::ToolResult::cancelled("tool".into(), "cancelled"),
         );
         let obligation = workflow::DirectTurnTerminalObligationInput {
             turn_id,
@@ -30717,7 +30717,7 @@ mod tests {
             conversation_id,
             21,
             created_at,
-            phoenix_core::domain::db_schema::ToolResult::success_with_display(
+            &phoenix_core::domain::db_schema::ToolResult::success_with_display(
                 "tool-terminal".into(),
                 "first durable result".into(),
                 Some(serde_json::json!({"kind": "first"})),
@@ -30756,7 +30756,7 @@ mod tests {
             conversation_id,
             result.row().sequence_id,
             result.row().created_at,
-            phoenix_core::domain::db_schema::ToolResult {
+            &phoenix_core::domain::db_schema::ToolResult {
                 tool_use_id: "tool-terminal".into(),
                 outcome: phoenix_core::domain::db_schema::ToolOutcome::Error {
                     output: "conflicting replay".into(),
@@ -30818,7 +30818,7 @@ mod tests {
             "conv-terminal-round",
             21,
             Utc::now(),
-            phoenix_core::domain::db_schema::ToolResult::cancelled(
+            &phoenix_core::domain::db_schema::ToolResult::cancelled(
                 "tool-terminal".into(),
                 "cancelled",
             ),
@@ -30884,7 +30884,7 @@ mod tests {
             "conv-tr",
             11,
             Utc::now(),
-            phoenix_core::domain::db_schema::ToolResult::success(
+            &phoenix_core::domain::db_schema::ToolResult::success(
                 "tool-a".into(),
                 "output a".into(),
             ),
@@ -30894,7 +30894,7 @@ mod tests {
             "conv-tr",
             12,
             Utc::now(),
-            phoenix_core::domain::db_schema::ToolResult::success(
+            &phoenix_core::domain::db_schema::ToolResult::success(
                 "tool-b".into(),
                 "output b".into(),
             ),

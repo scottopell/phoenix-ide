@@ -87,7 +87,7 @@ impl ReportRound {
     }
 }
 
-fn finalized_result(assistant: &Message, result: ToolResult) -> FinalizedToolResult {
+fn finalized_result(assistant: &Message, result: &ToolResult) -> FinalizedToolResult {
     FinalizedToolResult::new(
         &assistant.message_id,
         &assistant.conversation_id,
@@ -500,7 +500,7 @@ async fn after_canonical_commit_cut_retains_report_and_replays_without_duplicate
 async fn finalized_report_success_cannot_bypass_the_pending_checkpoint_path() {
     let (db, owner, round) = report_fixture().await;
     let committed = round.commit(&db).await.unwrap();
-    let finalized = vec![finalized_result(&round.assistant, accepted_report_result())];
+    let finalized = vec![finalized_result(&round.assistant, &accepted_report_result())];
     assert_eq!(
         serde_json::to_value(finalized[0].row()).unwrap(),
         serde_json::to_value(&committed.results[0]).unwrap()

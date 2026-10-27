@@ -340,7 +340,7 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
         CONVERSATION,
         3,
         Utc::now(),
-        ToolResult::error("toolu_slack".into(), "Session expired".into()),
+        &ToolResult::error("toolu_slack".into(), "Session expired".into()),
     );
     let replay = AnthropicResponseSet::with_public_content(
         AnthropicResponseIdentity {

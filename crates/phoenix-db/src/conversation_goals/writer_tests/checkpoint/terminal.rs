@@ -70,7 +70,7 @@ async fn canonical_ordinary_first_terminal_second_rejects_without_an_obligation(
     ordinary_round(&mut round);
     let obligation = obligation(&db, &round).await;
     let canonical = round.commit(&db).await.unwrap();
-    let finalized = vec![finalized_result(&round.assistant, ordinary_result())];
+    let finalized = vec![finalized_result(&round.assistant, &ordinary_result())];
     assert_eq!(
         serde_json::to_value(finalized[0].row()).unwrap(),
         serde_json::to_value(&canonical.results[0]).unwrap()
@@ -118,7 +118,7 @@ async fn ordinary_terminal_replay_verifies_identity_and_preserves_newer_state() 
     let mut obligation = obligation(&db, &round).await;
     let committed = terminal_commit(&db, &round, &obligation).await.unwrap();
     assert!(!committed.replayed);
-    let finalized = vec![finalized_result(&round.assistant, ordinary_result())];
+    let finalized = vec![finalized_result(&round.assistant, &ordinary_result())];
     assert_eq!(
         serde_json::to_value(finalized[0].row()).unwrap(),
         serde_json::to_value(&committed.results[0]).unwrap()

@@ -1037,7 +1037,9 @@ pub fn tool_result_message_content(result: &ToolResult) -> MessageContent {
         ToolOutcome::TrustedInstructions { .. } => {
             "Authenticated built-in skill instructions were delivered for this live request."
         }
-        _ => result.output(),
+        ToolOutcome::Success { .. } | ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. } => {
+            result.output()
+        }
     };
     MessageContent::tool_with_images(
         &result.tool_use_id,
@@ -1068,7 +1070,7 @@ impl FinalizedToolResult {
         conversation_id: &str,
         sequence_id: i64,
         created_at: DateTime<Utc>,
-        result: ToolResult,
+        result: &ToolResult,
     ) -> Self {
         let disposition = match &result.outcome {
             ToolOutcome::Success { .. } => FinalizedToolDisposition::Success,
@@ -1086,7 +1088,7 @@ impl FinalizedToolResult {
             conversation_id: conversation_id.to_owned(),
             sequence_id,
             message_type: MessageType::Tool,
-            content: tool_result_message_content(&result),
+            content: tool_result_message_content(result),
             created_at,
             display_data: merge_duration_into_display_data(
                 result.display_data(),
@@ -2378,7 +2380,7 @@ mod conversation_serde_tests {
                 "conversation:2",
                 17,
                 fixture_ts(),
-                ToolResult {
+                &ToolResult {
                     tool_use_id: "tool:3".into(),
                     outcome,
                     duration_ms: Some(42),
@@ -2437,7 +2439,7 @@ mod conversation_serde_tests {
                 "conversation",
                 1,
                 fixture_ts(),
-                ToolResult {
+                &ToolResult {
                     tool_use_id: "tool".into(),
                     outcome: ToolOutcome::Success {
                         output: "ok".into(),

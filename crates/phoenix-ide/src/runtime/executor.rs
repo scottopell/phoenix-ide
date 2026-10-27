@@ -9240,7 +9240,7 @@ where
                     &conv_id,
                     sequence_id,
                     Utc::now(),
-                    result,
+                    &result,
                 )
             })
             .collect();
@@ -9330,7 +9330,7 @@ where
                             &conv_id,
                             sequence_id,
                             Utc::now(),
-                            result,
+                            &result,
                         )
                     })
                     .collect();
@@ -25722,7 +25722,7 @@ mod goal_report_cancellation_checkpoint_tests {
                 conversation_id,
                 row.sequence_id,
                 row.created_at,
-                result,
+                &result,
             );
             assert_eq!(
                 serde_json::to_value(result.row()).unwrap(),

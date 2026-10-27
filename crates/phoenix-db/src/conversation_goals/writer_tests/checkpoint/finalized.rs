@@ -31,7 +31,7 @@ async fn unprepared_report_guard_uses_outcome_not_output_across_db_entrypoints()
             ),
         ] {
             let (db, owner, mut round) = report_fixture().await;
-            let finalized = vec![finalized_result(&round.assistant, result.clone())];
+            let finalized = vec![finalized_result(&round.assistant, &result)];
             round.results = vec![result.into()];
             let obligation = terminal::obligation(&db, &round).await;
             let before = evidence(&db, &owner, &round).await;
@@ -129,7 +129,7 @@ async fn finalized_result_metadata_and_pairing_mismatches_reject_without_writes(
             },
             round.assistant.sequence_id + 1,
             round.assistant.created_at,
-            result,
+            &result,
         )];
         if mismatch == "missing" {
             finalized.clear();
