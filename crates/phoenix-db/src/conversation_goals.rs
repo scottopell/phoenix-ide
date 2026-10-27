@@ -509,6 +509,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_history_accepts_nonreport_underway_and_suspended_dispositions() {
+        let db = migrated_db().await;
+        let conversation = db
+            .create_conversation("goal-dispositions", "goal-dispositions", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let owner = conversation.product_conversation_id;
+        seed_goal(&db, &owner, "disposition-goal").await;
+
+        sqlx::query(
+            "INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,2,'disposition-goal','underway',NULL,'fixture-underway','state',NULL,1,1,2), (?,3,'disposition-goal','suspended','waiting','fixture-suspend','state',NULL,1,1,3)",
+        )
+            .bind(owner.as_str())
+            .bind(owner.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let history = db
+            .conversation_goal_history(&owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            &history[1].mutation().change,
+            GoalChange::SetDisposition {
+                disposition: GoalDisposition::Underway,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &history[2].mutation().change,
+            GoalChange::SetDisposition {
+                disposition: GoalDisposition::Suspended(reason),
+                ..
+            } if reason.as_str() == "waiting"
+        ));
+    }
+
+    #[tokio::test]
+    async fn report_history_rejects_nonreport_disposition_in_corrupt_decoder_fixture() {
+        // This private schema intentionally omits production CHECK constraints to model a
+        // malformed persisted row; it is not a legal canonical-database history fixture.
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE conversation_goal_ids (goal_id TEXT, objective TEXT, owner_id TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE conversation_goal_history (owner_id TEXT, version INTEGER, goal_id TEXT, state TEXT, reason TEXT, action_id TEXT, change_kind TEXT, report_turn_id INTEGER, requested_actor_id INTEGER, applied_actor_id INTEGER, recorded_at_us INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, host_action_id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE conversation_goal_bindings (turn_id INTEGER, workflow_id INTEGER, owner_id TEXT, observed_version INTEGER, goal_id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_ids VALUES ('goal','objective','owner')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1,'owner','generated_host','fixture-action')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_bindings VALUES (7,8,'owner',1,'goal')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_history VALUES ('owner',2,'goal','underway',NULL,'fixture-report','report',7,1,1,2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let owner = ProductConversationId::parse("owner").unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let error = history_tx(&mut tx, &owner, GoalVersion::INITIAL)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GoalDbError::Domain(GoalError::Inapplicable)));
+    }
+
+    #[tokio::test]
     async fn public_history_paginates_legal_history_and_current_entry_matches_latest() {
         let db = migrated_db().await;
         let conversation = db
