@@ -88,19 +88,48 @@ const MARKERS: &[(u32, &[ColumnMarker])] = &[
     ),
     (
         137,
-        &[ColumnMarker {
-            table: "coordinator_watch_goal_captures",
-            column: "event_id",
-            declared_type: "TEXT",
-        }],
+        &[
+            ColumnMarker {
+                table: "coordinator_watch_goal_captures",
+                column: "event_id",
+                declared_type: "TEXT",
+            },
+            ColumnMarker {
+                table: "coordinator_watch_events",
+                column: "goal_capture_kind",
+                declared_type: "TEXT",
+            },
+            ColumnMarker {
+                table: "coordinator_watch_events",
+                column: "goal_capture_event_id",
+                declared_type: "TEXT",
+            },
+        ],
     ),
     (
         138,
-        &[ColumnMarker {
-            table: "conversation_goal_requests",
-            column: "request_id",
-            declared_type: "TEXT",
-        }],
+        &[
+            ColumnMarker {
+                table: "conversation_goal_requests",
+                column: "request_id",
+                declared_type: "TEXT",
+            },
+            ColumnMarker {
+                table: "durable_turns",
+                column: "input_kind",
+                declared_type: "TEXT",
+            },
+            ColumnMarker {
+                table: "durable_turns",
+                column: "goal_start_id",
+                declared_type: "INTEGER",
+            },
+            ColumnMarker {
+                table: "durable_turns",
+                column: "materialized",
+                declared_type: "INTEGER",
+            },
+        ],
     ),
     (
         139,
@@ -245,6 +274,13 @@ pub(crate) async fn preflight(
             )));
         }
     }
+    validate_table_groups_and_stop_markers(pool, &recorded).await
+}
+
+async fn validate_table_groups_and_stop_markers(
+    pool: &SqlitePool,
+    recorded: &BTreeMap<u32, String>,
+) -> DbResult<()> {
     for &(version, tables) in TABLE_GROUPS {
         for table in tables {
             let kind: Option<String> =
@@ -302,7 +338,7 @@ async fn column_marker(pool: &SqlitePool, marker: &ColumnMarker) -> DbResult<(bo
         )));
     }
     let declared: Option<String> =
-        sqlx::query_scalar("SELECT type FROM pragma_table_info(?) WHERE name = ?")
+        sqlx::query_scalar("SELECT type FROM pragma_table_xinfo(?) WHERE name = ?")
             .bind(marker.table)
             .bind(marker.column)
             .fetch_optional(pool)
@@ -696,6 +732,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn orphaned_existing_table_goal_columns_refuse_without_mutation() {
+        let alterations = [
+            "ALTER TABLE coordinator_watch_events ADD COLUMN goal_capture_kind TEXT NOT NULL DEFAULT 'legacy'",
+            "ALTER TABLE coordinator_watch_events ADD COLUMN goal_capture_event_id TEXT GENERATED ALWAYS AS (event_id) VIRTUAL",
+            "ALTER TABLE durable_turns ADD COLUMN input_kind TEXT NOT NULL DEFAULT 'message'",
+            "ALTER TABLE durable_turns ADD COLUMN goal_start_id INTEGER",
+            "ALTER TABLE durable_turns ADD COLUMN materialized INTEGER NOT NULL DEFAULT 0",
+        ];
+        for alteration in alterations {
+            let pool = real_prefix(131).await;
+            sqlx::raw_sql(alteration).execute(&pool).await.unwrap();
+            refuses_without_mutation(&pool).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_existing_table_goal_columns_must_all_be_present() {
+        for (through, table, column) in [
+            (137, "coordinator_watch_events", "goal_capture_kind"),
+            (137, "coordinator_watch_events", "goal_capture_event_id"),
+            (138, "durable_turns", "input_kind"),
+            (138, "durable_turns", "goal_start_id"),
+            (138, "durable_turns", "materialized"),
+        ] {
+            let pool = pool().await;
+            ledger(&pool).await;
+            for version in 129..=through {
+                canonical_row(&pool, version).await;
+            }
+            shape(&pool, through).await;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} DROP COLUMN {column}"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+            refuses_without_mutation(&pool).await;
+        }
     }
 
     #[tokio::test]

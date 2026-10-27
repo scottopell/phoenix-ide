@@ -1,12 +1,18 @@
 # ADR-187: Preserve main migration identities when extracting the Goals schema
 
-- Status: Accepted
-- Date: 2026-10-27
-- Requirements: REQ-COMP-020
+- **Status:** Accepted
+- **Date:** 2026-10-27
+- **Affects:** REQ-COMP-020; migration registry and existing local writers
 
 ## Context
 
 The unshipped source stack behind PR #975 assigned its nine schema entries to 130–138, overlapping main's continuation-handoff and request-capacity migrations at 130/131. The bounded reconciliation was authorized on October 26. The user subsequently requested a coherent ordered extraction queue rather than landing the combined runtime stack. Schema identity is shared by those later slices and cannot be independently renumbered in each one.
+
+## Options considered
+
+1. Reuse the overlapping branch numbers: rejected because a number could identify two different SQL bodies.
+2. Convert branch ledgers or reset their databases: rejected because provenance is ambiguous and no unshipped-database conversion contract is authorized.
+3. Preserve main's identities, assign one forward-only suffix, and refuse unsupported physical or ledger evidence before writes: selected.
 
 ## Decision
 

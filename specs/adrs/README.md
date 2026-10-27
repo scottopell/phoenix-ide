@@ -360,4 +360,4 @@ Capacity planning across ordinary requests, handoffs and model switches is gover
 
 Generated handoff readability and explicit source authority are governed by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md); automatic initiation remains governed by ADR-054.
 
-Goals schema extraction and refusal of unsupported migration lineages are governed by [ADR-187](187_goal_main_migration_identity_reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility.
+Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility.
