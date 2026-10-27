@@ -25659,9 +25659,7 @@ mod goal_report_cancellation_checkpoint_tests {
                 _ => None,
             })
             .expect("cancellation produces a checkpoint");
-        let CheckpointData::ToolRound { tool_results, .. } = &data else {
-            panic!("cancellation must persist a paired tool round");
-        };
+        let CheckpointData::ToolRound { tool_results, .. } = &data;
         let results = tool_results.clone();
         assert_eq!(results.len(), 2);
         for result in &results {
