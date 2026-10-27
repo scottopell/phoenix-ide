@@ -5750,29 +5750,43 @@ class OrdinarySource129To131Tests(unittest.TestCase):
         )
         for through in (129, 131):
             for source_kind in ("local_head", "published_release"):
-                with self.subTest(through=through, source_kind=source_kind):
-                    database = self.database(through=through)
-                    manifest = dataclasses.replace(self.ordinary_manifest(database), source_kind=source_kind)
-                    ordinary = manifest.ordinary_forward_migration
-                    registry = Path(ordinary.migration_registry_path)
-                    registry.write_bytes(actual_registry.read_bytes())
-                    manifest = dataclasses.replace(manifest, ordinary_forward_migration=dataclasses.replace(
-                        ordinary, migration_registry_sha256=helper.sha256(registry)))
-                    paths = [database, Path(manifest.target_binary), Path(manifest.target_plist),
-                             Path(manifest.candidate_binary), Path(manifest.candidate_plist),
-                             Path(manifest.rollback_binary), Path(manifest.rollback_plist),
-                             Path(manifest.active_path), Path(manifest.deployed_sha_path),
-                             Path(manifest.status_path)]
-                    before = {path: path.read_bytes() if path.exists() else None for path in paths}
-                    ledger = helper.database_ledger(database)
-                    with self.assertRaisesRegex(helper.ActivationError, "not qualified"):
-                        helper.ordinary_forward_policy_applies(manifest)
-                    with mock.patch.object(helper, "Launchctl") as launchctl:
+                for initial_status in (None, "prepared"):
+                    with self.subTest(through=through, source_kind=source_kind, initial_status=initial_status):
+                        database = self.database(through=through)
+                        manifest = dataclasses.replace(self.ordinary_manifest(database), source_kind=source_kind)
+                        ordinary = manifest.ordinary_forward_migration
+                        registry = Path(ordinary.migration_registry_path)
+                        registry.write_bytes(actual_registry.read_bytes())
+                        manifest = dataclasses.replace(manifest, ordinary_forward_migration=dataclasses.replace(
+                            ordinary, migration_registry_sha256=helper.sha256(registry)))
+                        status_path = Path(manifest.status_path)
+                        status_path.unlink(missing_ok=True)
+                        if initial_status is not None:
+                            helper.write_status(manifest, initial_status)
+                        status_before = status_path.read_bytes() if status_path.exists() else None
+                        paths = [database, Path(manifest.target_binary), Path(manifest.target_plist),
+                                 Path(manifest.candidate_binary), Path(manifest.candidate_plist),
+                                 Path(manifest.rollback_binary), Path(manifest.rollback_plist),
+                                 Path(manifest.active_path), Path(manifest.deployed_sha_path)]
+                        before = {path: path.read_bytes() if path.exists() else None for path in paths}
+                        ledger = helper.database_ledger(database)
                         with self.assertRaisesRegex(helper.ActivationError, "not qualified"):
-                            helper.activate(manifest)
-                    launchctl.assert_not_called()
-                    self.assertEqual(helper.database_ledger(database), ledger)
-                    self.assertEqual({path: path.read_bytes() if path.exists() else None for path in paths}, before)
+                            helper.ordinary_forward_policy_applies(manifest)
+                        self.assertEqual(status_path.read_bytes() if status_path.exists() else None, status_before)
+                        with mock.patch.object(helper, "Launchctl") as launchctl:
+                            with self.assertRaisesRegex(helper.ActivationError, "not qualified") as failure:
+                                helper.activate(manifest)
+                        launchctl.assert_not_called()
+                        self.assertEqual(helper.database_ledger(database), ledger)
+                        self.assertEqual({path: path.read_bytes() if path.exists() else None for path in paths}, before)
+                        status = helper.read_status(manifest)
+                        self.assertEqual(status["transaction_id"], manifest.transaction_id)
+                        self.assertEqual(status["state"], "precondition_failed")
+                        self.assertEqual(status["source_kind"], source_kind)
+                        self.assertEqual(status["failure"], str(failure.exception))
+                        self.assertFalse(status["finalization_pending"])
+                        self.assertIsNone(status["rollback_failure"])
+                        self.assertIsNone(status["cleanup_failure"])
 
     def test_changed_registry_and_source_names_reject_before_stop(self) -> None:
         for mutation in ("missing", "newer", "name", "bytes", "source"):
