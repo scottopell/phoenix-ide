@@ -308,9 +308,9 @@ pub async fn checkpoint_request_tx(
     }
     let live_claim: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM durable_turns WHERE turn_id=? AND workflow_id=?
-         AND generation=? AND disposition='Runtime' AND terminal_kind IS NULL AND owns_conversation=1)",
+         AND generation=? AND generation=? AND disposition='Runtime' AND terminal_kind IS NULL AND owns_conversation=1)",
     ).bind(intent.execution.turn_id()).bind(intent.execution.workflow_id())
-        .bind(claim_generation).fetch_one(&mut **tx).await?;
+        .bind(claim_generation).bind(intent.generation()).fetch_one(&mut **tx).await?;
     if !live_claim {
         return Err(GoalRequestError::Detached);
     }

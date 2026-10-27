@@ -17,21 +17,9 @@ impl Default for DispatchEpoch {
 }
 
 impl DispatchEpoch {
-    pub(crate) fn commit_revocation(&mut self) -> ControlCommitRevocation<'_> {
-        ControlCommitRevocation(self)
-    }
-
     pub(crate) fn revoke(&mut self) {
         self.cancelled.send_replace(true);
         self.cancelled = watch::channel(false).0;
-    }
-}
-
-pub(crate) struct ControlCommitRevocation<'a>(&'a mut DispatchEpoch);
-
-impl Drop for ControlCommitRevocation<'_> {
-    fn drop(&mut self) {
-        self.0.revoke();
     }
 }
 

@@ -4,12 +4,14 @@ use phoenix_core::domain::{
     conversation_goal::GoalTimestampUs, product_conversation::ProductConversationId,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqliteRow, Row};
+use sqlx::{sqlite::SqliteRow, Connection, Row};
 use uuid::Uuid;
 
 use crate::Database;
 
 pub mod dispatch;
+#[cfg(test)]
+mod tests;
 use dispatch::GoalDispatchPermit;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -150,6 +152,38 @@ fn decode(row: &SqliteRow, input: &ControlRequest) -> Result<ControlReceipt, Con
         recorded_at: GoalTimestampUs::parse(row.try_get("recorded_at_us")?)
             .map_err(|_| ControlError::Integrity("control receipt timestamp"))?,
     })
+}
+
+#[cfg(test)]
+enum ControlCommitCut {
+    None,
+    LostAcknowledgement,
+    LostClassification,
+    AfterCommit {
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    },
+}
+
+struct ControlCommitAuthority<F: FnOnce()> {
+    unresolved: bool,
+    on_authority_lost: Option<F>,
+}
+
+impl<F: FnOnce()> ControlCommitAuthority<F> {
+    fn classified(&mut self) {
+        self.unresolved = false;
+    }
+}
+
+impl<F: FnOnce()> Drop for ControlCommitAuthority<F> {
+    fn drop(&mut self) {
+        if self.unresolved {
+            if let Some(close_authority) = self.on_authority_lost.take() {
+                close_authority();
+            }
+        }
+    }
 }
 
 async fn receipt_tx(
@@ -351,14 +385,65 @@ impl Database {
     /// The reserved control schema is not installed by this operation.
     ///
     /// # Errors
-    /// Rejects closed/nonordinary owners, conflicting request identities, invalid versions and storage failures.
-    pub async fn apply_goal_control(
+    /// Established failures reject closed/nonordinary owners, conflicting identities,
+    /// invalid versions, or a transaction known not to have committed.
+    ///
+    /// `on_authority_lost` must synchronously close the owner's existing authority
+    /// fence, honoring its serving/coordinated-shutdown disposition. It must not
+    /// defer closure to an async task or panic. It is invoked at most once, including
+    /// when this future is cancelled during COMMIT; it must not publish cancellation.
+    pub async fn apply_goal_control<F: FnOnce() + Send>(
         &self,
         input: &ControlRequest,
         at: GoalTimestampUs,
-    ) -> Result<ControlReceipt, ControlError> {
+        on_authority_lost: F,
+    ) -> crate::workflow::LocalAuthorityResult<Result<ControlReceipt, ControlError>> {
+        self.apply_goal_control_at_cut(
+            input,
+            at,
+            on_authority_lost,
+            #[cfg(test)]
+            ControlCommitCut::None,
+        )
+        .await
+    }
+
+    async fn apply_goal_control_at_cut<F: FnOnce() + Send>(
+        &self,
+        input: &ControlRequest,
+        at: GoalTimestampUs,
+        on_authority_lost: F,
+        #[cfg(test)] cut: ControlCommitCut,
+    ) -> crate::workflow::LocalAuthorityResult<Result<ControlReceipt, ControlError>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+        match self
+            .apply_goal_control_command(
+                input,
+                at,
+                on_authority_lost,
+                #[cfg(test)]
+                cut,
+            )
+            .await
+        {
+            Ok(DurableFactEstablished(receipt)) => DurableFactEstablished(Ok(receipt)),
+            Ok(DurableFactUnclassified) => DurableFactUnclassified,
+            Err(error) => DurableFactEstablished(Err(error)),
+        }
+    }
+
+    async fn apply_goal_control_command<F: FnOnce() + Send>(
+        &self,
+        input: &ControlRequest,
+        at: GoalTimestampUs,
+        on_authority_lost: F,
+        #[cfg(test)] cut: ControlCommitCut,
+    ) -> Result<crate::workflow::LocalAuthorityResult<ControlReceipt>, ControlError> {
         let gate = self.goal_control_runtime.owner(input.owner.as_str())?;
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let mut connection = self.pool().acquire().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let mut epoch = gate.lock().await;
         let authorized_owner: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM product_conversations p WHERE p.id=? AND p.kind='ordinary' AND p.ordinary_lifecycle='open' AND NOT EXISTS(SELECT 1 FROM close_obligations o WHERE o.product_conversation_id=p.id AND o.phase!='completed'))")
             .bind(input.owner.as_str()).fetch_one(&mut *tx).await?;
@@ -366,8 +451,7 @@ impl Database {
             return Err(ControlError::OwnerUnavailable);
         }
         if let Some(receipt) = receipt_tx(&mut tx, input).await? {
-            tx.commit().await?;
-            return Ok(receipt);
+            return Ok(crate::workflow::LocalAuthorityResult::DurableFactEstablished(receipt));
         }
         let expected = i64::try_from(input.expected_control_version)
             .map_err(|_| ControlError::VersionRange)?;
@@ -395,9 +479,61 @@ impl Database {
         let receipt = receipt_tx(&mut tx, input)
             .await?
             .ok_or(ControlError::Integrity("missing committed control receipt"))?;
-        let revocation = accepted.then(|| epoch.commit_revocation());
-        tx.commit().await?;
-        drop(revocation);
-        Ok(receipt)
+        let mut authority = ControlCommitAuthority {
+            unresolved: true,
+            on_authority_lost: Some(on_authority_lost),
+        };
+        let result = async {
+            let commit_result = tx.commit().await;
+            #[cfg(test)]
+            let commit_result = match cut {
+                ControlCommitCut::None => commit_result,
+                ControlCommitCut::LostAcknowledgement => {
+                    commit_result?;
+                    Err(sqlx::Error::Protocol(
+                        "injected lost commit acknowledgement".into(),
+                    ))
+                }
+                ControlCommitCut::LostClassification => {
+                    commit_result?;
+                    return Err(ControlError::Integrity(
+                        "injected unavailable classification",
+                    ));
+                }
+                ControlCommitCut::AfterCommit { reached, release } => {
+                    commit_result?;
+                    let _ = reached.send(());
+                    let _ = release.await;
+                    Ok(())
+                }
+            };
+            if let Err(commit_error) = commit_result {
+                // SQLx queues the failed transaction's rollback on this same worker
+                // before BEGIN; absence is authoritative only after BEGIN succeeds.
+                let mut classification = connection.begin_with("BEGIN IMMEDIATE").await?;
+                match receipt_tx(&mut classification, input).await? {
+                    Some(actual) if actual == receipt => {}
+                    None => {
+                        authority.classified();
+                        return Err(commit_error.into());
+                    }
+                    Some(_) => {
+                        return Err(ControlError::Integrity("control commit receipt differs"))
+                    }
+                }
+            }
+            authority.classified();
+            if accepted {
+                epoch.revoke();
+            }
+            Ok(receipt)
+        }
+        .await;
+        if authority.unresolved {
+            drop(authority);
+            Ok(crate::workflow::LocalAuthorityResult::DurableFactUnclassified)
+        } else {
+            result.map(crate::workflow::LocalAuthorityResult::DurableFactEstablished)
+        }
     }
 }

@@ -45,7 +45,7 @@ impl WatchOutcome {
             ("failed", Some(reason)) => Ok(Self::Failed { reason }),
             ("cleanup_failed", Some(reason)) => Ok(Self::CleanupFailed { reason }),
             ("cancelled", None) => Ok(Self::Cancelled),
-            ("goal_changed", Some(reason)) if reason == "goal_changed" => Ok(Self::GoalChanged),
+            ("goal_changed", None) => Ok(Self::GoalChanged),
             ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
                 Ok(Self::AwaitingUserResponse)
             }
@@ -77,8 +77,7 @@ impl WatchOutcome {
             Self::Failed { reason } | Self::CleanupFailed { reason } => Some(reason),
             Self::AwaitingUserResponse => Some("question_request"),
             Self::AwaitingTaskApproval => Some("task_approval_wait"),
-            Self::GoalChanged => Some("goal_changed"),
-            Self::Completed | Self::Cancelled => None,
+            Self::Completed | Self::Cancelled | Self::GoalChanged => None,
         }
     }
 }

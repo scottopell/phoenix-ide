@@ -81,8 +81,11 @@ async fn release(db: &Database, owner: &ProductConversationId) {
             expected_control_version: 0,
         },
         at(),
+        || panic!("unexpected control authority loss"),
     )
     .await
+    .established()
+    .expect("classified control")
     .unwrap();
 }
 
@@ -205,8 +208,8 @@ async fn settled_goal_watch_capture_commits_or_rolls_back_with_the_mutation() {
         )
         .await
         .unwrap();
-    let fact: (String, String, i64, String, String) = sqlx::query_as(
-        "SELECT e.terminal_kind,c.kind,c.owner_version,c.goal_id,c.objective
+    let fact: (String, Option<String>, String, i64, String, String) = sqlx::query_as(
+        "SELECT e.terminal_kind,e.terminal_reason,c.kind,c.owner_version,c.goal_id,c.objective
          FROM coordinator_watch_events e JOIN coordinator_watch_goal_captures c USING(event_id)
          WHERE e.source_occurrence_kind='goal_change' AND c.owner_id=?",
     )
@@ -218,12 +221,25 @@ async fn settled_goal_watch_capture_commits_or_rolls_back_with_the_mutation() {
         fact,
         (
             "goal_changed".into(),
+            None,
             "saved_goal".into(),
             first.snapshot().version().get(),
             "captured-a".into(),
             "objective-captured-a".into()
         )
     );
+    let pending = db.pending_coordinator_watch_events(16).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].product_conversation_id, owner);
+    assert_eq!(pending[0].source_occurrence_kind, "goal_change");
+    assert_eq!(
+        pending[0].outcome,
+        crate::coordinator_watches::WatchOutcome::GoalChanged
+    );
+    assert!(matches!(
+        &pending[0].route,
+        crate::coordinator_watches::WatchEventRoute::Subscription
+    ));
     let before = counts(&db).await;
     sqlx::query("CREATE TRIGGER reject_goal_capture BEFORE INSERT ON coordinator_watch_goal_captures BEGIN SELECT RAISE(ABORT,'injected capture failure'); END")
         .execute(db.pool()).await.unwrap();
@@ -306,13 +322,15 @@ async fn user_goal_commands_retain_typed_receipts_and_control_attribution() {
     assert_eq!(counts(&db).await.2, before.2);
 }
 
+use crate::workflow::ClaimAuthoritativeTurnInput;
 use phoenix_core::domain::db_schema::InputOrigin;
 use phoenix_core::domain::sm_event::{
     PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
     SubmittedDirectTurnIdentity,
 };
 use phoenix_workflow::{
-    AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
+    AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+    ProcessIncarnation, Timestamp, TurnAuthorityId, TurnCommand, WorkflowId,
 };
 
 async fn accept_execution(
@@ -361,6 +379,135 @@ fn runtime_input(transcript: &str, key: &str) -> crate::workflow::AcceptAuthorit
         disposition: AcceptedDisposition::Runtime,
         accepted_at: Timestamp(1),
     }
+}
+
+#[tokio::test]
+async fn retained_generation_zero_request_cannot_checkpoint_after_fail_and_rearm() {
+    let db = fixture().await;
+    let (transcript, owner) = ordinary(&db, "request-rearm-owner").await;
+    let goal = db
+        .apply_conversation_goal(
+            &create(&owner, GoalVersion::INITIAL, "rearm-goal", "rearm-create"),
+            &transcript,
+            at(),
+        )
+        .await
+        .unwrap();
+    release(&db, &owner).await;
+    let repo = db.workflow_repository();
+    let execution =
+        accept_execution(&repo, &runtime_input(&transcript, "request-rearm-turn")).await;
+    let original = GoalRequestIntent::new(
+        GoalRequestId::parse("request-before-rearm").unwrap(),
+        goal.snapshot().fence(),
+        execution,
+        0,
+        GoalRequestCause::Initial,
+    )
+    .unwrap();
+    let after_rearm = GoalRequestIntent::new(
+        GoalRequestId::parse("request-after-rearm").unwrap(),
+        goal.snapshot().fence(),
+        execution,
+        0,
+        GoalRequestCause::Summary {
+            operation: GoalText::parse("summary-after-rearm").unwrap(),
+        },
+    )
+    .unwrap();
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    append_request_tx(&mut tx, db.goal_execution_installation(), &original)
+        .await
+        .unwrap();
+    append_request_tx(&mut tx, db.goal_execution_installation(), &after_rearm)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let turn_id = TurnAuthorityId(u64::try_from(execution.turn_id()).unwrap());
+    let workflow_id = WorkflowId(u64::try_from(execution.workflow_id()).unwrap());
+    let claim = repo
+        .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+            turn_id,
+            workflow_id,
+            process_incarnation: ProcessIncarnation(20),
+            now: Timestamp(20),
+            lease_until: LeaseExpiry(30),
+        })
+        .await
+        .unwrap();
+    assert!(claim.authority.is_some());
+    let checkpoint = GoalText::parse("existing-checkpoint").unwrap();
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    execution::checkpoint_request_tx(
+        &mut tx,
+        db.goal_execution_installation(),
+        &original,
+        0,
+        &checkpoint,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    repo.terminate_authoritative_turn(TurnCommand::Fail {
+        turn_id,
+        expected_generation: 0,
+        reason: "failed".into(),
+    })
+    .await
+    .unwrap();
+    let rearmed = repo
+        .rearm_terminal_runtime_direct_turn(&crate::workflow::RearmAuthoritativeTurnInput {
+            turn_id,
+            expected_generation: 1,
+            rearmed_at: Timestamp(40),
+        })
+        .await
+        .unwrap();
+    let crate::workflow::RearmAuthoritativeTurnOutcome::Rearmed { turn } = rearmed else {
+        panic!("expected turn to rearm");
+    };
+    assert_eq!(turn.generation, 2);
+
+    let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    assert!(matches!(
+        execution::checkpoint_request_tx(
+            &mut tx,
+            db.goal_execution_installation(),
+            &after_rearm,
+            2,
+            &GoalText::parse("must-not-be-written").unwrap(),
+        )
+        .await,
+        Err(GoalRequestError::Detached)
+    ));
+    assert_eq!(
+        execution::retained_request_tx(&mut tx, db.goal_execution_installation(), &original)
+            .await
+            .unwrap()
+            .unwrap()
+            .checkpoint,
+        Some(checkpoint.clone())
+    );
+    execution::checkpoint_request_tx(
+        &mut tx,
+        db.goal_execution_installation(),
+        &original,
+        0,
+        &checkpoint,
+    )
+    .await
+    .unwrap();
+    let checkpoint_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_goal_request_checkpoints WHERE request_id=?",
+    )
+    .bind(after_rearm.id().as_str())
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(checkpoint_count, 0);
+    tx.commit().await.unwrap();
 }
 
 #[tokio::test]
@@ -518,8 +665,11 @@ async fn fresh_runtime_turn_captures_goal_and_control_once_before_replay() {
             expected_control_version: 1,
         },
         at(),
+        || panic!("unexpected control authority loss"),
     )
     .await
+    .established()
+    .expect("classified control")
     .unwrap();
     let replay = repo.accept_authoritative_turn(&input).await.unwrap();
     assert!(matches!(
