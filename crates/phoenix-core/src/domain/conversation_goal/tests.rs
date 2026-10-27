@@ -74,6 +74,238 @@ fn set(current: &GoalSnapshot, disposition: GoalDisposition) -> GoalMutation {
 }
 
 #[test]
+fn saved_snapshot_requires_committed_version_in_constructor_and_wire() {
+    let saved = initial();
+    let mut encoded = serde_json::to_value(&saved).unwrap();
+    assert_eq!(
+        serde_json::from_value::<GoalSnapshot>(encoded.clone()).unwrap(),
+        saved
+    );
+    assert_eq!(saved.version().get(), 1);
+    assert_eq!(saved.owner().as_str(), "owner");
+    assert_eq!(saved.goal_id().as_str(), "goal");
+    assert_eq!(saved.objective().as_str(), "prepare only");
+    assert_eq!(saved.state(), &GoalState::Underway);
+    assert_eq!(
+        GoalSnapshot::new(
+            saved.owner().clone(),
+            saved.goal_id().clone(),
+            GoalVersion::INITIAL,
+            saved.objective().clone(),
+            saved.state().clone()
+        ),
+        Err(GoalError::Range)
+    );
+    encoded["version"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<GoalSnapshot>(encoded).is_err());
+}
+
+#[test]
+fn user_control_requires_exact_pair_and_applicable_command() {
+    let first = initial();
+    let principal = uuid::Uuid::new_v4();
+    let request = uuid::Uuid::new_v4();
+    let control = GoalActor::UserControl {
+        principal_id: principal,
+        request_id: request,
+        command: GoalUserCommandKind::State,
+    };
+    let change = GoalChange::SetDisposition {
+        goal_id: first.goal_id().clone(),
+        disposition: GoalDisposition::Blocked(text("waiting")),
+    };
+    let mut command = mutation(1, change);
+    command.attribution = GoalAttribution {
+        requested_by: control.clone(),
+        applied_by: control.clone(),
+    };
+    assert_eq!(
+        command.advance(Some(&first)).unwrap().state(),
+        &GoalState::Blocked(text("waiting"))
+    );
+    for mismatch in [
+        GoalActor::UserControl {
+            principal_id: uuid::Uuid::new_v4(),
+            request_id: request,
+            command: GoalUserCommandKind::State,
+        },
+        GoalActor::UserControl {
+            principal_id: principal,
+            request_id: uuid::Uuid::new_v4(),
+            command: GoalUserCommandKind::State,
+        },
+        GoalActor::UserControl {
+            principal_id: principal,
+            request_id: request,
+            command: GoalUserCommandKind::Create,
+        },
+        user(),
+    ] {
+        command.attribution.applied_by = mismatch.clone();
+        assert_eq!(command.advance(Some(&first)), Err(GoalError::Inapplicable));
+        command.attribution = GoalAttribution {
+            requested_by: mismatch,
+            applied_by: control.clone(),
+        };
+        assert_eq!(command.advance(Some(&first)), Err(GoalError::Inapplicable));
+        command.attribution.requested_by = control.clone();
+    }
+    command.attribution.applied_by = control;
+    command.change = GoalChange::Create {
+        goal_id: GoalId::parse("other").unwrap(),
+        objective: text("new"),
+    };
+    assert_eq!(command.advance(Some(&first)), Err(GoalError::Inapplicable));
+}
+
+#[test]
+fn history_reconstruction_checks_local_transition_without_live_authority() {
+    let create = mutation(
+        0,
+        GoalChange::Create {
+            goal_id: GoalId::parse("goal").unwrap(),
+            objective: text("prepare only"),
+        },
+    );
+    let initial = create.advance(None).unwrap();
+    let timestamp = GoalTimestampUs::parse(123).unwrap();
+    let receipt = GoalHistoryEntry::new(initial.clone(), create.clone(), timestamp).unwrap();
+    assert_eq!(receipt.snapshot(), &initial);
+    assert_eq!(receipt.mutation(), &create);
+    assert_eq!(receipt.recorded_at_us(), timestamp);
+    let encoded = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(
+        serde_json::from_value::<GoalHistoryEntry>(encoded.clone()).unwrap(),
+        receipt
+    );
+    // A retained receipt is locally consistent even when the current goal has since changed.
+    let retired = set(&initial, GoalDisposition::Complete(text("finished")))
+        .advance(Some(&initial))
+        .unwrap();
+    assert_eq!(
+        GoalHistoryEntry::new(initial.clone(), create.clone(), timestamp).unwrap(),
+        receipt
+    );
+    assert_ne!(retired, initial);
+    for (path, value) in [
+        ("owner", serde_json::json!("other")),
+        ("version", serde_json::json!(2)),
+        ("goal_id", serde_json::json!("wrong")),
+        ("objective", serde_json::json!("changed")),
+        ("state", serde_json::json!({"Blocked":"waiting"})),
+    ] {
+        let mut invalid = encoded.clone();
+        invalid["snapshot"][path] = value;
+        assert!(
+            serde_json::from_value::<GoalHistoryEntry>(invalid).is_err(),
+            "{path}"
+        );
+    }
+    let mut invalid = encoded;
+    invalid["mutation"]["expected_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<GoalHistoryEntry>(invalid).is_err());
+    let state_command = set(&initial, GoalDisposition::Blocked(text("waiting")));
+    let blocked = state_command.advance(Some(&initial)).unwrap();
+    let state_receipt = GoalHistoryEntry::new(blocked.clone(), state_command, timestamp).unwrap();
+    assert_eq!(
+        serde_json::from_value::<GoalHistoryEntry>(serde_json::to_value(&state_receipt).unwrap())
+            .unwrap(),
+        state_receipt
+    );
+    let reported = report(&initial);
+    let result = reported.advance(Some(&initial)).unwrap();
+    let report_receipt = GoalHistoryEntry::new(result, reported, timestamp).unwrap();
+    assert_eq!(
+        serde_json::from_value::<GoalHistoryEntry>(serde_json::to_value(&report_receipt).unwrap())
+            .unwrap(),
+        report_receipt
+    );
+}
+
+#[test]
+fn history_reconstruction_rejects_impossible_local_attribution() {
+    fn rejects(snapshot: &GoalSnapshot, mutation: GoalMutation) {
+        let recorded_at_us = GoalTimestampUs::parse(123).unwrap();
+        assert!(GoalHistoryEntry::new(snapshot.clone(), mutation.clone(), recorded_at_us).is_err());
+        let wire = serde_json::json!({
+            "snapshot": snapshot,
+            "mutation": mutation,
+            "recorded_at_us": recorded_at_us,
+        });
+        assert!(serde_json::from_value::<GoalHistoryEntry>(wire).is_err());
+    }
+
+    let snapshot = initial();
+    let mut create = mutation(
+        0,
+        GoalChange::Create {
+            goal_id: snapshot.goal_id().clone(),
+            objective: snapshot.objective().clone(),
+        },
+    );
+    let principal_id = uuid::Uuid::new_v4();
+    let request_id = uuid::Uuid::new_v4();
+    let control = GoalActor::UserControl {
+        principal_id,
+        request_id,
+        command: GoalUserCommandKind::Create,
+    };
+    create.attribution = GoalAttribution {
+        requested_by: control.clone(),
+        applied_by: control.clone(),
+    };
+    let timestamp = GoalTimestampUs::parse(123).unwrap();
+    assert!(GoalHistoryEntry::new(snapshot.clone(), create.clone(), timestamp).is_ok());
+    for applied in [
+        GoalActor::UserControl {
+            principal_id: uuid::Uuid::new_v4(),
+            request_id,
+            command: GoalUserCommandKind::Create,
+        },
+        GoalActor::UserControl {
+            principal_id,
+            request_id: uuid::Uuid::new_v4(),
+            command: GoalUserCommandKind::Create,
+        },
+        user(),
+    ] {
+        let mut invalid = create.clone();
+        invalid.attribution.applied_by = applied;
+        rejects(&snapshot, invalid);
+    }
+    let mut wrong_command = create;
+    let state_control = GoalActor::UserControl {
+        principal_id,
+        request_id,
+        command: GoalUserCommandKind::State,
+    };
+    wrong_command.attribution = GoalAttribution {
+        requested_by: state_control.clone(),
+        applied_by: state_control,
+    };
+    rejects(&snapshot, wrong_command);
+
+    let report = report(&snapshot);
+    let result = report.advance(Some(&snapshot)).unwrap();
+    let mut wrong_actor = report.clone();
+    wrong_actor.attribution.requested_by = user();
+    rejects(&result, wrong_actor);
+    let mut wrong_execution = report.clone();
+    if let GoalActor::OwningAgent(source) = &mut wrong_execution.attribution.requested_by {
+        source.execution = GoalExecution::parse(1, 3).unwrap();
+    }
+    rejects(&result, wrong_execution);
+    let mut wrong_owner = report.clone();
+    if let GoalActor::OwningAgent(source) = &mut wrong_owner.attribution.requested_by {
+        source.product_conversation_id = ProductConversationId::parse("other").unwrap();
+    }
+    rejects(&result, wrong_owner);
+    let mut unbound = set(&snapshot, GoalDisposition::Complete(text("done")));
+    unbound.attribution.requested_by = report.attribution.requested_by;
+    rejects(&result, unbound);
+}
+
+#[test]
 fn replacement_changes_identity_and_fences_admitted_report_even_with_same_text() {
     let first = initial();
     let mut stale = report(&first);

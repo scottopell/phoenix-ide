@@ -252,13 +252,35 @@ impl GoalDisposition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalSnapshot {
-    pub owner: ProductConversationId,
-    pub goal_id: GoalId,
-    pub version: GoalVersion,
-    pub objective: GoalText,
-    pub state: GoalState,
+    owner: ProductConversationId,
+    goal_id: GoalId,
+    version: GoalVersion,
+    objective: GoalText,
+    state: GoalState,
+}
+
+impl<'de> Deserialize<'de> for GoalSnapshot {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            owner: ProductConversationId,
+            goal_id: GoalId,
+            version: GoalVersion,
+            objective: GoalText,
+            state: GoalState,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(
+            fields.owner,
+            fields.goal_id,
+            fields.version,
+            fields.objective,
+            fields.state,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +291,52 @@ pub struct GoalFence {
 }
 
 impl GoalSnapshot {
+    /// # Errors
+    /// Rejects a no-goal observation version as a saved snapshot.
+    pub fn new(
+        owner: ProductConversationId,
+        goal_id: GoalId,
+        version: GoalVersion,
+        objective: GoalText,
+        state: GoalState,
+    ) -> Result<Self, GoalError> {
+        if version == GoalVersion::INITIAL {
+            return Err(GoalError::Range);
+        }
+        Ok(Self {
+            owner,
+            goal_id,
+            version,
+            objective,
+            state,
+        })
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &ProductConversationId {
+        &self.owner
+    }
+
+    #[must_use]
+    pub fn goal_id(&self) -> &GoalId {
+        &self.goal_id
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> GoalVersion {
+        self.version
+    }
+
+    #[must_use]
+    pub fn objective(&self) -> &GoalText {
+        &self.objective
+    }
+
+    #[must_use]
+    pub fn state(&self) -> &GoalState {
+        &self.state
+    }
+
     #[must_use]
     pub fn fence(&self) -> GoalFence {
         GoalFence {
@@ -318,6 +386,58 @@ pub struct GoalMutation {
 }
 
 impl GoalMutation {
+    fn validate_local(&self) -> Result<(), GoalError> {
+        match (&self.attribution.requested_by, &self.attribution.applied_by) {
+            (
+                requested @ GoalActor::UserControl { command, .. },
+                applied @ GoalActor::UserControl { .. },
+            ) => {
+                if requested != applied
+                    || !matches!(
+                        (*command, &self.change),
+                        (GoalUserCommandKind::Create, GoalChange::Create { .. })
+                            | (
+                                GoalUserCommandKind::State,
+                                GoalChange::SetDisposition { .. }
+                            )
+                    )
+                {
+                    return Err(GoalError::Inapplicable);
+                }
+            }
+            (GoalActor::UserControl { .. }, _) | (_, GoalActor::UserControl { .. }) => {
+                return Err(GoalError::Inapplicable);
+            }
+            _ => {}
+        }
+        match &self.change {
+            GoalChange::SetDisposition { .. } => {
+                if matches!(self.attribution.requested_by, GoalActor::OwningAgent(_)) {
+                    return Err(GoalError::ReportBindingRequired);
+                }
+            }
+            GoalChange::Report { binding, .. } => {
+                if binding.owner != self.owner {
+                    return Err(GoalError::Conflict);
+                }
+                match &self.attribution.requested_by {
+                    GoalActor::OwningAgent(source)
+                        if source.product_conversation_id == self.owner
+                            && source.execution == binding.execution => {}
+                    GoalActor::OwningAgent(_)
+                    | GoalActor::UserApi { .. }
+                    | GoalActor::UserControl { .. }
+                    | GoalActor::Coordinator(_)
+                    | GoalActor::GeneratedHost { .. } => {
+                        return Err(GoalError::ReportBindingRequired);
+                    }
+                }
+            }
+            GoalChange::Create { .. } => {}
+        }
+        Ok(())
+    }
+
     /// Pure CAS and report fencing; admission/commission authorization belongs to callers.
     ///
     /// # Errors
@@ -327,30 +447,18 @@ impl GoalMutation {
         if version != self.expected_version || current.is_some_and(|s| s.owner != self.owner) {
             return Err(GoalError::Conflict);
         }
-        for actor in [&self.attribution.requested_by, &self.attribution.applied_by] {
-            if let GoalActor::UserControl { command, .. } = actor {
-                let applicable = match command {
-                    GoalUserCommandKind::Create => matches!(self.change, GoalChange::Create { .. }),
-                    GoalUserCommandKind::State => {
-                        matches!(self.change, GoalChange::SetDisposition { .. })
-                    }
-                };
-                if !applicable {
-                    return Err(GoalError::Inapplicable);
-                }
-            }
-        }
+        self.validate_local()?;
         if let GoalChange::Create { goal_id, objective } = &self.change {
             if current.is_some_and(|s| s.goal_id == *goal_id) {
                 return Err(GoalError::Inapplicable);
             }
-            return Ok(GoalSnapshot {
-                owner: self.owner.clone(),
-                goal_id: goal_id.clone(),
-                version: version.next()?,
-                objective: objective.clone(),
-                state: GoalState::Underway,
-            });
+            return GoalSnapshot::new(
+                self.owner.clone(),
+                goal_id.clone(),
+                version.next()?,
+                objective.clone(),
+                GoalState::Underway,
+            );
         }
         let current = current.ok_or(GoalError::Conflict)?;
         if matches!(
@@ -370,9 +478,6 @@ impl GoalMutation {
                 if goal_id != &current.goal_id {
                     return Err(GoalError::Conflict);
                 }
-                if matches!(self.attribution.requested_by, GoalActor::OwningAgent(_)) {
-                    return Err(GoalError::ReportBindingRequired);
-                }
                 next.state = disposition.state();
             }
             GoalChange::Report {
@@ -387,18 +492,6 @@ impl GoalMutation {
                 if !matches!(current.state, GoalState::Underway) {
                     return Err(GoalError::Inapplicable);
                 }
-                match &self.attribution.requested_by {
-                    GoalActor::OwningAgent(source)
-                        if source.product_conversation_id == self.owner
-                            && source.execution == binding.execution => {}
-                    GoalActor::OwningAgent(_)
-                    | GoalActor::UserApi { .. }
-                    | GoalActor::UserControl { .. }
-                    | GoalActor::Coordinator(_)
-                    | GoalActor::GeneratedHost { .. } => {
-                        return Err(GoalError::ReportBindingRequired)
-                    }
-                }
                 next.state = disposition.state();
             }
         }
@@ -411,11 +504,89 @@ impl GoalMutation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalHistoryEntry {
-    pub snapshot: GoalSnapshot,
-    pub mutation: GoalMutation,
-    pub recorded_at_us: GoalTimestampUs,
+    snapshot: GoalSnapshot,
+    mutation: GoalMutation,
+    recorded_at_us: GoalTimestampUs,
+}
+
+impl GoalHistoryEntry {
+    /// # Errors
+    /// Rejects a historical result inconsistent with the mutation's local transition facts.
+    pub fn new(
+        snapshot: GoalSnapshot,
+        mutation: GoalMutation,
+        recorded_at_us: GoalTimestampUs,
+    ) -> Result<Self, GoalError> {
+        mutation.validate_local()?;
+        if snapshot.owner != mutation.owner
+            || snapshot.version != mutation.expected_version.next()?
+        {
+            return Err(GoalError::Conflict);
+        }
+        let consistent = match &mutation.change {
+            GoalChange::Create { goal_id, objective } => {
+                snapshot.goal_id == *goal_id
+                    && snapshot.objective == *objective
+                    && snapshot.state == GoalState::Underway
+            }
+            GoalChange::SetDisposition {
+                goal_id,
+                disposition,
+            } => snapshot.goal_id == *goal_id && snapshot.state == disposition.state(),
+            GoalChange::Report {
+                binding,
+                disposition,
+            } => {
+                binding.owner == mutation.owner
+                    && binding.observation
+                        == GoalAdmissionObservation::Goal(GoalFence {
+                            owner: snapshot.owner.clone(),
+                            goal_id: snapshot.goal_id.clone(),
+                            version: mutation.expected_version,
+                        })
+                    && snapshot.state == disposition.state()
+            }
+        };
+        if !consistent {
+            return Err(GoalError::Inapplicable);
+        }
+        Ok(Self {
+            snapshot,
+            mutation,
+            recorded_at_us,
+        })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &GoalSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn mutation(&self) -> &GoalMutation {
+        &self.mutation
+    }
+
+    #[must_use]
+    pub const fn recorded_at_us(&self) -> GoalTimestampUs {
+        self.recorded_at_us
+    }
+}
+
+impl<'de> Deserialize<'de> for GoalHistoryEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            snapshot: GoalSnapshot,
+            mutation: GoalMutation,
+            recorded_at_us: GoalTimestampUs,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(fields.snapshot, fields.mutation, fields.recorded_at_us)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]

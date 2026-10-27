@@ -87,11 +87,11 @@ impl GoalRequestCause {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalRequestIntent {
-    pub id: GoalRequestId,
+    id: GoalRequestId,
     goal: GoalFence,
     pub execution: GoalExecution,
     generation: i64,
-    pub cause: GoalRequestCause,
+    cause: GoalRequestCause,
 }
 
 impl GoalRequestIntent {
@@ -107,6 +107,10 @@ impl GoalRequestIntent {
         if generation < 0 || goal.version.get() == 0 {
             return Err(GoalError::Range);
         }
+        if matches!(&cause, GoalRequestCause::AfterCheckpoint { predecessor } if predecessor == &id)
+        {
+            return Err(GoalError::Inapplicable);
+        }
         Ok(Self {
             id,
             goal,
@@ -119,6 +123,16 @@ impl GoalRequestIntent {
     #[must_use]
     pub const fn goal(&self) -> &GoalFence {
         &self.goal
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &GoalRequestId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn cause(&self) -> &GoalRequestCause {
+        &self.cause
     }
 
     #[must_use]
@@ -198,17 +212,62 @@ mod tests {
         let mut invalid_goal = intent.goal().clone();
         invalid_goal.version = GoalVersion::INITIAL;
         assert!(GoalRequestIntent::new(
-            intent.id.clone(),
+            intent.id().clone(),
             invalid_goal,
             intent.execution,
             intent.generation(),
-            intent.cause.clone(),
+            intent.cause().clone(),
         )
         .is_err());
         assert_eq!(intent.goal(), &goal);
         let mut invalid_encoded = encoded;
         invalid_encoded["goal"]["version"] = serde_json::json!(0);
         assert!(serde_json::from_value::<GoalRequestIntent>(invalid_encoded).is_err());
+    }
+
+    #[test]
+    fn request_cannot_precede_itself_through_constructor_or_wire() {
+        use super::super::{GoalId, GoalVersion, ProductConversationId};
+        let goal = GoalFence {
+            owner: ProductConversationId::parse("owner").unwrap(),
+            goal_id: GoalId::parse("goal").unwrap(),
+            version: GoalVersion::parse(1).unwrap(),
+        };
+        let id = GoalRequestId::parse("request").unwrap();
+        let execution = GoalExecution::parse(1, 2).unwrap();
+        let self_cause = GoalRequestCause::AfterCheckpoint {
+            predecessor: id.clone(),
+        };
+        assert_eq!(
+            GoalRequestIntent::new(id.clone(), goal.clone(), execution, 0, self_cause),
+            Err(GoalError::Inapplicable)
+        );
+        let mut encoded = serde_json::to_value(
+            GoalRequestIntent::new(
+                id.clone(),
+                goal.clone(),
+                execution,
+                0,
+                GoalRequestCause::AfterCheckpoint {
+                    predecessor: GoalRequestId::parse("previous").unwrap(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(encoded["cause"]["predecessor"], "previous");
+        encoded["cause"]["predecessor"] = serde_json::json!("request");
+        assert!(serde_json::from_value::<GoalRequestIntent>(encoded).is_err());
+        let valid =
+            GoalRequestIntent::new(id.clone(), goal, execution, 0, GoalRequestCause::Initial)
+                .unwrap();
+        assert_eq!(valid.id(), &id);
+        assert_eq!(valid.cause(), &GoalRequestCause::Initial);
+        assert_eq!(
+            serde_json::from_value::<GoalRequestIntent>(serde_json::to_value(&valid).unwrap())
+                .unwrap(),
+            valid
+        );
     }
 
     #[test]
