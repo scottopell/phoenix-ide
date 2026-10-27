@@ -36,8 +36,8 @@ pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
     PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
-mod conversation_name;
 pub mod conversation_goals;
+mod conversation_name;
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
