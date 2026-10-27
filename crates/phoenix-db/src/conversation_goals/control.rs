@@ -483,8 +483,8 @@ impl Database {
             unresolved: true,
             on_authority_lost: Some(on_authority_lost),
         };
+        let commit_result = tx.commit().await;
         let result = async {
-            let commit_result = tx.commit().await;
             #[cfg(test)]
             let commit_result = match cut {
                 ControlCommitCut::None => commit_result,
