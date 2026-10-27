@@ -121,11 +121,11 @@ async fn binding_tx(tx: &mut GoalTx<'_>, turn_id: i64) -> Result<Option<GoalExec
             observed_version: version,
         },
     };
-    Ok(Some(GoalExecutionBinding {
+    Ok(Some(GoalExecutionBinding::new(
         owner,
-        execution: GoalExecution::parse(row.try_get("workflow_id")?, turn_id)?,
+        GoalExecution::parse(row.try_get("workflow_id")?, turn_id)?,
         observation,
-    }))
+    )?))
 }
 
 async fn read_actor(tx: &mut GoalTx<'_>, actor_id: i64) -> Result<GoalActor> {
@@ -198,7 +198,7 @@ async fn history_entry(tx: &mut GoalTx<'_>, row: &SqliteRow) -> Result<GoalHisto
             binding: binding_tx(tx, row.try_get("report_turn_id")?)
                 .await?
                 .ok_or(GoalDbError::Integrity("report binding"))?,
-            disposition: disposition(snapshot.state()),
+            disposition: disposition(snapshot.state()).try_into()?,
         },
         _ => return Err(GoalDbError::Integrity("change kind")),
     };
@@ -286,7 +286,7 @@ impl Database {
         let binding = binding_tx(&mut tx, execution.turn_id()).await?;
         if binding
             .as_ref()
-            .is_some_and(|binding| binding.execution != execution)
+            .is_some_and(|binding| binding.execution() != execution)
         {
             return Err(GoalDbError::Integrity("execution binding"));
         }
@@ -466,9 +466,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(saved_binding.owner, saved_owner);
+        assert_eq!(saved_binding.owner(), &saved_owner);
         assert_eq!(
-            saved_binding.observation,
+            saved_binding.observation().clone(),
             GoalAdmissionObservation::Goal(
                 GoalFence::new(
                     saved_owner,
@@ -483,9 +483,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(no_goal_binding.owner, no_goal_owner);
+        assert_eq!(no_goal_binding.owner(), &no_goal_owner);
         assert_eq!(
-            no_goal_binding.observation,
+            no_goal_binding.observation().clone(),
             GoalAdmissionObservation::NoGoal {
                 observed_version: GoalVersion::INITIAL
             }
@@ -772,13 +772,13 @@ mod tests {
             .await
             .unwrap();
         let no_goal = binding_tx(&mut tx, 10).await.unwrap().unwrap();
-        assert_eq!(no_goal.owner.as_str(), "owner");
+        assert_eq!(no_goal.owner().as_str(), "owner");
         assert!(
-            matches!(no_goal.observation, GoalAdmissionObservation::NoGoal { observed_version } if observed_version.get() == 0)
+            matches!(no_goal.observation(), GoalAdmissionObservation::NoGoal { observed_version } if observed_version.get() == 0)
         );
         let goal = binding_tx(&mut tx, 11).await.unwrap().unwrap();
         assert!(
-            matches!(goal.observation, GoalAdmissionObservation::Goal(fence) if fence.version().get() == 2)
+            matches!(goal.observation(), GoalAdmissionObservation::Goal(fence) if fence.version().get() == 2)
         );
 
         sqlx::query("INSERT INTO conversation_goal_bindings VALUES (12, 'owner', 3, NULL, -1), (13, ' ', 3, NULL, 0)")
