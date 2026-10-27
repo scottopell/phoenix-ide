@@ -316,17 +316,50 @@ mod tests {
     #[tokio::test]
     async fn public_current_history_reads_use_migrated_database_and_ordinary_eligibility() {
         let db = migrated_db().await;
-        let ordinary = db.create_conversation("goal-owner", "goal-owner", "/tmp", true, None, None).await.unwrap();
+        let ordinary = db
+            .create_conversation("goal-owner", "goal-owner", "/tmp", true, None, None)
+            .await
+            .unwrap();
         let owner = ordinary.product_conversation_id.clone();
         assert!(db.conversation_goal(&owner).await.unwrap().is_none());
-        assert!(db.conversation_goal_current_entry(&owner).await.unwrap().is_none());
-        assert!(db.conversation_goal_history(&owner, GoalVersion::INITIAL).await.unwrap().is_empty());
+        assert!(db
+            .conversation_goal_current_entry(&owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .conversation_goal_history(&owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .is_empty());
 
-        let coordinator = db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default()).await.unwrap();
-        assert!(db.conversation_goal(&coordinator.product_conversation_id).await.unwrap().is_none());
-        assert!(db.conversation_goal_current_entry(&coordinator.product_conversation_id).await.is_err());
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_ids").fetch_one(db.pool()).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_history").fetch_one(db.pool()).await.unwrap(), 0);
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        assert!(db
+            .conversation_goal(&coordinator.product_conversation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .conversation_goal_current_entry(&coordinator.product_conversation_id)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_ids")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_history")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
 
         sqlx::query("INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES ('goal-1','objective',?)")
             .bind(owner.as_str()).execute(db.pool()).await.unwrap();
@@ -337,12 +370,23 @@ mod tests {
 
         let current = db.conversation_goal(&owner).await.unwrap().unwrap();
         assert_eq!(current.objective().as_str(), "objective");
-        let entry = db.conversation_goal_current_entry(&owner).await.unwrap().unwrap();
+        let entry = db
+            .conversation_goal_current_entry(&owner)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.snapshot(), &current);
         assert_eq!(entry.recorded_at_us().get(), 1234);
-        assert!(matches!(entry.mutation().attribution.requested_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
-        assert!(matches!(entry.mutation().attribution.applied_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
-        let history = db.conversation_goal_history(&owner, GoalVersion::INITIAL).await.unwrap();
+        assert!(
+            matches!(entry.mutation().attribution.requested_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create")
+        );
+        assert!(
+            matches!(entry.mutation().attribution.applied_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create")
+        );
+        let history = db
+            .conversation_goal_history(&owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].snapshot(), &current);
         assert_eq!(history[0].mutation().action_id.as_str(), "action-1");
@@ -351,9 +395,20 @@ mod tests {
     #[tokio::test]
     async fn public_binding_read_of_absent_execution_does_not_capture_or_write() {
         let db = migrated_db().await;
-        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings").fetch_one(db.pool()).await.unwrap();
-        assert!(db.conversation_goal_execution_binding(GoalExecution::parse(9001, 7001).unwrap()).await.unwrap().is_none());
-        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings").fetch_one(db.pool()).await.unwrap();
+        let before =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(db
+            .conversation_goal_execution_binding(GoalExecution::parse(9001, 7001).unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(before, after);
         assert_eq!(after, 0);
     }
@@ -371,7 +426,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(read_state(&row).unwrap(), GoalState::Blocked(GoalText::parse(" waiting ").unwrap()));
+        assert_eq!(
+            read_state(&row).unwrap(),
+            GoalState::Blocked(GoalText::parse(" waiting ").unwrap())
+        );
 
         for (state, reason) in [("underway", "why"), ("blocked", " "), ("unknown", "why")] {
             let row = sqlx::query("SELECT ? AS state, ? AS reason")
@@ -380,7 +438,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-            assert!(read_state(&row).is_err(), "accepted {state:?} with {reason:?}");
+            assert!(
+                read_state(&row).is_err(),
+                "accepted {state:?} with {reason:?}"
+            );
         }
     }
 
@@ -391,22 +452,30 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert!(matches!(snapshot(&row), Err(GoalDbError::Domain(GoalError::Blank))));
+        assert!(matches!(
+            snapshot(&row),
+            Err(GoalDbError::Domain(GoalError::Blank))
+        ));
 
         let row = sqlx::query("SELECT 'owner' AS owner_id, 'goal' AS goal_id, 1 AS version, 'objective' AS objective, 'underway' AS state, 'reason' AS reason")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert!(matches!(snapshot(&row), Err(GoalDbError::Integrity("state/reason"))));
+        assert!(matches!(
+            snapshot(&row),
+            Err(GoalDbError::Integrity("state/reason"))
+        ));
     }
 
     #[tokio::test]
     async fn current_and_history_read_absent_and_persisted_facts() {
         let pool = test_pool().await;
-        sqlx::query("CREATE TABLE conversation_goal_ids (owner_id TEXT, goal_id TEXT, objective TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE conversation_goal_ids (owner_id TEXT, goal_id TEXT, objective TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("CREATE TABLE conversation_goal_history (owner_id TEXT, version INTEGER, goal_id TEXT, state TEXT, reason TEXT, change_kind TEXT, action_id TEXT, requested_actor_id INTEGER, applied_actor_id INTEGER, recorded_at_us INTEGER, report_turn_id INTEGER)")
             .execute(&pool)
             .await
@@ -419,7 +488,10 @@ mod tests {
         let owner = ProductConversationId::parse("owner").unwrap();
         let mut tx = pool.begin().await.unwrap();
         assert!(current_tx(&mut tx, &owner).await.unwrap().is_none());
-        assert!(history_tx(&mut tx, &owner, GoalVersion::INITIAL).await.unwrap().is_empty());
+        assert!(history_tx(&mut tx, &owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .is_empty());
 
         sqlx::query("INSERT INTO conversation_goal_ids VALUES ('owner', 'goal', 'objective')")
             .execute(&mut *tx)
@@ -436,7 +508,9 @@ mod tests {
 
         let current = current_tx(&mut tx, &owner).await.unwrap().unwrap();
         assert_eq!(current.objective().as_str(), "objective");
-        let history = history_tx(&mut tx, &owner, GoalVersion::INITIAL).await.unwrap();
+        let history = history_tx(&mut tx, &owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].snapshot(), &current);
         assert_eq!(history[0].recorded_at_us().get(), 100);
@@ -446,10 +520,12 @@ mod tests {
     #[tokio::test]
     async fn history_reads_are_oldest_first_and_capped_at_one_hundred() {
         let pool = test_pool().await;
-        sqlx::query("CREATE TABLE conversation_goal_ids (goal_id TEXT, owner_id TEXT, objective TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE conversation_goal_ids (goal_id TEXT, owner_id TEXT, objective TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("CREATE TABLE conversation_goal_history (owner_id TEXT, version INTEGER, goal_id TEXT, state TEXT, reason TEXT, change_kind TEXT, action_id TEXT, requested_actor_id INTEGER, applied_actor_id INTEGER, recorded_at_us INTEGER, report_turn_id INTEGER)")
             .execute(&pool)
             .await
@@ -479,7 +555,9 @@ mod tests {
 
         let owner = ProductConversationId::parse("owner").unwrap();
         let mut tx = pool.begin().await.unwrap();
-        let entries = history_tx(&mut tx, &owner, GoalVersion::INITIAL).await.unwrap();
+        let entries = history_tx(&mut tx, &owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 100);
         assert_eq!(entries.first().unwrap().snapshot().version().get(), 1);
         assert_eq!(entries.last().unwrap().snapshot().version().get(), 100);
@@ -502,16 +580,26 @@ mod tests {
             .unwrap();
         let no_goal = binding_tx(&mut tx, 10).await.unwrap().unwrap();
         assert_eq!(no_goal.owner.as_str(), "owner");
-        assert!(matches!(no_goal.observation, GoalAdmissionObservation::NoGoal { observed_version } if observed_version.get() == 0));
+        assert!(
+            matches!(no_goal.observation, GoalAdmissionObservation::NoGoal { observed_version } if observed_version.get() == 0)
+        );
         let goal = binding_tx(&mut tx, 11).await.unwrap().unwrap();
-        assert!(matches!(goal.observation, GoalAdmissionObservation::Goal(GoalFence { version, .. }) if version.get() == 2));
+        assert!(
+            matches!(goal.observation, GoalAdmissionObservation::Goal(GoalFence { version, .. }) if version.get() == 2)
+        );
 
         sqlx::query("INSERT INTO conversation_goal_bindings VALUES (12, 'owner', 3, NULL, -1), (13, ' ', 3, NULL, 0)")
             .execute(&mut *tx)
             .await
             .unwrap();
-        assert!(matches!(binding_tx(&mut tx, 12).await, Err(GoalDbError::Domain(GoalError::Range))));
-        assert!(matches!(binding_tx(&mut tx, 13).await, Err(GoalDbError::Integrity("product id"))));
+        assert!(matches!(
+            binding_tx(&mut tx, 12).await,
+            Err(GoalDbError::Domain(GoalError::Range))
+        ));
+        assert!(matches!(
+            binding_tx(&mut tx, 13).await,
+            Err(GoalDbError::Integrity("product id"))
+        ));
         tx.rollback().await.unwrap();
     }
 }
