@@ -28,7 +28,28 @@ additional retention evidence, not proof that every remaining PTY is leaked.
 The production descriptor fix does not revoke descriptors already inherited by
 existing processes; no existing user session is terminated by this work.
 
-## Earlier investigation
+## Implementation verification
+
+- Original allocator failed both endpoint protection and raw fork/exec regressions.
+- Fixed allocator passed all 90 terminal-crate tests; all eight WebSocket/reclaim
+  tests passed, including the relay-copy regression and real direct handoff.
+- Two isolated adversarial reviews of runtime source at
+  `698affa9444c5fa87f647790e73c34fe8fa72c38` found no actionable defects. Independent
+  macOS probes confirmed unchanged default terminal attributes.
+- The full `./dev.py check` passed 18 of 19 checks; its Rust lane exposed the
+  already-tracked missing native Bash launcher prerequisite (task 44020), not a
+  PTY regression. With this worktree's source-built launcher configured via
+  `PHOENIX_BASH_LAUNCH_TEST_EXE` and `PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1`, the failed
+  Coordinator case, its 19-test module, and the 83-test runtime module passed.
+- The complete affected Rust lane and formatting were then rerun through
+  `./dev.py check --lanes rust,cargo-fmt` with that prerequisite: all five checks
+  passed in 494.1 seconds. No runtime source changed between the full check and
+  the corrected Rust rerun.
+- PR #983 contains the implementation. Hosted CI and automatic Codex review are
+  separate merge-time gates; no deployment or revocation of existing inherited
+  descriptors is claimed.
+
+## Earlier investigation evidence
 
 Observed during context-capacity qualification: terminal handoff fixture fails at openpty with ENXIO before lifecycle assertions; an independent Python os.openpty call fails with the same host error. kern.tty.ptmx_max is 511. Read-only lsof inspection found many existing tmux processes holding multiple PTY masters, including masters shared across process families. This is evidence of exhaustion; it does not by itself prove a leak.
 

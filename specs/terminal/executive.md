@@ -14,8 +14,8 @@ PhoenixIDE organises work into conversations, each tied to a directory. The term
 opens into that directory, giving immediate access to the environment the agent is
 working in — without SSH, without switching applications.
 
-A secondary motivation is learning: the implementation uses `nix` crate syscalls
-directly (`openpty`, `fork`, `setsid`, `TIOCSCTTY`, `TIOCSWINSZ`) rather than a
+A secondary motivation is learning: the implementation uses `libc` and `nix` syscalls
+directly (`open`, `grantpt`, `unlockpt`, `fork`, `setsid`, `TIOCSCTTY`, `TIOCSWINSZ`) rather than a
 higher-level abstraction, making the PTY/TTY stack concrete and auditable. The
 canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 
@@ -82,7 +82,7 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | REQ-TERM-012: Terminal torn down with WorkScope | ✅ Done | src/terminal/ws.rs:teardown watcher (per-scope dispatch) |
 | REQ-TERM-013: WebSocket endpoint authentication | ✅ Done | src/api/auth.rs middleware |
 | REQ-TERM-014: Output channel backpressure | ✅ Done | src/terminal/ws.rs:OUTPUT_BUF bounded reads |
-| REQ-TERM-024: Terminal descriptor isolation | Implementation in progress | Atomic close-on-exec allocation and relay duplication; exec-inheritance regression required. |
+| REQ-TERM-024: Terminal descriptor isolation | Implemented; locally verified | `pty::allocate`, `terminal_ws::build_pty_io`; endpoint/relay flags, raw fork/exec positive control, closed-stdio allocation, real terminal reclaim and retirement tests. |
 | REQ-TERM-WS-001: Terminal sessions keyed by WorkScope | ✅ Done | src/terminal/session.rs:ActiveTerminals; src/work_scope.rs |
 
 ## Detached-child reaping candidate
