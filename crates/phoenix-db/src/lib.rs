@@ -10296,15 +10296,34 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_tool_round_state_and_replay_input(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: crate::conversation_goals::round::ToolRoundWrite<'_>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> DbResult<crate::conversation_goals::round::CommittedGoalRound> {
+        self.persist_canonical_state_and_replay_input(
+            conversation_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
+            update,
+            None,
+        )
+        .await
+    }
+
     /// Persist a tool round and its selected conversation state atomically.
     ///
     /// # Errors
     ///
     /// Returns a [`DbError`] when message insertion, state update, or commit fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if the conversation state cannot be serialized.
     pub async fn persist_tool_round_and_state(
         &self,
         conversation_id: &str,
@@ -10313,27 +10332,11 @@ impl Database {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
-        }
-        coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state).unwrap();
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-        )
-        .bind(state_json)
-        .bind(conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
-        }
-        tx.commit().await?;
+        self.persist_tool_round_state_and_replay_input(
+            conversation_id, assistant,
+            conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            state, state_updated_at, None,
+        ).await?;
         Ok(())
     }
 
@@ -10350,17 +10353,62 @@ impl Database {
         obligation: &workflow::DirectTurnTerminalObligationInput,
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        insert_message_tx(&mut tx, assistant).await?;
-        for message in tool_results {
-            insert_message_tx(&mut tx, message).await?;
+        self.persist_tool_round_with_terminal_obligation_input_at_cut(
+            conversation_id, assistant,
+            conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            obligation, None, cut,
+        ).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_with_terminal_obligation_input_at_cut(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: conversation_goals::round::ToolRoundWrite<'_>,
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> DbResult<conversation_goals::round::CommittedGoalTerminalRound> {
+        use conversation_goals::round;
+        if matches!(&input, round::ToolRoundWrite::Pending { .. }) {
+            if let Some(update) = replay {
+                provider_replay::validate_goal_round_replay(assistant, update)?;
+            }
         }
-        workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let round::ToolRoundWrite::Pending { execution, .. } = &input {
+            if i64::try_from(obligation.turn_id.0).ok() != Some(execution.turn_id()) {
+                return Err(DbError::Serialization("goal terminal turn differs".into()));
+            }
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT conversation_id FROM durable_turns WHERE turn_id = ? AND workflow_id = ?",
+            )
+            .bind(execution.turn_id())
+            .bind(execution.workflow_id())
+            .fetch_optional(&mut *tx)
             .await?;
+            if owner.as_deref() != Some(conversation_id) {
+                return Err(DbError::Serialization("goal terminal conversation differs".into()));
+            }
+        }
+        let (results, replayed) = round::write_round_tx(
+            &mut tx, conversation_id, assistant, input,
+            &obligation.projection.state, obligation.projection.state_updated_at,
+            self.goal_write_policies(),
+        ).await?;
+        if !replayed {
+            workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
+            if let Some(update) = replay {
+                provider_replay::apply_replay_tx(&mut tx, conversation_id, update).await?;
+            }
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(Utc::now().to_rfc3339())
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         if cut == TerminalEvidenceTransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(DbError::Serialization(
@@ -10373,7 +10421,7 @@ impl Database {
                 "injected after-commit cut".to_string(),
             ));
         }
-        Ok(())
+        Ok(round::CommittedGoalTerminalRound { results, replayed })
     }
 
     /// Persist a terminal tool round and its obligation in one transaction.
