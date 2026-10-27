@@ -42,23 +42,24 @@ and exact request coverage.
 Deleted runtime code includes receipt inspection, inspection scheduling, private
 retry handling, question-text rendering and question-retirement synchronization.
 Obsolete retry tests are replaced by single-attempt failure/restart regressions.
-Existing migration history remains unchanged; retained private retries stop visibly
+Published upstream migration history remains intact; retained private retries stop visibly
 and definitely-unsent legacy question-text returns become distinct generic handoffs.
 
 ## Validation
 
-All 606 affected Rust tests pass, covering MCP, gateway, native routing,
-migrations, creation replay and deletion. All ten local check types pass,
-including full UI tests, type checking, linting, Clippy, formatting, Allium and
-structural checks. The 86-test focused run also passes. Regression coverage
-includes single-attempt command outcomes across settings changes/restart,
-interrupted eyes claims, discovery after failed acknowledgments, generic handoffs
-across question changes, exact connector pagination and OAuth callback grace.
+The integrated 645-test Rust run passed 641 tests initially. Three historical
+fixtures required schema-aware setup; all three pass after correction. One
+process killed by SIGKILL passes in isolation. Coverage includes MCP, gateway,
+Goals storage, native routing, migrations, creation replay and deletion.
+All ten local check types pass, including full UI tests, type checking, linting,
+Clippy, formatting, Allium and structural checks. Ten protected deployment
+controller tests pass, including rejection of the unqualified current registry
+before stopping a service.
 
-The 1,200-test developer-tool run had three environment-sensitive failures;
-all three pass with native Bash/OpenSSL and the shared Cargo target override
-removed. The full developer-tool run was not repeated. Hosted CI and posted
-review feedback remain gates for the new head.
+The pre-integration 1,200-test developer-tool run had three environment-sensitive
+failures; all three pass with native Bash/OpenSSL and the shared Cargo target
+override removed. The full developer-tool run was not repeated. Hosted CI and
+posted review feedback remain gates for the integrated head.
 
 ## Production boundary
 
@@ -67,8 +68,12 @@ routing, credentials, provider adapters and private operational records stay out
 the public repository. The redesigned settings and later hardening are not claimed
 deployed by pilot evidence.
 
-Public migrations 132–136 follow upstream migration 131; the pilot used a distinct
+Public migrations 141–145 follow upstream migration 140; the pilot used a distinct
 pre-publication migration-130 ledger. Direct pilot-to-public upgrade is unqualified
 and requires offline reconciliation plus paired rollback qualification. Protected
 deployment limits remain intact. No merge, new deployment or live integration
 writes are implied by local tests or this simplification.
+
+The unmerged Slack migrations follow upstream's 132–140 registry at 141–145.
+The Slack origin CHECK preserves upstream remote attribution. Earlier prototype
+and pre-integration development ledgers are not qualified direct upgrade sources.

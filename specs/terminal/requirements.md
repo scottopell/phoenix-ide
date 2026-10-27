@@ -170,6 +170,26 @@ making orphan prevention correct by construction rather than by discipline.
 
 ---
 
+### REQ-TERM-024: Terminal Descriptor Isolation
+
+WHEN Phoenix allocates a terminal PTY or duplicates its master for an I/O relay
+THE SYSTEM SHALL create each descriptor with close-on-exec protection atomically
+AND SHALL NOT expose an inheritable descriptor between allocation and protection,
+including when another thread concurrently launches a child process.
+
+WHEN Phoenix executes a child process
+THE SYSTEM SHALL NOT pass terminal master descriptors or original slave descriptors
+into that executable
+AND SHALL preserve the intended terminal child's slave-backed standard input,
+standard output, and standard error across exec.
+
+**Rationale:** An unrelated child retaining a terminal descriptor can keep the PTY
+allocated after its owning terminal closes. Relay copies require the same isolation
+as the registered master; closing only Phoenix's local handles cannot release a
+descriptor retained by another executable.
+
+---
+
 ### REQ-TERM-009: Child Process Reaped After Shell Exit
 
 WHEN a terminal child is published in the active-terminal registry

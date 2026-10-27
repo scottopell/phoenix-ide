@@ -15,6 +15,7 @@ export function eventCardFragments(presentation: EventPresentation | null, event
   const labels = {
     turn_finished: 'Turn finished', failed: 'Failed', cleanup_failed: 'Cleanup failed',
     cancelled: 'Cancelled', awaiting_user_response: 'Awaiting user response', awaiting_task_approval: 'Awaiting task approval',
+    goal_changed: 'Goal changed',
   };
   const date = new Date(presentation.occurred_at_us / 1000);
   return {

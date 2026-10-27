@@ -1693,7 +1693,7 @@ mod tests {
         // The original direct workflow may still own the conversation while
         // a private steering occurrence has already become the active input.
         sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'fixture',1,1,1,0,0,'Active','fixture',1,X'00',1,1)").execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,canonical_message_id) VALUES (1,1,?1,'fixture','fixture',X'00','Runtime',0,1,?2)").bind(&conv.id).bind(&request.input_id).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,canonical_message_id,materialized) VALUES (1,1,?1,'fixture','fixture',X'00','Runtime',0,1,?2,1)").bind(&conv.id).bind(&request.input_id).execute(db.pool()).await.unwrap();
         db.add_message_with_seq_and_origin(
             "private-input",
             &conv.id,
@@ -2871,7 +2871,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let origin = InputOrigin::SlackGateway {
-            request_id: request.request_id,
+            request_id: request.request_id.clone(),
         };
         db.add_message_with_seq_and_origin(
             "input",
@@ -2884,6 +2884,12 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(db.get_messages("test").await.unwrap()[0].origin, origin);
+        sqlx::query("UPDATE messages SET origin_kind='remote_api',origin_source_instance_id='6fccba50-c1ac-43fd-bc13-7559428d2e90',origin_slack_request_id=NULL WHERE message_id='input'")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE messages SET origin_kind='slack_gateway',origin_source_instance_id=NULL,origin_slack_request_id=?1 WHERE message_id='input'")
+            .bind(&request.request_id)
+            .execute(db.pool()).await.unwrap();
         assert_eq!(db.get_messages("test").await.unwrap()[0].origin, origin);
         assert!(sqlx::query(
             "UPDATE messages SET origin_slack_request_id=NULL WHERE message_id='input'"
@@ -2941,7 +2947,7 @@ mod tests {
             ids.push(r.request_id);
         }
         sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'fixture',1,1,1,0,0,'Active','fixture',1,X'00',1,1)").execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,canonical_message_id) SELECT 1,1,'test','fixture','fixture',X'00','Runtime',0,1,input_id FROM slack_gateway_requests WHERE request_id=?1").bind(&ids[0]).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,canonical_message_id,materialized) SELECT 1,1,'test','fixture','fixture',X'00','Runtime',0,1,input_id,1 FROM slack_gateway_requests WHERE request_id=?1").bind(&ids[0]).execute(db.pool()).await.unwrap();
         db.add_message_with_seq_and_origin(
             "private-input",
             "test",

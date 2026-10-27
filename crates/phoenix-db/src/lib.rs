@@ -26,6 +26,7 @@ mod git_repository_reconciliation;
 mod message_attachments;
 mod svg_artifacts;
 pub use svg_artifacts::SvgArtifact;
+mod lineage;
 mod migrations;
 mod product_creation;
 mod provider_replay;
@@ -37,6 +38,7 @@ pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
     PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
+pub mod conversation_goals;
 mod conversation_name;
 mod product_conversation_read;
 pub mod retrieval;
@@ -1668,6 +1670,9 @@ impl SteeringCapacityTestControl {
 pub struct Database {
     pool: SqlitePool,
     slack_gateway_wakeup: std::sync::Arc<tokio::sync::Notify>,
+    goal_control_installation: conversation_goals::control::GoalControlInstallation,
+    goal_execution_installation: conversation_goals::execution::GoalExecutionInstallation,
+    goal_control_runtime: std::sync::Arc<conversation_goals::control::dispatch::GoalControlRuntime>,
     sqlite_workload_collector: SqliteWorkloadCollector,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
@@ -1693,6 +1698,9 @@ impl Clone for Database {
         Self {
             pool: self.pool.clone(),
             slack_gateway_wakeup: self.slack_gateway_wakeup.clone(),
+            goal_control_installation: self.goal_control_installation,
+            goal_execution_installation: self.goal_execution_installation,
+            goal_control_runtime: self.goal_control_runtime.clone(),
             sqlite_workload_collector: self.sqlite_workload_collector.clone(),
             path: self.path.clone(),
             dormant_git_repository_catchup_authority_state: self
@@ -1841,6 +1849,8 @@ impl Database {
         workflow::WorkflowRepository::with_sqlite_workload_collector(
             self.pool.clone(),
             self.sqlite_workload_collector.clone(),
+            self.goal_control_installation,
+            self.goal_execution_installation,
         )
     }
 
@@ -1925,6 +1935,11 @@ impl Database {
             slack_gateway_wakeup: std::sync::Arc::new(tokio::sync::Notify::new()),
             sqlite_workload_collector,
             path,
+            goal_control_installation:
+                conversation_goals::control::GoalControlInstallation::Disabled,
+            goal_execution_installation:
+                conversation_goals::execution::GoalExecutionInstallation::Disabled,
+            goal_control_runtime: std::sync::Arc::default(),
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
                 git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
             ),
@@ -3541,6 +3556,7 @@ impl Database {
     }
 
     async fn run_migrations(&self) -> DbResult<()> {
+        lineage::preflight(&self.pool, migrations::migration_identities()).await?;
         sqlx::raw_sql(ddl::SCHEMA).execute(&self.pool).await?;
         sqlx::raw_sql(ddl::MIGRATION_TYPED_STATE)
             .execute(&self.pool)

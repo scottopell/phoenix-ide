@@ -1,3 +1,4 @@
+pub(crate) mod goal_facts;
 mod mandatory_close;
 mod presentation;
 use mandatory_close::decode_route;
@@ -34,6 +35,7 @@ pub enum WatchOutcome {
     Cancelled,
     AwaitingUserResponse,
     AwaitingTaskApproval,
+    GoalChanged,
 }
 
 impl WatchOutcome {
@@ -43,6 +45,7 @@ impl WatchOutcome {
             ("failed", Some(reason)) => Ok(Self::Failed { reason }),
             ("cleanup_failed", Some(reason)) => Ok(Self::CleanupFailed { reason }),
             ("cancelled", None) => Ok(Self::Cancelled),
+            ("goal_changed", None) => Ok(Self::GoalChanged),
             ("awaiting_user_response", Some(reason)) if reason == "question_request" => {
                 Ok(Self::AwaitingUserResponse)
             }
@@ -64,6 +67,7 @@ impl WatchOutcome {
             Self::Cancelled => "cancelled",
             Self::AwaitingUserResponse => "awaiting_user_response",
             Self::AwaitingTaskApproval => "awaiting_task_approval",
+            Self::GoalChanged => "goal_changed",
         }
     }
 
@@ -73,7 +77,7 @@ impl WatchOutcome {
             Self::Failed { reason } | Self::CleanupFailed { reason } => Some(reason),
             Self::AwaitingUserResponse => Some("question_request"),
             Self::AwaitingTaskApproval => Some("task_approval_wait"),
-            Self::Completed | Self::Cancelled => None,
+            Self::Completed | Self::Cancelled | Self::GoalChanged => None,
         }
     }
 }

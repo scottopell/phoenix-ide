@@ -1,6 +1,6 @@
 -- REQ-SG-005/009/011/013. Existing inputs and origin columns are preserved.
 PRAGMA writable_schema = ON;
-UPDATE sqlite_schema SET sql = replace(sql, '''subscription_event''))', '''subscription_event'', ''slack_gateway''))')
+UPDATE sqlite_schema SET sql = replace(sql, '''remote_coordinator''))', '''remote_coordinator'', ''slack_gateway''))')
 WHERE type = 'table' AND name IN ('messages','steering_messages','durable_turns');
 PRAGMA writable_schema = RESET;
 ALTER TABLE messages ADD COLUMN origin_slack_request_id TEXT REFERENCES slack_gateway_requests(request_id);

@@ -7,9 +7,10 @@ Deployment tests decompress it without relying on historical git objects in
 shallow CI clones. It provides immutable historical protected-route evidence;
 synthetic schema-128 fixtures remove migration129 and scope their own pin.
 
-`migrations-through-131.rs.gz` captures the byte-exact registry from
-`b68c79c67` with `gzip -n`. Its decompressed SHA-256 is
-`850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac`,
-the protected ordinary source-129/target-131 pin. Tests retain that qualification
-without accidentally admitting a later registry; the current candidate is
-separately tested for refusal before stopping a service.
+`migrations-through-131.rs.gz` is the byte-exact target-131 Rust registry from
+commit `3c83092665f951cb01547eb79a1e952e4776c88f`, compressed with gzip (`mtime=0`).
+Its uncompressed SHA-256 is
+`850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac`.
+`OrdinarySource129To131Tests` uses it for historical admission and recovery;
+the newer ambient registry is exercised separately as an unqualified
+interval that must be rejected before any service stop or start.
