@@ -1712,7 +1712,7 @@ impl WorkflowRepository {
         )
         .await?;
         let updated = sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1
                  WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NULL
                    AND canonical_message_id IS NULL AND workflow_id = ?4",
         )
@@ -5149,6 +5149,18 @@ mod tests {
                 MaterializeAuthoritativeTurnOutcome::Materialized(_)
             )
         ));
+        let (materialized, stored_message): (i64, Option<String>) = sqlx::query_as(
+            "SELECT materialized, canonical_message_id FROM durable_turns WHERE turn_id = ?",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(materialized, 1);
+        assert_eq!(
+            stored_message.as_deref(),
+            Some(canonical_message_id("conv-a", "message-conv-a-typed-receipt").as_str())
+        );
         let result = sqlx::query(
             "SELECT r.receipt_payload, d.delivery_id, d.payload_blob
              FROM workflow_receipts r
@@ -7214,7 +7226,7 @@ mod tests {
         .await
         .unwrap();
         assert!(sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = ?2 WHERE turn_id = ?1",
+            "UPDATE durable_turns SET canonical_message_id = ?2, materialized = 1 WHERE turn_id = ?1",
         )
         .bind(i64::try_from(turn_id.0).unwrap())
         .bind(canonical_message_id("conv-b", "foreign-message"))
