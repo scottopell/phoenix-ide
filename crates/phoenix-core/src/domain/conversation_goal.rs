@@ -615,7 +615,9 @@ impl GoalHistoryEntry {
         recorded_at_us: GoalTimestampUs,
     ) -> Result<Self, GoalError> {
         mutation.validate_local()?;
-        if snapshot.owner != mutation.owner
+        if (!matches!(mutation.change, GoalChange::Create { .. })
+            && mutation.expected_version == GoalVersion::INITIAL)
+            || snapshot.owner != mutation.owner
             || snapshot.version != mutation.expected_version.next()?
         {
             return Err(GoalError::Conflict);

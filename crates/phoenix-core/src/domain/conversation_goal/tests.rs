@@ -269,6 +269,54 @@ fn report_outcomes_keep_valid_wire_and_reject_non_report_states() {
 }
 
 #[test]
+fn historical_non_create_receipts_require_a_positive_predecessor_version() {
+    let current = initial();
+    let timestamp = GoalTimestampUs::parse(123).unwrap();
+    let initial_create = create(0, "goal");
+    let receipt = GoalHistoryEntry::new(current.clone(), initial_create, timestamp).unwrap();
+    assert_eq!(
+        serde_json::from_value::<GoalHistoryEntry>(serde_json::to_value(&receipt).unwrap())
+            .unwrap(),
+        receipt,
+    );
+    for command in [
+        set(&current, GoalDisposition::Blocked(text("access"))),
+        report(&current),
+        create(current.version().get(), "replacement"),
+    ] {
+        let snapshot = command.advance(Some(&current)).unwrap();
+        let receipt = GoalHistoryEntry::new(snapshot.clone(), command.clone(), timestamp).unwrap();
+        assert_eq!(receipt.snapshot().version().get(), 2);
+        assert_eq!(
+            serde_json::from_value::<GoalHistoryEntry>(serde_json::to_value(&receipt).unwrap())
+                .unwrap(),
+            receipt,
+        );
+        if matches!(command.change, GoalChange::Create { .. }) {
+            continue;
+        }
+        let first_snapshot = GoalSnapshot::new(
+            snapshot.owner().clone(),
+            snapshot.goal_id().clone(),
+            GoalVersion::parse(1).unwrap(),
+            snapshot.objective().clone(),
+            snapshot.state().clone(),
+        )
+        .unwrap();
+        let mut invalid = command;
+        invalid.expected_version = GoalVersion::INITIAL;
+        assert_eq!(
+            GoalHistoryEntry::new(first_snapshot.clone(), invalid.clone(), timestamp),
+            Err(GoalError::Conflict),
+        );
+        let wire = serde_json::json!({
+            "snapshot": first_snapshot, "mutation": invalid, "recorded_at_us": timestamp,
+        });
+        assert!(serde_json::from_value::<GoalHistoryEntry>(wire).is_err());
+    }
+}
+
+#[test]
 fn saved_snapshot_requires_committed_version_in_constructor_and_wire() {
     let saved = initial();
     let mut encoded = serde_json::to_value(&saved).unwrap();
