@@ -359,3 +359,5 @@ ADR-000 (adopt spEARS v2 for new work)
 Capacity planning across ordinary requests, handoffs and model switches is governed by [ADR-146](146_context-capacity-preserves-output-and-semantic-continuity.md), affecting REQ-LLM-004f/004j–004m, REQ-BED-020a, REQ-STR-012 and REQ-AN-011.
 
 Generated handoff readability and explicit source authority are governed by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md); automatic initiation remains governed by ADR-054.
+
+Goals schema extraction and refusal of unsupported migration lineages are governed by [ADR-187](187_goal_main_migration_identity_reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility.

@@ -25,6 +25,7 @@ mod message_attachments;
 mod svg_artifacts;
 pub use svg_artifacts::SvgArtifact;
 mod migrations;
+mod lineage;
 mod product_creation;
 mod provider_replay;
 mod responses_replay;
@@ -3536,6 +3537,7 @@ impl Database {
     }
 
     async fn run_migrations(&self) -> DbResult<()> {
+        lineage::preflight(&self.pool, migrations::migration_identities()).await?;
         sqlx::raw_sql(ddl::SCHEMA).execute(&self.pool).await?;
         sqlx::raw_sql(ddl::MIGRATION_TYPED_STATE)
             .execute(&self.pool)
