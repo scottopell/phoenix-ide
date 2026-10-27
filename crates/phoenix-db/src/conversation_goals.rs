@@ -392,6 +392,207 @@ mod tests {
         assert_eq!(history[0].mutation().action_id.as_str(), "action-1");
     }
 
+    async fn seed_execution_turn(
+        db: &Database,
+        conversation_id: &str,
+        workflow_id: i64,
+        turn_id: i64,
+    ) {
+        let message = db
+            .add_message(
+                &format!("goal-turn-{turn_id}"),
+                conversation_id,
+                &crate::schema::MessageContent::user("goal execution"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (?, 'direct_turn', 1, 0, 1, 1, 0, 'Active', 'direct_turn.snapshot', 1, X'01', 1, 1)")
+            .bind(workflow_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id) VALUES (?, ?, ?, ?, 'goal-test-fingerprint', X'01', 'Runtime', 0, 1, 'user_api', ?)")
+            .bind(turn_id)
+            .bind(workflow_id)
+            .bind(conversation_id)
+            .bind(format!("goal-turn-key-{turn_id}"))
+            .bind(message.message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn seed_goal(db: &Database, owner: &ProductConversationId, goal_id: &str) {
+        sqlx::query("INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES (?, 'objective', ?)")
+            .bind(goal_id)
+            .bind(owner.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id) VALUES (1,?,'generated_host','fixture-create')")
+            .bind(owner.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,1,?,'underway',NULL,'fixture-create','create',NULL,1,1,1)")
+            .bind(owner.as_str())
+            .bind(goal_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_binding_reads_saved_goal_and_no_goal_without_capturing_or_writing() {
+        let db = migrated_db().await;
+        let saved = db
+            .create_conversation("goal-saved", "goal-saved", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let no_goal = db
+            .create_conversation("goal-none", "goal-none", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let saved_owner = saved.product_conversation_id.clone();
+        let no_goal_owner = no_goal.product_conversation_id.clone();
+        seed_goal(&db, &saved_owner, "saved-goal").await;
+        seed_execution_turn(&db, &saved.id, 9001, 7001).await;
+        seed_execution_turn(&db, &no_goal.id, 9002, 7002).await;
+        sqlx::query("INSERT INTO conversation_goal_bindings(turn_id,workflow_id,owner_id,observed_version,goal_id) VALUES (7001,9001,?,1,'saved-goal'), (7002,9002,?,NULL,NULL)")
+            .bind(saved_owner.as_str())
+            .bind(no_goal_owner.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let saved_binding = db
+            .conversation_goal_execution_binding(GoalExecution::parse(9001, 7001).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_binding.owner, saved_owner);
+        assert_eq!(
+            saved_binding.observation,
+            GoalAdmissionObservation::Goal(
+                GoalFence::new(
+                    saved_owner,
+                    GoalId::parse("saved-goal".to_string()).unwrap(),
+                    GoalVersion::parse(1).unwrap(),
+                )
+                .unwrap(),
+            )
+        );
+        let no_goal_binding = db
+            .conversation_goal_execution_binding(GoalExecution::parse(9002, 7002).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_goal_binding.owner, no_goal_owner);
+        assert_eq!(
+            no_goal_binding.observation,
+            GoalAdmissionObservation::NoGoal {
+                observed_version: GoalVersion::INITIAL
+            }
+        );
+        assert!(matches!(
+            db.conversation_goal_execution_binding(GoalExecution::parse(9999, 7001).unwrap())
+                .await,
+            Err(GoalDbError::Integrity("execution binding"))
+        ));
+        assert!(db
+            .conversation_goal_execution_binding(GoalExecution::parse(9001, 7999).unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(before, 2);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn public_history_paginates_legal_history_and_current_entry_matches_latest() {
+        let db = migrated_db().await;
+        let conversation = db
+            .create_conversation("goal-history", "goal-history", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let owner = conversation.product_conversation_id;
+        sqlx::query("INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id) VALUES (1,?,'generated_host','fixture-history')")
+            .bind(owner.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let mut version = 0_i64;
+        for goal_number in 0..34 {
+            let goal_id = format!("history-goal-{goal_number}");
+            sqlx::query("INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES (?, ?, ?)")
+                .bind(&goal_id)
+                .bind(format!("objective {goal_number}"))
+                .bind(owner.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            version += 1;
+            sqlx::query("INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?, ?, ?, 'underway', NULL, ?, 'create', NULL, 1, 1, ?)")
+                .bind(owner.as_str())
+                .bind(version)
+                .bind(&goal_id)
+                .bind(format!("history-action-{version}"))
+                .bind(version)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            for (state, reason) in [("blocked", Some("waiting")), ("underway", None)] {
+                version += 1;
+                sqlx::query("INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?, ?, ?, ?, ?, ?, 'state', NULL, 1, 1, ?)")
+                    .bind(owner.as_str())
+                    .bind(version)
+                    .bind(&goal_id)
+                    .bind(state)
+                    .bind(reason)
+                    .bind(format!("history-action-{version}"))
+                    .bind(version)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(version, 102);
+
+        let first_page = db
+            .conversation_goal_history(&owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
+        assert_eq!(first_page.len(), 100);
+        assert_eq!(first_page.first().unwrap().snapshot().version().get(), 1);
+        assert_eq!(first_page.last().unwrap().snapshot().version().get(), 100);
+        let second_page = db
+            .conversation_goal_history(&owner, GoalVersion::parse(100).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(second_page.len(), 2);
+        assert_eq!(second_page[0].snapshot().version().get(), 101);
+        assert_eq!(second_page[1].snapshot().version().get(), 102);
+
+        let current = db
+            .conversation_goal_current_entry(&owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.snapshot(), second_page.last().unwrap().snapshot());
+        assert_eq!(current, second_page[1]);
+    }
+
     #[tokio::test]
     async fn public_binding_read_of_absent_execution_does_not_capture_or_write() {
         let db = migrated_db().await;
