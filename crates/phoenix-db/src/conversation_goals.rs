@@ -398,27 +398,16 @@ mod tests {
         workflow_id: i64,
         turn_id: i64,
     ) {
-        let message = db
-            .add_message(
-                &format!("goal-turn-{turn_id}"),
-                conversation_id,
-                &crate::schema::MessageContent::user("goal execution"),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
         sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (?, 'direct_turn', 1, 0, 1, 1, 0, 'Active', 'direct_turn.snapshot', 1, X'01', 1, 1)")
             .bind(workflow_id)
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id) VALUES (?, ?, ?, ?, 'goal-test-fingerprint', X'01', 'Runtime', 0, 1, 'user_api', ?)")
+        sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id,materialized) VALUES (?, ?, ?, ?, 'goal-test-fingerprint', X'01', 'Runtime', 0, 1, 'user_api', NULL, 0)")
             .bind(turn_id)
             .bind(workflow_id)
             .bind(conversation_id)
             .bind(format!("goal-turn-key-{turn_id}"))
-            .bind(message.message_id)
             .execute(db.pool())
             .await
             .unwrap();
