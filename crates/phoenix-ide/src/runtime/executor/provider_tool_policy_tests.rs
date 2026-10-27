@@ -1,10 +1,10 @@
 use super::*;
-use crate::db::{Database, Message, ToolContent};
+use crate::db::{Database, Message};
 use crate::runtime::testing::MockToolExecutor;
 use crate::runtime::traits::DatabaseStorage;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
-use phoenix_core::domain::db_schema::InputOrigin;
+use phoenix_core::domain::db_schema::{FinalizedToolResult, InputOrigin};
 use phoenix_core::domain::llm_types::{ToolReference, ToolSearchResultContent};
 use phoenix_core::domain::provider_replay::{
     AnthropicPrivateBlock, AnthropicResponseIdentity, AnthropicResponseSet, ContentIndex,
@@ -335,15 +335,12 @@ async fn sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reo
         },
     ];
     let owner = saved_message("assistant-owner", 2, MessageContent::Agent(public.clone()));
-    let result = saved_message(
-        "failed-result",
+    let result = FinalizedToolResult::new(
+        &owner.message_id,
+        CONVERSATION,
         3,
-        MessageContent::Tool(ToolContent {
-            tool_use_id: "toolu_slack".into(),
-            content: "Session expired".into(),
-            is_error: true,
-            images: vec![],
-        }),
+        Utc::now(),
+        ToolResult::error("toolu_slack".into(), "Session expired".into()),
     );
     let replay = AnthropicResponseSet::with_public_content(
         AnthropicResponseIdentity {

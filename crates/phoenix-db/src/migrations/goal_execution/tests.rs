@@ -65,7 +65,13 @@ async fn migration_138_backfills_materialized_without_breaking_ordinary_message_
     assert_eq!(decoded.message_id, written.message_id);
     assert_eq!(decoded.content, written.content);
     assert_eq!(run_through_for_test(db.pool(), 140).await.unwrap(), 0);
-    assert_eq!(MIGRATIONS.last().unwrap().version, 140);
+    assert_eq!(MIGRATIONS.last().unwrap().version, 141);
+    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 1);
+    let receipt_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='canonical_tool_round_receipts'",
+    ).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(receipt_table, 1);
+    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 0);
 }
 
 #[tokio::test]

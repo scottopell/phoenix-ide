@@ -2,7 +2,10 @@ use super::*;
 use crate::conversation_goals::round::CommittedGoalTerminalRound;
 use crate::workflow::{DirectTurnTerminalObligationInput, PersistedConversationProjection};
 
-async fn obligation(db: &Database, round: &ReportRound) -> DirectTurnTerminalObligationInput {
+pub(super) async fn obligation(
+    db: &Database,
+    round: &ReportRound,
+) -> DirectTurnTerminalObligationInput {
     let generation: i64 =
         sqlx::query_scalar("SELECT generation FROM durable_turns WHERE turn_id=?")
             .bind(round.execution.turn_id())
@@ -29,7 +32,7 @@ pub(super) fn ordinary_round(round: &mut ReportRound) {
         name: "search".into(),
         input: serde_json::json!({}),
     }]);
-    round.results = vec![ToolResult::success("checkpoint-call".into(), "found".into()).into()];
+    round.results = vec![ordinary_result().into()];
 }
 
 async fn terminal_commit(
@@ -67,12 +70,17 @@ async fn canonical_ordinary_first_terminal_second_rejects_without_an_obligation(
     ordinary_round(&mut round);
     let obligation = obligation(&db, &round).await;
     let canonical = round.commit(&db).await.unwrap();
+    let finalized = vec![finalized_result(&round.assistant, ordinary_result())];
+    assert_eq!(
+        serde_json::to_value(finalized[0].row()).unwrap(),
+        serde_json::to_value(&canonical.results[0]).unwrap()
+    );
     let before = evidence(&db, &owner, &round).await;
     let error = db
         .persist_tool_round_with_terminal_obligation(
             &round.assistant.conversation_id,
             &round.assistant,
-            &canonical.results,
+            &finalized,
             &obligation,
         )
         .await
@@ -110,6 +118,11 @@ async fn ordinary_terminal_replay_verifies_identity_and_preserves_newer_state() 
     let mut obligation = obligation(&db, &round).await;
     let committed = terminal_commit(&db, &round, &obligation).await.unwrap();
     assert!(!committed.replayed);
+    let finalized = vec![finalized_result(&round.assistant, ordinary_result())];
+    assert_eq!(
+        serde_json::to_value(finalized[0].row()).unwrap(),
+        serde_json::to_value(&committed.results[0]).unwrap()
+    );
     let newer_state = ConvState::LlmRequesting { attempt: 3 };
     db.update_conversation_state(&round.assistant.conversation_id, &newer_state)
         .await
@@ -118,7 +131,7 @@ async fn ordinary_terminal_replay_verifies_identity_and_preserves_newer_state() 
     db.persist_tool_round_with_terminal_obligation_input_at_cut(
         &round.assistant.conversation_id,
         &round.assistant,
-        ToolRoundWrite::Finalized(&committed.results),
+        ToolRoundWrite::Finalized(&finalized),
         &obligation,
         Some(&round.replay()),
         crate::TerminalEvidenceTransactionCut::None,
@@ -131,7 +144,7 @@ async fn ordinary_terminal_replay_verifies_identity_and_preserves_newer_state() 
         .persist_tool_round_with_terminal_obligation_input_at_cut(
             &round.assistant.conversation_id,
             &round.assistant,
-            ToolRoundWrite::Finalized(&committed.results),
+            ToolRoundWrite::Finalized(&finalized),
             &obligation,
             Some(&round.replay()),
             crate::TerminalEvidenceTransactionCut::None,

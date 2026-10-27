@@ -6,7 +6,7 @@ use phoenix_core::domain::conversation_goal::{
     GoalPendingReport, GoalReportCall, GoalReportOutcome, ToolRoundResult,
 };
 use phoenix_core::domain::db_schema::{
-    InputOrigin, Message, MessageContent, MessageType, ToolResult,
+    FinalizedToolResult, InputOrigin, Message, MessageContent, MessageType, ToolOutcome, ToolResult,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::provider_replay::{
@@ -17,6 +17,7 @@ use phoenix_core::domain::sm_state::ConvState;
 use phoenix_core::domain::tool_result_identity::tool_result_message_id;
 
 mod canonical;
+mod finalized;
 mod terminal;
 
 struct ReportRound {
@@ -84,6 +85,29 @@ impl ReportRound {
         )
         .await
     }
+}
+
+fn finalized_result(assistant: &Message, result: ToolResult) -> FinalizedToolResult {
+    FinalizedToolResult::new(
+        &assistant.message_id,
+        &assistant.conversation_id,
+        assistant.sequence_id + 1,
+        assistant.created_at,
+        result,
+    )
+}
+
+fn ordinary_result() -> ToolResult {
+    ToolResult::success("checkpoint-call".into(), "found".into())
+}
+
+fn accepted_report_result() -> ToolResult {
+    let mut result = ToolResult::success(
+        "checkpoint-call".into(),
+        "Goal checkpoint-goal recorded complete at owner version 2.".into(),
+    );
+    result.duration_ms = Some(17);
+    result
 }
 
 async fn report_fixture() -> (Database, ProductConversationId, ReportRound) {
@@ -476,12 +500,17 @@ async fn after_canonical_commit_cut_retains_report_and_replays_without_duplicate
 async fn finalized_report_success_cannot_bypass_the_pending_checkpoint_path() {
     let (db, owner, round) = report_fixture().await;
     let committed = round.commit(&db).await.unwrap();
+    let finalized = vec![finalized_result(&round.assistant, accepted_report_result())];
+    assert_eq!(
+        serde_json::to_value(finalized[0].row()).unwrap(),
+        serde_json::to_value(&committed.results[0]).unwrap()
+    );
     let before = evidence(&db, &owner, &round).await;
     assert!(db
         .persist_tool_round(
             &round.assistant.conversation_id,
             &round.assistant,
-            &committed.results,
+            &finalized,
         )
         .await
         .is_err());
@@ -489,7 +518,7 @@ async fn finalized_report_success_cannot_bypass_the_pending_checkpoint_path() {
         .persist_tool_round_and_state(
             &round.assistant.conversation_id,
             &round.assistant,
-            &committed.results,
+            &finalized,
             &ConvState::Idle,
             round.timestamp + Duration::seconds(1),
         )

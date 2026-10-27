@@ -7,6 +7,7 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::db_schema::FinalizedToolResult;
 use phoenix_db::SubAgentTerminalCause;
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
@@ -398,14 +399,14 @@ pub trait MessageStore: Send + Sync {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String>;
 
     async fn persist_tool_round_and_state(
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
@@ -414,7 +415,7 @@ pub trait MessageStore: Send + Sync {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment;
 
@@ -616,7 +617,7 @@ pub trait StateStore: Send + Sync {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -1118,7 +1119,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String> {
         (**self)
             .persist_tool_round(conv_id, assistant, tool_results)
@@ -1129,7 +1130,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
@@ -1142,7 +1143,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment {
         (**self)
@@ -1393,7 +1394,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -2258,7 +2259,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String> {
         self.db
             .persist_tool_round(conv_id, assistant, tool_results)
@@ -2270,7 +2271,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
@@ -2284,13 +2285,13 @@ impl MessageStore for DatabaseStorage {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment {
         let obligation = terminal_obligation(settlement, None);
         let mut messages = Vec::with_capacity(1 + tool_results.len());
         messages.push(assistant.clone());
-        messages.extend_from_slice(tool_results);
+        messages.extend(tool_results.iter().map(|result| result.row().clone()));
         let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::Messages(messages);
         match self
             .db
@@ -2774,7 +2775,7 @@ impl StateStore for DatabaseStorage {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,

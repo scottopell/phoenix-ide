@@ -10275,7 +10275,7 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
     ) -> DbResult<()> {
         if conversation_id != assistant.conversation_id {
             return Err(DbError::Serialization(
@@ -10329,7 +10329,7 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
@@ -10354,7 +10354,7 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         obligation: &workflow::DirectTurnTerminalObligationInput,
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<()> {
@@ -10463,7 +10463,7 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         obligation: &workflow::DirectTurnTerminalObligationInput,
     ) -> DbResult<()> {
         self.persist_tool_round_with_terminal_obligation_at_cut(
@@ -30269,34 +30269,26 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         };
-        let result_a = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id,
-                "tool-a",
+        let result_a = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            11,
+            Utc::now(),
+            phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-a".into(),
+                "output a".into(),
             ),
-            conversation_id: "conv-tr".to_string(),
-            sequence_id: 11,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-a", "output a", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-        let result_b = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id,
-                "tool-b",
+        );
+        let result_b = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            12,
+            Utc::now(),
+            phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-b".into(),
+                "output b".into(),
             ),
-            conversation_id: "conv-tr".to_string(),
-            sequence_id: 12,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-b", "output b", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        );
 
         db.persist_tool_round("conv-tr", &assistant, &[result_a, result_b])
             .await
@@ -30440,20 +30432,13 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         };
-        let tool = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id,
-                "tool",
-            ),
-            conversation_id: "conv-checkpoint-cuts".to_string(),
-            sequence_id: 21,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool", "cancelled", true),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        let tool = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-checkpoint-cuts",
+            21,
+            Utc::now(),
+            phoenix_core::domain::db_schema::ToolResult::cancelled("tool".into(), "cancelled"),
+        );
         let obligation = workflow::DirectTurnTerminalObligationInput {
             turn_id,
             expected_generation: 0,
@@ -30464,8 +30449,10 @@ mod tests {
             },
             response_message_id: None,
         };
-        let evidence =
-            workflow::TerminalEvidenceExpectation::Messages(vec![assistant.clone(), tool.clone()]);
+        let evidence = workflow::TerminalEvidenceExpectation::Messages(vec![
+            assistant.clone(),
+            tool.row().clone(),
+        ]);
 
         assert!(db
             .persist_tool_round_with_terminal_obligation_at_cut(
@@ -30725,20 +30712,17 @@ mod tests {
             usage_data: None,
             created_at,
         };
-        let result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id,
-                "tool-terminal",
-            ),
-            conversation_id: conversation_id.to_string(),
-            sequence_id: 21,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-terminal", "first durable result", false),
-            display_data: Some(serde_json::json!({"kind": "first"})),
-            usage_data: None,
+        let result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            conversation_id,
+            21,
             created_at,
-        };
+            phoenix_core::domain::db_schema::ToolResult::success_with_display(
+                "tool-terminal".into(),
+                "first durable result".into(),
+                Some(serde_json::json!({"kind": "first"})),
+            ),
+        );
         let obligation = workflow::DirectTurnTerminalObligationInput {
             turn_id,
             expected_generation: 0,
@@ -30767,8 +30751,21 @@ mod tests {
         .await
         .expect("an exact replay is idempotent");
 
-        let mut conflicting = result.clone();
-        conflicting.content = MessageContent::tool("tool-terminal", "conflicting replay", true);
+        let conflicting = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            conversation_id,
+            result.row().sequence_id,
+            result.row().created_at,
+            phoenix_core::domain::db_schema::ToolResult {
+                tool_use_id: "tool-terminal".into(),
+                outcome: phoenix_core::domain::db_schema::ToolOutcome::Error {
+                    output: "conflicting replay".into(),
+                    display_data: result.row().display_data.clone(),
+                    images: vec![],
+                },
+                duration_ms: None,
+            },
+        );
         let error = db
             .persist_tool_round_with_terminal_obligation(
                 conversation_id,
@@ -30783,7 +30780,7 @@ mod tests {
             .contains("retained tool round result differs"));
         let persisted = db.get_messages(conversation_id).await.unwrap();
         assert_eq!(persisted.len(), 2);
-        assert_eq!(persisted[1].content, result.content);
+        assert_eq!(persisted[1].content, result.row().content);
         assert!(repo
             .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
@@ -30816,20 +30813,16 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         };
-        let result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id,
-                "tool-terminal",
+        let result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-terminal-round",
+            21,
+            Utc::now(),
+            phoenix_core::domain::db_schema::ToolResult::cancelled(
+                "tool-terminal".into(),
+                "cancelled",
             ),
-            conversation_id: "conv-terminal-round".to_string(),
-            sequence_id: 21,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-terminal", "cancelled", true),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        );
         let obligation = workflow::DirectTurnTerminalObligationInput {
             turn_id: phoenix_workflow::TurnAuthorityId(u64::MAX),
             expected_generation: 0,
@@ -30886,34 +30879,26 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         };
-        let good_result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id,
-                "tool-a",
+        let good_result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            11,
+            Utc::now(),
+            phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-a".into(),
+                "output a".into(),
             ),
-            conversation_id: "conv-tr".to_string(),
-            sequence_id: 11,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-a", "output a", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-        let rejected_result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
-                &assistant.message_id,
-                "tool-b",
+        );
+        let rejected_result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            12,
+            Utc::now(),
+            phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-b".into(),
+                "output b".into(),
             ),
-            conversation_id: "conv-tr".to_string(),
-            sequence_id: 12,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-b", "output b", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        );
 
         sqlx::query("CREATE TRIGGER reject_second_round_result BEFORE INSERT ON messages WHEN NEW.sequence_id=12 BEGIN SELECT RAISE(ABORT, 'injected second result insert failure'); END")
             .execute(db.pool()).await.unwrap();

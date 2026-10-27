@@ -11,12 +11,7 @@ async fn receipt_count(db: &Database) -> i64 {
 async fn plain_round_cannot_claim_any_canonical_checkpoint() {
     let (db, owner, mut round) = report_fixture().await;
     terminal::ordinary_round(&mut round);
-    let finalized = vec![crate::conversation_goals::round::result_message(
-        &round.assistant,
-        0,
-        &ToolResult::success("checkpoint-call".into(), "found".into()),
-    )
-    .unwrap()];
+    let finalized = vec![finalized_result(&round.assistant, ordinary_result())];
     db.persist_tool_round(
         &round.assistant.conversation_id,
         &round.assistant,

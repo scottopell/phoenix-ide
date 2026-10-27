@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::conversation_goal::{GoalExecution, GoalTimestampUs, ToolRoundResult};
 use phoenix_core::domain::db_schema::{
-    InputOrigin, Message, MessageContent, MessageType, ToolOutcome, ToolResult,
+    FinalizedToolDisposition, FinalizedToolResult, InputOrigin, Message, MessageContent,
+    MessageType, ToolOutcome, ToolResult,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_state::ConvState;
@@ -37,7 +38,7 @@ pub struct CommittedGoalTerminalRound {
 }
 
 pub(crate) enum ToolRoundWrite<'a> {
-    Finalized(&'a [Message]),
+    Finalized(&'a [FinalizedToolResult]),
     Pending {
         execution: GoalExecution,
         results: &'a [ToolRoundResult],
@@ -60,8 +61,12 @@ pub(crate) fn db_error(error: GoalDbError) -> DbError {
 pub(crate) async fn persist_finalized_round_tx(
     tx: &mut GoalTx<'_>,
     assistant: &Message,
-    results: &[Message],
+    finalized: &[FinalizedToolResult],
 ) -> DbResult<bool> {
+    let results: Vec<Message> = finalized
+        .iter()
+        .map(|result| result.row().clone())
+        .collect();
     let MessageContent::Agent(blocks) = &assistant.content else {
         return Err(DbError::Serialization(
             "tool round requires a genuine assistant".into(),
@@ -81,7 +86,8 @@ pub(crate) async fn persist_finalized_round_tx(
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    for result in results {
+    for finalized in finalized {
+        let result = finalized.row();
         let MessageContent::Tool(content) = &result.content else {
             return Err(DbError::Serialization(
                 "tool round requires tool results".into(),
@@ -102,17 +108,22 @@ pub(crate) async fn persist_finalized_round_tx(
                 "tool round result owning assistant differs".into(),
             ));
         }
-        if *name == "goal_report" && !content.is_error {
+        if *name == "goal_report"
+            && matches!(
+                finalized.disposition(),
+                FinalizedToolDisposition::Success | FinalizedToolDisposition::TrustedInstructions
+            )
+        {
             return Err(DbError::Serialization(
                 "goal report success requires pending round finalization".into(),
             ));
         }
     }
-    if retained_finalized_round_tx(tx, assistant, results).await? {
+    if retained_finalized_round_tx(tx, assistant, &results).await? {
         return Ok(true);
     }
     crate::insert_message_tx(tx, assistant).await?;
-    for result in results {
+    for result in &results {
         crate::insert_message_tx(tx, result).await?;
     }
     Ok(false)
@@ -264,7 +275,10 @@ pub(crate) async fn write_round_tx(
     match input {
         ToolRoundWrite::Finalized(results) => {
             let replayed = persist_finalized_round_tx(tx, assistant, results).await?;
-            Ok((results.to_vec(), replayed))
+            Ok((
+                results.iter().map(|result| result.row().clone()).collect(),
+                replayed,
+            ))
         }
         ToolRoundWrite::Pending { execution, results } => finalize_round_tx(
             tx,
