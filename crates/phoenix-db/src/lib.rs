@@ -10414,9 +10414,9 @@ impl Database {
             self.goal_write_policies(),
         )
         .await?;
+        round::persist_round_terminal_obligation_tx(&mut tx, conversation_id, obligation, replayed)
+            .await?;
         if !replayed {
-            workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation)
-                .await?;
             if let Some(update) = replay {
                 provider_replay::apply_replay_tx(&mut tx, conversation_id, update).await?;
             }
@@ -30383,7 +30383,11 @@ mod tests {
             sequence_id: 20,
             message_type: MessageType::Agent,
             content: MessageContent::agent(vec![
-                phoenix_core::domain::llm_types::ContentBlock::text("checkpoint"),
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
             ]),
             display_data: None,
             usage_data: None,
@@ -30391,7 +30395,10 @@ mod tests {
         };
         let tool = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "checkpoint-tool".to_string(),
+            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id,
+                "tool",
+            ),
             conversation_id: "conv-checkpoint-cuts".to_string(),
             sequence_id: 21,
             message_type: MessageType::Tool,
@@ -30660,14 +30667,23 @@ mod tests {
             conversation_id: conversation_id.to_string(),
             sequence_id: 20,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-terminal".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at,
         };
         let result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-terminal-exact".to_string(),
+            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id,
+                "tool-terminal",
+            ),
             conversation_id: conversation_id.to_string(),
             sequence_id: 21,
             message_type: MessageType::Tool,
@@ -30717,7 +30733,7 @@ mod tests {
             .expect_err("a conflicting replay must not consume the obligation");
         assert!(error
             .to_string()
-            .contains("conflicts with first durable payload"));
+            .contains("retained tool round result differs"));
         let persisted = db.get_messages(conversation_id).await.unwrap();
         assert_eq!(persisted.len(), 2);
         assert_eq!(persisted[1].content, result.content);
@@ -30742,14 +30758,23 @@ mod tests {
             conversation_id: "conv-terminal-round".to_string(),
             sequence_id: 20,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-terminal".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
         let result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-terminal-result".to_string(),
+            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id,
+                "tool-terminal",
+            ),
             conversation_id: "conv-terminal-round".to_string(),
             sequence_id: 21,
             message_type: MessageType::Tool,

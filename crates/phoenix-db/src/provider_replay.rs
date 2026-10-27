@@ -8,7 +8,7 @@
 
 use crate::{Database, DbError, DbResult};
 use phoenix_core::domain::db_schema::Message;
-use phoenix_core::domain::provider_replay::AnthropicReplayPayload;
+use phoenix_core::domain::provider_replay::{AnthropicReplayPayload, ProviderReplayUpdate};
 use sqlx::Row;
 
 pub(crate) fn validate_goal_round_replay(

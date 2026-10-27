@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::conversation_goal::{GoalExecution, GoalTimestampUs, ToolRoundResult};
 use phoenix_core::domain::db_schema::{
-    InputOrigin, Message, MessageContent, MessageType, ToolResult,
+    InputOrigin, Message, MessageContent, MessageType, ToolOutcome, ToolResult,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_state::ConvState;
@@ -61,7 +61,7 @@ pub(crate) async fn persist_finalized_round_tx(
     tx: &mut GoalTx<'_>,
     assistant: &Message,
     results: &[Message],
-) -> DbResult<()> {
+) -> DbResult<bool> {
     let MessageContent::Agent(blocks) = &assistant.content else {
         return Err(DbError::Serialization(
             "tool round requires a genuine assistant".into(),
@@ -108,11 +108,102 @@ pub(crate) async fn persist_finalized_round_tx(
             ));
         }
     }
+    if retained_finalized_round_tx(tx, assistant, results).await? {
+        return Ok(true);
+    }
     crate::insert_message_tx(tx, assistant).await?;
     for result in results {
         crate::insert_message_tx(tx, result).await?;
     }
-    Ok(())
+    Ok(false)
+}
+
+pub(crate) async fn persist_round_terminal_obligation_tx(
+    tx: &mut GoalTx<'_>,
+    conversation_id: &str,
+    obligation: &crate::workflow::DirectTurnTerminalObligationInput,
+    replayed: bool,
+) -> DbResult<()> {
+    let turn_id = i64::try_from(obligation.turn_id.0)
+        .map_err(|_| DbError::Serialization("goal terminal turn id out of range".into()))?;
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT conversation_id FROM durable_turns WHERE turn_id = ?")
+            .bind(turn_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if owner.as_deref() != Some(conversation_id) {
+        return Err(DbError::Serialization(
+            "tool round terminal conversation differs".into(),
+        ));
+    }
+    if replayed {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM direct_turn_terminal_obligations WHERE turn_id = ?)",
+        )
+        .bind(turn_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exists {
+            return Err(DbError::Serialization(
+                "retained round has no terminal obligation".into(),
+            ));
+        }
+    }
+    crate::workflow::WorkflowRepository::persist_terminal_obligation_tx(tx, obligation).await
+}
+
+async fn retained_finalized_round_tx(
+    tx: &mut GoalTx<'_>,
+    assistant: &Message,
+    results: &[Message],
+) -> DbResult<bool> {
+    let retained_assistant = retained_message_tx(tx, &assistant.message_id)
+        .await
+        .map_err(db_error)?;
+    if retained_assistant
+        .as_ref()
+        .is_some_and(|actual| !message_matches(actual, assistant))
+    {
+        return Err(DbError::Serialization(
+            "retained tool round assistant differs".into(),
+        ));
+    }
+    let mut retained = 0;
+    for result in results {
+        if let Some(actual) = retained_message_tx(tx, &result.message_id)
+            .await
+            .map_err(db_error)?
+        {
+            if !message_matches(&actual, result) {
+                return Err(DbError::Serialization(
+                    "retained tool round result differs".into(),
+                ));
+            }
+            retained += 1;
+        }
+    }
+    if retained == results.len() && retained_assistant.is_some() {
+        return Ok(true);
+    }
+    if retained != 0 {
+        return Err(DbError::Serialization("partial retained tool round".into()));
+    }
+    Ok(false)
+}
+
+fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    let persisted_output = match &result.outcome {
+        ToolOutcome::TrustedInstructions { .. } => {
+            "Authenticated built-in skill instructions were delivered for this live request."
+        }
+        _ => result.output(),
+    };
+    MessageContent::tool_with_images(
+        &result.tool_use_id,
+        persisted_output,
+        result.is_error(),
+        result.images().to_vec(),
+    )
 }
 
 pub(super) fn result_message(
@@ -140,7 +231,7 @@ pub(super) fn result_message(
         conversation_id: assistant.conversation_id.clone(),
         sequence_id,
         message_type: MessageType::Tool,
-        content: MessageContent::Tool(result.persisted_tool_content()),
+        content: tool_result_message_content(result),
         display_data,
         usage_data: None,
         origin: InputOrigin::SystemGenerated,
@@ -170,8 +261,8 @@ pub(crate) async fn write_round_tx(
     }
     match input {
         ToolRoundWrite::Finalized(results) => {
-            persist_finalized_round_tx(tx, assistant, results).await?;
-            Ok((results.to_vec(), false))
+            let replayed = persist_finalized_round_tx(tx, assistant, results).await?;
+            Ok((results.to_vec(), replayed))
         }
         ToolRoundWrite::Pending { execution, results } => finalize_round_tx(
             tx,

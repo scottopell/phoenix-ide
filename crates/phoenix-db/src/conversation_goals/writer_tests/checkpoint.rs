@@ -16,6 +16,8 @@ use phoenix_core::domain::provider_replay::{
 use phoenix_core::domain::sm_state::ConvState;
 use phoenix_core::domain::tool_result_identity::tool_result_message_id;
 
+mod terminal;
+
 struct ReportRound {
     assistant: Message,
     execution: GoalExecution,
@@ -489,7 +491,9 @@ async fn finalized_report_success_cannot_bypass_the_pending_checkpoint_path() {
 async fn terminal_report_checkpoint_requires_the_admitted_turn() {
     let (db, owner, round) = report_fixture().await;
     let obligation = crate::workflow::DirectTurnTerminalObligationInput {
-        turn_id: phoenix_workflow::TurnId(u64::try_from(round.execution.turn_id() + 1).unwrap()),
+        turn_id: phoenix_workflow::TurnAuthorityId(
+            u64::try_from(round.execution.turn_id() + 1).unwrap(),
+        ),
         expected_generation: 0,
         terminal: phoenix_workflow::TurnTerminal::Cancelled,
         projection: crate::workflow::PersistedConversationProjection {
@@ -509,7 +513,9 @@ async fn terminal_report_checkpoint_requires_the_admitted_turn() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("goal terminal turn differs"));
+    assert!(error
+        .to_string()
+        .contains("goal report terminal turn differs"));
     assert_eq!(evidence(&db, &owner, &round).await, before);
 }
 
@@ -523,7 +529,9 @@ async fn terminal_obligation_conflict_rolls_back_accepted_report_and_replay() {
             .await
             .unwrap();
     let obligation = crate::workflow::DirectTurnTerminalObligationInput {
-        turn_id: phoenix_workflow::TurnId(u64::try_from(round.execution.turn_id()).unwrap()),
+        turn_id: phoenix_workflow::TurnAuthorityId(
+            u64::try_from(round.execution.turn_id()).unwrap(),
+        ),
         expected_generation: u64::try_from(generation + 1).unwrap(),
         terminal: phoenix_workflow::TurnTerminal::Cancelled,
         projection: crate::workflow::PersistedConversationProjection {
