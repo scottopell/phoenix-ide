@@ -13311,9 +13311,9 @@ mod tests {
                      VALUES (6, 2, 'wake-history', 'wake-history:message', 'tool-6', 'Fired', 1, 20);
                  INSERT INTO durable_turns (turn_id, workflow_id, conversation_id, client_turn_key,
                      prepared_fingerprint, prepared_payload, disposition, generation, owns_conversation,
-                     canonical_message_id)
+                     canonical_message_id, materialized)
                      VALUES (100, 100, 'wake-history', 'wake:6:2', 'accepted-fingerprint', X'FF000A',
-                         'Runtime', 7, 1, 'wake-history:message');
+                         'Runtime', 7, 1, 'wake-history:message', 1);
                  INSERT INTO workflow_external_acceptance_bindings (profile_kind, profile_version,
                      target_scope, idempotency_key, intent_fingerprint, workflow_id,
                      receipt_handle, disposition_handle, created_at)
