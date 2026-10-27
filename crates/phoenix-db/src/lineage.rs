@@ -211,19 +211,33 @@ pub(crate) async fn preflight(
     match ledger_kind.as_deref() {
         None => {}
         Some("table") => {
-            let columns: Vec<(String, String, i64, i64)> = sqlx::query_as(
-                "SELECT name, type, \"notnull\", pk FROM pragma_table_info('_migrations') ORDER BY cid",
+            let columns: Vec<(String, String, i64, Option<String>, i64, i64)> = sqlx::query_as(
+                "SELECT name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo('_migrations') ORDER BY cid",
             ).fetch_all(pool).await?;
-            let valid_version = columns.iter().any(|(name, ty, _, pk)| {
-                name == "version" && ty.eq_ignore_ascii_case("INTEGER") && *pk == 1
+            let valid_version = columns.iter().any(|(name, ty, _, _, pk, hidden)| {
+                name == "version" && ty.eq_ignore_ascii_case("INTEGER") && *pk == 1 && *hidden == 0
             });
-            let valid_name = columns.iter().any(|(name, ty, required, _)| {
-                name == "name" && ty.eq_ignore_ascii_case("TEXT") && *required == 1
+            let valid_name = columns.iter().any(|(name, ty, required, _, pk, hidden)| {
+                name == "name"
+                    && ty.eq_ignore_ascii_case("TEXT")
+                    && *required == 1
+                    && *pk == 0
+                    && *hidden == 0
             });
-            let valid_timestamp = columns.iter().any(|(name, ty, required, _)| {
-                name == "applied_at" && ty.eq_ignore_ascii_case("TEXT") && *required == 1
-            });
-            if !(valid_version && valid_name && valid_timestamp) {
+            let valid_timestamp =
+                columns
+                    .iter()
+                    .any(|(name, ty, required, default, pk, hidden)| {
+                        name == "applied_at"
+                            && ty.eq_ignore_ascii_case("TEXT")
+                            && *required == 1
+                            && *pk == 0
+                            && *hidden == 0
+                            && default
+                                .as_deref()
+                                .is_some_and(|value| value.eq_ignore_ascii_case("datetime('now')"))
+                    });
+            if !(columns.len() == 3 && valid_version && valid_name && valid_timestamp) {
                 return Err(conflict("malformed migration ledger schema"));
             }
             let invalid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _migrations WHERE typeof(version) != 'integer' OR typeof(name) != 'text' OR typeof(applied_at) != 'text')")
@@ -782,6 +796,21 @@ mod tests {
             "CREATE TABLE _migrations(version TEXT, name TEXT, applied_at TEXT)",
             "CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL)",
             "CREATE TABLE steering_messages(origin_source_instance_id TEXT)",
+        ] {
+            let pool = pool().await;
+            sqlx::raw_sql(ddl).execute(&pool).await.unwrap();
+            refuses_without_mutation(&pool).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_incompatible_ledgers_refuse_before_both_entrypoints() {
+        for ddl in [
+            "CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)",
+            "CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT NULL)",
+            "CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')), extra TEXT NOT NULL)",
+            "CREATE TABLE _migrations(version INTEGER, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(version, name))",
+            "CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT GENERATED ALWAYS AS ('fixed') STORED NOT NULL)",
         ] {
             let pool = pool().await;
             sqlx::raw_sql(ddl).execute(&pool).await.unwrap();
