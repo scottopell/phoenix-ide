@@ -512,15 +512,23 @@ mod tests {
     async fn public_history_accepts_nonreport_underway_and_suspended_dispositions() {
         let db = migrated_db().await;
         let conversation = db
-            .create_conversation("goal-dispositions", "goal-dispositions", "/tmp", true, None, None)
+            .create_conversation(
+                "goal-dispositions",
+                "goal-dispositions",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let owner = conversation.product_conversation_id;
         seed_goal(&db, &owner, "disposition-goal").await;
 
         sqlx::query(
-            "INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,2,'disposition-goal','underway',NULL,'fixture-underway','state',NULL,1,1,2), (?,3,'disposition-goal','suspended','waiting','fixture-suspend','state',NULL,1,1,3)",
+            "INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,2,'disposition-goal','blocked','waiting','fixture-block','state',NULL,1,1,2), (?,3,'disposition-goal','underway',NULL,'fixture-underway','state',NULL,1,1,3), (?,4,'disposition-goal','suspended','waiting','fixture-suspend','state',NULL,1,1,4)",
         )
+            .bind(owner.as_str())
             .bind(owner.as_str())
             .bind(owner.as_str())
             .execute(db.pool())
@@ -531,16 +539,16 @@ mod tests {
             .conversation_goal_history(&owner, GoalVersion::INITIAL)
             .await
             .unwrap();
-        assert_eq!(history.len(), 3);
+        assert_eq!(history.len(), 4);
         assert!(matches!(
-            &history[1].mutation().change,
+            &history[2].mutation().change,
             GoalChange::SetDisposition {
                 disposition: GoalDisposition::Underway,
                 ..
             }
         ));
         assert!(matches!(
-            &history[2].mutation().change,
+            &history[3].mutation().change,
             GoalChange::SetDisposition {
                 disposition: GoalDisposition::Suspended(reason),
                 ..
@@ -583,17 +591,24 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO conversation_goal_history VALUES ('owner',2,'goal','underway',NULL,'fixture-report','report',7,1,1,2)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
         let owner = ProductConversationId::parse("owner").unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        let error = history_tx(&mut tx, &owner, GoalVersion::INITIAL)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, GoalDbError::Domain(GoalError::Inapplicable)));
+        for (state, reason) in [("underway", None), ("suspended", Some("waiting"))] {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query("INSERT INTO conversation_goal_history VALUES ('owner',2,'goal',?,?,'fixture-report','report',7,1,1,2)")
+                .bind(state)
+                .bind(reason)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let error = history_tx(&mut tx, &owner, GoalVersion::INITIAL)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                GoalDbError::Domain(GoalError::Inapplicable)
+            ));
+            tx.rollback().await.unwrap();
+        }
     }
 
     #[tokio::test]
