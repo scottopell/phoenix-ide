@@ -826,7 +826,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, host_action_id TEXT)")
+        sqlx::query("CREATE TABLE conversation_goal_actors (actor_id INTEGER, owner_id TEXT, kind TEXT, source_product_id TEXT, transcript_id TEXT, workflow_id INTEGER, turn_id INTEGER, message_id TEXT, tool_use_id TEXT, host_action_id TEXT, control_principal_id BLOB, control_request_id BLOB, control_command TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -835,10 +835,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO conversation_goal_actors VALUES (1, 'owner', 'generated_host', 'host-action')")
+        sqlx::query("INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id) VALUES (1, 'owner', 'generated_host', 'host-action')")
             .execute(&pool)
             .await
             .unwrap();
+        // Private decoder LIMIT/order fixture, not a canonical aggregate journey.
+        // The public pagination test above covers legal retained history.
         for version in 1..=101_i64 {
             sqlx::query("INSERT INTO conversation_goal_history VALUES ('owner', ?, 'goal', 'underway', NULL, 'create', ?, 1, 1, ?, NULL)")
                 .bind(version)
