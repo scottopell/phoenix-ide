@@ -196,7 +196,9 @@ fn tool_result_message_content(result: &ToolResult) -> MessageContent {
         ToolOutcome::TrustedInstructions { .. } => {
             "Authenticated built-in skill instructions were delivered for this live request."
         }
-        _ => result.output(),
+        ToolOutcome::Success { .. } | ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. } => {
+            result.output()
+        }
     };
     MessageContent::tool_with_images(
         &result.tool_use_id,
