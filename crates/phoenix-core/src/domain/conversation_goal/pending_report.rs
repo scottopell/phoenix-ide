@@ -174,12 +174,11 @@ impl GoalPendingReport {
     pub fn mutation(&self) -> GoalMutation {
         let goal = &self.admission.goal;
         let action_id = self.action_id();
-        let binding = GoalExecutionBinding::new(
-            goal.owner().clone(),
-            self.admission.execution,
-            GoalAdmissionObservation::Goal(goal.clone()),
-        )
-        .expect("binding owner is derived from its goal fence");
+        let binding = GoalExecutionBinding {
+            owner: goal.owner().clone(),
+            execution: self.admission.execution,
+            observation: GoalAdmissionObservation::Goal(goal.clone()),
+        };
         let source = GoalAgentSource {
             product_conversation_id: goal.owner().clone(),
             execution: self.admission.execution,
