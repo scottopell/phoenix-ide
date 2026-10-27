@@ -456,10 +456,11 @@ mod tests {
             .await
             .unwrap();
 
-        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+        let before =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         let saved_binding = db
             .conversation_goal_execution_binding(GoalExecution::parse(9001, 7001).unwrap())
             .await
@@ -524,13 +525,15 @@ mod tests {
         let mut version = 0_i64;
         for goal_number in 0..34 {
             let goal_id = format!("history-goal-{goal_number}");
-            sqlx::query("INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES (?, ?, ?)")
-                .bind(&goal_id)
-                .bind(format!("objective {goal_number}"))
-                .bind(owner.as_str())
-                .execute(db.pool())
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES (?, ?, ?)",
+            )
+            .bind(&goal_id)
+            .bind(format!("objective {goal_number}"))
+            .bind(owner.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
             version += 1;
             sqlx::query("INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?, ?, ?, 'underway', NULL, ?, 'create', NULL, 1, 1, ?)")
                 .bind(owner.as_str())
