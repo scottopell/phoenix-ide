@@ -88,7 +88,7 @@ impl GoalRequestCause {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalRequestIntent {
     pub id: GoalRequestId,
-    pub goal: GoalFence,
+    goal: GoalFence,
     pub execution: GoalExecution,
     generation: i64,
     pub cause: GoalRequestCause,
@@ -114,6 +114,11 @@ impl GoalRequestIntent {
             generation,
             cause,
         })
+    }
+
+    #[must_use]
+    pub const fn goal(&self) -> &GoalFence {
+        &self.goal
     }
 
     #[must_use]
@@ -164,6 +169,46 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<GoalRequestLimit>("9223372036854775808").is_err());
+    }
+
+    #[test]
+    fn request_intent_preserves_checked_goal_on_roundtrip_and_replacement() {
+        use super::super::{GoalId, GoalVersion, ProductConversationId};
+
+        let goal = GoalFence {
+            owner: ProductConversationId::parse("owner").unwrap(),
+            goal_id: GoalId::parse("goal").unwrap(),
+            version: GoalVersion::parse(1).unwrap(),
+        };
+        let intent = GoalRequestIntent::new(
+            GoalRequestId::parse("request").unwrap(),
+            goal.clone(),
+            GoalExecution::parse(1, 2).unwrap(),
+            0,
+            GoalRequestCause::Initial,
+        )
+        .unwrap();
+        assert_eq!(intent.goal(), &goal);
+        let encoded = serde_json::to_value(&intent).unwrap();
+        assert_eq!(
+            serde_json::from_value::<GoalRequestIntent>(encoded.clone()).unwrap(),
+            intent
+        );
+
+        let mut invalid_goal = intent.goal().clone();
+        invalid_goal.version = GoalVersion::INITIAL;
+        assert!(GoalRequestIntent::new(
+            intent.id.clone(),
+            invalid_goal,
+            intent.execution,
+            intent.generation(),
+            intent.cause.clone(),
+        )
+        .is_err());
+        assert_eq!(intent.goal(), &goal);
+        let mut invalid_encoded = encoded;
+        invalid_encoded["goal"]["version"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<GoalRequestIntent>(invalid_encoded).is_err());
     }
 
     #[test]

@@ -170,7 +170,10 @@ mod tests {
             value["requester"]["principal_id"],
             "ea96d1d2-71df-4638-901c-726ea0e56584"
         );
-        assert_eq!(serde_json::from_value::<GoalStartInput>(value.clone()).unwrap(), input);
+        assert_eq!(
+            serde_json::from_value::<GoalStartInput>(value.clone()).unwrap(),
+            input
+        );
 
         let mut invalid = value;
         invalid["request_id"] = serde_json::json!("not-a-uuid");
