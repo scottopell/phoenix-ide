@@ -169,7 +169,8 @@ async fn evidence(
             .fetch_one(db.pool())
             .await
             .unwrap();
-    let receipts: Vec<(String, Vec<u8>, String, String, Option<Vec<u8>>)> = sqlx::query_as(
+    type ReceiptRow = (String, Vec<u8>, String, String, Option<Vec<u8>>);
+    let receipts: Vec<ReceiptRow> = sqlx::query_as(
         "SELECT assistant_message_id,selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256
          FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
     ).bind(transcript).fetch_all(db.pool()).await.unwrap();

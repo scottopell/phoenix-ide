@@ -265,7 +265,7 @@ async fn new_canonical_round_rejects_rewritten_anthropic_response_identity_atomi
             "public" => {
                 retained.public_content = vec![ContentBlock::Text {
                     text: "older public text".into(),
-                }]
+                }];
             }
             _ => unreachable!(),
         }
