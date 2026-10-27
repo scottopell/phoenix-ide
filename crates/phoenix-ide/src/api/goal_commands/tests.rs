@@ -34,21 +34,15 @@ impl Fixture {
             .db()
             .create_conversation(
                 "goal-api",
+                "goal-api",
                 std::env::temp_dir().to_str().unwrap(),
-                "test-model",
+                true,
                 None,
-                None,
-                None,
+                Some("test-model"),
             )
             .await
             .unwrap();
-        let owner = state
-            .runtime
-            .db()
-            .product_conversation_for_transcript(&conversation.id)
-            .await
-            .unwrap()
-            .id;
+        let owner = conversation.product_conversation_id.clone();
         Self {
             router: create_router(state.clone()),
             state,
