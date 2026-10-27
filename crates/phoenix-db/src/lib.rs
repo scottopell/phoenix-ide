@@ -30240,14 +30240,28 @@ mod tests {
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-a".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-b".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
         let result_a = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-a-result".to_string(),
+            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id,
+                "tool-a",
+            ),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 11,
             message_type: MessageType::Tool,
@@ -30258,7 +30272,10 @@ mod tests {
         };
         let result_b = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-b-result".to_string(),
+            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id,
+                "tool-b",
+            ),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 12,
             message_type: MessageType::Tool,
@@ -30274,16 +30291,33 @@ mod tests {
 
         let msgs = db.get_messages("conv-tr").await.unwrap();
         let ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(
+            msgs.len(),
+            3,
+            "exactly one assistant and both results commit"
+        );
         assert!(
             ids.contains(&"asst-tr"),
             "assistant message must be durable"
         );
         assert!(
-            ids.contains(&"tool-a-result"),
+            ids.contains(
+                &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                    &assistant.message_id,
+                    "tool-a",
+                )
+                .as_str()
+            ),
             "first tool result must be durable"
         );
         assert!(
-            ids.contains(&"tool-b-result"),
+            ids.contains(
+                &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                    &assistant.message_id,
+                    "tool-b",
+                )
+                .as_str()
+            ),
             "second tool result must be durable"
         );
     }
@@ -30812,12 +30846,6 @@ mod tests {
 
     #[tokio::test]
     async fn persist_tool_round_rolls_back_assistant_when_a_result_insert_fails() {
-        // A `tool_use` with no paired `tool_result` 400s every later LLM
-        // request. `persist_tool_round` must commit the whole round or none of
-        // it. Here the second result names a non-existent conversation, so its
-        // INSERT trips the `messages.conversation_id` foreign key (FKs are on)
-        // and the transaction rolls back — the assistant message must NOT be
-        // left behind unpaired.
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-tr", "ctr", "/tmp", true, None, None)
             .await
@@ -30829,14 +30857,28 @@ mod tests {
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-a".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-b".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
         let good_result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-a-result".to_string(),
+            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id,
+                "tool-a",
+            ),
             conversation_id: "conv-tr".to_string(),
             sequence_id: 11,
             message_type: MessageType::Tool,
@@ -30845,11 +30887,13 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         };
-        let orphan_fk_result = Message {
+        let rejected_result = Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-b-result".to_string(),
-            // No such conversation: FK violation on insert.
-            conversation_id: "conv-does-not-exist".to_string(),
+            message_id: phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                &assistant.message_id,
+                "tool-b",
+            ),
+            conversation_id: "conv-tr".to_string(),
             sequence_id: 12,
             message_type: MessageType::Tool,
             content: MessageContent::tool("tool-b", "output b", false),
@@ -30858,13 +30902,19 @@ mod tests {
             created_at: Utc::now(),
         };
 
+        sqlx::query("CREATE TRIGGER reject_second_round_result BEFORE INSERT ON messages WHEN NEW.sequence_id=12 BEGIN SELECT RAISE(ABORT, 'injected second result insert failure'); END")
+            .execute(db.pool()).await.unwrap();
         let err = db
-            .persist_tool_round("conv-tr", &assistant, &[good_result, orphan_fk_result])
-            .await;
-        assert!(err.is_err(), "FK violation must surface as an error");
-
-        // Nothing from the round committed: not the assistant, not the first
-        // (otherwise-valid) result. All-or-nothing.
+            .persist_tool_round("conv-tr", &assistant, &[good_result, rejected_result])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::Sqlx(_)),
+            "must reach the storage failure: {err}"
+        );
+        assert!(err
+            .to_string()
+            .contains("injected second result insert failure"));
         let msgs = db.get_messages("conv-tr").await.unwrap();
         assert!(
             msgs.is_empty(),
