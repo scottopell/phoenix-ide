@@ -1,4 +1,5 @@
 use super::*;
+use crate::conversation_goals::round::CommittedGoalTerminalRound;
 use crate::workflow::{DirectTurnTerminalObligationInput, PersistedConversationProjection};
 
 async fn obligation(db: &Database, round: &ReportRound) -> DirectTurnTerminalObligationInput {
