@@ -381,8 +381,12 @@ fn runtime_input(transcript: &str, key: &str) -> crate::workflow::AcceptAuthorit
     }
 }
 
-#[tokio::test]
-async fn retained_generation_zero_request_cannot_checkpoint_after_fail_and_rearm() {
+async fn retained_generation_zero_requests_fixture() -> (
+    Database,
+    GoalExecution,
+    GoalRequestIntent,
+    GoalRequestIntent,
+) {
     let db = fixture().await;
     let (transcript, owner) = ordinary(&db, "request-rearm-owner").await;
     let goal = db
@@ -423,7 +427,13 @@ async fn retained_generation_zero_request_cannot_checkpoint_after_fail_and_rearm
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    (db, execution, original, after_rearm)
+}
 
+#[tokio::test]
+async fn retained_generation_zero_request_cannot_checkpoint_after_fail_and_rearm() {
+    let (db, execution, original, after_rearm) = retained_generation_zero_requests_fixture().await;
+    let repo = db.workflow_repository();
     let turn_id = TurnAuthorityId(u64::try_from(execution.turn_id()).unwrap());
     let workflow_id = WorkflowId(u64::try_from(execution.workflow_id()).unwrap());
     let claim = repo
