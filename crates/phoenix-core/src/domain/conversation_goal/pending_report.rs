@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::{
     GoalActor, GoalAdmissionObservation, GoalAgentSource, GoalAttribution, GoalChange,
     GoalDisposition, GoalError, GoalExecution, GoalExecutionBinding, GoalFence, GoalMutation,
-    GoalText,
+    GoalState, GoalText,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -19,9 +19,6 @@ impl TryFrom<GoalExecutionBinding> for GoalReportBinding {
         let GoalAdmissionObservation::Goal(goal) = binding.observation else {
             return Err(GoalError::ReportBindingRequired);
         };
-        if goal.owner() != &binding.owner {
-            return Err(GoalError::Conflict);
-        }
         Ok(Self {
             execution: binding.execution,
             goal,
@@ -72,6 +69,46 @@ impl GoalReportOutcome {
             Self::Complete(reason) => GoalDisposition::Complete(reason.clone()),
             Self::Exhausted(reason) => GoalDisposition::Exhausted(reason.clone()),
         }
+    }
+
+    pub(super) fn state(&self) -> GoalState {
+        self.disposition().state()
+    }
+}
+
+impl TryFrom<GoalDisposition> for GoalReportOutcome {
+    type Error = GoalError;
+
+    fn try_from(disposition: GoalDisposition) -> Result<Self, Self::Error> {
+        match disposition {
+            GoalDisposition::Blocked(reason) => Ok(Self::Blocked(reason)),
+            GoalDisposition::Complete(reason) => Ok(Self::Complete(reason)),
+            GoalDisposition::Exhausted(reason) => Ok(Self::Exhausted(reason)),
+            GoalDisposition::Underway | GoalDisposition::Suspended(_) => {
+                Err(GoalError::Inapplicable)
+            }
+        }
+    }
+}
+
+pub(super) mod report_disposition_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{GoalDisposition, GoalReportOutcome};
+
+    pub fn serialize<S: Serializer>(
+        outcome: &GoalReportOutcome,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        outcome.disposition().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<GoalReportOutcome, D::Error> {
+        GoalDisposition::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -137,11 +174,12 @@ impl GoalPendingReport {
     pub fn mutation(&self) -> GoalMutation {
         let goal = &self.admission.goal;
         let action_id = self.action_id();
-        let binding = GoalExecutionBinding {
-            owner: goal.owner().clone(),
-            execution: self.admission.execution,
-            observation: GoalAdmissionObservation::Goal(goal.clone()),
-        };
+        let binding = GoalExecutionBinding::new(
+            goal.owner().clone(),
+            self.admission.execution,
+            GoalAdmissionObservation::Goal(goal.clone()),
+        )
+        .expect("binding owner is derived from its goal fence");
         let source = GoalAgentSource {
             product_conversation_id: goal.owner().clone(),
             execution: self.admission.execution,
@@ -159,7 +197,7 @@ impl GoalPendingReport {
             },
             change: GoalChange::Report {
                 binding,
-                disposition: self.outcome.disposition(),
+                disposition: self.outcome.clone(),
             },
         }
     }
@@ -213,7 +251,7 @@ mod tests {
             panic!("report only")
         };
         assert_eq!(binding, admitted);
-        assert!(matches!(disposition, GoalDisposition::Blocked(_)));
+        assert!(matches!(disposition, GoalReportOutcome::Blocked(_)));
         let GoalActor::OwningAgent(source) = command.attribution.requested_by else {
             panic!("owning execution only")
         };
@@ -230,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn no_goal_or_inconsistent_fence_cannot_construct_pending_report_binding() {
+    fn no_goal_or_zero_fence_cannot_construct_pending_report_binding() {
         let mut missing = binding();
         missing.observation = GoalAdmissionObservation::NoGoal {
             observed_version: GoalVersion::parse(9).unwrap(),
@@ -238,12 +276,6 @@ mod tests {
         assert_eq!(
             GoalReportBinding::try_from(missing),
             Err(GoalError::ReportBindingRequired)
-        );
-        let mut mismatch = binding();
-        mismatch.owner = ProductConversationId::parse("different").unwrap();
-        assert_eq!(
-            GoalReportBinding::try_from(mismatch),
-            Err(GoalError::Conflict)
         );
         let valid = GoalReportBinding::try_from(binding()).unwrap();
         let mut zero = serde_json::to_value(valid).unwrap();

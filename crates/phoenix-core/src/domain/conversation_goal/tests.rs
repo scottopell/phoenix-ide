@@ -48,12 +48,13 @@ fn report(current: &GoalSnapshot) -> GoalMutation {
     let mut report = mutation(
         current.version.get(),
         GoalChange::Report {
-            binding: GoalExecutionBinding {
-                owner: current.owner.clone(),
+            binding: GoalExecutionBinding::new(
+                current.owner.clone(),
                 execution,
-                observation: GoalAdmissionObservation::Goal(current.fence()),
-            },
-            disposition: GoalDisposition::Complete(text("prepared, not deployed")),
+                GoalAdmissionObservation::Goal(current.fence()),
+            )
+            .unwrap(),
+            disposition: GoalReportOutcome::Complete(text("prepared, not deployed")),
         },
     );
     report.attribution = GoalAttribution {
@@ -134,6 +135,137 @@ fn no_goal_binding_preserves_initial_zero_observation() {
         serde_json::from_value::<GoalExecutionBinding>(wire).unwrap(),
         binding
     );
+}
+
+#[test]
+fn execution_binding_rejects_owner_mismatch_at_construction_and_deserialization() {
+    let current = initial();
+    let execution = GoalExecution::parse(1, 2).unwrap();
+    let observation = GoalAdmissionObservation::Goal(current.fence());
+    let binding =
+        GoalExecutionBinding::new(current.owner().clone(), execution, observation.clone()).unwrap();
+    assert_eq!(binding.owner(), current.owner());
+    assert_eq!(binding.execution(), execution);
+    assert_eq!(binding.observation(), &observation);
+    let wire = serde_json::to_value(&binding).unwrap();
+    assert_eq!(
+        serde_json::from_value::<GoalExecutionBinding>(wire.clone()).unwrap(),
+        binding
+    );
+    let other = ProductConversationId::parse("other").unwrap();
+    assert_eq!(
+        GoalExecutionBinding::new(other.clone(), execution, observation),
+        Err(GoalError::Conflict),
+    );
+    let mut invalid = wire;
+    invalid["owner"] = serde_json::json!(other);
+    assert!(serde_json::from_value::<GoalExecutionBinding>(invalid).is_err());
+    for version in [0, 9] {
+        let binding = GoalExecutionBinding::new(
+            other.clone(),
+            execution,
+            GoalAdmissionObservation::NoGoal {
+                observed_version: GoalVersion::parse(version).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<GoalExecutionBinding>(serde_json::to_value(&binding).unwrap())
+                .unwrap(),
+            binding,
+        );
+    }
+}
+
+#[test]
+fn report_outcomes_keep_valid_wire_and_reject_non_report_states() {
+    let current = initial();
+    let timestamp = GoalTimestampUs::parse(123).unwrap();
+    for (disposition, state, name) in [
+        (
+            GoalDisposition::Blocked(text("access")),
+            GoalState::Blocked(text("access")),
+            "Blocked",
+        ),
+        (
+            GoalDisposition::Complete(text("done")),
+            GoalState::Complete(text("done")),
+            "Complete",
+        ),
+        (
+            GoalDisposition::Exhausted(text("limit")),
+            GoalState::Exhausted(text("limit")),
+            "Exhausted",
+        ),
+    ] {
+        let outcome = GoalReportOutcome::try_from(disposition.clone()).unwrap();
+        let mut command = report(&current);
+        let GoalChange::Report {
+            disposition: reported,
+            ..
+        } = &mut command.change
+        else {
+            panic!("report")
+        };
+        *reported = outcome.clone();
+        let wire = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            wire["change"]["Report"]["disposition"],
+            serde_json::to_value(disposition).unwrap()
+        );
+        let restored: GoalMutation = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored, command);
+        let snapshot = command.advance(Some(&current)).unwrap();
+        assert_eq!(snapshot.state(), &state);
+        let receipt = GoalHistoryEntry::new(snapshot, command, timestamp).unwrap();
+        assert_eq!(
+            serde_json::from_value::<GoalHistoryEntry>(serde_json::to_value(&receipt).unwrap())
+                .unwrap(),
+            receipt,
+        );
+        let pending_wire = serde_json::to_value(outcome).unwrap();
+        assert_eq!(pending_wire["status"], name.to_lowercase());
+    }
+    for disposition in [
+        GoalDisposition::Underway,
+        GoalDisposition::Suspended(text("stopped")),
+    ] {
+        assert_eq!(
+            GoalReportOutcome::try_from(disposition.clone()),
+            Err(GoalError::Inapplicable)
+        );
+        let invalid = serde_json::to_value(&disposition).unwrap();
+        let mut wire = serde_json::to_value(report(&current)).unwrap();
+        wire["change"]["Report"]["disposition"] = invalid.clone();
+        assert!(serde_json::from_value::<GoalMutation>(wire).is_err());
+        let prior = if matches!(disposition, GoalDisposition::Underway) {
+            set(&current, GoalDisposition::Blocked(text("access restored")))
+                .advance(Some(&current))
+                .unwrap()
+        } else {
+            current.clone()
+        };
+        let command = set(&prior, disposition);
+        let restored: GoalMutation =
+            serde_json::from_value(serde_json::to_value(&command).unwrap()).unwrap();
+        assert_eq!(restored, command);
+        let snapshot = command.advance(Some(&prior)).unwrap();
+        let receipt = GoalHistoryEntry::new(snapshot, command, timestamp).unwrap();
+        let mut wire = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(
+            serde_json::from_value::<GoalHistoryEntry>(wire.clone()).unwrap(),
+            receipt
+        );
+        wire["mutation"] = serde_json::to_value(report(&current)).unwrap();
+        wire["mutation"]["change"]["Report"]["disposition"] = invalid;
+        assert!(serde_json::from_value::<GoalHistoryEntry>(wire).is_err());
+    }
+    for status in ["underway", "suspended"] {
+        assert!(serde_json::from_value::<GoalReportOutcome>(
+            serde_json::json!({"status": status, "reason": "invalid report"})
+        )
+        .is_err());
+    }
 }
 
 #[test]

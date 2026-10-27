@@ -400,11 +400,58 @@ pub enum GoalAdmissionObservation {
     Goal(GoalFence),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalExecutionBinding {
-    pub owner: ProductConversationId,
-    pub execution: GoalExecution,
-    pub observation: GoalAdmissionObservation,
+    owner: ProductConversationId,
+    execution: GoalExecution,
+    observation: GoalAdmissionObservation,
+}
+
+impl GoalExecutionBinding {
+    /// # Errors
+    /// Rejects a goal-bearing observation belonging to a different owner.
+    pub fn new(
+        owner: ProductConversationId,
+        execution: GoalExecution,
+        observation: GoalAdmissionObservation,
+    ) -> Result<Self, GoalError> {
+        if matches!(&observation, GoalAdmissionObservation::Goal(goal) if goal.owner() != &owner) {
+            return Err(GoalError::Conflict);
+        }
+        Ok(Self {
+            owner,
+            execution,
+            observation,
+        })
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &ProductConversationId {
+        &self.owner
+    }
+
+    #[must_use]
+    pub fn execution(&self) -> GoalExecution {
+        self.execution
+    }
+
+    #[must_use]
+    pub fn observation(&self) -> &GoalAdmissionObservation {
+        &self.observation
+    }
+}
+
+impl<'de> Deserialize<'de> for GoalExecutionBinding {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireBinding {
+            owner: ProductConversationId,
+            execution: GoalExecution,
+            observation: GoalAdmissionObservation,
+        }
+        let wire = WireBinding::deserialize(deserializer)?;
+        Self::new(wire.owner, wire.execution, wire.observation).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,7 +466,8 @@ pub enum GoalChange {
     },
     Report {
         binding: GoalExecutionBinding,
-        disposition: GoalDisposition,
+        #[serde(with = "pending_report::report_disposition_wire")]
+        disposition: GoalReportOutcome,
     },
 }
 
