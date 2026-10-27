@@ -736,45 +736,10 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 141,
-        name: "slack_gateway",
+        name: "slack_gateway_v1",
         sql: include_str!("migrations/slack_gateway.sql"),
     },
-    Migration {
-        version: 142,
-        name: "slack_gateway_first_observation",
-        sql: "CREATE TABLE slack_gateway_observations (
-            workspace TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL, message_ts TEXT NOT NULL,
-            first_observed_at_unix_micros INTEGER NOT NULL CHECK(typeof(first_observed_at_unix_micros)='integer' AND first_observed_at_unix_micros>=0),
-            PRIMARY KEY(workspace,owner,channel,message_ts)
-        );",
-    },
-    Migration {
-        version: 143,
-        name: "slack_gateway_trigger_provenance",
-        sql: "ALTER TABLE slack_gateway_requests ADD COLUMN trigger_kind TEXT NOT NULL DEFAULT 'unknown_historical' CHECK(trigger_kind IN ('prefix','reaction','unknown_historical'));",
-    },
-    Migration {
-        version: 144,
-        name: "slack_gateway_frozen_notification_target",
-        sql: "-- Old unsent operations lack their original URL; never invent one from current settings.
-        ALTER TABLE slack_gateway_returns ADD COLUMN notification_url TEXT CHECK(notification_url IS NULL OR length(trim(notification_url))>0);
-        UPDATE slack_gateway_returns SET state='failed',failure='Historical notification retry lacks its original destination URL; automatic retry stopped' || CASE WHEN failure IS NOT NULL THEN ': ' || failure ELSE '' END WHERE destination='private' AND state='known_unsent';
-        CREATE TRIGGER slack_gateway_notification_operation_immutable BEFORE UPDATE OF notification_command,notification_url ON slack_gateway_returns
-        WHEN (OLD.notification_command IS NOT NULL AND NEW.notification_command IS NOT OLD.notification_command) OR (OLD.notification_url IS NOT NULL AND NEW.notification_url IS NOT OLD.notification_url)
-        BEGIN SELECT RAISE(ABORT,'notification operation is immutable'); END;",
-    },
-    Migration {
-        version: 145,
-        name: "slack_gateway_delivery_retry_bounds",
-        sql: "ALTER TABLE slack_gateway_requests ADD COLUMN eyes_failure TEXT CHECK(eyes_failure IS NULL OR (eyes_confirmed=0 AND length(trim(eyes_failure))>0));
-        ALTER TABLE slack_gateway_returns ADD COLUMN notification_inspect_after_us INTEGER CHECK(notification_inspect_after_us IS NULL OR (typeof(notification_inspect_after_us)='integer' AND notification_inspect_after_us>=0));",
-    },
-    Migration {
-        version: 146,
-        name: "slack_gateway_thread_attempt_bound",
-        sql: "ALTER TABLE slack_gateway_returns ADD COLUMN thread_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(typeof(thread_attempt_count)='integer' AND thread_attempt_count BETWEEN 0 AND 3);
-        UPDATE slack_gateway_returns SET thread_attempt_count=1 WHERE destination='thread' AND attempt_id IS NOT NULL;",
-    },
+
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13136,107 +13101,55 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn historical_notification_retries_never_guess_a_missing_target() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+    async fn slack_final_schema_excludes_obsolete_prototype_storage() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        let identity: String = sqlx::query_scalar("SELECT name FROM _migrations WHERE version=141")
+            .fetch_one(db.pool())
             .await
             .unwrap();
-        sqlx::raw_sql("CREATE TABLE slack_gateway_returns(return_id TEXT PRIMARY KEY,destination TEXT,state TEXT,notification_command TEXT,failure TEXT); INSERT INTO slack_gateway_returns VALUES('retry','private','known_unsent','[\"/old/notify\"]',NULL),('submitted','private','submitted','[\"/old/notify\"]',NULL),('pending','private','pending',NULL,NULL),('thread','thread','known_unsent',NULL,NULL);").execute(&pool).await.unwrap();
-        sqlx::raw_sql(
-            MIGRATIONS
-                .iter()
-                .find(|m| m.name == "slack_gateway_frozen_notification_target")
-                .unwrap()
-                .sql,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT return_id,state,notification_url FROM slack_gateway_returns ORDER BY return_id",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                ("pending".into(), "pending".into(), None),
-                ("retry".into(), "failed".into(), None),
-                ("submitted".into(), "submitted".into(), None),
-                ("thread".into(), "known_unsent".into(), None)
-            ]
-        );
-        assert!(sqlx::query_scalar::<_, String>(
-            "SELECT failure FROM slack_gateway_returns WHERE return_id='retry'"
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .contains("original destination URL"));
+        assert_eq!(identity, "slack_gateway_v1");
+        let obsolete: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM sqlite_schema WHERE name='slack_gateway_questions')
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_requests') WHERE name IN ('question_id','question_transcript'))
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_native_outcomes') WHERE name IN ('question_id','question_body'))
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_returns') WHERE name IN ('response_kind','notification_inspect_after_us'))")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(obsolete, 0);
     }
 
     #[tokio::test]
-    async fn slack_thread_attempt_bound_preserves_retained_claims() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::raw_sql("CREATE TABLE slack_gateway_returns(return_id TEXT PRIMARY KEY,destination TEXT,attempt_id TEXT);
-            INSERT INTO slack_gateway_returns VALUES('pending','thread',NULL),('thread','thread','old-attempt'),('private','private','old-command');")
-            .execute(&pool).await.unwrap();
-        let migration = MIGRATIONS
-            .iter()
-            .find(|m| m.name == "slack_gateway_thread_attempt_bound")
-            .unwrap();
-        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT return_id,thread_attempt_count FROM slack_gateway_returns ORDER BY return_id",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                ("pending".into(), 0),
-                ("private".into(), 0),
-                ("thread".into(), 1)
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn slack_trigger_provenance_preserves_historical_unknowns() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::raw_sql("CREATE TABLE slack_gateway_requests(request_id TEXT PRIMARY KEY, kind TEXT, context TEXT, observed_at_unix_micros INTEGER); INSERT INTO slack_gateway_requests VALUES('old','explicit','unchanged',17);").execute(&pool).await.unwrap();
-        let migration = MIGRATIONS
-            .iter()
-            .find(|m| m.name == "slack_gateway_trigger_provenance")
-            .unwrap();
-        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
-        let row: (String, String, i64, String) = sqlx::query_as("SELECT kind,context,observed_at_unix_micros,trigger_kind FROM slack_gateway_requests WHERE request_id='old'").fetch_one(&pool).await.unwrap();
-        assert_eq!(
-            row,
-            (
-                "explicit".into(),
-                "unchanged".into(),
-                17,
-                "unknown_historical".into()
-            )
-        );
-        assert!(
-            sqlx::query("UPDATE slack_gateway_requests SET trigger_kind='guessed'")
+    async fn slack_prototype_ledgers_are_refused_before_mutation() {
+        for (version, name) in [
+            (141, "slack_gateway"),
+            (142, "slack_gateway_first_observation"),
+        ] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::raw_sql("CREATE TABLE _migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT (datetime('now')));
+                CREATE TABLE prototype_work(instruction TEXT); INSERT INTO prototype_work VALUES('preserve this work');")
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _migrations(version,name) VALUES (?1,?2)")
+                .bind(version)
+                .bind(name)
                 .execute(&pool)
                 .await
-                .is_err()
-        );
+                .unwrap();
+            assert!(run_pending_migrations(&pool).await.is_err());
+            let work: String = sqlx::query_scalar("SELECT instruction FROM prototype_work")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(work, "preserve this work");
+            let objects: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(objects, 2);
+        }
     }
 
     #[tokio::test]
@@ -15122,12 +15035,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (146, "slack_gateway_thread_attempt_bound"),
-            (145, "slack_gateway_delivery_retry_bounds"),
-            (144, "slack_gateway_frozen_notification_target"),
-            (143, "slack_gateway_trigger_provenance"),
-            (142, "slack_gateway_first_observation"),
-            (141, "slack_gateway"),
+            (141, "slack_gateway_v1"),
             (140, "federation_local_stop_acceptance"),
             (139, "goal_start_materialization_witness"),
             (138, "per_goal_execution_requests"),

@@ -75,8 +75,7 @@ contract SlackDiscoveryPort {
         -- Unambiguous owner prefixes require no reaction read. A possible
         -- connector footer still needs metadata to isolate literal source text;
         -- unavailable metadata retains that candidate for retry.
-        -- Persist verified trigger provenance independently of request kind;
-        -- historical unknown provenance cannot imply prefix-message age.
+        -- Persist verified prefix/reaction provenance independently of request kind.
         -- A source reply must also be observed under its claimed root; the
         -- search permalink alone does not establish that return destination.
         -- Eligibility uses the current and preceding three calendar dates in

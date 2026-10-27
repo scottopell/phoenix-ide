@@ -135,3 +135,11 @@ on the status page.
 Production activation must qualify its actual installed schema transition and
 preserve installed configuration and credentials. See the feature executive
 summary for current qualification status.
+
+## Database boundary
+
+The public feature installs the final `141/slack_gateway_v1` schema on a supported
+canonical Phoenix database. Earlier unmerged Slack databases are unsupported and
+are refused by migration identity before mutation. Preserve prototype work for a
+separate offline upgrade plan; do not relabel its ledger or open it as a fresh
+installation. The normal protected production-deployment gate still applies.

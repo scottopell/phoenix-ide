@@ -1,6 +1,6 @@
 # ADR-155: Slack signals are best effort and questions stay native
 
-- **Status:** Accepted
+- **Status:** Prototype compatibility superseded by ADR-188
 - **Date:** 2026-10-27
 - **Affects:** REQ-SG-005/006/012/013/014/015/016/017
 

@@ -559,13 +559,6 @@ fn assignment(request: &SlackRequest) -> String {
 }
 #[allow(clippy::too_many_lines)] // Reconcile the reserved creation/input identities before dispatching any new work.
 async fn admit(state: &AppState, c: &Config, request: &SlackRequest) -> Result<(), String> {
-    if request.question_id.is_some() || request.question_transcript.is_some() {
-        return state.db.fail_slack_before_admission(
-            &request.request_id,
-            "Slack clarification answers are unavailable; answer the pending question in Phoenix",
-            &c.phoenix_url,
-        ).await.map_err(err);
-    }
     if request.source.kind == SlackRequestKind::Explicit
         && request.source.instruction.trim().is_empty()
     {
@@ -741,6 +734,18 @@ mod tests {
         ProviderStreamTelemetry, Usage,
     };
     use std::sync::{Arc, Mutex};
+
+    fn config() -> Config {
+        Config {
+            enabled: false,
+            mcp_server: "fixture".into(),
+            owner: "UFIXTURE".into(),
+            workspace: "fixture.slack.com".into(),
+            timezone: "America/New_York".into(),
+            phoenix_url: "https://phoenix.example".into(),
+            notification_command: None,
+        }
+    }
     #[tokio::test]
     async fn private_notifications_attempt_once_for_acceptance_rejection_and_ambiguity() {
         for result in ["submitted", "failed", "invalid", "missing", "unconfigured"] {
@@ -749,12 +754,7 @@ mod tests {
             let trace = directory.path().join("calls");
             let response = serde_json::json!({"version":1,"notification_id":"notice","owner":"UFIXTURE","receipt":"receipt","state":result,"reason":"Rejected"}).to_string();
             let mut c = Config {
-                enabled: false,
-                mcp_server: "fixture".into(),
-                owner: "UFIXTURE".into(),
-                workspace: "fixture.slack.com".into(),
                 timezone: "UTC".into(),
-                phoenix_url: "https://phoenix.example".into(),
                 notification_command: match result {
                     "unconfigured" => None,
                     "missing" => Some(vec![directory
@@ -773,6 +773,7 @@ mod tests {
                         ),
                     ]),
                 },
+                ..config()
             };
             let source = phoenix_db::SlackSource {
                 workspace: c.workspace.clone(),
@@ -841,13 +842,8 @@ mod tests {
     async fn undispatched_reply_retries_after_tool_readiness_recovers() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let c = Config {
-            enabled: false,
-            mcp_server: "fixture".into(),
-            owner: "UFIXTURE".into(),
-            workspace: "fixture.slack.com".into(),
-            timezone: "America/New_York".into(),
             phoenix_url: "https://localhost:8043".into(),
-            notification_command: None,
+            ..config()
         };
         let source = phoenix_db::SlackSource {
             workspace: c.workspace.clone(),
@@ -1006,13 +1002,8 @@ mod tests {
         state.runtime.start_direct_turn_worker().await.unwrap();
         state.runtime.start_creation_worker().await.unwrap();
         let c = Config {
-            enabled: false,
-            mcp_server: "fixture".into(),
-            owner: "UFIXTURE".into(),
-            workspace: "fixture.slack.com".into(),
-            timezone: "America/New_York".into(),
             phoenix_url: "https://localhost:8043".into(),
-            notification_command: None,
+            ..config()
         };
         let mut products = vec![];
         for ts in ["100.000001", "100.000002"] {
@@ -1134,13 +1125,8 @@ mod tests {
             1
         );
         let c = Config {
-            enabled: false,
-            mcp_server: "fixture".into(),
-            owner: "UFIXTURE".into(),
-            workspace: "fixture.slack.com".into(),
-            timezone: "America/New_York".into(),
             phoenix_url: "https://localhost:8043".into(),
-            notification_command: None,
+            ..config()
         };
         let wakeup = state.db.clone().slack_gateway_wakeup();
         tokio::time::timeout(std::time::Duration::from_secs(1), wakeup.notified())
@@ -1209,12 +1195,7 @@ mod tests {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let c = Config {
             enabled: true,
-            mcp_server: "fixture".into(),
-            owner: "UFIXTURE".into(),
-            workspace: "fixture.slack.com".into(),
-            timezone: "America/New_York".into(),
-            phoenix_url: "https://phoenix.example".into(),
-            notification_command: None,
+            ..config()
         };
         let mut slack = Slack::new(state.mcp_manager.clone(), &c);
         slack.fixture = Some(Arc::new(|_, _| Err("fixture source read failed".into())));
@@ -1268,15 +1249,7 @@ mod tests {
         .flat_map(|code| [(code, false), (code, true)])
         {
             let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-            let c = Config {
-                enabled: false,
-                mcp_server: "fixture".into(),
-                owner: "UFIXTURE".into(),
-                workspace: "fixture.slack.com".into(),
-                timezone: "America/New_York".into(),
-                phoenix_url: "https://phoenix.example".into(),
-                notification_command: None,
-            };
+            let c = config();
             let source = phoenix_db::SlackSource {
                 workspace: c.workspace.clone(),
                 owner: c.owner.clone(),
@@ -1346,15 +1319,7 @@ mod tests {
             let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
             let directory = tempfile::tempdir().unwrap();
             let marker = directory.path().join("sends");
-            let mut c = Config {
-                enabled: false,
-                mcp_server: "fixture".into(),
-                owner: "UFIXTURE".into(),
-                workspace: "fixture.slack.com".into(),
-                timezone: "America/New_York".into(),
-                phoenix_url: "https://phoenix.example".into(),
-                notification_command: None,
-            };
+            let mut c = config();
             let source = phoenix_db::SlackSource {
                 workspace: c.workspace.clone(),
                 owner: c.owner.clone(),
@@ -1451,21 +1416,13 @@ mod tests {
         }
     }
 
-    // REQ-SG-012: neither a fresh trigger nor a stored association answers a question.
+    // REQ-SG-012: Slack triggers do not answer pending native questions.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn pending_native_question_requires_phoenix_and_new_requests_stay_distinct() {
         use phoenix_core::domain::sm_state::{ConvState, QuestionRequestAuthority, UserQuestion};
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-        let c = Config {
-            enabled: false,
-            mcp_server: "fixture".into(),
-            owner: "UFIXTURE".into(),
-            workspace: "fixture.slack.com".into(),
-            timezone: "America/New_York".into(),
-            phoenix_url: "https://phoenix.example".into(),
-            notification_command: None,
-        };
+        let c = config();
         let conv = state
             .db
             .create_conversation("pending", "pending", "/tmp", true, None, None)
@@ -1521,7 +1478,7 @@ mod tests {
             )
             .await
             .unwrap();
-        for (ts, stored_association) in [("102.000000", false), ("103.000000", true)] {
+        for ts in ["102.000000", "103.000000"] {
             state
                 .db
                 .accept_slack_source(&source(ts), false)
@@ -1533,19 +1490,6 @@ mod tests {
                 .await
                 .unwrap()
                 .pop()
-                .unwrap();
-            assert!(request.question_id.is_none());
-            if stored_association {
-                sqlx::query("UPDATE slack_gateway_requests SET question_id=?2,question_transcript=?3 WHERE request_id=?1")
-                    .bind(&request.request_id).bind(authority.request_id().unwrap().to_string()).bind(&conv.id).execute(state.db.pool()).await.unwrap();
-            }
-            let request = state
-                .db
-                .slack_requests(&c.workspace, &c.owner)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|r| r.request_id == request.request_id)
                 .unwrap();
             let _ = admit(&state, &c, &request).await;
             let rejected = state

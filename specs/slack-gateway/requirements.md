@@ -122,9 +122,11 @@ WHEN a briefing is ready, THE SYSTEM SHALL provide a concise summary, relevant e
 
 WHEN a request is associated with a target, THE SYSTEM SHALL create or resolve it through shared conversation services and submit the input through ordinary durable turn admission with its stable identity. Accepted, already-admitted, queued-as-steering, and rejected outcomes SHALL remain distinguishable.
 
-WHEN interrupted after creation or turn acceptance, THE SYSTEM SHALL reconcile the same creation and turn identities rather than submit replacement work. An acknowledgment, context-read, or return-delivery failure SHALL NOT rerun an accepted turn. Only same-version restart with retained feature state is guaranteed; no mixed-version writer, downgrade, database replacement, or cross-host recovery guarantee is added beyond the compatibility contract.
+WHEN interrupted after creation or turn acceptance, THE SYSTEM SHALL reconcile the same creation and turn identities rather than submit replacement work. An acknowledgment, context-read, or return-delivery failure SHALL NOT rerun an accepted turn. Only restart with retained state from the same final Slack schema is guaranteed; no mixed-version writer, downgrade, database replacement, or cross-host recovery guarantee is added beyond the compatibility contract.
 
 WHEN the gateway schema is introduced, THE SYSTEM SHALL preserve existing conversation, message, steering, and turn data and attribution, add gateway state without enabling discovery, and retain the existing bounded production-deployment qualification gate. A new feature migration SHALL NOT silently qualify a newer production activation target.
+
+The Slack feature installs one final schema on a supported canonical Phoenix database. Databases created by unmerged Slack builds are unsupported migration lineages and SHALL be refused by the existing migration-identity preflight. Prototype conversion requires a separate offline plan; the gateway SHALL NOT interpret or repair obsolete trigger, question-answer, notification-retry or delivery-inspection formats.
 
 **Rationale:** Slack must not become a second conversation runtime or create duplicate work at crash boundaries.
 
@@ -136,13 +138,13 @@ WHEN several explicit requests in the same bound thread overlap, THE SYSTEM MAY 
 
 WHEN one native execution consumes a queued batch containing several Slack inputs, completion, failure and question evidence SHALL account for every consumed Slack input rather than only the first batch message. Unconsumed queued inputs SHALL retain separate obligations.
 
-WHEN clarification is required, THE SYSTEM SHALL post it in that thread, send only a generic handoff with a deep link to the ordinary Phoenix conversation, and direct the owner to answer there. The confirmed clarification handoff SHALL satisfy the request's automatic Slack response obligation; subsequent native discussion SHALL remain private unless separately authorized for publication by a new explicit request. Slack triggers SHALL remain ordinary requests and SHALL NOT answer native questions. WHEN the native conversation cannot accept a new request while awaiting an answer, THE SYSTEM SHALL explain that the owner must answer in Phoenix without changing the pending question or treating the new request as an answer. Persisted question associations SHALL NOT authorize unsubmitted Slack answers.
+WHEN clarification is required, THE SYSTEM SHALL post it in that thread, send only a generic handoff with a deep link to the ordinary Phoenix conversation, and direct the owner to answer there. The confirmed clarification handoff SHALL satisfy the request's automatic Slack response obligation; subsequent native discussion SHALL remain private unless separately authorized for publication by a new explicit request. Slack triggers SHALL remain ordinary requests and SHALL NOT answer native questions. WHEN the native conversation cannot accept a new request while awaiting an answer, THE SYSTEM SHALL explain that the owner must answer in Phoenix without changing the pending question or treating the new request as an answer.
 
 THE SYSTEM SHALL include a Phoenix deep link in gateway-generated clarifications and explanations: the stable conversation route when one exists, otherwise the specific return's status route. For source-thread returns, the gateway SHALL durably freeze that complete outgoing text, including the link, when creating its return obligation and reuse it for a known-unsent retry. The assignment SHALL encourage the agent to link its Phoenix conversation when useful in an intentional answer.
 
 Owner-facing status SHALL distinguish a reserved product identity from a native-route-eligible published conversation and SHALL offer a conversation link only while native routing can resolve it. Pending, failed or deleted targets SHALL remain inspectable through gateway status.
 
-Clarification handoffs SHALL NOT copy question bodies, options, private answers, or subsequent discussion into Slack. A generic handoff SHALL remain safe to send when the native question changes or is answered before delivery, without question-state synchronization. Retained definitely-unsent question-text returns SHALL be retired and replaced with a distinct generic handoff preserving exact coverage; attempting, confirmed and uncertain external operations SHALL NOT be replaced or replayed.
+Clarification handoffs SHALL NOT copy question bodies, options, private answers, or subsequent discussion into Slack. A generic handoff SHALL remain safe to send when the native question changes or is answered before delivery, without question-state synchronization.
 
 **Rationale:** An explicit Slack invocation should not disappear into an agent that silently decides to say nothing.
 
@@ -180,7 +182,7 @@ Each captured briefing occurrence SHALL retain its own notification obligation; 
 
 THE SYSTEM SHALL pass generic notification content and a Phoenix link through a versioned input protocol to the configured command. Provider credentials and recipient routing SHALL remain outside gateway settings. Each notice SHALL have at most one bounded command attempt, claimed durably before launch. The attempt's command and URL SHALL be retained for inspection; they SHALL NOT create a retry obligation.
 
-THE SYSTEM SHALL record command acceptance, rejection, or uncertainty without claiming recipient delivery or device display. Missing command configuration and definitely-unlaunched failures SHALL be recorded as failed attempts. Interrupted or ambiguous attempts SHALL remain uncertain. Neither kind of failure SHALL be automatically retried, inspected through the command, or rerun the agent. Retained submitted receipts SHALL remain historical submission evidence without further inspection; retained definitely-unsent private retries SHALL be stopped visibly.
+THE SYSTEM SHALL record command acceptance, rejection, or uncertainty without claiming recipient delivery or device display. Missing command configuration and definitely-unlaunched failures SHALL be recorded as failed attempts. Interrupted or ambiguous attempts SHALL remain uncertain. Neither kind of failure SHALL be automatically retried, inspected through the command, or rerun the agent. Submitted receipts SHALL establish only command acceptance, without further inspection.
 
 Each serialized reconciliation opportunity SHALL start at most one private command after an eligible source-thread delivery attempt. Native work and source-thread response duties SHALL remain independent of private notification outcomes; notification outcomes SHALL NOT block account changes. Phoenix SHALL remain the authoritative place to find the work and notification status.
 
@@ -210,7 +212,7 @@ Ready responses SHALL be reconciled independently of waiting for the next discov
 
 The gateway's owner-facing read-access inspection SHALL share that allowance, serialization and persisted retry deadline, without accepting triggers or advancing discovery. Direct agent or manual MCP tool calls are outside this gateway allowance.
 
-Inspection SHALL report sampled hits and verified sources for each query, and distinguish successful search from demonstrated source and reaction reads. Empty or unverified samples SHALL be inconclusive about read access. Accepted sources SHALL retain verified prefix/reaction provenance independently of request kind; historical unknown provenance SHALL NOT be inferred from message age or used for prefix-age metrics.
+Inspection SHALL report sampled hits and verified sources for each query, and distinguish successful search from demonstrated source and reaction reads. Empty or unverified samples SHALL be inconclusive about read access. Accepted sources SHALL retain verified prefix/reaction provenance independently of request kind.
 
 Ready return delivery SHALL receive an opportunity before best-effort acknowledgment attempts consume available allowance or introduce a new provider delay. Retry deadlines SHALL apply to the configured owner/workspace, rather than another retained account. Non-throttling discovery failures SHALL be reported as failed rather than provider backoff. A startup recovery failure SHALL remain visible and be retried without requiring a Phoenix restart; no external work SHALL begin before that recovery succeeds.
 

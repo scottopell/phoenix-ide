@@ -8,7 +8,7 @@ interface Config {
 interface GatewayStatus {
   config: Config | null;
   scan?: { status: string; last_scan_at_unix_micros: number | null; last_error: string | null; baseline_complete: boolean; calls_last_pass: number; pages_last_pass: number; retry_at_us: number | null } | null;
-  requests: { request_id: string; product_id: string | null; conversation_available: boolean; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; eyes_failure: string | null; failure: string | null; source: { source_url: string; kind: string; trigger_kind: 'prefix' | 'reaction' | 'unknown_historical'; observed_at_unix_micros: number; message_ts: string } }[];
+  requests: { request_id: string; product_id: string | null; conversation_available: boolean; admitted: boolean; accepted_at_us: number; eyes_confirmed: boolean; eyes_failure: string | null; failure: string | null; source: { source_url: string; kind: string; trigger_kind: 'prefix' | 'reaction'; observed_at_unix_micros: number; message_ts: string } }[];
   returns: { return_id: string; state: string; destination: string; request_ids: string[]; failure: string | null; notification_receipt: string | null }[];
 }
 const initial = (): Config => ({ enabled: false, mcp_server: '', owner: '', workspace: '', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, phoenix_url: window.location.origin, notification_command: null });

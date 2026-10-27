@@ -49,7 +49,7 @@ it.each([
   expect(status.textContent).not.toContain('both discovery queries passed');
 });
 
-it.each(['prefix', 'reaction', 'unknown_historical'])('only exposes message age for known prefixes: %s', async triggerKind => {
+it.each(['prefix', 'reaction'])('only exposes message age for known prefixes: %s', async triggerKind => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ config: null, returns: [], requests: [{ request_id: 'request', product_id: null, conversation_available: false,
     admitted: false, accepted_at_us: 3000000, eyes_confirmed: false, failure: null,
     source: { source_url: 'https://example.slack.com/source', kind: 'explicit', trigger_kind: triggerKind, observed_at_unix_micros: 2000000, message_ts: '1.000001' } }] }) }));
