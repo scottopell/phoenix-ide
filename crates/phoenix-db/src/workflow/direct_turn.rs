@@ -445,6 +445,21 @@ impl WorkflowRepository {
         .execute(&mut *tx.tx)
         .await
         .map_err(map_constraint)?;
+        if input.disposition == AcceptedDisposition::Runtime {
+            let execution = phoenix_core::domain::conversation_goal::GoalExecution::parse(
+                to_i64(workflow_id.0, "workflow_id")?,
+                to_i64(turn_id.0, "turn_id")?,
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            crate::conversation_goals::control::capture_runtime_control_tx(
+                &mut tx.tx,
+                execution,
+                self.goal_control_installation,
+            )
+            .await
+            .map_err(crate::conversation_goals::control::db_error)?;
+            crate::conversation_goals::capture_goal_at_new_turn_tx(&mut tx.tx, execution).await?;
+        }
         insert_prepared_turn_attachments_tx(&mut tx.tx, turn_id, &prepared_payload).await?;
         if cut == TransactionCut::BeforeCommit {
             tx.rollback().await?;

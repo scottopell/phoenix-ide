@@ -146,6 +146,7 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
       v.looseObject({ kind: v.literal('cancelled') }),
       v.looseObject({ kind: v.literal('awaiting_user_response') }),
       v.looseObject({ kind: v.literal('awaiting_task_approval') }),
+      v.looseObject({ kind: v.literal('goal_changed') }),
     ]),
   }),
   v.looseObject({

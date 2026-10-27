@@ -424,6 +424,9 @@ pub struct CompleteScheduleOccurrenceInput {
 #[derive(Debug, Clone)]
 pub struct WorkflowRepository {
     pool: SqlitePool,
+    goal_control_installation: crate::conversation_goals::control::GoalControlInstallation,
+    #[allow(dead_code)]
+    goal_execution_installation: crate::conversation_goals::execution::GoalExecutionInstallation,
     sqlite_workload_collector: Option<crate::SqliteWorkloadCollector>,
 }
 
@@ -1272,15 +1275,23 @@ impl WorkflowRepository {
         Self {
             pool,
             sqlite_workload_collector: None,
+            goal_control_installation:
+                crate::conversation_goals::control::GoalControlInstallation::Disabled,
+            goal_execution_installation:
+                crate::conversation_goals::execution::GoalExecutionInstallation::Disabled,
         }
     }
 
     pub(crate) fn with_sqlite_workload_collector(
         pool: SqlitePool,
         sqlite_workload_collector: crate::SqliteWorkloadCollector,
+        goal_control_installation: crate::conversation_goals::control::GoalControlInstallation,
+        goal_execution_installation: crate::conversation_goals::execution::GoalExecutionInstallation,
     ) -> Self {
         Self {
             pool,
+            goal_control_installation,
+            goal_execution_installation,
             sqlite_workload_collector: Some(sqlite_workload_collector),
         }
     }

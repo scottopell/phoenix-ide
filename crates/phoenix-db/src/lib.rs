@@ -1667,6 +1667,9 @@ impl SteeringCapacityTestControl {
 
 pub struct Database {
     pool: SqlitePool,
+    goal_control_installation: conversation_goals::control::GoalControlInstallation,
+    goal_execution_installation: conversation_goals::execution::GoalExecutionInstallation,
+    goal_control_runtime: std::sync::Arc<conversation_goals::control::dispatch::GoalControlRuntime>,
     sqlite_workload_collector: SqliteWorkloadCollector,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
@@ -1691,6 +1694,9 @@ impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            goal_control_installation: self.goal_control_installation,
+            goal_execution_installation: self.goal_execution_installation,
+            goal_control_runtime: self.goal_control_runtime.clone(),
             sqlite_workload_collector: self.sqlite_workload_collector.clone(),
             path: self.path.clone(),
             dormant_git_repository_catchup_authority_state: self
@@ -1839,6 +1845,8 @@ impl Database {
         workflow::WorkflowRepository::with_sqlite_workload_collector(
             self.pool.clone(),
             self.sqlite_workload_collector.clone(),
+            self.goal_control_installation,
+            self.goal_execution_installation,
         )
     }
 
@@ -1922,6 +1930,11 @@ impl Database {
             pool,
             sqlite_workload_collector,
             path,
+            goal_control_installation:
+                conversation_goals::control::GoalControlInstallation::Disabled,
+            goal_execution_installation:
+                conversation_goals::execution::GoalExecutionInstallation::Disabled,
+            goal_control_runtime: std::sync::Arc::default(),
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
                 git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
             ),
