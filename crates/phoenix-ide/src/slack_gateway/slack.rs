@@ -41,11 +41,6 @@ pub(super) struct VerifiedSource {
     pub body: String,
     pub reaction_read_verified: bool,
 }
-#[derive(Debug)]
-pub(super) enum Acknowledgment {
-    Confirmed,
-    Unavailable(String),
-}
 
 enum SourceRead {
     Thread,
@@ -421,7 +416,7 @@ impl Slack {
         ReactionEvidence::parse(field(&value, "result")?, &c.owner)?;
         Ok(true)
     }
-    pub async fn eyes(&self, channel: &str, ts: &str) -> Result<Acknowledgment, String> {
+    pub async fn eyes(&self, channel: &str, ts: &str) -> Result<(), String> {
         match self
             .call_classified(
                 "slack_add_reaction",
@@ -429,28 +424,15 @@ impl Slack {
             )
             .await
         {
-            Ok(_) => Ok(Acknowledgment::Confirmed),
+            Ok(_) => Ok(()),
             Err(error)
                 if operation_rejection(&error, "reactions.add").is_some_and(|value| {
                     value.get("error").and_then(Value::as_str) == Some("already_reacted")
                 }) =>
             {
-                Ok(Acknowledgment::Confirmed)
+                Ok(())
             }
-            Err(error) => {
-                if let Some(value) = operation_rejection(&error, "reactions.add") {
-                    if let Some(
-                        code @ ("message_not_found" | "channel_not_found" | "not_in_channel"
-                        | "access_denied"),
-                    ) = value.get("error").and_then(Value::as_str)
-                    {
-                        return Ok(Acknowledgment::Unavailable(format!(
-                            "Slack acknowledgment unavailable: {code}"
-                        )));
-                    }
-                }
-                Err(error.message().to_owned())
-            }
+            Err(error) => Err(error.message().to_owned()),
         }
     }
     pub async fn send(
@@ -661,17 +643,18 @@ pub(super) fn strip_fire(text: &str) -> Option<&str> {
 fn parse_page(v: &Value, c: &Config) -> Result<Page, String> {
     let results = field(v, "results")?;
     let paging = field(v, "pagination_info")?;
-    let cursor = if paging.contains("No more pages") || paging.contains("End of results") {
-        None
-    } else {
-        Some(
+    let paging = paging.trim();
+    let paging = paging.strip_suffix(r"\n").unwrap_or(paging).trim();
+    let cursor = match paging {
+        "End of results" | "End of results - No more pages available." => None,
+        _ => Some(
             paging
-                .split('`')
-                .nth(1)
-                .filter(|s| !s.is_empty())
+                .strip_prefix("For the next page of results use cursor `")
+                .and_then(|value| value.strip_suffix('`'))
+                .filter(|cursor| !cursor.is_empty() && !cursor.contains(['`', '\n', '\r']))
                 .ok_or("Unrecognized Slack pagination; scan remains incomplete")?
-                .to_string(),
-        )
+                .to_owned(),
+        ),
     };
     let mut hits = Vec::new();
     // Exactly one result per page: never interpret source text containing a
@@ -1058,37 +1041,6 @@ mod tests {
         .is_err());
     }
     #[tokio::test]
-    async fn acknowledgment_source_loss_requires_qualified_add_reaction_rejection() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
-        for code in [
-            "message_not_found",
-            "channel_not_found",
-            "not_in_channel",
-            "access_denied",
-        ] {
-            for proof in ["qualified", "opaque", "wrong_method", "transport"] {
-                let mut slack = Slack::new(state.mcp_manager.clone(), &config());
-                slack.fixture = Some(Arc::new(move |tool, _| {
-                    assert_eq!(tool, "slack_add_reaction");
-                    if proof == "transport" {
-                        return Err(code.into());
-                    }
-                    Ok(match proof {
-                        "qualified" => json!({"ok":false,"method":"reactions.add","error":code}),
-                        "wrong_method" => json!({"ok":false,"method":"reactions.get","error":code}),
-                        _ => json!({"error":code}),
-                    })
-                }));
-                let result = slack.eyes("C123", "100.000001").await;
-                if proof == "qualified" {
-                    assert!(matches!(result, Ok(Acknowledgment::Unavailable(_))));
-                } else {
-                    assert!(result.is_err());
-                }
-            }
-        }
-    }
-    #[tokio::test]
     async fn owner_prefix_is_independent_of_reaction_access_but_footer_is_not() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let c = config();
@@ -1250,6 +1202,44 @@ mod tests {
             };
             assert_eq!(slack.source(&c, &hit, false).await.is_ok(), matches);
             assert_eq!(slack.calls.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn pagination_completion_requires_the_exact_connector_envelope() {
+        let page = |pagination| serde_json::json!({"results":"No results found","pagination_info":pagination});
+        for terminal in [
+            "End of results",
+            "End of results - No more pages available.",
+            r"End of results - No more pages available.\n",
+        ] {
+            assert!(parse_page(&page(terminal), &config())
+                .unwrap()
+                .cursor
+                .is_none());
+        }
+        assert_eq!(
+            parse_page(
+                &page("For the next page of results use cursor `opaque=`\n"),
+                &config()
+            )
+            .unwrap()
+            .cursor
+            .as_deref(),
+            Some("opaque=")
+        );
+        for malformed in [
+            "Could not establish End of results",
+            "No more pages unavailable",
+            "Error: End of results - No more pages available.",
+            "For the next page of results use cursor ``",
+            "Error with cursor `opaque`",
+            "For the next page of results use cursor `opaque` extra",
+        ] {
+            assert!(
+                parse_page(&page(malformed), &config()).is_err(),
+                "{malformed}"
+            );
         }
     }
 

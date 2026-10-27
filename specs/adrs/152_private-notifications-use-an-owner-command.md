@@ -1,6 +1,6 @@
 # ADR-152: Private notifications use an owner command
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-155
 - **Date:** 2026-10-23
 - **Affects:** REQ-SG-015; private notification returns
 

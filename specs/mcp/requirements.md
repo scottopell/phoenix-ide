@@ -567,6 +567,10 @@ cannot be bound, so a sign-in URL is never published when its callback could not
 be received. The listener SHALL bind loopback only (both IP families), accept
 callbacks until the flow resolves or the 25-minute local sign-in window expires
 (a failed exchange leaves the flow retryable within that window).
+A callback accepted before that deadline with exactly one matching state nonce
+SHALL retain a bounded thirty-second completion grace for its redirect to Phoenix.
+The grace SHALL NOT accept new loopback connections or be extended by unrelated
+requests.
 Transient callback accept failures SHALL retain the bound sockets and retry
 with bounded backoff within the original window, without extending it.
 Status and

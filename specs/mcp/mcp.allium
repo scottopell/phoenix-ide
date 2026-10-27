@@ -445,7 +445,11 @@ rule OAuthClientPreconfigured {
         -- loopback URI, and a listener on that port (bound before the URL is
         -- surfaced, on both IP families, accepting until the flow resolves)
         -- bounces the browser's callback to the real /api/mcp/oauth/callback
-        -- route (REQ-MCP-020). Otherwise the redirect is Phoenix's server route.
+        -- route (REQ-MCP-020). A callback accepted before the 25-minute deadline
+        -- with exactly one matching nonce retains thirty seconds to reach Phoenix;
+        -- listener completion cannot discard it during that grace. No new loopback
+        -- connections are accepted after the deadline. Otherwise the redirect is
+        -- Phoenix's server route.
         -- A cached registration is reused only when its client_id still matches
         -- the configured one; a re-keyed clientId replaces the stale row.
 }

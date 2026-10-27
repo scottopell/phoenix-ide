@@ -234,7 +234,7 @@ async fn startup_recovery_retries_a_database_failure_without_restarting_phoenix(
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // Compare exhaustion and throttling against the same ready-return obligation.
-async fn ready_reply_precedes_exhausting_or_throttled_eyes_retries() {
+async fn ready_reply_precedes_one_time_eyes_and_failed_acks_do_not_starve_later_discovery() {
     for throttled in [false, true] {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let mut c = config();
@@ -302,6 +302,9 @@ async fn ready_reply_precedes_exhausting_or_throttled_eyes_retries() {
                     "fixture eyes rejected"
                 }
                 .into()),
+                "slack_search_public_and_private" => {
+                    Ok(json!({"results":"No results found","pagination_info":"End of results"}))
+                }
                 _ => panic!("unexpected tool {tool}"),
             }
         }));
@@ -320,26 +323,58 @@ async fn ready_reply_precedes_exhausting_or_throttled_eyes_retries() {
                 .state,
             phoenix_db::SlackReturnState::Confirmed
         );
-        let log = log.lock().unwrap();
-        let sent = log
-            .iter()
-            .position(|tool| tool == "slack_send_message")
-            .unwrap();
-        let eyes = log
-            .iter()
-            .position(|tool| tool == "slack_add_reaction")
-            .unwrap();
-        assert!(sent < eyes);
-        assert_eq!(
-            log.iter()
-                .filter(|tool| tool.as_str() == "slack_send_message")
-                .count(),
-            1
-        );
-        assert_eq!(
-            slack.calls.load(Ordering::Relaxed),
-            if throttled { 4 } else { 16 }
-        );
+        {
+            let log = log.lock().unwrap();
+            let sent = log
+                .iter()
+                .position(|tool| tool == "slack_send_message")
+                .unwrap();
+            let eyes = log
+                .iter()
+                .position(|tool| tool == "slack_add_reaction")
+                .unwrap();
+            assert!(sent < eyes);
+            assert_eq!(
+                log.iter()
+                    .filter(|tool| tool.as_str() == "slack_send_message")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                slack.calls.load(Ordering::Relaxed),
+                if throttled { 4 } else { 16 }
+            );
+        }
+        if !throttled {
+            c.enabled = true;
+            for _ in 0..2 {
+                let mut next = slack::Slack::new(state.mcp_manager.clone(), &c);
+                next.fixture = slack.fixture.clone();
+                driver::tick(
+                    &state,
+                    &c,
+                    &next,
+                    Pass::Discovery {
+                        reactions_first: false,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(state
+                .db
+                .slack_baseline_complete(&c.workspace, &c.owner)
+                .await
+                .unwrap());
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|tool| tool.as_str() == "slack_add_reaction")
+                    .count(),
+                14
+            );
+        }
     }
 }
 
@@ -373,7 +408,7 @@ fn reaction_fixture(
                 let s = &sources[page];
                 Ok(
                     json!({"results":format!("### Result 1 of 1\nChannel: DM (ID: {})\nMessage_ts: {}\nPermalink: [link]({})\nText: fixture message",s.channel,s.message_ts,s.source_url),
-                    "pagination_info":if page+1 < sources.len() {format!("Next cursor `{}`",page+1)} else {"End of results".into()}}),
+                    "pagination_info":if page+1 < sources.len() {format!("For the next page of results use cursor `{}`",page+1)} else {"End of results".into()}}),
                 )
             }
             "slack_read_thread" => Ok(

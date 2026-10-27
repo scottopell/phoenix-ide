@@ -111,11 +111,9 @@ contract NativeReconciliationPort {
         -- attempt; remaining replies retain their opportunity on later passes.
         -- The eligible thread-delivery attempt receives its opportunity before
         -- any private notification command. A serialized reconciliation opportunity
-        -- may start at most one submission or inspection; a not-due row consumes
-        -- no slot. Shared deadline ordering allows other due notices to progress
-        -- while a definitely-unsent submission or pending inspection is deferred.
-        -- Fresh notices enter that ordering at their creation time, so a stream
-        -- of new submissions cannot always outrank an overdue retained deadline.
+        -- may start at most one private command. Each notice has one attempt;
+        -- there is no receipt inspection, retry deadline or retry ordering.
+
         -- Local admission/outcome reconciliation and ready return work receive
         -- an opportunity before a discovery burst. The result reports success;
         -- an error is recorded and does not authorize duplicate work. A failed
@@ -125,7 +123,7 @@ contract NativeReconciliationPort {
         -- and the shared allowance/backoff. Private notification operations retain
         -- their separate lifecycle and are outside the Slack allowance.
         -- Ready returns receive their dispatch opportunity before acknowledgment
-        -- retries, so failed or throttled eyes cannot perpetually starve an answer.
+        -- attempts, so failed eyes cannot form a permanent retry backlog.
         -- Startup recovery errors remain visible and are retried before external
         -- work; they do not permanently stop the gateway task.
         -- Every serialized recovery opportunity also retires orphaned attempting

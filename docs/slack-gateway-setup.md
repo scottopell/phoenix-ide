@@ -27,11 +27,10 @@ from the notification script passed in its arguments. Configure
 the absolute executable path there, or an executable-plus-arguments JSON array in
 `notification_command` through the settings API. Keep provider credentials and
 personal routing outside this repository. See [notification protocol](#notification-protocol).
-Missing notification configuration leaves new private notices visibly pending.
-The first delivery attempt freezes the command and Phoenix link together.
-Later settings changes affect new deliveries; known-unsent retries retain their
-original operation, including after restart. Historical retries without a
-retained target fail visibly rather than guess a new link.
+Each private notice has one bounded command attempt. Missing configuration or
+launch rejection fails visibly; ambiguous or interrupted attempts remain uncertain.
+There are no automatic retries or receipt inspections, including after restart.
+An accepted submission does not prove alert delivery. Work remains in Phoenix.
 
 ## Gestures and initialization
 
@@ -43,11 +42,11 @@ retained target fail visibly rather than guess a new link.
 Initialization records historical matches without starting agents. Wait for
 ready before using triggers; gestures observed during initialization can be
 absorbed by the baseline. Searches cover today and the previous three calendar
-dates in your timezone. Leave fire attached until eyes appears. Removing fire
+dates in your timezone. Leave fire attached until eyes appears or acceptance is visible in Phoenix. Removing fire
 after acceptance does not cancel native work.
-If the source disappears before eyes can be added, Phoenix records the
-acknowledgment as unavailable in Activity and stops retrying that reaction.
-The accepted task and its response still continue independently.
+Eyes is attempted once after durable acceptance. Failure or interruption remains
+visible without retry; missing eyes does not mean the request was missed.
+The accepted task and its response continue independently.
 Set the timezone before initialization; once its first sweep has started,
 changing the timezone requires that initialization finish first.
 
@@ -63,9 +62,9 @@ blocks ordinary admission, new explicit requests receive an explanation and
 the Phoenix link. The clarification completes the automatic Slack response;
 further discussion in Phoenix remains private. Send a new explicit Slack
 request when you want another intentional answer published there.
-If you answer or replace a question before its clarification is sent, Phoenix
-queues a generic linked explanation instead of the stale question. An uncertain
-send remains visible for inspection.
+Clarification messages contain only a generic handoff and Phoenix link. Question
+text, options and private answers stay in Phoenix. Changing or answering the
+question does not require replacing the handoff.
 
 Discovery runs once per minute. A bounded newest-prefix-page check can find a
 new explicit request while an older sweep continues. Search indexing, saved
@@ -83,58 +82,40 @@ as uncertain without sending it again or requiring a Phoenix restart.
 
 ## Notification protocol
 
-The executable receives one JSON document on stdin and returns one JSON document
-on stdout. Arguments are fixed by owner configuration, never supplied by the
-agent. The command is frozen before a submission; status reads use that exact
-command and receipt even after settings change. Exit failure, timeout or invalid
-submission evidence leaves the external outcome uncertain; Phoenix does not
-blindly retry a send. Stderr is not exposed as notification content.
-A correlated `failed` submission with a nonempty sanitized `reason` is a
-terminal failure, retained with its receipt rather than treated as uncertain.
-A command that could not be launched is definitely unsent and remains retryable
-after the executable is repaired. Once a command starts, ambiguous outcomes
-retain the conservative uncertainty rule.
-
-Submit input:
+The local command receives one version-1 JSON request on stdin:
 
 ```json
-{"version":1,"operation":"submit","notification_id":"notice-id","owner":"UOWNER","text":"Phoenix: your briefing is ready","url":"https://phoenix.example/c/conversation-id"}
+{"version":1,"operation":"submit","notification_id":"notice-id","owner":"UOWNER","text":"Phoenix: your briefing is ready","url":"https://phoenix.example/c/conversation"}
 ```
 
-Submission response:
+Return one correlated response on stdout with a nonempty submission receipt:
 
 ```json
 {"version":1,"notification_id":"notice-id","owner":"UOWNER","receipt":"opaque-receipt","state":"submitted"}
 ```
 
-Inspect input:
+A rejected submission uses `"state":"failed"` and a nonempty `reason`.
+The receipt is historical submission evidence. Phoenix never invokes an `inspect`
+operation and never infers recipient delivery from command acceptance. Existing
+adapters that accept `submit` and return this response remain compatible.
 
-```json
-{"version":1,"operation":"inspect","notification_id":"notice-id","owner":"UOWNER","receipt":"opaque-receipt"}
-```
+Execution is bounded to 45 seconds and 64 KiB stdout. A launch failure is recorded
+as failed; timeout, malformed evidence or interrupted execution is uncertain.
+Neither is automatically retried. The attempt is persisted before launch, so a
+crash in between may produce no alert. Keep provider credentials and recipient
+routing in the local adapter; send only a generic notice and Phoenix link.
 
-Inspection returns the same version, notification ID, owner and receipt. State
-is `submitted`, `delivered` with nonempty `proof`, or `failed` with a sanitized
-`reason`. The adapter must verify its actual recipient and exact delivery
-operation before returning proof; a service accepting a request is insufficient.
-The initial delivery check can run on the next recovery pass. Pending results
-and inspection errors defer another check for at least thirty seconds after
-completion, with that deadline retained across restart. Activity shows the
-earliest next check; terminal outcomes stop inspection.
-The pre-call reservation covers the maximum command duration and cooldown even
-if recording the result fails. Ready thread replies go first; each recovery pass
-starts at most one private command (submission or inspection), considering earlier
-deadlines before later ones so other due notices can progress. Definitely-unsent
-submissions wait at least thirty seconds before retry, including across restart.
-It must not echo credentials, private findings, raw provider headers or request
-bodies. The process timeout is 45 seconds and output is capped at 64 KiB.
+The command is optional. Without it, alert failures are visible in Activity and
+native work continues. Account changes wait for native work and source-thread
+duties, rather than notification or acknowledgment success. Pending old-account
+private notices are visibly skipped when its account changes.
 
 For a source inside a thread, acceptance verifies the parent and exact reply
 together using a narrow timestamp range. Its initial quoted context includes
 those two messages; the agent can read more discussion through ordinary Slack
 tools when the assignment needs it. Top-level sources retain a bounded thread
 read. Coverage and truncation remain visible in the conversation.
-Confirmation does not prove that the owner's device displayed an alert.
+Notification submission does not prove that the owner's device displayed an alert.
 
 ## Acceptance and stopping
 

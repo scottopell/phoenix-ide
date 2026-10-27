@@ -1,6 +1,6 @@
 -- allium: 3
 -- Scope: accepted-source identity, request-bound native admission, and return delivery.
--- Includes: duplicate gestures, durable acknowledgment, restart reconciliation,
+-- Includes: duplicate gestures, best-effort acknowledgment, restart reconciliation,
 -- request-scoped publication, and ambiguous external outcomes.
 -- Discovery scheduling and baseline cutover are owned by discovery.allium, which
 -- produces the verified observations consumed here using this source identity.
@@ -15,7 +15,7 @@ use "../conversation_atom/conversation_atom.allium" as native
 
 enum RequestKind { briefing | explicit_request }
 enum RequestState { accepted | admitted | rejected }
-enum AcknowledgmentState { pending | confirmed | unavailable }
+enum AcknowledgmentState { pending | attempting | confirmed | unavailable }
 enum ReturnKind { thread_reply | private_notice }
 enum ReturnState { pending | attempting | submitted | confirmed | known_unsent | uncertain | failed }
 enum BindingState { reserved | ready | failed | closed }
@@ -34,7 +34,7 @@ external entity NativeAdmission {
 external entity NativeOutcome {
     covered_admissions: Set<NativeAdmission>
     occurrence_key: String
-    kind: answer | clarification | retired_clarification | failure | briefing_ready | cancelled | empty_completion
+    kind: answer | clarification | failure | briefing_ready | cancelled | empty_completion
     public_response: String
 }
 
@@ -70,8 +70,9 @@ entity Gateway {
 
     @invariant AccountWorkContinuity
         -- A needs-input notice does not settle an active briefing lifecycle.
-        -- Changing owner/workspace requires terminal briefing evidence and its
-        -- corresponding settled notice, or a settled creation/admission rejection.
+        -- Changing owner/workspace requires captured terminal briefing evidence
+        -- or a creation/admission rejection. Best-effort private
+        -- notices and acknowledgments never independently block account changes.
         -- Deleting the last live primary transcript atomically captures a terminal
         -- cancellation for unfinished admitted work. A live successor keeps its
         -- lifecycle; deleting completed work does not create a second notice.
@@ -156,7 +157,6 @@ entity ReturnObligation {
     attempt_key: String?
     notification_receipt: String?
     notification_operation: NotificationOperation?
-    next_notification_call_at: Timestamp?
     delivery_proof: String when state = confirmed
     failure_reason: String when state = failed
 
@@ -166,15 +166,14 @@ entity ReturnObligation {
         -- duty when confirmed. Slack triggers never answer native questions;
         -- native discussion does not inherit the original publication authority.
         -- Thread handoff text and links are frozen when the return is created.
-        -- A question settled before handoff still owes a generic linked explanation,
-        -- without publishing the stale question or private answer.
+        -- Only generic text and a Phoenix link are published; question bodies and
+        -- options remain native. Question changes require no return replacement.
 
-    @invariant NotificationRetryIdentity
-        -- A private command and URL are captured atomically at its first attempt.
-        -- Known-unsent retries and restart retain that exact operation despite
-        -- settings or publication changes. Removing the current command does not
-        -- retarget accepted retries. Historical known-unsent notices missing
-        -- their original URL fail visibly rather than guess current settings.
+    @invariant BestEffortNotification
+        -- REQ-SG-015. A private notice has at most one claimed command attempt.
+        -- Submitted is terminal submission evidence, never proof of recipient
+        -- delivery. Rejection and uncertainty are terminal for private notices.
+        -- No private command inspection, automatic retry or account lock follows.
 
     invariant NonemptyCoverage {
         request in covered_requests
@@ -188,15 +187,12 @@ entity ReturnObligation {
         attempting -> known_unsent
         attempting -> uncertain
         attempting -> failed
-        submitted -> confirmed
-        submitted -> failed
-        submitted -> uncertain
         known_unsent -> attempting
         known_unsent -> failed
         uncertain -> confirmed
         uncertain -> known_unsent
         uncertain -> failed
-        terminal: confirmed, failed
+        terminal: submitted, confirmed, failed
     }
 }
 
@@ -227,26 +223,27 @@ rule AcceptVerifiedSource {
     )
 }
 
--- REQ-SG-006. The acknowledgment is independent of admission or return delivery.
-rule EyesConfirmed {
-    when: EyesReactionConfirmed(request)
+-- REQ-SG-006. Claim once before calling Slack; a crash cannot create a retry.
+rule BeginEyesAttempt {
+    when: AttemptEyes(request)
     requires: request.acknowledgment = pending
-    ensures: request.acknowledgment = confirmed
-    @guidance
-        -- Confirmation requires successful add-reaction evidence or a structured
-        -- reactions.add rejection proving the acknowledgment already exists.
-        -- An opaque already_reacted token does not confirm the operation.
+    ensures: request.acknowledgment = attempting
 }
 
-rule EyesUnavailable {
-    when: AcknowledgmentSourceUnavailable(request, reason)
-    requires: request.acknowledgment = pending
+rule EyesConfirmed {
+    when: EyesReactionConfirmed(request)
+    requires: request.acknowledgment = attempting
+    ensures: request.acknowledgment = confirmed
+}
+
+rule EyesUnconfirmed {
+    when: EyesAttemptFailedOrInterrupted(request, reason)
+    requires: request.acknowledgment = attempting
     ensures: request.acknowledgment = unavailable
     ensures: request.acknowledgment_failure = reason
     @guidance
-        -- Requires structured rejection of reactions.add proving source loss.
-        -- Opaque, unrelated and transient errors retain pending acknowledgment.
-        -- This settles only acknowledgment, never execution or response duties.
+        -- Includes all rejection, ambiguity, timeout and interruption outcomes.
+        -- No retry follows; native work and reply duties remain independent.
 }
 
 -- REQ-SG-007/011. The existing native service owns creation and admission.
@@ -319,7 +316,6 @@ rule RecordBeforeAdmissionFailure {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_call_at: null
     )
 }
 
@@ -331,7 +327,7 @@ rule OweExplicitResponse {
     requires: request.status = admitted
     requires: request.observation.kind = explicit_request
     requires: request.admission in outcome.covered_admissions
-    requires: outcome.kind in {answer, clarification, retired_clarification, failure, cancelled, empty_completion}
+    requires: outcome.kind in {answer, clarification, failure, cancelled, empty_completion}
     let covered = request.gateway.requests where status = admitted and observation.kind = explicit_request and binding_key = request.binding_key and admission in outcome.covered_admissions
     requires: covered.count = outcome.covered_admissions.count
     requires: not request.gateway.returns.any(r => r.kind = thread_reply and request in r.covered_requests)
@@ -348,7 +344,6 @@ rule OweExplicitResponse {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_call_at: null
     )
 }
 
@@ -358,7 +353,7 @@ rule OweBriefingNotice {
     requires: request.status = admitted
     requires: request.observation.kind = briefing
     requires: outcome.covered_admissions = {request.admission}
-    requires: outcome.kind in {briefing_ready, clarification, retired_clarification, failure, cancelled, empty_completion}
+    requires: outcome.kind in {briefing_ready, clarification, failure, cancelled, empty_completion}
     requires: not request.gateway.returns.any(r => r.request = request and r.occurrence_key = outcome.occurrence_key)
     ensures: ReturnObligation.created(
         request: request,
@@ -372,43 +367,7 @@ rule OweBriefingNotice {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_call_at: null
     )
-}
-
--- REQ-SG-012/013. A retired, definitely-unsent question still owes an explanation.
-rule ReplaceRetiredClarification {
-    when: UndeliveredClarificationRetired(obligation, replacement)
-    requires: obligation.state in {pending, known_unsent}
-    requires: obligation.native_outcome != null
-    requires: obligation.native_outcome.kind = clarification
-    requires: replacement.kind = retired_clarification
-    requires: replacement.covered_admissions = obligation.native_outcome.covered_admissions
-    requires: replacement.occurrence_key != obligation.occurrence_key
-    requires: not obligation.request.gateway.returns.any(r => r.kind = obligation.kind and r.destination_key = obligation.destination_key and r.occurrence_key = replacement.occurrence_key)
-    ensures: obligation.state = failed
-    ensures: obligation.failure_reason = "Undelivered clarification retired; generic handoff queued"
-    ensures: ReturnObligation.created(
-        request: obligation.request,
-        covered_requests: obligation.covered_requests,
-        native_outcome: replacement,
-        occurrence_key: replacement.occurrence_key,
-        kind: obligation.kind,
-        destination_key: obligation.destination_key,
-        text: replacement.public_response,
-        state: pending,
-        attempt_key: null,
-        notification_receipt: null
-        notification_operation: null
-        next_notification_call_at: null
-    )
-    @guidance
-        -- Retirement is exact native-question evidence. The replacement contains
-        -- only a generic explanation and frozen Phoenix link. It retains the
-        -- predecessor's source-question association and exact request coverage.
-        -- The original outgoing text stays intact; replacement is a new operation.
-        -- A stale-question snapshot cannot begin an external attempt. Attempting,
-        -- confirmed and uncertain writes are never replaced by this rule.
 }
 
 -- REQ-SG-013. Record attempt identity before the external operation.
@@ -423,9 +382,8 @@ rule BeginReturnAttempt {
 rule BeginNotificationAttempt {
     when: DispatchNotification(obligation, attempt, operation)
     requires: obligation.kind = private_notice
-    requires: obligation.state in {pending, known_unsent}
-    requires: (obligation.state = pending and obligation.notification_operation = null) or obligation.notification_operation = operation
-    requires: obligation.next_notification_call_at = null or obligation.next_notification_call_at <= now
+    requires: obligation.state = pending
+    requires: obligation.attempt_key = null
     ensures: obligation.state = attempting
     ensures: obligation.attempt_key = attempt
     ensures: obligation.notification_operation = operation
@@ -448,50 +406,23 @@ rule RecordNotificationSubmission {
     requires: obligation.attempt_key = attempt
     ensures: obligation.state = submitted
     ensures: obligation.notification_receipt = instance
-    ensures: obligation.next_notification_call_at = null
 }
 
-rule ReserveNotificationInspection {
-    when: InspectSubmittedNotification(obligation, instance)
+rule FailUnsentNotification {
+    when: ExternalOperationNotSent(obligation, attempt)
     requires: obligation.kind = private_notice
-    requires: obligation.state = submitted
-    requires: obligation.notification_receipt = instance
-    requires: obligation.next_notification_call_at = null or obligation.next_notification_call_at <= now
-    ensures: obligation.next_notification_call_at = now + 45.seconds + 30.seconds
-    @guidance
-        -- Reserve before invoking the adapter. Retained deadlines prevent a
-        -- restart or a frequent local recovery pass from starting another read.
-        -- Reserve through the adapter's maximum 45-second call plus cooldown,
-        -- so a failed completion write cannot leave an already-expired guard.
-}
-
-rule DeferNotificationInspection {
-    when: NotificationInspectionPendingOrReadFailed(obligation, instance)
-    requires: obligation.kind = private_notice
-    requires: obligation.state = submitted
-    requires: obligation.notification_receipt = instance
-    ensures: obligation.next_notification_call_at = now + 30.seconds
-    @guidance
-        -- Pending results and read errors schedule from completion; neither
-        -- reruns the agent, resubmits the notice, nor confirms delivery.
-}
-
-rule ConfirmNotificationDelivery {
-    when: NotificationDeliveryConfirmed(obligation, instance, delivery_proof)
-    requires: obligation.state = submitted
-    requires: obligation.kind = private_notice
-    requires: obligation.notification_receipt = instance
-    ensures: obligation.state = confirmed
-    ensures: obligation.delivery_proof = delivery_proof
-    ensures: obligation.next_notification_call_at = null
+    requires: obligation.state = attempting
+    requires: obligation.attempt_key = attempt
+    ensures: obligation.state = failed
+    ensures: obligation.failure_reason = "Notification was not submitted; no automatic retry"
 }
 
 rule RecordKnownUnsent {
     when: ExternalOperationNotSent(obligation, attempt)
+    requires: obligation.kind = thread_reply
     requires: obligation.state = attempting
     requires: obligation.attempt_key = attempt
     ensures: obligation.state = known_unsent
-    ensures: obligation.next_notification_call_at = if obligation.kind = private_notice: now + 30.seconds else: null
 }
 
 rule RecordUncertainReturn {
@@ -513,6 +444,7 @@ rule InterruptedExternalAttempt {
 -- Positive readback evidence, not a timeout, resolves an uncertain attempt.
 rule ReconcileConfirmedReturn {
     when: MatchingExternalDeliveryFound(obligation, delivery_proof)
+    requires: obligation.kind = thread_reply
     requires: obligation.state = uncertain
     ensures: obligation.state = confirmed
     ensures: obligation.delivery_proof = delivery_proof
@@ -539,7 +471,6 @@ rule ReportUnavailableThread {
         attempt_key: null,
         notification_receipt: null
         notification_operation: null
-        next_notification_call_at: null
     )
     @guidance
         -- The current message-post attempt has structured rejection evidence
@@ -549,13 +480,15 @@ rule ReportUnavailableThread {
 
 rule ReconcileUnsentReturn {
     when: ExternalNonDeliveryProven(obligation)
+    requires: obligation.kind = thread_reply
     requires: obligation.state = uncertain
     ensures: obligation.state = known_unsent
 }
 
 rule RecordReturnFailure {
     when: ReturnPermanentlyFailed(obligation, reason)
-    requires: obligation.state in {attempting, submitted, known_unsent, uncertain}
+    requires: obligation.state in {attempting, known_unsent, uncertain}
+    requires: obligation.kind = thread_reply or obligation.state = attempting
     ensures: obligation.state = failed
     ensures: obligation.failure_reason = reason
 }
@@ -599,10 +532,8 @@ contract NativeRuntimePort {
         -- Clarification follow-ups include the original admission only when the
         -- selected response explicitly covers that original request as well.
         -- A request omitted from that set retains its separate response duty.
-        -- retired_clarification projects exact question-retirement evidence,
-        -- not a new admission or permission to publish a private native answer.
         -- Positive external readback identifies the exact return obligation and
-        -- attempt; notification proof also matches its retained instance identity.
+        -- attempt. Private notices do not acquire delivery-proof obligations.
 }
 
 surface GatewayBoundary {
@@ -613,6 +544,8 @@ surface GatewayBoundary {
 
     provides:
         EligibleSourceObserved(gateway, observation)
+        AttemptEyes(request)
+        EyesAttemptFailedOrInterrupted(request, reason)
         EyesReactionConfirmed(request)
         NativeInputAccepted(request, admission)
         EnsureRequestBinding(request)
@@ -622,11 +555,9 @@ surface GatewayBoundary {
         RequestFailedBeforeAdmission(request, reason, response)
         RequestOutcomeObserved(request, outcome)
         BriefingOutcomeObserved(request, outcome, notice)
-        UndeliveredClarificationRetired(obligation, replacement)
         DispatchReturn(obligation, attempt)
         SlackReplyConfirmed(obligation, attempt, message_identity)
         NotificationSubmissionConfirmed(obligation, attempt, instance)
-        NotificationDeliveryConfirmed(obligation, instance, delivery_proof)
         ExternalOperationNotSent(obligation, attempt)
         ExternalOutcomeUnknown(obligation, attempt)
         RecoverInterruptedReturn(obligation)

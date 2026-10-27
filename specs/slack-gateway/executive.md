@@ -1,314 +1,74 @@
-# Slack gateway — Executive summary
+# Slack gateway status
 
-## Requirements summary
+## Scope
 
-One configured owner can flag a Slack discussion for a private briefing or
-submit an explicit local agent request using a fire-prefixed message or fire on
-their own message. Work remains an ordinary Phoenix conversation with native
-permissions. Replies are intentional, source-bound and deduplicated. Discovery
-covers four calendar dates and establishes a non-executing initial baseline.
-Clarifications link to the ordinary Phoenix conversation for answers. That
-handoff ends the automatic Slack response; native discussion stays private.
+One owner's three Slack gestures create or reuse ordinary local Phoenix
+conversations through shared native services and the existing Slack MCP connection.
+Explicit requests receive intentional source-thread answers. Other-author reactions
+prepare separate private briefings. Thread reuse and exact reply coverage remain.
 
-## Technical summary
+## Requirements
 
-The in-process gateway uses shared conversation services and the existing MCP
-manager. It owns source discovery, association, acknowledgments and external
-return evidence; it does not own another agent runtime or permission mode.
-The lifecycle Allium model owns acceptance, native correlation and returns.
-The companion discovery model owns call allowance, service opportunities,
-pagination and initialization. Private notification providers are isolated in
-an owner-configured local executable using a versioned stdin/stdout protocol.
+| Requirement | Status | Evidence boundary |
+|---|---|---|
+| REQ-SG-001 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-002 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-003 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-004 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-005 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-006 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-007 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-008 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-009 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-010 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-011 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-012 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-013 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-014 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-015 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-016 | Partial | Implemented; current candidate validation and production limits below. |
+| REQ-SG-017 | Partial | Implemented; current candidate validation and production limits below. |
 
-## Status summary
+## Simplification
 
-| Requirement | Status | Notes |
-| --- | --- | --- |
-| REQ-SG-001 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-002 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-003 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-004 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-005 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-006 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-007 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-008 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-009 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-010 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-011 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-012 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-013 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-014 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-015 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-016 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
-| REQ-SG-017 | Partial | Implemented; operating-condition and production qualification remain bounded by evidence below. |
+ADR-155 replaces independent signal recovery with single-attempt behavior.
+Private commands record submission, rejection or uncertainty without receipt
+inspection or automatic retry. Eyes is claimed once before calling Slack; failure
+or interruption cannot retry it. These signals never block an otherwise settled
+account change. Clarifications contain only a generic Phoenix handoff and link;
+question bodies and options remain native. Thread replies retain durable delivery
+and exact request coverage.
 
-## Evidence and limits
+Deleted runtime code includes receipt inspection, inspection scheduling, private
+retry handling, question-text rendering and question-retirement synchronization.
+Obsolete retry tests are replaced by single-attempt failure/restart regressions.
+Existing migration history remains unchanged; retained private retries stop visibly
+and definitely-unsent legacy question-text returns become distinct generic handoffs.
 
-The prototype completed private prefix, own-reaction, other-author briefing,
-thread reuse, intentional publication, generic
-private notification and retained-state deduplication checks. Source IDs,
-workspace identities, recipient details, helper commands and provider-specific
-operational records remain outside the public repository. Private prototype
-commits are not ancestors of the publication branch.
+## Validation
 
-The scheduling baseline passed 20 focused application and 50 database/replay/
-watch tests, Allium structural checks, Clippy, formatting and spec checks. Its
-adversarial author review found and fixed inactive acceptance being mistaken
-for recorded evidence and acknowledgment throttling losing its backoff status.
-These author reviews are not independent sign-off or a formal liveness proof.
+All 606 affected Rust tests pass, covering MCP, gateway, native routing,
+migrations, creation replay and deletion. All ten local check types pass,
+including full UI tests, type checking, linting, Clippy, formatting, Allium and
+structural checks. The 86-test focused run also passes. Regression coverage
+includes single-attempt command outcomes across settings changes/restart,
+interrupted eyes claims, discovery after failed acknowledgments, generic handoffs
+across question changes, exact connector pagination and OAuth callback grace.
 
-The public candidate adds migrations 132–136 after upstream's migration 131, replaces
-the personal notifier with a provider-neutral command, and adds bounded
-newest-prefix refresh. Focused gateway checks, the controller snapshot fixture,
-Clippy, formatting, UI type checking/lint/tests, model checks and API end-to-end
-checks have passed. The broad native run passed 5,319 tests and failed 14.
-All nine historical migration failures passed after isolating their fixtures;
-three shell runtime checks passed with the required native launcher fixture,
-and the browser lifecycle check passed with a fresh temporary profile. The local
-terminal-exit timeout remains a host qualification limit. The merged source's
-24 gateway tests, Clippy, formatting and structural/timing checks pass.
-Historical developer-tool registry fixtures have focused regression coverage;
-the clean-environment full local run timed out, so hosted CI remains a gate.
+The 1,200-test developer-tool run had three environment-sensitive failures;
+all three pass with native Bash/OpenSSL and the shared Cargo target override
+removed. The full developer-tool run was not repeated. Hosted CI and posted
+review feedback remain gates for the new head.
 
-The first public Codex review identified five source-verification, return,
-question-recovery and configuration boundaries. Focused fixes use exact source
-bodies, typed pre-dispatch evidence, native execution-receipt recovery, verified
-authors for ambiguous echo matching and an atomic account-switch guard. The
-expanded 233-test MCP/gateway run passed 232 cases; its remaining schema-error
-assertion was updated to the new typed outcome and passed in isolation. Clippy,
-formatting, Allium and structural/timing checks pass. The next public review and
-full CI head remain qualification gates.
+## Production boundary
 
-The second public review identified explicit notifier rejection, recovery replay
-accounting, unavailable search hits and independent thread-root verification.
-Those fixes passed the expanded 238-case MCP/gateway suite. A final two-case
-one-shot test also confirms connection recovery settles without replaying a
-read or write. The eight API-guidance checks follow the shared native question
-service, and Clippy, formatting, Allium and structural/timing checks pass.
-Latest-head hosted CI and automatic review remain gates.
+The enabled production pilot is an earlier accepted build. Source IDs, recipient
+routing, credentials, provider adapters and private operational records stay outside
+the public repository. The redesigned settings and later hardening are not claimed
+deployed by pilot evidence.
 
-The third public review added fixed-connection actor/workspace verification,
-retryable notifier launch refusal, expired backoff cleanup, connector-metadata
-separation, complete consumed-batch fallback coverage and permanent thread
-restriction handling. All 244 affected MCP/gateway cases pass on the revised
-source, with Clippy, formatting, Allium and structural/timing checks passing.
-The mandatory workspace proof changes the backlog fixture to 16 calls over two
-passes, with two context reads; the earlier 12-call result remains a historical
-measurement before that verification. Latest-head CI and review remain gates.
-
-The fourth review closes private-question publication through a lagging native
-owner, preserves literal reaction-shaped instruction lines, shares settings
-inspection's allowance/backoff with automatic service, guards unfinished
-initialization against timezone changes and retries positively rejected
-rate-limited sends. Exact source reads isolate the source timestamp; reaction
-metadata requires independent evidence. All 248 affected MCP/gateway tests pass,
-including shared inspection and private-input regressions. Clippy, formatting,
-Allium and structural/timing checks pass. Hosted Rust CI on the preceding head
-stopped at a Linux browser CLI teardown failure (`missing process group`);
-latest-head hosted CI and automatic review still require qualification.
-
-The exact server candidate `9648aa15576e056d878e73fae79af411a472921b`
-passed online-backup and stopped-snapshot rehearsals from the installed complete
-127 ledger to its exact complete 130 registry. Integrity, foreign keys,
-conversation/message/product identities and message contents were preserved.
-An explicitly approved manual offline cutover installed that candidate while
-preserving installed configuration except the version value. This operator
-pilot does not expand any automated deployment controller's qualified intervals,
-provide automatic database rollback or qualify a generic 127-to-130 route.
-That pilot's migration 130 is the pre-publication Slack allocation. Upstream
-subsequently assigned 130 and 131 to continuation/capacity data; this branch
-allocates Slack at 132 while preserving the upstream migrations and Slack SQL,
-then adds first-observation metadata at 133, trigger provenance at 134, and
-frozen notification targets at 135, and delivery retry bounds at 136.
-The pilot ledger is not the public candidate's ledger. No direct upgrade from
-that pilot to the merged candidate is qualified; it requires separate offline
-reconciliation and validation before any later production deployment.
-
-Production initialization completed without executing historical triggers. Two
-sequential explicit private-thread requests each produced exactly one native
-input and confirmed reply, reused one conversation and survived a managed
-restart without duplicates. The owner confirmed the notification alert and
-reacted to the test notice. That gesture produced one native input in a separate
-briefing conversation, assistant output and one exactly correlated confirmed
-private return; the source thread received no reply. The bounded production
-acceptance sequence passed. Only production discovery is enabled; the former dev watcher
-is paused. Private operational evidence is retained outside the repository.
-
-The native client recognizes Slack origins and source links, with version-2
-transcript caches and a bounded version-1 migration. Local wire-model type
-checking/round-trip execution and Swift parsing passed. Full native-client
-build/test execution passed in hosted simulator CI. This host lacks the iOS
-platform SDK and simulator runtime. The pinned local server predates the
-publication branch's upstream integration; hosted checks qualify that integration
-separately from the bounded operator pilot.
-
-## Activation checklist
-
-1. Pass focused scheduling, notification-protocol and native integration checks;
-   validate Allium, formatting, Clippy and UI contracts.
-2. Reconcile residual regression failures with the current candidate rather than
-   treating historical failures as current evidence. The reproduced controller
-   fixture failure is resolved by sealing its offline snapshot before the
-   unchanged read-only controller checks it; unqualified targets still reject.
-3. Establish the actual installed complete ledger, qualify the exact transition
-   on disposable SQLite copies, and preserve the protected deployment contract.
-4. Deploy the exact reviewed local candidate with discovery disabled and verify
-   runtime identity and installed configuration; only one instance may watch.
-5. Run a separately approved bounded private acceptance sequence, measure
-   discovery-to-delivery stages and inspect exact deduplication evidence.
-6. After local acceptance, publish only sanitized commits, open the PR, and
-   resolve automated review feedback on each pushed head until review-clean.
-
-Live automatic continuation and longer soak coverage remain unqualified until
-exercised. They are follow-up confidence work rather than an invented unlimited
-SLO for a bounded personal pilot. External shared-channel send limitations remain.
-The clarification handoff replaces Slack answer inference with deep links into
-Phoenix. Unsubmitted persisted question associations are rejected, native
-answers retain their ordinary UI contract, and confirmed handoffs close the
-original automatic response duty without inheriting private discussion.
-After upstream reconciliation, all 387 MCP/gateway, migration and creation
-delivery-replay tests pass, including the handoff, pending-question admission,
-exact status-link and frozen-link retry regressions. All 235 deployment tests
-pass with byte-exact historical registry fixtures and refusal of the newer
-candidate by the protected target-131 route. Clippy, formatting, TypeScript,
-Allium and structural/timing checks pass. The preceding public head
-passed every required hosted check; the revised head still needs automatic
-review and CI. The approved local pilot remains on its separately pinned build.
-
-The handoff also retains an explanation when the native question settles before
-outbox materialization. Its generic text excludes stale questions and private
-answers; unavailable conversation links fall back to the exact return status.
-The expanded 255-case MCP/gateway run and final 18-case database run pass,
-including resolution/replacement-before-materialization and missing-product
-link coverage. Clippy, formatting, Allium and structural/timing checks pass.
-
-Further review hardening retires settled continuation exhaustion events and
-handles deleted lifecycle sources without blocking other gateway work. Private
-briefing notices deduplicate per captured occurrence. A later serialized pass
-reconciles orphaned external attempts without resending; terminal destination
-failure requires structured message-post rejection. Reactor verification reads
-actual terminal member IDs rather than display-name tokens. Migration 133
-retains first observation across candidate-verification retries and transfers
-it atomically on acceptance; its metadata grants no request authority.
-All 395 affected MCP/gateway, migration and creation-replay tests pass. After
-retaining observation times for the entire returned page before any candidate
-read can fail, the final 70-case gateway suite passes. Clippy, formatting,
-Allium and structural/timing checks pass. These revisions still need exact-head
-automated review and hosted CI; they are not deployed by the pilot evidence.
-
-The next review closes account switching after a briefing's needs-input notice,
-validates comma-containing reactor names without trusting embedded identity
-tokens, requires operation-specific evidence for already-present eyes and
-rejects ambiguous thread-root receipts. Retired, definitely-unsent clarification
-returns retain their frozen text and are replaced by separate generic handoffs
-with the same source association, coverage and destination. Atomic attempt
-admission prevents a stale snapshot from sending the old question; uncertain
-and confirmed operations are not replaced. All 397 affected MCP/gateway,
-migration and creation-replay tests pass, as do the final 71 gateway cases and
-Clippy, formatting, Allium and structural/timing checks. These fixes still need
-new exact-head hosted CI and automatic review; the pilot remains separately pinned.
-
-Source verification also distinguishes an unverified reactor list from verified
-absence: ambiguous lists retain their discovery page and first-observation time
-for retry, while an independently verified owner prefix remains sufficient.
-Only structured rejection of the relevant source-read operation establishes
-unavailability. Gateway status now derives actual product existence and hides
-conversation links for reserved, failed or deleted targets. All 400 affected
-MCP/gateway, migration and creation-replay tests pass, along with full UI tests,
-type checking, linting, Clippy, formatting, Allium and structural/timing checks.
-Exact-head hosted CI and automatic review remain open for this batch.
-
-The following review extends link eligibility to the native route's publication
-boundary, shared by status, thread handoffs and private notice links. Verified
-prefixes no longer depend on reaction access unless a possible connector footer
-needs independent metadata to isolate literal owner text; unavailable metadata
-retains that candidate for retry. Migration 134 preserves verified prefix or
-reaction provenance, while historical rows remain unknown. Status exposes
-prefix-message age only for known prefixes, reports empty read-access samples
-as inconclusive, and distinguishes top-level discussion from parent-plus-reply
-context. All 427 affected MCP/gateway, native-route, migration and creation-replay
-tests pass, along with full UI tests, the final eight settings regressions, type
-checking, linting, Clippy, formatting, Allium and structural/timing checks.
-This batch requires new exact-head hosted CI and automatic review;
-the separately pinned production pilot has not been upgraded.
-
-Private notification attempts now atomically freeze the command and target URL;
-known-unsent retries reuse that exact operation after settings changes or a
-database reopen. Migration 135 fails historical unsent notices with missing
-target evidence visibly, preserving their earlier failure reason and leaving
-submitted receipts inspectable. Settings now use the shared theme, responsive
-sections, status badges and an advanced editor for every command argument.
-All 429 affected Rust tests pass. Full UI tests and all ten local check types
-pass, including the final Clippy, model and structural checks. Synthetic desktop,
-mobile and dark-mode browser checks found no overflow or unexpected API calls;
-keyboard toggling and command disclosure passed. Fresh hosted CI and automatic
-review remain required; these changes are not deployed by the pilot evidence.
-
-Further review bounds asynchronous notification inspection with a persisted,
-receipt-scoped deadline: pending or failed reads defer another inspection for
-at least thirty seconds after completion. Definitive add-reaction source loss
-now becomes a visible terminal acknowledgment failure, without discarding work
-or blocking account changes after all other obligations settle. Opaque and
-transient errors still retry. Migration 136 preserves both outcomes. All 433
-affected Rust tests pass, along with the full UI suite and final Clippy, model,
-formatting and structural checks. Fresh hosted CI and automatic review remain
-required for this batch; the production pilot has not been upgraded.
-
-Slow inspection now reserves through the adapter's canonical 45-second timeout
-plus cooldown, retaining a safe guard when recording completion fails. Ready
-thread replies dispatch first; each reconciliation pass starts at most one
-submitted-notice inspection, using earliest deadlines to let other due notices
-progress. The completion-write failure and multi-notice ordering regressions
-pass within all 434 affected Rust tests. Clippy, formatting, Allium and structural
-checks pass. This refinement adds no migration; exact-head hosted CI and review
-remain required before qualification is complete.
-
-Private submissions and inspections now share one command slot per pass, after
-ready thread replies. Definitely-unsent submissions reuse the retained deadline
-for a thirty-second retry delay, allowing other due notices to progress without
-another migration. Deleting the last live primary transcript atomically captures
-cancellation for unfinished admitted work; live successors and completed outcomes
-remain intact. Required notices must still settle before account changes. All
-607 affected gateway, MCP, routing, migration and deletion tests pass, including
-deletion rollback and native continuation coverage. The full UI suite and all ten
-local check types pass; the final six Rust/model/structural checks also pass on
-the final source. Fresh exact-head hosted CI and review remain required. The
-production pilot remains unchanged.
-
-Fresh pending notices now enter due ordering at their existing creation timestamp,
-so overdue retries and receipt checks retain an opportunity during new arrivals.
-Deletion and normal reconciliation share completion-checkpoint recovery; deletion
-captures completed work before removing its evidence and cancels only the
-unfinished remainder. A failed completion capture rolls back deletion. All 608
-affected Rust tests pass, and final Clippy, formatting, Allium and structural
-checks pass. The UI is unchanged from its validated source. No migration or
-additional persisted state is introduced. Normal per-push automatic review and
-exact-head hosted CI remain the final qualification checks; unavailable review
-verdict metadata is reported separately from posted findings and thread resolution.
-
-Empty search results now require the exact connector sentinel (with surrounding
-whitespace allowed); malformed explanations containing that phrase remain
-retryable. Each service pass starts at most one thread-delivery attempt before
-private notification and acknowledgment/discovery opportunities. All 609 affected
-Rust tests pass, along with final Clippy, formatting, structural and model checks.
-The native two-reply fixture confirms eight logical calls across two immediate
-passes, zero discovery pages, and no calls on the following idle pass. This adds
-two identity-verification calls relative to dispatching both replies in one pass;
-the controlled discovery backlog remains sixteen calls across two passes. No
-migration or additional persisted state is introduced. Normal automatic review
-and exact-head hosted CI remain required; production is not redeployed.
-
-Private conversation-link availability now uses the shared native route predicate
-without requiring retention of the original creation job. A native continuation
-and predecessor-deletion regression verifies that the successor stays linkable
-after that job is removed. Single-attempt MCP deadlines retain the supervisor's
-eventual cancellation outcome for background connection recovery, using its typed
-recovery classification and existing epoch fences without replaying the call.
-Queued/cancellation-safe outcomes do not force replacement. All 610 affected Rust
-tests pass, including the paused-clock recovery regression; final Clippy,
-formatting, Allium and structural checks pass. No migration, permission mode or
-additional persisted state is added. Normal automatic review and exact-head
-hosted CI remain required; the production pilot is not redeployed.
-
-See [setup](../../docs/slack-gateway-setup.md),
-[measurements](../../docs/slack-gateway-performance.md), and the two Allium files.
+Public migrations 132–136 follow upstream migration 131; the pilot used a distinct
+pre-publication migration-130 ledger. Direct pilot-to-public upgrade is unqualified
+and requires offline reconciliation plus paired rollback qualification. Protected
+deployment limits remain intact. No merge, new deployment or live integration
+writes are implied by local tests or this simplification.

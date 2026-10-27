@@ -49,24 +49,15 @@ again after a duplicate-check poll. This sample does not establish a latency
 distribution or a matched before/after comparison. Personal source identifiers
 and operational records are retained outside the public repository.
 
-## Notification inspection and acknowledgments
+## Best-effort notices and acknowledgments
 
-Private notification inspections use a separate persisted thirty-second minimum
-interval after pending results or read errors. Frequent local recovery passes
-do not start another adapter command before that deadline. The local fixture
-performs one inspection across four immediate recovery passes, then one more
-after advancing the deadline; this measures logical adapter calls, not live
-provider requests. Terminal source-loss acknowledgment evidence also prevents
-repeated impossible add-reaction calls without changing the accepted task.
-Ready thread replies are dispatched before private notification commands. Each
-service pass starts at most one submission or inspection, ordered by the earliest
-retained deadline, using creation time for fresh pending notices. New submissions
-cannot indefinitely outrank an overdue retry or receipt check. Definitely-unsent
-submissions also defer retry for thirty
-seconds so a failed launch does not monopolize later passes. A trace fixture with two older submitted notices and a newer ready
-reply sends the reply first, inspects one notice, then inspects the other on the
-next pass. The initial reservation covers the 45-second maximum command duration
-plus thirty seconds, so a failed completion write cannot permit an early retry.
+Private notifications and eyes each have one durably claimed attempt. Failed or
+ambiguous attempts are visible without automatic retries; submitted notices are
+not inspected. This removes recurring notification inspection calls and prevents
+persistent acknowledgment failures from forming a permanent retry backlog.
+Ready source-thread replies precede private commands and eyes. A pass starts at
+most one private command and one source-thread reply; discovery and Slack writes
+retain their shared finite call allowance and provider backoff.
 
 ## Newest-prefix refresh
 

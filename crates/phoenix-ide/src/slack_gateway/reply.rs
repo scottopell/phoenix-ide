@@ -24,7 +24,7 @@ impl Tool for Reply {
         "slack_gateway_reply"
     }
     fn description(&self) -> String {
-        "Select the intentional answer for accepted explicit Slack requests in this conversation. Queues one source-thread reply; does not send synchronously. Supply the exact request IDs answered by this text, including original and follow-up when applicable. Never include private transcript dumps. Do not also post the automatic answer with Slack tools. Delivery state is shown in Phoenix.".into()
+        "Select the intentional answer for accepted explicit Slack requests in this conversation. Queues one source-thread reply; does not send synchronously. Supply the exact request IDs answered by this text, including original and follow-up when applicable. Never include private transcript dumps. Use native questions for clarifications; the gateway supplies a generic Phoenix handoff. Do not also post the automatic answer with Slack tools. Delivery state is shown in Phoenix.".into()
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"request_ids":{"type":"array","items":{"type":"string"},"minItems":1,"uniqueItems":true},"text":{"type":"string","minLength":1,"maxLength":4500}},"required":["request_ids","text"],"additionalProperties":false})

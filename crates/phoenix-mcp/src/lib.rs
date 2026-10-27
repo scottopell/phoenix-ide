@@ -1697,21 +1697,31 @@ async fn run_loopback_redirect(
     server: String,
     listeners: Vec<tokio::net::TcpListener>,
     target_base: String,
+    state_nonce: String,
 ) {
+    let mut completion_deadline = None;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25 * 60);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let accepts = listeners
             .iter()
             .map(|l| Box::pin(l.accept()))
             .collect::<Vec<_>>();
         match tokio::time::timeout(remaining, futures::future::select_all(accepts)).await {
             Ok((Ok((stream, _)), _, _)) => {
-                let _ = tokio::time::timeout(
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                    bounce_loopback_callback(stream, &target_base),
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    bounce_loopback_callback(stream, &target_base, &state_nonce),
                 )
-                .await;
+                .await
+                    == Ok(true)
+                {
+                    completion_deadline =
+                        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+                }
             }
             Ok((Err(e), _, _)) => {
                 tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
@@ -1719,11 +1729,15 @@ async fn run_loopback_redirect(
                 // descriptor exhaustion/aborted connections must not discard
                 // both address families or extend the authorization window.
                 if !wait_for_loopback_retry(deadline).await {
-                    return;
+                    break;
                 }
             }
-            Err(_) => return,
+            Err(_) => break,
         }
+    }
+    drop(listeners);
+    if let Some(deadline) = completion_deadline {
+        tokio::time::sleep_until(deadline).await;
     }
 }
 
@@ -1738,14 +1752,18 @@ async fn wait_for_loopback_retry(deadline: tokio::time::Instant) -> bool {
 
 /// Read one callback request off `stream` and reply `302` to Phoenix's real
 /// callback route, forwarding the query verbatim.
-async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base: &str) {
+async fn bounce_loopback_callback(
+    mut stream: tokio::net::TcpStream,
+    target_base: &str,
+    state_nonce: &str,
+) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = vec![0u8; 8192];
     let Ok(Ok(n)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await
     else {
-        return;
+        return false;
     };
     let request = String::from_utf8_lossy(&buf[..n]);
     let query = callback_request_query(&request);
@@ -1764,6 +1782,10 @@ async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
     tracing::debug!(target_base, "OAuth loopback callback bounced to Phoenix");
+    reqwest::Url::parse(&format!("http://localhost/{query}")).is_ok_and(|url| {
+        let mut states = url.query_pairs().filter(|(key, _)| key == "state");
+        states.next().is_some_and(|(_, value)| value == state_nonce) && states.next().is_none()
+    })
 }
 
 #[allow(clippy::too_many_lines)] // One ordered sequence: discover, acquire client, bind callback, publish.
@@ -1879,7 +1901,12 @@ async fn begin_oauth_flow(
                  (already in use?): {e}"
             )
         })?;
-        let handle = tokio::spawn(run_loopback_redirect(name.to_string(), listeners, base));
+        let handle = tokio::spawn(run_loopback_redirect(
+            name.to_string(),
+            listeners,
+            base,
+            flow.state_nonce.clone(),
+        ));
         oauth_rt
             .loopback_listeners
             .lock()
@@ -6295,6 +6322,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_callback_near_deadline_retains_only_a_bounded_nonce_matched_grace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for state in ["fixture", "wrong", "fixture&state=fixture"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::time::pause();
+            let task = tokio::spawn(run_loopback_redirect(
+                "fixture".into(),
+                vec![listener],
+                "https://localhost:8021".into(),
+                "fixture".into(),
+            ));
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(25 * 60 - 1)).await;
+            tokio::time::resume();
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(format!("GET /callback?code=fixture&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 302 Found"));
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(task.is_finished(), state != "fixture");
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+            assert!(task.is_finished());
+            task.await.unwrap();
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
     async fn oauth_callback_listener_outlives_five_minutes_and_accepts_retries() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6304,6 +6364,7 @@ mod tests {
             "fixture".into(),
             vec![listener],
             "https://localhost:8021".into(),
+            "fixture".into(),
         ));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(301)).await;

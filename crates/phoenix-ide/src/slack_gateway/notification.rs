@@ -1,6 +1,6 @@
 //! Provider-neutral owner notification command. Credentials stay in the local adapter.
 use super::Config;
-use phoenix_db::{SlackNotificationObservation, SlackNotificationOperation, SlackReturn};
+use phoenix_db::SlackReturn;
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,36 +12,24 @@ struct Request<'a> {
     version: u8,
     notification_id: &'a str,
     owner: &'a str,
-    #[serde(flatten)]
-    operation: Operation<'a>,
-}
-#[derive(Serialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-enum Operation<'a> {
-    Submit { text: &'a str, url: &'a str },
-    Inspect { receipt: &'a str },
+    operation: &'static str,
+    text: &'a str,
+    url: &'a str,
 }
 #[derive(Debug, Deserialize)]
-struct Response {
+pub(super) struct Response {
     version: u8,
     notification_id: String,
     owner: String,
-    receipt: String,
+    pub receipt: String,
     #[serde(flatten)]
-    outcome: Outcome,
+    pub outcome: Outcome,
 }
 #[derive(Debug, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-enum Outcome {
+pub(super) enum Outcome {
     Submitted,
-    Delivered { proof: String },
     Failed { reason: String },
-}
-
-#[derive(Debug)]
-pub(super) enum Submission {
-    Submitted { receipt: String },
-    Failed { receipt: String, reason: String },
 }
 
 #[derive(Debug)]
@@ -63,9 +51,6 @@ impl From<&str> for NotificationError {
 }
 
 pub(super) fn target_url(c: &Config, output: &SlackReturn) -> Result<String, NotificationError> {
-    if let Some(url) = &output.notification_url {
-        return Ok(url.clone());
-    }
     Ok(if output.published {
         let product = output.product_id.as_deref().ok_or_else(|| {
             NotificationError::NotDispatched("Published notice has no conversation identity".into())
@@ -82,66 +67,21 @@ pub(super) fn target_url(c: &Config, output: &SlackReturn) -> Result<String, Not
 
 pub(super) async fn notify(
     output: &SlackReturn,
-    operation: &SlackNotificationOperation,
-) -> Result<Submission, NotificationError> {
-    let response = call(
-        &operation.command,
-        Request {
-            version: 1,
-            notification_id: &output.return_id,
-            owner: &output.owner,
-            operation: Operation::Submit {
-                text: &output.text,
-                url: &operation.url,
-            },
-        },
-    )
-    .await?;
-    submission(response).map_err(NotificationError::Uncertain)
-}
-
-fn submission(response: Response) -> Result<Submission, String> {
-    match response.outcome {
-        Outcome::Submitted => Ok(Submission::Submitted { receipt: response.receipt }),
-        Outcome::Failed { reason } if !reason.trim().is_empty() => {
-            Ok(Submission::Failed { receipt: response.receipt, reason })
-        }
-        Outcome::Delivered { .. } | Outcome::Failed { .. } =>
-            Err("Notification submission did not establish submission or explicit failure; outcome uncertain".into()),
-    }
-}
-
-pub(super) async fn observe(output: &SlackReturn) -> Result<SlackNotificationObservation, String> {
-    let receipt = output
-        .notification_receipt
-        .as_deref()
-        .ok_or("Missing notification receipt")?;
-    let command = output
-        .notification_command
-        .as_deref()
-        .ok_or("Missing frozen notification command")?;
-    let response = call(
+    command: &[String],
+    url: &str,
+) -> Result<Response, NotificationError> {
+    call(
         command,
         Request {
             version: 1,
             notification_id: &output.return_id,
             owner: &output.owner,
-            operation: Operation::Inspect { receipt },
+            operation: "submit",
+            text: &output.text,
+            url,
         },
     )
     .await
-    .map_err(|e| e.message().to_string())?;
-    if response.receipt != receipt {
-        return Err("Notification evidence does not match the submitted receipt".into());
-    }
-    Ok(match response.outcome {
-        Outcome::Submitted => SlackNotificationObservation::Pending,
-        Outcome::Delivered { proof } if !proof.trim().is_empty() => {
-            SlackNotificationObservation::Delivered { proof }
-        }
-        Outcome::Delivered { .. } => return Err("Notification delivery proof is empty".into()),
-        Outcome::Failed { reason } => SlackNotificationObservation::Failed { reason },
-    })
 }
 
 async fn call(command: &[String], request: Request<'_>) -> Result<Response, NotificationError> {
@@ -220,7 +160,9 @@ mod tests {
             version: 1,
             notification_id: "notice",
             owner: "UOWNER",
-            operation: Operation::Inspect { receipt: "receipt" },
+            operation: "submit",
+            text: "ready",
+            url: "https://phoenix.example/c/fixture",
         };
         let response = r#"{"version":1,"notification_id":"notice","owner":"UOWNER","receipt":"receipt","state":"submitted"}"#;
         let command = |script: String| vec!["/bin/sh".into(), "-c".into(), script];

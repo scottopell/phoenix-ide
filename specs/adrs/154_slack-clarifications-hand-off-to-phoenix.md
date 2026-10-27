@@ -1,6 +1,6 @@
 # ADR-154: Slack clarifications hand off to Phoenix
 
-- **Status:** Accepted
+- **Status:** Accepted; question-text publication superseded by ADR-155
 - **Date:** 2026-10-26
 - **Affects:** REQ-SG-012, REQ-SG-013
 

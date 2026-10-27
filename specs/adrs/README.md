@@ -186,9 +186,10 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [145](145_coordinator-check-in-drives-scoped-work.md) | Coordinator check-ins drive scoped work and report outcomes | Accepted | REQ-GR-010, REQ-GR-011, REQ-GR-013 |
 | [150](150_slack-owner-gestures-bind-intentional-returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
 | [151](151_bound-discovery-and-refresh-new-explicit-requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
-| [152](152_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Accepted | REQ-SG-015 |
+| [152](152_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Superseded by ADR-155 | REQ-SG-015 |
 | [153](153_slack-gateway-uses-native-conversation-services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
-| [154](154_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Accepted | REQ-SG-012/013 |
+| [154](154_slack-clarifications-hand-off-to-phoenix.md) | Slack clarifications hand off to Phoenix | Question-text publication superseded by ADR-155 | REQ-SG-012/013 |
+| [155](155_slack-signals-are-best-effort-and-questions-stay-native.md) | Slack signals are best effort and questions stay native | Accepted | REQ-SG-005/006/012/013/014/015/016/017 |
 
 ## For agents: which decisions bind your task
 
