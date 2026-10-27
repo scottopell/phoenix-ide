@@ -82,10 +82,7 @@ async fn unprepared_report_guard_uses_outcome_not_output_across_db_entrypoints()
                 let after = evidence(&db, &owner, &round).await;
                 if rejected {
                     let error = outcome.unwrap_err();
-                    assert!(
-                        error.to_string().contains("goal report"),
-                        "{entrypoint}: {error}"
-                    );
+                    assert!(error.to_string().contains("goal report"), "{entrypoint}: {error}");
                     assert_eq!(after, before, "{entrypoint}");
                 } else {
                     outcome.unwrap();

@@ -30775,9 +30775,7 @@ mod tests {
             )
             .await
             .expect_err("a conflicting replay must not consume the obligation");
-        assert!(error
-            .to_string()
-            .contains("retained tool round result differs"));
+        assert!(error.to_string().contains("retained tool round result differs"));
         let persisted = db.get_messages(conversation_id).await.unwrap();
         assert_eq!(persisted.len(), 2);
         assert_eq!(persisted[1].content, result.row().content);
