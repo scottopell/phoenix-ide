@@ -308,6 +308,56 @@ mod tests {
             .expect("in-memory SQLite pool")
     }
 
+    async fn migrated_db() -> Database {
+        let db = Database::open_in_memory().await.unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn public_current_history_reads_use_migrated_database_and_ordinary_eligibility() {
+        let db = migrated_db().await;
+        let ordinary = db.create_conversation("goal-owner", "goal-owner", "/tmp", true, None, None).await.unwrap();
+        let owner = ordinary.product_conversation_id.clone();
+        assert!(db.conversation_goal(&owner).await.unwrap().is_none());
+        assert!(db.conversation_goal_current_entry(&owner).await.unwrap().is_none());
+        assert!(db.conversation_goal_history(&owner, GoalVersion::INITIAL).await.unwrap().is_empty());
+
+        let coordinator = db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default()).await.unwrap();
+        assert!(db.conversation_goal(&coordinator.product_conversation_id).await.unwrap().is_none());
+        assert!(db.conversation_goal_current_entry(&coordinator.product_conversation_id).await.is_err());
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_ids").fetch_one(db.pool()).await.unwrap(), 0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_history").fetch_one(db.pool()).await.unwrap(), 0);
+
+        sqlx::query("INSERT INTO conversation_goal_ids(goal_id,objective,owner_id) VALUES ('goal-1','objective',?)")
+            .bind(owner.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO conversation_goal_actors(actor_id,owner_id,kind,host_action_id) VALUES (1,?,'generated_host','fixture-create')")
+            .bind(owner.as_str()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO conversation_goal_history(owner_id,version,goal_id,state,reason,action_id,change_kind,report_turn_id,requested_actor_id,applied_actor_id,recorded_at_us) VALUES (?,1,'goal-1','underway',NULL,'action-1','create',NULL,1,1,1234)")
+            .bind(owner.as_str()).execute(db.pool()).await.unwrap();
+
+        let current = db.conversation_goal(&owner).await.unwrap().unwrap();
+        assert_eq!(current.objective.as_str(), "objective");
+        let entry = db.conversation_goal_current_entry(&owner).await.unwrap().unwrap();
+        assert_eq!(entry.snapshot, current);
+        assert_eq!(entry.recorded_at_us.get(), 1234);
+        assert!(matches!(entry.mutation.attribution.requested_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
+        assert!(matches!(entry.mutation.attribution.applied_by, GoalActor::GeneratedHost { ref action_id } if action_id.as_str() == "fixture-create"));
+        let history = db.conversation_goal_history(&owner, GoalVersion::INITIAL).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].snapshot, current);
+        assert_eq!(history[0].mutation.action_id.as_str(), "action-1");
+    }
+
+    #[tokio::test]
+    async fn public_binding_read_of_absent_execution_does_not_capture_or_write() {
+        let db = migrated_db().await;
+        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings").fetch_one(db.pool()).await.unwrap();
+        assert!(db.conversation_goal_execution_binding(GoalExecution::parse(9001, 7001).unwrap()).await.unwrap().is_none());
+        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_goal_bindings").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after, 0);
+    }
+
     #[tokio::test]
     async fn state_decoder_requires_consistent_kind_and_nonblank_reason() {
         let pool = test_pool().await;
