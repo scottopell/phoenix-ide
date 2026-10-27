@@ -64,6 +64,10 @@ gateway/ledger tests, one additional retained-claim migration regression, and
 seven final static checks. Retry exhaustion across reopen preserves text and
 coverage, creates one private failure notice, and releases the account-change lock;
 the existing readiness/rate-limit fixture confirms delivery on the last allowance.
+The subsequent destination-rejection correction passes 26 adapter/driver tests
+and five final static checks. Non-threadable roots and resource/permission denials
+settle only with operation-qualified rejection and no accepted-message identity;
+opaque errors and possible partial success remain uncertain.
 
 The pre-integration 1,200-test developer-tool run had three environment-sensitive
 failures; all three pass with native Bash/OpenSSL and the shared Cargo target

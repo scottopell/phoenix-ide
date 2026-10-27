@@ -1257,7 +1257,16 @@ mod tests {
 
     #[tokio::test]
     async fn opaque_destination_errors_remain_uncertain_without_failure_notice() {
-        for qualified in [false, true] {
+        for (code, qualified) in [
+            "channel_not_found",
+            "cannot_reply_to_message",
+            "access_denied",
+            "ekm_access_denied",
+            "no_permission",
+        ]
+        .into_iter()
+        .flat_map(|code| [(code, false), (code, true)])
+        {
             let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
             let c = Config {
                 enabled: false,
@@ -1297,9 +1306,9 @@ mod tests {
             slack.fixture = Some(Arc::new(move |tool, _| {
                 assert_eq!(tool, "slack_send_message");
                 Ok(if qualified {
-                    serde_json::json!({"ok":false,"error":"channel_not_found","method":"chat.postMessage"})
+                    serde_json::json!({"ok":false,"error":code,"method":"chat.postMessage"})
                 } else {
-                    serde_json::json!({"error":"channel_not_found"})
+                    serde_json::json!({"error":code})
                 })
             }));
             dispatch_returns(&state, &c, &slack, true).await.unwrap();

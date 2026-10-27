@@ -504,6 +504,10 @@ pub(super) fn destination_unavailable(error: &McpOneShotError) -> bool {
         matches!(
             code.as_str(),
             "channel_not_found"
+                | "cannot_reply_to_message"
+                | "access_denied"
+                | "ekm_access_denied"
+                | "no_permission"
                 | "is_archived"
                 | "not_in_channel"
                 | "restricted_action"
@@ -948,6 +952,10 @@ mod tests {
     #[test]
     fn permanent_thread_restrictions_are_not_uncertain_transport_outcomes() {
         for code in [
+            "cannot_reply_to_message",
+            "access_denied",
+            "ekm_access_denied",
+            "no_permission",
             "restricted_action_thread_locked",
             "restricted_action_read_only_channel",
             "restricted_action_non_threadable_channel",
@@ -973,6 +981,16 @@ mod tests {
         assert!(!destination_unavailable(&McpOneShotError::Uncertain(
             "transport response lost".into()
         )));
+        for code in [
+            "internal_error",
+            "fatal_error",
+            "unknown_failure",
+            "ratelimited",
+        ] {
+            assert!(!destination_unavailable(&McpOneShotError::ToolRejected(
+                json!({"ok":false,"method":"chat.postMessage","error":code}).to_string()
+            )));
+        }
     }
 
     #[test]
