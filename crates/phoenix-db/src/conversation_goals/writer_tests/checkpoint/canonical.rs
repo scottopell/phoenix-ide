@@ -76,10 +76,11 @@ async fn report_messages_without_canonical_receipt_cannot_claim_state_or_replay(
         &mut tx,
         &round.assistant.conversation_id,
         &round.assistant,
-        crate::conversation_goals::round::RoundResults::Pending {
+        crate::conversation_goals::round::ToolRoundWrite::Pending {
             execution: round.execution,
             results: &round.results,
         },
+        &round.state,
         round.timestamp,
         db.goal_write_policies(),
     )
