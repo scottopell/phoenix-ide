@@ -19,7 +19,7 @@ impl TryFrom<GoalExecutionBinding> for GoalReportBinding {
         let GoalAdmissionObservation::Goal(goal) = binding.observation else {
             return Err(GoalError::ReportBindingRequired);
         };
-        if goal.owner != binding.owner || goal.version.get() == 0 {
+        if goal.owner() != &binding.owner {
             return Err(GoalError::Conflict);
         }
         Ok(Self {
@@ -38,9 +38,6 @@ impl<'de> Deserialize<'de> for GoalReportBinding {
             goal: GoalFence,
         }
         let wire = WireBinding::deserialize(deserializer)?;
-        if wire.goal.version.get() == 0 {
-            return Err(serde::de::Error::custom(GoalError::Conflict));
-        }
         Ok(Self {
             execution: wire.execution,
             goal: wire.goal,
@@ -119,9 +116,9 @@ impl GoalPendingReport {
     fn action_id(&self) -> GoalText {
         let goal = &self.admission.goal;
         let source = (
-            goal.owner.as_str(),
-            goal.goal_id.as_str(),
-            goal.version.get(),
+            goal.owner().as_str(),
+            goal.goal_id().as_str(),
+            goal.version().get(),
             self.admission.execution.workflow_id(),
             self.admission.execution.turn_id(),
             self.call.transcript_id.as_str(),
@@ -141,20 +138,20 @@ impl GoalPendingReport {
         let goal = &self.admission.goal;
         let action_id = self.action_id();
         let binding = GoalExecutionBinding {
-            owner: goal.owner.clone(),
+            owner: goal.owner().clone(),
             execution: self.admission.execution,
             observation: GoalAdmissionObservation::Goal(goal.clone()),
         };
         let source = GoalAgentSource {
-            product_conversation_id: goal.owner.clone(),
+            product_conversation_id: goal.owner().clone(),
             execution: self.admission.execution,
             transcript_id: self.call.transcript_id.clone(),
             message_id: self.call.message_id.clone(),
             tool_use_id: self.call.tool_use_id.clone(),
         };
         GoalMutation {
-            owner: goal.owner.clone(),
-            expected_version: goal.version,
+            owner: goal.owner().clone(),
+            expected_version: goal.version(),
             action_id: action_id.clone(),
             attribution: GoalAttribution {
                 requested_by: GoalActor::OwningAgent(source),
@@ -182,11 +179,14 @@ mod tests {
         GoalExecutionBinding {
             owner: owner.clone(),
             execution: GoalExecution::parse(31, 47).unwrap(),
-            observation: GoalAdmissionObservation::Goal(GoalFence {
-                owner,
-                goal_id: GoalId::parse("report-goal").unwrap(),
-                version: GoalVersion::parse(9).unwrap(),
-            }),
+            observation: GoalAdmissionObservation::Goal(
+                GoalFence::new(
+                    owner,
+                    GoalId::parse("report-goal").unwrap(),
+                    GoalVersion::parse(9).unwrap(),
+                )
+                .unwrap(),
+            ),
         }
     }
 
@@ -245,12 +245,10 @@ mod tests {
             GoalReportBinding::try_from(mismatch),
             Err(GoalError::Conflict)
         );
-        let mut zero = binding();
-        let GoalAdmissionObservation::Goal(ref mut fence) = zero.observation else {
-            panic!("fixture")
-        };
-        fence.version = GoalVersion::INITIAL;
-        assert_eq!(GoalReportBinding::try_from(zero), Err(GoalError::Conflict));
+        let valid = GoalReportBinding::try_from(binding()).unwrap();
+        let mut zero = serde_json::to_value(valid).unwrap();
+        zero["goal"]["version"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<GoalReportBinding>(zero).is_err());
     }
 
     #[test]

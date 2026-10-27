@@ -166,11 +166,14 @@ mod tests {
         let binding = GoalExecutionBinding {
             owner: owner.clone(),
             execution: GoalExecution::parse(13, 29).unwrap(),
-            observation: GoalAdmissionObservation::Goal(GoalFence {
-                owner,
-                goal_id: GoalId::parse("round-goal").unwrap(),
-                version: GoalVersion::parse(3).unwrap(),
-            }),
+            observation: GoalAdmissionObservation::Goal(
+                GoalFence::new(
+                    owner,
+                    GoalId::parse("round-goal").unwrap(),
+                    GoalVersion::parse(3).unwrap(),
+                )
+                .unwrap(),
+            ),
         };
         let report = GoalPendingReport::new(
             binding.try_into().unwrap(),

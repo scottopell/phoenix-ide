@@ -27,7 +27,7 @@ impl GoalStartInput {
         requester: GoalStartRequester,
         goal: GoalFence,
     ) -> Result<Self, GoalError> {
-        if goal.version.get() == 0 {
+        if goal.version().get() == 0 {
             return Err(GoalError::Range);
         }
         Ok(Self {
@@ -127,11 +127,12 @@ mod tests {
     };
 
     fn fence(version: i64) -> GoalFence {
-        GoalFence {
-            owner: ProductConversationId::parse("owner").unwrap(),
-            goal_id: GoalId::parse("goal").unwrap(),
-            version: GoalVersion::parse(version).unwrap(),
-        }
+        GoalFence::new(
+            ProductConversationId::parse("owner").unwrap(),
+            GoalId::parse("goal").unwrap(),
+            GoalVersion::parse(version).unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -140,7 +141,6 @@ mod tests {
             principal_id: Uuid::new_v4(),
         };
         let request_id = Uuid::new_v4();
-        assert!(GoalStartInput::new(request_id, requester.clone(), fence(0)).is_err());
         let input = GoalStartInput::new(request_id, requester, fence(1)).unwrap();
         let encoded = serde_json::to_value(&input).unwrap();
         assert_eq!(encoded.as_object().unwrap().len(), 3);
@@ -148,6 +148,9 @@ mod tests {
             serde_json::from_value::<GoalStartInput>(encoded.clone()).unwrap(),
             input
         );
+        let mut zero = encoded.clone();
+        zero["goal"]["version"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<GoalStartInput>(zero).is_err());
         let mut forged = encoded;
         forged["message"] = serde_json::json!("not a message");
         assert!(serde_json::from_value::<GoalStartInput>(forged).is_err());

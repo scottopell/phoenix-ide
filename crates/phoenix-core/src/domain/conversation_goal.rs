@@ -283,11 +283,58 @@ impl<'de> Deserialize<'de> for GoalSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalFence {
-    pub owner: ProductConversationId,
-    pub goal_id: GoalId,
-    pub version: GoalVersion,
+    owner: ProductConversationId,
+    goal_id: GoalId,
+    version: GoalVersion,
+}
+
+impl GoalFence {
+    /// # Errors
+    /// Rejects version zero, which cannot identify a saved goal.
+    pub fn new(
+        owner: ProductConversationId,
+        goal_id: GoalId,
+        version: GoalVersion,
+    ) -> Result<Self, GoalError> {
+        if version == GoalVersion::INITIAL {
+            return Err(GoalError::Range);
+        }
+        Ok(Self {
+            owner,
+            goal_id,
+            version,
+        })
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &ProductConversationId {
+        &self.owner
+    }
+
+    #[must_use]
+    pub fn goal_id(&self) -> &GoalId {
+        &self.goal_id
+    }
+
+    #[must_use]
+    pub fn version(&self) -> GoalVersion {
+        self.version
+    }
+}
+
+impl<'de> Deserialize<'de> for GoalFence {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireFence {
+            owner: ProductConversationId,
+            goal_id: GoalId,
+            version: GoalVersion,
+        }
+        let wire = WireFence::deserialize(deserializer)?;
+        Self::new(wire.owner, wire.goal_id, wire.version).map_err(serde::de::Error::custom)
+    }
 }
 
 impl GoalSnapshot {
@@ -540,12 +587,13 @@ impl GoalHistoryEntry {
                 disposition,
             } => {
                 binding.owner == mutation.owner
-                    && binding.observation
-                        == GoalAdmissionObservation::Goal(GoalFence {
-                            owner: snapshot.owner.clone(),
-                            goal_id: snapshot.goal_id.clone(),
-                            version: mutation.expected_version,
-                        })
+                    && matches!(
+                        &binding.observation,
+                        GoalAdmissionObservation::Goal(goal)
+                            if goal.owner() == &snapshot.owner
+                                && goal.goal_id() == &snapshot.goal_id
+                                && goal.version() == mutation.expected_version
+                    )
                     && snapshot.state == disposition.state()
             }
         };

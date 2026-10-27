@@ -104,7 +104,7 @@ impl GoalRequestIntent {
         generation: i64,
         cause: GoalRequestCause,
     ) -> Result<Self, GoalError> {
-        if generation < 0 || goal.version.get() == 0 {
+        if generation < 0 {
             return Err(GoalError::Range);
         }
         if matches!(&cause, GoalRequestCause::AfterCheckpoint { predecessor } if predecessor == &id)
@@ -189,11 +189,12 @@ mod tests {
     fn request_intent_preserves_checked_goal_on_roundtrip_and_replacement() {
         use super::super::{GoalId, GoalVersion, ProductConversationId};
 
-        let goal = GoalFence {
-            owner: ProductConversationId::parse("owner").unwrap(),
-            goal_id: GoalId::parse("goal").unwrap(),
-            version: GoalVersion::parse(1).unwrap(),
-        };
+        let goal = GoalFence::new(
+            ProductConversationId::parse("owner").unwrap(),
+            GoalId::parse("goal").unwrap(),
+            GoalVersion::parse(1).unwrap(),
+        )
+        .unwrap();
         let intent = GoalRequestIntent::new(
             GoalRequestId::parse("request").unwrap(),
             goal.clone(),
@@ -209,16 +210,14 @@ mod tests {
             intent
         );
 
-        let mut invalid_goal = intent.goal().clone();
-        invalid_goal.version = GoalVersion::INITIAL;
-        assert!(GoalRequestIntent::new(
-            intent.id().clone(),
-            invalid_goal,
-            intent.execution,
-            intent.generation(),
-            intent.cause().clone(),
-        )
-        .is_err());
+        assert_eq!(
+            GoalFence::new(
+                goal.owner().clone(),
+                goal.goal_id().clone(),
+                GoalVersion::INITIAL
+            ),
+            Err(GoalError::Range)
+        );
         assert_eq!(intent.goal(), &goal);
         let mut invalid_encoded = encoded;
         invalid_encoded["goal"]["version"] = serde_json::json!(0);
@@ -228,11 +227,12 @@ mod tests {
     #[test]
     fn request_cannot_precede_itself_through_constructor_or_wire() {
         use super::super::{GoalId, GoalVersion, ProductConversationId};
-        let goal = GoalFence {
-            owner: ProductConversationId::parse("owner").unwrap(),
-            goal_id: GoalId::parse("goal").unwrap(),
-            version: GoalVersion::parse(1).unwrap(),
-        };
+        let goal = GoalFence::new(
+            ProductConversationId::parse("owner").unwrap(),
+            GoalId::parse("goal").unwrap(),
+            GoalVersion::parse(1).unwrap(),
+        )
+        .unwrap();
         let id = GoalRequestId::parse("request").unwrap();
         let execution = GoalExecution::parse(1, 2).unwrap();
         let self_cause = GoalRequestCause::AfterCheckpoint {

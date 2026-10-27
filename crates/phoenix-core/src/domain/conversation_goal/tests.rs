@@ -74,6 +74,69 @@ fn set(current: &GoalSnapshot, disposition: GoalDisposition) -> GoalMutation {
 }
 
 #[test]
+fn saved_goal_fence_rejects_zero_through_constructor_and_nested_binding_wire() {
+    let owner = ProductConversationId::parse("owner").unwrap();
+    let goal_id = GoalId::parse("saved").unwrap();
+    assert_eq!(
+        GoalFence::new(owner.clone(), goal_id.clone(), GoalVersion::INITIAL),
+        Err(GoalError::Range)
+    );
+    for version in [1, 2, i64::MAX] {
+        let version = GoalVersion::parse(version).unwrap();
+        let fence = GoalFence::new(owner.clone(), goal_id.clone(), version).unwrap();
+        assert_eq!(fence.owner(), &owner);
+        assert_eq!(fence.goal_id(), &goal_id);
+        assert_eq!(fence.version(), version);
+        let wire = serde_json::to_value(&fence).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"owner": owner, "goal_id": "saved", "version": version.get()})
+        );
+        assert_eq!(
+            serde_json::from_value::<GoalFence>(wire.clone()).unwrap(),
+            fence
+        );
+        let mut zero = wire;
+        zero["version"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<GoalFence>(zero).is_err());
+
+        let binding = GoalExecutionBinding {
+            owner: owner.clone(),
+            execution: GoalExecution::parse(1, 2).unwrap(),
+            observation: GoalAdmissionObservation::Goal(fence),
+        };
+        let mut wire = serde_json::to_value(&binding).unwrap();
+        assert_eq!(
+            serde_json::from_value::<GoalExecutionBinding>(wire.clone()).unwrap(),
+            binding
+        );
+        wire["observation"]["Goal"]["version"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<GoalExecutionBinding>(wire).is_err());
+    }
+}
+
+#[test]
+fn no_goal_binding_preserves_initial_zero_observation() {
+    let owner = ProductConversationId::parse("owner").unwrap();
+    let binding = GoalExecutionBinding {
+        owner,
+        execution: GoalExecution::parse(1, 2).unwrap(),
+        observation: GoalAdmissionObservation::NoGoal {
+            observed_version: GoalVersion::INITIAL,
+        },
+    };
+    let wire = serde_json::to_value(&binding).unwrap();
+    assert_eq!(
+        wire["observation"],
+        serde_json::json!({"NoGoal": {"observed_version": 0}})
+    );
+    assert_eq!(
+        serde_json::from_value::<GoalExecutionBinding>(wire).unwrap(),
+        binding
+    );
+}
+
+#[test]
 fn saved_snapshot_requires_committed_version_in_constructor_and_wire() {
     let saved = initial();
     let mut encoded = serde_json::to_value(&saved).unwrap();
