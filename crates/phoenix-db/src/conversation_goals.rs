@@ -112,11 +112,11 @@ async fn binding_tx(tx: &mut GoalTx<'_>, turn_id: i64) -> Result<Option<GoalExec
     )?;
     let goal_id: Option<String> = row.try_get("goal_id")?;
     let observation = match goal_id {
-        Some(goal_id) => GoalAdmissionObservation::Goal(GoalFence {
-            owner: owner.clone(),
-            goal_id: GoalId::parse(goal_id)?,
+        Some(goal_id) => GoalAdmissionObservation::Goal(GoalFence::new(
+            owner.clone(),
+            GoalId::parse(goal_id)?,
             version,
-        }),
+        )?),
         None => GoalAdmissionObservation::NoGoal {
             observed_version: version,
         },
@@ -585,7 +585,7 @@ mod tests {
         );
         let goal = binding_tx(&mut tx, 11).await.unwrap().unwrap();
         assert!(
-            matches!(goal.observation, GoalAdmissionObservation::Goal(GoalFence { version, .. }) if version.get() == 2)
+            matches!(goal.observation, GoalAdmissionObservation::Goal(fence) if fence.version().get() == 2)
         );
 
         sqlx::query("INSERT INTO conversation_goal_bindings VALUES (12, 'owner', 3, NULL, -1), (13, ' ', 3, NULL, 0)")
@@ -599,6 +599,14 @@ mod tests {
         assert!(matches!(
             binding_tx(&mut tx, 13).await,
             Err(GoalDbError::Integrity("product id"))
+        ));
+        sqlx::query("INSERT INTO conversation_goal_bindings VALUES (14, 'owner', 3, 'goal', 0)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert!(matches!(
+            binding_tx(&mut tx, 14).await,
+            Err(GoalDbError::Domain(GoalError::Range))
         ));
         tx.rollback().await.unwrap();
     }
