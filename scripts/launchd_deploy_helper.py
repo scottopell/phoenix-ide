@@ -28,7 +28,7 @@ import urllib.request
 import urllib.parse
 import stat
 from pathlib import Path
-from typing import Callable, Optional, get_args, get_type_hints
+from typing import Callable, Optional, Union, get_args, get_type_hints
 from contextlib import closing
 
 HANDOFF_PROTOCOL_VERSION = 1
@@ -41,13 +41,6 @@ CURRENT_SCHEMA_REQUIRED_MIGRATIONS = {
     127: "coordinator_owned_work_scope_home",
     128: "product_creation_provisioning_stage",
 }
-# REQ-LDD-028: exact additive candidate registry; historical protected pins are independent.
-ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256 = "850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac"
-ORDINARY_SOURCE129_TARGET131_MIGRATIONS = (
-    (129, "single_conversation_name_and_route_projection"),
-    (130, "continuation_handoff_candidates"),
-    (131, "request_capacity_diagnostics"),
-)
 MINIMUM_FREE_AFTER_RESERVATION_BYTES = 20 * 1024 * 1024 * 1024
 CURRENT_SCHEMA_GROWTH_MARGIN_MIN_BYTES = 1024 * 1024 * 1024
 CURRENT_SCHEMA_GROWTH_MARGIN_MAX_BYTES = 8 * 1024 * 1024 * 1024
@@ -376,6 +369,38 @@ class OrdinaryForwardMigration:
 
 
 @dataclasses.dataclass(frozen=True)
+class OrdinaryForwardHistory:
+    source: tuple[tuple[int, str], ...]
+    target: tuple[tuple[int, str], ...]
+
+    @property
+    def pending(self) -> tuple[tuple[int, str], ...]:
+        return self.target[len(self.source):]
+
+
+@dataclasses.dataclass(frozen=True)
+class OrdinaryForwardPlan:
+    source: tuple[tuple[int, str], ...]
+    target: tuple[tuple[int, str], ...]
+    source_digest: str
+
+    @property
+    def pending(self) -> tuple[tuple[int, str], ...]:
+        return self.target[len(self.source):]
+
+
+ORDINARY_PREPARED = "ordinary_forward_prepared"
+ORDINARY_BOUNDARY = "ordinary_forward_boundary"
+ORDINARY_PROVEN = "ordinary_migration_proven"
+ORDINARY_FORWARD_PHASES = {ORDINARY_PREPARED, ORDINARY_BOUNDARY, ORDINARY_PROVEN}
+ORDINARY_PREBOUNDARY_STATES = {
+    "ordinary_preboundary_prepared", "ordinary_preboundary_stopped",
+    "ordinary_source_proven", "ordinary_preboundary_failed_stopped",
+    "ordinary_activation_failed_rollback_failed",
+}
+
+
+@dataclasses.dataclass(frozen=True)
 class DatabaseCapacityPlan:
     reservation_bytes: int
     ceiling_bytes: int
@@ -430,7 +455,12 @@ class Manifest:
     health_timeout_secs: float = DEFAULT_HEALTH_TIMEOUT_SECS
     # None is intentional for pre-feature runtime-only manifests.
     paired_database_upgrade: Optional[PairedDatabaseUpgrade] = None
-    current_schema_upgrade: Optional[CurrentSchemaUpgrade | PreparedSource114Upgrade | PreparedSource128Upgrade | PreparedSchema129Refresh] = None
+    current_schema_upgrade: Optional[Union[
+        CurrentSchemaUpgrade,
+        PreparedSource114Upgrade,
+        PreparedSource128Upgrade,
+        PreparedSchema129Refresh,
+    ]] = None
     ordinary_forward_migration: Optional[OrdinaryForwardMigration] = None
 
     @classmethod
@@ -621,6 +651,7 @@ def write_status(
     committed_diagnostic: Optional[str] = None,
     finalization_pending: bool = False,
     recovery_mode: Optional[str] = None,
+    forward_plan: Optional[OrdinaryForwardPlan] = None,
 ) -> None:
     try:
         prior = read_status(manifest)
@@ -647,6 +678,17 @@ def write_status(
         "finalization_pending": finalization_pending,
         "recovery_mode": recovery_mode,
     }
+    if recovery_mode in ORDINARY_FORWARD_PHASES:
+        if forward_plan is None:
+            if not isinstance(prior, dict) or prior.get("transaction_id") != manifest.transaction_id:
+                raise ActivationError("ordinary forward boundary evidence is missing")
+            status["forward_source_ledger"] = prior.get("forward_source_ledger")
+            status["forward_target_ledger"] = prior.get("forward_target_ledger")
+            status["forward_source_digest"] = prior.get("forward_source_digest")
+        else:
+            status["forward_source_ledger"] = forward_plan.source
+            status["forward_target_ledger"] = forward_plan.target
+            status["forward_source_digest"] = forward_plan.source_digest
     status["prepared_mode"] = manifest_prepared_mode(manifest)
     atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
@@ -1067,40 +1109,131 @@ def database_logical_digest(path: Path) -> str:
         raise ActivationError("could not digest SQLite database") from exc
 
 
-def ordinary_forward_target(ordinary: OrdinaryForwardMigration, registry: Path) -> tuple[tuple[int, str], ...]:
-    if ordinary.migration_registry_sha256 == ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256:
-        target = migration_registry(registry, qualified_current_target=False)
-        if target[-3:] != ORDINARY_SOURCE129_TARGET131_MIGRATIONS:
-            raise ActivationError("ordinary candidate registry differs from qualified target131")
-        return target
-    return migration_registry(registry)
+def forward_history_plan(
+    source: tuple[tuple[int, str], ...],
+    target: tuple[tuple[int, str], ...],
+) -> OrdinaryForwardHistory:
+    if not target:
+        raise ActivationError("candidate migration history must be nonempty")
+    if len({version for version, _name in target}) != len(target):
+        raise ActivationError("candidate migration history contains duplicate versions")
+    if len({version for version, _name in source}) != len(source):
+        raise ActivationError("source migration history contains duplicate versions")
+    if len(source) > len(target) or source != target[:len(source)]:
+        raise ActivationError("source migration history is not an exact candidate prefix")
+    return OrdinaryForwardHistory(source, target)
 
 
-def ordinary_forward_policy_applies(manifest: Manifest) -> bool:
+def ordinary_forward_admission_plan(manifest: Manifest) -> OrdinaryForwardHistory:
     ordinary = manifest.ordinary_forward_migration
     if ordinary is None:
-        return False
-    database = Path(ordinary.database_path)
-    ledger = database_ledger(database)
+        raise ActivationError("ordinary forward migration is not configured")
     registry = verify_staged(
         ordinary.migration_registry_path,
         ordinary.migration_registry_sha256,
         "ordinary candidate migration registry",
     )
     target = migration_registry(registry, qualified_current_target=False)
-    if ledger == target:
+    database = Path(ordinary.database_path)
+    validate_database(database)
+    return forward_history_plan(database_ledger(database), target)
+
+
+def ordinary_forward_plan(manifest: Manifest) -> OrdinaryForwardPlan:
+    ordinary = manifest.ordinary_forward_migration
+    if ordinary is None:
+        raise ActivationError("ordinary forward migration is not configured")
+    history = ordinary_forward_admission_plan(manifest)
+    return OrdinaryForwardPlan(
+        history.source,
+        history.target,
+        database_logical_digest(Path(ordinary.database_path)),
+    )
+
+
+def ordinary_forward_policy_applies(manifest: Manifest) -> bool:
+    if manifest.ordinary_forward_migration is None:
         return False
-    if ordinary.migration_registry_sha256 == ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256:
-        target = ordinary_forward_target(ordinary, registry)
-        source = tuple(item for item in target if item[0] <= 129)
-        if ledger != source:
-            raise ActivationError("ordinary pending migration interval is not qualified; expected exact source129 ledger")
-        validate_database(database)
-        return True
-    if not ledger or ledger[-1][0] != CURRENT_SCHEMA_BASELINE_VERSION:
-        raise ActivationError("ordinary pending migration interval is not qualified; use an explicit protected upgrade")
-    validate_current_schema_database(database, registry)
-    return True
+    pending = bool(ordinary_forward_admission_plan(manifest).pending)
+    if pending and manifest.previous is None:
+        raise ActivationError("ordinary pending migration requires a verified installed predecessor")
+    return pending
+
+
+def assert_ordinary_database_exclusive(manifest: Manifest) -> None:
+    ordinary = manifest.ordinary_forward_migration
+    if ordinary is None:
+        raise ActivationError("ordinary forward migration is not configured")
+    database = Path(ordinary.database_path)
+    _regular_nosymlink(database, "ordinary database")
+    paths = []
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = database.with_name(database.name + suffix)
+        if os.path.lexists(path):
+            _regular_nosymlink(path, "ordinary SQLite sidecar")
+            paths.append(path)
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-t", "--", *map(str, paths)],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ActivationError("could not prove ordinary database exclusivity") from exc
+    if result.returncode not in (0, 1) or result.stderr.strip() or result.stdout.strip():
+        raise ActivationError("ordinary database remains open or exclusivity is unconfirmed")
+
+
+def invoke_ordinary_candidate(manifest: Manifest) -> None:
+    ordinary = manifest.ordinary_forward_migration
+    if ordinary is None:
+        raise ActivationError("ordinary forward migration is not configured")
+    with Path(manifest.candidate_plist).open("rb") as stream:
+        plist = plistlib.load(stream)
+    plist_environment = plist.get("EnvironmentVariables", {})
+    if not isinstance(plist_environment, dict) or plist_environment.get("PHOENIX_DB_PATH") != ordinary.database_path:
+        raise ActivationError("ordinary candidate migration database path differs from manifest")
+    environment = os.environ.copy()
+    environment.update({str(key): str(value) for key, value in plist_environment.items()})
+    try:
+        result = subprocess.run(
+            [manifest.candidate_binary, "--migrate-only"], env=environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=7200, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ActivationError("ordinary candidate offline migration could not complete") from exc
+    if result.returncode != 0:
+        raise ActivationError(f"ordinary candidate offline migration failed with exit {result.returncode}")
+
+
+def prove_ordinary_migration(manifest: Manifest, plan: OrdinaryForwardPlan) -> None:
+    ordinary = manifest.ordinary_forward_migration
+    assert ordinary is not None
+    validate_database(Path(ordinary.database_path))
+    if database_ledger(Path(ordinary.database_path)) != plan.target:
+        raise ActivationError("ordinary migrated ledger differs from exact candidate target")
+    write_status(manifest, "ordinary_migration_proven", recovery_mode=ORDINARY_PROVEN,
+                 forward_plan=plan, finalization_pending=True)
+
+
+def recover_ordinary_boundary(manifest: Manifest, plan: OrdinaryForwardPlan) -> None:
+    ordinary = manifest.ordinary_forward_migration
+    assert ordinary is not None
+    assert_ordinary_database_exclusive(manifest)
+    verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "ordinary candidate binary")
+    verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "ordinary candidate plist")
+    verify_staged(ordinary.migration_registry_path, ordinary.migration_registry_sha256, "ordinary candidate migration registry")
+    validate_database(Path(ordinary.database_path))
+    observed = database_ledger(Path(ordinary.database_path))
+    observed_plan = forward_history_plan(observed, plan.target)
+    if observed == plan.source and database_logical_digest(Path(ordinary.database_path)) != plan.source_digest:
+        raise ActivationError("ordinary source contents changed after forward boundary")
+    observed_versions = {version for version, _name in observed}
+    if any(version not in observed_versions for version, _name in plan.source):
+        raise ActivationError("ordinary partial migration lost a recorded source migration")
+    if observed_plan.pending:
+        invoke_ordinary_candidate(manifest)
+    prove_ordinary_migration(manifest, plan)
 
 
 def validate_legacy_database(path: Path) -> None:
@@ -2753,7 +2886,7 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
         "candidate plist",
     )
     candidate_plist_contents = _load_staged_plist(candidate_plist, "candidate plist")
-    if exact_prepared_source114 or exact_prepared_source128:
+    if exact_prepared_source114 or exact_prepared_source128 or manifest.ordinary_forward_migration is not None:
         _validate_staged_plist_binding(
             candidate_plist_contents,
             manifest_label=manifest.label,
@@ -2773,7 +2906,7 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
             "rollback plist",
         )
         rollback_plist_contents = _load_staged_plist(rollback_plist, "rollback plist")
-        if exact_prepared_source114 or exact_prepared_source128:
+        if exact_prepared_source114 or exact_prepared_source128 or manifest.ordinary_forward_migration is not None:
             _validate_staged_plist_binding(
                 rollback_plist_contents,
                 manifest_label=manifest.label,
@@ -2799,6 +2932,31 @@ def validate_pre_disruption_handoff(manifest: Manifest) -> ValidatedLaunchdHando
 
 def require_fresh_prepared_activation(manifest: Manifest) -> None:
     if manifest.current_schema_upgrade is None:
+        if manifest.ordinary_forward_migration is not None:
+            path = Path(manifest.status_path)
+            status = read_status(manifest) if path.is_file() and not path.is_symlink() else {}
+            if (
+                status.get("transaction_id") != manifest.transaction_id
+                or status.get("state") != "prepared"
+                or status.get("source_kind") != manifest.source_kind
+                or "prepared_mode" not in status or status["prepared_mode"] is not None
+                or status.get("source_commit") != manifest.source_commit
+                or "release_tag" not in status or status["release_tag"] != manifest.release_tag
+                or "release_commit" not in status or status["release_commit"] != manifest.release_commit
+                or status.get("expected_version") != manifest.expected.version
+                or status.get("expected_git_sha") != manifest.expected.git_sha
+                or status.get("created_at") != manifest.created_at
+                or not isinstance(status.get("updated_at"), str)
+                or "failure" not in status or status["failure"] is not None
+                or "rollback_failure" not in status or status["rollback_failure"] is not None
+                or status.get("finalization_pending") is not False
+                or status.get("recovery_mode") is not None
+                or any(key.startswith("forward_") for key in status)
+            ):
+                raise ActivationError(
+                    "ordinary activation requires a fresh prepared transaction; "
+                    "use resume-forward for retained history"
+                )
         return
     status = read_status(manifest)
     if (
@@ -2827,10 +2985,16 @@ def activate(manifest: Manifest) -> str:
         prepared_installs: list[Path] = []
         prepared_rollback: Optional[tuple[Path, Path]] = None
         capacity_reservation: Optional[DatabaseCapacityReservation] = None
-        ordinary_forward_only = False
+        ordinary_admission_plan: Optional[OrdinaryForwardHistory] = None
+        ordinary_plan: Optional[OrdinaryForwardPlan] = None
         try:
             validated = validate_pre_disruption_handoff(manifest)
-            ordinary_forward_only = ordinary_forward_policy_applies(manifest)
+            if manifest.ordinary_forward_migration is not None:
+                ordinary_admission_plan = ordinary_forward_admission_plan(manifest)
+                if ordinary_admission_plan.pending and manifest.previous is None:
+                    raise ActivationError(
+                        "ordinary pending migration requires a verified installed predecessor"
+                    )
             if manifest.paired_database_upgrade is not None:
                 validate_legacy_database(Path(manifest.paired_database_upgrade.database_path))
             elif manifest.current_schema_upgrade is not None:
@@ -2887,6 +3051,10 @@ def activate(manifest: Manifest) -> str:
             raise
 
         launchctl = Launchctl(manifest)
+        ordinary_forward = (
+            ordinary_admission_plan is not None
+            and bool(ordinary_admission_plan.pending)
+        )
         write_status(manifest, "activating")
         disrupted = False
         quarantined_previous_plist: Optional[Path] = None
@@ -2897,7 +3065,7 @@ def activate(manifest: Manifest) -> str:
         current_schema_migration_started = False
         source128_post_marker = False
         refresh = _schema129_refresh(manifest)
-        ordinary_candidate_started = False
+        ordinary_boundary_entered = False
         try:
             upgrade = prepared_database_upgrade(manifest)
             if manifest.paired_database_upgrade is not None:
@@ -2908,15 +3076,36 @@ def activate(manifest: Manifest) -> str:
                     _current_schema_registry(manifest), source_kind=manifest.source_kind, manifest=manifest,
                 )
             exact_source128 = _protected_129(manifest)
-            if exact_source128:
+            if exact_source128 or ordinary_forward:
                 disrupted = True
-                quarantined_previous_plist = quarantine_paired_plist(manifest)
+                quarantined_previous_plist = (
+                    quarantine_ordinary_target_plist(manifest)
+                    if ordinary_forward
+                    else quarantine_paired_plist(manifest)
+                )
                 if quarantined_previous_plist is None:
                     raise ActivationError("prepared predecessor plist is unavailable")
                 if sha256(quarantined_previous_plist) != manifest.rollback_plist_sha256:
                     raise ActivationError("captured predecessor plist checksum mismatch")
             old_pid = launchctl.stop()
             disrupted = True
+            if ordinary_forward:
+                state, pid = launchctl.inspect()
+                if state != "not_loaded" or pid is not None:
+                    raise ActivationError("ordinary predecessor absence is unconfirmed")
+                assert_ordinary_database_exclusive(manifest)
+                ordinary_plan = ordinary_forward_plan(manifest)
+                if not ordinary_plan.pending:
+                    raise ActivationError(
+                        "ordinary forward history no longer has a pending migration"
+                    )
+                write_status(
+                    manifest,
+                    "ordinary_preboundary_stopped",
+                    recovery_mode=ORDINARY_PREPARED,
+                    forward_plan=ordinary_plan,
+                    finalization_pending=True,
+                )
             if exact_source128:
                 quarantine_source128_target(manifest)
                 state, pid = launchctl.inspect()
@@ -2966,16 +3155,33 @@ def activate(manifest: Manifest) -> str:
                     committed_diagnostic="irreversible database migration committed; candidate start and publication pending",
                 )
             if upgrade is None:
-                commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
-                if ordinary_forward_only:
+                if ordinary_forward:
+                    if os.path.lexists(manifest.target_plist):
+                        raise ActivationError("ordinary persistent target plist must remain quarantined")
+                else:
+                    commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
+                if ordinary_plan is not None and ordinary_plan.pending:
+                    assert_ordinary_database_exclusive(manifest)
+                    stopped_plan = ordinary_forward_plan(manifest)
+                    if stopped_plan != ordinary_plan:
+                        raise ActivationError("ordinary source ledger changed after stop")
+                    ordinary_plan = stopped_plan
                     write_status(
                         manifest,
-                        "candidate_may_migrate",
+                        "ordinary_source_proven",
+                        recovery_mode=ORDINARY_PREPARED,
+                        forward_plan=ordinary_plan,
                         finalization_pending=True,
-                        committed_diagnostic="candidate startup may commit irreversible forward migration or initialization",
                     )
-                    ordinary_candidate_started = True
-                launchctl.start(old_pid)
+                    verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "ordinary candidate binary")
+                    write_status(manifest, "candidate_may_migrate", recovery_mode=ORDINARY_BOUNDARY,
+                                 forward_plan=ordinary_plan, finalization_pending=True)
+                    ordinary_boundary_entered = True
+                    recover_ordinary_boundary(manifest, ordinary_plan)
+                    launchctl.start(old_pid, plist_path=manifest.candidate_plist)
+                    require_loaded_plist(manifest, launchctl, candidate_plist)
+                else:
+                    launchctl.start(old_pid)
             else:
                 if manifest.current_schema_upgrade is not None:
                     assert_database_exclusive(manifest)
@@ -2993,6 +3199,28 @@ def activate(manifest: Manifest) -> str:
             if exact_source128:
                 require_loaded_plist(manifest, launchctl, candidate_plist)
             wait_for_identity(manifest, manifest.expected)
+            if ordinary_forward:
+                try:
+                    atomic_write(
+                        Path(manifest.deployed_sha_path),
+                        (manifest.source_commit + "\n").encode(),
+                        0o600,
+                    )
+                    write_status(
+                        manifest,
+                        "committed",
+                        recovery_mode=ORDINARY_PROVEN,
+                        forward_plan=ordinary_plan,
+                        finalization_pending=True,
+                        committed_diagnostic="persistent launchd publication pending",
+                    )
+                    commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
+                    write_status(manifest, "committed")
+                except BaseException:
+                    retain_ordinary_startup_fence(manifest)
+                    raise
+                committed_durable = True
+                return "committed"
             if exact_source128:
                 atomic_write(
                     Path(manifest.deployed_sha_path),
@@ -3057,7 +3285,27 @@ def activate(manifest: Manifest) -> str:
                 except Exception:
                     pass
                 return "committed"
-            if ordinary_forward_only and ordinary_candidate_started:
+            if not ordinary_boundary_entered and ordinary_forward:
+                try:
+                    retained = read_status(manifest)
+                    ordinary_boundary_entered = (
+                        retained.get("recovery_mode") in {ORDINARY_BOUNDARY, ORDINARY_PROVEN}
+                        and retained.get("state") in {
+                            "candidate_may_migrate",
+                            "ordinary_migration_proven",
+                            "ordinary_activation_failed_forward_only",
+                        }
+                    )
+                except (OSError, ValueError, TypeError):
+                    ordinary_boundary_entered = True
+            if ordinary_boundary_entered:
+                retained_phase = ORDINARY_BOUNDARY
+                try:
+                    retained_phase = read_status(manifest).get("recovery_mode")
+                except (OSError, ValueError, TypeError):
+                    pass
+                if retained_phase not in {ORDINARY_BOUNDARY, ORDINARY_PROVEN}:
+                    retained_phase = ORDINARY_BOUNDARY
                 teardown_failure = None
                 try:
                     launchctl.stop()
@@ -3066,13 +3314,19 @@ def activate(manifest: Manifest) -> str:
                         raise ActivationError("forward candidate remains loaded after failed activation")
                 except Exception as teardown_exc:
                     teardown_failure = str(teardown_exc)
+                try:
+                    retain_ordinary_startup_fence(manifest)
+                except Exception as fence_exc:
+                    teardown_failure = "; ".join(filter(None, (teardown_failure, str(fence_exc))))
                 write_status(
                     manifest,
                     "ordinary_activation_failed_forward_only",
                     failure=failure,
                     rollback_failure=teardown_failure,
+                    recovery_mode=retained_phase,
+                    forward_plan=ordinary_plan,
                     finalization_pending=True,
-                    committed_diagnostic="candidate may have committed migrations or initialization; predecessor launch is forbidden",
+                    committed_diagnostic="ordinary forward boundary crossed; predecessor launch is forbidden",
                 )
                 return "ordinary_activation_failed_forward_only"
             if (
@@ -3089,6 +3343,11 @@ def activate(manifest: Manifest) -> str:
                     committed_diagnostic="offline migration may have committed database writes; predecessor rollback is forbidden",
                 )
                 return "activation_failed_database_committed"
+            if not disrupted and ordinary_forward:
+                write_status(manifest, "ordinary_preboundary_failed_stopped", failure=failure,
+                             recovery_mode=ORDINARY_PREPARED, forward_plan=ordinary_plan,
+                             finalization_pending=True)
+                return "ordinary_preboundary_failed_stopped"
             if not disrupted:
                 if capacity_reservation is not None and not database_snapshot:
                     try:
@@ -3111,6 +3370,19 @@ def activate(manifest: Manifest) -> str:
                 if manifest.current_schema_upgrade is not None:
                     raise CurrentSchemaPreconditionFailure(failure) from activation_exc
                 raise
+            if ordinary_forward:
+                try:
+                    verify_ordinary_preboundary(manifest, read_status(manifest))
+                    state, pid = launchctl.inspect()
+                    if state != "not_loaded" or pid is not None:
+                        raise ActivationError("ordinary predecessor absence is unconfirmed")
+                except Exception as proof_exc:
+                    write_status(
+                        manifest, "ordinary_preboundary_failed_stopped", failure=failure,
+                        rollback_failure=str(proof_exc), recovery_mode=ORDINARY_PREPARED,
+                        forward_plan=ordinary_plan, finalization_pending=True,
+                    )
+                    return "ordinary_preboundary_failed_stopped"
             try:
                 restore(
                     manifest,
@@ -3142,7 +3414,8 @@ def activate(manifest: Manifest) -> str:
                     else "ordinary_activation_failed_rollback_failed"
                 )
                 try:
-                    write_status(manifest, failed_state, failure=failure, rollback_failure=rollback_failure)
+                    write_status(manifest, failed_state, failure=failure, rollback_failure=rollback_failure,
+                                 finalization_pending=ordinary_forward)
                 except Exception as exc:
                     if isinstance(rollback_exc, VerifiedPredecessorFinalizationError):
                         raise VerifiedPredecessorFinalizationError(str(exc)) from exc
@@ -3178,6 +3451,34 @@ def quarantine_source128_target(manifest: Manifest) -> list[Path]:
         raise ActivationError("source128 persistent target keeps reappearing during bounded isolation")
     fsync_dir(target.parent)
     return retained
+
+
+def retain_ordinary_startup_fence(manifest: Manifest) -> None:
+    target = Path(manifest.target_plist)
+    if not os.path.lexists(target):
+        fsync_dir(target.parent)
+        return
+    expected = {manifest.candidate_plist_sha256, manifest.rollback_plist_sha256}
+    expected.discard(None)
+    if target.is_symlink() or not target.is_file() or sha256(target) not in expected:
+        raise ActivationError("ordinary persistent target is not a retained transaction plist")
+    target.unlink()
+    fsync_dir(target.parent)
+
+
+def quarantine_ordinary_target_plist(manifest: Manifest) -> Optional[Path]:
+    target = Path(manifest.target_plist)
+    rollback = Path(manifest.rollback_plist) if manifest.rollback_plist is not None else None
+    if rollback is None or manifest.rollback_plist_sha256 is None:
+        raise ActivationError("ordinary predecessor plist evidence is unavailable")
+    verify_staged(str(rollback), manifest.rollback_plist_sha256, "ordinary predecessor plist")
+    if target.is_symlink():
+        raise ActivationError("ordinary target plist must not be a symlink")
+    if not target.exists() or sha256(target) != manifest.rollback_plist_sha256:
+        raise ActivationError("ordinary installed predecessor plist is unavailable")
+    target.unlink()
+    fsync_dir(target.parent)
+    return rollback
 
 
 def quarantine_paired_plist(manifest: Manifest) -> Optional[Path]:
@@ -4416,6 +4717,178 @@ def finalize_paired(manifest: Manifest, *, current_schema: bool = False) -> str:
         return "committed"
 
 
+def retained_ordinary_plan(manifest: Manifest, status: dict) -> OrdinaryForwardPlan:
+    ordinary = manifest.ordinary_forward_migration
+    assert ordinary is not None
+    registry = verify_staged(ordinary.migration_registry_path, ordinary.migration_registry_sha256,
+                             "ordinary candidate migration registry")
+    target = migration_registry(registry, qualified_current_target=False)
+    source_raw = status.get("forward_source_ledger")
+    if not isinstance(source_raw, list) or any(
+        not isinstance(item, list) or len(item) != 2 or type(item[0]) is not int or
+        not isinstance(item[1], str) for item in source_raw
+    ):
+        raise ActivationError("forward source ledger evidence is malformed")
+    source = tuple((item[0], item[1]) for item in source_raw)
+    if status.get("forward_target_ledger") != [list(item) for item in target]:
+        raise ActivationError("forward history differs from candidate registry")
+    source_digest = status.get("forward_source_digest")
+    if not isinstance(source_digest, str) or re.fullmatch(r"[0-9a-f]{64}", source_digest) is None:
+        raise ActivationError("forward source digest evidence is malformed")
+    history = forward_history_plan(source, target)
+    plan = OrdinaryForwardPlan(history.source, history.target, source_digest)
+    if not plan.pending:
+        raise ActivationError("forward recovery evidence has no pending migration")
+    return plan
+
+
+def verify_ordinary_preboundary(manifest: Manifest, status: dict, *, stopped: bool = True) -> OrdinaryForwardPlan:
+    if (status.get("state") not in ORDINARY_PREBOUNDARY_STATES or
+            status.get("recovery_mode") != ORDINARY_PREPARED or
+            status.get("finalization_pending") is not True):
+        raise ActivationError("preboundary recovery requires typed retained phase")
+    claim = Path(manifest.active_path)
+    if not claim.is_file() or claim.is_symlink() or claim.read_text().strip() != manifest.transaction_id:
+        raise ActivationError("preboundary recovery claim mismatch")
+    validate_pre_disruption_handoff(manifest)
+    if manifest.previous is None:
+        raise ActivationError("preboundary predecessor identity is missing")
+    plan = retained_ordinary_plan(manifest, status)
+    if stopped:
+        assert_ordinary_database_exclusive(manifest)
+        database = Path(manifest.ordinary_forward_migration.database_path)
+        validate_database(database)
+        if database_ledger(database) != plan.source or database_logical_digest(database) != plan.source_digest:
+            raise ActivationError("ordinary preboundary source changed; predecessor restart forbidden")
+    for target, candidate_hash, predecessor_hash, absent_is_fenced in (
+        (manifest.target_binary, manifest.candidate_binary_sha256, manifest.rollback_binary_sha256, False),
+        (manifest.target_plist, manifest.candidate_plist_sha256, manifest.rollback_plist_sha256, True),
+    ):
+        if absent_is_fenced and not os.path.lexists(target):
+            continue
+        if not any(
+            expected and _matches_staged(target, expected)
+            for expected in (candidate_hash, predecessor_hash)
+        ):
+            raise ActivationError("preboundary installed artifact is not the retained candidate or predecessor")
+    if manifest.previous_deployed_sha is not None:
+        path = Path(manifest.deployed_sha_path)
+        if path.is_symlink() or not path.is_file() or path.read_text().strip() != manifest.previous_deployed_sha:
+            raise ActivationError("preboundary predecessor deployed identity changed")
+    return plan
+
+
+def _matches_staged(path: str, expected: str) -> bool:
+    try:
+        verify_staged(path, expected, "installed ordinary artifact")
+        return True
+    except ActivationError:
+        return False
+
+
+def recover_ordinary_preboundary(manifest: Manifest, status: dict) -> str:
+    verify_ordinary_preboundary(manifest, status, stopped=False)
+    launchctl = Launchctl(manifest)
+    launchctl.stop()
+    state, pid = launchctl.inspect()
+    if state != "not_loaded" or pid is not None:
+        raise ActivationError("preboundary target absence is unconfirmed")
+    # Stopping can race a last write from the old process; prove exclusivity and source again.
+    verify_ordinary_preboundary(manifest, status)
+    try:
+        restore(manifest, launchctl, database_snapshot=False)
+        finalize_verified_predecessor(manifest, "ordinary preboundary activation interrupted")
+        return "activation_failed_rolled_back"
+    except Exception as exc:
+        cleanup_failures: list[str] = []
+        try:
+            launchctl.stop()
+            state, pid = launchctl.inspect()
+            if state != "not_loaded" or pid is not None:
+                raise ActivationError("failed predecessor remains loaded")
+        except Exception as stop_exc:
+            cleanup_failures.append(f"stop predecessor: {stop_exc}")
+        try:
+            retain_ordinary_startup_fence(manifest)
+        except Exception as fence_exc:
+            cleanup_failures.append(f"persistent fence: {fence_exc}")
+        failed_state = (
+            "ordinary_activation_failed_rollback_failed"
+            if cleanup_failures
+            else "ordinary_preboundary_failed_stopped"
+        )
+        write_status(
+            manifest,
+            failed_state,
+            failure=str(exc),
+            rollback_failure="; ".join(cleanup_failures) or None,
+            recovery_mode=ORDINARY_PREPARED,
+            finalization_pending=True,
+        )
+        raise
+
+
+def finalize_ordinary_publication(manifest: Manifest, status: dict) -> str:
+    if (
+        status.get("state") != "committed"
+        or status.get("finalization_pending") is not True
+        or status.get("recovery_mode") != ORDINARY_PROVEN
+    ):
+        raise ActivationError("ordinary publication finalization evidence is invalid")
+    plan = retained_ordinary_plan(manifest, status)
+    ordinary = manifest.ordinary_forward_migration
+    if ordinary is None:
+        raise ActivationError("ordinary publication requires retained migration evidence")
+    validate_pre_disruption_handoff(manifest)
+    verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "forward staged candidate binary")
+    verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "forward staged candidate plist")
+    verify_staged(manifest.target_binary, manifest.candidate_binary_sha256, "forward candidate binary")
+    database = Path(ordinary.database_path)
+    validate_database(database)
+    if database_ledger(database) != plan.target:
+        raise ActivationError("ordinary publication target ledger changed")
+    target = Path(manifest.target_plist)
+    if os.path.lexists(target):
+        verify_staged(str(target), manifest.candidate_plist_sha256, "forward candidate plist")
+    launchctl = Launchctl(manifest)
+    try:
+        state, pid = launchctl.inspect()
+        if state == "not_loaded" and pid is None:
+            launchctl.start(None, plist_path=manifest.candidate_plist)
+        else:
+            require_loaded_plist(manifest, launchctl, Path(manifest.candidate_plist))
+        wait_for_identity(manifest, manifest.expected)
+        if not os.path.lexists(target):
+            publication = prepare_atomic_install(Path(manifest.candidate_plist), target, 0o600)
+            commit_atomic_install(publication, target)
+        atomic_write(
+            Path(manifest.deployed_sha_path),
+            (manifest.source_commit + "\n").encode(),
+            0o600,
+        )
+        write_status(manifest, "committed")
+        return "committed"
+    except BaseException as publication_exc:
+        cleanup_failures: list[str] = []
+        try:
+            launchctl.stop()
+            state, pid = launchctl.inspect()
+            if state != "not_loaded" or pid is not None:
+                raise ActivationError("publication candidate remains loaded")
+        except Exception as stop_exc:
+            cleanup_failures.append(f"stop candidate: {stop_exc}")
+        try:
+            retain_ordinary_startup_fence(manifest)
+        except Exception as fence_exc:
+            cleanup_failures.append(f"persistent fence: {fence_exc}")
+        if cleanup_failures:
+            raise ActivationError(
+                "ordinary publication recovery could not re-establish its fence: "
+                + "; ".join(cleanup_failures)
+            ) from publication_exc
+        raise
+
+
 def resume_forward(manifest: Manifest) -> str:
     with Path(manifest.lock_path).open("a+") as lock:
         try:
@@ -4426,14 +4899,6 @@ def resume_forward(manifest: Manifest) -> str:
         validate_manifest_mode(manifest)
         if manifest.ordinary_forward_migration is None:
             raise ActivationError("forward recovery requires an ordinary forward transaction")
-        ordinary = manifest.ordinary_forward_migration
-        registry = verify_staged(ordinary.migration_registry_path, ordinary.migration_registry_sha256, "ordinary candidate migration registry")
-        target = ordinary_forward_target(ordinary, registry)
-        if ordinary.migration_registry_sha256 == ORDINARY_SOURCE129_TARGET131_REGISTRY_SHA256:
-            ledger = database_ledger(Path(ordinary.database_path))
-            if ledger not in tuple(target[:length] for length in range(len(target) - 2, len(target) + 1)):
-                raise ActivationError("forward recovery requires exact source129, partial130 or target131 ledger")
-            validate_database(Path(ordinary.database_path))
         old_helper = subprocess.run(
             ["launchctl", "print", f"gui/{manifest.uid}/{manifest.helper_label}"],
             capture_output=True,
@@ -4447,28 +4912,69 @@ def resume_forward(manifest: Manifest) -> str:
             raise ActivationError("activation helper absence unconfirmed")
         status = read_status(manifest)
         validate_status_manifest_mode(manifest, status)
+        claim = Path(manifest.active_path)
+        if not claim.is_file() or claim.is_symlink() or claim.read_text().strip() != manifest.transaction_id:
+            raise ActivationError("forward recovery claim mismatch")
+        if status.get("state") == "committed":
+            return finalize_ordinary_publication(manifest, status)
+        if status.get("state") in ORDINARY_PREBOUNDARY_STATES:
+            return recover_ordinary_preboundary(manifest, status)
         if status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {
             "candidate_may_migrate",
+            "ordinary_migration_proven",
             "ordinary_activation_failed_forward_only",
         }:
             raise ActivationError("forward recovery requires matching unresolved status")
-        claim = Path(manifest.active_path)
-        if not claim.exists() or claim.read_text().strip() != manifest.transaction_id:
-            raise ActivationError("forward recovery claim mismatch")
+        phase = status.get("recovery_mode")
+        if phase not in {ORDINARY_BOUNDARY, ORDINARY_PROVEN} or status.get("finalization_pending") is not True:
+            raise ActivationError("forward recovery requires unambiguous ordinary phase evidence")
+        ordinary = manifest.ordinary_forward_migration
+        plan = retained_ordinary_plan(manifest, status)
+        target = plan.target
+        validate_pre_disruption_handoff(manifest)
+        verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "forward staged candidate binary")
+        verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "forward staged candidate plist")
         verify_staged(manifest.target_binary, manifest.candidate_binary_sha256, "forward candidate binary")
-        verify_staged(manifest.target_plist, manifest.candidate_plist_sha256, "forward candidate plist")
+        if os.path.lexists(manifest.target_plist):
+            verify_staged(manifest.target_plist, manifest.candidate_plist_sha256, "forward candidate plist")
         launchctl = Launchctl(manifest)
-        state, pid = launchctl.inspect()
-        if state != "not_loaded" or pid is not None:
-            raise ActivationError("forward recovery requires a stopped target")
         try:
-            launchctl.start(None)
+            state, pid = launchctl.inspect()
+            if state != "not_loaded" or pid is not None:
+                require_loaded_plist(manifest, launchctl, Path(manifest.candidate_plist))
+                wait_for_identity(manifest, manifest.expected)
+                launchctl.stop()
+                state, pid = launchctl.inspect()
+                if state != "not_loaded" or pid is not None:
+                    raise ActivationError("forward recovery could not stop the proven candidate")
+                retain_ordinary_startup_fence(manifest)
+            if phase == ORDINARY_BOUNDARY:
+                recover_ordinary_boundary(manifest, plan)
+            else:
+                assert_ordinary_database_exclusive(manifest)
+                validate_database(Path(ordinary.database_path))
+                if database_ledger(Path(ordinary.database_path)) != target:
+                    raise ActivationError("proven ordinary target ledger changed")
+            launchctl.start(None, plist_path=manifest.candidate_plist)
+            require_loaded_plist(manifest, launchctl, Path(manifest.candidate_plist))
             wait_for_identity(manifest, manifest.expected)
             atomic_write(
                 Path(manifest.deployed_sha_path),
                 (manifest.source_commit + "\n").encode(),
                 0o600,
             )
+            write_status(
+                manifest,
+                "committed",
+                recovery_mode=ORDINARY_PROVEN,
+                forward_plan=plan,
+                finalization_pending=True,
+                committed_diagnostic="persistent launchd publication pending",
+            )
+            publication = prepare_atomic_install(
+                Path(manifest.candidate_plist), Path(manifest.target_plist), 0o600
+            )
+            commit_atomic_install(publication, Path(manifest.target_plist))
             write_status(manifest, "committed")
         except BaseException as exc:
             teardown_failure = None
@@ -4479,11 +4985,17 @@ def resume_forward(manifest: Manifest) -> str:
                     raise ActivationError("forward candidate teardown is unconfirmed")
             except Exception as teardown_exc:
                 teardown_failure = str(teardown_exc)
+            try:
+                retain_ordinary_startup_fence(manifest)
+            except Exception as fence_exc:
+                teardown_failure = "; ".join(filter(None, (teardown_failure, str(fence_exc))))
             write_status(
                 manifest,
                 "ordinary_activation_failed_forward_only",
                 failure=str(exc),
                 rollback_failure=teardown_failure,
+                recovery_mode=phase,
+                forward_plan=plan,
                 finalization_pending=True,
                 committed_diagnostic="forward candidate recovery failed; predecessor launch remains forbidden",
             )
@@ -4601,6 +5113,7 @@ def main() -> int:
     parser.add_argument(
         "command",
         nargs="?",
+        default="activate",
         choices=[
             "activate",
             "cleanup-paired",
@@ -4651,6 +5164,7 @@ def main() -> int:
                     pass
     manifest = None
     verified_helper_label: Optional[str] = None
+    preserve_owner_helper = False
     try:
         manifest_path = Path(args.manifest)
         if args.command in {"cleanup-paired", "cleanup-current"} and (
@@ -4703,7 +5217,7 @@ def main() -> int:
                 and state == "precondition_failed"
             )
             or (
-                args.command in {"recover-paired", "recover-current"}
+                args.command in {"recover-paired", "recover-current", "resume-forward"}
                 and state == "activation_failed_rolled_back"
             )
         ) else 1
@@ -4715,6 +5229,9 @@ def main() -> int:
             "finalize-current",
             "resume-forward",
         }
+        if manifest is not None and manifest.ordinary_forward_migration is not None:
+            protected_recovery.add("activate")
+            preserve_owner_helper = args.command in {"activate", "resume-forward"}
         if (
             manifest is not None
             and prepared_database_upgrade(manifest) is None
@@ -4810,7 +5327,8 @@ def main() -> int:
         return 1
     finally:
         if (
-            args.command not in {"finalize-paired", "finalize-current"}
+            not preserve_owner_helper
+            and args.command not in {"finalize-paired", "finalize-current"}
             and verified_helper_label is not None
         ):
             request_helper_bootout(args.uid, verified_helper_label)

@@ -12850,7 +12850,14 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
         not isinstance(forward, dict)
         or not _deploy_status_matches_manifest(staging, payload, status, DeployManifestKind.ORDINARY_FORWARD)
         or status.get("transaction_id") != transaction_id
-        or status.get("state") not in {"candidate_may_migrate", "ordinary_activation_failed_forward_only"}
+        or status.get("state") not in {
+            "committed",
+            "ordinary_preboundary_prepared", "ordinary_preboundary_stopped",
+            "ordinary_source_proven", "ordinary_preboundary_failed_stopped",
+            "ordinary_activation_failed_rollback_failed",
+            "candidate_may_migrate", "ordinary_migration_proven",
+            "ordinary_activation_failed_forward_only",
+        }
         or _deploy_claim_owner() != transaction_id
     ):
         raise SystemExit("forward recovery requires a retained unresolved ordinary transaction")
@@ -12872,7 +12879,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     )
     if result.returncode != 0:
         raise SystemExit(f"forward recovery failed; claim retained: {result.stderr.strip()}")
-    print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
+    print(f"Forward recovery completed: {transaction_id}.")
 
 
 def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:
@@ -13116,6 +13123,20 @@ def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = No
             ) from exc
     env_file = _load_env_file(env)
     return env, env_file
+
+
+def _prepared_launchd_deploy_status(manifest: dict, prepared_mode: str | None) -> dict:
+    identity = manifest["expected"]
+    return {
+        "transaction_id": manifest["transaction_id"], "state": "prepared",
+        "preparing_pid": os.getpid(), "source_kind": manifest["source_kind"],
+        "prepared_mode": prepared_mode,
+        "source_commit": manifest["source_commit"],
+        "release_commit": manifest["release_commit"], "release_tag": manifest["release_tag"],
+        "expected_version": identity["version"], "expected_git_sha": identity["git_sha"],
+        "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
+        "failure": None, "rollback_failure": None, "finalization_pending": False,
+    }
 
 
 def launchd_prod_deploy(
@@ -13505,15 +13526,7 @@ def launchd_prod_deploy(
             with artifact.open("rb") as stream:
                 os.fsync(stream.fileno())
         _fsync_directory(staging)
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "prepared",
-            "preparing_pid": os.getpid(), "source_kind": source_kind,
-            "prepared_mode": prepared_mode,
-            "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
-            "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
-            "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
-            "failure": None, "rollback_failure": None,
-        })
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, _prepared_launchd_deploy_status(manifest, prepared_mode))
         _ensure_newsyslog_config()
         bootstrap_attempted = True
         result = subprocess.run(
