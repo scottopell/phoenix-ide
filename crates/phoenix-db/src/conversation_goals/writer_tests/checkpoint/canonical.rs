@@ -57,7 +57,7 @@ async fn mixed_pending_round_preserves_nonobject_display_with_duration_atomicall
         assert_eq!(retained["messages"].as_array().unwrap().len(), 3);
         assert!(retained["replay"].is_object());
         assert_eq!(
-            retained["state"]["conv_state"],
+            retained["state"][0],
             serde_json::to_string(&round.state).unwrap()
         );
         assert_eq!(receipt_count(&db).await, 1);
