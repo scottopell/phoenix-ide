@@ -12879,7 +12879,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     )
     if result.returncode != 0:
         raise SystemExit(f"forward recovery failed; claim retained: {result.stderr.strip()}")
-    print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
+    print(f"Forward recovery completed: {transaction_id}.")
 
 
 def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:

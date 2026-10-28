@@ -5962,10 +5962,21 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
                         "source_kind": "local_head", "prepared_mode": None,
                     }))
                     run.reset_mock()
+                    run.side_effect = None
                     if state in admitted:
-                        dev.cmd_prod_resume_forward(transaction_id)
+                        run.side_effect = [
+                            subprocess.CompletedProcess([], 0, "", ""),
+                            subprocess.CompletedProcess(
+                                [], 0, "activation_failed_rolled_back\n", ""
+                            ),
+                        ]
+                        with mock.patch("builtins.print") as print_mock:
+                            dev.cmd_prod_resume_forward(transaction_id)
                         self.assertEqual(run.call_count, 2)
                         self.assertEqual(run.call_args.args[0][2], "resume-forward")
+                        print_mock.assert_called_once_with(
+                            "Forward recovery completed: ordinary-tx."
+                        )
                     else:
                         with self.assertRaisesRegex(SystemExit, "retained unresolved ordinary transaction"):
                             dev.cmd_prod_resume_forward(transaction_id)
