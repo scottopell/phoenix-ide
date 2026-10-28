@@ -14,11 +14,47 @@ use crate::runtime::RuntimeManager;
 
 pub(super) struct GoalCommandService {
     runtime: Arc<RuntimeManager>,
+    #[cfg(test)]
+    read_publication_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    receipt_lookup_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl GoalCommandService {
     pub(super) fn new(runtime: Arc<RuntimeManager>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            #[cfg(test)]
+            read_publication_barrier: None,
+            #[cfg(test)]
+            receipt_lookup_barrier: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_read_publication_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.read_publication_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_receipt_lookup_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.receipt_lookup_barrier = Some(barrier);
+        self
+    }
+
+    fn read_result<T>(&self, result: Result<T, AppError>) -> Result<T, AppError> {
+        let _publication = self
+            .runtime
+            .acquire_local_authority_pass()
+            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
+        result
     }
 
     pub(super) async fn current(
@@ -29,11 +65,18 @@ impl GoalCommandService {
             .runtime
             .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-        self.runtime
+        let result = self
+            .runtime
             .db()
             .conversation_goal_current_entry(owner)
             .await
-            .map_err(goal_error)
+            .map_err(goal_error);
+        #[cfg(test)]
+        if let Some(barrier) = &self.read_publication_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        self.read_result(result)
     }
 
     pub(super) async fn history(
@@ -45,11 +88,18 @@ impl GoalCommandService {
             .runtime
             .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-        self.runtime
+        let result = self
+            .runtime
             .db()
             .conversation_goal_history(owner, after)
             .await
-            .map_err(goal_error)
+            .map_err(goal_error);
+        #[cfg(test)]
+        if let Some(barrier) = &self.read_publication_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        self.read_result(result)
     }
 
     pub(super) fn established_receipt(
@@ -102,6 +152,11 @@ impl GoalCommandService {
             .await
             .map_err(crate::api::product_conversations::db_to_app)?;
         let transcript = ordinary.latest_transcript_row_id;
+        #[cfg(test)]
+        if let Some(barrier) = &self.receipt_lookup_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         if let Some(receipt) = db
             .retained_user_goal_command(&command, &transcript)
             .await

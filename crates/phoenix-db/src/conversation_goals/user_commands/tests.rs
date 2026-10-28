@@ -199,6 +199,126 @@ async fn busy_receipt_uses_live_owner_after_sampled_transcript_continues_and_ret
 }
 
 #[tokio::test]
+async fn retained_accepted_retry_uses_live_owner_after_sampled_transcript_continues() {
+    let db = fixture().await;
+    let (sampled_transcript, owner) = ordinary(&db, "accepted-retry-after-continuation").await;
+    let mut input = command(owner.clone());
+    let receipt = db
+        .apply_user_goal_command(&input, &sampled_transcript, at(), || {
+            panic!("initial command must remain classified");
+        })
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&receipt.result, GoalUserResult::Accepted { .. }));
+    db.update_conversation_state(
+        &sampled_transcript,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "continue before retained accepted retry".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let crate::ContinueOutcome::Created(successor) =
+        db.continue_conversation(&sampled_transcript).await.unwrap()
+    else {
+        panic!("continuation must create a new live transcript");
+    };
+    assert_ne!(successor.id, sampled_transcript);
+    assert_eq!(successor.product_conversation_id, owner);
+    let before = counts(&db).await;
+    assert_eq!(
+        db.retained_user_goal_command(&input, &sampled_transcript)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    assert_eq!(
+        db.retained_user_goal_command(&input, &successor.id)
+            .await
+            .unwrap(),
+        Some(receipt)
+    );
+    input.change = GoalUserChange::Create {
+        objective: GoalText::parse("conflicting accepted retry after continuation").unwrap(),
+    };
+    assert!(matches!(
+        db.retained_user_goal_command(&input, &sampled_transcript)
+            .await,
+        Err(GoalDbError::RetryConflict)
+    ));
+    assert_eq!(counts(&db).await, before);
+}
+
+#[tokio::test]
+async fn new_command_stale_sample_has_no_receipt_then_commits_on_live_successor() {
+    let db = fixture().await;
+    let (sampled_transcript, owner) = ordinary(&db, "new-command-after-continuation").await;
+    let input = command(owner.clone());
+    db.update_conversation_state(
+        &sampled_transcript,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "continue before new command receipt lookup".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let crate::ContinueOutcome::Created(successor) =
+        db.continue_conversation(&sampled_transcript).await.unwrap()
+    else {
+        panic!("continuation must create a new live transcript");
+    };
+    assert_ne!(successor.id, sampled_transcript);
+    assert_eq!(successor.product_conversation_id, owner);
+    let before = counts(&db).await;
+    assert!(db
+        .retained_user_goal_command(&input, &sampled_transcript)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.apply_user_goal_command(&input, &sampled_transcript, at(), || {
+            panic!("stale write target must remain classified");
+        })
+        .await
+        .established()
+        .unwrap(),
+        Err(GoalDbError::TargetChanged)
+    ));
+    assert_eq!(counts(&db).await, before);
+    let receipt = db
+        .apply_user_goal_command(&input, &successor.id, at(), || {
+            panic!("live successor command must remain classified");
+        })
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&receipt.result, GoalUserResult::Accepted { .. }));
+    let after = counts(&db).await;
+    assert_eq!(after.0, before.0 + 1);
+    assert_eq!(after.1, before.1 + 1);
+    assert_eq!(after.6, before.6 + 1);
+    assert_eq!(
+        db.retained_user_goal_command(&input, &sampled_transcript)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    let retry = db
+        .apply_user_goal_command(&input, &successor.id, at(), || {
+            panic!("exact successor retry must remain classified");
+        })
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry, receipt);
+    assert_eq!(counts(&db).await, after);
+}
+
+#[tokio::test]
 async fn conflicting_retry_classification_after_lost_rollback_ack_is_nonfatal() {
     let db = fixture().await;
     let (transcript, owner) = ordinary(&db, "conflicting-retry-classification").await;

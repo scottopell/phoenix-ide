@@ -231,17 +231,20 @@ async fn reject_tx(
 }
 
 impl Database {
-    /// Read an exact user goal-command receipt after revalidating the ordinary owner's live target.
+    /// Read an exact user goal-command receipt with the ordinary owner's live target in one snapshot.
+    ///
+    /// The transcript argument is a prior caller sample; this read resolves the live target itself.
     ///
     /// # Errors
     /// Rejects unavailable owners, changed request payloads and malformed or missing schema.
     pub async fn retained_user_goal_command(
         &self,
         input: &GoalUserCommand,
-        expected_transcript: &str,
+        _expected_transcript: &str,
     ) -> Result<Option<GoalUserReceipt>> {
         let mut tx = self.pool().begin().await?;
-        admission::require_target_tx(&mut tx, &input.owner, expected_transcript).await?;
+        let live = Self::get_ordinary_product_conversation_on(&mut tx, &input.owner).await?;
+        admission::require_target_tx(&mut tx, &input.owner, &live.latest_transcript_row_id).await?;
         let retained = retained_tx(&mut tx, input).await?;
         tx.commit().await?;
         Ok(retained)

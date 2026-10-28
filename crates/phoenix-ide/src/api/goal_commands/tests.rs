@@ -496,3 +496,198 @@ async fn classified_goal_domain_error_preserves_next_admission() {
         StatusCode::OK,
     );
 }
+
+async fn assert_inflight_goal_read_rejects_after_snapshot(history: bool) {
+    let fixture = Fixture::new().await;
+    fixture.create().await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone())
+        .with_read_publication_barrier(barrier.clone());
+    let read = async {
+        if history {
+            service
+                .history(&fixture.owner, GoalVersion::INITIAL)
+                .await
+                .map(|entries| entries.len())
+        } else {
+            service
+                .current(&fixture.owner)
+                .await
+                .map(|entry| usize::from(entry.is_some()))
+        }
+    };
+    let close = async {
+        barrier.wait().await;
+        let writer = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+        assert!(matches!(
+            writer.established_receipt(
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            ),
+            Err(crate::api::handlers::AppError::Internal(_))
+        ));
+        assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+        barrier.wait().await;
+    };
+    let (result, ()) = tokio::join!(read, close);
+    assert!(matches!(
+        result,
+        Err(crate::api::handlers::AppError::Internal(_))
+    ));
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .db()
+            .conversation_goal_history(&fixture.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn current_rechecks_authority_after_inflight_snapshot_before_publication() {
+    assert_inflight_goal_read_rejects_after_snapshot(false).await;
+}
+
+#[tokio::test]
+async fn history_rechecks_authority_after_inflight_snapshot_before_publication() {
+    assert_inflight_goal_read_rejects_after_snapshot(true).await;
+}
+
+async fn command_across_real_rollover(
+    fixture: &Fixture,
+    request: &Value,
+) -> Result<
+    phoenix_db::conversation_goals::user_commands::GoalUserReceipt,
+    crate::api::handlers::AppError,
+> {
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone())
+        .with_receipt_lookup_barrier(barrier.clone());
+    let command = service.command(
+        fixture.owner.clone(),
+        uuid::Uuid::parse_str(request["request_id"].as_str().unwrap()).unwrap(),
+        GoalVersion::INITIAL,
+        phoenix_db::conversation_goals::user_commands::GoalUserChange::Create {
+            objective: phoenix_core::domain::conversation_goal::GoalText::parse(
+                request["objective"].as_str().unwrap(),
+            )
+            .unwrap(),
+        },
+        crate::api::auth::OwnerAuthenticated,
+    );
+    let rollover = async {
+        barrier.wait().await;
+        let db = fixture.state.runtime.db();
+        db.update_conversation_state(
+            &fixture.transcript,
+            &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+                summary: "roll over between owner sample and receipt lookup".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let phoenix_db::ContinueOutcome::Created(successor) =
+            db.continue_conversation(&fixture.transcript).await.unwrap()
+        else {
+            panic!("continuation must create a successor");
+        };
+        assert_ne!(successor.id, fixture.transcript);
+        assert_eq!(successor.product_conversation_id, fixture.owner);
+        barrier.wait().await;
+    };
+    let (result, ()) = tokio::join!(command, rollover);
+    result
+}
+
+#[tokio::test]
+async fn accepted_retry_rollover_before_receipt_lookup_preserves_receipt_over_busy_gate() {
+    let fixture = Fixture::new().await;
+    let request = fixture.create().await;
+    let (status, expected) = fixture.call("POST", "", request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let _product_guard = fixture
+        .state
+        .runtime
+        .try_lock_product_message_admission(fixture.owner.as_str())
+        .await
+        .unwrap();
+    let receipt = command_across_real_rollover(&fixture, &request)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .db()
+            .conversation_goal_history(&fixture.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn new_command_rollover_before_receipt_lookup_commits_on_live_successor() {
+    let fixture = Fixture::new().await;
+    let request = create_request(0, "new command after rollover");
+    let receipt = command_across_real_rollover(&fixture, &request)
+        .await
+        .unwrap();
+    assert!(matches!(
+        &receipt.result,
+        phoenix_db::conversation_goals::user_commands::GoalUserResult::Accepted { .. }
+    ));
+    let (status, retry) = fixture.call("POST", "", request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(retry, serde_json::to_value(receipt).unwrap());
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .db()
+            .conversation_goal_history(&fixture.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn new_command_rollover_before_receipt_lookup_retains_durable_busy_refusal() {
+    let fixture = Fixture::new().await;
+    let request = create_request(0, "busy command after rollover");
+    let product_guard = fixture
+        .state
+        .runtime
+        .try_lock_product_message_admission(fixture.owner.as_str())
+        .await
+        .unwrap();
+    let receipt = command_across_real_rollover(&fixture, &request)
+        .await
+        .unwrap();
+    assert!(matches!(
+        &receipt.result,
+        phoenix_db::conversation_goals::user_commands::GoalUserResult::Rejected {
+            reason: phoenix_db::conversation_goals::user_commands::GoalUserRefusal::Busy,
+            ..
+        }
+    ));
+    drop(product_guard);
+    let (status, retry) = fixture.call("POST", "", request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(retry, serde_json::to_value(receipt).unwrap());
+    assert!(fixture
+        .state
+        .runtime
+        .db()
+        .conversation_goal_history(&fixture.owner, GoalVersion::INITIAL)
+        .await
+        .unwrap()
+        .is_empty());
+}
