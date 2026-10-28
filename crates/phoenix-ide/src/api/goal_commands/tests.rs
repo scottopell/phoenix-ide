@@ -405,3 +405,53 @@ async fn nonsettled_runtime_refuses_commands_and_unknown_product_targets_do_not_
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(fixture.snapshot().await, before);
 }
+
+#[tokio::test]
+async fn unclassified_goal_write_latches_fatal_and_blocks_next_admission() {
+    let fixture = Fixture::new().await;
+    let before = fixture.snapshot().await;
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+    assert!(service
+        .established_receipt(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,)
+        .is_err());
+    assert!(fixture
+        .state
+        .runtime
+        .acquire_local_authority_pass()
+        .is_err());
+    assert_eq!(
+        fixture
+            .call("POST", "", create_request(0, "must remain blocked"))
+            .await
+            .0,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    );
+    assert_eq!(fixture.snapshot().await, before);
+}
+
+#[tokio::test]
+async fn classified_goal_domain_error_preserves_next_admission() {
+    let fixture = Fixture::new().await;
+    let before = fixture.snapshot().await;
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+    assert!(service
+        .established_receipt(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                phoenix_db::conversation_goals::GoalDbError::RetryConflict,
+            )),
+        )
+        .is_err());
+    assert!(fixture.state.runtime.acquire_local_authority_pass().is_ok());
+    assert_eq!(fixture.snapshot().await, before);
+    assert_eq!(
+        fixture
+            .call(
+                "POST",
+                "",
+                create_request(0, "allowed after domain rejection")
+            )
+            .await
+            .0,
+        StatusCode::OK,
+    );
+}

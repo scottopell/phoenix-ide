@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use phoenix_db::workflow::LocalAuthorityResult;
+
 use phoenix_core::domain::conversation_goal::{GoalHistoryEntry, GoalTimestampUs, GoalVersion};
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::conversation_goals::user_commands::{
@@ -52,6 +54,24 @@ impl GoalCommandService {
             .map_err(goal_error)
     }
 
+    pub(super) fn established_receipt(
+        &self,
+        outcome: LocalAuthorityResult<
+            Result<GoalUserReceipt, phoenix_db::conversation_goals::GoalDbError>,
+        >,
+    ) -> Result<GoalUserReceipt, AppError> {
+        match outcome {
+            LocalAuthorityResult::DurableFactEstablished(result) => result.map_err(goal_error),
+            LocalAuthorityResult::DurableFactUnclassified => {
+                self.runtime
+                    .signal_fatal_local_authority("goal_command_result");
+                Err(AppError::Internal(
+                    "goal command durable result is unclassified".into(),
+                ))
+            }
+        }
+    }
+
     pub(super) async fn command(
         &self,
         owner: ProductConversationId,
@@ -98,10 +118,13 @@ impl GoalCommandService {
             .try_lock_product_message_admission(owner.as_str())
             .await
         else {
-            return db
-                .reject_busy_user_goal_command(&command, &transcript, at)
-                .await
-                .map_err(goal_error);
+            return self.established_receipt(
+                db.reject_busy_user_goal_command(&command, &transcript, at, || {
+                    self.runtime
+                        .signal_fatal_local_authority("goal_user_command_write")
+                })
+                .await,
+            );
         };
         // Resolve again under product admission: continuation can change the latest transcript.
         let transcript = db
@@ -111,13 +134,20 @@ impl GoalCommandService {
             .latest_transcript_row_id;
         let Some(_acceptance_guard) = self.runtime.try_lock_message_acceptance(&transcript).await
         else {
-            return db
-                .reject_busy_user_goal_command(&command, &transcript, at)
-                .await
-                .map_err(goal_error);
+            return self.established_receipt(
+                db.reject_busy_user_goal_command(&command, &transcript, at, || {
+                    self.runtime
+                        .signal_fatal_local_authority("goal_user_command_write")
+                })
+                .await,
+            );
         };
-        db.apply_user_goal_command(&command, &transcript, at)
-            .await
-            .map_err(goal_error)
+        self.established_receipt(
+            db.apply_user_goal_command(&command, &transcript, at, || {
+                self.runtime
+                    .signal_fatal_local_authority("goal_user_command_write")
+            })
+            .await,
+        )
     }
 }
