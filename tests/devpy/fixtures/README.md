@@ -14,3 +14,10 @@ Its uncompressed SHA-256 is
 `OrdinarySource129To131Tests` uses it for historical admission and recovery;
 the ambient target-140 registry is exercised separately as an unqualified
 interval that must be rejected before any service stop or start.
+
+`migrations-through-140-2d66.rs.gz` is the byte-exact
+`crates/phoenix-db/src/migrations.rs` git object from commit `2d66`, compressed
+with `gzip -n`. Its decompressed SHA-256 is
+`f2dd8cf9c30438ead4848d3fec21bd90813badc8928bf6f99dbae82d0e620dc4`.
+The prepared-upgrade tests use it to preserve the target-140 historical
+qualification case separately from the current migration registry.

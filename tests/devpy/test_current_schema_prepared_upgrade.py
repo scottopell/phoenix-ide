@@ -5742,12 +5742,7 @@ class OrdinarySource129To131Tests(unittest.TestCase):
                         with self.assertRaises(helper.ActivationError):
                             helper.ordinary_forward_policy_applies(manifest)
 
-    def test_actual_target140_registry_rejects_129_and_131_before_stop(self) -> None:
-        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
-        self.assertEqual(
-            helper.migration_registry(actual_registry, qualified_current_target=False)[-1][0],
-            140,
-        )
+    def assert_registry_rejects_129_and_131_before_stop(self, registry_source: bytes) -> None:
         for through in (129, 131):
             for source_kind in ("local_head", "published_release"):
                 for initial_status in (None, "prepared"):
@@ -5756,7 +5751,7 @@ class OrdinarySource129To131Tests(unittest.TestCase):
                         manifest = dataclasses.replace(self.ordinary_manifest(database), source_kind=source_kind)
                         ordinary = manifest.ordinary_forward_migration
                         registry = Path(ordinary.migration_registry_path)
-                        registry.write_bytes(actual_registry.read_bytes())
+                        registry.write_bytes(registry_source)
                         manifest = dataclasses.replace(manifest, ordinary_forward_migration=dataclasses.replace(
                             ordinary, migration_registry_sha256=helper.sha256(registry)))
                         status_path = Path(manifest.status_path)
@@ -5787,6 +5782,25 @@ class OrdinarySource129To131Tests(unittest.TestCase):
                         self.assertFalse(status["finalization_pending"])
                         self.assertIsNone(status["rollback_failure"])
                         self.assertIsNone(status["cleanup_failure"])
+
+    def test_historical_target140_registry_rejects_129_and_131_before_stop(self) -> None:
+        fixture = ROOT / "tests/devpy/fixtures/migrations-through-140-2d66.rs.gz"
+        historical_source = gzip.decompress(fixture.read_bytes())
+        historical_registry = self.root / "historical-target-140-migrations.rs"
+        historical_registry.write_bytes(historical_source)
+        self.assertEqual(
+            helper.sha256(historical_registry),
+            "f2dd8cf9c30438ead4848d3fec21bd90813badc8928bf6f99dbae82d0e620dc4",
+        )
+        self.assertEqual(
+            helper.migration_registry(historical_registry, qualified_current_target=False)[-1][0],
+            140,
+        )
+        self.assert_registry_rejects_129_and_131_before_stop(historical_source)
+
+    def test_actual_current_registry_rejects_129_and_131_before_stop(self) -> None:
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        self.assert_registry_rejects_129_and_131_before_stop(actual_registry.read_bytes())
 
     def test_changed_registry_and_source_names_reject_before_stop(self) -> None:
         for mutation in ("missing", "newer", "name", "bytes", "source"):
