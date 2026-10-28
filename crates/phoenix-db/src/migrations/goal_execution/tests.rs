@@ -120,17 +120,20 @@ async fn migration_141_requires_nonnegative_integer_microsecond_receipts() {
         ("9223372036854775808", false),
         ("1e30", false),
     ] {
-        let insert = format!(
+        let mut insert = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "INSERT INTO canonical_tool_round_receipts
              (conversation_id,assistant_message_id,selected_checkpoint_sha256,
               selected_state_updated_at_us,replay_kind)
-             VALUES (?,?,zeroblob(32),{value},'none')"
+             VALUES (",
         );
-        let outcome = sqlx::query(&insert)
-            .bind(&conversation.id)
-            .bind(&assistant.message_id)
-            .execute(db.pool())
-            .await;
+        insert
+            .push_bind(&conversation.id)
+            .push(",")
+            .push_bind(&assistant.message_id)
+            .push(",zeroblob(32),")
+            .push(value)
+            .push(",'none')");
+        let outcome = insert.build().execute(db.pool()).await;
         assert_eq!(outcome.is_ok(), accepted, "{value}: {outcome:?}");
         if accepted {
             let stored: (i64, String) = sqlx::query_as(
