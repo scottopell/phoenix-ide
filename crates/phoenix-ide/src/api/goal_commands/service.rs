@@ -25,11 +25,10 @@ impl GoalCommandService {
         &self,
         owner: &ProductConversationId,
     ) -> Result<Option<GoalHistoryEntry>, AppError> {
-        self.runtime
-            .db()
-            .get_ordinary_product_conversation(owner)
-            .await
-            .map_err(crate::api::product_conversations::db_to_app)?;
+        let _authority = self
+            .runtime
+            .acquire_local_authority_pass()
+            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
         self.runtime
             .db()
             .conversation_goal_current_entry(owner)
@@ -42,11 +41,10 @@ impl GoalCommandService {
         owner: &ProductConversationId,
         after: GoalVersion,
     ) -> Result<Vec<GoalHistoryEntry>, AppError> {
-        self.runtime
-            .db()
-            .get_ordinary_product_conversation(owner)
-            .await
-            .map_err(crate::api::product_conversations::db_to_app)?;
+        let _authority = self
+            .runtime
+            .acquire_local_authority_pass()
+            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
         self.runtime
             .db()
             .conversation_goal_history(owner, after)

@@ -15,6 +15,7 @@ enum UserCommitCut {
     LostAcknowledgement,
     RolledBack,
     LostClassification,
+    LostRollbackAcknowledgement,
 }
 use sqlx::Row;
 
@@ -300,7 +301,12 @@ impl Database {
         at: GoalTimestampUs,
         host_gate_busy: bool,
     ) -> Result<GoalUserReceipt> {
-        admission::require_target_tx(tx, &input.owner, expected_transcript).await?;
+        if host_gate_busy {
+            let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
+            admission::require_target_tx(tx, &input.owner, &live.latest_transcript_row_id).await?;
+        } else {
+            admission::require_target_tx(tx, &input.owner, expected_transcript).await?;
+        }
         if let Some(retained) = retained_tx(tx, input).await? {
             return Ok(retained);
         }
@@ -428,7 +434,8 @@ impl Database {
                     UserCommitCut::None
                     | UserCommitCut::LostAcknowledgement
                     | UserCommitCut::RolledBack
-                    | UserCommitCut::LostClassification => committed,
+                    | UserCommitCut::LostClassification
+                    | UserCommitCut::LostRollbackAcknowledgement => committed,
                 };
                 match committed {
                     Ok(()) => {
@@ -439,7 +446,11 @@ impl Database {
                 }
             }
             Err(error) => {
-                if tx.rollback().await.is_ok() {
+                let rolled_back = tx.rollback().await.is_ok();
+                #[cfg(test)]
+                let rolled_back =
+                    rolled_back && !matches!(cut, UserCommitCut::LostRollbackAcknowledgement);
+                if rolled_back {
                     authority.classified();
                     return LocalAuthorityResult::DurableFactEstablished(Err(error));
                 }
@@ -469,6 +480,10 @@ impl Database {
             (Ok(None), Ok(())) => {
                 authority.classified();
                 LocalAuthorityResult::DurableFactEstablished(Err(attempted))
+            }
+            (Err(GoalDbError::RetryConflict), Ok(())) => {
+                authority.classified();
+                LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::RetryConflict))
             }
             _ => LocalAuthorityResult::DurableFactUnclassified,
         }

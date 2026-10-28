@@ -430,6 +430,47 @@ async fn unclassified_goal_write_latches_fatal_and_blocks_next_admission() {
 }
 
 #[tokio::test]
+async fn goal_reads_reject_after_unclassified_write_closes_local_authority() {
+    let fixture = Fixture::new().await;
+    let (status, _) = fixture
+        .call(
+            "POST",
+            "",
+            create_request(0, "history before fatal closure"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for suffix in ["", "/history"] {
+        let (status, _) = fixture.call("GET", suffix, Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+    assert!(matches!(
+        service.established_receipt(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+        ),
+        Err(crate::api::handlers::AppError::Internal(_))
+    ));
+    assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+    for suffix in ["", "/history"] {
+        let (status, body) = fixture.call("GET", suffix, Value::Null).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.to_string().contains("history before fatal closure"));
+    }
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .db()
+            .conversation_goal_history(&fixture.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn classified_goal_domain_error_preserves_next_admission() {
     let fixture = Fixture::new().await;
     let before = fixture.snapshot().await;

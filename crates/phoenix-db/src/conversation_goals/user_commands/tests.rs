@@ -134,3 +134,120 @@ async fn uncertain_user_and_busy_writes_with_unclassifiable_lookup_signal_author
             .is_some());
     }
 }
+
+#[tokio::test]
+async fn busy_receipt_uses_live_owner_after_sampled_transcript_continues_and_retries_exactly() {
+    let db = fixture().await;
+    let (sampled_transcript, owner) = ordinary(&db, "busy-after-continuation").await;
+    let command = command(owner);
+    assert!(db
+        .retained_user_goal_command(&command, &sampled_transcript)
+        .await
+        .unwrap()
+        .is_none());
+    db.update_state(
+        &sampled_transcript,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "continue before busy refusal".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let crate::ContinueOutcome::Created(successor) =
+        db.continue_conversation(&sampled_transcript).await.unwrap()
+    else {
+        panic!("continuation must create a new live transcript");
+    };
+    assert_ne!(successor.id, sampled_transcript);
+    let mut expected_counts = counts(&db).await;
+    expected_counts.6 += 1;
+    let result = db
+        .reject_busy_user_goal_command(&command, &sampled_transcript, at(), || {
+            panic!("live busy refusal must be classified");
+        })
+        .await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(receipt)) = result else {
+        panic!("busy gate must retain a receipt across continuation");
+    };
+    assert!(matches!(
+        receipt.result,
+        GoalUserResult::Rejected {
+            reason: GoalUserRefusal::Busy,
+            ..
+        }
+    ));
+    let retry = db
+        .apply_user_goal_command(&command, &successor.id, at(), || {
+            panic!("exact retry must remain classified");
+        })
+        .await;
+    assert!(
+        matches!(retry, LocalAuthorityResult::DurableFactEstablished(Ok(ref stored)) if stored == &receipt)
+    );
+    assert_eq!(
+        db.retained_user_goal_command(&command, &successor.id)
+            .await
+            .unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(counts(&db).await, expected_counts);
+    assert!(db
+        .conversation_goal(&command.owner)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn conflicting_retry_classification_after_lost_rollback_ack_is_nonfatal() {
+    let db = fixture().await;
+    let (transcript, owner) = ordinary(&db, "conflicting-retry-classification").await;
+    let mut command = command(owner);
+    let original = db
+        .apply_user_goal_command(&command, &transcript, at(), || {
+            panic!("initial receipt must commit");
+        })
+        .await;
+    assert!(matches!(
+        original,
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
+    ));
+    let original_change = std::mem::replace(
+        &mut command.change,
+        GoalUserChange::Create {
+            objective: GoalText::parse("conflicting retry payload").unwrap(),
+        },
+    );
+    let fatal = AtomicBool::new(false);
+    let result = db
+        .user_goal_command(
+            &command,
+            &transcript,
+            at(),
+            false,
+            || fatal.store(true, Ordering::SeqCst),
+            UserCommitCut::LostRollbackAcknowledgement,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::RetryConflict))
+    ));
+    assert!(!fatal.load(Ordering::SeqCst));
+    assert_eq!(
+        db.conversation_goal_history(&command.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    command.change = original_change;
+    let retry = db
+        .apply_user_goal_command(&command, &transcript, at(), || {
+            panic!("authority must remain available after typed conflict");
+        })
+        .await;
+    assert!(
+        matches!((original, retry), (LocalAuthorityResult::DurableFactEstablished(Ok(first)), LocalAuthorityResult::DurableFactEstablished(Ok(second))) if first == second)
+    );
+}
