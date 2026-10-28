@@ -30683,6 +30683,24 @@ mod tests {
             .is_empty());
     }
 
+    async fn assert_terminal_replay_evidence(
+        db: &Database,
+        repo: &workflow::WorkflowRepository,
+        conversation_id: &str,
+        result: &phoenix_core::domain::db_schema::FinalizedToolResult,
+    ) {
+        let persisted = db.get_messages(conversation_id).await.unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1].content, result.row().content);
+        assert!(repo
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn terminal_tool_round_accepts_only_exact_message_replays() {
         let db = Database::open_in_memory().await.unwrap();
@@ -30775,17 +30793,10 @@ mod tests {
             )
             .await
             .expect_err("a conflicting replay must not consume the obligation");
-        assert!(error.to_string().contains("retained tool round result differs"));
-        let persisted = db.get_messages(conversation_id).await.unwrap();
-        assert_eq!(persisted.len(), 2);
-        assert_eq!(persisted[1].content, result.row().content);
-        assert!(repo
-            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
-                conversation_id.to_string(),
-            ))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(error
+            .to_string()
+            .contains("retained tool round result differs"));
+        assert_terminal_replay_evidence(&db, &repo, conversation_id, &result).await;
     }
 
     #[tokio::test]

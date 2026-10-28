@@ -1,35 +1,39 @@
 use super::*;
 
+fn unprepared_report_cases() -> [(ToolResult, bool); 4] {
+    [
+        (
+            ToolResult::success("checkpoint-call".into(), "Tool execution cancelled".into()),
+            true,
+        ),
+        (
+            ToolResult {
+                tool_use_id: "checkpoint-call".into(),
+                outcome: ToolOutcome::TrustedInstructions {
+                    output: "Tool execution cancelled".into(),
+                },
+                duration_ms: None,
+            },
+            true,
+        ),
+        (
+            ToolResult::error(
+                "checkpoint-call".into(),
+                accepted_report_result().output().into(),
+            ),
+            false,
+        ),
+        (
+            ToolResult::cancelled("checkpoint-call".into(), accepted_report_result().output()),
+            false,
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn unprepared_report_guard_uses_outcome_not_output_across_db_entrypoints() {
     for entrypoint in ["plain", "state", "replay", "terminal", "pending"] {
-        for (result, rejected) in [
-            (
-                ToolResult::success("checkpoint-call".into(), "Tool execution cancelled".into()),
-                true,
-            ),
-            (
-                ToolResult {
-                    tool_use_id: "checkpoint-call".into(),
-                    outcome: ToolOutcome::TrustedInstructions {
-                        output: "Tool execution cancelled".into(),
-                    },
-                    duration_ms: None,
-                },
-                true,
-            ),
-            (
-                ToolResult::error(
-                    "checkpoint-call".into(),
-                    accepted_report_result().output().into(),
-                ),
-                false,
-            ),
-            (
-                ToolResult::cancelled("checkpoint-call".into(), accepted_report_result().output()),
-                false,
-            ),
-        ] {
+        for (result, rejected) in unprepared_report_cases() {
             let (db, owner, mut round) = report_fixture().await;
             let finalized = vec![finalized_result(&round.assistant, &result)];
             round.results = vec![result.into()];
@@ -82,7 +86,10 @@ async fn unprepared_report_guard_uses_outcome_not_output_across_db_entrypoints()
                 let after = evidence(&db, &owner, &round).await;
                 if rejected {
                     let error = outcome.unwrap_err();
-                    assert!(error.to_string().contains("goal report"), "{entrypoint}: {error}");
+                    assert!(
+                        error.to_string().contains("goal report"),
+                        "{entrypoint}: {error}"
+                    );
                     assert_eq!(after, before, "{entrypoint}");
                 } else {
                     outcome.unwrap();
