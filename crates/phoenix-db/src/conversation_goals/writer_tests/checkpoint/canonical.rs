@@ -8,6 +8,71 @@ async fn receipt_count(db: &Database) -> i64 {
 }
 
 #[tokio::test]
+async fn mixed_pending_round_preserves_nonobject_display_with_duration_atomically() {
+    for display in [serde_json::json!(["card", 7]), serde_json::Value::Null] {
+        let (db, owner, mut round) = report_fixture().await;
+        let MessageContent::Agent(blocks) = &mut round.assistant.content else {
+            unreachable!()
+        };
+        blocks.push(ContentBlock::ToolUse {
+            id: "search-call".into(),
+            name: "search".into(),
+            input: serde_json::json!({}),
+        });
+        let mut other = ToolResult::success_with_display(
+            "search-call".into(),
+            "found".into(),
+            Some(display.clone()),
+        );
+        other.duration_ms = Some(23);
+        let expected = FinalizedToolResult::new(
+            &round.assistant.message_id,
+            &round.assistant.conversation_id,
+            round.assistant.sequence_id + 2,
+            round.assistant.created_at,
+            &other,
+        );
+        assert_eq!(expected.row().display_data, Some(display));
+        round.results.push(other.into());
+        let before = evidence(&db, &owner, &round).await;
+        let error = round
+            .cut(&db, CanonicalCommitCut::BeforeCanonicalCommit)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected before canonical commit"));
+        assert_eq!(evidence(&db, &owner, &round).await, before);
+        assert_eq!(receipt_count(&db).await, 0);
+        let committed = round.commit(&db).await.unwrap();
+        assert!(!committed.replayed);
+        assert_eq!(committed.results.len(), 2);
+        assert_result(&committed.results[0], false);
+        assert_eq!(
+            serde_json::to_value(&committed.results[1]).unwrap(),
+            serde_json::to_value(expected.row()).unwrap()
+        );
+        let retained = evidence(&db, &owner, &round).await;
+        assert_eq!(retained["history"].as_array().unwrap().len(), 2);
+        assert_eq!(retained["messages"].as_array().unwrap().len(), 3);
+        assert!(retained["replay"].is_object());
+        assert_eq!(
+            retained["state"]["conv_state"],
+            serde_json::to_string(&round.state).unwrap()
+        );
+        assert_eq!(receipt_count(&db).await, 1);
+        let retry = round.commit(&db).await.unwrap();
+        assert!(retry.replayed);
+        assert_eq!(
+            serde_json::to_value(&retry.results).unwrap(),
+            serde_json::to_value(&committed.results).unwrap()
+        );
+        assert_eq!(evidence(&db, &owner, &round).await, retained);
+        assert_eq!(receipt_count(&db).await, 1);
+    }
+}
+
+#[tokio::test]
 async fn plain_round_cannot_claim_any_canonical_checkpoint() {
     let (db, owner, mut round) = report_fixture().await;
     terminal::ordinary_round(&mut round);

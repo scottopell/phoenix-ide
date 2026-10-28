@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::conversation_goal::{GoalExecution, GoalTimestampUs, ToolRoundResult};
 use phoenix_core::domain::db_schema::{
-    FinalizedToolDisposition, FinalizedToolResult, InputOrigin, Message, MessageContent,
-    MessageType, ToolOutcome, ToolResult,
+    merge_duration_into_display_data, FinalizedToolDisposition, FinalizedToolResult, InputOrigin,
+    Message, MessageContent, MessageType, ToolOutcome, ToolResult,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_state::ConvState;
@@ -231,14 +231,8 @@ pub(super) fn result_message(
         .checked_add(ordinal)
         .and_then(|seq| seq.checked_add(1))
         .ok_or(GoalDbError::Integrity("round result sequence"))?;
-    let mut display_data = result.display_data().cloned();
-    if let Some(duration) = result.duration_ms {
-        let display = display_data.get_or_insert_with(|| serde_json::json!({}));
-        let object = display
-            .as_object_mut()
-            .ok_or(GoalDbError::Integrity("round result display data"))?;
-        object.insert("duration_ms".into(), duration.into());
-    }
+    let display_data =
+        merge_duration_into_display_data(result.display_data().cloned(), result.duration_ms);
     Ok(Message {
         message_id: tool_result_message_id(&assistant.message_id, &result.tool_use_id),
         conversation_id: assistant.conversation_id.clone(),
