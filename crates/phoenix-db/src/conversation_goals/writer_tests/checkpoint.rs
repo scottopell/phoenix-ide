@@ -180,7 +180,7 @@ async fn evidence(
     owner: &ProductConversationId,
     round: &ReportRound,
 ) -> serde_json::Value {
-    type ReceiptRow = (String, Vec<u8>, String, String, Option<Vec<u8>>);
+    type ReceiptRow = (String, Vec<u8>, i64, String, Option<Vec<u8>>);
     let transcript = &round.assistant.conversation_id;
     let state: (String, String, String, String) = sqlx::query_as(
         "SELECT state,state_kind,state_updated_at,updated_at FROM conversations WHERE id=?",
@@ -195,7 +195,7 @@ async fn evidence(
             .await
             .unwrap();
     let receipts: Vec<ReceiptRow> = sqlx::query_as(
-        "SELECT assistant_message_id,selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256
+        "SELECT assistant_message_id,selected_checkpoint_sha256,selected_state_updated_at_us,replay_kind,replay_payload_sha256
          FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
     ).bind(transcript).fetch_all(db.pool()).await.unwrap();
     let replay_head: Option<(String, String, String)> = sqlx::query_as(

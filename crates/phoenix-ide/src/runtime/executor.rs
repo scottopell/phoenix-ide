@@ -25730,8 +25730,8 @@ mod goal_report_cancellation_checkpoint_tests {
             );
             finalized.push(result);
         }
-        let receipt: (Vec<u8>, String, String, Option<Vec<u8>>) = sqlx::query_as(
-            "SELECT selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256
+        let receipt: (Vec<u8>, i64, String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT selected_checkpoint_sha256,selected_state_updated_at_us,replay_kind,replay_payload_sha256
              FROM canonical_tool_round_receipts WHERE conversation_id=? AND assistant_message_id=?",
         )
         .bind(conversation_id)
@@ -25740,7 +25740,7 @@ mod goal_report_cancellation_checkpoint_tests {
         .await
         .unwrap();
         assert_eq!(receipt.0.len(), 32);
-        assert_eq!(receipt.1, selected_at.to_rfc3339());
+        assert_eq!(receipt.1, selected_at.timestamp_micros());
         assert_eq!(receipt.2, "none");
         assert_eq!(receipt.3, None);
         db.persist_tool_round_and_state(

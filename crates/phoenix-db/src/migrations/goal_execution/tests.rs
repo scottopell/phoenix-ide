@@ -75,6 +75,115 @@ async fn migration_138_backfills_materialized_without_breaking_ordinary_message_
 }
 
 #[tokio::test]
+async fn migration_141_requires_nonnegative_integer_microsecond_receipts() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let db = Database::from_pool_for_tests(pool, "migration-141-clock".into());
+    db.run_migrations().await.unwrap();
+    run_through_for_test(db.pool(), 140).await.unwrap();
+    let conversation = db
+        .create_conversation("schema-141", "schema-141", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let assistant = db
+        .add_message(
+            "clock-assistant",
+            &conversation.id,
+            &MessageContent::Agent(vec![]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 0);
+    let clock_type: String = sqlx::query_scalar(
+        "SELECT type FROM pragma_table_info('canonical_tool_round_receipts')
+         WHERE name='selected_state_updated_at_us'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(clock_type, "INTEGER");
+    for (value, accepted) in [
+        ("0", true),
+        ("1700000000123456", true),
+        ("9223372036854775807", true),
+        ("NULL", false),
+        ("-1", false),
+        ("0.5", false),
+        ("'not-an-integer'", false),
+        ("X'00'", false),
+        ("9223372036854775808", false),
+        ("1e30", false),
+    ] {
+        let insert = format!(
+            "INSERT INTO canonical_tool_round_receipts
+             (conversation_id,assistant_message_id,selected_checkpoint_sha256,
+              selected_state_updated_at_us,replay_kind)
+             VALUES (?,?,zeroblob(32),{value},'none')"
+        );
+        let outcome = sqlx::query(&insert)
+            .bind(&conversation.id)
+            .bind(&assistant.message_id)
+            .execute(db.pool())
+            .await;
+        assert_eq!(outcome.is_ok(), accepted, "{value}: {outcome:?}");
+        if accepted {
+            let stored: (i64, String) = sqlx::query_as(
+                "SELECT selected_state_updated_at_us,typeof(selected_state_updated_at_us)
+                 FROM canonical_tool_round_receipts",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(stored, (value.parse::<i64>().unwrap(), "integer".into()));
+        }
+        sqlx::query("DELETE FROM canonical_tool_round_receipts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn migration_141_failure_does_not_advance_ledger() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let db = Database::from_pool_for_tests(pool, "migration-141-failure".into());
+    db.run_migrations().await.unwrap();
+    run_through_for_test(db.pool(), 140).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE sentinel (value INTEGER);
+         CREATE TRIGGER canonical_tool_round_receipt_source BEFORE INSERT ON sentinel
+         BEGIN SELECT 1; END;",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(run_through_for_test(db.pool(), 141).await.is_err());
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(version, 140);
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+         AND name='canonical_tool_round_receipts'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(tables, 0);
+}
+
+#[tokio::test]
 async fn migration_138_rolls_back_schema_edit_without_ledger_write() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

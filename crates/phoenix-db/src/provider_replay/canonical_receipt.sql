@@ -1,9 +1,11 @@
 CREATE TABLE canonical_tool_round_receipts (
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     assistant_message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
-    selected_state_sha256 BLOB NOT NULL
-        CHECK (typeof(selected_state_sha256) = 'blob' AND length(selected_state_sha256) = 32),
-    selected_state_updated_at TEXT NOT NULL CHECK (trim(selected_state_updated_at) <> ''),
+    selected_checkpoint_sha256 BLOB NOT NULL
+        CHECK (typeof(selected_checkpoint_sha256) = 'blob' AND length(selected_checkpoint_sha256) = 32),
+    selected_state_updated_at_us INTEGER NOT NULL
+        CHECK (typeof(selected_state_updated_at_us) = 'integer'
+               AND selected_state_updated_at_us BETWEEN 0 AND 9223372036854775807),
     replay_kind TEXT NOT NULL CHECK (replay_kind IN ('none','clear','anthropic','responses')),
     replay_payload_sha256 BLOB,
     PRIMARY KEY (conversation_id, assistant_message_id),

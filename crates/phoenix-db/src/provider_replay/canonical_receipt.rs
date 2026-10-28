@@ -8,8 +8,8 @@ use crate::{DbError, DbResult};
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct CanonicalReceipt {
-    state_hash: Vec<u8>,
-    state_updated_at: String,
+    checkpoint_hash: Vec<u8>,
+    state_updated_at_us: i64,
     replay_kind: &'static str,
     replay_hash: Option<Vec<u8>>,
 }
@@ -32,6 +32,16 @@ impl CanonicalReceipt {
         timestamp: DateTime<Utc>,
         replay: Option<&ProviderReplayUpdate>,
     ) -> DbResult<Self> {
+        let state_updated_at_us = timestamp
+            .timestamp()
+            .checked_mul(1_000_000)
+            .and_then(|seconds| seconds.checked_add(i64::from(timestamp.timestamp_subsec_micros())))
+            .filter(|micros| *micros >= 0)
+            .ok_or_else(|| {
+                DbError::Serialization(
+                    "selected checkpoint timestamp outside microsecond range".into(),
+                )
+            })?;
         let (replay_kind, replay_hash) = match replay {
             None => ("none", None),
             Some(ProviderReplayUpdate::Clear) => ("clear", None),
@@ -45,8 +55,11 @@ impl CanonicalReceipt {
             ),
         };
         Ok(Self {
-            state_hash: command_hash(b"canonical-tool-round/state/v1\0", state)?,
-            state_updated_at: timestamp.to_rfc3339(),
+            checkpoint_hash: command_hash(
+                b"canonical-tool-round/selected-checkpoint/v1\0",
+                &(state, timestamp.to_rfc3339()),
+            )?,
+            state_updated_at_us,
             replay_kind,
             replay_hash,
         })
@@ -59,7 +72,7 @@ impl CanonicalReceipt {
         assistant_id: &str,
     ) -> DbResult<()> {
         let row = sqlx::query(
-            "SELECT selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256
+            "SELECT selected_checkpoint_sha256,selected_state_updated_at_us,replay_kind,replay_payload_sha256
              FROM canonical_tool_round_receipts WHERE conversation_id=? AND assistant_message_id=?",
         )
         .bind(conversation_id).bind(assistant_id).fetch_optional(&mut **tx).await?;
@@ -68,8 +81,8 @@ impl CanonicalReceipt {
                 "retained round has no canonical checkpoint receipt".into(),
             ));
         };
-        if row.try_get::<Vec<u8>, _>("selected_state_sha256")? != self.state_hash
-            || row.try_get::<String, _>("selected_state_updated_at")? != self.state_updated_at
+        if row.try_get::<Vec<u8>, _>("selected_checkpoint_sha256")? != self.checkpoint_hash
+            || row.try_get::<i64, _>("selected_state_updated_at_us")? != self.state_updated_at_us
             || row.try_get::<String, _>("replay_kind")? != self.replay_kind
             || row.try_get::<Option<Vec<u8>>, _>("replay_payload_sha256")? != self.replay_hash
         {
@@ -88,13 +101,13 @@ impl CanonicalReceipt {
     ) -> DbResult<()> {
         sqlx::query(
             "INSERT INTO canonical_tool_round_receipts
-             (conversation_id,assistant_message_id,selected_state_sha256,selected_state_updated_at,
+             (conversation_id,assistant_message_id,selected_checkpoint_sha256,selected_state_updated_at_us,
               replay_kind,replay_payload_sha256) VALUES (?,?,?,?,?,?)",
         )
         .bind(conversation_id)
         .bind(assistant_id)
-        .bind(&self.state_hash)
-        .bind(&self.state_updated_at)
+        .bind(&self.checkpoint_hash)
+        .bind(self.state_updated_at_us)
         .bind(self.replay_kind)
         .bind(&self.replay_hash)
         .execute(&mut **tx)
@@ -106,6 +119,38 @@ impl CanonicalReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_identity_preserves_nanoseconds_with_integer_microseconds() {
+        let state = ConvState::LlmRequesting { attempt: 1 };
+        let timestamp = DateTime::from_timestamp(1_700_000_000, 123_456_001).unwrap();
+        let other = timestamp + chrono::Duration::nanoseconds(1);
+        let first = CanonicalReceipt::new(&state, timestamp, None).unwrap();
+        let second = CanonicalReceipt::new(&state, other, None).unwrap();
+        assert_eq!(first.state_updated_at_us, 1_700_000_000_123_456);
+        assert_eq!(first.state_updated_at_us, second.state_updated_at_us);
+        assert_ne!(first.checkpoint_hash, second.checkpoint_hash);
+        assert_eq!(
+            first,
+            CanonicalReceipt::new(&state, timestamp, None).unwrap()
+        );
+        assert_ne!(
+            first.checkpoint_hash,
+            command_hash(b"canonical-tool-round/state/v1\0", &state).unwrap()
+        );
+        assert_ne!(
+            first,
+            CanonicalReceipt::new(&ConvState::LlmRequesting { attempt: 2 }, timestamp, None)
+                .unwrap()
+        );
+        assert!(CanonicalReceipt::new(
+            &state,
+            DateTime::from_timestamp(-1, 999_999_999).unwrap(),
+            None
+        )
+        .is_err());
+        assert!(CanonicalReceipt::new(&state, DateTime::<Utc>::MAX_UTC, None).is_ok());
+    }
 
     #[test]
     fn responses_receipt_hashes_whole_payload_and_canonicalizes_nested_objects() {

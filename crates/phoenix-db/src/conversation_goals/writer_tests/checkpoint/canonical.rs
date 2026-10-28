@@ -165,6 +165,63 @@ async fn report_messages_without_canonical_receipt_cannot_claim_state_or_replay(
 }
 
 #[tokio::test]
+async fn nanosecond_retry_refuses_collision_and_preserves_newer_selection() {
+    use chrono::Timelike;
+
+    let (db, owner, mut round) = report_fixture().await;
+    round.timestamp = round.timestamp.with_nanosecond(123_456_001).unwrap();
+    let first = round.commit(&db).await.unwrap();
+    let original_timestamp = round.timestamp;
+    let committed = evidence(&db, &owner, &round).await;
+    assert_eq!(committed["state"][2], original_timestamp.to_rfc3339());
+    round.timestamp += Duration::nanoseconds(1);
+    assert_eq!(
+        round.timestamp.timestamp_micros(),
+        original_timestamp.timestamp_micros()
+    );
+    assert!(round
+        .commit(&db)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("canonical checkpoint command differs"));
+    assert_eq!(evidence(&db, &owner, &round).await, committed);
+    round.timestamp = original_timestamp;
+    assert!(round.commit(&db).await.unwrap().replayed);
+    assert_eq!(evidence(&db, &owner, &round).await, committed);
+    let newer_state = ConvState::LlmRequesting { attempt: 4 };
+    db.update_conversation_state(&round.assistant.conversation_id, &newer_state)
+        .await
+        .unwrap();
+    db.clear_provider_replay_state(&round.assistant.conversation_id)
+        .await
+        .unwrap();
+    let newer = evidence(&db, &owner, &round).await;
+    round.timestamp += Duration::nanoseconds(1);
+    assert!(round
+        .commit(&db)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("canonical checkpoint command differs"));
+    assert_eq!(evidence(&db, &owner, &round).await, newer);
+    round.timestamp = original_timestamp;
+    let retry = round.commit(&db).await.unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.state, newer_state);
+    assert_eq!(
+        retry.state_updated_at.to_rfc3339(),
+        newer["state"][2].as_str().unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&retry.results).unwrap(),
+        serde_json::to_value(&first.results).unwrap()
+    );
+    assert_eq!(evidence(&db, &owner, &round).await, newer);
+    assert_eq!(receipt_count(&db).await, 1);
+}
+
+#[tokio::test]
 async fn exact_canonical_retry_preserves_newer_state_and_private_replay() {
     let (db, owner, round) = report_fixture().await;
     let first = round.commit(&db).await.unwrap();

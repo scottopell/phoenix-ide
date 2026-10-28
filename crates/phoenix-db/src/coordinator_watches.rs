@@ -749,7 +749,7 @@ mod tests {
     ) -> serde_json::Value {
         use phoenix_core::domain::conversation_goal::GoalVersion;
 
-        type ReceiptEvidence = (String, Vec<u8>, String, String, Option<Vec<u8>>);
+        type ReceiptEvidence = (String, Vec<u8>, i64, String, Option<Vec<u8>>);
         let state: (String, String, String, String) = sqlx::query_as(
             "SELECT state,state_kind,state_updated_at,updated_at FROM conversations WHERE id=?",
         )
@@ -758,7 +758,7 @@ mod tests {
         .await
         .unwrap();
         let receipts: Vec<ReceiptEvidence> = sqlx::query_as(
-            "SELECT assistant_message_id,selected_state_sha256,selected_state_updated_at,replay_kind,replay_payload_sha256 FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
+            "SELECT assistant_message_id,selected_checkpoint_sha256,selected_state_updated_at_us,replay_kind,replay_payload_sha256 FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
         )
         .bind(transcript)
         .fetch_all(db.pool())
