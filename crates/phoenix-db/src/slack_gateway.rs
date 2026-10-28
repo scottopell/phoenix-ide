@@ -1553,16 +1553,18 @@ mod tests {
             db_schema::{InputOrigin, MessageContent},
             sm_state::ConvState,
         };
-        for (legacy_checkpoint, final_state) in [
-            (false, ConvState::Idle),
-            (false, ConvState::Terminal),
+        for (legacy_checkpoint, canonical_checkpoint, final_state) in [
+            (false, false, ConvState::Idle),
+            (false, false, ConvState::Terminal),
             (
+                false,
                 false,
                 ConvState::Completed {
                     result: "ready".into(),
                 },
             ),
-            (true, ConvState::Idle),
+            (true, false, ConvState::Idle),
+            (false, true, ConvState::Idle),
         ] {
             let db = Database::open_in_memory().await.unwrap();
             let conv = db
@@ -1616,6 +1618,39 @@ mod tests {
                 .unwrap();
                 sqlx::query("UPDATE conversations SET state='{\"type\":\"idle\"}',state_kind='idle' WHERE id=?1")
                     .bind(&conv.id).execute(db.pool()).await.unwrap();
+            } else if canonical_checkpoint {
+                let assistant = phoenix_core::domain::db_schema::Message {
+                    message_id: "answer".into(),
+                    conversation_id: conv.id.clone(),
+                    sequence_id: 2,
+                    message_type: phoenix_core::domain::db_schema::MessageType::Agent,
+                    content: MessageContent::agent(vec![]),
+                    origin: InputOrigin::SystemGenerated,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: chrono::Utc::now(),
+                };
+                let timestamp = chrono::Utc::now();
+                for _ in 0..2 {
+                    db.persist_tool_round_state_and_replay(
+                        &conv.id,
+                        &assistant,
+                        &[],
+                        &final_state,
+                        timestamp,
+                        &phoenix_core::domain::provider_replay::ProviderReplayUpdate::Clear,
+                    )
+                    .await
+                    .unwrap();
+                }
+                let captured: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM slack_gateway_native_outcomes WHERE request_id=?1",
+                )
+                .bind(&request.request_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(captured, 1);
             } else {
                 db.add_message_and_clear_provider_replay(
                     "answer",

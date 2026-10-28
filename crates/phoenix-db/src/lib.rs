@@ -10281,25 +10281,48 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
+        if conversation_id != assistant.conversation_id {
+            return Err(DbError::Serialization(
+                "tool round transcript differs".into(),
+            ));
         }
-
-        // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
-        // `updated_at` so list-ordering stays current.
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let replayed =
+            conversation_goals::round::persist_finalized_round_tx(&mut tx, assistant, tool_results)
+                .await?;
+        if !replayed {
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(Utc::now().to_rfc3339())
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_tool_round_state_and_replay_input(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: crate::conversation_goals::round::ToolRoundWrite<'_>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        update: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+    ) -> DbResult<crate::conversation_goals::round::CommittedGoalRound> {
+        self.persist_canonical_state_and_replay_input(
+            conversation_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
+            update,
+            None,
+        )
+        .await
     }
 
     /// Persist a tool round and its selected conversation state atomically.
@@ -10308,38 +10331,23 @@ impl Database {
     ///
     /// Returns a [`DbError`] when message insertion, state update, or commit fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if the conversation state cannot be serialized.
     pub async fn persist_tool_round_and_state(
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
-        }
-        coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state).unwrap();
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
+        self.persist_tool_round_state_and_replay_input(
+            conversation_id,
+            assistant,
+            conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            state,
+            state_updated_at,
+            None,
         )
-        .bind(state_json)
-        .bind(conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
-        }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -10352,21 +10360,91 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         obligation: &workflow::DirectTurnTerminalObligationInput,
         cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        insert_message_tx(&mut tx, assistant).await?;
-        for message in tool_results {
-            insert_message_tx(&mut tx, message).await?;
+        self.persist_tool_round_with_terminal_obligation_input_at_cut(
+            conversation_id,
+            assistant,
+            conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            obligation,
+            None,
+            cut,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_tool_round_with_terminal_obligation_input_at_cut(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: conversation_goals::round::ToolRoundWrite<'_>,
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+        replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> DbResult<conversation_goals::round::CommittedGoalTerminalRound> {
+        use conversation_goals::round;
+        let receipt = provider_replay::CanonicalReceipt::new(
+            &obligation.projection.state,
+            obligation.projection.state_updated_at,
+            replay,
+        )?;
+        if matches!(&input, round::ToolRoundWrite::Pending { .. }) {
+            if let Some(update) = replay {
+                provider_replay::validate_goal_round_replay(assistant, update)?;
+            }
         }
-        workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let round::ToolRoundWrite::Pending { execution, .. } = &input {
+            if i64::try_from(obligation.turn_id.0).ok() != Some(execution.turn_id()) {
+                return Err(DbError::Serialization("goal terminal turn differs".into()));
+            }
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT conversation_id FROM durable_turns WHERE turn_id = ? AND workflow_id = ?",
+            )
+            .bind(execution.turn_id())
+            .bind(execution.workflow_id())
+            .fetch_optional(&mut *tx)
             .await?;
+            if owner.as_deref() != Some(conversation_id) {
+                return Err(DbError::Serialization(
+                    "goal terminal conversation differs".into(),
+                ));
+            }
+        }
+        let (results, replayed) = round::write_round_tx(
+            &mut tx,
+            conversation_id,
+            assistant,
+            input,
+            &obligation.projection.state,
+            obligation.projection.state_updated_at,
+            self.goal_write_policies(),
+        )
+        .await?;
+        round::persist_round_terminal_obligation_tx(&mut tx, conversation_id, obligation, replayed)
+            .await?;
+        if replayed {
+            receipt
+                .verify(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
+        }
+        if !replayed {
+            if let Some(update) = replay {
+                provider_replay::apply_replay_tx(&mut tx, conversation_id, update).await?;
+            }
+            receipt
+                .insert(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(Utc::now().to_rfc3339())
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         if cut == TerminalEvidenceTransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(DbError::Serialization(
@@ -10379,7 +10457,7 @@ impl Database {
                 "injected after-commit cut".to_string(),
             ));
         }
-        Ok(())
+        Ok(round::CommittedGoalTerminalRound { results, replayed })
     }
 
     /// Persist a terminal tool round and its obligation in one transaction.
@@ -10391,7 +10469,7 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         obligation: &workflow::DirectTurnTerminalObligationInput,
     ) -> DbResult<()> {
         self.persist_tool_round_with_terminal_obligation_at_cut(
@@ -30190,33 +30268,42 @@ mod tests {
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-a".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-b".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
-        let result_a = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-a-result".to_string(),
-            conversation_id: "conv-tr".to_string(),
-            sequence_id: 11,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-a", "output a", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-        let result_b = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-b-result".to_string(),
-            conversation_id: "conv-tr".to_string(),
-            sequence_id: 12,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-b", "output b", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        let result_a = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            11,
+            Utc::now(),
+            &phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-a".into(),
+                "output a".into(),
+            ),
+        );
+        let result_b = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            12,
+            Utc::now(),
+            &phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-b".into(),
+                "output b".into(),
+            ),
+        );
 
         db.persist_tool_round("conv-tr", &assistant, &[result_a, result_b])
             .await
@@ -30224,16 +30311,33 @@ mod tests {
 
         let msgs = db.get_messages("conv-tr").await.unwrap();
         let ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(
+            msgs.len(),
+            3,
+            "exactly one assistant and both results commit"
+        );
         assert!(
             ids.contains(&"asst-tr"),
             "assistant message must be durable"
         );
         assert!(
-            ids.contains(&"tool-a-result"),
+            ids.contains(
+                &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                    &assistant.message_id,
+                    "tool-a",
+                )
+                .as_str()
+            ),
             "first tool result must be durable"
         );
         assert!(
-            ids.contains(&"tool-b-result"),
+            ids.contains(
+                &phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                    &assistant.message_id,
+                    "tool-b",
+                )
+                .as_str()
+            ),
             "second tool result must be durable"
         );
     }
@@ -30333,23 +30437,23 @@ mod tests {
             sequence_id: 20,
             message_type: MessageType::Agent,
             content: MessageContent::agent(vec![
-                phoenix_core::domain::llm_types::ContentBlock::text("checkpoint"),
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
             ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
-        let tool = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "checkpoint-tool".to_string(),
-            conversation_id: "conv-checkpoint-cuts".to_string(),
-            sequence_id: 21,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool", "cancelled", true),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        let tool = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-checkpoint-cuts",
+            21,
+            Utc::now(),
+            &phoenix_core::domain::db_schema::ToolResult::cancelled("tool".into(), "cancelled"),
+        );
         let obligation = workflow::DirectTurnTerminalObligationInput {
             turn_id,
             expected_generation: 0,
@@ -30360,8 +30464,10 @@ mod tests {
             },
             response_message_id: None,
         };
-        let evidence =
-            workflow::TerminalEvidenceExpectation::Messages(vec![assistant.clone(), tool.clone()]);
+        let evidence = workflow::TerminalEvidenceExpectation::Messages(vec![
+            assistant.clone(),
+            tool.row().clone(),
+        ]);
 
         assert!(db
             .persist_tool_round_with_terminal_obligation_at_cut(
@@ -30592,6 +30698,24 @@ mod tests {
             .is_empty());
     }
 
+    async fn assert_terminal_replay_evidence(
+        db: &Database,
+        repo: &workflow::WorkflowRepository,
+        conversation_id: &str,
+        result: &phoenix_core::domain::db_schema::FinalizedToolResult,
+    ) {
+        let persisted = db.get_messages(conversation_id).await.unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1].content, result.row().content);
+        assert!(repo
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn terminal_tool_round_accepts_only_exact_message_replays() {
         let db = Database::open_in_memory().await.unwrap();
@@ -30610,22 +30734,28 @@ mod tests {
             conversation_id: conversation_id.to_string(),
             sequence_id: 20,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-terminal".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at,
         };
-        let result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-terminal-exact".to_string(),
-            conversation_id: conversation_id.to_string(),
-            sequence_id: 21,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-terminal", "first durable result", false),
-            display_data: Some(serde_json::json!({"kind": "first"})),
-            usage_data: None,
+        let result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            conversation_id,
+            21,
             created_at,
-        };
+            &phoenix_core::domain::db_schema::ToolResult::success_with_display(
+                "tool-terminal".into(),
+                "first durable result".into(),
+                Some(serde_json::json!({"kind": "first"})),
+            ),
+        );
         let obligation = workflow::DirectTurnTerminalObligationInput {
             turn_id,
             expected_generation: 0,
@@ -30654,8 +30784,21 @@ mod tests {
         .await
         .expect("an exact replay is idempotent");
 
-        let mut conflicting = result.clone();
-        conflicting.content = MessageContent::tool("tool-terminal", "conflicting replay", true);
+        let conflicting = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            conversation_id,
+            result.row().sequence_id,
+            result.row().created_at,
+            &phoenix_core::domain::db_schema::ToolResult {
+                tool_use_id: "tool-terminal".into(),
+                outcome: phoenix_core::domain::db_schema::ToolOutcome::Error {
+                    output: "conflicting replay".into(),
+                    display_data: result.row().display_data.clone(),
+                    images: vec![],
+                },
+                duration_ms: None,
+            },
+        );
         let error = db
             .persist_tool_round_with_terminal_obligation(
                 conversation_id,
@@ -30667,17 +30810,8 @@ mod tests {
             .expect_err("a conflicting replay must not consume the obligation");
         assert!(error
             .to_string()
-            .contains("conflicts with first durable payload"));
-        let persisted = db.get_messages(conversation_id).await.unwrap();
-        assert_eq!(persisted.len(), 2);
-        assert_eq!(persisted[1].content, result.content);
-        assert!(repo
-            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
-                conversation_id.to_string(),
-            ))
-            .await
-            .unwrap()
-            .is_some());
+            .contains("retained tool round result differs"));
+        assert_terminal_replay_evidence(&db, &repo, conversation_id, &result).await;
     }
 
     #[tokio::test]
@@ -30692,22 +30826,27 @@ mod tests {
             conversation_id: "conv-terminal-round".to_string(),
             sequence_id: 20,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-terminal".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
-        let result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-terminal-result".to_string(),
-            conversation_id: "conv-terminal-round".to_string(),
-            sequence_id: 21,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-terminal", "cancelled", true),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        let result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-terminal-round",
+            21,
+            Utc::now(),
+            &phoenix_core::domain::db_schema::ToolResult::cancelled(
+                "tool-terminal".into(),
+                "cancelled",
+            ),
+        );
         let obligation = workflow::DirectTurnTerminalObligationInput {
             turn_id: phoenix_workflow::TurnAuthorityId(u64::MAX),
             expected_generation: 0,
@@ -30737,12 +30876,6 @@ mod tests {
 
     #[tokio::test]
     async fn persist_tool_round_rolls_back_assistant_when_a_result_insert_fails() {
-        // A `tool_use` with no paired `tool_result` 400s every later LLM
-        // request. `persist_tool_round` must commit the whole round or none of
-        // it. Here the second result names a non-existent conversation, so its
-        // INSERT trips the `messages.conversation_id` foreign key (FKs are on)
-        // and the transaction rolls back — the assistant message must NOT be
-        // left behind unpaired.
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-tr", "ctr", "/tmp", true, None, None)
             .await
@@ -30754,42 +30887,56 @@ mod tests {
             conversation_id: "conv-tr".to_string(),
             sequence_id: 10,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-a".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+                phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                    id: "tool-b".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
         };
-        let good_result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-a-result".to_string(),
-            conversation_id: "conv-tr".to_string(),
-            sequence_id: 11,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-a", "output a", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-        let orphan_fk_result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-b-result".to_string(),
-            // No such conversation: FK violation on insert.
-            conversation_id: "conv-does-not-exist".to_string(),
-            sequence_id: 12,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-b", "output b", false),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
+        let good_result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            11,
+            Utc::now(),
+            &phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-a".into(),
+                "output a".into(),
+            ),
+        );
+        let rejected_result = phoenix_core::domain::db_schema::FinalizedToolResult::new(
+            &assistant.message_id,
+            "conv-tr",
+            12,
+            Utc::now(),
+            &phoenix_core::domain::db_schema::ToolResult::success(
+                "tool-b".into(),
+                "output b".into(),
+            ),
+        );
 
+        sqlx::query("CREATE TRIGGER reject_second_round_result BEFORE INSERT ON messages WHEN NEW.sequence_id=12 BEGIN SELECT RAISE(ABORT, 'injected second result insert failure'); END")
+            .execute(db.pool()).await.unwrap();
         let err = db
-            .persist_tool_round("conv-tr", &assistant, &[good_result, orphan_fk_result])
-            .await;
-        assert!(err.is_err(), "FK violation must surface as an error");
-
-        // Nothing from the round committed: not the assistant, not the first
-        // (otherwise-valid) result. All-or-nothing.
+            .persist_tool_round("conv-tr", &assistant, &[good_result, rejected_result])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::Sqlx(_)),
+            "must reach the storage failure: {err}"
+        );
+        assert!(err
+            .to_string()
+            .contains("injected second result insert failure"));
         let msgs = db.get_messages("conv-tr").await.unwrap();
         assert!(
             msgs.is_empty(),

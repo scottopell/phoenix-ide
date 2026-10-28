@@ -43,3 +43,9 @@ single-attempt signals. This supersedes ADR-155's prototype conversion policy.
 - [Compatibility requirements](../compatibility/requirements.md)
 - ADR-034, ADR-155, ADR-187
 - `lineage::preflight`, `run_pending_migrations`, `slack_recover_returns`
+
+## Integration allocation
+
+Main published `141/canonical_tool_round_receipts` before this feature merged.
+The final Slack schema is therefore allocated `142/slack_gateway_v1`; upstream
+migrations through 141 remain unchanged. The prototype refusal policy is unchanged.

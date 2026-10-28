@@ -45,15 +45,16 @@ when their error detail is missing or malformed.
 Deleted runtime code includes receipt inspection, inspection scheduling, private
 retry handling, question-text rendering and question-retirement synchronization.
 Obsolete retry tests are replaced by single-attempt failure/restart regressions.
-ADR-188 removes prototype compatibility. One final `141/slack_gateway_v1`
+ADR-188 removes prototype compatibility. One final `142/slack_gateway_v1`
 schema replaces the unmerged migration chain. Obsolete question associations,
 question snapshots, notification inspection metadata and historical trigger
 provenance are absent. Existing lineage preflight refuses prototype identities
-before mutation. Upstream migration history through 140 is unchanged.
+before mutation. Upstream migration history through 141 is unchanged.
 
 ## Validation
 
-All 198 Rust migration, lineage and gateway tests pass on the final schema.
+All 292 Rust migration, lineage, gateway, Goal and replay tests pass on the
+reconciled schema.
 Coverage includes fresh installation, prototype refusal before mutation, native
 attribution, restart admission and delivery, exact request coverage, generic
 clarification handoffs, bounded reply attempts and one-attempt signals.
@@ -61,11 +62,13 @@ clarification handoffs, bounded reply attempts and one-attempt signals.
 Eleven UI/static checks pass; seven final static checks also pass after test
 fixture consolidation. The full developer-tool suite and spec-shape checks pass
 with native Bash/OpenSSL and without a shared Cargo target override. Upstream
-migration definitions through 140 are byte-for-byte unchanged.
+migration definitions through 141 are byte-for-byte unchanged.
 
-The prior published candidate has thirteen successful CI checks and four skips,
-with all sixty-six posted review threads resolved. The schema cleanup still
-requires its own hosted CI and normal automatic review.
+Integration with main preserves canonical checkpoint transactions and their
+receipt schema. Briefing completion remains atomic and checkpoint replay cannot
+duplicate its private notice. Ten UI/static checks and three final static checks
+pass. Hosted CI and normal automatic review run on the reconciled candidate
+before merge.
 
 ## Production boundary
 

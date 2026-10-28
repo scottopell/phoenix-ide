@@ -736,6 +736,11 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 141,
+        name: "canonical_tool_round_receipts",
+        sql: include_str!("provider_replay/canonical_receipt.sql"),
+    },
+    Migration {
+        version: 142,
         name: "slack_gateway_v1",
         sql: include_str!("migrations/slack_gateway.sql"),
     },
@@ -13103,7 +13108,7 @@ mod tests {
     #[tokio::test]
     async fn slack_final_schema_excludes_obsolete_prototype_storage() {
         let db = crate::Database::open_in_memory().await.unwrap();
-        let identity: String = sqlx::query_scalar("SELECT name FROM _migrations WHERE version=141")
+        let identity: String = sqlx::query_scalar("SELECT name FROM _migrations WHERE version=142")
             .fetch_one(db.pool())
             .await
             .unwrap();
@@ -13120,6 +13125,7 @@ mod tests {
     async fn slack_prototype_ledgers_are_refused_before_mutation() {
         for (version, name) in [
             (141, "slack_gateway"),
+            (141, "slack_gateway_v1"),
             (142, "slack_gateway_first_observation"),
         ] {
             let pool = SqlitePoolOptions::new()
@@ -15035,7 +15041,8 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (141, "slack_gateway_v1"),
+            (142, "slack_gateway_v1"),
+            (141, "canonical_tool_round_receipts"),
             (140, "federation_local_stop_acceptance"),
             (139, "goal_start_materialization_witness"),
             (138, "per_goal_execution_requests"),

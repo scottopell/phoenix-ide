@@ -203,19 +203,28 @@ describe('CoordinatorPage', () => {
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
     const action = screen.getByRole('button', { name: 'Check in & drive' });
     expect(action).toHaveAttribute('data-prompt', COORDINATOR_BRIEFING_PROMPT);
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('including idle owners, but intervene selectively');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Leave healthy progressing work alone');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('do not assume idle owners are stalled');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('do not expand authority or reset prior decisions, pauses or gates');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Recover unanswered user decisions from history');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('verify each is still unresolved and material');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Advance independent authorized work first');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('ask_user_question with context and a recommendation');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Brief me first on what still needs my input');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('the problem, what you did, and where delivery goes next');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('not a fixed report template');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('through existing owners within verified standing authority');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not wait indefinitely for owner replies');
+    // Pre-rewrite prompt: 150 words, 984 characters.
+    expect(COORDINATOR_BRIEFING_PROMPT.split(/\s+/).length).toBeLessThanOrEqual(150);
+    expect(COORDINATOR_BRIEFING_PROMPT.length).toBeLessThanOrEqual(984);
+    for (const phrase of [
+      'including idle owners',
+      'Leave verified healthy progress alone',
+      'diagnose blocked or waiting states',
+      'smallest recovery step through existing owners within verified standing authority',
+      'verify work resumed',
+      'Progress elsewhere does not clear a blocker',
+      'Preserve prior decisions, pauses and gates',
+      'check-ins add no authority',
+      'reconcile later decisions and completed work',
+      'Verify unanswered choices still matter',
+      'independent authorized work',
+      'ask_user_question with context and a recommendation',
+      'Assume I missed intervening messages',
+      'plain English, not internal process labels',
+      'distinguish requests from verified outcomes',
+      'Skip routine check/send receipts',
+      'No fixed template',
+    ]) expect(COORDINATOR_BRIEFING_PROMPT).toContain(phrase);
     expect(COORDINATOR_BRIEFING_PROMPT).not.toContain('Do not send messages');
 
     expect(screen.queryByRole('heading', { name: 'Coordinator' })).not.toBeInTheDocument();

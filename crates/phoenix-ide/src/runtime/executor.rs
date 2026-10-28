@@ -41,6 +41,10 @@ use crate::system_prompt::{
 };
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::db_schema::{
+    merge_duration_into_display_data, tool_result_message_content, FinalizedToolDisposition,
+    FinalizedToolResult,
+};
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
@@ -652,21 +656,6 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             images: convert(images),
         },
     }
-}
-
-fn tool_result_message_content(result: &ToolResult) -> MessageContent {
-    let persisted_output = match &result.outcome {
-        ToolOutcome::TrustedInstructions { .. } => {
-            "Authenticated built-in skill instructions were delivered for this live request."
-        }
-        _ => result.output(),
-    };
-    MessageContent::tool_with_images(
-        &result.tool_use_id,
-        persisted_output,
-        result.is_error(),
-        result.images().to_vec(),
-    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9247,25 +9236,17 @@ where
             usage_data: assistant_message.usage,
             created_at: assistant_message.created_at,
         };
-        let tool_msgs: Vec<crate::db::Message> = tool_results
+        let tool_msgs: Vec<FinalizedToolResult> = tool_results
             .into_iter()
             .zip(reserved_seqs.into_iter().skip(1))
             .map(|(result, sequence_id)| {
-                let content = tool_result_message_content(&result);
-                crate::db::Message {
-                    origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                    message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
-                    conversation_id: conv_id.clone(),
+                FinalizedToolResult::new(
+                    &agent_msg.message_id,
+                    &conv_id,
                     sequence_id,
-                    message_type: content.message_type(),
-                    content,
-                    display_data: merge_duration_into_display_data(
-                        result.display_data(),
-                        result.duration_ms,
-                    ),
-                    usage_data: None,
-                    created_at: Utc::now(),
-                }
+                    Utc::now(),
+                    &result,
+                )
             })
             .collect();
         match self
@@ -9297,7 +9278,7 @@ where
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
-                .persisted_message(message);
+                .persisted_message(message.into_message());
         }
         Ok(None)
     }
@@ -9345,27 +9326,19 @@ where
                     created_at: assistant_message.created_at,
                 };
 
-                // Build all tool-result rows.
-                let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-                for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-                    let tool_content = tool_result_message_content(result);
-                    let merged_display =
-                        merge_duration_into_display_data(result.display_data(), result.duration_ms);
-                    tool_msgs.push(crate::db::Message {
-                        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                        message_id: tool_result_message_id(
+                let tool_msgs: Vec<FinalizedToolResult> = tool_results
+                    .into_iter()
+                    .zip(reserved_seqs.into_iter().skip(1))
+                    .map(|(result, sequence_id)| {
+                        FinalizedToolResult::new(
                             &agent_msg.message_id,
-                            &result.tool_use_id,
-                        ),
-                        conversation_id: conv_id.clone(),
-                        sequence_id: *tool_seq,
-                        message_type: tool_content.message_type(),
-                        content: tool_content,
-                        display_data: merged_display,
-                        usage_data: None,
-                        created_at: Utc::now(),
-                    });
-                }
+                            &conv_id,
+                            sequence_id,
+                            Utc::now(),
+                            &result,
+                        )
+                    })
+                    .collect();
 
                 // Persist the assistant message and every tool result in one
                 // transaction: either the full round is durable or none of it
@@ -9382,7 +9355,11 @@ where
                             &update,
                         )
                         .await?;
-                } else if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
+                } else if tool_msgs
+                    .iter()
+                    .any(|result| result.disposition() == FinalizedToolDisposition::Cancelled)
+                    || matches!(self.state, ConvState::AwaitingTaskApproval { .. })
+                {
                     self.storage
                         .persist_tool_round_and_state(
                             &conv_id,
@@ -9420,7 +9397,7 @@ where
                     let _ = self
                         .broadcast_tx
                         .admitted_publication(admitted)
-                        .persisted_message(msg);
+                        .persisted_message(msg.into_message());
                 }
             }
         }
@@ -12472,33 +12449,6 @@ fn drop_leading_non_user(messages: Vec<LlmMessage>) -> (Vec<LlmMessage>, usize) 
         .count();
     let kept = messages.into_iter().skip(trimmed).collect();
     (kept, trimmed)
-}
-
-/// Merge a `duration_ms` value into an existing `display_data` JSON blob.
-///
-/// If `duration_ms` is `None`, returns a clone of the existing data unchanged.
-/// If `display_data` is `None`, returns `{ "duration_ms": ms }` when a
-/// duration is present. If both are `Some`, inserts `duration_ms` into the
-/// existing object without overwriting any tool-specific fields.
-fn merge_duration_into_display_data(
-    existing: Option<&serde_json::Value>,
-    duration_ms: Option<u64>,
-) -> Option<serde_json::Value> {
-    match (existing, duration_ms) {
-        (None, None) => None,
-        (Some(v), None) => Some(v.clone()),
-        (None, Some(ms)) => Some(serde_json::json!({ "duration_ms": ms })),
-        (Some(v), Some(ms)) => {
-            let mut merged = v.clone();
-            if let Some(obj) = merged.as_object_mut() {
-                obj.insert(
-                    "duration_ms".to_string(),
-                    serde_json::Value::Number(ms.into()),
-                );
-            }
-            Some(merged)
-        }
-    }
 }
 
 /// Normalize a working-dir-relative `task_file` to repository-relative
@@ -25566,6 +25516,285 @@ mod steer_drain_detector_tests {
             !saw_duration_update,
             "duration must not be rebroadcast as a follow-up MessageUpdated"
         );
+    }
+}
+
+#[cfg(test)]
+mod goal_report_cancellation_checkpoint_tests {
+    #![allow(clippy::large_futures)]
+
+    use super::*;
+    use crate::db::Database;
+    use crate::runtime::testing::{MockLlmClient, MockToolExecutor};
+    use crate::runtime::traits::DatabaseStorage;
+    use crate::state_machine::event::CancelCause;
+    use crate::state_machine::state::{AssistantMessage, PendingSubAgent, SubAgentMode, ToolInput};
+    use phoenix_core::domain::conversation_goal::{
+        GoalActor, GoalAttribution, GoalChange, GoalId, GoalMutation, GoalText, GoalTimestampUs,
+        GoalVersion,
+    };
+    use phoenix_core::domain::db_schema::FinalizedToolResult;
+
+    async fn goal_and_watch_counts(db: &Database) -> (i64, i64, i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM conversation_goal_ids),
+                    (SELECT COUNT(*) FROM conversation_goal_history),
+                    (SELECT COUNT(*) FROM conversation_goal_actors),
+                    (SELECT COUNT(*) FROM coordinator_watch_events),
+                    (SELECT COUNT(*) FROM coordinator_watch_goal_captures)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn cancellation_checkpoint(pending_sub_agents: Vec<PendingSubAgent>) {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("cancelled-goal-report.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let conversation_id = "cancelled-goal-report";
+        let conversation = db
+            .create_conversation(conversation_id, "cancel report", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let owner = conversation.product_conversation_id;
+        db.watch_product_conversation(&owner).await.unwrap();
+        let actor = GoalActor::GeneratedHost {
+            action_id: GoalText::parse("seed-goal").unwrap(),
+        };
+        db.apply_conversation_goal(
+            &GoalMutation {
+                owner: owner.clone(),
+                expected_version: GoalVersion::INITIAL,
+                action_id: GoalText::parse("seed-goal").unwrap(),
+                attribution: GoalAttribution {
+                    requested_by: actor.clone(),
+                    applied_by: actor,
+                },
+                change: GoalChange::Create {
+                    goal_id: GoalId::parse("retained-goal").unwrap(),
+                    objective: GoalText::parse("Must remain underway after cancellation").unwrap(),
+                },
+            },
+            conversation_id,
+            GoalTimestampUs::parse(Utc::now().timestamp_micros()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let goal_before = db.conversation_goal(&owner).await.unwrap();
+        let history_before = db
+            .conversation_goal_history(&owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
+        let counts_before = goal_and_watch_counts(&db).await;
+        let context = ConvContext::new(
+            conversation_id,
+            directory.path().to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
+        let call = |id: &str| {
+            ToolCall::new(
+                id,
+                ToolInput::Unknown {
+                    name: "goal_report".into(),
+                    input: serde_json::json!({"outcome": "complete", "reason": "finished"}),
+                },
+            )
+        };
+        let current = call("current-report");
+        let skipped = call("skipped-report");
+        let assistant = AssistantMessage::new(
+            "cancel-report-owner".into(),
+            [&current, &skipped]
+                .into_iter()
+                .map(|tool| ContentBlock::tool_use(&tool.id, tool.name(), tool.input.to_value()))
+                .collect(),
+            None,
+            None,
+        );
+        let has_pending_sub_agents = !pending_sub_agents.is_empty();
+        let executing = ConvState::ToolExecuting {
+            current_tool: current,
+            remaining_tools: vec![skipped],
+            completed_results: vec![],
+            pending_sub_agents,
+            assistant_message: assistant,
+        };
+        let cancelling = crate::state_machine::transition::transition(
+            &executing,
+            &context,
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            cancelling.new_state,
+            ConvState::CancellingTool { .. }
+        ));
+        db.update_conversation_state_at(conversation_id, &cancelling.new_state, Utc::now())
+            .await
+            .unwrap();
+        let settled = crate::state_machine::transition::transition(
+            &cancelling.new_state,
+            &context,
+            Event::ToolAborted {
+                tool_use_id: "current-report".into(),
+            },
+        )
+        .unwrap();
+        let selected_state = settled.new_state;
+        if has_pending_sub_agents {
+            assert!(matches!(
+                selected_state,
+                ConvState::CancellingSubAgents { .. }
+            ));
+        } else {
+            assert_eq!(selected_state, ConvState::Idle);
+        }
+        let data = settled
+            .effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PersistCheckpoint { data } => Some(data),
+                _ => None,
+            })
+            .expect("cancellation produces a checkpoint");
+        let CheckpointData::ToolRound { tool_results, .. } = &data;
+        let results = tool_results.clone();
+        assert_eq!(results.len(), 2);
+        for result in &results {
+            assert!(matches!(result.outcome, ToolOutcome::Cancelled { .. }));
+            assert!(!result.is_error());
+        }
+        assert_eq!(results[0].output(), "Cancelled by user");
+        assert_eq!(results[1].output(), "Skipped due to cancellation");
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            selected_state.clone(),
+            DatabaseStorage::new(db.clone()),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(32, 0),
+        );
+        let selected_at = runtime.state_updated_at;
+        // Do not execute PersistState: this effect must own the state write too.
+        runtime
+            .execute_effect(Effect::PersistCheckpoint { data })
+            .await
+            .expect("cancelled reports are finalized results, not successful reports");
+        drop(runtime);
+        db.pool().close().await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let retained = db.get_conversation(conversation_id).await.unwrap();
+        assert_eq!(retained.state, selected_state);
+        assert_eq!(retained.state_updated_at, selected_at);
+        let messages = db.get_messages(conversation_id).await.unwrap();
+        assert_eq!(messages.len(), 3);
+        let assistant = messages
+            .iter()
+            .find(|message| message.message_id == "cancel-report-owner")
+            .unwrap();
+        assert!(matches!(&assistant.content, MessageContent::Agent(blocks) if blocks.len() == 2));
+        let mut finalized = Vec::new();
+        for result in results {
+            let id = tool_result_message_id(&assistant.message_id, &result.tool_use_id);
+            let row = messages
+                .iter()
+                .find(|message| message.message_id == id)
+                .unwrap();
+            assert!(matches!(
+                &row.content,
+                MessageContent::Tool(tool_content)
+                    if tool_content.tool_use_id == result.tool_use_id
+                        && tool_content.content == result.output()
+                        && !tool_content.is_error
+            ));
+            let result = FinalizedToolResult::new(
+                &assistant.message_id,
+                conversation_id,
+                row.sequence_id,
+                row.created_at,
+                &result,
+            );
+            assert_eq!(
+                serde_json::to_value(result.row()).unwrap(),
+                serde_json::to_value(row).unwrap()
+            );
+            finalized.push(result);
+        }
+        let receipt: (Vec<u8>, i64, String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT selected_checkpoint_sha256,selected_state_updated_at_us,replay_kind,replay_payload_sha256
+             FROM canonical_tool_round_receipts WHERE conversation_id=? AND assistant_message_id=?",
+        )
+        .bind(conversation_id)
+        .bind(&assistant.message_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt.0.len(), 32);
+        assert_eq!(receipt.1, selected_at.timestamp_micros());
+        assert_eq!(receipt.2, "none");
+        assert_eq!(receipt.3, None);
+        db.persist_tool_round_and_state(
+            conversation_id,
+            assistant,
+            &finalized,
+            &selected_state,
+            selected_at,
+        )
+        .await
+        .expect("exact finalized cancellation retry");
+        assert_eq!(
+            serde_json::to_value(db.get_messages(conversation_id).await.unwrap()).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM canonical_tool_round_receipts")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(receipt_count, 1);
+        let retried = db.get_conversation(conversation_id).await.unwrap();
+        assert_eq!(retried.state, selected_state);
+        assert_eq!(retried.state_updated_at, selected_at);
+        assert_eq!(db.conversation_goal(&owner).await.unwrap(), goal_before);
+        assert_eq!(
+            db.conversation_goal_history(&owner, GoalVersion::INITIAL)
+                .await
+                .unwrap(),
+            history_before
+        );
+        assert_eq!(goal_and_watch_counts(&db).await, counts_before);
+    }
+
+    #[tokio::test]
+    async fn cancelled_current_and_skipped_goal_reports_checkpoint_idle_in_real_database() {
+        cancellation_checkpoint(vec![]).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_current_and_skipped_goal_reports_checkpoint_subagent_cancellation_in_real_database(
+    ) {
+        cancellation_checkpoint(vec![PendingSubAgent {
+            agent_id: "pending-child".into(),
+            task: "independent work".into(),
+            mode: SubAgentMode::Work,
+        }])
+        .await;
     }
 }
 
