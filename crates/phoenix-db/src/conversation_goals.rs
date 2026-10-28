@@ -14,9 +14,13 @@ use crate::Database;
 type GoalTx<'a> = Transaction<'a, Sqlite>;
 
 mod admission;
+pub mod checkpoint;
 pub mod control;
 pub mod execution;
+pub mod round;
 pub mod user_commands;
+
+pub use round::{CommittedGoalRound, GoalRoundCheckpoint};
 
 #[cfg(test)]
 mod writer_tests;

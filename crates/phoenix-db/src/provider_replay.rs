@@ -7,8 +7,140 @@
 //! derived from the last response set in the payload on write.
 
 use crate::{Database, DbError, DbResult};
-use phoenix_core::domain::provider_replay::AnthropicReplayPayload;
+use phoenix_core::domain::db_schema::Message;
+use phoenix_core::domain::provider_replay::{AnthropicReplayPayload, ProviderReplayUpdate};
 use sqlx::Row;
+
+mod canonical_receipt;
+pub(crate) use canonical_receipt::CanonicalReceipt;
+
+pub(crate) fn validate_goal_round_replay(
+    assistant: &Message,
+    update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
+) -> DbResult<()> {
+    use phoenix_core::domain::{db_schema::MessageContent, provider_replay::ProviderReplayUpdate};
+    let MessageContent::Agent(blocks) = &assistant.content else {
+        return Err(DbError::Serialization("goal round replay assistant".into()));
+    };
+    let matches = match update {
+        ProviderReplayUpdate::Anthropic(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
+        ProviderReplayUpdate::Responses(set) => {
+            set.owner_message_id == assistant.message_id && &set.public_content == blocks
+        }
+        ProviderReplayUpdate::Clear => true,
+    };
+    if !matches {
+        return Err(DbError::Serialization(
+            "goal round replay owner differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) type CanonicalWriteOutcome = crate::conversation_goals::round::CommittedGoalRound;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum CanonicalCommitCut {
+    BeforeCanonicalCommit,
+    AfterCanonicalCommit,
+}
+
+impl Database {
+    /// Commit report evidence, selected state, and optional private replay atomically.
+    ///
+    /// # Errors
+    /// Rejects invalid round provenance, mismatched replay evidence, or failed persistence.
+    pub async fn persist_canonical_checkpoint(
+        &self,
+        checkpoint: &crate::conversation_goals::GoalRoundCheckpoint<'_>,
+        update: Option<&ProviderReplayUpdate>,
+    ) -> DbResult<crate::conversation_goals::CommittedGoalRound> {
+        self.persist_canonical_state_and_replay_input(
+            &checkpoint.assistant.conversation_id,
+            checkpoint.assistant,
+            crate::conversation_goals::round::ToolRoundWrite::Pending {
+                execution: checkpoint.execution,
+                results: checkpoint.results,
+            },
+            checkpoint.state,
+            checkpoint.state_updated_at,
+            update,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_canonical_state_and_replay_input(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        input: crate::conversation_goals::round::ToolRoundWrite<'_>,
+        state: &phoenix_core::domain::sm_state::ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        update: Option<&ProviderReplayUpdate>,
+        cut: Option<CanonicalCommitCut>,
+    ) -> DbResult<CanonicalWriteOutcome> {
+        use crate::conversation_goals::round;
+        if matches!(&input, round::ToolRoundWrite::Pending { .. }) {
+            if let Some(update) = update {
+                validate_goal_round_replay(assistant, update)?;
+            }
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let receipt = canonical_receipt::CanonicalReceipt::new(state, state_updated_at, update)?;
+        let (results, replayed) = round::write_round_tx(
+            &mut tx,
+            conversation_id,
+            assistant,
+            input,
+            state,
+            state_updated_at,
+            self.goal_write_policies(),
+        )
+        .await?;
+        if replayed {
+            receipt
+                .verify(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
+        }
+        let (state, state_updated_at) =
+            round::selected_state_tx(&mut tx, conversation_id, state, state_updated_at, replayed)
+                .await
+                .map_err(round::db_error)?;
+        if !replayed {
+            if let Some(update) = update {
+                apply_replay_tx(&mut tx, conversation_id, update).await?;
+            }
+        }
+        if !replayed {
+            receipt
+                .insert(&mut tx, conversation_id, &assistant.message_id)
+                .await?;
+        }
+        if cut == Some(CanonicalCommitCut::BeforeCanonicalCommit) {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "injected before canonical commit".into(),
+            ));
+        }
+        tx.commit().await?;
+        if cut == Some(CanonicalCommitCut::AfterCanonicalCommit) {
+            return Err(DbError::Serialization(
+                "injected after canonical commit".into(),
+            ));
+        }
+        Ok(round::CommittedGoalRound {
+            results,
+            state,
+            state_updated_at,
+            replayed,
+        })
+    }
+}
 
 impl Database {
     #[cfg(test)]
@@ -36,7 +168,7 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &phoenix_core::domain::db_schema::Message,
-        tool_results: &[phoenix_core::domain::db_schema::Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
         update: &phoenix_core::domain::provider_replay::AnthropicReplayUpdate,
@@ -153,29 +285,20 @@ impl Database {
         &self,
         conversation_id: &str,
         assistant: &phoenix_core::domain::db_schema::Message,
-        tool_results: &[phoenix_core::domain::db_schema::Message],
+        tool_results: &[phoenix_core::domain::db_schema::FinalizedToolResult],
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
     ) -> DbResult<()> {
-        let mut tx = self.pool().begin().await?;
-        crate::insert_message_tx(&mut tx, assistant).await?;
-        for message in tool_results {
-            crate::insert_message_tx(&mut tx, message).await?;
-        }
-        crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        sqlx::query("UPDATE conversations SET state=?1, state_kind=?2, state_updated_at=?3, updated_at=?4 WHERE id=?5")
-            .bind(state_json)
-            .bind(crate::conv_state_kind(state))
-            .bind(state_updated_at.to_rfc3339())
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
-        apply_replay_tx(&mut tx, conversation_id, update).await?;
-        tx.commit().await?;
+        self.persist_tool_round_state_and_replay_input(
+            conversation_id,
+            assistant,
+            crate::conversation_goals::round::ToolRoundWrite::Finalized(tool_results),
+            state,
+            state_updated_at,
+            Some(update),
+        )
+        .await?;
         Ok(())
     }
 
@@ -371,7 +494,7 @@ impl Database {
     }
 }
 
-async fn apply_replay_tx(
+pub(crate) async fn apply_replay_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conversation_id: &str,
     update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -397,12 +520,18 @@ async fn apply_replay_tx(
                     DbError::Serialization(format!("provider replay validation: {error}"))
                 })?
                 .map_or_else(Vec::new, |payload| payload.response_sets);
-            if !sets
+            if let Some(retained) = sets
                 .iter()
-                .any(|set| set.identity.response_id == response.identity.response_id)
+                .find(|set| set.identity.response_id == response.identity.response_id)
             {
-                sets.push(response.clone());
+                if retained != response {
+                    return Err(DbError::Serialization(
+                        "Anthropic response identity differs".into(),
+                    ));
+                }
+                return Ok(());
             }
+            sets.push(response.clone());
             let payload = AnthropicReplayPayload::new(sets)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             let json = serde_json::to_string(&payload)

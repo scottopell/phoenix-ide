@@ -8,6 +8,7 @@ use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_core::domain::db_schema::FinalizedToolResult;
 use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_db::workflow::DirectTurnMaterializationEligibility;
 use phoenix_llm::ModelRegistry;
@@ -2000,7 +2001,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         conv_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String> {
         if *self.fail_tool_round_persist.lock().unwrap() {
             return Err("injected tool round persist failure".to_string());
@@ -2015,8 +2016,8 @@ impl MessageStore for InMemoryStorage {
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());
-        for msg in tool_results {
-            bucket.push(msg.clone());
+        for result in tool_results {
+            bucket.push(result.row().clone());
         }
         Ok(())
     }
@@ -2025,7 +2026,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         conv_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
@@ -2038,7 +2039,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         conv_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
         if *self.terminal_mutation_retired.lock().unwrap() {
@@ -2510,7 +2511,7 @@ impl StateStore for InMemoryStorage {
         &self,
         conversation_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &phoenix_core::domain::sm_state::ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
         _update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,

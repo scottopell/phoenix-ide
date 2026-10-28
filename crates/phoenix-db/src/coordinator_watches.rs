@@ -742,9 +742,52 @@ mod tests {
         );
     }
 
+    async fn evidence(
+        db: &Database,
+        transcript: &str,
+        owner: &ProductConversationId,
+    ) -> serde_json::Value {
+        use phoenix_core::domain::conversation_goal::GoalVersion;
+
+        type ReceiptEvidence = (String, Vec<u8>, i64, String, Option<Vec<u8>>);
+        let state: (String, String, String, String) = sqlx::query_as(
+            "SELECT state,state_kind,state_updated_at,updated_at FROM conversations WHERE id=?",
+        )
+        .bind(transcript)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let receipts: Vec<ReceiptEvidence> = sqlx::query_as(
+            "SELECT assistant_message_id,selected_checkpoint_sha256,selected_state_updated_at_us,replay_kind,replay_payload_sha256 FROM canonical_tool_round_receipts WHERE conversation_id=? ORDER BY assistant_message_id",
+        )
+        .bind(transcript)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        serde_json::json!({
+            "state": state,
+            "messages": db.get_messages(transcript).await.unwrap(),
+            "receipts": receipts,
+            "goal": db.conversation_goal(owner).await.unwrap(),
+            "history": db.conversation_goal_history(owner, GoalVersion::INITIAL).await.unwrap(),
+            "events": format!("{:?}", db.pending_coordinator_watch_events(16).await.unwrap()),
+        })
+    }
+
+    async fn assert_checkpoint_not_terminal(db: &Database, turn: u64) {
+        let terminal: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(terminal.is_none());
+    }
+
     #[tokio::test]
     async fn checkpoint_without_provider_replay_persists_approval_event_atomically() {
         use phoenix_core::domain::db_schema::{Message, MessageContent, MessageType};
+
         let db = Database::open_in_memory().await.unwrap();
         let source = db
             .create_conversation(
@@ -778,12 +821,20 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         };
+        let checkpoint_at = Utc::now();
+        let before = evidence(&db, &source.id, &source.product_conversation_id).await;
         sqlx::query("CREATE TRIGGER reject_wait_checkpoint BEFORE UPDATE OF state ON conversations BEGIN SELECT RAISE(ABORT, 'checkpoint test failure'); END")
             .execute(db.pool()).await.unwrap();
-        assert!(db
-            .persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+        let error = db
+            .persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, checkpoint_at)
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(&error, DbError::Sqlx(_)));
+        assert!(error.to_string().contains("checkpoint test failure"));
+        assert_eq!(
+            evidence(&db, &source.id, &source.product_conversation_id).await,
+            before
+        );
         assert!(db
             .pending_coordinator_watch_events(16)
             .await
@@ -794,7 +845,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, checkpoint_at)
             .await
             .unwrap();
         let events = db.pending_coordinator_watch_events(16).await.unwrap();
@@ -805,20 +856,36 @@ mod tests {
             waiting
         );
         assert!(db.get_message_by_id(&assistant.message_id).await.is_ok());
-        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, Utc::now())
+        let committed = evidence(&db, &source.id, &source.product_conversation_id).await;
+        db.persist_tool_round_and_state(&source.id, &assistant, &[], &waiting, checkpoint_at)
             .await
             .unwrap();
+        assert_eq!(
+            evidence(&db, &source.id, &source.product_conversation_id).await,
+            committed
+        );
+        let error = db
+            .persist_tool_round_and_state(
+                &source.id,
+                &assistant,
+                &[],
+                &waiting,
+                checkpoint_at + chrono::Duration::microseconds(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, DbError::Serialization(message) if message == "canonical checkpoint command differs")
+        );
+        assert_eq!(
+            evidence(&db, &source.id, &source.product_conversation_id).await,
+            committed
+        );
         assert_eq!(
             db.pending_coordinator_watch_events(16).await.unwrap().len(),
             1
         );
-        let terminal: Option<String> =
-            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
-                .bind(i64::try_from(turn).unwrap())
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert!(terminal.is_none());
+        assert_checkpoint_not_terminal(&db, turn).await;
     }
 
     #[tokio::test]

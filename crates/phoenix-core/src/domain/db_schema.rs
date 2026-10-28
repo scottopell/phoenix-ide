@@ -1010,6 +1010,112 @@ impl ToolResult {
     }
 }
 
+#[must_use]
+pub fn merge_duration_into_display_data(
+    existing: Option<&serde_json::Value>,
+    duration_ms: Option<u64>,
+) -> Option<serde_json::Value> {
+    match (existing, duration_ms) {
+        (None, None) => None,
+        (Some(v), None) => Some(v.clone()),
+        (None, Some(ms)) => Some(serde_json::json!({ "duration_ms": ms })),
+        (Some(v), Some(ms)) => {
+            let mut merged = v.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert(
+                    "duration_ms".to_string(),
+                    serde_json::Value::Number(ms.into()),
+                );
+            }
+            Some(merged)
+        }
+    }
+}
+#[must_use]
+pub fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    let persisted_output = match &result.outcome {
+        ToolOutcome::TrustedInstructions { .. } => {
+            "Authenticated built-in skill instructions were delivered for this live request."
+        }
+        ToolOutcome::Success { .. } | ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. } => {
+            result.output()
+        }
+    };
+    MessageContent::tool_with_images(
+        &result.tool_use_id,
+        persisted_output,
+        result.is_error(),
+        result.images().to_vec(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalizedToolDisposition {
+    Success,
+    TrustedInstructions,
+    Error,
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+pub struct FinalizedToolResult {
+    row: Message,
+    disposition: FinalizedToolDisposition,
+}
+
+impl FinalizedToolResult {
+    #[must_use]
+    pub fn new(
+        assistant_message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        created_at: DateTime<Utc>,
+        result: &ToolResult,
+    ) -> Self {
+        let disposition = match &result.outcome {
+            ToolOutcome::Success { .. } => FinalizedToolDisposition::Success,
+            ToolOutcome::TrustedInstructions { .. } => {
+                FinalizedToolDisposition::TrustedInstructions
+            }
+            ToolOutcome::Error { .. } => FinalizedToolDisposition::Error,
+            ToolOutcome::Cancelled { .. } => FinalizedToolDisposition::Cancelled,
+        };
+        let row = Message {
+            message_id: super::tool_result_identity::tool_result_message_id(
+                assistant_message_id,
+                &result.tool_use_id,
+            ),
+            conversation_id: conversation_id.to_owned(),
+            sequence_id,
+            message_type: MessageType::Tool,
+            content: tool_result_message_content(result),
+            created_at,
+            display_data: merge_duration_into_display_data(
+                result.display_data(),
+                result.duration_ms,
+            ),
+            usage_data: None,
+            origin: InputOrigin::SystemGenerated,
+        };
+        Self { row, disposition }
+    }
+
+    #[must_use]
+    pub fn row(&self) -> &Message {
+        &self.row
+    }
+
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        self.row
+    }
+
+    #[must_use]
+    pub fn disposition(&self) -> FinalizedToolDisposition {
+        self.disposition
+    }
+}
+
 // SubAgentResult is now in state_machine::state
 
 // ============================================================
@@ -2213,6 +2319,138 @@ mod conversation_serde_tests {
 
     fn fixture_ts() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn finalized_tool_result_preserves_disposition_content_and_metadata() {
+        let images = vec![ToolContentImage {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        }];
+        let cases = [
+            (
+                ToolOutcome::Success {
+                    output: "success output".into(),
+                    display_data: Some(serde_json::json!({"detail": "success", "duration_ms": 1})),
+                    images: images.clone(),
+                },
+                FinalizedToolDisposition::Success,
+                "success output",
+                false,
+                images.clone(),
+                serde_json::json!({"detail": "success", "duration_ms": 42}),
+            ),
+            (
+                ToolOutcome::Error {
+                    output: "error output".into(),
+                    display_data: Some(serde_json::json!({"detail": "error"})),
+                    images: images.clone(),
+                },
+                FinalizedToolDisposition::Error,
+                "error output",
+                true,
+                images,
+                serde_json::json!({"detail": "error", "duration_ms": 42}),
+            ),
+            (
+                ToolOutcome::Cancelled {
+                    message: "cancelled by user".into(),
+                },
+                FinalizedToolDisposition::Cancelled,
+                "cancelled by user",
+                false,
+                vec![],
+                serde_json::json!({"duration_ms": 42}),
+            ),
+            (
+                ToolOutcome::TrustedInstructions {
+                    output: "private live instructions: do not persist".into(),
+                },
+                FinalizedToolDisposition::TrustedInstructions,
+                "Authenticated built-in skill instructions were delivered for this live request.",
+                false,
+                vec![],
+                serde_json::json!({"duration_ms": 42}),
+            ),
+        ];
+
+        for (outcome, disposition, content, is_error, images, display_data) in cases {
+            let finalized = FinalizedToolResult::new(
+                "assistant:1",
+                "conversation:2",
+                17,
+                fixture_ts(),
+                &ToolResult {
+                    tool_use_id: "tool:3".into(),
+                    outcome,
+                    duration_ms: Some(42),
+                },
+            );
+            assert_eq!(finalized.disposition(), disposition);
+            let row = finalized.row();
+            assert_eq!(row.message_id, "tool-result:11:assistant:1:tool:3");
+            assert_eq!(row.conversation_id, "conversation:2");
+            assert_eq!(row.sequence_id, 17);
+            assert_eq!(row.created_at, fixture_ts());
+            assert_eq!(row.message_type, MessageType::Tool);
+            assert_eq!(row.origin, InputOrigin::SystemGenerated);
+            assert!(row.usage_data.is_none());
+            assert_eq!(row.display_data, Some(display_data));
+            assert_eq!(
+                row.content,
+                MessageContent::Tool(ToolContent {
+                    tool_use_id: "tool:3".into(),
+                    content: content.into(),
+                    is_error,
+                    images,
+                })
+            );
+            let expected = serde_json::to_value(row).unwrap();
+            assert_eq!(
+                serde_json::to_value(finalized.into_message()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_tool_result_preserves_nonobject_display_data_and_optional_duration() {
+        let cases = [
+            (None, None, None),
+            (
+                Some(serde_json::json!({"detail": "kept"})),
+                None,
+                Some(serde_json::json!({"detail": "kept"})),
+            ),
+            (
+                Some(serde_json::json!(["nonobject"])),
+                Some(42),
+                Some(serde_json::json!(["nonobject"])),
+            ),
+            (
+                Some(serde_json::Value::Null),
+                Some(42),
+                Some(serde_json::Value::Null),
+            ),
+        ];
+        for (display_data, duration_ms, expected) in cases {
+            let finalized = FinalizedToolResult::new(
+                "assistant",
+                "conversation",
+                1,
+                fixture_ts(),
+                &ToolResult {
+                    tool_use_id: "tool".into(),
+                    outcome: ToolOutcome::Success {
+                        output: "ok".into(),
+                        display_data,
+                        images: vec![],
+                    },
+                    duration_ms,
+                },
+            );
+            assert_eq!(finalized.row().display_data, expected);
+        }
     }
 
     fn fixture(continued_in_conv_id: Option<String>) -> Conversation {
