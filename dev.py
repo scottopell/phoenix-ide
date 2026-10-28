@@ -11546,6 +11546,29 @@ def _release_launchd_restart_claim(transaction_id: str) -> bool:
         return _release_launchd_restart_claim_unlocked(transaction_id)
 
 
+_ORDINARY_FORWARD_RESUME_STATES = frozenset(
+    {
+        "ordinary_preboundary_prepared",
+        "ordinary_preboundary_stopped",
+        "ordinary_source_proven",
+        "ordinary_preboundary_failed_stopped",
+        "ordinary_activation_failed_rollback_failed",
+        "candidate_may_migrate",
+        "ordinary_migration_proven",
+        "ordinary_activation_failed_forward_only",
+    }
+)
+
+
+def _ordinary_forward_recovery_pending(status: dict) -> bool:
+    state = status.get("state")
+    return state in _ORDINARY_FORWARD_RESUME_STATES or (
+        state == "committed"
+        and status.get("finalization_pending") is True
+        and status.get("recovery_mode") == "ordinary_forward_proven"
+    )
+
+
 def _paired_recovery_refusal(owner: str | None) -> str | None:
     if owner is None:
         return None
@@ -11608,6 +11631,11 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             f"ordinary forward activation {owner} may have committed migration 126/127 or coordinator-home initialization. "
             "Do not start the predecessor or remove the claim. Preserve the retained candidate and evidence; "
             f"after explicit forward-recovery authorization run ./dev.py prod resume-forward {owner}."
+        )
+    if ordinary_forward and owner_status and _ordinary_forward_recovery_pending(status):
+        return (
+            f"ordinary forward recovery for {owner} is incomplete. Do not remove its claim or retained evidence; "
+            f"run ./dev.py prod resume-forward {owner}."
         )
     if (
         owner_status
@@ -12850,7 +12878,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
         not isinstance(forward, dict)
         or not _deploy_status_matches_manifest(staging, payload, status, DeployManifestKind.ORDINARY_FORWARD)
         or status.get("transaction_id") != transaction_id
-        or status.get("state") not in {"candidate_may_migrate", "ordinary_activation_failed_forward_only"}
+        or not _ordinary_forward_recovery_pending(status)
         or _deploy_claim_owner() != transaction_id
     ):
         raise SystemExit("forward recovery requires a retained unresolved ordinary transaction")
@@ -12872,7 +12900,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     )
     if result.returncode != 0:
         raise SystemExit(f"forward recovery failed; claim retained: {result.stderr.strip()}")
-    print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
+    print(f"Forward recovery completed: {transaction_id}.")
 
 
 def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:
@@ -13116,6 +13144,20 @@ def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = No
             ) from exc
     env_file = _load_env_file(env)
     return env, env_file
+
+
+def _prepared_launchd_deploy_status(manifest: dict, prepared_mode: str | None) -> dict:
+    identity = manifest["expected"]
+    return {
+        "transaction_id": manifest["transaction_id"], "state": "prepared",
+        "preparing_pid": os.getpid(), "source_kind": manifest["source_kind"],
+        "prepared_mode": prepared_mode,
+        "source_commit": manifest["source_commit"],
+        "release_commit": manifest["release_commit"], "release_tag": manifest["release_tag"],
+        "expected_version": identity["version"], "expected_git_sha": identity["git_sha"],
+        "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
+        "failure": None, "rollback_failure": None, "finalization_pending": False,
+    }
 
 
 def launchd_prod_deploy(
@@ -13505,15 +13547,7 @@ def launchd_prod_deploy(
             with artifact.open("rb") as stream:
                 os.fsync(stream.fileno())
         _fsync_directory(staging)
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "prepared",
-            "preparing_pid": os.getpid(), "source_kind": source_kind,
-            "prepared_mode": prepared_mode,
-            "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
-            "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
-            "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
-            "failure": None, "rollback_failure": None,
-        })
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, _prepared_launchd_deploy_status(manifest, prepared_mode))
         _ensure_newsyslog_config()
         bootstrap_attempted = True
         result = subprocess.run(
@@ -13951,16 +13985,13 @@ def _print_launchd_deploy_status() -> None:
             }
             ordinary_forward = kind is DeployManifestKind.ORDINARY_FORWARD
             resolved = _markerless_status_is_resolved(deploy)
-            forward_only_state = deploy.get("state") in {
-                "candidate_may_migrate",
-                "ordinary_activation_failed_forward_only",
-            }
-            ordinary_forward_only = ordinary_forward and forward_only_state
-            conflicting_forward_state = forward_only_state and not ordinary_forward
+            forward_recovery_state = _ordinary_forward_recovery_pending(deploy)
+            ordinary_forward_recovery = ordinary_forward and forward_recovery_state
+            conflicting_forward_state = forward_recovery_state and not ordinary_forward
             unknown_unresolved = kind is DeployManifestKind.UNKNOWN and not resolved
             markerless_unresolved = (
                 (prepared and not resolved)
-                or ordinary_forward_only
+                or ordinary_forward_recovery
                 or conflicting_forward_state
                 or unknown_unresolved
             )
@@ -13972,16 +14003,16 @@ def _print_launchd_deploy_status() -> None:
                 )
             elif conflicting_forward_state:
                 print(
-                    "    UNRESOLVED: forward-only status conflicts with the retained ordinary manifest. "
+                    "    UNRESOLVED: forward-recovery status conflicts with the retained ordinary manifest. "
                     "Preserve its candidate and evidence; do not redeploy or invoke recovery until "
                     "the manifest/status mismatch is diagnosed."
                 )
-            elif ordinary_forward_only:
+            elif ordinary_forward_recovery:
                 print(
-                    "    UNRESOLVED: ordinary forward-only transaction status has no active claim owner. "
+                    "    UNRESOLVED: ordinary forward-recovery status has no active claim owner. "
                     "Preserve its candidate and evidence; do not start the predecessor, redeploy, "
                     "or recreate or clear markers until claim/status ownership is diagnosed. "
-                    "After an actual matching claim exists and forward recovery is explicitly authorized, "
+                    "After an actual matching claim exists, "
                     f"the supported path is ./dev.py prod resume-forward {transaction_id}."
                 )
             elif prepared and not resolved:
