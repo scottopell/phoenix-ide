@@ -292,30 +292,19 @@ impl Database {
         .await
     }
 
-    async fn user_goal_command<F: FnOnce()>(
+    async fn user_goal_command_tx(
         &self,
+        tx: &mut GoalTx<'_>,
         input: &GoalUserCommand,
         expected_transcript: &str,
         at: GoalTimestampUs,
         host_gate_busy: bool,
-        on_authority_lost: F,
-        #[cfg(test)] cut: UserCommitCut,
-    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
-        let mut connection = match self.pool().acquire().await {
-            Ok(connection) => connection,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
-        };
-        let mut tx = match sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await {
-            Ok(tx) => tx,
-            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
-        };
-        let mut authority = super::control::ControlCommitAuthority::new(on_authority_lost);
-        let result: Result<GoalUserReceipt> = async {
-        admission::require_target_tx(&mut tx, &input.owner, expected_transcript).await?;
-        if let Some(retained) = retained_tx(&mut tx, input).await? {
+    ) -> Result<GoalUserReceipt> {
+        admission::require_target_tx(tx, &input.owner, expected_transcript).await?;
+        if let Some(retained) = retained_tx(tx, input).await? {
             return Ok(retained);
         }
-        let current = current_tx(&mut tx, &input.owner).await?;
+        let current = current_tx(tx, &input.owner).await?;
         let observed = current
             .as_ref()
             .map_or(GoalVersion::INITIAL, super::GoalSnapshot::version);
@@ -325,7 +314,7 @@ impl Database {
             } else {
                 GoalUserRefusal::Version
             };
-            let receipt = reject_tx(&mut tx, input, reason, observed, at).await?;
+            let receipt = reject_tx(tx, input, reason, observed, at).await?;
             return Ok(receipt);
         }
         let actor = GoalActor::UserControl {
@@ -346,12 +335,11 @@ impl Database {
             },
             change: input.change.mutation_change()?,
         };
-        match admission::require_settled_tx(&mut tx, &mutation, expected_transcript).await {
+        match admission::require_settled_tx(tx, &mutation, expected_transcript).await {
             Ok(()) => {}
             Err(GoalDbError::Busy) => {
-                let receipt =
-                    reject_tx(&mut tx, input, GoalUserRefusal::Busy, observed, at).await?;
-                    return Ok(receipt);
+                let receipt = reject_tx(tx, input, GoalUserRefusal::Busy, observed, at).await?;
+                return Ok(receipt);
             }
             Err(error) => return Err(error),
         }
@@ -361,8 +349,8 @@ impl Database {
                 if matches!(&input.change, GoalUserChange::State { .. }) =>
             {
                 let receipt =
-                    reject_tx(&mut tx, input, GoalUserRefusal::Transition, observed, at).await?;
-                    return Ok(receipt);
+                    reject_tx(tx, input, GoalUserRefusal::Transition, observed, at).await?;
+                return Ok(receipt);
             }
             Err(error) => return Err(error.into()),
         };
@@ -370,9 +358,9 @@ impl Database {
             .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
             .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
             .bind(next.goal_id().as_str()).bind(next.version().get()).bind(at.get())
-            .execute(&mut *tx).await?;
+            .execute(&mut **tx).await?;
         let entry = apply_goal_tx(
-            &mut tx,
+            tx,
             &mutation,
             Some(expected_transcript),
             at,
@@ -380,7 +368,7 @@ impl Database {
         )
         .await?;
         crate::coordinator_watches::goal_facts::settled_change_tx(
-            &mut tx,
+            tx,
             self.goal_control_installation(),
             &entry,
             expected_transcript,
@@ -393,7 +381,29 @@ impl Database {
                 entry: Box::new(entry),
             },
         })
-        }.await;
+    }
+
+    async fn user_goal_command<F: FnOnce()>(
+        &self,
+        input: &GoalUserCommand,
+        expected_transcript: &str,
+        at: GoalTimestampUs,
+        host_gate_busy: bool,
+        on_authority_lost: F,
+        #[cfg(test)] cut: UserCommitCut,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        let mut connection = match self.pool().acquire().await {
+            Ok(connection) => connection,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let mut tx = match sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let mut authority = super::control::ControlCommitAuthority::new(on_authority_lost);
+        let result = self
+            .user_goal_command_tx(&mut tx, input, expected_transcript, at, host_gate_busy)
+            .await;
         let attempted = match result {
             Ok(receipt) => {
                 #[cfg(not(test))]
@@ -433,11 +443,11 @@ impl Database {
                 error
             }
         };
-        let mut lookup =
-            match sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await {
-                Ok(tx) => tx,
-                Err(_) => return LocalAuthorityResult::DurableFactUnclassified,
-            };
+        let Ok(mut lookup) =
+            sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await
+        else {
+            return LocalAuthorityResult::DurableFactUnclassified;
+        };
         let retained = retained_tx(&mut lookup, input).await;
         #[cfg(test)]
         let retained = if matches!(cut, UserCommitCut::LostClassification) {
