@@ -393,10 +393,16 @@ ORDINARY_PREPARED = "ordinary_forward_prepared"
 ORDINARY_BOUNDARY = "ordinary_forward_boundary"
 ORDINARY_PROVEN = "ordinary_migration_proven"
 ORDINARY_FORWARD_PHASES = {ORDINARY_PREPARED, ORDINARY_BOUNDARY, ORDINARY_PROVEN}
+ORDINARY_PREBOUNDARY_PREPARED = "ordinary_preboundary_prepared"
+ORDINARY_STOPPED = "ordinary_preboundary_stopped"
 ORDINARY_PREBOUNDARY_STATES = {
-    "ordinary_preboundary_prepared", "ordinary_preboundary_stopped",
+    ORDINARY_PREBOUNDARY_PREPARED, ORDINARY_STOPPED,
     "ordinary_source_proven", "ordinary_preboundary_failed_stopped",
     "ordinary_activation_failed_rollback_failed",
+}
+ORDINARY_BOUNDARY_STATES = {
+    "candidate_may_migrate", ORDINARY_PROVEN,
+    "ordinary_activation_failed_forward_only",
 }
 
 
@@ -678,7 +684,10 @@ def write_status(
         "finalization_pending": finalization_pending,
         "recovery_mode": recovery_mode,
     }
-    if recovery_mode in ORDINARY_FORWARD_PHASES:
+    if state == ORDINARY_PREBOUNDARY_PREPARED:
+        if recovery_mode != ORDINARY_PREPARED or forward_plan is not None:
+            raise ActivationError("preboundary prepared status must precede stopped forward proof")
+    elif recovery_mode in ORDINARY_FORWARD_PHASES:
         if forward_plan is None:
             if not isinstance(prior, dict) or prior.get("transaction_id") != manifest.transaction_id:
                 raise ActivationError("ordinary forward boundary evidence is missing")
@@ -3055,7 +3064,15 @@ def activate(manifest: Manifest) -> str:
             ordinary_admission_plan is not None
             and bool(ordinary_admission_plan.pending)
         )
-        write_status(manifest, "activating")
+        if ordinary_forward:
+            write_status(
+                manifest,
+                ORDINARY_PREBOUNDARY_PREPARED,
+                recovery_mode=ORDINARY_PREPARED,
+                finalization_pending=True,
+            )
+        else:
+            write_status(manifest, "activating")
         disrupted = False
         quarantined_previous_plist: Optional[Path] = None
         candidate_binary_mutated = False
@@ -3344,10 +3361,14 @@ def activate(manifest: Manifest) -> str:
                 )
                 return "activation_failed_database_committed"
             if not disrupted and ordinary_forward:
-                write_status(manifest, "ordinary_preboundary_failed_stopped", failure=failure,
-                             recovery_mode=ORDINARY_PREPARED, forward_plan=ordinary_plan,
-                             finalization_pending=True)
-                return "ordinary_preboundary_failed_stopped"
+                write_status(
+                    manifest,
+                    ORDINARY_PREBOUNDARY_PREPARED,
+                    failure=failure,
+                    recovery_mode=ORDINARY_PREPARED,
+                    finalization_pending=True,
+                )
+                return ORDINARY_PREBOUNDARY_PREPARED
             if not disrupted:
                 if capacity_reservation is not None and not database_snapshot:
                     try:
@@ -3371,8 +3392,34 @@ def activate(manifest: Manifest) -> str:
                     raise CurrentSchemaPreconditionFailure(failure) from activation_exc
                 raise
             if ordinary_forward:
+                status = read_status(manifest)
+                if status.get("state") == ORDINARY_PREBOUNDARY_PREPARED:
+                    try:
+                        state, pid = launchctl.inspect()
+                        if state != "not_loaded" or pid is not None:
+                            raise ActivationError("ordinary predecessor absence is unconfirmed")
+                        assert_ordinary_database_exclusive(manifest)
+                        ordinary_plan = ordinary_forward_plan(manifest)
+                        write_status(
+                            manifest,
+                            ORDINARY_STOPPED,
+                            recovery_mode=ORDINARY_PREPARED,
+                            forward_plan=ordinary_plan,
+                            finalization_pending=True,
+                        )
+                        status = read_status(manifest)
+                    except Exception as proof_exc:
+                        write_status(
+                            manifest,
+                            ORDINARY_PREBOUNDARY_PREPARED,
+                            failure=failure,
+                            rollback_failure=str(proof_exc),
+                            recovery_mode=ORDINARY_PREPARED,
+                            finalization_pending=True,
+                        )
+                        return ORDINARY_PREBOUNDARY_PREPARED
                 try:
-                    verify_ordinary_preboundary(manifest, read_status(manifest))
+                    verify_ordinary_preboundary(manifest, status)
                     state, pid = launchctl.inspect()
                     if state != "not_loaded" or pid is not None:
                         raise ActivationError("ordinary predecessor absence is unconfirmed")
@@ -4742,8 +4789,11 @@ def retained_ordinary_plan(manifest: Manifest, status: dict) -> OrdinaryForwardP
     return plan
 
 
-def verify_ordinary_preboundary(manifest: Manifest, status: dict, *, stopped: bool = True) -> OrdinaryForwardPlan:
-    if (status.get("state") not in ORDINARY_PREBOUNDARY_STATES or
+def verify_ordinary_preboundary(
+    manifest: Manifest, status: dict, *, stopped: bool = True,
+) -> Optional[OrdinaryForwardPlan]:
+    state = status.get("state")
+    if (state not in ORDINARY_PREBOUNDARY_STATES or
             status.get("recovery_mode") != ORDINARY_PREPARED or
             status.get("finalization_pending") is not True):
         raise ActivationError("preboundary recovery requires typed retained phase")
@@ -4753,8 +4803,15 @@ def verify_ordinary_preboundary(manifest: Manifest, status: dict, *, stopped: bo
     validate_pre_disruption_handoff(manifest)
     if manifest.previous is None:
         raise ActivationError("preboundary predecessor identity is missing")
-    plan = retained_ordinary_plan(manifest, status)
+    if state == ORDINARY_PREBOUNDARY_PREPARED:
+        if any(key.startswith("forward_") for key in status):
+            raise ActivationError("preboundary prepared status cannot contain stopped forward proof")
+        plan = None
+    else:
+        plan = retained_ordinary_plan(manifest, status)
     if stopped:
+        if plan is None:
+            raise ActivationError("preboundary stopped proof is unavailable")
         assert_ordinary_database_exclusive(manifest)
         database = Path(manifest.ordinary_forward_migration.database_path)
         validate_database(database)
@@ -4787,14 +4844,28 @@ def _matches_staged(path: str, expected: str) -> bool:
 
 
 def recover_ordinary_preboundary(manifest: Manifest, status: dict) -> str:
-    verify_ordinary_preboundary(manifest, status, stopped=False)
+    plan = verify_ordinary_preboundary(manifest, status, stopped=False)
     launchctl = Launchctl(manifest)
     launchctl.stop()
     state, pid = launchctl.inspect()
     if state != "not_loaded" or pid is not None:
         raise ActivationError("preboundary target absence is unconfirmed")
+    if status.get("state") == ORDINARY_PREBOUNDARY_PREPARED:
+        assert_ordinary_database_exclusive(manifest)
+        plan = ordinary_forward_plan(manifest)
+        if not plan.pending:
+            raise ActivationError("ordinary forward history no longer has a pending migration")
+        write_status(
+            manifest,
+            ORDINARY_STOPPED,
+            recovery_mode=ORDINARY_PREPARED,
+            forward_plan=plan,
+            finalization_pending=True,
+        )
+        status = read_status(manifest)
     # Stopping can race a last write from the old process; prove exclusivity and source again.
-    verify_ordinary_preboundary(manifest, status)
+    plan = verify_ordinary_preboundary(manifest, status)
+    assert plan is not None
     try:
         restore(manifest, launchctl, database_snapshot=False)
         finalize_verified_predecessor(manifest, "ordinary preboundary activation interrupted")
@@ -4823,6 +4894,7 @@ def recover_ordinary_preboundary(manifest: Manifest, status: dict) -> str:
             failure=str(exc),
             rollback_failure="; ".join(cleanup_failures) or None,
             recovery_mode=ORDINARY_PREPARED,
+            forward_plan=plan,
             finalization_pending=True,
         )
         raise
@@ -4919,11 +4991,10 @@ def resume_forward(manifest: Manifest) -> str:
             return finalize_ordinary_publication(manifest, status)
         if status.get("state") in ORDINARY_PREBOUNDARY_STATES:
             return recover_ordinary_preboundary(manifest, status)
-        if status.get("transaction_id") != manifest.transaction_id or status.get("state") not in {
-            "candidate_may_migrate",
-            "ordinary_migration_proven",
-            "ordinary_activation_failed_forward_only",
-        }:
+        if (
+            status.get("transaction_id") != manifest.transaction_id
+            or status.get("state") not in ORDINARY_BOUNDARY_STATES
+        ):
             raise ActivationError("forward recovery requires matching unresolved status")
         phase = status.get("recovery_mode")
         if phase not in {ORDINARY_BOUNDARY, ORDINARY_PROVEN} or status.get("finalization_pending") is not True:

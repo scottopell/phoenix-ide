@@ -11546,6 +11546,27 @@ def _release_launchd_restart_claim(transaction_id: str) -> bool:
         return _release_launchd_restart_claim_unlocked(transaction_id)
 
 
+_ORDINARY_FORWARD_RESUME_STATES = frozenset(
+    {
+        "ordinary_preboundary_prepared",
+        "ordinary_preboundary_stopped",
+        "ordinary_source_proven",
+        "ordinary_preboundary_failed_stopped",
+        "ordinary_activation_failed_rollback_failed",
+        "candidate_may_migrate",
+        "ordinary_migration_proven",
+        "ordinary_activation_failed_forward_only",
+    }
+)
+
+
+def _ordinary_forward_recovery_pending(status: dict) -> bool:
+    state = status.get("state")
+    return state in _ORDINARY_FORWARD_RESUME_STATES or (
+        state == "committed" and bool(status.get("finalization_pending"))
+    )
+
+
 def _paired_recovery_refusal(owner: str | None) -> str | None:
     if owner is None:
         return None
@@ -11608,6 +11629,11 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             f"ordinary forward activation {owner} may have committed migration 126/127 or coordinator-home initialization. "
             "Do not start the predecessor or remove the claim. Preserve the retained candidate and evidence; "
             f"after explicit forward-recovery authorization run ./dev.py prod resume-forward {owner}."
+        )
+    if ordinary_forward and owner_status and _ordinary_forward_recovery_pending(status):
+        return (
+            f"ordinary forward recovery for {owner} is incomplete. Do not remove its claim or retained evidence; "
+            f"run ./dev.py prod resume-forward {owner}."
         )
     if (
         owner_status
@@ -12850,14 +12876,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
         not isinstance(forward, dict)
         or not _deploy_status_matches_manifest(staging, payload, status, DeployManifestKind.ORDINARY_FORWARD)
         or status.get("transaction_id") != transaction_id
-        or status.get("state") not in {
-            "committed",
-            "ordinary_preboundary_prepared", "ordinary_preboundary_stopped",
-            "ordinary_source_proven", "ordinary_preboundary_failed_stopped",
-            "ordinary_activation_failed_rollback_failed",
-            "candidate_may_migrate", "ordinary_migration_proven",
-            "ordinary_activation_failed_forward_only",
-        }
+        or not _ordinary_forward_recovery_pending(status)
         or _deploy_claim_owner() != transaction_id
     ):
         raise SystemExit("forward recovery requires a retained unresolved ordinary transaction")
@@ -13964,16 +13983,13 @@ def _print_launchd_deploy_status() -> None:
             }
             ordinary_forward = kind is DeployManifestKind.ORDINARY_FORWARD
             resolved = _markerless_status_is_resolved(deploy)
-            forward_only_state = deploy.get("state") in {
-                "candidate_may_migrate",
-                "ordinary_activation_failed_forward_only",
-            }
-            ordinary_forward_only = ordinary_forward and forward_only_state
-            conflicting_forward_state = forward_only_state and not ordinary_forward
+            forward_recovery_state = _ordinary_forward_recovery_pending(deploy)
+            ordinary_forward_recovery = ordinary_forward and forward_recovery_state
+            conflicting_forward_state = forward_recovery_state and not ordinary_forward
             unknown_unresolved = kind is DeployManifestKind.UNKNOWN and not resolved
             markerless_unresolved = (
                 (prepared and not resolved)
-                or ordinary_forward_only
+                or ordinary_forward_recovery
                 or conflicting_forward_state
                 or unknown_unresolved
             )
@@ -13985,16 +14001,16 @@ def _print_launchd_deploy_status() -> None:
                 )
             elif conflicting_forward_state:
                 print(
-                    "    UNRESOLVED: forward-only status conflicts with the retained ordinary manifest. "
+                    "    UNRESOLVED: forward-recovery status conflicts with the retained ordinary manifest. "
                     "Preserve its candidate and evidence; do not redeploy or invoke recovery until "
                     "the manifest/status mismatch is diagnosed."
                 )
-            elif ordinary_forward_only:
+            elif ordinary_forward_recovery:
                 print(
-                    "    UNRESOLVED: ordinary forward-only transaction status has no active claim owner. "
+                    "    UNRESOLVED: ordinary forward-recovery status has no active claim owner. "
                     "Preserve its candidate and evidence; do not start the predecessor, redeploy, "
                     "or recreate or clear markers until claim/status ownership is diagnosed. "
-                    "After an actual matching claim exists and forward recovery is explicitly authorized, "
+                    "After an actual matching claim exists, "
                     f"the supported path is ./dev.py prod resume-forward {transaction_id}."
                 )
             elif prepared and not resolved:

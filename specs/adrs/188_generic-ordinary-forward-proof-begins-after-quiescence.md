@@ -1,4 +1,4 @@
-# ADR-150: Generic ordinary forward proof begins after quiescence
+# ADR-188: Generic ordinary forward proof begins after quiescence
 
 **Date:** 2026-10-27
 **Status:** Accepted
