@@ -125,12 +125,20 @@ async fn process_claimed_product_creation(
         Stage::ResolveRepository,
     )
     .await?;
-    let repo_root = tokio::task::spawn_blocking({
-        let cwd = cwd.clone();
-        move || discover_product_repository(Path::new(&cwd))
-    })
-    .await
-    .map_err(|error| format!("repository discovery join failed: {error}"))??;
+    let direct_gateway = matches!(
+        job.intent.origin,
+        crate::db::ProductCreationOrigin::SlackGateway { .. }
+    );
+    let repo_root = if direct_gateway {
+        None
+    } else {
+        tokio::task::spawn_blocking({
+            let cwd = cwd.clone();
+            move || discover_product_repository(Path::new(&cwd))
+        })
+        .await
+        .map_err(|error| format!("repository discovery join failed: {error}"))??
+    };
 
     let (
         effective_cwd,

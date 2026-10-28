@@ -121,6 +121,7 @@ pub enum Effect {
     },
     /// User input accepted by a parent interaction (approval feedback or question response).
     PersistUserInputMessage {
+        origin: phoenix_core::domain::db_schema::InputOrigin,
         content: MessageContent,
         message_id: String,
     },

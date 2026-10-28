@@ -1692,6 +1692,10 @@ pub enum InputOrigin {
         source_call: Option<Box<SourceToolCall>>,
     },
     SystemGenerated,
+    /// Trusted gateway admission; the normalized request retains exact Slack source.
+    SlackGateway {
+        request_id: String,
+    },
     SubscriptionEvent {
         event_id: String,
     },
@@ -1725,6 +1729,7 @@ impl InputOrigin {
             Self::UnknownHistorical
             | Self::UserApi
             | Self::SystemGenerated
+            | Self::SlackGateway { .. }
             | Self::SubscriptionEvent { .. } => None,
         }
     }
@@ -1769,9 +1774,47 @@ impl InputOrigin {
                 None,
             ),
             Self::SystemGenerated => ("system_generated", None, None, None),
+            Self::SlackGateway { .. } => ("slack_gateway", None, None, None),
             Self::SubscriptionEvent { event_id } => {
                 ("subscription_event", None, None, Some(event_id))
             }
+        }
+    }
+
+    #[must_use]
+    pub fn slack_request_id(&self) -> Option<&str> {
+        match self {
+            Self::SlackGateway { request_id } => Some(request_id),
+            Self::UnknownHistorical
+            | Self::UserApi
+            | Self::InternalConversation { .. }
+            | Self::SystemGenerated
+            | Self::SubscriptionEvent { .. } => None,
+        }
+    }
+
+    /// Decode the independently normalized external source column.
+    /// # Errors
+    /// Rejects missing Slack identity or identity on another origin.
+    pub fn from_db_parts_with_slack(
+        kind: &str,
+        product: Option<String>,
+        transcript: Option<String>,
+        event: Option<String>,
+        slack: Option<String>,
+    ) -> Result<Self, String> {
+        match (kind, slack) {
+            ("slack_gateway", Some(request_id))
+                if !request_id.trim().is_empty()
+                    && product.is_none()
+                    && transcript.is_none()
+                    && event.is_none() =>
+            {
+                Ok(Self::SlackGateway { request_id })
+            }
+            ("slack_gateway", _) => Err("invalid Slack input origin".into()),
+            (_, None) => Self::from_db_parts(kind, product, transcript, event),
+            _ => Err("Slack source on non-Slack origin".into()),
         }
     }
 

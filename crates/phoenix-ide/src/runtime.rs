@@ -6132,6 +6132,19 @@ impl RuntimeManager {
                     ),
                 };
                 let registry = registry.try_with_host_bound_tool(predecessor_tool.clone())?;
+                let registry = if crate::slack_gateway::has_explicit_binding(
+                    &self.db,
+                    conv.product_conversation_id.as_str(),
+                )
+                .await?
+                {
+                    registry.try_with_host_bound_tool(crate::slack_gateway::reply::tool(
+                        self.db.clone(),
+                        conv.product_conversation_id.to_string(),
+                    ))?
+                } else {
+                    registry
+                };
                 ToolRegistryExecutor::with_mcp(
                     registry,
                     self.mcp_manager.clone(),

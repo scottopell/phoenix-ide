@@ -115,6 +115,7 @@ impl EventPresentations {
                 InputOrigin::UnknownHistorical
                 | InputOrigin::UserApi
                 | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SlackGateway { .. }
                 | InputOrigin::SystemGenerated => None,
             })
             .collect();
@@ -150,6 +151,7 @@ impl EventPresentations {
             InputOrigin::UnknownHistorical
             | InputOrigin::UserApi
             | InputOrigin::InternalConversation { .. }
+            | InputOrigin::SlackGateway { .. }
             | InputOrigin::SystemGenerated => None,
         }
     }

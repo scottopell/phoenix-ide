@@ -118,6 +118,7 @@ export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.varian
   v.looseObject({ kind: v.literal('unknown_historical') }),
   v.looseObject({ kind: v.literal('user_api') }),
   v.looseObject({ kind: v.literal('system_generated') }),
+  v.looseObject({ kind: v.literal('slack_gateway'), request_id: v.string() }),
   v.looseObject({ kind: v.literal('subscription_event'), event_id: v.string() }),
   v.looseObject({
     kind: v.literal('internal_conversation'),

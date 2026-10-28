@@ -5800,6 +5800,10 @@ class OrdinarySource129To131Tests(unittest.TestCase):
 
     def test_actual_current_registry_rejects_129_and_131_before_stop(self) -> None:
         actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        self.assertGreater(
+            helper.migration_registry(actual_registry, qualified_current_target=False)[-1][0],
+            131,
+        )
         self.assert_registry_rejects_129_and_131_before_stop(actual_registry.read_bytes())
 
     def test_changed_registry_and_source_names_reject_before_stop(self) -> None:

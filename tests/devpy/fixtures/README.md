@@ -12,7 +12,7 @@ commit `3c83092665f951cb01547eb79a1e952e4776c88f`, compressed with gzip (`mtime=
 Its uncompressed SHA-256 is
 `850c25de411d57f14d07cd3fb09e3ee15e9e89f4fd07b24d48de00a533f1e1ac`.
 `OrdinarySource129To131Tests` uses it for historical admission and recovery;
-the ambient target-140 registry is exercised separately as an unqualified
+the newer ambient registry is exercised separately as an unqualified
 interval that must be rejected before any service stop or start.
 
 `migrations-through-140-2d66.rs.gz` is the byte-exact

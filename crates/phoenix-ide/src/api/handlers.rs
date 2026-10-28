@@ -509,6 +509,22 @@ pub fn create_router(state: AppState) -> Router {
         // Environment info
         .route("/api/env", get(get_env))
         // MCP management
+        .route(
+            "/api/slack-gateway",
+            get(crate::slack_gateway::http::get).put(crate::slack_gateway::http::put),
+        )
+        .route(
+            "/api/slack-gateway/requests/:id/source",
+            get(crate::slack_gateway::http::source),
+        )
+        .route(
+            "/api/slack-gateway/capabilities",
+            get(crate::slack_gateway::http::capabilities),
+        )
+        .route(
+            "/api/slack-gateway/inspect",
+            post(crate::slack_gateway::http::inspect),
+        )
         .route("/api/mcp/status", get(mcp_status))
         .route("/api/mcp/reload", post(reload_mcp))
         .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
@@ -5648,7 +5664,7 @@ async fn cancel_conversation_inner(
     }))
 }
 
-pub(super) fn map_ordinary_mutation_admission(
+pub(crate) fn map_ordinary_mutation_admission(
     admission: &phoenix_db::MessageTargetAdmission,
     operation: &str,
 ) -> Result<(), AppError> {
@@ -5701,7 +5717,7 @@ pub(super) fn map_hard_delete_admission(
     }
 }
 
-pub(super) fn map_admission_db_error(error: DbError) -> AppError {
+pub(crate) fn map_admission_db_error(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
         error => AppError::Internal(error.to_string()),
@@ -6609,7 +6625,7 @@ struct DismissQuestionPayload {
     request_id: Option<crate::state_machine::state::QuestionRequestId>,
 }
 
-fn validate_question_request_identity(
+pub(crate) fn validate_question_request_identity(
     pending: Option<&crate::state_machine::state::QuestionRequestId>,
     submitted: Option<&crate::state_machine::state::QuestionRequestId>,
 ) -> Result<(), AppError> {
@@ -6675,45 +6691,12 @@ async fn respond_to_question(
     Path(id): Path<String>,
     Json(req): Json<RespondToQuestionPayload>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state
-        .runtime
-        .mutation_admission(&id)
-        .await
-        .map_err(map_admission_db_error)?;
-    let _admission_guard = admission.lock().await;
-
-    let conv = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    let ConvState::AwaitingUserResponse {
-        request_authority, ..
-    } = &conv.state
-    else {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation is not awaiting a user response",
-            "wrong_state",
-        ))));
-    };
-    validate_question_request_identity(request_authority.request_id(), req.request_id.as_ref())?;
-
-    require_ordinary_mutation_admission(&state, &id, "question response").await?;
-
-    state
-        .runtime
-        .send_event(
-            &id,
-            Event::UserQuestionResponse {
-                request_id: req.request_id,
-                answers: req.answers,
-                annotations: req.annotations,
-            },
-        )
-        .await
-        .map_err(AppError::BadRequest)?;
+    crate::send_chat_service::SendChatApplicationService::new(
+        state.db.clone(),
+        state.runtime.clone(),
+    )
+    .respond_to_question(&id, req.request_id, req.answers, req.annotations, None)
+    .await?;
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -10721,6 +10704,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -17229,6 +17213,7 @@ mod regenerate_conversation_name_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -17686,6 +17671,7 @@ mod upgrade_model_state_guard_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -18162,6 +18148,7 @@ mod file_read_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -18949,6 +18936,7 @@ mod chat_authority_tests {
         );
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
@@ -19734,6 +19722,7 @@ mod lifecycle_handler_tests {
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,

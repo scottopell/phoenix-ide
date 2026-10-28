@@ -1046,7 +1046,7 @@ impl ToolRegistry {
         Ok(self)
     }
 
-    /// Add one host-bound read-only capability after rejecting name collisions.
+    /// Add one host-bound capability after rejecting name collisions.
     ///
     /// # Errors
     ///

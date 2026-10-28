@@ -28,7 +28,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     # Cold macOS builds compile/link the native binary and large IDE test harness.
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 30 }}
     steps:
       - uses: actions/checkout@v4
         with:
