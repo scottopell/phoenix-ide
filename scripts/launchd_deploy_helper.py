@@ -1026,6 +1026,18 @@ def _validate_product_conversation_schema(connection) -> None:
         )
 
 
+def validate_product_conversation_database(path: Path) -> None:
+    import sqlite3
+    from contextlib import closing
+
+    validate_database(path)
+    try:
+        with closing(_readonly_connection(path)) as connection:
+            _validate_product_conversation_schema(connection)
+    except sqlite3.Error as exc:
+        raise ActivationError("current-schema ProductConversation schema check failed") from exc
+
+
 def validate_current_schema_database(
     path: Path,
     registry_path: Path,
@@ -1034,9 +1046,6 @@ def validate_current_schema_database(
     source_kind: str = "prepared_artifact",
     manifest: Optional[Manifest] = None,
 ) -> tuple[tuple[int, str], ...]:
-    import sqlite3
-    from contextlib import closing
-
     qualified114 = manifest is not None and isinstance(manifest.current_schema_upgrade, PreparedSource114Upgrade)
     qualified128 = manifest is not None and _protected_129(manifest)
     if qualified114 or qualified128:
@@ -1071,11 +1080,7 @@ def validate_current_schema_database(
         raise ActivationError(
             f"current-schema migration ledger differs from {qualification}"
         )
-    try:
-        with closing(_readonly_connection(path)) as connection:
-            _validate_product_conversation_schema(connection)
-    except sqlite3.Error as exc:
-        raise ActivationError("current-schema ProductConversation schema check failed") from exc
+    validate_product_conversation_database(path)
     return ledger
 
 
@@ -1145,7 +1150,11 @@ def ordinary_forward_admission_plan(manifest: Manifest) -> OrdinaryForwardHistor
     target = migration_registry(registry, qualified_current_target=False)
     database = Path(ordinary.database_path)
     validate_database(database)
-    return forward_history_plan(database_ledger(database), target)
+    source = database_ledger(database)
+    plan = forward_history_plan(source, target)
+    if source and source[-1][0] == CURRENT_SCHEMA_BASELINE_VERSION:
+        validate_product_conversation_database(database)
+    return plan
 
 
 def ordinary_forward_plan(manifest: Manifest) -> OrdinaryForwardPlan:

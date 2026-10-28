@@ -11563,7 +11563,9 @@ _ORDINARY_FORWARD_RESUME_STATES = frozenset(
 def _ordinary_forward_recovery_pending(status: dict) -> bool:
     state = status.get("state")
     return state in _ORDINARY_FORWARD_RESUME_STATES or (
-        state == "committed" and bool(status.get("finalization_pending"))
+        state == "committed"
+        and status.get("finalization_pending") is True
+        and status.get("recovery_mode") == "ordinary_forward_proven"
     )
 
 

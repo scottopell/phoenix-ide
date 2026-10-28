@@ -4458,6 +4458,7 @@ class PreparationTests(unittest.TestCase):
         for state in (
             "candidate_may_migrate",
             "ordinary_activation_failed_forward_only",
+            "committed",
         ):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
@@ -4474,6 +4475,11 @@ class PreparationTests(unittest.TestCase):
                             "state": state,
                             "source_kind": "local_head",
                             "finalization_pending": True,
+                            "recovery_mode": (
+                                "ordinary_forward_proven"
+                                if state == "committed"
+                                else None
+                            ),
                             "updated_at": datetime.datetime.now(
                                 datetime.timezone.utc
                             ).isoformat(),
@@ -4497,6 +4503,60 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn("resume-forward tx", rendered)
                 self.assertNotIn("recover-paired", rendered)
                 self.assertNotIn("recover-current", rendered)
+
+    def test_markerless_shared_committed_checkpoint_uses_prepared_manifest_guidance(self):
+        cases = ("paired_database_upgrade", "current_schema_upgrade")
+        for mode in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                transaction = root / "transactions" / "tx"
+                transaction.mkdir(parents=True)
+                evidence = mode_evidence(transaction, mode)
+                manifest = make_manifest(root)
+                if mode == "paired_database_upgrade":
+                    manifest = dataclasses.replace(
+                        manifest,
+                        source_kind="prepared_artifact",
+                        release_tag=None,
+                        release_commit=None,
+                        paired_database_upgrade=helper.PairedDatabaseUpgrade(**evidence),
+                    )
+                else:
+                    manifest = dataclasses.replace(
+                        manifest,
+                        current_schema_upgrade=helper.CurrentSchemaUpgrade(**evidence),
+                    )
+                (transaction / "manifest.json").write_text(
+                    json.dumps(helper.dataclasses.asdict(manifest))
+                )
+                status = root / "status.json"
+                status.write_text(
+                    json.dumps(
+                        {
+                            "transaction_id": "tx",
+                            "state": "committed",
+                            "source_kind": manifest.source_kind,
+                            "finalization_pending": True,
+                            "updated_at": datetime.datetime.now(
+                                datetime.timezone.utc
+                            ).isoformat(),
+                        }
+                    )
+                )
+                with mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_DIR", root
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+                ), mock.patch("builtins.print") as output:
+                    self.dev._print_launchd_deploy_status()
+
+                rendered = " ".join(str(call) for call in output.call_args_list)
+                self.assertIn("prepared transaction status", rendered)
+                self.assertIn("do not redeploy", rendered)
+                self.assertNotIn("ordinary forward-recovery status", rendered)
+                self.assertNotIn("resume-forward", rendered)
 
     def test_markerless_forward_state_with_ordinary_manifest_warns_of_conflict(self):
         with tempfile.TemporaryDirectory() as td:

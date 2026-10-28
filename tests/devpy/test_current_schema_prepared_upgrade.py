@@ -5910,6 +5910,53 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
         ))
         return registry
 
+    def test_source123_generic_prefix_preserves_structural_qualification(self) -> None:
+        for valid_structure in (True, False):
+            with self.subTest(valid_structure=valid_structure):
+                database = self.database(through=123)
+                if not valid_structure:
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("DROP TABLE product_conversation_sources")
+                manifest = self.ordinary_manifest(
+                    database, ROOT / "crates/phoenix-db/src/migrations.rs",
+                )
+                if valid_structure:
+                    plan = helper.ordinary_forward_admission_plan(manifest)
+                    self.assertEqual(plan.source[-1][0], 123)
+                    self.assertEqual(
+                        plan.target,
+                        helper.migration_registry(
+                            ROOT / "crates/phoenix-db/src/migrations.rs",
+                            qualified_current_target=False,
+                        ),
+                    )
+                    self.assertTrue(plan.pending)
+                else:
+                    with self.assertRaisesRegex(
+                        helper.ActivationError,
+                        "ProductConversation schema",
+                    ):
+                        helper.ordinary_forward_admission_plan(manifest)
+
+    def test_empty_source_ledger_remains_a_generic_exact_prefix(self) -> None:
+        database = self.database(through=129)
+        with sqlite3.connect(database) as connection:
+            connection.execute("DELETE FROM _migrations")
+        manifest = self.ordinary_manifest(
+            database, ROOT / "crates/phoenix-db/src/migrations.rs",
+        )
+
+        plan = helper.ordinary_forward_admission_plan(manifest)
+
+        self.assertEqual(plan.source, ())
+        self.assertEqual(
+            plan.target,
+            helper.migration_registry(
+                ROOT / "crates/phoenix-db/src/migrations.rs",
+                qualified_current_target=False,
+            ),
+        )
+
     def test_prod_prepared_status_is_fresh_ordinary_activation_marker(self) -> None:
         dev = CurrentSchemaRepairTests.controller(self)
         current_target = compiled_ledger(None)[-1][0]
@@ -5958,6 +6005,9 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
                         "transaction_id": transaction_id, "state": state,
                         "source_kind": "local_head", "prepared_mode": None,
                         "finalization_pending": state == "committed",
+                        "recovery_mode": (
+                            "ordinary_forward_proven" if state == "committed" else None
+                        ),
                     }))
                     run.reset_mock()
                     run.side_effect = None
@@ -6102,6 +6152,9 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
                         "transaction_id": transaction_id,
                         "state": state,
                         "finalization_pending": state == "committed",
+                        "recovery_mode": (
+                            "ordinary_forward_proven" if state == "committed" else None
+                        ),
                     }))
                     refusal = dev._paired_recovery_refusal(transaction_id)
                     self.assertIn(f"prod resume-forward {transaction_id}", refusal)
