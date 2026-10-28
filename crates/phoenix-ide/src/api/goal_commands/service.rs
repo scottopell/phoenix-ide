@@ -18,6 +18,8 @@ pub(super) struct GoalCommandService {
     read_publication_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     receipt_lookup_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    command_publication_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl GoalCommandService {
@@ -28,6 +30,8 @@ impl GoalCommandService {
             read_publication_barrier: None,
             #[cfg(test)]
             receipt_lookup_barrier: None,
+            #[cfg(test)]
+            command_publication_barrier: None,
         }
     }
 
@@ -49,7 +53,16 @@ impl GoalCommandService {
         self
     }
 
-    fn read_result<T>(&self, result: Result<T, AppError>) -> Result<T, AppError> {
+    #[cfg(test)]
+    pub(super) fn with_command_publication_barrier(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.command_publication_barrier = Some(barrier);
+        self
+    }
+
+    fn publication_result<T>(&self, result: Result<T, AppError>) -> Result<T, AppError> {
         let _publication = self
             .runtime
             .acquire_local_authority_pass()
@@ -76,7 +89,7 @@ impl GoalCommandService {
             barrier.wait().await;
             barrier.wait().await;
         }
-        self.read_result(result)
+        self.publication_result(result)
     }
 
     pub(super) async fn history(
@@ -99,7 +112,7 @@ impl GoalCommandService {
             barrier.wait().await;
             barrier.wait().await;
         }
-        self.read_result(result)
+        self.publication_result(result)
     }
 
     pub(super) fn established_receipt(
@@ -121,6 +134,31 @@ impl GoalCommandService {
     }
 
     pub(super) async fn command(
+        &self,
+        owner: ProductConversationId,
+        request_id: uuid::Uuid,
+        expected_version: GoalVersion,
+        change: GoalUserChange,
+        authenticated_owner: OwnerAuthenticated,
+    ) -> Result<GoalUserReceipt, AppError> {
+        let result = self
+            .command_unpublished(
+                owner,
+                request_id,
+                expected_version,
+                change,
+                authenticated_owner,
+            )
+            .await;
+        #[cfg(test)]
+        if let Some(barrier) = &self.command_publication_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        self.publication_result(result)
+    }
+
+    async fn command_unpublished(
         &self,
         owner: ProductConversationId,
         request_id: uuid::Uuid,
@@ -164,15 +202,17 @@ impl GoalCommandService {
         {
             return Ok(receipt);
         }
-        let at = GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
-            .map_err(|error| goal_error(error.into()))?;
+        let clock = || {
+            GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
+                .map_err(phoenix_db::conversation_goals::GoalDbError::from)
+        };
         let Some(_product_guard) = self
             .runtime
             .try_lock_product_message_admission(owner.as_str())
             .await
         else {
             return self.established_receipt(
-                db.reject_busy_user_goal_command(&command, &transcript, at, || {
+                db.reject_busy_user_goal_command(&command, &transcript, clock, || {
                     self.runtime
                         .signal_fatal_local_authority("goal_user_command_write");
                 })
@@ -188,7 +228,7 @@ impl GoalCommandService {
         let Some(_acceptance_guard) = self.runtime.try_lock_message_acceptance(&transcript).await
         else {
             return self.established_receipt(
-                db.reject_busy_user_goal_command(&command, &transcript, at, || {
+                db.reject_busy_user_goal_command(&command, &transcript, clock, || {
                     self.runtime
                         .signal_fatal_local_authority("goal_user_command_write");
                 })
@@ -196,7 +236,7 @@ impl GoalCommandService {
             );
         };
         self.established_receipt(
-            db.apply_user_goal_command(&command, &transcript, at, || {
+            db.apply_user_goal_command(&command, &transcript, clock, || {
                 self.runtime
                     .signal_fatal_local_authority("goal_user_command_write");
             })

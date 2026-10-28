@@ -285,7 +285,12 @@ async fn user_goal_commands_retain_typed_receipts_and_control_attribution() {
         },
     };
     let receipt = db
-        .apply_user_goal_command(&command, &transcript, at(), || panic!("authority lost"))
+        .apply_user_goal_command(
+            &command,
+            &transcript,
+            || Ok(at()),
+            || panic!("authority lost"),
+        )
         .await
         .established()
         .unwrap()
@@ -302,11 +307,16 @@ async fn user_goal_commands_retain_typed_receipts_and_control_attribution() {
     ));
     let before = counts(&db).await;
     assert_eq!(
-        db.apply_user_goal_command(&command, &transcript, at(), || panic!("authority lost"))
-            .await
-            .established()
-            .unwrap()
-            .unwrap(),
+        db.apply_user_goal_command(
+            &command,
+            &transcript,
+            || Ok(at()),
+            || panic!("authority lost")
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
         receipt
     );
     assert_eq!(counts(&db).await, before);
@@ -315,12 +325,17 @@ async fn user_goal_commands_retain_typed_receipts_and_control_attribution() {
         ..command
     };
     assert!(matches!(
-        db.apply_user_goal_command(&stale, &transcript, at(), || panic!("authority lost"))
-            .await
-            .established()
-            .unwrap()
-            .unwrap()
-            .result,
+        db.apply_user_goal_command(
+            &stale,
+            &transcript,
+            || Ok(at()),
+            || panic!("authority lost")
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+        .result,
         GoalUserResult::Rejected {
             reason: GoalUserRefusal::Version,
             ..

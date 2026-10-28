@@ -691,3 +691,157 @@ async fn new_command_rollover_before_receipt_lookup_retains_durable_busy_refusal
         .unwrap()
         .is_empty());
 }
+
+#[derive(Clone, Copy)]
+enum CommandPublicationPath {
+    Retained,
+    Accepted,
+    ProductBusy,
+    TranscriptBusy,
+}
+
+async fn assert_publication_receipt(
+    fixture: &Fixture,
+    command: &phoenix_db::conversation_goals::user_commands::GoalUserCommand,
+    path: CommandPublicationPath,
+    before: Option<&phoenix_db::conversation_goals::user_commands::GoalUserReceipt>,
+) {
+    let retained = fixture
+        .state
+        .runtime
+        .db()
+        .retained_user_goal_command(command, &fixture.transcript)
+        .await
+        .unwrap()
+        .expect("command must retain its result before publication");
+    use phoenix_db::conversation_goals::user_commands::{GoalUserRefusal, GoalUserResult};
+    match path {
+        CommandPublicationPath::Retained => assert_eq!(Some(&retained), before),
+        CommandPublicationPath::Accepted => {
+            assert!(matches!(retained.result, GoalUserResult::Accepted { .. }));
+        }
+        CommandPublicationPath::ProductBusy | CommandPublicationPath::TranscriptBusy => {
+            assert!(matches!(
+                retained.result,
+                GoalUserResult::Rejected {
+                    reason: GoalUserRefusal::Busy,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+async fn assert_command_rechecks_authority(path: CommandPublicationPath) {
+    use phoenix_db::conversation_goals::user_commands::{GoalUserChange, GoalUserCommand};
+    let fixture = Fixture::new().await;
+    let request = if matches!(path, CommandPublicationPath::Retained) {
+        fixture.create().await
+    } else {
+        create_request(0, "receipt before authority closure")
+    };
+    let instance = fixture.state.runtime.db().instance_id().await.unwrap();
+    let command = GoalUserCommand {
+        owner: fixture.owner.clone(),
+        principal_id: uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            instance.to_string().as_bytes(),
+        ),
+        request_id: uuid::Uuid::parse_str(request["request_id"].as_str().unwrap()).unwrap(),
+        expected_version: GoalVersion::INITIAL,
+        change: GoalUserChange::Create {
+            objective: phoenix_core::domain::conversation_goal::GoalText::parse(
+                request["objective"].as_str().unwrap(),
+            )
+            .unwrap(),
+        },
+    };
+    let _product = if matches!(path, CommandPublicationPath::ProductBusy) {
+        Some(
+            fixture
+                .state
+                .runtime
+                .try_lock_product_message_admission(fixture.owner.as_str())
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let _transcript = if matches!(path, CommandPublicationPath::TranscriptBusy) {
+        Some(
+            fixture
+                .state
+                .runtime
+                .try_lock_message_acceptance(&fixture.transcript)
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let before = fixture
+        .state
+        .runtime
+        .db()
+        .retained_user_goal_command(&command, &fixture.transcript)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.is_some(),
+        matches!(path, CommandPublicationPath::Retained)
+    );
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone())
+        .with_command_publication_barrier(barrier.clone());
+    let pending = service.command(
+        fixture.owner.clone(),
+        command.request_id,
+        GoalVersion::INITIAL,
+        GoalUserChange::Create {
+            objective: phoenix_core::domain::conversation_goal::GoalText::parse(
+                request["objective"].as_str().unwrap(),
+            )
+            .unwrap(),
+        },
+        crate::api::auth::OwnerAuthenticated,
+    );
+    let close = async {
+        barrier.wait().await;
+        assert_publication_receipt(&fixture, &command, path, before.as_ref()).await;
+        let writer = super::service::GoalCommandService::new(fixture.state.runtime.clone());
+        assert!(matches!(
+            writer.established_receipt(
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            ),
+            Err(crate::api::handlers::AppError::Internal(_))
+        ));
+        barrier.wait().await;
+    };
+    let (result, ()) = tokio::join!(pending, close);
+    assert!(matches!(
+        result,
+        Err(crate::api::handlers::AppError::Internal(_))
+    ));
+    assert_publication_receipt(&fixture, &command, path, before.as_ref()).await;
+}
+
+#[tokio::test]
+async fn retained_command_rechecks_authority_after_lookup_before_publication() {
+    assert_command_rechecks_authority(CommandPublicationPath::Retained).await;
+}
+
+#[tokio::test]
+async fn accepted_command_rechecks_authority_after_commit_before_publication() {
+    assert_command_rechecks_authority(CommandPublicationPath::Accepted).await;
+}
+
+#[tokio::test]
+async fn product_busy_command_rechecks_authority_after_receipt_before_publication() {
+    assert_command_rechecks_authority(CommandPublicationPath::ProductBusy).await;
+}
+
+#[tokio::test]
+async fn transcript_busy_command_rechecks_authority_after_receipt_before_publication() {
+    assert_command_rechecks_authority(CommandPublicationPath::TranscriptBusy).await;
+}

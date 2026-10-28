@@ -24,7 +24,7 @@ async fn lost_acknowledgement_retains_receipt(busy: bool) {
         .user_goal_command(
             &input,
             &transcript,
-            at(),
+            || Ok(at()),
             busy,
             || fatal.store(true, Ordering::SeqCst),
             UserCommitCut::LostAcknowledgement,
@@ -49,7 +49,12 @@ async fn lost_acknowledgement_retains_receipt(busy: bool) {
     }
     let before = counts(&db).await;
     let retry = db
-        .apply_user_goal_command(&input, &transcript, at(), || panic!("retry authority lost"))
+        .apply_user_goal_command(
+            &input,
+            &transcript,
+            || Ok(at()),
+            || panic!("retry authority lost"),
+        )
         .await
         .established()
         .unwrap()
@@ -80,7 +85,7 @@ async fn classified_user_command_rollback_is_uncommitted_without_fatal_authority
             .user_goal_command(
                 &input,
                 &transcript,
-                at(),
+                || Ok(at()),
                 busy,
                 || fatal.store(true, Ordering::SeqCst),
                 UserCommitCut::RolledBack,
@@ -97,7 +102,12 @@ async fn classified_user_command_rollback_is_uncommitted_without_fatal_authority
             .unwrap()
             .is_none());
         assert!(db
-            .apply_user_goal_command(&input, &transcript, at(), || panic!("retry authority lost"))
+            .apply_user_goal_command(
+                &input,
+                &transcript,
+                || Ok(at()),
+                || panic!("retry authority lost")
+            )
             .await
             .established()
             .unwrap()
@@ -116,7 +126,7 @@ async fn uncertain_user_and_busy_writes_with_unclassifiable_lookup_signal_author
             .user_goal_command(
                 &input,
                 &transcript,
-                at(),
+                || Ok(at()),
                 busy,
                 || fatal.store(true, Ordering::SeqCst),
                 UserCommitCut::LostClassification,
@@ -162,9 +172,14 @@ async fn busy_receipt_uses_live_owner_after_sampled_transcript_continues_and_ret
     let mut expected_counts = counts(&db).await;
     expected_counts.6 += 1;
     let result = db
-        .reject_busy_user_goal_command(&command, &sampled_transcript, at(), || {
-            panic!("live busy refusal must be classified");
-        })
+        .reject_busy_user_goal_command(
+            &command,
+            &sampled_transcript,
+            || Ok(at()),
+            || {
+                panic!("live busy refusal must be classified");
+            },
+        )
         .await;
     let LocalAuthorityResult::DurableFactEstablished(Ok(receipt)) = result else {
         panic!("busy gate must retain a receipt across continuation");
@@ -177,9 +192,14 @@ async fn busy_receipt_uses_live_owner_after_sampled_transcript_continues_and_ret
         }
     ));
     let retry = db
-        .apply_user_goal_command(&command, &successor.id, at(), || {
-            panic!("exact retry must remain classified");
-        })
+        .apply_user_goal_command(
+            &command,
+            &successor.id,
+            || Ok(at()),
+            || {
+                panic!("exact retry must remain classified");
+            },
+        )
         .await;
     assert!(
         matches!(retry, LocalAuthorityResult::DurableFactEstablished(Ok(ref stored)) if stored == &receipt)
@@ -204,9 +224,14 @@ async fn retained_accepted_retry_uses_live_owner_after_sampled_transcript_contin
     let (sampled_transcript, owner) = ordinary(&db, "accepted-retry-after-continuation").await;
     let mut input = command(owner.clone());
     let receipt = db
-        .apply_user_goal_command(&input, &sampled_transcript, at(), || {
-            panic!("initial command must remain classified");
-        })
+        .apply_user_goal_command(
+            &input,
+            &sampled_transcript,
+            || Ok(at()),
+            || {
+                panic!("initial command must remain classified");
+            },
+        )
         .await
         .established()
         .unwrap()
@@ -278,9 +303,14 @@ async fn new_command_stale_sample_has_no_receipt_then_commits_on_live_successor(
         .unwrap()
         .is_none());
     assert!(matches!(
-        db.apply_user_goal_command(&input, &sampled_transcript, at(), || {
-            panic!("stale write target must remain classified");
-        })
+        db.apply_user_goal_command(
+            &input,
+            &sampled_transcript,
+            || Ok(at()),
+            || {
+                panic!("stale write target must remain classified");
+            }
+        )
         .await
         .established()
         .unwrap(),
@@ -288,9 +318,14 @@ async fn new_command_stale_sample_has_no_receipt_then_commits_on_live_successor(
     ));
     assert_eq!(counts(&db).await, before);
     let receipt = db
-        .apply_user_goal_command(&input, &successor.id, at(), || {
-            panic!("live successor command must remain classified");
-        })
+        .apply_user_goal_command(
+            &input,
+            &successor.id,
+            || Ok(at()),
+            || {
+                panic!("live successor command must remain classified");
+            },
+        )
         .await
         .established()
         .unwrap()
@@ -307,9 +342,14 @@ async fn new_command_stale_sample_has_no_receipt_then_commits_on_live_successor(
         Some(receipt.clone())
     );
     let retry = db
-        .apply_user_goal_command(&input, &successor.id, at(), || {
-            panic!("exact successor retry must remain classified");
-        })
+        .apply_user_goal_command(
+            &input,
+            &successor.id,
+            || Ok(at()),
+            || {
+                panic!("exact successor retry must remain classified");
+            },
+        )
         .await
         .established()
         .unwrap()
@@ -324,9 +364,14 @@ async fn conflicting_retry_classification_after_lost_rollback_ack_is_nonfatal() 
     let (transcript, owner) = ordinary(&db, "conflicting-retry-classification").await;
     let mut command = command(owner);
     let original = db
-        .apply_user_goal_command(&command, &transcript, at(), || {
-            panic!("initial receipt must commit");
-        })
+        .apply_user_goal_command(
+            &command,
+            &transcript,
+            || Ok(at()),
+            || {
+                panic!("initial receipt must commit");
+            },
+        )
         .await;
     assert!(matches!(
         original,
@@ -343,7 +388,7 @@ async fn conflicting_retry_classification_after_lost_rollback_ack_is_nonfatal() 
         .user_goal_command(
             &command,
             &transcript,
-            at(),
+            || Ok(at()),
             false,
             || fatal.store(true, Ordering::SeqCst),
             UserCommitCut::LostRollbackAcknowledgement,
@@ -363,11 +408,217 @@ async fn conflicting_retry_classification_after_lost_rollback_ack_is_nonfatal() 
     );
     command.change = original_change;
     let retry = db
-        .apply_user_goal_command(&command, &transcript, at(), || {
-            panic!("authority must remain available after typed conflict");
-        })
+        .apply_user_goal_command(
+            &command,
+            &transcript,
+            || Ok(at()),
+            || {
+                panic!("authority must remain available after typed conflict");
+            },
+        )
         .await;
     assert!(
         matches!((original, retry), (LocalAuthorityResult::DurableFactEstablished(Ok(first)), LocalAuthorityResult::DurableFactEstablished(Ok(second))) if first == second)
+    );
+}
+
+async fn assert_closed_receipt_retry(
+    db: &Database,
+    input: &GoalUserCommand,
+    transcript: &str,
+    receipt: &GoalUserReceipt,
+    history: bool,
+) {
+    let before = counts(db).await;
+    assert_eq!(
+        db.retained_user_goal_command(input, transcript)
+            .await
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    for busy in [false, true] {
+        let retry = db
+            .user_goal_command(
+                input,
+                transcript,
+                || panic!("retained retry must not sample a new timestamp"),
+                busy,
+                || panic!("retained retry must remain classified"),
+                UserCommitCut::None,
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&retry, receipt);
+    }
+    let mut fresh = command(input.owner.clone());
+    fresh.expected_version = input.expected_version;
+    let read = db.retained_user_goal_command(&fresh, transcript).await;
+    let write = db
+        .apply_user_goal_command(
+            &fresh,
+            transcript,
+            || panic!("closed owner must fail admission before sampling the clock"),
+            || panic!("refused new write must remain classified"),
+        )
+        .await
+        .established()
+        .unwrap();
+    for result in [read.map(|_| ()), write.map(|_| ())] {
+        if history {
+            assert!(matches!(
+                result,
+                Err(GoalDbError::Admission(
+                    crate::DbError::ProductConversationUnavailable(_)
+                ))
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(GoalDbError::Admission(
+                    crate::DbError::CloseAdmissionFenced(_)
+                ))
+            ));
+        }
+    }
+    assert_eq!(counts(db).await, before);
+}
+
+#[tokio::test]
+async fn accepted_create_and_state_lost_responses_retry_through_close_fence_and_history() {
+    use phoenix_core::domain::close::{CloseAttemptId, TranscriptConversationId};
+
+    for state in [false, true] {
+        let db = fixture().await;
+        let (transcript, owner) = ordinary(&db, "accepted-before-close").await;
+        let mut input = command(owner.clone());
+        if state {
+            let created = db
+                .apply_user_goal_command(
+                    &input,
+                    &transcript,
+                    || Ok(at()),
+                    || panic!("authority lost"),
+                )
+                .await
+                .established()
+                .unwrap()
+                .unwrap();
+            let GoalUserResult::Accepted { entry } = created.result else {
+                panic!("create must be accepted");
+            };
+            input.request_id = Uuid::new_v4();
+            input.expected_version = entry.snapshot().version();
+            input.change = GoalUserChange::State {
+                goal_id: entry.snapshot().goal_id().clone(),
+                disposition: GoalDisposition::Suspended(
+                    GoalText::parse("pause before close").unwrap(),
+                ),
+            };
+        }
+        let receipt = db
+            .user_goal_command(
+                &input,
+                &transcript,
+                || Ok(at()),
+                false,
+                || panic!("lost response must be classified"),
+                UserCommitCut::LostAcknowledgement,
+            )
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&receipt.result, GoalUserResult::Accepted { .. }));
+        let attempt = CloseAttemptId::parse("close-after-lost-response").unwrap();
+        db.begin_close_foundation(
+            &owner,
+            &TranscriptConversationId::parse(transcript.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        assert_closed_receipt_retry(&db, &input, &transcript, &receipt, false).await;
+        db.begin_close_idle_settlement(attempt.as_str())
+            .await
+            .unwrap();
+        db.advance_close_settlement_when_quiescent(attempt.as_str())
+            .await
+            .unwrap();
+        db.replace_close_inspection(crate::close_foundation::ReplaceCloseInspectionRequest {
+            attempt_id: attempt.clone(),
+            scopes: Vec::new(),
+        })
+        .await
+        .unwrap();
+        db.complete_close_retirement(&attempt).await.unwrap();
+        assert_closed_receipt_retry(&db, &input, &transcript, &receipt, true).await;
+    }
+}
+
+#[tokio::test]
+async fn queued_user_write_samples_clock_after_watch_enrollment_and_uses_one_timestamp() {
+    use std::{
+        cell::Cell,
+        future::Future,
+        task::{Context, Waker},
+    };
+
+    let db = fixture().await;
+    let (transcript, owner) = ordinary(&db, "watch-enrollment-before-user-writer").await;
+    let input = command(owner.clone());
+    let admitted_at = Cell::new(None);
+    let sampled = Cell::new(false);
+    let blocker = db.pool().acquire().await.unwrap();
+    let mut enrollment = Box::pin(db.watch_product_conversation(&owner));
+    let mut writer = Box::pin(db.apply_user_goal_command(
+        &input,
+        &transcript,
+        || {
+            assert!(!sampled.replace(true));
+            let enrollment = admitted_at
+                .get()
+                .expect("watch must commit before writer admission");
+            Ok(GoalTimestampUs::parse(enrollment + 1).unwrap())
+        },
+        || panic!("writer must remain classified"),
+    ));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(enrollment.as_mut().poll(&mut context).is_pending());
+    assert!(writer.as_mut().poll(&mut context).is_pending());
+    assert!(!sampled.get());
+    drop(blocker);
+    let watch = enrollment.await.unwrap();
+    admitted_at.set(Some(watch.enrolled_at_us));
+    let receipt = writer.await.established().unwrap().unwrap();
+    assert!(sampled.get());
+    let GoalUserResult::Accepted { entry } = &receipt.result else {
+        panic!("write after watch enrollment must be accepted");
+    };
+    let at = entry.recorded_at_us().get();
+    assert!(at >= watch.enrolled_at_us);
+    assert_eq!(at, watch.enrolled_at_us + 1);
+    let events = db.pending_coordinator_watch_events(10).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].source_occurrence_kind, "goal_change");
+    assert_eq!(events[0].occurred_at_us, at);
+    assert_eq!(
+        events[0].source_generation,
+        entry.snapshot().version().get()
+    );
+    let retained_at: i64 = sqlx::query_scalar(
+        "SELECT recorded_at_us FROM conversation_goal_user_requests WHERE request_id=?",
+    )
+    .bind(input.request_id.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained_at, at);
+    assert_eq!(
+        db.retained_user_goal_command(&input, &transcript)
+            .await
+            .unwrap(),
+        Some(receipt)
     );
 }

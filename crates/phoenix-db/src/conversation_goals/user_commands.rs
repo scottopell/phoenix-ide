@@ -231,7 +231,7 @@ async fn reject_tx(
 }
 
 impl Database {
-    /// Read an exact user goal-command receipt with the ordinary owner's live target in one snapshot.
+    /// Read an exact receipt for an ordinary owner before checking admission for a new write.
     ///
     /// The transcript argument is a prior caller sample; this read resolves the live target itself.
     ///
@@ -244,8 +244,11 @@ impl Database {
     ) -> Result<Option<GoalUserReceipt>> {
         let mut tx = self.pool().begin().await?;
         let live = Self::get_ordinary_product_conversation_on(&mut tx, &input.owner).await?;
-        admission::require_target_tx(&mut tx, &input.owner, &live.latest_transcript_row_id).await?;
         let retained = retained_tx(&mut tx, input).await?;
+        if retained.is_none() {
+            admission::require_target_tx(&mut tx, &input.owner, &live.latest_transcript_row_id)
+                .await?;
+        }
         tx.commit().await?;
         Ok(retained)
     }
@@ -258,13 +261,13 @@ impl Database {
         &self,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        at: GoalTimestampUs,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
         on_authority_lost: F,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
         self.user_goal_command(
             input,
             expected_transcript,
-            at,
+            clock,
             false,
             on_authority_lost,
             #[cfg(test)]
@@ -281,13 +284,13 @@ impl Database {
         &self,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        at: GoalTimestampUs,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
         on_authority_lost: F,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
         self.user_goal_command(
             input,
             expected_transcript,
-            at,
+            clock,
             true,
             on_authority_lost,
             #[cfg(test)]
@@ -301,18 +304,20 @@ impl Database {
         tx: &mut GoalTx<'_>,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        at: GoalTimestampUs,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
         host_gate_busy: bool,
     ) -> Result<GoalUserReceipt> {
-        if host_gate_busy {
-            let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
-            admission::require_target_tx(tx, &input.owner, &live.latest_transcript_row_id).await?;
-        } else {
-            admission::require_target_tx(tx, &input.owner, expected_transcript).await?;
-        }
+        let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
         if let Some(retained) = retained_tx(tx, input).await? {
             return Ok(retained);
         }
+        let target = if host_gate_busy {
+            &live.latest_transcript_row_id
+        } else {
+            expected_transcript
+        };
+        admission::require_target_tx(tx, &input.owner, target).await?;
+        let at = clock()?;
         let current = current_tx(tx, &input.owner).await?;
         let observed = current
             .as_ref()
@@ -396,7 +401,7 @@ impl Database {
         &self,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        at: GoalTimestampUs,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
         host_gate_busy: bool,
         on_authority_lost: F,
         #[cfg(test)] cut: UserCommitCut,
@@ -411,7 +416,7 @@ impl Database {
         };
         let mut authority = super::control::ControlCommitAuthority::new(on_authority_lost);
         let result = self
-            .user_goal_command_tx(&mut tx, input, expected_transcript, at, host_gate_busy)
+            .user_goal_command_tx(&mut tx, input, expected_transcript, clock, host_gate_busy)
             .await;
         let attempted = match result {
             Ok(receipt) => {
