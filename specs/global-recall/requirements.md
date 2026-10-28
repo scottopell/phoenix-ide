@@ -278,8 +278,13 @@ AND SHALL direct the Coordinator to recover unanswered user decisions from histo
 AND SHALL preserve prior decisions, corrections, pauses and gates; a repeated check-in SHALL NOT itself expand authority or reset them
 AND SHALL distinguish requested action and message acceptance from verified completion without requiring an announcement for every routine delivery
 AND SHALL lead the check-in briefing with still-needed user input, presenting genuine choices through `ask_user_question` with context and a recommendation, then explain what changed, why it matters and what happens next in concrete language understandable without intervening history, naming the actual work rather than opaque coordination labels, with useful links and grounded status where appropriate, without requiring a fixed report template or announcements for factual watch events
-AND SHALL include compact hypothetical bad-versus-good wording examples in both language-specific system prompts, distinguishing requests from verified outcomes without treating examples as incident facts
+
 AND SHALL include process or evidence limits when material to understanding or a decision, without indefinite polling or waiting for all owners to finish
+
+WHEN processing events without a user request for a briefing
+THE SYSTEM SHALL direct the Coordinator to report only needed user action or decisions, meaningful goal-level results, or new blockers or risks materially changing the plan; otherwise it SHALL continue authorized work quietly
+AND SHALL NOT treat routine check results, message deliveries or unchanged waiting as user-facing milestones
+AND SHALL include compact hypothetical bad-versus-good wording and silence examples in both language-specific system prompts, distinguishing requests from verified outcomes without treating examples as incident facts
 
 ---
 

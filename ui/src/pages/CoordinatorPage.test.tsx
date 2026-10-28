@@ -222,6 +222,7 @@ describe('CoordinatorPage', () => {
       'Assume I missed intervening messages',
       'plain English, not internal process labels',
       'distinguish requests from verified outcomes',
+      'Skip routine check/send receipts',
       'No fixed template',
     ]) expect(COORDINATOR_BRIEFING_PROMPT).toContain(phrase);
     expect(COORDINATOR_BRIEFING_PROMPT).not.toContain('Do not send messages');
