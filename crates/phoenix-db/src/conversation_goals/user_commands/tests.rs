@@ -145,7 +145,7 @@ async fn busy_receipt_uses_live_owner_after_sampled_transcript_continues_and_ret
         .await
         .unwrap()
         .is_none());
-    db.update_state(
+    db.update_conversation_state(
         &sampled_transcript,
         &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
             summary: "continue before busy refusal".into(),
