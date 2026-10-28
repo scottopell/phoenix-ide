@@ -176,6 +176,7 @@ pub fn base_prompt(lang: LlmLanguage) -> &'static str {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)] // Prompt literals are source-wrapped for 100-column review.
 pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
