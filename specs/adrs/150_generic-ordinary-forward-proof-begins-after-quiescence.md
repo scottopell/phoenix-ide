@@ -1,8 +1,8 @@
 # ADR-150: Generic ordinary forward proof begins after quiescence
 
-**Date:** 2026-10-27  
-**Status:** Accepted  
-**Decision owners:** Phoenix maintainers  
+**Date:** 2026-10-27
+**Status:** Accepted
+**Decision owners:** Phoenix maintainers
 **Scope:** Native launchd ordinary local-HEAD and published-release deployment with pending migrations
 
 ## Context
