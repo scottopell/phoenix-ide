@@ -121,7 +121,7 @@ impl GoalCommandService {
             return self.established_receipt(
                 db.reject_busy_user_goal_command(&command, &transcript, at, || {
                     self.runtime
-                        .signal_fatal_local_authority("goal_user_command_write")
+                        .signal_fatal_local_authority("goal_user_command_write");
                 })
                 .await,
             );
@@ -137,7 +137,7 @@ impl GoalCommandService {
             return self.established_receipt(
                 db.reject_busy_user_goal_command(&command, &transcript, at, || {
                     self.runtime
-                        .signal_fatal_local_authority("goal_user_command_write")
+                        .signal_fatal_local_authority("goal_user_command_write");
                 })
                 .await,
             );
@@ -145,7 +145,7 @@ impl GoalCommandService {
         self.established_receipt(
             db.apply_user_goal_command(&command, &transcript, at, || {
                 self.runtime
-                    .signal_fatal_local_authority("goal_user_command_write")
+                    .signal_fatal_local_authority("goal_user_command_write");
             })
             .await,
         )
