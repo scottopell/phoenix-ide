@@ -32,34 +32,44 @@ pub struct ProductCreationImage {
     pub data: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductCreationOrigin {
     UnknownHistorical,
     UserApi,
+    SlackGateway { request_id: String },
 }
 impl ProductCreationOrigin {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::UnknownHistorical => "unknown_historical",
             Self::UserApi => "user_api",
+            Self::SlackGateway { .. } => "slack_gateway",
         }
     }
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         match row.try_get::<String, _>("objective_origin")?.as_str() {
             "unknown_historical" => Ok(Self::UnknownHistorical),
             "user_api" => Ok(Self::UserApi),
+            "slack_gateway" => Ok(Self::SlackGateway {
+                request_id: row.try_get("objective_slack_request_id")?,
+            }),
             value => Err(sqlx::Error::Decode(
                 format!("invalid creation origin: {value}").into(),
             )),
         }
     }
     #[must_use]
-    pub fn input_origin(self) -> phoenix_core::domain::db_schema::InputOrigin {
+    pub fn input_origin(&self) -> phoenix_core::domain::db_schema::InputOrigin {
         match self {
             Self::UnknownHistorical => {
                 phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
             }
             Self::UserApi => phoenix_core::domain::db_schema::InputOrigin::UserApi,
+            Self::SlackGateway { request_id } => {
+                phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                    request_id: request_id.clone(),
+                }
+            }
         }
     }
 }
@@ -85,7 +95,7 @@ impl ProductCreationIntent {
             return false;
         }
         let mut normalized = retry.clone();
-        normalized.origin = self.origin;
+        normalized.origin = self.origin.clone();
         self == &normalized
     }
 }
@@ -369,7 +379,7 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.model, j.effort, j.llm_language, j.status,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.objective_slack_request_id, j.model, j.effort, j.llm_language, j.status,
                     j.provisioning_stage, j.stage_updated_at_unix_micros,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,
@@ -418,6 +428,7 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    #[allow(clippy::too_many_lines)] // One transaction reserves identity, source binding, and objective.
     pub async fn accept_product_creation(
         &self,
         request_id: &str,
@@ -428,7 +439,7 @@ impl Database {
         let now = unix_micros_now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
                     provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token,
@@ -464,9 +475,9 @@ impl Database {
         }
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
-                request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
+                request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
                 accepted_at_unix_micros, updated_at_unix_micros, stage_updated_at_unix_micros
-            ) VALUES (?1, ?2, ?3, ?4, ?9, ?5, ?6, ?7, 'accepted', ?8, ?8, ?8)",
+            ) VALUES (?1, ?2, ?3, ?4, ?9, ?10, ?5, ?6, ?7, 'accepted', ?8, ?8, ?8)",
         )
         .bind(request_id)
         .bind(accepted_product_conversation_id.as_str())
@@ -477,6 +488,7 @@ impl Database {
         .bind(intent.llm_language.as_str())
         .bind(now)
         .bind(intent.origin.as_str())
+        .bind(intent.origin.input_origin().slack_request_id())
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -492,6 +504,19 @@ impl Database {
             } else {
                 ProductCreationAcceptOutcome::Conflict(existing)
             });
+        }
+        if let ProductCreationOrigin::SlackGateway {
+            request_id: source_id,
+        } = &intent.origin
+        {
+            let changed = sqlx::query("UPDATE slack_gateway_bindings SET product_id=?2 WHERE creation_id=?1 AND binding_id=(SELECT binding_id FROM slack_gateway_requests WHERE request_id=?3) AND product_id IS NULL")
+                .bind(request_id).bind(accepted_product_conversation_id.as_str()).bind(source_id).execute(&mut *tx).await?;
+            if changed.rows_affected() != 1 {
+                return Err(DbError::Serialization(
+                    "Slack creation is not bound to its accepted source".into(),
+                ));
+            }
+            sqlx::query("UPDATE slack_gateway_requests SET input_id=?2 WHERE request_id=?1 AND admission_state='accepted'").bind(source_id).bind(request_id).execute(&mut *tx).await?;
         }
         for (ordinal, image) in intent.images.iter().enumerate() {
             sqlx::query(
@@ -537,7 +562,7 @@ impl Database {
                  status = 'accepted'
                  OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
-             ) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, model, effort,
+             ) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort,
                  llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
                  accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
@@ -605,7 +630,7 @@ impl Database {
                           accepted_at_unix_micros ASC, request_id ASC
                  LIMIT 1
              )
-             RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, model, effort,
+             RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort,
                  llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
                  accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
@@ -1273,7 +1298,7 @@ impl Database {
         cursor: Option<(i64, String)>,
     ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
         sqlx::query(
-            "SELECT request_id, cwd, objective, objective_origin, model, effort, llm_language, status,
+            "SELECT request_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
                     published_product_id, updated_at_unix_micros, last_error,
                     CASE WHEN j.status = 'delivery_failed' AND EXISTS (
                       SELECT 1 FROM product_conversations product
@@ -1742,7 +1767,7 @@ impl Database {
         let lease_until = now + lease_duration;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
                     provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token, claim_lease_until_unix_micros,

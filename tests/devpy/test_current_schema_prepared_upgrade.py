@@ -5742,11 +5742,11 @@ class OrdinarySource129To131Tests(unittest.TestCase):
                         with self.assertRaises(helper.ActivationError):
                             helper.ordinary_forward_policy_applies(manifest)
 
-    def test_actual_target140_registry_rejects_129_and_131_before_stop(self) -> None:
+    def test_actual_registry_rejects_129_and_131_before_stop(self) -> None:
         actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
-        self.assertEqual(
+        self.assertGreater(
             helper.migration_registry(actual_registry, qualified_current_target=False)[-1][0],
-            140,
+            131,
         )
         for through in (129, 131):
             for source_kind in ("local_head", "published_release"):

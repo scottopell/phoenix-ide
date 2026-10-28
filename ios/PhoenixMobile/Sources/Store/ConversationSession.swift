@@ -86,7 +86,7 @@ final class ConversationSession {
 
     /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
     /// versioning rule). Additive-optional fields (syncedAt) need no bump.
-    private static let snapshotSchemaVersion = 1
+    private static let snapshotSchemaVersion = 2
 
     private struct Snapshot: Codable, Sendable {
         var conversation: Conversation?
@@ -99,20 +99,25 @@ final class ConversationSession {
         var syncedAt: Date?
     }
 
+    private struct SnapshotV1Envelope: Decodable {
+        var payload: Snapshot
+    }
+
+    private static func loadSnapshot(name: String) -> Snapshot? {
+        DiskStore.loadVersioned(Snapshot.self, name: name, version: snapshotSchemaVersion) { version, data in
+            guard version == 1 else { return nil }
+            return try? JSONDecoder().decode(SnapshotV1Envelope.self, from: data).payload
+        }
+    }
+
     static func hasCachedSnapshot(conversationId: String) -> Bool {
-        guard let snapshot = DiskStore.loadVersioned(
-            Snapshot.self,
-            name: "conv-\(conversationId)",
-            version: snapshotSchemaVersion)
+        guard let snapshot = loadSnapshot(name: "conv-\(conversationId)")
         else { return false }
         return snapshot.conversation != nil && snapshot.syncedAt != nil
     }
 
     static func cachedConversation(conversationId: String) -> Conversation? {
-        guard let snapshot = DiskStore.loadVersioned(
-            Snapshot.self,
-            name: "conv-\(conversationId)",
-            version: snapshotSchemaVersion),
+        guard let snapshot = loadSnapshot(name: "conv-\(conversationId)"),
               snapshot.syncedAt != nil
         else { return nil }
         return snapshot.conversation
@@ -139,8 +144,7 @@ final class ConversationSession {
             name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 
         // Cached snapshot renders immediately; the stream refreshes it.
-        if let snap = DiskStore.loadVersioned(
-            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
+        if let snap = Self.loadSnapshot(name: snapshotName)
         {
             conversation = snap.conversation
             messages = snap.messages

@@ -28,6 +28,7 @@ mod resolution_root;
 mod resource_authority;
 mod runtime;
 mod send_chat_service;
+mod slack_gateway;
 mod suggest;
 mod system_prompt;
 mod task_listing;
@@ -1024,6 +1025,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .signal_fatal_local_authority("automatic_continuation_driver_supervisor");
         }
     });
+
+    crate::slack_gateway::start(state.clone());
 
     // Create router
     //
