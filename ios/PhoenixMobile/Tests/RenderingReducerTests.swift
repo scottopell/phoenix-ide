@@ -46,6 +46,8 @@ final class RenderingReducerTests: XCTestCase {
              .internalConversation(productConversationId: "product-1", transcriptId: "transcript-1"),
              "Conversation from @transcript:transcript-1 (conversation ID product-1)"),
             (#"{"kind":"system_generated"}"#, .systemGenerated, "System input"),
+            (#"{"kind":"slack_gateway","request_id":"request-1"}"#,
+             .slackGateway(requestId: "request-1"), "Slack request"),
             (#"{"kind":"subscription_event","event_id":"event-1"}"#,
              .subscriptionEvent(eventId: "event-1"), "Conversation event"),
             (#"{"kind":"unknown_historical"}"#, .unknownHistorical, "Unknown input"),
@@ -61,6 +63,9 @@ final class RenderingReducerTests: XCTestCase {
             XCTAssertEqual(decoded.inputOrigin.label, label)
             let roundTrip = try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(decoded))
             XCTAssertEqual(roundTrip.inputOrigin, expected)
+            XCTAssertEqual(decoded.inputOrigin.slackSourceURL(serverURL: "https://phoenix.example")?.absoluteString,
+                           expected == .slackGateway(requestId: "request-1")
+                           ? "https://phoenix.example/api/slack-gateway/requests/request-1/source" : nil)
         }
     }
 
@@ -70,6 +75,7 @@ final class RenderingReducerTests: XCTestCase {
             (.internalConversation(productConversationId: "pc-parent", transcriptId: "row-parent"), false),
             (.unknownHistorical, false),
             (.systemGenerated, false),
+            (.slackGateway(requestId: "request-1"), false),
             (.subscriptionEvent(eventId: "event-1"), false),
         ]
         for (origin, isHuman) in origins {

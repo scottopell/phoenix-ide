@@ -430,7 +430,7 @@ impl Fts5Retriever {
         .fetch_one(&self.pool)
         .await?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id FROM messages",
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id FROM messages",
         )
         .try_map(crate::parse_message_row)
         .fetch_all(&self.pool)
@@ -484,7 +484,7 @@ impl Fts5Retriever {
     ) -> Result<FtsMessageReconcileOutcome, RetrievalError> {
         let mut tx = self.pool.begin().await?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(&planned_message.message_id)
@@ -638,7 +638,7 @@ fn build_retrieval_sql(
              SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
                     meta.message_type, meta.created_at, source.origin_kind, \
                     source.origin_product_conversation_id, source.origin_transcript_id, \
-                    source.origin_subscription_event_id, source.origin_source_message_id, source.origin_source_tool_use_id, c.transcript_generation, \
+                    source.origin_subscription_event_id, source.origin_source_message_id, source.origin_source_tool_use_id, source.origin_slack_request_id, c.transcript_generation, \
                     (SELECT COUNT(*) FROM messages count_source WHERE count_source.conversation_id = c.id) AS message_count, \
                     snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
                     bm25(message_fts) AS score",
@@ -690,7 +690,7 @@ fn build_retrieval_sql(
     match request.grouping {
         RetrievalGrouping::None => {
             sql.push_str(
-                " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
+                " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, transcript_generation, message_count, snippet, score \
                   FROM ranked_hits \
                   ORDER BY score, created_at DESC \
                   LIMIT ?",
@@ -699,14 +699,14 @@ fn build_retrieval_sql(
         RetrievalGrouping::BestPerConversation => {
             sql.push_str(
                 ", grouped_hits AS (\
-                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score, \
+                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, transcript_generation, message_count, snippet, score, \
                             ROW_NUMBER() OVER (\
                                 PARTITION BY conversation_id \
                                 ORDER BY score, created_at DESC, message_id\
                             ) AS conversation_rank \
                      FROM ranked_hits\
                  ) \
-                 SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, transcript_generation, message_count, snippet, score \
+                 SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id, transcript_generation, message_count, snippet, score \
                  FROM grouped_hits \
                  WHERE conversation_rank = 1 \
                  ORDER BY score, created_at DESC, conversation_id \
@@ -859,7 +859,7 @@ impl MessageRetriever for Fts5Retriever {
         // Current source messages for these conversations.
         let mut messages = {
             let sql = format!(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id \
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id \
                  FROM messages WHERE conversation_id IN ({placeholders})"
             );
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -1355,11 +1355,12 @@ fn parse_chunk_row(row: sqlx::sqlite::SqliteRow) -> Result<RetrievedChunk, sqlx:
             char_range: None,
         },
         message_type: crate::parse_message_type(&row.try_get::<String, _>("message_type")?),
-        origin: InputOrigin::from_db_parts(
+        origin: InputOrigin::from_db_parts_with_slack(
             &row.try_get::<String, _>("origin_kind")?,
             row.try_get("origin_product_conversation_id")?,
             row.try_get("origin_transcript_id")?,
             row.try_get("origin_subscription_event_id")?,
+            row.try_get("origin_slack_request_id")?,
         )
         .and_then(|origin| {
             origin.with_source_call_columns(

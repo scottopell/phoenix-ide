@@ -18,21 +18,14 @@ async fn migration_138_backfills_materialized_without_breaking_ordinary_message_
         .create_conversation("schema-138", "schema-138", "/tmp", true, None, None)
         .await
         .unwrap();
-    let message = db
-        .add_message(
-            "before-138",
-            &conversation.id,
-            &MessageContent::user("before"),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at,origin_kind) VALUES ('before-138',?1,1,'user',?2,'2026-01-01T00:00:00Z','user_api')")
+        .bind(&conversation.id).bind(serde_json::to_string(&MessageContent::user("before")).unwrap())
+        .execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO workflows(workflow_id,profile_kind,profile_version,runtime_acceptance_enabled,external_acceptance_enabled,version,generation,status,snapshot_codec_family,snapshot_codec_version,snapshot_payload,created_at,updated_at) VALUES (1,'direct_turn',1,0,1,1,0,'Active','direct_turn.snapshot',1,X'0001FF',10,20)")
         .execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO durable_turns(turn_id,workflow_id,conversation_id,client_turn_key,prepared_fingerprint,prepared_payload,disposition,generation,owns_conversation,origin_kind,canonical_message_id) VALUES (1,1,?,'schema-key','schema-fingerprint',X'FF000A','Runtime',0,1,'user_api',?)")
         .bind(&conversation.id)
-        .bind(&message.message_id)
+        .bind("before-138")
         .execute(db.pool()).await.unwrap();
 
     assert_eq!(run_through_for_test(db.pool(), 138).await.unwrap(), 1);
@@ -51,6 +44,16 @@ async fn migration_138_backfills_materialized_without_breaking_ordinary_message_
     );
 
     run_through_for_test(db.pool(), 140).await.unwrap();
+    assert_eq!(run_through_for_test(db.pool(), 140).await.unwrap(), 0);
+    assert_eq!(MIGRATIONS.last().unwrap().version, 142);
+    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 1);
+    let receipt_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='canonical_tool_round_receipts'",
+    ).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(receipt_table, 1);
+    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(db.pool(), 142).await.unwrap(), 1);
+    assert_eq!(run_through_for_test(db.pool(), 142).await.unwrap(), 0);
     let written = db
         .add_message(
             "after-138",
@@ -64,14 +67,6 @@ async fn migration_138_backfills_materialized_without_breaking_ordinary_message_
     let decoded = db.get_message_by_id(&written.message_id).await.unwrap();
     assert_eq!(decoded.message_id, written.message_id);
     assert_eq!(decoded.content, written.content);
-    assert_eq!(run_through_for_test(db.pool(), 140).await.unwrap(), 0);
-    assert_eq!(MIGRATIONS.last().unwrap().version, 141);
-    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 1);
-    let receipt_table: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='canonical_tool_round_receipts'",
-    ).fetch_one(db.pool()).await.unwrap();
-    assert_eq!(receipt_table, 1);
-    assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -88,16 +83,9 @@ async fn migration_141_requires_nonnegative_integer_microsecond_receipts() {
         .create_conversation("schema-141", "schema-141", "/tmp", true, None, None)
         .await
         .unwrap();
-    let assistant = db
-        .add_message(
-            "clock-assistant",
-            &conversation.id,
-            &MessageContent::Agent(vec![]),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    sqlx::query("INSERT INTO messages(message_id,conversation_id,sequence_id,message_type,content,created_at,origin_kind) VALUES ('clock-assistant',?1,1,'agent',?2,'2026-01-01T00:00:00Z','system_generated')")
+        .bind(&conversation.id).bind(serde_json::to_string(&MessageContent::Agent(vec![])).unwrap())
+        .execute(db.pool()).await.unwrap();
     assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 1);
     assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 0);
     let clock_type: String = sqlx::query_scalar(
@@ -129,7 +117,7 @@ async fn migration_141_requires_nonnegative_integer_microsecond_receipts() {
         insert
             .push_bind(&conversation.id)
             .push(",")
-            .push_bind(&assistant.message_id)
+            .push_bind("clock-assistant")
             .push(",zeroblob(32),")
             .push(value)
             .push(",'none')");

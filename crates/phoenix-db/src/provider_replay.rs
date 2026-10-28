@@ -361,7 +361,7 @@ impl Database {
             .transpose()
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -377,11 +377,13 @@ impl Database {
         .bind(origin.db_parts().3)
     .bind(origin.source_call().map(|call| call.message_id.as_str()))
     .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
+    .bind(origin.slack_request_id())
         .execute(&mut *tx)
         .await?;
         if matches!(
             origin,
             phoenix_core::domain::db_schema::InputOrigin::UserApi
+                | phoenix_core::domain::db_schema::InputOrigin::SlackGateway { .. }
         ) {
             sqlx::query("INSERT INTO steering_execution_occurrences(conversation_id,message_id,source_kind) VALUES (?1,?2,'interaction_response') ON CONFLICT(conversation_id) DO UPDATE SET message_id = excluded.message_id, source_kind = 'interaction_response'")
                 .bind(conversation_id).bind(message_id).execute(&mut *tx).await?;
@@ -402,6 +404,12 @@ impl Database {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+        if matches!(
+            content,
+            phoenix_core::domain::db_schema::MessageContent::Agent(_)
+        ) {
+            crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
+        }
         sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
             .bind(conversation_id)
             .execute(&mut *tx)

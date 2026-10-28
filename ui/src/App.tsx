@@ -52,6 +52,7 @@ const CoordinatorPage = lazy(() =>
 const TerminalPage = lazy(() =>
   import('./pages/TerminalPage').then((m) => ({ default: m.TerminalPage })),
 );
+const SlackGatewayPage = lazy(() => import('./pages/SlackGatewayPage').then(m => ({ default: m.SlackGatewayPage })));
 const LlmLanguagePage = lazy(() =>
   import('./pages/LlmLanguagePage').then((m) => ({ default: m.LlmLanguagePage })),
 );
@@ -111,6 +112,7 @@ function AppRoutes() {
                 <Route path="/usage" element={<UsagePage />} />
                 <Route path="/global" element={<CoordinatorPage />} />
                 <Route path="/global/:slug" element={<CoordinatorPage />} />
+                <Route path="/settings/slack" element={<SlackGatewayPage />} />
                 <Route path="/settings/llm-language" element={<LlmLanguagePage />} />
               </Routes>
             </DesktopLayout>

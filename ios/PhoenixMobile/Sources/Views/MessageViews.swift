@@ -92,6 +92,9 @@ struct InputOriginHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(origin.label).textSelection(.enabled)
+            if let url = origin.slackSourceURL(serverURL: serverURL) {
+                Link("Open Slack source", destination: url)
+            }
             if let url = origin.sourceCallURL(serverURL: serverURL) {
                 Link("Open originating send call", destination: url)
             } else if origin.sourceCallUnavailable {

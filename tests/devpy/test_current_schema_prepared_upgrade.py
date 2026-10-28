@@ -5903,6 +5903,13 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
             ),
         )
 
+    def test_actual_registry_includes_post_131_migrations(self) -> None:
+        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        self.assertGreater(
+            helper.migration_registry(actual_registry, qualified_current_target=False)[-1][0],
+            131,
+        )
+
     def historical_registry(self, version: int) -> Path:
         registry = self.root / f"migrations-through-{version}.rs"
         registry.write_bytes(gzip.decompress(
@@ -5960,7 +5967,6 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
     def test_prod_prepared_status_is_fresh_ordinary_activation_marker(self) -> None:
         dev = CurrentSchemaRepairTests.controller(self)
         current_target = compiled_ledger(None)[-1][0]
-        self.assertEqual(current_target, 141)
         manifest = self.ordinary_manifest(
             self.database(through=current_target), ROOT / "crates/phoenix-db/src/migrations.rs",
         )
@@ -6181,18 +6187,20 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
         )
         plan = helper.ordinary_forward_plan(manifest)
         self.assertTrue(helper.ordinary_forward_policy_applies(manifest))
+        current = tuple(compiled_ledger(None))
         self.assertEqual(plan.source[-1][0], 131)
-        self.assertEqual(plan.target[-1][0], 141)
-        self.assertEqual((plan.pending[0][0], plan.pending[-1][0]), (132, 141))
+        self.assertEqual(plan.target, current)
+        self.assertEqual(plan.pending, tuple(entry for entry in current if entry[0] > 131))
 
-    def test_historical_140_to_actual_current_registry_is_one_step(self) -> None:
+    def test_historical_140_to_actual_current_registry_is_admitted(self) -> None:
         manifest = self.ordinary_manifest(
             self.database(through=140), ROOT / "crates/phoenix-db/src/migrations.rs",
         )
         plan = helper.ordinary_forward_plan(manifest)
+        current = tuple(compiled_ledger(None))
         self.assertEqual(plan.source, tuple(compiled_ledger(140)))
-        self.assertEqual(plan.target[-1][0], 141)
-        self.assertEqual(plan.pending, (compiled_ledger(None)[-1],))
+        self.assertEqual(plan.target, current)
+        self.assertEqual(plan.pending, tuple(entry for entry in current if entry[0] > 140))
 
     def test_completed_historical_131_to_140_migration_cannot_replay_ordinary_activate(self) -> None:
         database = self.database(through=131)
@@ -6295,7 +6303,6 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
 
     def test_fresh_no_pending_ordinary_activation_stays_admitted(self) -> None:
         current_target = compiled_ledger(None)[-1][0]
-        self.assertEqual(current_target, 141)
         manifest = self.ordinary_manifest(
             self.database(through=current_target),
             ROOT / "crates/phoenix-db/src/migrations.rs",

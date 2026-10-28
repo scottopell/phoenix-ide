@@ -246,7 +246,7 @@ pub(super) fn result_message(
 }
 
 pub(crate) async fn retained_message_tx(tx: &mut GoalTx<'_>, id: &str) -> Result<Option<Message>> {
-    Ok(sqlx::query("SELECT message_id,conversation_id,sequence_id,message_type,content,display_data,usage_data,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_message_id,origin_source_tool_use_id FROM messages WHERE message_id=?")
+    Ok(sqlx::query("SELECT message_id,conversation_id,sequence_id,message_type,content,display_data,usage_data,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_message_id,origin_source_tool_use_id,origin_slack_request_id FROM messages WHERE message_id=?")
         .bind(id).try_map(crate::parse_message_row).fetch_optional(&mut **tx).await?)
 }
 
@@ -466,6 +466,7 @@ pub(crate) async fn selected_state_tx(
                 "selected round conversation missing",
             ));
         }
+        crate::record_initial_execution_outcome_tx(tx, conversation_id, state).await?;
         return Ok((state.clone(), state_updated_at));
     }
     let row = sqlx::query("SELECT state,state_updated_at FROM conversations WHERE id=?")

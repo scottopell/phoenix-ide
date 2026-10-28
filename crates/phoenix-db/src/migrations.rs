@@ -739,6 +739,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "canonical_tool_round_receipts",
         sql: include_str!("provider_replay/canonical_receipt.sql"),
     },
+    Migration {
+        version: 142,
+        name: "slack_gateway_v1",
+        sql: include_str!("migrations/slack_gateway.sql"),
+    },
+
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -13100,6 +13106,59 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn slack_final_schema_excludes_obsolete_prototype_storage() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        let identity: String = sqlx::query_scalar("SELECT name FROM _migrations WHERE version=142")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(identity, "slack_gateway_v1");
+        let obsolete: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM sqlite_schema WHERE name='slack_gateway_questions')
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_requests') WHERE name IN ('question_id','question_transcript'))
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_native_outcomes') WHERE name IN ('question_id','question_body'))
+            + (SELECT COUNT(*) FROM pragma_table_info('slack_gateway_returns') WHERE name IN ('response_kind','notification_inspect_after_us'))")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(obsolete, 0);
+    }
+
+    #[tokio::test]
+    async fn slack_prototype_ledgers_are_refused_before_mutation() {
+        for (version, name) in [
+            (141, "slack_gateway"),
+            (141, "slack_gateway_v1"),
+            (142, "slack_gateway_first_observation"),
+        ] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::raw_sql("CREATE TABLE _migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT (datetime('now')));
+                CREATE TABLE prototype_work(instruction TEXT); INSERT INTO prototype_work VALUES('preserve this work');")
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _migrations(version,name) VALUES (?1,?2)")
+                .bind(version)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(run_pending_migrations(&pool).await.is_err());
+            let work: String = sqlx::query_scalar("SELECT instruction FROM prototype_work")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(work, "preserve this work");
+            let objects: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(objects, 2);
+        }
+    }
+
+    #[tokio::test]
     async fn migration_119_retains_retry_pending_plan_outbox_trigger_after_table_rebuild() {
         let db = crate::Database::open_in_memory().await.unwrap();
         let count: i64 = sqlx::query_scalar(
@@ -14845,6 +14904,16 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
+    async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
+        let connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn current_schema_controller_accepts_compiled_123_and_128_shapes() {
         let directory = tempfile::tempdir().unwrap();
@@ -14883,6 +14952,7 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap();
         db.pool().close().await;
         drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
 
         validate_current_schema_with_controller(&path, false);
 
@@ -14901,6 +14971,7 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap();
         db.pool().close().await;
         drop(db);
+        seal_current_schema_snapshot_fixture(&path).await;
 
         validate_current_schema_with_controller(&path, false);
         validate_current_schema_with_controller(&path, true);
@@ -14970,6 +15041,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (142, "slack_gateway_v1"),
             (141, "canonical_tool_round_receipts"),
             (140, "federation_local_stop_acceptance"),
             (139, "goal_start_materialization_witness"),
@@ -20376,6 +20448,7 @@ with tempfile.TemporaryDirectory() as directory:
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_006_archives_partially_archived_chains() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
