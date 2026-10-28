@@ -425,7 +425,10 @@ impl Database {
                             "injected lost acknowledgement".into(),
                         ))
                     }
-                    _ => committed,
+                    UserCommitCut::None
+                    | UserCommitCut::LostAcknowledgement
+                    | UserCommitCut::RolledBack
+                    | UserCommitCut::LostClassification => committed,
                 };
                 match committed {
                     Ok(()) => {
