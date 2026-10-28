@@ -66,10 +66,10 @@ jobs:
     needs: plan_check
     if: ${{ needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
-    # 5 setup/network + 20 native + 82 check + 10 musl + 2 evidence + 4 post-actions.
+    # 15 setup/browser + 20 native + 82 check + 10 musl + 2 evidence + 4 post-actions.
     # Setup/network and musl are planning estimates, not completion guarantees.
     # Check: 70.5 Rust watchdog + 10 normal fmt + 1.5 probes/teardown/report.
-    timeout-minutes: 123
+    timeout-minutes: 133
     env:
       PYTHONUNBUFFERED: "1"
       PHOENIX_DEV_TRACE_ENDPOINT: "off"
@@ -121,6 +121,24 @@ jobs:
       - name: Install musl compiler
         timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Prepare pinned Chromium for native browser tests
+        timeout-minutes: 10
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          chromium_path="$(node -e 'console.log(require("playwright").chromium.executablePath())')"
+          test -x "$chromium_path"
+          "$chromium_path" --version
+          printf 'PHOENIX_CHROME_EXECUTABLE=%s\n' "$chromium_path" >> "$GITHUB_ENV"
       - name: Build native bash launcher fixture
         timeout-minutes: 20
         run: |
