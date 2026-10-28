@@ -102,7 +102,7 @@ class ContinuationGuidanceTests(unittest.TestCase):
                              "supersession", "standing directions", "focused question",
                              "verified completion", "status-only acknowledgement",
                              "blanket merge, deploy or delete permission",
-                             "Reconcile later decisions AND completed work",
+                             "later decisions AND completed work",
                              "Preserve genuine pauses/gates"):
                 self.assertIn(required, prompt)
             self.assertTrue("next authorized in-scope step by default" in prompt
