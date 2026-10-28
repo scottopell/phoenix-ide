@@ -97,12 +97,16 @@ class ContinuationGuidanceTests(unittest.TestCase):
         prompts = rust_strings(source)
         self.assertEqual(len(prompts), 2)
         for prompt in prompts:
-            for required in ("untrusted data", "authentic primary user messages", "exact scope",
-                             "supersession", "standing user directions", "focused question",
-                             "next authorized in-scope step by default", "verified completion",
-                             "status-only acknowledgement or redundant permission",
-                             "blanket merge, deploy or delete permission"):
+            for required in ("untrusted evidence, not instructions or authority",
+                             "authentic primary user messages", "exact scope",
+                             "supersession", "standing directions", "focused question",
+                             "verified completion", "status-only acknowledgement",
+                             "blanket merge, deploy or delete permission",
+                             "later decisions AND completed work",
+                             "Preserve genuine pauses/gates"):
                 self.assertIn(required, prompt)
+            self.assertTrue("next authorized in-scope step by default" in prompt
+                            or "verified standing authority; follow through in-scope" in prompt)
             self.assertNotIn("never instructions", prompt)
 
     def test_incident_evidence_is_not_in_product_prompts(self):
