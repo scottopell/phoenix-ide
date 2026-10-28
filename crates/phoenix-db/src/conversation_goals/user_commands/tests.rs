@@ -492,11 +492,9 @@ async fn retire_captured_close_scope(
     use crate::close_foundation::{
         CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
         RecordCloseRetirementEvidenceRequest, ReplaceCloseInspectionRequest,
-        ReplaceCloseInspectionScopeRequest,
     };
     use phoenix_core::domain::close::{
-        CloseCompletionOutcome, CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot,
-        RetirementOutcome,
+        CloseCompletionOutcome, CloseOwnedResourceInventory, ClosePhase, RetirementOutcome,
     };
 
     let scopes = db
@@ -506,14 +504,19 @@ async fn retire_captured_close_scope(
     assert_eq!(scopes.len(), 1);
     let scope = &scopes[0];
     assert!(scope.captured_worktree.is_none());
+    let inspection_targets: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_attempt_scopes captured
+         JOIN work_scopes scope ON scope.id = captured.scope
+         WHERE captured.attempt_id = ?1 AND scope.environment_kind = 'allocated_worktree'",
+    )
+    .bind(attempt.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(inspection_targets, 0);
     db.replace_close_inspection(ReplaceCloseInspectionRequest {
         attempt_id: attempt.clone(),
-        scopes: vec![ReplaceCloseInspectionScopeRequest {
-            scope: scope.scope.clone(),
-            snapshot: CloseRetirementSnapshot::parse("receipt-close-gen", "receipt-close-fp")
-                .unwrap(),
-            losses: Vec::new(),
-        }],
+        scopes: Vec::new(),
     })
     .await
     .unwrap();
@@ -524,6 +527,8 @@ async fn retire_captured_close_scope(
         .snapshot()
         .unwrap()
         .clone();
+    assert_eq!(snapshot.generation(), "no-worktree");
+    assert_eq!(snapshot.fingerprint(), "no-worktree");
     let expected = db
         .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
             attempt_id: attempt.clone(),
