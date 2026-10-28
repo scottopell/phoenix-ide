@@ -231,8 +231,7 @@ pub(super) fn result_message(
         .checked_add(ordinal)
         .and_then(|seq| seq.checked_add(1))
         .ok_or(GoalDbError::Integrity("round result sequence"))?;
-    let display_data =
-        merge_duration_into_display_data(result.display_data().cloned(), result.duration_ms);
+    let display_data = merge_duration_into_display_data(result.display_data(), result.duration_ms);
     Ok(Message {
         message_id: tool_result_message_id(&assistant.message_id, &result.tool_use_id),
         conversation_id: assistant.conversation_id.clone(),
