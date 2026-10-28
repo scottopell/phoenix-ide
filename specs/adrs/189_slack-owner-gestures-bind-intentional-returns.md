@@ -1,4 +1,4 @@
-# ADR-150: Owner gestures bind intentional Slack returns
+# ADR-189: Owner gestures bind intentional Slack returns
 
 - **Status:** Accepted
 - **Date:** 2026-10-23

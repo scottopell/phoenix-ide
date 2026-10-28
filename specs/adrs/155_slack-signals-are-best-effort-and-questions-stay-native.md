@@ -50,5 +50,5 @@ ADR-152's inspection/retry contract and ADR-154's question-text publication.
 ## References
 
 - [Slack gateway requirements](../slack-gateway/requirements.md)
-- ADR-150, ADR-152 and ADR-154
+- ADR-189, ADR-152 and ADR-154
 - `dispatch_returns`, `slack_begin_eyes_attempt`, `record_slack_question_tx`

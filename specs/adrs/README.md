@@ -185,7 +185,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [147](147_readable-generated-handoffs-retain-source-authority.md) | Readable generated handoffs retain explicit source authority | Accepted; partially supersedes 054 | REQ-BED-020b/021/030, REQ-LLM-004m |
 | [146](146_context-capacity-preserves-output-and-semantic-continuity.md) | Shared capacity planning preserves output headroom and semantic continuity | Accepted | REQ-LLM-004f/004j–004m, REQ-BED-020a, REQ-STR-012, REQ-AN-011 |
 | [145](145_coordinator-check-in-drives-scoped-work.md) | Coordinator check-ins drive scoped work and report outcomes | Accepted | REQ-GR-010, REQ-GR-011, REQ-GR-013 |
-| [150](150_slack-owner-gestures-bind-intentional-returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
+| [189](189_slack-owner-gestures-bind-intentional-returns.md) | Owner gestures bind intentional Slack returns | Accepted | REQ-SG-001–007/009–014/016 |
 | [151](151_bound-discovery-and-refresh-new-explicit-requests.md) | Bound discovery and refresh new explicit requests | Accepted | REQ-SG-003/017 |
 | [152](152_private-notifications-use-an-owner-command.md) | Private notifications use an owner command | Superseded by ADR-155 | REQ-SG-015 |
 | [153](153_slack-gateway-uses-native-conversation-services.md) | Slack ingress uses native conversation services | Accepted | REQ-SG-004/008/009, REQ-CCR-001 |
