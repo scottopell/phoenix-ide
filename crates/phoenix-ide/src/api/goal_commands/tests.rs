@@ -706,6 +706,7 @@ async fn assert_publication_receipt(
     path: CommandPublicationPath,
     before: Option<&phoenix_db::conversation_goals::user_commands::GoalUserReceipt>,
 ) {
+    use phoenix_db::conversation_goals::user_commands::{GoalUserRefusal, GoalUserResult};
     let retained = fixture
         .state
         .runtime
@@ -714,7 +715,6 @@ async fn assert_publication_receipt(
         .await
         .unwrap()
         .expect("command must retain its result before publication");
-    use phoenix_db::conversation_goals::user_commands::{GoalUserRefusal, GoalUserResult};
     match path {
         CommandPublicationPath::Retained => assert_eq!(Some(&retained), before),
         CommandPublicationPath::Accepted => {
