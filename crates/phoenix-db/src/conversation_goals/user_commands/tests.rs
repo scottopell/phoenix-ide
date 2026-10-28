@@ -485,6 +485,90 @@ async fn assert_closed_receipt_retry(
     assert_eq!(counts(db).await, before);
 }
 
+async fn retire_captured_close_scope(
+    db: &crate::Database,
+    attempt: &phoenix_core::domain::close::CloseAttemptId,
+) {
+    use crate::close_foundation::{
+        CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
+        RecordCloseRetirementEvidenceRequest, ReplaceCloseInspectionRequest,
+        ReplaceCloseInspectionScopeRequest,
+    };
+    use phoenix_core::domain::close::{
+        CloseCompletionOutcome, CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot,
+        RetirementOutcome,
+    };
+
+    let scopes = db
+        .list_close_attempt_scopes(attempt.as_str())
+        .await
+        .unwrap();
+    assert_eq!(scopes.len(), 1);
+    let scope = &scopes[0];
+    assert!(scope.captured_worktree.is_none());
+    db.replace_close_inspection(ReplaceCloseInspectionRequest {
+        attempt_id: attempt.clone(),
+        scopes: vec![ReplaceCloseInspectionScopeRequest {
+            scope: scope.scope.clone(),
+            snapshot: CloseRetirementSnapshot::parse("receipt-close-gen", "receipt-close-fp")
+                .unwrap(),
+            losses: Vec::new(),
+        }],
+    })
+    .await
+    .unwrap();
+    let snapshot = db
+        .get_close_obligation(attempt.as_str())
+        .await
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .clone();
+    let expected = db
+        .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+            attempt_id: attempt.clone(),
+            snapshot,
+            scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                scope: scope.scope.clone(),
+                inventory: CloseOwnedResourceInventory {
+                    worktree: None,
+                    work_scopes: Default::default(),
+                    bash_process_groups: Default::default(),
+                    tmux_servers: Default::default(),
+                    pty_sessions: Default::default(),
+                    browser_sessions: Default::default(),
+                    equivalent_live_resources: Default::default(),
+                },
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(expected.len(), 1);
+    assert_eq!(
+        expected[0].resource.kind(),
+        phoenix_core::domain::close::RetiredResourceKind::WorkScope
+    );
+    assert_eq!(expected[0].scope, scope.scope);
+    for resource in expected {
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: resource.attempt_id,
+            scope: resource.scope,
+            snapshot: resource.snapshot,
+            resource: resource.resource,
+            outcome: RetirementOutcome::Retired,
+            detail: None,
+        })
+        .await
+        .unwrap();
+    }
+    let completed = db.complete_close_retirement(attempt).await.unwrap();
+    assert_eq!(completed.phase(), ClosePhase::Completed);
+    assert_eq!(
+        completed.close_outcome(),
+        Some(CloseCompletionOutcome::Archived)
+    );
+}
+
 #[tokio::test]
 async fn accepted_create_and_state_lost_responses_retry_through_close_fence_and_history() {
     use phoenix_core::domain::close::{CloseAttemptId, TranscriptConversationId};
@@ -546,13 +630,8 @@ async fn accepted_create_and_state_lost_responses_retry_through_close_fence_and_
         db.advance_close_settlement_when_quiescent(attempt.as_str())
             .await
             .unwrap();
-        db.replace_close_inspection(crate::close_foundation::ReplaceCloseInspectionRequest {
-            attempt_id: attempt.clone(),
-            scopes: Vec::new(),
-        })
-        .await
-        .unwrap();
-        db.complete_close_retirement(&attempt).await.unwrap();
+        retire_captured_close_scope(&db, &attempt).await;
+        assert!(db.get_conversation(&transcript).await.unwrap().archived);
         assert_closed_receipt_retry(&db, &input, &transcript, &receipt, true).await;
     }
 }
