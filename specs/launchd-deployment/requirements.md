@@ -237,20 +237,20 @@ The helper SHALL durably record `migration_started` immediately before starting 
 
 A successful activation SHALL retain the verified native backup, rehearsal proof, receipt digest, registry/ledger proof, quarantine history, and identity evidence as transaction audit evidence. Any unresolved failure or uncertain process absence, persistence, identity, publication, cleanup, claim release, or proof SHALL retain the backup and all evidence, ownership claim, and stopped fence for explicit recovery. The route SHALL reject ordinary `prod deploy`, unqualified prepared or published sources, aliases, local or runtime-only sources, systemd or bare-Linux backends, another source or target ledger, candidate/helper/receipt/registry/configuration substitution, and every option or manual action that bypasses native backup, sequential rehearsal, exact dynamic identity, durable marker, phase/proof authority, candidate-only finalization, or evidence retention. This requirement SHALL NOT qualify schema-129-to-129 for another backend or deployment mode, authorize downgrade or generic rollback, or alter existing migration-128 route pins or REQ-LDD-026.
 
-### REQ-LDD-028 — Exact ordinary additive schema-129-to-131 activation
+### REQ-LDD-028 — Generic exact-prefix ordinary forward-only activation
 
-WHEN ordinary local-HEAD or published-release native launchd deployment selects the exact complete candidate registry and source129 ledger qualified by `specs/compatibility/requirements.md` REQ-COMP-019,
-THE SYSTEM SHALL admit the pending130/131 interval through the existing ordinary candidate-start lifecycle in REQ-LDD-023
-AND SHALL execute pre-handoff admission from the path/hash-bound retained helper
-AND SHALL bind and re-verify the complete staged registry, candidate binary/configuration and helper before disruption.
+WHEN ordinary local-HEAD or published-release native launchd deployment selects a candidate whose immutable complete migration registry strictly extends the live database's exact ordered ledger prefix as qualified by `specs/compatibility/requirements.md` REQ-COMP-019,
+THE SYSTEM SHALL execute pre-handoff admission from the path- and hash-bound retained helper
+AND SHALL bind and re-verify the complete source ledger, target registry, registry digest, candidate binary and configuration, and helper before disruption
+AND SHALL stop the target, prove exclusive database ownership, durably retain that evidence, and run the exact candidate's pending migrations before its first service launch.
 
-THE SYSTEM SHALL reject an unqualified source, missing or modified registry, future registry or mismatched migration name before disruption. Exact target131 with no pending migrations SHALL retain ordinary deployment behavior.
+THE SYSTEM SHALL reject a non-prefix source, a missing or modified registry, a mismatched migration version or name, or unavailable source evidence before disruption. A source already equal to the target registry SHALL retain ordinary deployment behavior without the forward-only migration protocol.
 
-Before candidate startup is attempted, unchanged-predecessor runtime-artifact rollback MAY apply. At or after that attempt, the helper SHALL retain the candidate, configuration, helper, registry, status and ownership fence and SHALL prohibit predecessor startup or snapshot replay, including after migration130 commits independently or candidate health fails. Missing or contradictory evidence SHALL NOT release ownership or authorize another deployment.
+Before the candidate migration invocation can advance the database, unchanged-predecessor runtime-artifact rollback MAY apply. At or after that invocation boundary, the helper SHALL retain the candidate, configuration, helper, registry, source and target ledgers, status, and ownership fence and SHALL prohibit predecessor startup or snapshot replay. Missing, malformed, or contradictory evidence SHALL NOT release ownership or authorize another deployment.
 
 WHEN the operator explicitly selects `prod resume-forward TXN`,
-THE SYSTEM SHALL require matching unresolved status and claim, exact retained helper/candidate/configuration/registry hashes, confirmed previous-helper absence and a stopped target
-AND SHALL admit only the exact complete source129, partial130 or target131 ledger from that registry
-AND SHALL start only the exact retained candidate, retaining the forward-only fence on another failure.
+THE SYSTEM SHALL require matching unresolved status and claim, exact retained helper, candidate, configuration, registry hashes, and source and target ledgers, confirmed previous-helper absence, and a stopped target
+AND SHALL admit only an observed ledger that is an exact target prefix containing the complete retained source
+AND SHALL start only the exact retained candidate, retaining all forward-only evidence and the stopped fence on another failure.
 
-The interval SHALL add no mandatory standalone backup, protected snapshot/rehearsal proof, downgrade guarantee or alternate recovery protocol. REQ-LDD-019–027 and the exact123-to-128 ordinary qualification SHALL retain their distinct evidence, pins and boundaries.
+The generic ordinary protocol SHALL add no mandatory standalone backup, protected snapshot or rehearsal proof, downgrade guarantee, or alternate recovery protocol. REQ-LDD-019–027 SHALL retain their distinct evidence, pins, and boundaries.
