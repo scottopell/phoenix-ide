@@ -179,6 +179,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [142](142_ordinary-skill-catalog-is-executor-turn-local.md) | Ordinary skill catalog advertisement is executor-turn-local | Accepted | REQ-SK-007, REQ-SK-008, REQ-SK-009 |
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
+| [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |

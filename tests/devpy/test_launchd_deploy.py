@@ -4458,6 +4458,7 @@ class PreparationTests(unittest.TestCase):
         for state in (
             "candidate_may_migrate",
             "ordinary_activation_failed_forward_only",
+            "committed",
         ):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
@@ -4474,6 +4475,11 @@ class PreparationTests(unittest.TestCase):
                             "state": state,
                             "source_kind": "local_head",
                             "finalization_pending": True,
+                            "recovery_mode": (
+                                "ordinary_forward_proven"
+                                if state == "committed"
+                                else None
+                            ),
                             "updated_at": datetime.datetime.now(
                                 datetime.timezone.utc
                             ).isoformat(),
@@ -4492,10 +4498,65 @@ class PreparationTests(unittest.TestCase):
                 rendered = " ".join(str(call) for call in output.call_args_list)
                 self.assertIn("UNRESOLVED:", rendered)
                 self.assertIn("no active claim owner", rendered)
-                self.assertIn("forward-only", rendered)
+                self.assertIn("ordinary forward-recovery status", rendered)
+                self.assertIn("do not start the predecessor", rendered)
                 self.assertIn("resume-forward tx", rendered)
                 self.assertNotIn("recover-paired", rendered)
                 self.assertNotIn("recover-current", rendered)
+
+    def test_markerless_shared_committed_checkpoint_uses_prepared_manifest_guidance(self):
+        cases = ("paired_database_upgrade", "current_schema_upgrade")
+        for mode in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                transaction = root / "transactions" / "tx"
+                transaction.mkdir(parents=True)
+                evidence = mode_evidence(transaction, mode)
+                manifest = make_manifest(root)
+                if mode == "paired_database_upgrade":
+                    manifest = dataclasses.replace(
+                        manifest,
+                        source_kind="prepared_artifact",
+                        release_tag=None,
+                        release_commit=None,
+                        paired_database_upgrade=helper.PairedDatabaseUpgrade(**evidence),
+                    )
+                else:
+                    manifest = dataclasses.replace(
+                        manifest,
+                        current_schema_upgrade=helper.CurrentSchemaUpgrade(**evidence),
+                    )
+                (transaction / "manifest.json").write_text(
+                    json.dumps(helper.dataclasses.asdict(manifest))
+                )
+                status = root / "status.json"
+                status.write_text(
+                    json.dumps(
+                        {
+                            "transaction_id": "tx",
+                            "state": "committed",
+                            "source_kind": manifest.source_kind,
+                            "finalization_pending": True,
+                            "updated_at": datetime.datetime.now(
+                                datetime.timezone.utc
+                            ).isoformat(),
+                        }
+                    )
+                )
+                with mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_DIR", root
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status
+                ), mock.patch.object(
+                    self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "active"
+                ), mock.patch("builtins.print") as output:
+                    self.dev._print_launchd_deploy_status()
+
+                rendered = " ".join(str(call) for call in output.call_args_list)
+                self.assertIn("prepared transaction status", rendered)
+                self.assertIn("do not redeploy", rendered)
+                self.assertNotIn("ordinary forward-recovery status", rendered)
+                self.assertNotIn("resume-forward", rendered)
 
     def test_markerless_forward_state_with_ordinary_manifest_warns_of_conflict(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4528,7 +4589,7 @@ class PreparationTests(unittest.TestCase):
                 self.dev._print_launchd_deploy_status()
 
         rendered = " ".join(str(call) for call in output.call_args_list)
-        self.assertIn("forward-only status conflicts", rendered)
+        self.assertIn("forward-recovery status conflicts", rendered)
         self.assertIn("do not redeploy", rendered)
         self.assertNotIn("resume-forward", rendered)
         self.assertNotIn("recover-", rendered)
@@ -5822,7 +5883,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                      mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_bytes(Path(helper.__file__).read_bytes())), \
                      mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
                      mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=preflight) as policy:
-                    with self.assertRaisesRegex(RuntimeError, "ordinary pending migration interval is not qualified"):
+                    with self.assertRaisesRegex(RuntimeError, "ordinary pending migration requires a verified installed predecessor"):
                         self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
 
                 policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
@@ -5842,49 +5903,68 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
                 self.assertNotIn(("status", "prepared"), events)
                 self.assertFalse(any(event[0] == "command" and event[1][0] == "launchctl" for event in events))
 
-    def test_ordinary_nonprepared_129_over_live128_retains_predecessor_and_rejects_before_stop(self):
+    def test_ordinary_candidate_over_live128_requires_exact_prefix_before_handoff(self):
         preflight = self.dev._preflight_ordinary_launchd_policy
         registry = ROOT / "crates/phoenix-db/src/migrations.rs"
         for release in (False, True):
-            with self.subTest(release=release), self.deployment(paired=False, release=release) as (staging, controller, events):
-                database = self.dev.PROD_DB_PATH
-                with sqlite3.connect(database) as connection:
-                    connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-                    connection.executemany("INSERT INTO _migrations VALUES (?, ?)", [
-                        item for item in helper.migration_registry(registry, qualified_current_target=False)
-                        if item[0] <= 128
-                    ])
-                before_database = database.read_bytes()
-                before_binary = (self.dev.LAUNCHD_INSTALL_DIR / "phoenix-ide").read_bytes()
-                before_plist = self.dev.LAUNCHD_PLIST_PATH.read_bytes()
-                env = {"PATH": "/test", "PHOENIX_DB_PATH": str(database)}
-                plist = plistlib.dumps({"EnvironmentVariables": env}).decode()
+            for exact_prefix in (True, False):
+                with self.subTest(release=release, exact_prefix=exact_prefix), self.deployment(paired=False, release=release) as (staging, controller, events):
+                    database = self.dev.PROD_DB_PATH
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                        connection.executemany("INSERT INTO _migrations VALUES (?, ?)", [
+                            item for item in helper.migration_registry(registry, qualified_current_target=False)
+                            if item[0] <= 128
+                        ])
+                        if not exact_prefix:
+                            connection.execute(
+                                "UPDATE _migrations SET name = ? WHERE version = 128",
+                                ("not_the_candidate_migration",),
+                            )
+                    before_database = database.read_bytes()
+                    before_binary = (self.dev.LAUNCHD_INSTALL_DIR / "phoenix-ide").read_bytes()
+                    before_plist = self.dev.LAUNCHD_PLIST_PATH.read_bytes()
+                    env = {"PATH": "/test", "PHOENIX_DB_PATH": str(database)}
+                    plist = plistlib.dumps({"EnvironmentVariables": env}).decode()
 
-                def materialize(_commit, source_path, destination, _kind):
-                    self.assertEqual(source_path, "crates/phoenix-db/src/migrations.rs")
-                    destination.write_bytes(registry.read_bytes())
+                    def materialize(_commit, source_path, destination, _kind):
+                        self.assertEqual(source_path, "crates/phoenix-db/src/migrations.rs")
+                        destination.write_bytes(registry.read_bytes())
 
-                with mock.patch.object(self.dev.sys, "platform", "darwin"), \
-                     mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(env, None)), \
-                     mock.patch.object(self.dev, "generate_launchd_plist", return_value=plist), \
-                     mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_bytes(Path(helper.__file__).read_bytes())), \
-                     mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
-                     mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=preflight) as policy:
-                    with self.assertRaisesRegex(RuntimeError, "ordinary pending migration interval is not qualified"):
-                        self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
-                policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
-                manifest = json.loads((staging / "manifest.json").read_text())
-                self.assertIsNone(manifest["paired_database_upgrade"])
-                self.assertNotIn("current_schema_upgrade", manifest)
-                self.assertIsNotNone(manifest["previous"])
-                self.assertEqual(manifest["ordinary_forward_migration"]["database_path"], str(database))
-                self.assertEqual(database.read_bytes(), before_database)
-                self.assertEqual((self.dev.LAUNCHD_INSTALL_DIR / "phoenix-ide").read_bytes(), before_binary)
-                self.assertEqual(self.dev.LAUNCHD_PLIST_PATH.read_bytes(), before_plist)
-                self.assertIn(("status", "precondition_failed"), events)
-                self.assertNotIn(("status", "prepared"), events)
-                self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
-                self.assertFalse(any(event[0] == "command" and event[1][0] == "launchctl" for event in events))
+                    with mock.patch.object(self.dev.sys, "platform", "darwin"), \
+                         mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(env, None)), \
+                         mock.patch.object(self.dev, "generate_launchd_plist", return_value=plist), \
+                         mock.patch.object(self.dev, "_materialize_helper", side_effect=lambda _commit, path, _kind: path.write_bytes(Path(helper.__file__).read_bytes())), \
+                         mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
+                         mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy", side_effect=preflight) as policy:
+                        if exact_prefix:
+                            self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "source migration history is not an exact candidate prefix"):
+                                self.dev.launchd_prod_deploy("v2.0.0" if release else None, controller=controller)
+                    policy.assert_called_once_with(staging / "manifest.json", staging / "activate.py")
+                    manifest = json.loads((staging / "manifest.json").read_text())
+                    self.assertIsNone(manifest["paired_database_upgrade"])
+                    self.assertNotIn("current_schema_upgrade", manifest)
+                    self.assertIsNotNone(manifest["previous"])
+                    self.assertEqual(manifest["ordinary_forward_migration"]["database_path"], str(database))
+                    self.assertEqual(database.read_bytes(), before_database)
+                    self.assertEqual((self.dev.LAUNCHD_INSTALL_DIR / "phoenix-ide").read_bytes(), before_binary)
+                    self.assertEqual(self.dev.LAUNCHD_PLIST_PATH.read_bytes(), before_plist)
+                    if exact_prefix:
+                        self.assertIn(("status", "prepared"), events)
+                        self.assertNotIn(("status", "precondition_failed"), events)
+                        self.assertTrue(any(
+                            event[0] == "command"
+                            and event[1][0] == "launchctl"
+                            and "bootstrap" in event[1]
+                            for event in events
+                        ))
+                    else:
+                        self.assertIn(("status", "precondition_failed"), events)
+                        self.assertNotIn(("status", "prepared"), events)
+                        self.assertFalse(any(event[0] == "command" and "bootstrap" in event[1] for event in events))
+                        self.assertFalse(any(event[0] == "command" and event[1][0] == "launchctl" for event in events))
 
     def test_fresh_database_path_switch_preserves_predecessor_rollback(self):
         for release in (False, True):
