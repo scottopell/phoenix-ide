@@ -2052,11 +2052,12 @@ class PreparationTests(unittest.TestCase):
             "--controller-backend",
             "launchd",
         ]
-        stderr = mock.Mock()
-        stderr.write = io.StringIO().write
+        stderr = io.StringIO()
+        stderr.reconfigure = mock.Mock()
         with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stderr", stderr):
             with self.assertRaisesRegex(SystemExit, "2"):
                 self.dev.main()
+        self.assertIn("not allowed with argument --backend", stderr.getvalue())
 
     def test_candidate_prod_build_uses_isolated_output_without_touching_default_worktree(self):
         with tempfile.TemporaryDirectory() as td:
