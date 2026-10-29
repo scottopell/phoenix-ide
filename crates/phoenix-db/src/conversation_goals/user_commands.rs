@@ -527,7 +527,7 @@ impl Database {
         .await
     }
 
-    pub(crate) async fn control_goal_command<F: FnOnce()>(
+    async fn control_goal_command<F: FnOnce()>(
         &self,
         input: &GoalUserCommand,
         expected_transcript: &str,
