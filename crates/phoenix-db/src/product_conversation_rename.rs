@@ -435,6 +435,80 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn historical_rename_receipt_survives_target_deletion_and_fences_reuse() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("deleted-target", "deleted-target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
+        command.product_conversation_id = root.product_conversation_id.clone();
+        command.expected_root_transcript_id = root.id.clone();
+        command.source.product_conversation_id = gc.product_conversation_id.clone();
+        command.source.transcript_id = gc.id.clone();
+        let ProductConversationRenameResult::Applied(receipt) = db
+            .rename_product_conversation(&gc.id, &command)
+            .await
+            .unwrap()
+        else {
+            panic!("expected applied rename");
+        };
+        db.delete_conversation(&root.id).await.unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations WHERE id=?1")
+                .bind(root.product_conversation_id.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            db.rename_product_conversation(&gc.id, &command)
+                .await
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(receipt.clone())
+        );
+        let replacement = db
+            .create_conversation("replacement", "replacement", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut changed = command.clone();
+        changed.product_conversation_id = replacement.product_conversation_id;
+        changed.expected_root_transcript_id = replacement.id;
+        assert!(matches!(
+            db.rename_product_conversation(&gc.id, &changed).await,
+            Ok(ProductConversationRenameResult::Conflict)
+        ));
+        changed = command.clone();
+        changed.title = NormalizedConversationTitle::parse("changed intent").unwrap();
+        assert!(matches!(
+            db.rename_product_conversation(&gc.id, &changed).await,
+            Ok(ProductConversationRenameResult::Conflict)
+        ));
+        changed = command.clone();
+        changed.source.product_conversation_id = command.product_conversation_id.clone();
+        assert!(matches!(
+            db.rename_product_conversation(&gc.id, &changed).await,
+            Ok(ProductConversationRenameResult::Conflict)
+        ));
+        assert_eq!(
+            db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
+                .await
+                .unwrap(),
+            Some(receipt)
+        );
+    }
+
     fn test_command(operation_id: String, revision: i64) -> ProductConversationRenameCommand {
         let owner: ProductConversationId = "pc_test".parse().unwrap();
         ProductConversationRenameCommand {

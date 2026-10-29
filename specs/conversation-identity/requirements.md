@@ -75,10 +75,10 @@ THE SYSTEM SHALL require the immutable product identity, canonical root transcri
 AND SHALL commit the shared title and allocated-slug update only if that exact naming baseline and existing lifecycle admission still hold.
 
 THE SYSTEM SHALL persist the normalized rename intent, trusted executing source-call identity, and resulting naming receipt under one operation identity in the same transaction as the naming update
-AND SHALL reconcile identical retries from that historical receipt without reapplying the rename, even after a later naming change
+AND SHALL reconcile identical retries from that historical receipt without reapplying the rename, even after a later naming change or permanent deletion of the target ProductConversation
 AND SHALL reject changed intent or source product/transcript owner reuse rather than silently choose another operation or target
 AND SHALL permit the same source product/transcript owner to retry with a new assistant-message/tool-use locator while retaining the first accepted source-call attribution
-AND SHALL distinguish a historical receipt from the current name, route, and lifecycle state.
+AND SHALL distinguish a historical receipt from the current name, route, and lifecycle state without implying that a deleted target still exists.
 
 THE SYSTEM SHALL retain the existing immutable identity and released-slug semantics without reserving former routes or granting lifecycle mutation authority.
 

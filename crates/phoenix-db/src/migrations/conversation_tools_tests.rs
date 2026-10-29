@@ -7,6 +7,7 @@ use crate::{Database, DbError, DbResult};
 
 const PROVENANCE: &str = include_str!("agent_creation_provenance.sql");
 const RECEIPTS: &str = include_str!("product_conversation_rename_receipts.sql");
+const RETAIN_RECEIPTS: &str = include_str!("retain_product_conversation_rename_receipts.sql");
 const FAULTS: &[&str] = &[
     "DROP TABLE product_creation_jobs;\n",
     "INSERT INTO product_creation_job_images (request_id, ordinal, media_type, data) SELECT request_id, ordinal, media_type, data FROM _phase1_images_before;\n",
@@ -252,6 +253,7 @@ fn registered_identity_order_and_exact_bodies() {
         (142, "slack_gateway_v1"),
         (143, "agent_creation_provenance"),
         (144, "product_conversation_rename_receipts"),
+        (146, "retain_product_conversation_rename_receipts"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -261,7 +263,7 @@ fn registered_identity_order_and_exact_bodies() {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, name);
     }
-    for (bytes, version) in [(PROVENANCE, 143), (RECEIPTS, 144)] {
+    for (bytes, version) in [(PROVENANCE, 143), (RECEIPTS, 144), (RETAIN_RECEIPTS, 146)] {
         let entries = MIGRATIONS
             .iter()
             .filter(|m| m.sql == bytes)
@@ -283,12 +285,94 @@ fn registered_identity_order_and_exact_bodies() {
 }
 
 #[tokio::test]
+async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomically() {
+    const SELECT_RECEIPT: &str = "SELECT operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros FROM product_conversation_rename_receipts";
+    type ReceiptRow = (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+    );
+    let pool = fixture(144, false).await;
+    let db = Database::from_pool_for_tests(pool.clone(), String::new());
+    let root = db
+        .create_conversation("retention-root", "retention-root", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let title = crate::NormalizedConversationTitle::parse("\0Historical title").unwrap();
+    sqlx::query("INSERT INTO product_conversation_rename_receipts (operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros) VALUES ('retained-operation', ?1, 7, ?3, 'source-product', 'source-transcript', 'source-message', 'source-call', ?2, 'historical-slug', 123456)")
+        .bind(root.product_conversation_id.as_str()).bind(&root.id).bind(title.as_str())
+        .execute(&pool).await.unwrap();
+    let before: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TRIGGER retention_ledger_fault BEFORE INSERT ON _migrations WHEN NEW.version=146 BEGIN SELECT RAISE(ABORT,'retention ledger fault'); END;").execute(&pool).await.unwrap();
+    let before_schema = snapshot(&mut pool.acquire().await.unwrap()).await;
+    let error = run_pending_migrations(&pool).await.unwrap_err();
+    assert!(
+        error.to_string().contains("retention ledger fault"),
+        "{error}"
+    );
+    assert_eq!(
+        snapshot(&mut pool.acquire().await.unwrap()).await,
+        before_schema
+    );
+    let after_rollback: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after_rollback);
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(foreign_keys, 1);
+    sqlx::raw_sql("DROP TRIGGER retention_ledger_fault")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(foreign_keys, 0);
+    let after: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    db.delete_conversation(&root.id).await.unwrap();
+    let historical: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, historical);
+    let mut conn = pool.acquire().await.unwrap();
+    clean(&mut conn).await;
+    drop(conn);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
     use crate::{ProductCreationAcceptOutcome, ProductCreationOrigin};
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -349,7 +433,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let pool = fixture(prefix, populated).await;
             run_through_for_test(&pool, 142).await.unwrap();
             let before = snapshot(&mut pool.acquire().await.unwrap()).await;
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             clean(&mut conn).await;
@@ -362,7 +446,8 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     .collect::<Vec<_>>(),
                 [
                     (143, "agent_creation_provenance"),
-                    (144, "product_conversation_rename_receipts")
+                    (144, "product_conversation_rename_receipts"),
+                    (146, "retain_product_conversation_rename_receipts")
                 ]
             );
             drop(conn);
@@ -402,7 +487,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
             .await
             .unwrap();
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         clean(&mut conn).await;
@@ -424,7 +509,7 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
 }
 
 #[tokio::test]
