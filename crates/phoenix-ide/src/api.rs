@@ -22,7 +22,7 @@ mod lifecycle_handlers;
 mod local_reveal;
 pub(crate) mod pr_monitoring;
 mod process_sample;
-mod product_conversations;
+pub(crate) mod product_conversations;
 mod release_updates;
 pub(crate) mod resource_monitor;
 mod share_svg_artifacts;

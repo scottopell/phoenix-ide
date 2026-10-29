@@ -4,11 +4,10 @@ use std::path::Path;
 
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_core::domain::product_conversation::ProductConversationId;
-use phoenix_core::llm_language::LlmLanguage;
 
 use crate::api::handlers::AppError;
 use crate::api::product_conversations::db_to_app;
-use crate::api::types::{ConflictErrorResponse, CreateProductConversationRequest};
+use crate::api::{ConflictErrorResponse, CreateProductConversationRequest};
 use crate::db::{
     DbError, NormalizedConversationTitle, ProductCreationAcceptOutcome, ProductCreationImage,
     ProductCreationIntent, ProductCreationJobRecord, ProductCreationOrigin,
@@ -222,8 +221,9 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use crate::platform::PlatformCapability;
+    use crate::tools::mcp::McpClientManager;
+    use phoenix_core::llm_language::LlmLanguage;
     use phoenix_llm::{LlmConfig, ModelRegistry};
-    use phoenix_mcp::McpClientManager;
     use std::sync::Arc;
 
     fn runtime(db: Database, registry: ModelRegistry) -> RuntimeManager {

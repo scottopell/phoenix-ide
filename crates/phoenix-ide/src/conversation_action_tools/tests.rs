@@ -138,7 +138,7 @@ async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) 
         crate::platform::PlatformCapability::None {
             details: "offline tools fixture".into(),
         },
-        Arc::new(phoenix_mcp::McpClientManager::new()),
+        Arc::new(crate::tools::mcp::McpClientManager::new()),
         None,
     ));
     (runtime, db, coordinator.id)

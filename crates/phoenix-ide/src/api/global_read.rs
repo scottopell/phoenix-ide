@@ -2442,6 +2442,9 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::CoordinatorWorkScope(_)
+        | DbError::ConversationTitleInvalid
+        | DbError::CurrentCoordinatorRequired
+        | DbError::ProductCreationIntentInvalid(_)
         | DbError::Serialization(_)
         | DbError::SubAgentLifecycleConflict(_)
         | DbError::ContinuationPrecondition(_)

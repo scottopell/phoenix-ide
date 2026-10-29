@@ -1070,6 +1070,9 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::CoordinatorWorkScope(_)
+        | crate::db::DbError::ConversationTitleInvalid
+        | crate::db::DbError::CurrentCoordinatorRequired
+        | crate::db::DbError::ProductCreationIntentInvalid(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::SubAgentLifecycleConflict(_)
         | crate::db::DbError::ContinuationPrecondition(_)
@@ -1123,6 +1126,9 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::TranscriptSnapshotChanged
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::CoordinatorWorkScope(_)
+        | crate::db::DbError::ConversationTitleInvalid
+        | crate::db::DbError::CurrentCoordinatorRequired
+        | crate::db::DbError::ProductCreationIntentInvalid(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::SubAgentLifecycleConflict(_)
         | crate::db::DbError::ContinuationPrecondition(_)

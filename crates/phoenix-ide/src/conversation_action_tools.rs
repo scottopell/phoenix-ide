@@ -8,7 +8,7 @@ use phoenix_tools::{Tool, ToolContext, ToolOutput};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
-use crate::api::types::CreateProductConversationRequest;
+use crate::api::CreateProductConversationRequest;
 use crate::conversation_actions::{
     accept_create, normalize_product_conversation_title, CreateSource,
 };

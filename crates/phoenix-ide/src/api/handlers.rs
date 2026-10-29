@@ -9940,6 +9940,23 @@ pub(crate) enum AppError {
     UnprocessableEntity(ExpansionErrorResponse),
 }
 
+impl std::fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message: &str = match self {
+            Self::BadRequest(message)
+            | Self::NotFound(message)
+            | Self::Forbidden(message)
+            | Self::Internal(message)
+            | Self::TypedBadRequest { message, .. }
+            | Self::TypedInternal { message, .. } => message,
+            Self::TranscriptSnapshotChanged => "transcript changed during opening observation read",
+            Self::Conflict(detail) => &detail.error,
+            Self::UnprocessableEntity(detail) => &detail.error,
+        };
+        formatter.write_str(message)
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
