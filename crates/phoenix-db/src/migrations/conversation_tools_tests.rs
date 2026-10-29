@@ -252,6 +252,7 @@ fn registered_identity_order_and_exact_bodies() {
         (142, "slack_gateway_v1"),
         (143, "agent_creation_provenance"),
         (144, "product_conversation_rename_receipts"),
+        (145, "coordinator_goal_preparations"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -261,7 +262,11 @@ fn registered_identity_order_and_exact_bodies() {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, name);
     }
-    for (bytes, version) in [(PROVENANCE, 143), (RECEIPTS, 144)] {
+    for (bytes, version) in [
+        (PROVENANCE, 143),
+        (RECEIPTS, 144),
+        (include_str!("../conversation_goals/prepared.sql"), 145),
+    ] {
         let entries = MIGRATIONS
             .iter()
             .filter(|m| m.sql == bytes)
@@ -288,7 +293,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -349,7 +354,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let pool = fixture(prefix, populated).await;
             run_through_for_test(&pool, 142).await.unwrap();
             let before = snapshot(&mut pool.acquire().await.unwrap()).await;
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             clean(&mut conn).await;
@@ -362,7 +367,8 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     .collect::<Vec<_>>(),
                 [
                     (143, "agent_creation_provenance"),
-                    (144, "product_conversation_rename_receipts")
+                    (144, "product_conversation_rename_receipts"),
+                    (145, "coordinator_goal_preparations")
                 ]
             );
             drop(conn);
@@ -402,7 +408,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
             .await
             .unwrap();
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         clean(&mut conn).await;
@@ -424,7 +430,7 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
 }
 
 #[tokio::test]
