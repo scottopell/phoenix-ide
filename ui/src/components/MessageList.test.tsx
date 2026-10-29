@@ -4165,7 +4165,7 @@ for (const stopType of ['touchend', 'touchcancel'] as const) {
       const receiptCount = () => reducer.mock.calls.filter(([, event]) => event.type === (stopType === 'touchend' ? 'touchEnded' : 'touchCancelled')).length;
       const count = receiptCount();
       const end = { type: stopType, isTrusted: true, target, touches: [], changedTouches: [touch] } as unknown as TouchEvent;
-      act(() => stopCallback({ ...end, changedTouches: [{ ...touch, identifier: 99 }] } as unknown as TouchEvent));
+      act(() => stopCallback({ ...end, touches: [touch], changedTouches: [{ ...touch, identifier: 99 }] } as unknown as TouchEvent));
       act(() => stopCallback({ ...end, isTrusted: false } as unknown as TouchEvent));
       expect(receiptCount()).toBe(count);
       act(() => { stopCallback(end); stopCallback(end); });
