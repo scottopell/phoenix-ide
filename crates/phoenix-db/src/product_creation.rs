@@ -2380,6 +2380,8 @@ impl Database {
 #[cfg(test)]
 mod product_creation_tests {
     use super::*;
+    use phoenix_core::domain::db_schema::{Message, MessageContent, UserContent};
+    use phoenix_core::domain::sm_state::ConvState;
     use phoenix_core::llm_language::LlmLanguage;
 
     async fn advance_to_metadata(db: &Database, request_id: &str, claim: &ProductCreationClaim) {
@@ -2624,10 +2626,8 @@ mod product_creation_tests {
                 .await
                 .unwrap();
         }
-        let content = phoenix_core::domain::MessageContent::User(
-            phoenix_core::domain::UserContent::new(delivery.job.intent.objective.clone()),
-        );
-        let initial_message = phoenix_core::domain::Message {
+        let content = MessageContent::User(UserContent::new(delivery.job.intent.objective.clone()));
+        let initial_message = Message {
             message_id: request_id.clone(),
             conversation_id: conversation_id.clone(),
             sequence_id: 1,
@@ -2641,7 +2641,7 @@ mod product_creation_tests {
         db.commit_steering_drain(
             &conversation_id,
             &[initial_message],
-            &crate::domain::ConvState::LlmRequesting { attempt: 0 },
+            &ConvState::LlmRequesting { attempt: 0 },
             Utc::now(),
         )
         .await
@@ -2660,7 +2660,7 @@ mod product_creation_tests {
         let (db, request, conversation) = initial_execution_fixture(true).await;
         for (state, expected) in [
             (
-                crate::domain::ConvState::AwaitingUserResponse {
+                ConvState::AwaitingUserResponse {
                     questions: Vec::new(),
                     tool_use_id: "initial-question".into(),
                     request_authority:
@@ -2669,7 +2669,7 @@ mod product_creation_tests {
                 ProductCreationInitialExecution::AwaitingUserResponse,
             ),
             (
-                crate::domain::ConvState::AwaitingTaskApproval {
+                ConvState::AwaitingTaskApproval {
                     task_file: "tasks/test.md".into(),
                     title: "test".into(),
                     priority: phoenix_core::task_source::Priority::P2,
@@ -2688,7 +2688,7 @@ mod product_creation_tests {
                 expected
             );
         }
-        db.update_conversation_state(&conversation, &crate::domain::ConvState::Idle)
+        db.update_conversation_state(&conversation, &ConvState::Idle)
             .await
             .unwrap();
         assert_eq!(
@@ -2697,15 +2697,12 @@ mod product_creation_tests {
                 .unwrap(),
             ProductCreationInitialExecution::Completed
         );
+        db.update_conversation_state(&conversation, &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .unwrap();
         db.update_conversation_state(
             &conversation,
-            &crate::domain::ConvState::LlmRequesting { attempt: 0 },
-        )
-        .await
-        .unwrap();
-        db.update_conversation_state(
-            &conversation,
-            &crate::domain::ConvState::Error {
+            &ConvState::Error {
                 message: "unrelated later turn".into(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
                 resets_at: None,
@@ -2726,7 +2723,7 @@ mod product_creation_tests {
         let (db, request, conversation) = initial_execution_fixture(true).await;
         db.update_conversation_state(
             &conversation,
-            &crate::domain::ConvState::Error {
+            &ConvState::Error {
                 message: "initial failure".into(),
                 error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
                 resets_at: None,
@@ -2748,13 +2745,10 @@ mod product_creation_tests {
                 .unwrap(),
             ProductCreationInitialExecution::Failed
         );
-        db.update_conversation_state(
-            &conversation,
-            &crate::domain::ConvState::LlmRequesting { attempt: 0 },
-        )
-        .await
-        .unwrap();
-        db.update_conversation_state(&conversation, &crate::domain::ConvState::Idle)
+        db.update_conversation_state(&conversation, &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .unwrap();
+        db.update_conversation_state(&conversation, &ConvState::Idle)
             .await
             .unwrap();
         assert_eq!(
@@ -2768,7 +2762,7 @@ mod product_creation_tests {
     #[tokio::test]
     async fn initial_objective_without_retained_terminal_evidence_is_unavailable_not_success() {
         let (db, request, conversation) = initial_execution_fixture(false).await;
-        db.update_conversation_state(&conversation, &crate::domain::ConvState::Idle)
+        db.update_conversation_state(&conversation, &ConvState::Idle)
             .await
             .unwrap();
         assert_eq!(
