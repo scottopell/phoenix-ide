@@ -80,6 +80,7 @@ fn rename_decoder_requires_cas_and_rejects_retargeting_extra_fields() {
 #[test]
 fn rename_detail_uses_shared_encoded_canonical_route_with_stable_id_fallback() {
     let mut detail = crate::db::ProductConversationRenameDetail {
+        can_rename: true,
         product_conversation_id: "pc_test".parse().unwrap(),
         root_transcript_id: "root".into(),
         name_revision: 7,
@@ -92,6 +93,15 @@ fn rename_detail_uses_shared_encoded_canonical_route_with_stable_id_fallback() {
         "/c/%E6%9D%B1%E4%BA%AC%20%2F%20name"
     );
     assert_eq!(response["detail"]["name_revision"], 7);
+    assert_eq!(
+        response["allowed_actions"],
+        json!(["detail", "read", "rename"])
+    );
+    detail.can_rename = false;
+    assert_eq!(
+        rename_detail_response(&detail)["allowed_actions"],
+        json!(["detail", "read"])
+    );
     detail.slug = None;
     assert_eq!(
         rename_detail_response(&detail)["canonical_route"],
@@ -279,4 +289,92 @@ async fn native_registered_create_freezes_literal_intent_and_reconciles_same_req
         )
         .await;
     assert!(matches!(denied, ToolOutput::Error { .. }));
+}
+
+#[tokio::test]
+async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_directory() {
+    let (runtime, db, gc) = native_runtime().await;
+    let tool = CreateConversation(runtime.clone());
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("not-a-directory");
+    std::fs::write(&file, "fixture").unwrap();
+    for path in [temp.path().join("missing"), file] {
+        let output = tool
+            .run(json!({"op":"options", "cwd":path}), native_context(&gc))
+            .await;
+        assert!(
+            matches!(output, ToolOutput::Error { .. }),
+            "{}",
+            output.output()
+        );
+    }
+    let options = tool
+        .run(
+            json!({"op":"options", "cwd":temp.path()}),
+            native_context(&gc),
+        )
+        .await;
+    let options: Value = serde_json::from_str(options.output()).unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let accepted = tool
+        .run(
+            json!({"op":"create", "request_id":request_id,
+        "cwd":options["cwd"], "objective":"offline acceptance", "start":"submit_objective",
+        "model":"gpt-5.6-sol"}),
+            native_context(&gc),
+        )
+        .await;
+    assert!(
+        !matches!(accepted, ToolOutput::Error { .. }),
+        "{}",
+        accepted.output()
+    );
+    let read = tool
+        .run(
+            json!({"op":"read", "request_id":request_id}),
+            native_context(&gc),
+        )
+        .await;
+    let read: Value = serde_json::from_str(read.output()).unwrap();
+    assert_eq!(read["allowed_actions"], json!(["read"]));
+    assert_eq!(read["initial_objective_execution"], "unavailable");
+    assert!(read["execution_interpretation"]
+        .as_str()
+        .unwrap()
+        .contains("not objective completed"));
+    assert_eq!(
+        db.get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "accepted"
+    );
+}
+
+#[tokio::test]
+async fn native_archived_detail_does_not_advertise_rename() {
+    let (runtime, db, gc) = native_runtime().await;
+    let root = db
+        .create_conversation("archive-detail", "archive-detail", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let tool = RenameConversation(runtime);
+    let input = json!({"op":"detail", "reference":root.product_conversation_id});
+    let open = tool.run(input.clone(), native_context(&gc)).await;
+    let open: Value = serde_json::from_str(open.output()).unwrap();
+    assert_eq!(open["allowed_actions"], json!(["detail", "read", "rename"]));
+    sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1")
+        .bind(root.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?1")
+        .bind(&root.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let closed = tool.run(input, native_context(&gc)).await;
+    let closed: Value = serde_json::from_str(closed.output()).unwrap();
+    assert_eq!(closed["allowed_actions"], json!(["detail", "read"]));
 }

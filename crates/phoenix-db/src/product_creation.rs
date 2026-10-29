@@ -6,6 +6,9 @@ pub use phoenix_core::domain::product_creation::ProductCreationProvisioningStage
 use phoenix_core::llm_language::LlmLanguage;
 use sqlx::SqliteConnection;
 
+mod initial_execution;
+pub use initial_execution::ProductCreationInitialExecution;
+
 const PRODUCT_CREATION_MAX_ATTEMPTS: i64 = 4;
 const PRODUCT_CREATION_RETRY_DELAYS_SECONDS: [i64; 3] = [2, 10, 30];
 const PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS: i64 = 4;
@@ -2586,6 +2589,200 @@ mod product_creation_tests {
                 .unwrap()
                 .unwrap(),
         }
+    }
+
+    async fn initial_execution_fixture(watched: bool) -> (Database, String, String) {
+        let db = Database::open_in_memory().await.unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let delivery = staged_delivery(&db, &request_id).await;
+        let conversation_id = delivery.job.published_conversation_id.clone().unwrap();
+        let fingerprint = format!("product-create:{request_id}");
+        db.append_product_creation_steering_entry(
+            &delivery,
+            &delivery_entry(&delivery),
+            &fingerprint,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .complete_product_creation_delivery(
+                &request_id,
+                &delivery.claim,
+                &SteeringAcceptanceFingerprint::Exact(fingerprint),
+                &delivery.job.intent
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.product_creation_initial_execution(&request_id)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Queued
+        );
+        if watched {
+            db.watch_product_conversation(&delivery.job.product_conversation_id)
+                .await
+                .unwrap();
+        }
+        let content = phoenix_core::domain::MessageContent::User(
+            phoenix_core::domain::UserContent::new(delivery.job.intent.objective.clone()),
+        );
+        let initial_message = phoenix_core::domain::Message {
+            message_id: request_id.clone(),
+            conversation_id: conversation_id.clone(),
+            sequence_id: 1,
+            origin: delivery.job.intent.origin.input_origin(),
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        db.commit_steering_drain(
+            &conversation_id,
+            &[initial_message],
+            &crate::domain::ConvState::LlmRequesting { attempt: 0 },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(&request_id)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Running
+        );
+        (db, request_id, conversation_id)
+    }
+
+    #[tokio::test]
+    async fn initial_objective_status_distinguishes_publication_live_waits_and_completion() {
+        let (db, request, conversation) = initial_execution_fixture(true).await;
+        for (state, expected) in [
+            (
+                crate::domain::ConvState::AwaitingUserResponse {
+                    questions: Vec::new(),
+                    tool_use_id: "initial-question".into(),
+                    request_authority:
+                        phoenix_core::domain::sm_state::QuestionRequestAuthority::new(),
+                },
+                ProductCreationInitialExecution::AwaitingUserResponse,
+            ),
+            (
+                crate::domain::ConvState::AwaitingTaskApproval {
+                    task_file: "tasks/test.md".into(),
+                    title: "test".into(),
+                    priority: phoenix_core::task_source::Priority::P2,
+                    plan: "test".into(),
+                },
+                ProductCreationInitialExecution::AwaitingTaskApproval,
+            ),
+        ] {
+            db.update_conversation_state(&conversation, &state)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.product_creation_initial_execution(&request)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        db.update_conversation_state(&conversation, &crate::domain::ConvState::Idle)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Completed
+        );
+        db.update_conversation_state(
+            &conversation,
+            &crate::domain::ConvState::LlmRequesting { attempt: 0 },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            &conversation,
+            &crate::domain::ConvState::Error {
+                message: "unrelated later turn".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                resets_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_objective_failure_is_not_creation_failure_or_later_turn_success() {
+        let (db, request, conversation) = initial_execution_fixture(true).await;
+        db.update_conversation_state(
+            &conversation,
+            &crate::domain::ConvState::Error {
+                message: "initial failure".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                resets_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_product_creation_job(&request)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "published"
+        );
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Failed
+        );
+        db.update_conversation_state(
+            &conversation,
+            &crate::domain::ConvState::LlmRequesting { attempt: 0 },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(&conversation, &crate::domain::ConvState::Idle)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_objective_without_retained_terminal_evidence_is_unavailable_not_success() {
+        let (db, request, conversation) = initial_execution_fixture(false).await;
+        db.update_conversation_state(&conversation, &crate::domain::ConvState::Idle)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Unavailable
+        );
+        assert_eq!(
+            db.product_creation_initial_execution("unknown-request")
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Unavailable
+        );
     }
 
     fn delivery_entry(

@@ -66,6 +66,7 @@ pub enum ProductConversationRenameResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductConversationRenameDetail {
+    pub can_rename: bool,
     pub product_conversation_id: ProductConversationId,
     pub root_transcript_id: String,
     pub name_revision: i64,
@@ -84,10 +85,11 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         require_current_gc_tx(&mut tx, transcript_id).await?;
         let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, reference).await?;
-        let row = sqlx::query("SELECT id, title, slug, name_revision FROM conversations root WHERE product_conversation_id = ?1 AND runtime_role = 'user' AND user_initiated = 1 AND parent_conversation_id IS NULL AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id) ORDER BY id LIMIT 1")
+        let row = sqlx::query("SELECT id, title, slug, name_revision, (archived = 0 AND name_revision < 9223372036854775807 AND EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = root.product_conversation_id AND p.ordinary_lifecycle = 'open') AND NOT EXISTS (SELECT 1 FROM close_obligations o WHERE o.product_conversation_id = root.product_conversation_id AND (o.phase <> 'completed' OR o.close_outcome = 'close_incomplete'))) AS can_rename FROM conversations root WHERE product_conversation_id = ?1 AND runtime_role = 'user' AND user_initiated = 1 AND parent_conversation_id IS NULL AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id) ORDER BY id LIMIT 1")
             .bind(resolved.product_conversation_id.as_str()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| DbError::ConversationNotFound(reference.to_string()))?;
         let detail = ProductConversationRenameDetail {
+            can_rename: row.try_get("can_rename")?,
             product_conversation_id: resolved.product_conversation_id,
             root_transcript_id: row.try_get("id")?,
             name_revision: row.try_get("name_revision")?,

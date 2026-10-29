@@ -79,15 +79,18 @@ fn resolve_intent(
     req: &CreateProductConversationRequest,
     source: &CreateSource,
     resolution: ProductCreationResolution<'_>,
+    cwd_preparation: &CreationCwdPreparation,
 ) -> Result<ProductCreationIntent, DbError> {
     let origin = source.origin();
     if let ProductCreationResolution::Existing(existing) = resolution {
-        let cwd = if matches!(source, CreateSource::UserApi) && req.cwd != existing.intent.cwd {
-            crate::conversation_cwd::normalize_product_creation_cwd_intent(
-                &req.cwd,
-                runtime.runtime_home(),
-            )
-            .map_err(|error| invalid(error.to_string()))?
+        let cwd = if req.cwd == existing.intent.cwd {
+            req.cwd.clone()
+        } else if matches!(source, CreateSource::UserApi) {
+            cwd_preparation
+                .replay
+                .as_ref()
+                .map_err(|error| invalid(error.clone()))?
+                .clone()
         } else {
             req.cwd.clone()
         };
@@ -140,16 +143,11 @@ fn resolve_intent(
             "cwd must be an exact normalized absolute path; use options first",
         ));
     }
-    let cwd = if internal {
-        crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
-            .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
-    } else {
-        crate::conversation_cwd::normalize_product_creation_cwd_intent(
-            &req.cwd,
-            runtime.runtime_home(),
-        )
-    }
-    .map_err(|error| invalid(error.to_string()))?;
+    let cwd = cwd_preparation
+        .new
+        .as_ref()
+        .map_err(|error| invalid(error.clone()))?
+        .clone();
     if internal && cwd != req.cwd {
         return Err(invalid(format!(
             "cwd must be the exact normalized path {cwd:?}; use options first"
@@ -183,22 +181,82 @@ fn resolve_intent(
     })
 }
 
+struct CreationCwdPreparation {
+    new: Result<String, String>,
+    replay: Result<String, String>,
+}
+
+fn validate_new_creation_cwd(cwd: &str, home: &Path, internal: bool) -> Result<String, String> {
+    if internal {
+        crate::conversation_cwd::validate_conversation_cwd(cwd)
+            .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
+    } else {
+        crate::conversation_cwd::normalize_product_creation_cwd_intent(cwd, home)
+    }
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn accept_create(
     runtime: &RuntimeManager,
     req: CreateProductConversationRequest,
     source: CreateSource,
 ) -> Result<CreateAccepted, AppError> {
+    accept_create_with_cwd_validator(runtime, req, source, validate_new_creation_cwd).await
+}
+
+async fn accept_create_with_cwd_validator<F>(
+    runtime: &RuntimeManager,
+    req: CreateProductConversationRequest,
+    source: CreateSource,
+    validator: F,
+) -> Result<CreateAccepted, AppError>
+where
+    F: FnOnce(&str, &Path, bool) -> Result<String, String> + Send + 'static,
+{
     let _authority = runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_owned())
     })?;
     uuid::Uuid::parse_str(&req.request_id)
         .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_owned()))?;
+    let existing = runtime
+        .db()
+        .get_product_creation_job(&req.request_id)
+        .await
+        .map_err(db_to_app)?;
+    let internal = matches!(&source, CreateSource::CurrentCoordinator { .. });
+    let cwd_preparation = if existing
+        .as_ref()
+        .is_some_and(|job| internal || job.intent.cwd == req.cwd)
+    {
+        CreationCwdPreparation {
+            new: Err("creation receipt disappeared during acceptance".into()),
+            replay: Ok(req.cwd.clone()),
+        }
+    } else {
+        let cwd = req.cwd.clone();
+        let home = runtime.runtime_home().to_path_buf();
+        let prepared = tokio::task::spawn_blocking(move || validator(&cwd, &home, internal))
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "creation directory validation task failed: {error}"
+                ))
+            })?;
+        CreationCwdPreparation {
+            new: prepared.clone(),
+            replay: if internal {
+                Ok(req.cwd.clone())
+            } else {
+                prepared
+            },
+        }
+    };
     let outcome = runtime
         .db()
         .accept_product_creation_resolved(
             &req.request_id,
             source.coordinator_transcript_id(),
-            |resolution| resolve_intent(runtime, &req, &source, resolution),
+            |resolution| resolve_intent(runtime, &req, &source, resolution, &cwd_preparation),
         )
         .await
         .map_err(db_to_app)?;
@@ -264,6 +322,25 @@ mod tests {
         }
     }
 
+    fn resolve_test_intent(
+        runtime: &RuntimeManager,
+        req: &CreateProductConversationRequest,
+        source: &CreateSource,
+        resolution: ProductCreationResolution<'_>,
+    ) -> Result<ProductCreationIntent, DbError> {
+        let internal = matches!(source, CreateSource::CurrentCoordinator { .. });
+        let prepared = validate_new_creation_cwd(&req.cwd, runtime.runtime_home(), internal);
+        let preparation = CreationCwdPreparation {
+            new: prepared.clone(),
+            replay: if internal {
+                Ok(req.cwd.clone())
+            } else {
+                prepared
+            },
+        };
+        resolve_intent(runtime, req, source, resolution, &preparation)
+    }
+
     #[tokio::test]
     async fn internal_new_intent_freezes_defaults_but_keeps_omitted_effort_native() {
         let dir = tempfile::tempdir().unwrap();
@@ -280,7 +357,7 @@ mod tests {
             .effective_effort("gpt-5.6-sol", None)
             .level()
             .is_some());
-        let intent = resolve_intent(
+        let intent = resolve_test_intent(
             &manager,
             &req,
             &coordinator_source("first"),
@@ -300,7 +377,7 @@ mod tests {
             {"media_type": "image/png", "data": "bytes"}
         ]))
         .unwrap();
-        assert!(resolve_intent(
+        assert!(resolve_test_intent(
             &manager,
             &req,
             &coordinator_source("first"),
@@ -325,7 +402,7 @@ mod tests {
         let mut req = request(missing.to_str().unwrap());
         req.model = Some("gpt-5.6-sol".into());
         assert!(matches!(
-            resolve_intent(
+            resolve_test_intent(
                 &manager,
                 &req,
                 &coordinator_source("first"),
@@ -336,7 +413,7 @@ mod tests {
             Err(DbError::ProductCreationIntentInvalid(_))
         ));
         assert!(!missing.exists());
-        let api_intent = resolve_intent(
+        let api_intent = resolve_test_intent(
             &manager,
             &req,
             &CreateSource::UserApi,
@@ -392,7 +469,7 @@ mod tests {
                 tool_use_id: "retry-call".into(),
             },
         };
-        let resolved = resolve_intent(
+        let resolved = resolve_test_intent(
             &manager,
             &req,
             &retry,
@@ -406,7 +483,7 @@ mod tests {
             .accept_product_creation_resolved(
                 &req.request_id,
                 Some(&coordinator.id),
-                |resolution| resolve_intent(&manager, &req, &retry, resolution),
+                |resolution| resolve_test_intent(&manager, &req, &retry, resolution),
             )
             .await
             .unwrap();
@@ -423,7 +500,7 @@ mod tests {
             db.accept_product_creation_resolved(
                 &req.request_id,
                 Some(&coordinator.id),
-                |resolution| resolve_intent(&manager, &req, &retry, resolution)
+                |resolution| resolve_test_intent(&manager, &req, &retry, resolution)
             )
             .await
             .unwrap(),
@@ -462,7 +539,7 @@ mod tests {
             .unwrap();
         let outcome = db
             .accept_product_creation_resolved(&req.request_id, None, |resolution| {
-                resolve_intent(&manager, &req, &CreateSource::UserApi, resolution)
+                resolve_test_intent(&manager, &req, &CreateSource::UserApi, resolution)
             })
             .await
             .unwrap();
@@ -470,6 +547,47 @@ mod tests {
             panic!("same HTTP cwd spelling must replay the normalized winner");
         };
         assert_eq!(job.intent, frozen);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_creation_cwd_validation_does_not_hold_sqlite_writer() {
+        let db = Database::open_in_memory().await.unwrap();
+        let manager = Arc::new(runtime(db.clone(), ModelRegistry::new_empty()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let acceptance = tokio::spawn(async move {
+            accept_create_with_cwd_validator(
+                &manager,
+                request("/blocked-filesystem"),
+                CreateSource::UserApi,
+                move |_, _, _| {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("test must release blocked filesystem validator");
+                    Err("deliberately invalid test directory".into())
+                },
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+        let write = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.set_default_llm_language(LlmLanguage::Caveman),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        write
+            .expect("independent settings write must finish before filesystem validation resumes")
+            .unwrap();
+        assert!(matches!(
+            acceptance.await.unwrap(),
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::Caveman
+        );
     }
 
     #[tokio::test]

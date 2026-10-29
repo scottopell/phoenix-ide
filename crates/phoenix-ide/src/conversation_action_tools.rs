@@ -5,7 +5,7 @@ use phoenix_core::domain::llm_types::ModelEffort;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::llm_language::LlmLanguage;
 use phoenix_tools::{Tool, ToolContext, ToolOutput};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::CreateProductConversationRequest;
@@ -164,7 +164,8 @@ fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -
         detail.slug.as_deref(),
         detail.product_conversation_id.as_str(),
     );
-    json!({"status":"detail", "canonical_route":route, "detail":detail})
+    json!({"status":"detail", "canonical_route":route, "detail":detail,
+        "allowed_actions": if detail.can_rename { vec!["detail", "read", "rename"] } else { vec!["detail", "read"] }})
 }
 
 impl RenameConversation {
@@ -267,6 +268,82 @@ impl Tool for CreateConversation {
     }
 }
 
+fn validated_creation_directory(cwd: &str, home: &std::path::Path) -> Result<String, String> {
+    let cwd = cwd.trim();
+    let path = if cwd == "~" {
+        home.to_path_buf()
+    } else if let Some(relative) = cwd.strip_prefix("~/") {
+        home.join(relative)
+    } else {
+        std::path::PathBuf::from(cwd)
+    };
+    if cwd.is_empty() || !path.is_dir() {
+        return Err("cwd must name an existing directory, not a file".into());
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    crate::conversation_cwd::validate_conversation_cwd(&canonical.to_string_lossy())
+        .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Serialize)]
+struct NativeCreationPublication {
+    conversation_id: String,
+    canonical_route: String,
+}
+
+#[derive(Serialize)]
+struct NativeCreationStatus {
+    request_id: String,
+    product_conversation_id: ProductConversationId,
+    status: String,
+    provisioning_stage: phoenix_db::ProductCreationProvisioningStage,
+    provisioning_stage_updated_at: chrono::DateTime<chrono::Utc>,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+    publication: Option<NativeCreationPublication>,
+    initial_objective_execution: phoenix_db::ProductCreationInitialExecution,
+    execution_interpretation: &'static str,
+    allowed_actions: [&'static str; 1],
+}
+
+async fn native_creation_status(
+    runtime: &RuntimeManager,
+    job: phoenix_db::ProductCreationJobRecord,
+) -> Result<NativeCreationStatus, String> {
+    let initial_objective_execution = runtime
+        .db()
+        .product_creation_initial_execution(&job.request_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let publication = if let Some(conversation_id) = job.published_conversation_id {
+        let aggregate = runtime
+            .db()
+            .get_ordinary_product_conversation(&job.product_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Some(NativeCreationPublication {
+            conversation_id,
+            canonical_route: crate::api::product_conversations::canonical_route(&aggregate),
+        })
+    } else {
+        None
+    };
+    Ok(NativeCreationStatus {
+        request_id: job.request_id,
+        product_conversation_id: job.product_conversation_id,
+        status: job.status,
+        provisioning_stage: job.provisioning_stage,
+        provisioning_stage_updated_at: job.stage_updated_at,
+        retry_at: job.retry_at.or(job.delivery_retry_at),
+        error: job.last_error,
+        publication,
+        initial_objective_execution,
+        execution_interpretation: "Publication means initial input accepted, not objective completed. Unavailable means no attributable outcome is retained; never infer success from later turns.",
+        allowed_actions: ["read"],
+    })
+}
+
 impl CreateConversation {
     #[allow(clippy::too_many_lines)]
     async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
@@ -278,15 +355,17 @@ impl CreateConversation {
         let request: CreateRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
         match request {
             CreateRequest::Options { cwd } => {
-                let cwd = cwd
-                    .map(|cwd| {
-                        crate::conversation_cwd::normalize_product_creation_cwd_intent(
-                            &cwd,
-                            self.0.runtime_home(),
-                        )
-                    })
-                    .transpose()
-                    .map_err(|e| e.to_string())?;
+                let cwd = match cwd {
+                    Some(cwd) => Some({
+                        let home = self.0.runtime_home().to_path_buf();
+                        tokio::task::spawn_blocking(move || {
+                            validated_creation_directory(&cwd, &home)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())??
+                    }),
+                    None => None,
+                };
                 let mut projects = self
                     .0
                     .db()
@@ -316,32 +395,8 @@ impl CreateConversation {
                 let Some(job) = job else {
                     return Ok(json!({"status":"unknown", "request_id":request_id.0}));
                 };
-                let route = if job.status == "published" {
-                    let aggregate = self
-                        .0
-                        .db()
-                        .get_ordinary_product_conversation(&job.product_conversation_id)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Some(crate::api::product_conversations::canonical_route(
-                        &aggregate,
-                    ))
-                } else {
-                    None
-                };
-                let delivery_retryable = self
-                    .0
-                    .db()
-                    .product_creation_delivery_retryable(&job.request_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let status = crate::api::handlers::product_creation_status_response(
-                    job,
-                    delivery_retryable,
-                    route,
-                )
-                .map_err(|e| e.to_string())?;
-                serde_json::to_value(status).map_err(|e| e.to_string())
+                serde_json::to_value(native_creation_status(&self.0, job).await?)
+                    .map_err(|error| error.to_string())
             }
             CreateRequest::Create {
                 request_id,
