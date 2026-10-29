@@ -178,7 +178,18 @@ THE SYSTEM SHALL additionally provide explicit subscription management only to t
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
-AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, dedicated conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other dedicated lifecycle mutation tools to the Coordinator
+AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation and naming capabilities defined below to the Coordinator
+
+WHILE the persisted singleton Global Coordinator is the executing current transcript
+THE SYSTEM MAY provide dedicated conversation creation and naming tools through the same application actions used by public conversation operations
+AND SHALL recheck current Coordinator authority at the committing persistence boundary, including operation reconciliation reads
+AND SHALL NOT grant these tools to ordinary conversations, predecessor transcripts, sub-agents, or restricted planning conversations
+AND SHALL preserve durable request identity, exact immutable target identity, source tool-call provenance, and operation-specific replay semantics
+AND SHALL expose creation acceptance and historical naming receipts without claiming runtime completion or current naming state
+AND SHALL NOT thereby grant continuation, structured-answer, review, task approval, or other lifecycle mutation authority
+
+THE creation capability SHALL follow `../conversation-creation/requirements.md` REQ-CCR-013
+AND THE naming capability SHALL follow `../conversation-identity/requirements.md` REQ-CID-007
 
 ---
 

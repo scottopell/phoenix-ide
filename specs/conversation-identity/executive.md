@@ -6,6 +6,8 @@ The single-name implementation is delivered as source in [PR #951](https://githu
 
 ## Implementation
 
+The Coordinator-only rename adapter (REQ-CID-007, ADR-191) requires immutable product/root identity and the shared naming revision, then stores its historical receipt atomically with the title/slug update. Integrated qualification is pending; authored CAS, ABA, replay-after-later-rename, and revoked-Coordinator tests are not yet an integrated pass.
+
 The root transcript `title` is the sole name authority. Migration 129 folds effective root names into it, drops persisted `chain_name`, releases migrating root slugs before deterministic reallocation, and retains messages and identities. The shared allocator checks transcript slugs and actual/reserved transcript/product identities. Rename, low-level creation, legacy shell metadata, approved-task handoff, product publication and fork insertion use that allocator within their write transactions. Generated naming captures an immutable target and name baseline. Creation claims and ordinary History/Close admission remain authoritative.
 
 `canonical_route`, list/snapshot/status responses and ordinary Global navigation publish encoded readable routes. Product UUIDs remain API/cache identity. Exact evidence links use permanent identity plus explicit transcript/message selection. ProductConversation title mutation and name regeneration are the supported naming operations. Chain snapshot/read and Q&A compatibility surfaces remain; no legacy chain-name mutation route is supported. UI naming uses authoritative presentation; delayed rename completion preserves the live route, transcript pin, search and anchor.

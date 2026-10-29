@@ -368,3 +368,22 @@ AND SHALL retain claim-fenced reconciliation and sequential advancement when wor
 AND SHALL NOT infer additional completed phases from repository state, error text, or elapsed time
 
 This forward transformation grants no downgrade, mixed-version writer, or live database replacement guarantee beyond [the compatibility requirements](../compatibility/requirements.md).
+
+### REQ-CCR-013: Coordinator Creation Preserves Intent and Provenance
+
+WHEN the current Global Coordinator requests an ordinary conversation through its dedicated creation capability
+THE SYSTEM SHALL use the shared durable creation acceptance and reconciliation path with one canonical request identity and an explicit submit-objective start intent
+AND SHALL accept only nonblank objective text, an existing absolute directory, and validated supported model, effort, and language choices
+AND SHALL NOT accept attachments, caller-authored origin metadata, filesystem references, or skill expansion as part of this capability.
+
+THE SYSTEM SHALL persist the executing product, transcript, assistant message, and tool-use identities as internal-conversation provenance
+AND SHALL deliver Coordinator objective text literally as agent-authored input rather than user-authored input
+AND SHALL retain the first accepted provenance on an identical retry while allowing a fresh source-call locator from the same authorized source
+AND SHALL reject reuse of a request identity for a different intent rather than reserve another conversation.
+
+WHEN the Coordinator reconciles an uncertain creation result
+THE SYSTEM SHALL return the original durable request and product identities and observed creation status
+AND SHALL distinguish acceptance from publication, objective delivery, runtime execution, and completion
+AND SHALL NOT implicitly cancel, restart, or repeat an intentional creation under a new identity.
+
+THE SYSTEM SHALL preserve public user API, historical, and Slack gateway origin decoding and objective-delivery behavior independently of the Coordinator's literal-input policy.

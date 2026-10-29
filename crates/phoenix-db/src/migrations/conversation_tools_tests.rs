@@ -280,6 +280,51 @@ fn registered_identity_order_and_exact_bodies() {
 }
 
 #[tokio::test]
+async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
+    use crate::{ProductCreationAcceptOutcome, ProductCreationOrigin};
+
+    let pool = fixture(142, true).await;
+    let db = Database::from_pool_for_tests(pool.clone(), String::new());
+    db.run_migrations().await.unwrap();
+    let retained = db
+        .get_product_creation_job("old-slack")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retained.intent.origin,
+        ProductCreationOrigin::SlackGateway {
+            request_id: "slack-request".into(),
+        }
+    );
+    assert!(matches!(
+        db.accept_product_creation("old-slack", &retained.intent)
+            .await
+            .unwrap(),
+        ProductCreationAcceptOutcome::Replayed(_)
+    ));
+    let mut intent = retained.intent;
+    intent.images.clear();
+    let ProductCreationAcceptOutcome::Accepted(accepted) = db
+        .accept_product_creation("new-slack", &intent)
+        .await
+        .unwrap()
+    else {
+        panic!("expected new Slack acceptance");
+    };
+    assert_eq!(accepted.intent.origin, intent.origin);
+    assert_eq!(
+        db.get_product_creation_job("new-slack")
+            .await
+            .unwrap()
+            .unwrap()
+            .intent
+            .origin,
+        intent.origin
+    );
+}
+
+#[tokio::test]
 async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
     let fresh = Database::open_in_memory().await.unwrap();
     assert_eq!(run_pending_migrations(fresh.pool()).await.unwrap(), 0);

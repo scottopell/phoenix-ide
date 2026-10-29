@@ -514,7 +514,7 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.objective_source_product_conversation_id, j.objective_source_transcript_id, j.objective_source_message_id, j.objective_source_tool_use_id, j.model, j.effort, j.llm_language, j.status,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.objective_slack_request_id, j.objective_source_product_conversation_id, j.objective_source_transcript_id, j.objective_source_message_id, j.objective_source_tool_use_id, j.model, j.effort, j.llm_language, j.status,
                     j.provisioning_stage, j.stage_updated_at_unix_micros,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,

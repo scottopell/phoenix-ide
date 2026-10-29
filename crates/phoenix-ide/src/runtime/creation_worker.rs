@@ -466,7 +466,8 @@ async fn expand_product_creation_objective(
 ) -> Result<crate::send_chat_service::ExpandedDispatchMessage, String> {
     let policy = match origin {
         crate::db::ProductCreationOrigin::UnknownHistorical
-        | crate::db::ProductCreationOrigin::UserApi => {
+        | crate::db::ProductCreationOrigin::UserApi
+        | crate::db::ProductCreationOrigin::SlackGateway { .. } => {
             crate::send_chat_service::MessageExpansionPolicy::ExpandReferences
         }
         crate::db::ProductCreationOrigin::InternalConversation { .. } => {
@@ -4421,19 +4422,27 @@ mod product_creation_delivery_replay_tests {
             None,
         );
 
-        let expanded = expand_product_creation_objective(
-            &manager,
-            "expanded-product-objective",
-            "Read @notes.md",
-            &crate::db::ProductCreationOrigin::UserApi,
-        )
-        .await
-        .unwrap();
-        assert_eq!(expanded.display_text, "Read @notes.md");
-        assert!(expanded
-            .llm_text
-            .as_deref()
-            .is_some_and(|text| text.contains("published root contents")));
+        for origin in [
+            crate::db::ProductCreationOrigin::UnknownHistorical,
+            crate::db::ProductCreationOrigin::UserApi,
+            crate::db::ProductCreationOrigin::SlackGateway {
+                request_id: "slack-request".into(),
+            },
+        ] {
+            let expanded = expand_product_creation_objective(
+                &manager,
+                "expanded-product-objective",
+                "Read @notes.md",
+                &origin,
+            )
+            .await
+            .unwrap();
+            assert_eq!(expanded.display_text, "Read @notes.md");
+            assert!(expanded
+                .llm_text
+                .as_deref()
+                .is_some_and(|text| text.contains("published root contents")));
+        }
     }
 
     #[tokio::test]

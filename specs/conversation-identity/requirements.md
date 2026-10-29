@@ -68,6 +68,19 @@ THE SYSTEM SHALL allocate root projections, remove the competing persisted `chai
 
 THE SYSTEM SHALL NOT introduce a second ProductConversation name column, an old-slug registry, a persistence framework, or an additional naming lifecycle.
 
+### REQ-CID-007 — Coordinator Rename Is Fenced and Replayable
+
+WHEN the current Global Coordinator renames an ordinary ProductConversation through its dedicated naming capability
+THE SYSTEM SHALL require the immutable product identity, canonical root transcript identity, and naming revision returned by a fresh detail read
+AND SHALL commit the shared title and allocated-slug update only if that exact naming baseline and existing lifecycle admission still hold.
+
+THE SYSTEM SHALL persist the normalized rename intent, trusted executing source-call identity, and resulting naming receipt under one operation identity in the same transaction as the naming update
+AND SHALL reconcile identical retries from that historical receipt without reapplying the rename, even after a later naming change
+AND SHALL reject changed intent or source identity reuse rather than silently choose another operation or target
+AND SHALL distinguish a historical receipt from the current name, route, and lifecycle state.
+
+THE SYSTEM SHALL retain the existing immutable identity and released-slug semantics without reserving former routes or granting lifecycle mutation authority.
+
 ## Acceptance scenarios
 
 - Duplicate human names remain identical while projections allocate `base`, `base-2`, and `base-3` under concurrent rename and creation.
