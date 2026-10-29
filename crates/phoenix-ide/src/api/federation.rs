@@ -603,13 +603,13 @@ pub async fn read_conversation(
     State(state): State<AppState>,
     Json(request): Json<RemoteReadConversationRequest>,
 ) -> Response {
-    read_conversation_with_limits(
+    Box::pin(read_conversation_with_limits(
         peer,
         state,
         request,
         &READ_ADMISSION,
         REMOTE_READ_DEADLINE,
-    )
+    ))
     .await
 }
 
@@ -662,7 +662,7 @@ async fn read_conversation_with_limits(
     let read = execute_bounded_remote_read(
         admission,
         deadline,
-        service.read_conversation_page(&request.target.reference(), request.cursor),
+        Box::pin(service.read_conversation_page(&request.target.reference(), request.cursor)),
     )
     .await;
     match read {
