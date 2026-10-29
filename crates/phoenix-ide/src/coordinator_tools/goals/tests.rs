@@ -28,9 +28,7 @@ impl Fixture {
     }
 
     async fn with_db(db: crate::db::Database) -> Self {
-        phoenix_db::migrations::run_pending_migrations(db.pool())
-            .await
-            .unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let caller = db
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
