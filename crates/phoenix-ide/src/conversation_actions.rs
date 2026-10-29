@@ -139,10 +139,14 @@ fn resolve_intent(
             "cwd must be an exact normalized absolute path; use options first",
         ));
     }
-    let cwd = crate::conversation_cwd::normalize_product_creation_cwd_intent(
-        &req.cwd,
-        runtime.runtime_home(),
-    )
+    let cwd = if internal {
+        crate::conversation_cwd::validate_conversation_cwd(&req.cwd).map(|cwd| cwd.into_raw())
+    } else {
+        crate::conversation_cwd::normalize_product_creation_cwd_intent(
+            &req.cwd,
+            runtime.runtime_home(),
+        )
+    }
     .map_err(|error| invalid(error.to_string()))?;
     if internal && cwd != req.cwd {
         return Err(invalid(format!(
@@ -206,7 +210,7 @@ pub(crate) async fn accept_create(
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 "request_id conflicts with immutable creation intent",
                 "product_creation_request_conflict",
-            ))))
+            ))));
         }
     };
     runtime.kick_creation_worker();
@@ -222,7 +226,6 @@ mod tests {
     use crate::db::Database;
     use crate::platform::PlatformCapability;
     use crate::tools::mcp::McpClientManager;
-    use phoenix_core::llm_language::LlmLanguage;
     use phoenix_llm::{LlmConfig, ModelRegistry};
     use std::sync::Arc;
 
@@ -309,6 +312,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_new_intent_requires_existing_directory_without_changing_user_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().canonicalize().unwrap().join("not-created");
+        let manager = runtime(
+            Database::open_in_memory().await.unwrap(),
+            ModelRegistry::new(&LlmConfig {
+                openai_api_key: Some("test-never-dispatched".into()),
+                ..Default::default()
+            }),
+        );
+        let mut req = request(missing.to_str().unwrap());
+        req.model = Some("gpt-5.6-sol".into());
+        assert!(matches!(
+            resolve_intent(
+                &manager,
+                &req,
+                &coordinator_source("first"),
+                ProductCreationResolution::New {
+                    default_llm_language: Default::default(),
+                },
+            ),
+            Err(DbError::ProductCreationIntentInvalid(_))
+        ));
+        assert!(!missing.exists());
+        let api_intent = resolve_intent(
+            &manager,
+            &req,
+            &CreateSource::UserApi,
+            ProductCreationResolution::New {
+                default_llm_language: Default::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(api_intent.cwd, req.cwd);
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test]
     async fn replay_uses_frozen_defaults_and_preserves_first_source_attribution() {
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
@@ -390,9 +431,8 @@ mod tests {
         ));
         assert!(matches!(
             db.accept_product_creation_resolved(&req.request_id, None, |_| Ok(frozen.clone()))
-                .await
-                .unwrap(),
-            ProductCreationAcceptOutcome::Conflict(_)
+                .await,
+            Err(DbError::CurrentCoordinatorRequired)
         ));
     }
 
