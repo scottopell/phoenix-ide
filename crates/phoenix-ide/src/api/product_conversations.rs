@@ -763,17 +763,25 @@ pub async fn get_product_conversation(
     .await
 }
 
-pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
+pub(super) fn percent_encode_route_segment(value: &str) -> String {
     use std::fmt::Write;
-    let mut route = String::from(PRODUCT_CONVERSATION_ROUTE_PREFIX);
-    for byte in slug.unwrap_or(product_id).bytes() {
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            route.push(char::from(byte));
+            encoded.push(char::from(byte));
         } else {
-            let _ = write!(route, "%{byte:02X}");
+            let _ = write!(encoded, "%{byte:02X}");
         }
     }
-    route
+    encoded
+}
+
+pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
+    format!(
+        "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
+        percent_encode_route_segment(slug.unwrap_or(product_id))
+    )
 }
 
 pub(super) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {

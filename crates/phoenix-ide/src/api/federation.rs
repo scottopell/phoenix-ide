@@ -19,6 +19,9 @@ use super::AppState;
 
 static QUERY_ADMISSION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
+static READ_ADMISSION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
+const REMOTE_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
 
 #[derive(Deserialize)]
@@ -262,12 +265,13 @@ pub struct RemoteResolveReferenceRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteResolveReferenceResponse {
     pub destination_instance_id: InstanceId,
     pub caller_instance_id: InstanceId,
     pub path_owner_instance_id: InstanceId,
     pub requested: RemoteConversationTarget,
-    pub resolution: serde_json::Value,
+    pub resolution: super::global_read::ResolveGlobalReferenceResponse,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -279,11 +283,14 @@ pub struct RemoteReadConversationRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteReadConversationResponse {
     pub destination_instance_id: InstanceId,
     pub caller_instance_id: InstanceId,
     pub source_instance_id: InstanceId,
     pub requested: RemoteConversationTarget,
+    pub cursor: usize,
+    pub next_cursor: Option<usize>,
     pub content: String,
 }
 
@@ -295,6 +302,13 @@ pub async fn resolve_saved_peer_id(
     if selector.is_empty() {
         return Err(FederationClientError::InvalidPeerSelector);
     }
+    if let Ok(id) = InstanceId::from_str(selector) {
+        return db
+            .federation_peer_connection(id)
+            .await?
+            .map(|_| id)
+            .ok_or(FederationClientError::PeerNotFound);
+    }
     let ids: Vec<String> = sqlx::query_scalar(
         "SELECT peer_instance_id FROM federation_peer_connections
          WHERE peer_display_name = ?1 ORDER BY peer_instance_id LIMIT 2",
@@ -302,16 +316,11 @@ pub async fn resolve_saved_peer_id(
     .bind(selector)
     .fetch_all(db.pool())
     .await?;
-    let mut candidates = ids
+    let candidates = ids
         .iter()
         .map(|id| InstanceId::from_str(id))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| phoenix_db::DbError::Serialization(error.to_string()))?;
-    if let Ok(id) = InstanceId::from_str(selector) {
-        if !candidates.contains(&id) && db.federation_peer_connection(id).await?.is_some() {
-            candidates.push(id);
-        }
-    }
     match candidates.as_slice() {
         [] => Err(FederationClientError::PeerNotFound),
         [id] => Ok(*id),
@@ -376,9 +385,7 @@ pub async fn resolve_remote_reference(
     .await?;
     validate_remote_provenance(&response, peer_id, caller, &requested)?;
     validate_resolution_binding(&response.resolution, &requested)?;
-    if let Some(resolution) = response.resolution.as_object_mut() {
-        resolution.remove("href");
-    }
+    response.resolution.href = None;
     Ok(response)
 }
 
@@ -417,6 +424,12 @@ pub async fn read_remote_conversation(
     reference: &str,
     cursor: usize,
 ) -> Result<RemoteReadConversationResponse, FederationClientError> {
+    if cursor > super::global_read::MAX_CONVERSATION_READ_CURSOR {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "cursor exceeds maximum {}",
+            super::global_read::MAX_CONVERSATION_READ_CURSOR
+        )));
+    }
     let requested = RemoteConversationTarget::parse(reference)?;
     require_bounded_read_target(&requested)?;
     let peer_id = resolve_saved_peer_id(db, selector).await?;
@@ -447,7 +460,27 @@ pub async fn read_remote_conversation(
             "read response changed the requested reference".to_string(),
         ));
     }
+    if response.cursor != cursor {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "read response changed the requested cursor".to_string(),
+        ));
+    }
+    validate_remote_next_cursor(cursor, response.next_cursor)?;
     Ok(response)
+}
+
+fn validate_remote_next_cursor(
+    cursor: usize,
+    next_cursor: Option<usize>,
+) -> Result<(), FederationClientError> {
+    if let Some(next_cursor) = next_cursor {
+        if next_cursor <= cursor || next_cursor > super::global_read::MAX_CONVERSATION_READ_CURSOR {
+            return Err(FederationClientError::ProvenanceMismatch(
+                "read response returned an invalid next cursor".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_remote_provenance(
@@ -473,10 +506,9 @@ fn validate_remote_provenance(
 }
 
 fn validate_resolution_binding(
-    resolution: &serde_json::Value,
+    resolution: &super::global_read::ResolveGlobalReferenceResponse,
     requested: &RemoteConversationTarget,
 ) -> Result<(), FederationClientError> {
-    let field = |name| resolution.get(name).and_then(serde_json::Value::as_str);
     let (expected_kind, expected_id) = match requested {
         RemoteConversationTarget::ProductConversation {
             product_conversation_id,
@@ -490,13 +522,18 @@ fn validate_resolution_binding(
             ..
         } => ("message", message_id.as_str()),
     };
-    let href = field("href").ok_or_else(|| {
+    let href = resolution.href.as_deref().ok_or_else(|| {
         FederationClientError::ProvenanceMismatch("resolved reference omitted href".to_string())
     })?;
-    let href = reqwest::Url::parse("https://destination.invalid/")
+    if !href.starts_with('/') || href.starts_with("//") {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "resolved href is not destination-relative".to_string(),
+        ));
+    }
+    let parsed_href = reqwest::Url::parse("https://destination.invalid/")
         .and_then(|base| base.join(href))
         .map_err(|error| FederationClientError::ProvenanceMismatch(error.to_string()))?;
-    if href.scheme() != "https" || href.host_str() != Some("destination.invalid") {
+    if parsed_href.scheme() != "https" || parsed_href.host_str() != Some("destination.invalid") {
         return Err(FederationClientError::ProvenanceMismatch(
             "resolved href is not destination-relative".to_string(),
         ));
@@ -506,23 +543,17 @@ fn validate_resolution_binding(
         message_id,
     } = requested
     {
-        let pins = href
-            .query_pairs()
-            .filter(|(key, _)| key == "source_transcript")
-            .map(|(_, value)| value.into_owned())
-            .collect::<Vec<_>>();
-        let pinned = pins.as_slice() == [transcript_id.as_str()];
-        let fragment_matches = message_id.as_ref().is_none_or(|id| {
-            href.fragment()
-                .is_none_or(|fragment| fragment == format!("message-{id}"))
+        let transcript_href = super::global_read::exact_conversation_href(transcript_id, None);
+        let message_href = message_id.as_deref().map(|message_id| {
+            super::global_read::exact_conversation_href(transcript_id, Some(message_id))
         });
-        if href.path() != format!("/c/{transcript_id}") || !pinned || !fragment_matches {
+        if href != transcript_href && message_href.as_deref() != Some(href) {
             return Err(FederationClientError::ProvenanceMismatch(
                 "resolved href changed the exact transcript target".to_string(),
             ));
         }
     }
-    if field("kind") != Some(expected_kind) || field("id") != Some(expected_id) {
+    if resolution.kind.as_str() != expected_kind || resolution.id != expected_id {
         return Err(FederationClientError::ProvenanceMismatch(
             "resolved kind or identity does not match the requested reference".to_string(),
         ));
@@ -552,29 +583,64 @@ pub async fn resolve_reference(
         state.db.clone(),
         state.message_retriever.clone(),
     );
-    match service.resolve_reference(&request.target.reference()).await {
-        Ok(resolution) => match serde_json::to_value(resolution) {
-            Ok(resolution) => Json(RemoteResolveReferenceResponse {
-                destination_instance_id: destination,
-                caller_instance_id: peer.caller_instance_id,
-                path_owner_instance_id: destination,
-                requested: request.target,
-                resolution,
-            })
-            .into_response(),
-            Err(error) => {
-                tracing::error!(%error, "failed to encode remote resolution");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        },
-        Err(error) => error.into_response(),
-    }
+    let reference = request.target.reference();
+    let resolution = match service.resolve_reference(&reference).await {
+        Ok(resolution) => resolution,
+        Err(error) => return error.into_response(),
+    };
+    Json(RemoteResolveReferenceResponse {
+        destination_instance_id: destination,
+        caller_instance_id: peer.caller_instance_id,
+        path_owner_instance_id: destination,
+        requested: request.target,
+        resolution,
+    })
+    .into_response()
 }
 
 pub async fn read_conversation(
     peer: PeerAuthenticated,
     State(state): State<AppState>,
     Json(request): Json<RemoteReadConversationRequest>,
+) -> Response {
+    read_conversation_with_limits(
+        peer,
+        state,
+        request,
+        &READ_ADMISSION,
+        REMOTE_READ_DEADLINE,
+    )
+    .await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteReadLimitError {
+    Admission,
+    Deadline,
+}
+
+async fn execute_bounded_remote_read<T, F>(
+    admission: &std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: std::time::Duration,
+    operation: F,
+) -> Result<T, RemoteReadLimitError>
+where
+    F: Future<Output = T>,
+{
+    let _permit = std::sync::Arc::clone(admission)
+        .try_acquire_owned()
+        .map_err(|_| RemoteReadLimitError::Admission)?;
+    tokio::time::timeout(deadline, operation)
+        .await
+        .map_err(|_| RemoteReadLimitError::Deadline)
+}
+
+async fn read_conversation_with_limits(
+    peer: PeerAuthenticated,
+    state: AppState,
+    request: RemoteReadConversationRequest,
+    admission: &std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: std::time::Duration,
 ) -> Response {
     let destination = match state.db.instance_id().await {
         Ok(id) => id,
@@ -593,19 +659,31 @@ pub async fn read_conversation(
         state.db.clone(),
         state.message_retriever.clone(),
     );
-    match service
-        .read_conversation(&request.target.reference(), request.cursor)
-        .await
-    {
-        Ok(content) => Json(RemoteReadConversationResponse {
+    let read = execute_bounded_remote_read(
+        admission,
+        deadline,
+        service.read_conversation_page(&request.target.reference(), request.cursor),
+    )
+    .await;
+    match read {
+        Err(RemoteReadLimitError::Admission) => federation_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "remote read admission limit reached",
+        ),
+        Err(RemoteReadLimitError::Deadline) => {
+            federation_error(StatusCode::GATEWAY_TIMEOUT, "remote read deadline exceeded")
+        }
+        Ok(Ok(page)) => Json(RemoteReadConversationResponse {
             destination_instance_id: destination,
             caller_instance_id: peer.caller_instance_id,
             source_instance_id: destination,
             requested: request.target,
-            content,
+            cursor: request.cursor,
+            next_cursor: page.next_cursor,
+            content: page.content,
         })
         .into_response(),
-        Err(error) => federation_error(StatusCode::UNPROCESSABLE_ENTITY, &error),
+        Ok(Err(error)) => federation_error(StatusCode::UNPROCESSABLE_ENTITY, &error),
     }
 }
 
@@ -814,6 +892,22 @@ pub async fn revoke_enrollment(
 mod tests {
     use super::*;
 
+    fn resolution(
+        kind: super::super::global_read::ResolvedReferenceKind,
+        id: &str,
+        title: Option<&str>,
+        href: Option<&str>,
+    ) -> super::super::global_read::ResolveGlobalReferenceResponse {
+        super::super::global_read::ResolveGlobalReferenceResponse {
+            kind,
+            id: id.to_string(),
+            title: title.map(str::to_string),
+            href: href.map(str::to_string),
+            work_scope: super::super::global_read::ResolvedWorkScope::Missing,
+            summary: String::new(),
+        }
+    }
+
     #[test]
     fn peer_tokens_are_prefixed_random_credentials() {
         let first = random_peer_token();
@@ -835,10 +929,12 @@ mod tests {
         };
         let first = InstanceId::new();
         let second = InstanceId::new();
-        let unique_name = InstanceId::new().to_string();
+        let shadow = InstanceId::new();
+        let first_id = first.to_string();
         for (id, name, url) in [
-            (first, unique_name.as_str(), "https://first.example"),
+            (first, "unique", "https://first.example"),
             (second, "duplicate", "https://second.example"),
+            (shadow, first_id.as_str(), "https://shadow.example"),
         ] {
             state
                 .db
@@ -846,7 +942,13 @@ mod tests {
                     id,
                     name,
                     &url.parse().unwrap(),
-                    &token(if id == first { "a" } else { "b" }),
+                    &token(if id == first {
+                        "a"
+                    } else if id == second {
+                        "b"
+                    } else {
+                        "c"
+                    }),
                     &PeerTlsTrust::PlatformRoots,
                 )
                 .await
@@ -859,9 +961,7 @@ mod tests {
             first
         );
         assert_eq!(
-            resolve_saved_peer_id(&state.db, &unique_name)
-                .await
-                .unwrap(),
+            resolve_saved_peer_id(&state.db, "unique").await.unwrap(),
             first
         );
         state
@@ -870,7 +970,7 @@ mod tests {
                 InstanceId::new(),
                 "duplicate",
                 &"https://other.example".parse().unwrap(),
-                &token("c"),
+                &token("d"),
                 &PeerTlsTrust::PlatformRoots,
             )
             .await
@@ -885,6 +985,59 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn remote_read_rejects_oversized_cursor_before_peer_lookup() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+
+        let error = read_remote_conversation(
+            &state.db,
+            "missing-peer",
+            "@conv:missing-product",
+            super::super::global_read::MAX_CONVERSATION_READ_CURSOR + 1,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, FederationClientError::RemoteRejected(message) if message.contains("cursor exceeds maximum"))
+        );
+    }
+
+    #[test]
+    fn remote_next_cursor_must_advance_within_the_local_cap() {
+        assert!(validate_remote_next_cursor(0, None).is_ok());
+        assert!(validate_remote_next_cursor(0, Some(1)).is_ok());
+        assert!(validate_remote_next_cursor(1, Some(1)).is_err());
+        assert!(validate_remote_next_cursor(2, Some(1)).is_err());
+        assert!(validate_remote_next_cursor(
+            0,
+            Some(super::super::global_read::MAX_CONVERSATION_READ_CURSOR + 1),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_remote_read_rejects_exhausted_admission_and_deadline() {
+        let exhausted = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        assert_eq!(
+            execute_bounded_remote_read(&exhausted, std::time::Duration::from_secs(1), async { 1 })
+                .await,
+            Err(RemoteReadLimitError::Admission)
+        );
+
+        let admitted = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert_eq!(
+            execute_bounded_remote_read(
+                &admitted,
+                std::time::Duration::ZERO,
+                std::future::pending::<usize>(),
+            )
+            .await,
+            Err(RemoteReadLimitError::Deadline)
+        );
+        assert_eq!(admitted.available_permits(), 1);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn peer_routes_enforce_auth_destination_and_stable_exact_semantics() {
@@ -894,6 +1047,19 @@ mod tests {
         state
             .db
             .create_conversation("remote-transcript", "remote", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let opaque_transcript_id = "opaque/segment?x=1&state=50%";
+        state
+            .db
+            .create_conversation(
+                opaque_transcript_id,
+                "opaque",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
             .await
             .unwrap();
         for index in 0..180 {
@@ -975,8 +1141,39 @@ mod tests {
             .await
             .unwrap();
         let resolved: RemoteResolveReferenceResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(resolved.resolution["kind"], "product_conversation");
-        assert_eq!(resolved.resolution["id"], product_id);
+        assert_eq!(resolved.resolution.kind.as_str(), "product_conversation");
+        assert_eq!(resolved.resolution.id, product_id);
+        assert_eq!(resolved.resolution.title.as_deref(), Some("Remote"));
+
+        let opaque = serde_json::to_value(RemoteResolveReferenceRequest {
+            destination_instance_id: destination,
+            target: RemoteConversationTarget::ExactTranscript {
+                transcript_id: opaque_transcript_id.to_string(),
+                message_id: None,
+            },
+        })
+        .unwrap();
+        let opaque = app
+            .clone()
+            .oneshot(request(
+                "/api/federation/peer/resolve-reference",
+                opaque,
+                Some(&bearer),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(opaque.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(opaque.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let opaque: RemoteResolveReferenceResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(opaque.resolution.id, opaque_transcript_id);
+        let expected_opaque_href =
+            super::super::global_read::exact_conversation_href(opaque_transcript_id, None);
+        assert_eq!(
+            opaque.resolution.href.as_deref(),
+            Some(expected_opaque_href.as_str())
+        );
 
         let exact = |cursor| {
             serde_json::to_value(RemoteReadConversationRequest {
@@ -1002,17 +1199,34 @@ mod tests {
         let body = axum::body::to_bytes(first.into_body(), MAX_REMOTE_RESPONSE_BYTES)
             .await
             .unwrap();
-        let _: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        let first: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first.cursor, 0);
+        assert_eq!(first.next_cursor, Some(7000));
+        assert_eq!(
+            first.requested,
+            RemoteConversationTarget::ExactTranscript {
+                transcript_id: "remote-transcript".to_string(),
+                message_id: None,
+            }
+        );
+        assert!(!first.content.contains("call read_conversation again"));
+        let next_cursor = first.next_cursor.unwrap();
         let second = app
             .clone()
             .oneshot(request(
                 "/api/federation/peer/read-conversation",
-                exact(1),
+                exact(next_cursor),
                 Some(&bearer),
             ))
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(second.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let second: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second.cursor, next_cursor);
+        assert_ne!(second.content, first.content);
 
         let wrong = serde_json::to_value(RemoteReadConversationRequest {
             destination_instance_id: InstanceId::new(),
@@ -1040,13 +1254,159 @@ mod tests {
             transcript_id: "transcript".to_string(),
             message_id: None,
         };
-        let duplicate = serde_json::json!({"kind":"conversation","id":"transcript","href":"/c/transcript?source_transcript=other&source_transcript=transcript"});
+        let duplicate = resolution(
+            super::super::global_read::ResolvedReferenceKind::Conversation,
+            "transcript",
+            Some("Transcript"),
+            Some("/c/transcript?source_transcript=other&source_transcript=transcript"),
+        );
         assert!(validate_resolution_binding(&duplicate, &exact).is_err());
         let smuggled = RemoteConversationTarget::ExactTranscript {
             transcript_id: "transcript#message-message".to_string(),
             message_id: None,
         };
         assert!(require_bounded_read_target(&smuggled).is_err());
+    }
+
+    #[test]
+    fn remote_provenance_preserves_opaque_exact_target_ids() {
+        let transcript_id = "transcript/part?query&percent%";
+        let message_id = "message/part?query&percent%";
+        let target = RemoteConversationTarget::ExactTranscript {
+            transcript_id: transcript_id.to_string(),
+            message_id: Some(message_id.to_string()),
+        };
+        let href =
+            super::super::global_read::exact_conversation_href(transcript_id, Some(message_id));
+        let resolved = resolution(
+            super::super::global_read::ResolvedReferenceKind::Message,
+            message_id,
+            Some("Transcript"),
+            Some(&href),
+        );
+
+        assert_eq!(
+            href,
+            "/c/transcript%2Fpart%3Fquery%26percent%25?source_transcript=transcript%2Fpart%3Fquery%26percent%25#message-message%2Fpart%3Fquery%26percent%25"
+        );
+        assert!(validate_resolution_binding(&resolved, &target).is_ok());
+    }
+
+    #[test]
+    fn remote_provenance_accepts_exact_messages_without_rendered_anchors() {
+        let target = RemoteConversationTarget::ExactTranscript {
+            transcript_id: "transcript".to_string(),
+            message_id: Some("tool-message".to_string()),
+        };
+        let resolved = resolution(
+            super::super::global_read::ResolvedReferenceKind::Message,
+            "tool-message",
+            Some("Transcript"),
+            Some("/c/transcript?source_transcript=transcript"),
+        );
+
+        assert!(validate_resolution_binding(&resolved, &target).is_ok());
+    }
+
+    #[test]
+    fn remote_provenance_rejects_wrong_exact_message_fragment() {
+        let target = RemoteConversationTarget::ExactTranscript {
+            transcript_id: "transcript".to_string(),
+            message_id: Some("message".to_string()),
+        };
+        let wrong = resolution(
+            super::super::global_read::ResolvedReferenceKind::Message,
+            "message",
+            Some("Transcript"),
+            Some("/c/transcript?source_transcript=transcript#message-other"),
+        );
+        assert!(validate_resolution_binding(&wrong, &target).is_err());
+        let exact = resolution(
+            super::super::global_read::ResolvedReferenceKind::Message,
+            "message",
+            Some("Transcript"),
+            Some("/c/transcript?source_transcript=transcript#message-message"),
+        );
+        assert!(validate_resolution_binding(&exact, &target).is_ok());
+    }
+
+    #[test]
+    fn remote_provenance_rejects_non_relative_hrefs_for_stable_targets() {
+        let target = RemoteConversationTarget::ProductConversation {
+            product_conversation_id: "product".to_string(),
+        };
+        for href in [
+            "https://attacker.invalid/product",
+            "//attacker.invalid/product",
+        ] {
+            let resolved = resolution(
+                super::super::global_read::ResolvedReferenceKind::ProductConversation,
+                "product",
+                Some("Product"),
+                Some(href),
+            );
+            assert!(validate_resolution_binding(&resolved, &target).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_wire_rejects_malformed_missing_and_unknown_fields() {
+        let id = InstanceId::new();
+        let null_content = serde_json::json!({
+            "destination_instance_id": id,
+            "caller_instance_id": id,
+            "source_instance_id": id,
+            "requested": {"kind": "product_conversation", "product_conversation_id": "product"},
+            "cursor": 0,
+            "next_cursor": null,
+            "content": null,
+        });
+        assert!(serde_json::from_value::<RemoteReadConversationResponse>(null_content).is_err());
+
+        let valid = serde_json::json!({
+            "destination_instance_id": id,
+            "caller_instance_id": id,
+            "path_owner_instance_id": id,
+            "requested": {"kind": "product_conversation", "product_conversation_id": "product"},
+            "resolution": {
+                "kind": "product_conversation",
+                "id": "product",
+                "title": "Product",
+                "href": "/conversations/product",
+                "work_scope": {"status": "missing"},
+                "summary": ""
+            }
+        });
+        assert!(
+            serde_json::from_value::<RemoteResolveReferenceResponse>(valid.clone()).is_ok()
+        );
+
+        for field in ["kind", "id", "href", "title", "work_scope", "summary"] {
+            let mut missing = valid.clone();
+            missing["resolution"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<RemoteResolveReferenceResponse>(missing).is_err(),
+                "missing resolution field was accepted: {field}"
+            );
+        }
+
+        for (field, malformed) in [
+            ("kind", serde_json::Value::Null),
+            ("id", serde_json::Value::Null),
+            ("work_scope", serde_json::json!({"status": "unknown"})),
+            ("summary", serde_json::Value::Null),
+        ] {
+            let mut response = valid.clone();
+            response["resolution"][field] = malformed;
+            assert!(
+                serde_json::from_value::<RemoteResolveReferenceResponse>(response).is_err(),
+                "malformed resolution field was accepted: {field}"
+            );
+        }
+
+        let mut unknown = valid;
+        unknown["resolution"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RemoteResolveReferenceResponse>(unknown).is_err());
     }
 
     #[tokio::test]
@@ -1130,12 +1490,12 @@ mod tests {
                 requested: RemoteConversationTarget::ProductConversation {
                     product_conversation_id: "product".to_string(),
                 },
-                resolution: serde_json::json!({
-                    "kind": "product_conversation",
-                    "id": "product",
-                    "href": "/conversations/product",
-                    "work_scope": {"working_directory": "/remote/path"}
-                }),
+                resolution: resolution(
+                    super::super::global_read::ResolvedReferenceKind::ProductConversation,
+                    "product",
+                    Some("Product"),
+                    Some("/conversations/product"),
+                ),
             })
             .unwrap();
             stream
