@@ -313,8 +313,6 @@ mod tests {
 
     #[tokio::test]
     async fn native_new_intent_requires_existing_directory_without_changing_user_api() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().canonicalize().unwrap().join("not-created");
         let manager = runtime(
             Database::open_in_memory().await.unwrap(),
             ModelRegistry::new(&LlmConfig {
@@ -322,6 +320,8 @@ mod tests {
                 ..Default::default()
             }),
         );
+        let dir = tempfile::tempdir_in(manager.runtime_home()).unwrap();
+        let missing = dir.path().canonicalize().unwrap().join("not-created");
         let mut req = request(missing.to_str().unwrap());
         req.model = Some("gpt-5.6-sol".into());
         assert!(matches!(
