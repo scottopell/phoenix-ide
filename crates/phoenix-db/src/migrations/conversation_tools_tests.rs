@@ -216,7 +216,10 @@ async fn preserved(conn: &mut SqliteConnection, before: &Snapshot) {
             .fetch_one(&mut *conn)
             .await
             .unwrap();
-    assert_eq!(new_count as usize, before.columns[0].len() + 4);
+    assert_eq!(
+        usize::try_from(new_count).unwrap(),
+        before.columns[0].len() + 4
+    );
 }
 async fn clean(conn: &mut SqliteConnection) {
     let marker: String =

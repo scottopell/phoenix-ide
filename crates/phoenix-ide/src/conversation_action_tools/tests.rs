@@ -125,12 +125,12 @@ fn native_context(transcript: &str) -> ToolContext {
 async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) {
     let db = crate::db::Database::open_in_memory().await.unwrap();
     let coordinator = db
-        .get_or_create_coordinator(None, Default::default())
+        .get_or_create_coordinator(None, LlmLanguage::default())
         .await
         .unwrap();
     let registry = phoenix_llm::ModelRegistry::new(&phoenix_llm::LlmConfig {
         openai_api_key: Some("fixture-not-dispatched".into()),
-        ..Default::default()
+        ..phoenix_llm::LlmConfig::default()
     });
     let runtime = Arc::new(RuntimeManager::new(
         db.clone(),

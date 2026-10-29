@@ -73,6 +73,7 @@ fn requested_images(req: &CreateProductConversationRequest) -> Vec<ProductCreati
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn resolve_intent(
     runtime: &RuntimeManager,
     req: &CreateProductConversationRequest,
@@ -226,6 +227,7 @@ mod tests {
     use crate::db::Database;
     use crate::platform::PlatformCapability;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_core::llm_language::LlmLanguage;
     use phoenix_llm::{LlmConfig, ModelRegistry};
     use std::sync::Arc;
 
@@ -269,7 +271,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = ModelRegistry::new(&LlmConfig {
             openai_api_key: Some("test-never-dispatched".into()),
-            ..Default::default()
+            ..LlmConfig::default()
         });
         let manager = runtime(Database::open_in_memory().await.unwrap(), registry);
         let mut req = request(dir.path().to_str().unwrap());
@@ -305,7 +307,7 @@ mod tests {
             &req,
             &coordinator_source("first"),
             ProductCreationResolution::New {
-                default_llm_language: Default::default()
+                default_llm_language: LlmLanguage::default()
             }
         )
         .is_err());
@@ -317,7 +319,7 @@ mod tests {
             Database::open_in_memory().await.unwrap(),
             ModelRegistry::new(&LlmConfig {
                 openai_api_key: Some("test-never-dispatched".into()),
-                ..Default::default()
+                ..LlmConfig::default()
             }),
         );
         let dir = tempfile::tempdir_in(manager.runtime_home()).unwrap();
@@ -330,7 +332,7 @@ mod tests {
                 &req,
                 &coordinator_source("first"),
                 ProductCreationResolution::New {
-                    default_llm_language: Default::default(),
+                    default_llm_language: LlmLanguage::default(),
                 },
             ),
             Err(DbError::ProductCreationIntentInvalid(_))
@@ -341,7 +343,7 @@ mod tests {
             &req,
             &CreateSource::UserApi,
             ProductCreationResolution::New {
-                default_llm_language: Default::default(),
+                default_llm_language: LlmLanguage::default(),
             },
         )
         .unwrap();
@@ -353,7 +355,7 @@ mod tests {
     async fn replay_uses_frozen_defaults_and_preserves_first_source_attribution() {
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, LlmLanguage::default())
             .await
             .unwrap();
         let source = CreateSource::CurrentCoordinator {
@@ -454,7 +456,7 @@ mod tests {
             origin: ProductCreationOrigin::UserApi,
             model: Some("no-longer-available-model".into()),
             effort: None,
-            llm_language: Default::default(),
+            llm_language: LlmLanguage::default(),
             images: Vec::new(),
         };
         db.accept_product_creation(&req.request_id, &frozen)
@@ -493,7 +495,7 @@ mod tests {
                 .is_empty()
         );
         let current = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, LlmLanguage::default())
             .await
             .unwrap();
         let tools = crate::conversation_action_tools::tools(manager.clone(), &current.id)

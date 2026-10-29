@@ -578,11 +578,7 @@ impl Database {
                     return Ok(None);
                 }
             }
-            let expected_revision = if let Some(baseline) = baseline {
-                Some(baseline.revision)
-            } else {
-                None
-            };
+            let expected_revision = baseline.map(|baseline| baseline.revision);
             let applied = crate::product_conversation_rename::apply_conversation_name_tx(
                 &mut transaction,
                 &resolved.product_conversation_id,

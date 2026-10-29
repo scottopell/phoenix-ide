@@ -603,6 +603,7 @@ impl Database {
 
     /// Serializes caller authorization, durable winner selection, and new-intent validation.
     /// The resolver sees the existing accepted job before it is asked to prepare a candidate.
+    #[allow(clippy::too_many_lines)]
     pub async fn accept_product_creation_resolved<F>(
         &self,
         request_id: &str,
@@ -683,10 +684,22 @@ impl Database {
         .bind(&intent.cwd)
         .bind(&intent.objective)
         .bind(intent.origin.as_str())
-        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { product_conversation_id, .. } => Some(product_conversation_id.as_str()), _ => None })
-        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { transcript_id, .. } => Some(transcript_id.as_str()), _ => None })
-        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.message_id.as_str()), _ => None })
-        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.tool_use_id.as_str()), _ => None })
+        .bind(match &intent.origin {
+            ProductCreationOrigin::InternalConversation { product_conversation_id, .. } => Some(product_conversation_id.as_str()),
+            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+        })
+        .bind(match &intent.origin {
+            ProductCreationOrigin::InternalConversation { transcript_id, .. } => Some(transcript_id.as_str()),
+            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+        })
+        .bind(match &intent.origin {
+            ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.message_id.as_str()),
+            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+        })
+        .bind(match &intent.origin {
+            ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.tool_use_id.as_str()),
+            ProductCreationOrigin::UnknownHistorical | ProductCreationOrigin::UserApi | ProductCreationOrigin::SlackGateway { .. } => None,
+        })
         .bind(&intent.model)
         .bind(intent.effort.map(ModelEffort::as_wire_name))
         .bind(intent.llm_language.as_str())
@@ -3912,7 +3925,7 @@ mod product_creation_tests {
         use phoenix_core::domain::db_schema::SourceToolCall;
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, LlmLanguage::default())
             .await
             .unwrap();
         let product_conversation_id = coordinator.product_conversation_id;
@@ -3957,7 +3970,7 @@ mod product_creation_tests {
         use phoenix_core::domain::db_schema::SourceToolCall;
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, LlmLanguage::default())
             .await
             .unwrap();
         let mut candidate = intent("/repo/origin", "objective");

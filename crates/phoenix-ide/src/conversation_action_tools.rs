@@ -268,6 +268,7 @@ impl Tool for CreateConversation {
 }
 
 impl CreateConversation {
+    #[allow(clippy::too_many_lines)]
     async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
         self.0
             .db()

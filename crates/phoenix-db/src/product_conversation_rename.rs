@@ -8,6 +8,8 @@ use crate::{Database, DbError, DbResult};
 pub struct NormalizedConversationTitle(String);
 
 impl NormalizedConversationTitle {
+    /// # Errors
+    /// Returns an error when the trimmed title is empty or exceeds 200 characters.
     pub fn parse(value: &str) -> DbResult<Self> {
         let value = value.trim();
         if value.is_empty() || value.chars().count() > 200 {
@@ -16,6 +18,7 @@ impl NormalizedConversationTitle {
         Ok(Self(value.to_owned()))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -71,6 +74,8 @@ pub struct ProductConversationRenameDetail {
 }
 
 impl Database {
+    /// # Errors
+    /// Returns an error if Coordinator authority, conversation resolution, or database access fails.
     pub async fn read_product_conversation_rename_detail(
         &self,
         transcript_id: &str,
@@ -94,6 +99,8 @@ impl Database {
     }
 
     /// Checks persisted role and singleton-head authority for a caller-selected transcript.
+    /// # Errors
+    /// Returns an error when the transcript is not the current Coordinator or the query fails.
     pub async fn require_current_coordinator_transcript(
         &self,
         transcript_id: &str,
@@ -109,6 +116,8 @@ impl Database {
     }
 
     /// Reads one receipt only after validating the current persisted Coordinator authority.
+    /// # Errors
+    /// Returns an error if Coordinator authority, operation ID validation, or database access fails.
     pub async fn read_product_conversation_rename_receipt(
         &self,
         transcript_id: &str,
@@ -125,7 +134,7 @@ impl Database {
             .bind(operation_id)
             .fetch_optional(&mut *tx)
             .await?;
-            row.map(decode_receipt).transpose()
+            row.as_ref().map(decode_receipt).transpose()
         }
         .await;
         match result {
@@ -141,6 +150,8 @@ impl Database {
     }
 
     /// Atomically performs a root-identity/revision-fenced rename and records its durable receipt.
+    /// # Errors
+    /// Returns an error if command validation, Coordinator authority, or database access fails.
     pub async fn rename_product_conversation(
         &self,
         current_gc_transcript_id: &str,
@@ -165,7 +176,7 @@ impl Database {
             }
             if let Some(row) = sqlx::query("SELECT * FROM product_conversation_rename_receipts WHERE operation_id = ?1")
                 .bind(&command.operation_id).fetch_optional(&mut *tx).await? {
-                let receipt = decode_receipt(row)?;
+                let receipt = decode_receipt(&row)?;
                 return Ok(if same_intent(&receipt, command) { ProductConversationRenameResult::Replayed(receipt) } else { ProductConversationRenameResult::Conflict });
             }
             let resolved = Self::resolve_ordinary_product_conversation_on(&mut tx, command.product_conversation_id.as_str()).await;
@@ -292,7 +303,7 @@ fn same_intent(
         && receipt.source.transcript_id == command.source.transcript_id
 }
 
-fn decode_receipt(row: sqlx::sqlite::SqliteRow) -> DbResult<ProductConversationRenameReceipt> {
+fn decode_receipt(row: &sqlx::sqlite::SqliteRow) -> DbResult<ProductConversationRenameReceipt> {
     let product = |key: &str| -> DbResult<ProductConversationId> {
         row.try_get::<String, _>(key)?
             .parse::<ProductConversationId>()
@@ -351,7 +362,7 @@ mod tests {
             .await
             .unwrap();
         let gc = db
-            .get_or_create_coordinator(None, Default::default())
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
             .unwrap();
         let detail = db
