@@ -3355,6 +3355,17 @@ def cmd_seed(
         conn.commit()
 
 
+def cmd_qa_coordinator_drive_eval() -> None:
+    """Run the isolated opt-in provider evaluation with the normal dev env."""
+    env = _resolved_phoenix_env()
+    env.setdefault("CARGO_BUILD_JOBS", "2")
+    subprocess.run(
+        ["cargo", "test", "-p", "phoenix-llm", "--test", "coordinator_drive_eval",
+         "coordinator_drive_eval", "--", "--ignored", "--exact", "--nocapture"],
+        cwd=ROOT, env=env, check=True,
+    )
+
+
 def cmd_qa_grounding_panel() -> None:
     """Capture grounding panel Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -8018,98 +8029,239 @@ def _production_cargo_feature_args() -> list[str]:
     return ["--features", "phoenix_ide/datadog-tracing"]
 
 
+@dataclasses.dataclass(frozen=True)
+class LocalCandidateSource:
+    root: Path
+    commit: str
+
+
+def _validated_local_candidate_source(source: LocalCandidateSource) -> LocalCandidateSource:
+    if re.fullmatch(r"[0-9a-f]{40}", source.commit) is None:
+        raise SystemExit("--candidate-source-commit must be a full lowercase git SHA")
+    try:
+        root = source.root.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit("candidate source root is not a readable directory") from exc
+    if not root.is_dir() or source.root.is_symlink():
+        raise SystemExit("candidate source root must be a real directory, not a symlink")
+    try:
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=root,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit("candidate source root is not a readable git worktree") from exc
+    if Path(toplevel).resolve() != root:
+        raise SystemExit("candidate source root must name the git worktree root")
+    if head != source.commit:
+        raise SystemExit(
+            f"candidate source root HEAD {head} does not match --candidate-source-commit {source.commit}"
+        )
+    try:
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=normal"], cwd=root,
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit("candidate source root is not a readable git worktree") from exc
+    if dirty:
+        raise SystemExit("candidate source root must be clean before candidate selection")
+    return LocalCandidateSource(root=root, commit=source.commit)
+
+
+def _trusted_controller_head() -> str:
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=normal"], cwd=ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit("cannot verify the trusted deployment controller checkout") from exc
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None or dirty:
+        raise SystemExit("deployment controller checkout must be clean at a full commit")
+    return head
+
+
+def _copy_local_candidate_source_file(
+    source: LocalCandidateSource,
+    relative_path: str,
+    destination: Path,
+) -> None:
+    source = _validated_local_candidate_source(source)
+    selected = source.root / relative_path
+    if not selected.is_file() or selected.is_symlink():
+        raise SystemExit(f"candidate source is missing regular file {relative_path}")
+    shutil.copy2(selected, destination)
+
+
 def prod_build(
     strip: bool = True,
     target: str | None = "x86_64-unknown-linux-musl",
     *,
     compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+    candidate_source: LocalCandidateSource | None = None,
+    candidate_output_root: Path | None = None,
 ) -> Path:
-    """Build the production binary from the invoking checkout's exact HEAD."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
-    )
-    commit = result.stdout.strip()
-    ref = commit
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True
-    ).stdout.strip()
-    if dirty:
-        print("⚠ Warning: uncommitted changes will NOT be included in the build:")
-        for line in dirty.splitlines()[:10]:
-            print(f"    {line}")
-        if len(dirty.splitlines()) > 10:
-            print(f"    ... and {len(dirty.splitlines()) - 10} more")
-        print()
-    print(f"Building from HEAD: {commit[:12]}")
-    
-    # Set up or update the build worktree
-    worktree = PROD_BUILD_WORKTREE
-    
-    if worktree.exists():
-        print(f"Updating build worktree to {ref}...")
-        subprocess.run(["git", "checkout", "--force", ref], cwd=worktree, check=True, capture_output=True)
-    else:
-        # Create new worktree
-        print(f"Creating build worktree at {worktree}...")
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", str(worktree), ref],
-            cwd=ROOT, check=True
+    """Build a production binary from the selected immutable source commit."""
+    isolated_output: Path | None = None
+    copied_candidate = False
+    if candidate_source is None:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT,
+            capture_output=True, text=True, check=True,
         )
-    
-    ui_dir = worktree / "ui"
-
-    # Build UI. Corepack-prepare pnpm before any pnpm invocation in the
-    # worktree (the helper reads the pin from the main checkout's package.json,
-    # but corepack state is global so the worktree picks it up too).
-    ensure_corepack_pnpm()
-    pnpm_env = node_env()
-    print("Installing UI dependencies...")
-    result = subprocess.run(
-        ["pnpm", "install", "--frozen-lockfile"],
-        cwd=ui_dir, capture_output=True, text=True, env=pnpm_env,
-    )
-    if result.returncode != 0:
-        print(result.stdout, end="")
-        print(result.stderr, file=sys.stderr, end="")
-        raise SystemExit(f"pnpm install --frozen-lockfile failed (exit {result.returncode})")
-
-    print("Building UI...")
-    subprocess.run(["pnpm", "run", "build"], cwd=ui_dir, check=True, env=pnpm_env)
-    subprocess.run(["git", "restore", "ui/dist/.gitkeep"], cwd=worktree, check=True)
-    build_tree_status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=worktree, capture_output=True, text=True, check=True
-    ).stdout.strip()
-    if build_tree_status:
-        raise SystemExit(f"production build worktree is dirty before Rust compilation:\n{build_tree_status}")
-    
-    # Build Rust
-    _, build_env = (
-        compiler_cache_setup
-        if compiler_cache_setup is not None
-        else _compiler_cache_subprocess_env(cargo_cwd=PROD_BUILD_WORKTREE)
-    )
-    needs_cross = target and sys.platform != "linux"
-    if needs_cross:
-        raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")
-    cargo_cmd = ["cargo", "build", "--release", *_production_cargo_feature_args()]
-    if target:
-        print(f"Building Rust ({target}, release)...")
-        cargo_cmd += ["--target", target]
-        binary = worktree / "target" / target / "release" / "phoenix_ide"
+        commit = result.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if dirty:
+            print("⚠ Warning: uncommitted changes will NOT be included in the build:")
+            for line in dirty.splitlines()[:10]:
+                print(f"    {line}")
+            if len(dirty.splitlines()) > 10:
+                print(f"    ... and {len(dirty.splitlines()) - 10} more")
+            print()
+        worktree = PROD_BUILD_WORKTREE
+        if worktree.exists():
+            print(f"Updating build worktree to {commit}...")
+            subprocess.run(
+                ["git", "checkout", "--force", commit], cwd=worktree,
+                check=True, capture_output=True,
+            )
+        else:
+            print(f"Creating build worktree at {worktree}...")
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), commit],
+                cwd=ROOT, check=True,
+            )
+        target_dir = worktree / "target"
+        worktree_owner = ROOT
+        build_git_env = None
     else:
-        print("Building Rust (native, release)...")
-        binary = worktree / "target" / "release" / "phoenix_ide"
-    subprocess.run(cargo_cmd, cwd=worktree, check=True, env=build_env)
+        candidate_source = _validated_local_candidate_source(candidate_source)
+        commit = candidate_source.commit
+        isolated_output = candidate_output_root or Path(
+            tempfile.mkdtemp(prefix=f"phoenix-prod-{commit[:12]}-")
+        )
+        if not isolated_output.is_dir() or any(isolated_output.iterdir()):
+            raise SystemExit("candidate output root must be an existing empty directory")
+        copied_candidate = True
+        worktree = isolated_output / "source"
+        target_dir = isolated_output / "target"
+        git_dir = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"],
+            cwd=candidate_source.root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        build_git_env = os.environ | {
+            "GIT_DIR": git_dir,
+            "GIT_WORK_TREE": str(worktree),
+        }
+        print(f"Copying isolated candidate source to {worktree}...")
+        shutil.copytree(
+            candidate_source.root,
+            worktree,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git", "target", "node_modules"),
+        )
+    print(f"Building from commit: {commit}")
 
-    # Strip the binary (unless debugging)
-    if strip:
-        print("Stripping binary...")
-        subprocess.run(["strip", str(binary)], check=True)
-    else:
-        print("Keeping debug symbols (unstripped)...")
+    try:
+        ui_dir = worktree / "ui"
+        ensure_corepack_pnpm()
+        pnpm_env = node_env()
+        if build_git_env is not None:
+            pnpm_env.update({
+                "GIT_DIR": build_git_env["GIT_DIR"],
+                "GIT_WORK_TREE": build_git_env["GIT_WORK_TREE"],
+            })
+        print("Installing UI dependencies...")
+        result = subprocess.run(
+            ["pnpm", "install", "--frozen-lockfile"],
+            cwd=ui_dir, capture_output=True, text=True, env=pnpm_env,
+        )
+        if result.returncode != 0:
+            print(result.stdout, end="")
+            print(result.stderr, file=sys.stderr, end="")
+            raise SystemExit(f"pnpm install --frozen-lockfile failed (exit {result.returncode})")
 
-    size_mb = binary.stat().st_size / (1024 * 1024)
-    print(f"Built: {binary} ({size_mb:.1f} MB)")
+        print("Building UI...")
+        subprocess.run(["pnpm", "run", "build"], cwd=ui_dir, check=True, env=pnpm_env)
+        subprocess.run(
+            ["git", "restore", "ui/dist/.gitkeep"],
+            cwd=worktree,
+            check=True,
+            env=build_git_env,
+        )
+        build_tree_status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=worktree,
+            capture_output=True, text=True, check=True, env=build_git_env,
+        ).stdout.strip()
+        if build_tree_status:
+            raise SystemExit(
+                f"production build worktree is dirty before Rust compilation:\n{build_tree_status}"
+            )
+
+        _, build_env = (
+            compiler_cache_setup
+            if compiler_cache_setup is not None
+            else _compiler_cache_subprocess_env(cargo_cwd=worktree)
+        )
+        if build_git_env is not None:
+            build_env = build_env | {
+                "GIT_DIR": build_git_env["GIT_DIR"],
+                "GIT_WORK_TREE": build_git_env["GIT_WORK_TREE"],
+            }
+        needs_cross = target and sys.platform != "linux"
+        if needs_cross:
+            raise SystemExit(
+                f"Cross-compilation not supported on {sys.platform}; use CI for release builds."
+            )
+        cargo_cmd = ["cargo", "build", "--release", *_production_cargo_feature_args()]
+        if isolated_output is not None:
+            cargo_cmd += ["--target-dir", str(target_dir)]
+        if target:
+            print(f"Building Rust ({target}, release)...")
+            cargo_cmd += ["--target", target]
+            binary = target_dir / target / "release" / "phoenix_ide"
+        else:
+            print("Building Rust (native, release)...")
+            binary = target_dir / "release" / "phoenix_ide"
+        subprocess.run(cargo_cmd, cwd=worktree, check=True, env=build_env)
+
+        if strip:
+            print("Stripping binary...")
+            subprocess.run(["strip", str(binary)], check=True)
+        else:
+            print("Keeping debug symbols (unstripped)...")
+
+        size_mb = binary.stat().st_size / (1024 * 1024)
+        print(f"Built: {binary} ({size_mb:.1f} MB)")
+        if copied_candidate:
+            shutil.copy2(
+                worktree / "crates" / "phoenix-db" / "src" / "migrations.rs",
+                isolated_output / "migrations.rs",
+            )
+    finally:
+        if copied_candidate:
+            shutil.rmtree(worktree, ignore_errors=True)
+        elif isolated_output is not None and worktree.exists():
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree)],
+                cwd=worktree_owner,
+                check=True,
+            )
 
     return binary
 
@@ -10048,6 +10200,16 @@ class PreparedCandidate:
     identity: RuntimeIdentity
     release_tag: str | None = None
     release_commit: str | None = None
+    migration_registry: Path | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PrebuiltLocalCandidateInputs:
+    binary: Path
+    binary_sha256: str
+    migration_registry: Path
+    migration_registry_sha256: str
+    source: LocalCandidateSource
 
 
 @dataclasses.dataclass(frozen=True)
@@ -10099,6 +10261,68 @@ class ProdDeployControllerOptions:
     systemd_current_schema_upgrade: bool = False
     same_schema_refresh: bool = False
     controller_source_commit: str | None = None
+    candidate_source_root: Path | None = None
+    candidate_source_commit: str | None = None
+
+    def require_local_candidate_source(
+        self,
+        release: str | None,
+        *,
+        prebuilt_source: LocalCandidateSource | None = None,
+    ) -> LocalCandidateSource | None:
+        if (self.candidate_source_root is None) != (self.candidate_source_commit is None):
+            raise SystemExit(
+                "--candidate-source-root and --candidate-source-commit must be provided together"
+            )
+        if prebuilt_source is not None and self.candidate_source_root is not None:
+            raise SystemExit(
+                "verified prebuilt local candidate cannot be combined with candidate source flags"
+            )
+        if prebuilt_source is None and self.candidate_source_root is None:
+            return None
+        if self.enabled:
+            raise SystemExit(
+                "explicit candidate source cannot be combined with --controller-mode"
+            )
+        if sys.platform != "darwin" or self.backend != "launchd":
+            raise SystemExit(
+                "explicit candidate source requires macOS and --backend launchd"
+            )
+        if release is not None:
+            raise SystemExit("explicit candidate source cannot be combined with a release version")
+        if self.prepared_artifact is not None:
+            raise SystemExit("explicit candidate source cannot be combined with --prepared-artifact")
+        if self.controller_source_commit is not None:
+            raise SystemExit(
+                "explicit candidate source cannot be combined with --controller-source-commit"
+            )
+        if any((
+            self.paired_database_upgrade,
+            self.current_schema_upgrade,
+            self.systemd_current_schema_upgrade,
+            self.same_schema_refresh,
+        )):
+            raise SystemExit(
+                "explicit candidate source selects an ordinary local-head transaction; "
+                "do not combine it with a migration mode selector"
+            )
+        if any(value is not None for value in (
+            self.exact_release_tag,
+            self.expected_full_commit,
+            self.expected_asset_name,
+            self.expected_asset_sha256,
+            self.expected_preparation_receipt_sha256,
+        )):
+            raise SystemExit(
+                "explicit candidate source cannot be combined with release or prepared-artifact pins"
+            )
+        return _validated_local_candidate_source(
+            prebuilt_source
+            or LocalCandidateSource(
+                root=self.candidate_source_root,
+                commit=self.candidate_source_commit,
+            )
+        )
 
     def require_controller_source(self, release: str | None) -> None:
         if self.same_schema_refresh:
@@ -10205,6 +10429,9 @@ class ProdDeployControllerOptions:
         return release, expected
 
     def require_backend(self) -> str:
+        if self.candidate_source_root is not None or self.candidate_source_commit is not None:
+            self.require_local_candidate_source(None)
+            return "launchd"
         if not self.enabled:
             return detect_prod_env()
         backend = {
@@ -10854,34 +11081,93 @@ def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> Pr
 
 
 
+def _verify_prebuilt_local_candidate(
+    inputs: PrebuiltLocalCandidateInputs,
+    source: LocalCandidateSource,
+) -> PreparedCandidate:
+    if inputs.source != source:
+        raise SystemExit("prebuilt local candidate source does not match selected source")
+    artifacts = (
+        ("binary", inputs.binary, inputs.binary_sha256),
+        ("migration registry", inputs.migration_registry, inputs.migration_registry_sha256),
+    )
+    for description, path, expected_sha256 in artifacts:
+        if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+            raise SystemExit(f"prebuilt local candidate {description} SHA-256 is not exact")
+        if not path.is_file() or path.is_symlink():
+            raise SystemExit(f"prebuilt local candidate {description} is not a regular file")
+        if _file_sha256(path) != expected_sha256:
+            raise SystemExit(f"prebuilt local candidate {description} SHA-256 mismatch")
+    identity = RuntimeIdentity.from_value(_binary_identity(inputs.binary))
+    if identity.git_sha != source.commit:
+        raise SystemExit(
+            "prebuilt local candidate embedded identity does not match selected source"
+        )
+    for description, path, expected_sha256 in artifacts:
+        if _file_sha256(path) != expected_sha256:
+            raise SystemExit(f"prebuilt local candidate {description} changed during validation")
+    return PreparedCandidate(
+        binary=inputs.binary,
+        source_kind=ProdSourceKind.LOCAL_HEAD,
+        source_commit=source.commit,
+        identity=identity,
+        migration_registry=inputs.migration_registry,
+    )
+
+
 def _prepare_local_candidate(
     *,
     target: str | None,
     compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+    candidate_source: LocalCandidateSource | None = None,
 ) -> PreparedCandidate:
+    candidate_output_root = (
+        Path(tempfile.mkdtemp(prefix=f"phoenix-prod-{candidate_source.commit[:12]}-"))
+        if candidate_source is not None
+        else None
+    )
     binary = prod_build(
         target=target,
+        **(
+            {
+                "candidate_source": candidate_source,
+                "candidate_output_root": candidate_output_root,
+            }
+            if candidate_source is not None
+            else {}
+        ),
         **(
             {"compiler_cache_setup": compiler_cache_setup}
             if compiler_cache_setup is not None
             else {}
         ),
     )
-    source_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
-    ).stdout.strip()
+    source_commit = (
+        candidate_source.commit
+        if candidate_source is not None
+        else subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    )
     identity = RuntimeIdentity.from_value(_binary_identity(binary))
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
         raise SystemExit("selected HEAD is not a full lowercase git SHA")
     if re.fullmatch(r"[0-9a-f]{40}", identity.git_sha) is None or identity.git_sha != source_commit:
+        selected = "selected source" if candidate_source is not None else "selected HEAD"
         raise SystemExit(
-            f"local candidate identity {identity.git_sha} does not exactly match selected HEAD {source_commit}"
+            f"local candidate identity {identity.git_sha} does not exactly match {selected} {source_commit}"
         )
     return PreparedCandidate(
         binary=binary,
         source_kind=ProdSourceKind.LOCAL_HEAD,
         source_commit=source_commit,
         identity=identity,
+        migration_registry=(
+            candidate_output_root / "migrations.rs"
+            if candidate_output_root is not None
+            else None
+        ),
     )
 
 
@@ -11535,6 +11821,29 @@ def _release_launchd_restart_claim(transaction_id: str) -> bool:
         return _release_launchd_restart_claim_unlocked(transaction_id)
 
 
+_ORDINARY_FORWARD_RESUME_STATES = frozenset(
+    {
+        "ordinary_preboundary_prepared",
+        "ordinary_preboundary_stopped",
+        "ordinary_source_proven",
+        "ordinary_preboundary_failed_stopped",
+        "ordinary_activation_failed_rollback_failed",
+        "candidate_may_migrate",
+        "ordinary_migration_proven",
+        "ordinary_activation_failed_forward_only",
+    }
+)
+
+
+def _ordinary_forward_recovery_pending(status: dict) -> bool:
+    state = status.get("state")
+    return state in _ORDINARY_FORWARD_RESUME_STATES or (
+        state == "committed"
+        and status.get("finalization_pending") is True
+        and status.get("recovery_mode") == "ordinary_forward_proven"
+    )
+
+
 def _paired_recovery_refusal(owner: str | None) -> str | None:
     if owner is None:
         return None
@@ -11597,6 +11906,11 @@ def _paired_recovery_refusal(owner: str | None) -> str | None:
             f"ordinary forward activation {owner} may have committed migration 126/127 or coordinator-home initialization. "
             "Do not start the predecessor or remove the claim. Preserve the retained candidate and evidence; "
             f"after explicit forward-recovery authorization run ./dev.py prod resume-forward {owner}."
+        )
+    if ordinary_forward and owner_status and _ordinary_forward_recovery_pending(status):
+        return (
+            f"ordinary forward recovery for {owner} is incomplete. Do not remove its claim or retained evidence; "
+            f"run ./dev.py prod resume-forward {owner}."
         )
     if (
         owner_status
@@ -12839,7 +13153,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
         not isinstance(forward, dict)
         or not _deploy_status_matches_manifest(staging, payload, status, DeployManifestKind.ORDINARY_FORWARD)
         or status.get("transaction_id") != transaction_id
-        or status.get("state") not in {"candidate_may_migrate", "ordinary_activation_failed_forward_only"}
+        or not _ordinary_forward_recovery_pending(status)
         or _deploy_claim_owner() != transaction_id
     ):
         raise SystemExit("forward recovery requires a retained unresolved ordinary transaction")
@@ -12861,7 +13175,7 @@ def cmd_prod_resume_forward(transaction_id: str) -> None:
     )
     if result.returncode != 0:
         raise SystemExit(f"forward recovery failed; claim retained: {result.stderr.strip()}")
-    print(f"Forward recovery committed exact retained candidate: {transaction_id}.")
+    print(f"Forward recovery completed: {transaction_id}.")
 
 
 def _atomic_write_temporary_paths(evidence: Path) -> tuple[Path, ...]:
@@ -13107,11 +13421,26 @@ def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = No
     return env, env_file
 
 
+def _prepared_launchd_deploy_status(manifest: dict, prepared_mode: str | None) -> dict:
+    identity = manifest["expected"]
+    return {
+        "transaction_id": manifest["transaction_id"], "state": "prepared",
+        "preparing_pid": os.getpid(), "source_kind": manifest["source_kind"],
+        "prepared_mode": prepared_mode,
+        "source_commit": manifest["source_commit"],
+        "release_commit": manifest["release_commit"], "release_tag": manifest["release_tag"],
+        "expected_version": identity["version"], "expected_git_sha": identity["git_sha"],
+        "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
+        "failure": None, "rollback_failure": None, "finalization_pending": False,
+    }
+
+
 def launchd_prod_deploy(
     release: str | None = None,
     *,
     controller: "ProdDeployControllerOptions | None" = None,
     compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+    prebuilt_local_candidate: PrebuiltLocalCandidateInputs | None = None,
 ):
     """Prepare a candidate, then hand transactional activation to launchd."""
     import uuid
@@ -13120,6 +13449,33 @@ def launchd_prod_deploy(
     if controller.systemd_current_schema_upgrade:
         raise SystemExit("protected systemd current-schema mode cannot use this backend")
     controller.require_controller_source(release)
+    explicit_candidate_source = controller.require_local_candidate_source(
+        release,
+        prebuilt_source=(
+            prebuilt_local_candidate.source
+            if prebuilt_local_candidate is not None
+            else None
+        ),
+    )
+    trusted_controller_commit = None
+    prepared_local_candidate = None
+    if explicit_candidate_source is not None:
+        trusted_controller_commit = _trusted_controller_head()
+        prepared_local_candidate = (
+            _verify_prebuilt_local_candidate(
+                prebuilt_local_candidate, explicit_candidate_source
+            )
+            if prebuilt_local_candidate is not None
+            else _prepare_local_candidate(
+                target=None,
+                candidate_source=explicit_candidate_source,
+                **(
+                    {"compiler_cache_setup": compiler_cache_setup}
+                    if compiler_cache_setup is not None
+                    else {}
+                ),
+            )
+        )
     if (controller.prepared_artifact is not None
             and controller.expected_full_commit == PREPARED_SOURCE128_COMMIT
             and not controller.current_schema_upgrade):
@@ -13139,6 +13495,18 @@ def launchd_prod_deploy(
         or controller.expected_full_commit is None
     ):
         raise SystemExit("--current-schema-upgrade requires --prepared-artifact and --expected-full-commit, excludes --paired-database-upgrade and --release")
+    if explicit_candidate_source is not None:
+        if _validated_local_candidate_source(explicit_candidate_source) != explicit_candidate_source:
+            raise SystemExit("candidate source changed while the isolated build was running")
+        if _trusted_controller_head() != trusted_controller_commit:
+            raise SystemExit("trusted controller source changed while the isolated build was running")
+        if (
+            prepared_local_candidate is None
+            or prepared_local_candidate.migration_registry is None
+            or not prepared_local_candidate.migration_registry.is_file()
+        ):
+            raise SystemExit("isolated candidate build did not preserve migrations.rs")
+
     protected_current = controller.current_schema_upgrade or controller.same_schema_refresh
     installed_config_hash = _file_sha256(LAUNCHD_PLIST_PATH) if (controller.paired_database_upgrade or protected_current) and LAUNCHD_PLIST_PATH.is_file() else None
     launchd_env, _env_file = _launchd_candidate_env(controller)
@@ -13153,7 +13521,11 @@ def launchd_prod_deploy(
         "prepared_artifact" if controller.prepared_artifact is not None
         else "published_release" if release else "local_head"
     )
-    source_commit = None
+    source_commit = (
+        prepared_local_candidate.source_commit
+        if prepared_local_candidate is not None
+        else None
+    )
     release_commit = None
     release_tag = release
     selected_identity: RuntimeIdentity | None = None
@@ -13222,6 +13594,8 @@ def launchd_prod_deploy(
             prepared = (
                 _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
                 if release
+                else prepared_local_candidate
+                if prepared_local_candidate is not None
                 else _prepare_local_candidate(
                     target=None,
                     **(
@@ -13305,7 +13679,9 @@ def launchd_prod_deploy(
             ) = _resolve_rollback_identity(rollback_binary, previous_env)
 
         helper = staging / "activate.py"
-        controller_source_commit = controller.controller_source_commit
+        controller_source_commit = (
+            controller.controller_source_commit or trusted_controller_commit
+        )
         if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT:
             controller_source_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
             if re.fullmatch(r"[0-9a-f]{40}", controller_source_commit) is None:
@@ -13364,12 +13740,19 @@ def launchd_prod_deploy(
         )
         if protected_current or ordinary_forward_migration:
             migration_registry = staging / "migrations.rs"
-            _materialize_source_file(
-                source_commit,
-                "crates/phoenix-db/src/migrations.rs",
-                migration_registry,
-                "local_head" if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT else source_kind,
-            )
+            if explicit_candidate_source is not None:
+                if prepared.migration_registry is None:
+                    raise SystemExit("isolated candidate build did not preserve migrations.rs")
+                _stage_disposable_validation_file(
+                    prepared.migration_registry, migration_registry, 0o600
+                )
+            else:
+                _materialize_source_file(
+                    source_commit,
+                    "crates/phoenix-db/src/migrations.rs",
+                    migration_registry,
+                    "local_head" if prepared.source_kind == ProdSourceKind.PREPARED_ARTIFACT else source_kind,
+                )
             migration_registry.chmod(0o600)
             if prepared_source114 and _file_sha256(migration_registry) != PREPARED_SOURCE114_REGISTRY_SHA256:
                 raise SystemExit("exact prepared source114 candidate registry SHA-256 mismatch")
@@ -13494,15 +13877,7 @@ def launchd_prod_deploy(
             with artifact.open("rb") as stream:
                 os.fsync(stream.fileno())
         _fsync_directory(staging)
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "prepared",
-            "preparing_pid": os.getpid(), "source_kind": source_kind,
-            "prepared_mode": prepared_mode,
-            "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
-            "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
-            "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
-            "failure": None, "rollback_failure": None,
-        })
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, _prepared_launchd_deploy_status(manifest, prepared_mode))
         _ensure_newsyslog_config()
         bootstrap_attempted = True
         result = subprocess.run(
@@ -13940,16 +14315,13 @@ def _print_launchd_deploy_status() -> None:
             }
             ordinary_forward = kind is DeployManifestKind.ORDINARY_FORWARD
             resolved = _markerless_status_is_resolved(deploy)
-            forward_only_state = deploy.get("state") in {
-                "candidate_may_migrate",
-                "ordinary_activation_failed_forward_only",
-            }
-            ordinary_forward_only = ordinary_forward and forward_only_state
-            conflicting_forward_state = forward_only_state and not ordinary_forward
+            forward_recovery_state = _ordinary_forward_recovery_pending(deploy)
+            ordinary_forward_recovery = ordinary_forward and forward_recovery_state
+            conflicting_forward_state = forward_recovery_state and not ordinary_forward
             unknown_unresolved = kind is DeployManifestKind.UNKNOWN and not resolved
             markerless_unresolved = (
                 (prepared and not resolved)
-                or ordinary_forward_only
+                or ordinary_forward_recovery
                 or conflicting_forward_state
                 or unknown_unresolved
             )
@@ -13961,16 +14333,16 @@ def _print_launchd_deploy_status() -> None:
                 )
             elif conflicting_forward_state:
                 print(
-                    "    UNRESOLVED: forward-only status conflicts with the retained ordinary manifest. "
+                    "    UNRESOLVED: forward-recovery status conflicts with the retained ordinary manifest. "
                     "Preserve its candidate and evidence; do not redeploy or invoke recovery until "
                     "the manifest/status mismatch is diagnosed."
                 )
-            elif ordinary_forward_only:
+            elif ordinary_forward_recovery:
                 print(
-                    "    UNRESOLVED: ordinary forward-only transaction status has no active claim owner. "
+                    "    UNRESOLVED: ordinary forward-recovery status has no active claim owner. "
                     "Preserve its candidate and evidence; do not start the predecessor, redeploy, "
                     "or recreate or clear markers until claim/status ownership is diagnosed. "
-                    "After an actual matching claim exists and forward recovery is explicitly authorized, "
+                    "After an actual matching claim exists, "
                     f"the supported path is ./dev.py prod resume-forward {transaction_id}."
                 )
             elif prepared and not resolved:
@@ -14088,6 +14460,7 @@ def cmd_prod_deploy(
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
     controller.require_controller_source(release)
+    controller.require_local_candidate_source(release)
     upgrade_modes = (controller.paired_database_upgrade, controller.current_schema_upgrade, controller.same_schema_refresh)
     if sum(upgrade_modes) > 1:
         raise SystemExit("--paired-database-upgrade, --current-schema-upgrade and --same-schema-refresh are mutually exclusive")
@@ -14433,6 +14806,7 @@ def main():
     qa_sub.add_parser("sidebar", help="Capture sidebar Ladle screenshots")
     qa_sub.add_parser("task-approval", help="Capture task approval Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
+    qa_sub.add_parser("coordinator-drive-eval", help="Run isolated opt-in Coordinator action evaluation")
     qa_sub.add_parser("coordinator", help="Capture Coordinator screenshots across responsive viewports")
     qa_sub.add_parser("mobile-multi-pr-conversation", help="Capture a mobile conversation with two open PRs")
     qa_sub.add_parser("desktop-multi-pr-conversation", help="Capture a desktop conversation with multiple open PRs")
@@ -14475,13 +14849,26 @@ def main():
         "--release", metavar="TAG|latest",
         help="Install an immutable published GitHub release without checks or compilation",
     )
+    deploy_backend = deploy_parser.add_mutually_exclusive_group()
+    deploy_backend.add_argument(
+        "--backend", choices=["launchd"], default=None,
+        help="Deployment backend for explicit local-candidate source selection",
+    )
+    deploy_parser.add_argument(
+        "--candidate-source-root", type=Path, default=None,
+        help="Clean candidate checkout to build without changing the trusted controller checkout",
+    )
+    deploy_parser.add_argument(
+        "--candidate-source-commit", default=None,
+        help="Expected full lowercase HEAD SHA of --candidate-source-root",
+    )
     deploy_parser.add_argument("legacy_version", nargs="?", help=argparse.SUPPRESS)
     deploy_parser.add_argument(
         "--pretty", action="store_true", default=False,
         help="Render the pre-deploy check as a live lane table",
     )
     deploy_parser.add_argument("--controller-mode", action="store_true", help=argparse.SUPPRESS)
-    deploy_parser.add_argument(
+    deploy_backend.add_argument(
         "--controller-backend",
         choices=("launchd", "systemd", "bare_linux"),
         help=argparse.SUPPRESS,
@@ -14658,6 +15045,8 @@ def main():
             cmd_qa_task_approval()
         elif args.qa_command == "mobile-conversation-list":
             cmd_qa_mobile_conversation_list()
+        elif args.qa_command == "coordinator-drive-eval":
+            cmd_qa_coordinator_drive_eval()
         elif args.qa_command == "coordinator":
             cmd_qa_coordinator()
         elif args.qa_command == "mobile-multi-pr-conversation":
@@ -14704,6 +15093,8 @@ def main():
                 controller=ProdDeployControllerOptions(
                     enabled=args.controller_mode,
                     controller_source_commit=args.controller_source_commit,
+                    candidate_source_root=getattr(args, "candidate_source_root", None),
+                    candidate_source_commit=getattr(args, "candidate_source_commit", None),
                     exact_release_tag=args.controller_release_tag,
                     expected_full_commit=args.expected_full_commit or args.controller_expected_full_commit,
                     expected_asset_name=args.controller_expected_asset_name,
@@ -14715,7 +15106,10 @@ def main():
                     current_schema_upgrade=args.current_schema_upgrade,
                     systemd_current_schema_upgrade=args.systemd_current_schema_upgrade,
                     same_schema_refresh=args.same_schema_refresh,
-                    backend=args.controller_backend,
+                    backend=(
+                        getattr(args, "backend", None)
+                        or getattr(args, "controller_backend", None)
+                    ),
                 ),
             )
         elif args.prod_command == "cleanup-paired":

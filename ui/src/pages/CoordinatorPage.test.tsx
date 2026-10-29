@@ -49,7 +49,7 @@ vi.mock('./ProductConversationPage', () => ({
         {globalShell?.stateBarExtension?.details}
       </div>
       {globalShell?.composerQuickAction && (
-        <button type="button" data-prompt={globalShell.composerQuickAction.prompt}>
+        <button type="button" aria-label={globalShell.composerQuickAction.label} data-prompt={globalShell.composerQuickAction.prompt}>
           {globalShell.composerQuickAction.compactLabel}
           <span className="sr-only">{globalShell.composerQuickAction.label}</span>
         </button>
@@ -197,14 +197,35 @@ describe('CoordinatorPage', () => {
     expect(screen.getByRole('region', { name: 'Running commands' })).toBeInTheDocument();
   });
 
-  it('mounts only the shared conversation runtime with the briefing action', async () => {
+  it('wires the active check-in through the shared conversation runtime', async () => {
     renderPage();
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    const action = screen.getByRole('button', { name: /Brief me/ });
+    const action = screen.getByRole('button', { name: 'Check in & drive' });
     expect(action).toHaveAttribute('data-prompt', COORDINATOR_BRIEFING_PROMPT);
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('fresh current-work facts through query_database');
-    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages, change anything, or start a polling loop.');
+    // Pre-rewrite prompt: 150 words, 984 characters.
+    expect(COORDINATOR_BRIEFING_PROMPT.split(/\s+/).length).toBeLessThanOrEqual(150);
+    expect(COORDINATOR_BRIEFING_PROMPT.length).toBeLessThanOrEqual(984);
+    for (const phrase of [
+      'including idle owners',
+      'Leave verified healthy progress alone',
+      'diagnose blocked or waiting states',
+      'smallest recovery step through existing owners within verified standing authority',
+      'verify work resumed',
+      'Progress elsewhere does not clear a blocker',
+      'Preserve prior decisions, pauses and gates',
+      'check-ins add no authority',
+      'reconcile later decisions and completed work',
+      'Verify unanswered choices still matter',
+      'independent authorized work',
+      'ask_user_question with context and a recommendation',
+      'Assume I missed intervening messages',
+      'plain English, not internal process labels',
+      'distinguish requests from verified outcomes',
+      'Skip routine check/send receipts',
+      'No fixed template',
+    ]) expect(COORDINATOR_BRIEFING_PROMPT).toContain(phrase);
+    expect(COORDINATOR_BRIEFING_PROMPT).not.toContain('Do not send messages');
 
     expect(screen.queryByRole('heading', { name: 'Coordinator' })).not.toBeInTheDocument();
     expect(screen.queryByRole('tablist', { name: 'Coordinator view' })).not.toBeInTheDocument();

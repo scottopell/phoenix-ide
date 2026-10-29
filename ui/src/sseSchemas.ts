@@ -118,6 +118,7 @@ export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.varian
   v.looseObject({ kind: v.literal('unknown_historical') }),
   v.looseObject({ kind: v.literal('user_api') }),
   v.looseObject({ kind: v.literal('system_generated') }),
+  v.looseObject({ kind: v.literal('slack_gateway'), request_id: v.string() }),
   v.looseObject({ kind: v.literal('subscription_event'), event_id: v.string() }),
   v.looseObject({
     kind: v.literal('internal_conversation'),
@@ -146,6 +147,7 @@ export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation
       v.looseObject({ kind: v.literal('cancelled') }),
       v.looseObject({ kind: v.literal('awaiting_user_response') }),
       v.looseObject({ kind: v.literal('awaiting_task_approval') }),
+      v.looseObject({ kind: v.literal('goal_changed') }),
     ]),
   }),
   v.looseObject({
@@ -322,6 +324,8 @@ const ERROR_KIND_OPTIONS = [
   'cancelled',
   'sub_agent_error',
   'context_exhausted',
+  'context_capacity_conflict',
+  'planned_context_pressure',
   'output_tokens_exhausted',
   'turn_limit_exhausted',
   'content_filter',

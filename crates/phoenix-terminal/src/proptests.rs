@@ -1019,7 +1019,8 @@ async fn failed_wait_with_reused_pid_retires_exact_handle() {
 
 #[tokio::test]
 async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
-    use crate::spawn::{spawn_pty, PtyExecPlan};
+    use crate::spawn::{set_nonblocking, spawn_pty, PtyExecPlan};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let _real_child_guard = REAL_CHILD_TEST_LOCK.lock().await;
     let registry = ActiveTerminals::new();
@@ -1037,16 +1038,31 @@ async fn detached_direct_shell_exit_is_reaped_without_reconnect_or_close() {
         )
         .unwrap();
     let fd = handle.master_fd_raw().unwrap();
+    // SAFETY: the handle owns this master until natural cleanup; dup creates independent ownership.
+    let drain_fd = unsafe { libc::dup(fd) };
+    assert!(drain_fd >= 0, "duplicate master for test I/O");
+    // SAFETY: dup returned a new descriptor owned only by this fixture.
+    let drain_fd = unsafe { OwnedFd::from_raw_fd(drain_fd) };
+    set_nonblocking(drain_fd.as_raw_fd()).unwrap();
+    let mut drain = crate::relay::PtyMasterIo::new(drain_fd).unwrap();
     let command = b"exit\n";
     // SAFETY: this handle still owns the master and the command buffer is valid.
     assert_eq!(
         unsafe { libc::write(fd, command.as_ptr().cast(), command.len()) },
         5
     );
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        await_natural_cleanup(&handle),
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // macOS can defer shell exit until pending PTY output is read.
+        tokio::join!(
+            async {
+                tokio::io::copy(&mut drain, &mut tokio::io::sink())
+                    .await
+                    .expect("drain test PTY output");
+                drop(drain);
+            },
+            await_natural_cleanup(&handle),
+        );
+    })
     .await
     .expect("natural exit must clean detached shell without another connection");
     assert!(registry.get(&scope).is_none());

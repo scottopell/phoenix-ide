@@ -1,10 +1,11 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
--- Requirement traceability: REQ-LDD-001 through REQ-LDD-025
+-- Requirement traceability: REQ-LDD-001 through REQ-LDD-028
 -- REQ-LDD-019–022 admit prepared sources at exact 123 or exact 128 with
 -- exact target 128; one exact prepared candidate additionally admits prefix114.
 -- The protected published-release admission remains separate exact 114 -> 128.
--- REQ-LDD-023 admits ordinary pending migrations only at exact 123 -> 128.
+-- REQ-LDD-023/028 admit ordinary pending migrations when the complete live
+-- ledger is an exact ordered prefix of the immutable complete candidate registry.
 
 config {
     transition_timeout_seconds: Integer = 30
@@ -392,22 +393,22 @@ external entity TargetService {
 --   and exclusive operation lock all re-verify before any candidate startup.
 --   It does not repeat offline migration.
 -- ordinary_forward_boundary_qualified(transaction) -> Boolean
---   Only ordinary local HEAD or published release deployment with an exact
---   complete migration-123 source ledger and exact migration-128 candidate
---   registry with the named 126/127/128 entries defined by current_schema_preflight_is_valid.
---   The complete registry and SHA-256 digest are immutable evidence bound to the
---   candidate identity/configuration and helper, re-verified before activation
---   and forward recovery. Pre-handoff admission executes the hash/path-bound
---   staged helper, never an ambient checkout. Different, missing or newer registries reject.
+--   Ordinary local HEAD or published release deployment has a complete live
+--   ledger that exactly equals a prefix of the immutable complete candidate
+--   registry and a non-empty pending suffix. The exact source and target ledgers,
+--   registry and SHA-256 digest are immutable evidence bound to the candidate
+--   identity/configuration and helper, re-verified before activation and forward
+--   recovery. Pre-handoff admission executes the hash/path-bound staged helper,
+--   never an ambient checkout. Different, missing or malformed evidence rejects.
 --   No standalone database backup is required.
 -- ordinary_pending_migrations_admitted(transaction) -> Boolean
 --   True for protected transactions, an absent candidate database path, or no
 --   pending migrations. An absent path includes a switch from a predecessor's
 --   different database: captured predecessor configuration still governs ordinary
 --   artifact rollback. An existing database is guarded even on first install.
---   Ordinary pending migrations require ordinary_forward_boundary_qualified (exact 123 -> 128).
---   Protected exact 114 -> 128 admission does not qualify an ordinary interval.
---   Unknown or unqualified pending intervals reject before runtime disruption.
+--   Ordinary pending migrations require ordinary_forward_boundary_qualified.
+--   Protected admission remains an independent protocol with its own obligations.
+--   Non-prefix or unprovable pending histories reject before runtime disruption.
 -- OrdinaryPendingMigrationsRejected(transaction)
 --   Ordinary pending migrations have no explicitly qualified interval; no stop,
 --   install or candidate startup has occurred.
@@ -422,7 +423,8 @@ external entity TargetService {
 --   Explicit operator authorization, matching ownership claim and retained
 --   transaction/helper, exact candidate binary/configuration, immutable complete
 --   registry and SHA-256 digest, stopped target and exclusive operation lock all
---   re-verify before startup.
+--   re-verify before startup. The observed ledger is an exact target prefix that
+--   contains the complete retained source ledger.
 -- ordinary_forward_failure_fenced(transaction) -> Boolean
 --   Candidate teardown is attempted and the target remains stopped when possible;
 --   failure to confirm stop is reported explicitly, never treated as safe to
@@ -1104,7 +1106,8 @@ rule RecoverUnchangedCurrentSchemaSource {
 -- CurrentSchemaSnapshotNotReplayed(transaction)
 --   Finalization does not restore or replay the audit snapshot.
 -- OrdinaryForwardCandidateStartupRequested(transaction)
---   Exact 123 -> 128 ordinary activation is about to attempt candidate startup.
+--   A qualified exact-prefix ordinary activation attempts candidate startup only
+--   after the candidate has executed and proven the pending migration suffix.
 -- OrdinaryForwardActivationFailed(transaction, failure)
 --   Candidate startup or health failed, or absence of a start attempt is unproven.
 -- OrdinaryForwardResumeRequested(transaction)
@@ -1122,9 +1125,9 @@ rule FenceFailedOrdinaryForwardActivation {
     ensures: DurableStatusWritten(transaction)
 
     @guidance
-        -- A failed or unknown start may have committed migrations 126/127/128 or
-        -- coordinator-home initialization. Stop the candidate where possible;
-        -- never bootstrap the predecessor or clear the claim on uncertainty.
+        -- A failed candidate migration invocation or start may have advanced the
+        -- database. Stop the candidate where possible; never bootstrap the
+        -- predecessor or clear the claim on uncertainty.
 }
 
 rule ResumeFailedOrdinaryForwardActivation {

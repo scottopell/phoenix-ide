@@ -1,4 +1,5 @@
 import dataclasses
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -1379,7 +1380,9 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
         self.manifest_path = self.manifest_path.resolve()
         # Unit subprocess oracles use inert artifacts, never the production executable.
         asset_pin = mock.patch.object(helper, "PROTECTED_ASSET_SHA256", self.raw["candidate"]["binary"]["sha256"])
-        registry_source = (ROOT / "crates/phoenix-db/src/migrations.rs").read_text()
+        registry_bytes = gzip.decompress((ROOT / "tests/devpy/fixtures/migrations-through-129.rs.gz").read_bytes())
+        self.assertEqual(hashlib.sha256(registry_bytes).hexdigest(), "c54f9884b1b86aea19ca214cf059724f456c899a219006b59f1c6a16cca6caa5")
+        registry_source = registry_bytes.decode()
         registry_match = re.search(r"(const MIGRATIONS: &\[Migration\] = &\[)(.*?)(\n\];)", registry_source, re.DOTALL)
         self.assertIsNotNone(registry_match)
         historical_entries, removed = re.subn(
@@ -2298,7 +2301,8 @@ class SystemdProtectedCurrentTests(SystemdActivationTests):
 
     def test_actual_registry_with_migration129_is_rejected_by_protected_fixture(self):
         manifest = self.protected()
-        actual_registry = ROOT / "crates/phoenix-db/src/migrations.rs"
+        actual_registry = self.transaction / "actual-registry129.rs"
+        actual_registry.write_bytes(gzip.decompress((ROOT / "tests/devpy/fixtures/migrations-through-129.rs.gz").read_bytes()))
         mutated = dataclasses.replace(
             manifest,
             registry=helper.Artifact(str(actual_registry), digest(actual_registry)),

@@ -1,6 +1,6 @@
 [package]
 name = "phoenix_ide"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 rust-version = "1.95"
 
@@ -102,6 +102,7 @@ mime_guess = "2"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono-tz = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 thiserror = "2"

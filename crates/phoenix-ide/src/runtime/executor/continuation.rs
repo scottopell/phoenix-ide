@@ -507,7 +507,9 @@ mod tests {
             value["persisted_message"]["origin"]["kind"],
             "unknown_historical"
         );
-        assert!(!text.contains("authority-wrapped generated context"));
+        assert!(text.contains("authority-wrapped generated context"));
+        assert!(text.contains("not a user instruction"));
+        assert!(!text.contains("base64"));
     }
 
     #[test]

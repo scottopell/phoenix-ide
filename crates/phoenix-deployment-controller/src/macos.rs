@@ -1145,6 +1145,34 @@ mod tests {
         );
     }
 
+    fn executable_path(pid: ProcessId) -> Result<PathBuf, MacOsError> {
+        let native_pid =
+            c_int::try_from(pid.get()).map_err(|_| MacOsError::MalformedObservation)?;
+        let capacity = usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE)
+            .map_err(|_| MacOsError::MalformedObservation)?;
+        let buffer_size = u32::try_from(capacity).map_err(|_| MacOsError::MalformedObservation)?;
+        let mut buffer = vec![u8::MAX; capacity];
+        // SAFETY: buffer owns buffer_size writable bytes and remains alive for the call.
+        let written =
+            unsafe { libc::proc_pidpath(native_pid, buffer.as_mut_ptr().cast(), buffer_size) };
+        if written <= 0 {
+            return Err(last_process_error());
+        }
+        if usize::try_from(written).map_err(|_| MacOsError::MalformedObservation)? > capacity {
+            return Err(MacOsError::MalformedObservation);
+        }
+        let path_end = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(MacOsError::MalformedObservation)?;
+        if path_end == 0 {
+            return Err(MacOsError::MalformedObservation);
+        }
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(
+            &buffer[..path_end],
+        )))
+    }
+
     #[test]
     fn blocked_sleep_keeps_original_identity_until_one_use_release() {
         use crate::guardian_ipc::NativeInitialGate;
@@ -1152,21 +1180,16 @@ mod tests {
         let (mut child, gate) = os.spawn_blocked_sleep(5).unwrap();
         let identity = child.identity();
         assert_eq!(gate.identity(), identity);
-        let command = || {
-            let output = Command::new("/bin/ps")
-                .args(["-p", &identity.pid().get().to_string(), "-o", "comm="])
-                .output()
-                .unwrap();
-            String::from_utf8(output.stdout).unwrap()
-        };
         assert_eq!(
-            Path::new(command().trim()).file_name(),
+            executable_path(identity.pid()).unwrap().file_name(),
             Some(std::ffi::OsStr::new("sh"))
         );
         Box::new(gate).release().unwrap();
         let until = Instant::now() + Duration::from_secs(2);
         loop {
-            if Path::new(command().trim()).file_name() == Some(std::ffi::OsStr::new("sleep")) {
+            if executable_path(identity.pid()).unwrap().file_name()
+                == Some(std::ffi::OsStr::new("sleep"))
+            {
                 break;
             }
             assert!(Instant::now() < until, "gate must exec sleep");

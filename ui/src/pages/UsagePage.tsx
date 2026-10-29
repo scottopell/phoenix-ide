@@ -21,6 +21,7 @@ import type { Totals } from '../generated/Totals';
 import type { TtftSummaryRow } from '../generated/TtftSummaryRow';
 import type { TtftThresholdStat } from '../generated/TtftThresholdStat';
 import './UsagePage.css';
+import { CapacityDiagnostics } from './CapacityDiagnostics';
 
 function fmtTokens(n: number): string {
   if (n < 1000) return `${Math.round(n)}`;
@@ -546,6 +547,7 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
           unavailable.
         </div>
       )}
+      {detail && <CapacityDiagnostics data={detail.capacity} />}
       {detail && <AnalyticsExportPreview id={id} />}
       {detail && series.length > 0 && (
         <div className="usage-drill__charts">
@@ -670,6 +672,7 @@ export function UsagePage() {
           {empty && <div className="settings-section__hint">No token usage recorded yet.</div>}
 
           {data && <TtftHero data={data.ttft} />}
+          {data && <CapacityDiagnostics data={data.capacity} />}
 
           {data && !empty && (
             <>

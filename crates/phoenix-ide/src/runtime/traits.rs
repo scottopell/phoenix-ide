@@ -7,6 +7,7 @@ use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::db_schema::FinalizedToolResult;
 use phoenix_db::SubAgentTerminalCause;
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
@@ -120,6 +121,11 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String>;
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -393,14 +399,14 @@ pub trait MessageStore: Send + Sync {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String>;
 
     async fn persist_tool_round_and_state(
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
@@ -409,7 +415,7 @@ pub trait MessageStore: Send + Sync {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment;
 
@@ -611,7 +617,7 @@ pub trait StateStore: Send + Sync {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -643,6 +649,13 @@ pub trait StateStore: Send + Sync {
         service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
+    ) -> Result<(), String>;
+
+    /// Record one content-free prepared plan, including plans never dispatched.
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
     ) -> Result<(), String>;
 
     /// Record one content-free provider attempt for TTFT and stall analytics.
@@ -671,7 +684,25 @@ pub trait StateStore: Send + Sync {
 /// Client for making LLM requests
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    async fn count_input(
+        &self,
+        _request: &LlmRequest,
+    ) -> Result<Option<phoenix_llm::ProviderInputCount>, LlmError> {
+        Ok(None)
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError>;
+
+    fn diagnostic_route(
+        &self,
+    ) -> (
+        phoenix_core::domain::request_capacity::SafeRouteClass,
+        Option<String>,
+    ) {
+        (
+            phoenix_core::domain::request_capacity::SafeRouteClass::Unknown,
+            None,
+        )
+    }
 
     fn continuation_route_key(&self) -> Result<String, LlmError> {
         Ok(self.model_id().to_owned())
@@ -794,6 +825,15 @@ impl<T: SvgArtifactRepository + ?Sized> SvgArtifactRepository for Arc<T> {
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String> {
+        (**self)
+            .save_continuation_handoff_candidate(candidate)
+            .await
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -1079,7 +1119,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String> {
         (**self)
             .persist_tool_round(conv_id, assistant, tool_results)
@@ -1090,7 +1130,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
@@ -1103,7 +1143,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment {
         (**self)
@@ -1354,7 +1394,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -1409,6 +1449,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
     ) -> Result<(), String> {
         (**self)
             .insert_turn_usage(
@@ -1419,8 +1460,16 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 service_tier,
                 usage,
                 first_byte_at,
+                attempt,
             )
             .await
+    }
+
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
+    ) -> Result<(), String> {
+        (**self).insert_request_capacity_plan(plan).await
     }
 
     async fn upsert_llm_request_metrics(
@@ -1452,8 +1501,23 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
 #[async_trait]
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<phoenix_llm::ProviderInputCount>, LlmError> {
+        (**self).count_input(request).await
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         T::freeze_for_request(Arc::clone(self.as_ref()))
+    }
+
+    fn diagnostic_route(
+        &self,
+    ) -> (
+        phoenix_core::domain::request_capacity::SafeRouteClass,
+        Option<String>,
+    ) {
+        (**self).diagnostic_route()
     }
 
     fn continuation_route_key(&self) -> Result<String, LlmError> {
@@ -1601,6 +1665,16 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn save_continuation_handoff_candidate(
+        &self,
+        candidate: &crate::db::ContinuationHandoffCandidate,
+    ) -> Result<(), String> {
+        self.db
+            .save_continuation_handoff_candidate(candidate)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn read_message_continuation_opening(
         &self,
         message_id: &str,
@@ -2185,7 +2259,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
     ) -> Result<(), String> {
         self.db
             .persist_tool_round(conv_id, assistant, tool_results)
@@ -2197,7 +2271,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
@@ -2211,13 +2285,13 @@ impl MessageStore for DatabaseStorage {
         &self,
         conv_id: &str,
         assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
+        tool_results: &[FinalizedToolResult],
         settlement: &ActiveDirectTurnSettlement,
     ) -> TerminalMutationEstablishment {
         let obligation = terminal_obligation(settlement, None);
         let mut messages = Vec::with_capacity(1 + tool_results.len());
         messages.push(assistant.clone());
-        messages.extend_from_slice(tool_results);
+        messages.extend(tool_results.iter().map(|result| result.row().clone()));
         let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::Messages(messages);
         match self
             .db
@@ -2701,7 +2775,7 @@ impl StateStore for DatabaseStorage {
         &self,
         conversation_id: &str,
         assistant: &Message,
-        tool_results: &[Message],
+        tool_results: &[FinalizedToolResult],
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
         update: &phoenix_core::domain::provider_replay::ProviderReplayUpdate,
@@ -2758,6 +2832,7 @@ impl StateStore for DatabaseStorage {
         service_tier: phoenix_core::domain::llm_types::ServiceTier,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
+        attempt: Option<&phoenix_core::domain::llm_types::UsageAttempt>,
     ) -> Result<(), String> {
         self.db
             .insert_turn_usage(
@@ -2768,7 +2843,18 @@ impl StateStore for DatabaseStorage {
                 service_tier,
                 usage,
                 first_byte_at,
+                attempt,
             )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn insert_request_capacity_plan(
+        &self,
+        plan: &phoenix_core::domain::request_capacity::RequestCapacityPlan,
+    ) -> Result<(), String> {
+        self.db
+            .insert_request_capacity_plan(plan)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2853,6 +2939,10 @@ impl LlmClient for RegistryLlmClient {
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         Ok(Arc::new(FrozenServiceClient {
             service: self.service()?,
+            connection_id: self
+                .connection
+                .clone()
+                .or_else(|| self.registry.connection_for_model(&self.model_id)),
         }))
     }
 
@@ -2888,13 +2978,32 @@ impl LlmClient for RegistryLlmClient {
 }
 
 struct FrozenServiceClient {
+    connection_id: Option<String>,
     service: Arc<dyn phoenix_llm::LlmService>,
 }
 
 #[async_trait]
 impl LlmClient for FrozenServiceClient {
+    async fn count_input(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<phoenix_llm::ProviderInputCount>, LlmError> {
+        self.service.count_input(request).await
+    }
     fn freeze_for_request(self: Arc<Self>) -> Result<Arc<dyn LlmClient>, LlmError> {
         Ok(self)
+    }
+
+    fn diagnostic_route(
+        &self,
+    ) -> (
+        phoenix_core::domain::request_capacity::SafeRouteClass,
+        Option<String>,
+    ) {
+        (
+            self.service.diagnostic_route_class(),
+            self.connection_id.clone(),
+        )
     }
 
     fn continuation_route_key(&self) -> Result<String, LlmError> {

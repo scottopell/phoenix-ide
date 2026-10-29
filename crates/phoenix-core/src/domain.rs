@@ -6,6 +6,7 @@ pub mod active_pr_selection;
 pub mod bash_progress;
 pub mod bash_types;
 pub mod close;
+pub mod conversation_goal;
 pub mod creation_protocol;
 pub mod db_schema;
 pub mod instance_identity;
@@ -31,4 +32,7 @@ pub mod sm_state;
 pub mod tool_availability;
 pub mod tool_result_identity;
 pub mod tool_wire;
+pub mod watch_goal;
 pub mod work_scope_inventory;
+
+pub mod request_capacity;

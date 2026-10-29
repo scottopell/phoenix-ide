@@ -445,7 +445,11 @@ rule OAuthClientPreconfigured {
         -- loopback URI, and a listener on that port (bound before the URL is
         -- surfaced, on both IP families, accepting until the flow resolves)
         -- bounces the browser's callback to the real /api/mcp/oauth/callback
-        -- route (REQ-MCP-020). Otherwise the redirect is Phoenix's server route.
+        -- route (REQ-MCP-020). A callback accepted before the 25-minute deadline
+        -- with exactly one matching nonce retains thirty seconds to reach Phoenix;
+        -- listener completion cannot discard it during that grace. No new loopback
+        -- connections are accepted after the deadline. Otherwise the redirect is
+        -- Phoenix's server route.
         -- A cached registration is reused only when its client_id still matches
         -- the configured one; a re-keyed clientId replaces the stale row.
 }
@@ -654,7 +658,7 @@ rule TokenRefreshed {
         -- retaining a transport that still uses the old credential.
         -- Only transports retained by this OAuth recovery receive its new
         -- bearer; unrelated stale teardown retries retain their credentials.
-        -- The request whose 401 triggered the refresh (a tools/call or
+        -- For ordinary replay-eligible calls, the request whose 401 triggered the refresh (a tools/call or
         -- initialize) is replayed by the executor with the refreshed bearer
         -- once authorized, so a normal token expiry never surfaces as a tool
         -- failure (see deferred ReAuthCallRetry). Bind dispatch and replay to
@@ -1284,6 +1288,14 @@ deferred ReAuthCallRetry    -- see: crates/phoenix-tools/src/mcp.rs
     -- holding and replaying the specific call belongs to the tool-execution
     -- path. Schema-bound calls re-check their admitted definition after recovery
     -- and return unavailable instead of replaying against a changed definition.
+    -- Durable external-delivery callers may select single-attempt execution.
+    -- A caller deadline does not discard the eventual cancellation outcome:
+    -- its typed recovery evidence still restores the original connection for
+    -- later callers, without replaying the abandoned operation. A queued cancel
+    -- or cancellation-safe transport provides no reason to replace a connection.
+    -- That port validates readiness and the selected schema but never replays
+    -- a dispatched call after a transport/auth failure; it returns uncertainty
+    -- to the caller while leaving recovery for later calls available.
     -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
 
 ------------------------------------------------------------

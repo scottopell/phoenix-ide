@@ -53,6 +53,10 @@ round before its first ticket issues; retained historical evidence cannot restar
 unfinished reconciliation generation. This qualification does not establish process
 survival, IPC correctness, or production orchestration.
 
+## Ordinary control-frame timing verification
+
+Ordinary guardian client exchanges and server frame I/O use a finite two-second budget; server frames remain capped by the enclosing service deadline. This is not a hard deadline on synchronous handler work or on an entire multi-exchange dispatch. A socket-pair regression accepts a control response delayed beyond the former 250 ms allowance. A deterministic expired-budget regression checks timeout and connection drop without asserting scheduler timing; existing admission/cancellation and post-submit ambiguity tests cover effect custody separately. The controller library's 149 tests and Clippy pass locally. Hosted native process validation remains the integration gate; no live deployment behavior is inferred from these unit checks.
+
 ## Native architecture contract
 
 [ADR-135](../adrs/135_native-guardian-ipc-and-runner-are-same-build-pre-adoption.md)

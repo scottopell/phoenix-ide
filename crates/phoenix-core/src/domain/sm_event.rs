@@ -694,6 +694,7 @@ pub enum Event {
     // Ask user question events (REQ-AUQ-001)
     /// User answered the pending questions (POST /api/conversations/{id}/respond)
     UserQuestionResponse {
+        source: Option<QuestionAnswerSource>,
         request_id: Option<QuestionRequestId>,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
@@ -948,6 +949,13 @@ pub enum CoreEvent {
     },
 }
 
+/// Server-owned identity for an externally submitted question answer.
+#[derive(Debug, Clone)]
+pub struct QuestionAnswerSource {
+    pub message_id: String,
+    pub origin: crate::domain::db_schema::InputOrigin,
+}
+
 /// Events only valid for parent conversations.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
@@ -959,6 +967,7 @@ pub enum ParentOnlyEvent {
         successor_conv_id: String,
     },
     UserQuestionResponse {
+        source: Option<QuestionAnswerSource>,
         request_id: Option<QuestionRequestId>,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
@@ -1215,10 +1224,12 @@ impl TryFrom<Event> for ParentEvent {
                 }))
             }
             Event::UserQuestionResponse {
+                source,
                 request_id,
                 answers,
                 annotations,
             } => Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                source,
                 request_id,
                 answers,
                 annotations,

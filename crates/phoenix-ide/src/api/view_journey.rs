@@ -282,6 +282,7 @@ mod tests {
         ));
         let retriever: Arc<dyn crate::db::MessageRetriever> = Arc::new(db.fts_retriever());
         AppState {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             terminals: runtime.terminals.clone(),
             runtime,
             llm_registry: models.clone(),

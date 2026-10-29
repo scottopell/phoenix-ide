@@ -11,7 +11,7 @@ The Coordinator is an open-ended cross-conversation console, not a manager for o
 - **Orientation should be evidence-based.** Current-work briefings should use bounded fresh relational facts and distinguish observation from interpretation.
 - **Long-running work should not fragment identity.** A continuation chain represents one work item even though it spans multiple conversations.
 - **Intervention should be narrow and trustworthy.** The Coordinator may send text to existing conversations, while the receiving conversation's authoritative state determines whether the message starts immediately, becomes steering, or is rejected.
-- **Committed actions should be transparent.** The Coordinator reports acceptance per target without implying that another agent understood, acknowledged, or completed the instruction.
+- **Committed actions should be truthful.** When reporting a delivery, the Coordinator distinguishes each target's acceptance from another agent's understanding, execution, or completion.
 - **Global access should be deliberate and bounded.** Write-capable ordinary ProductConversations and the Coordinator may inspect Phoenix-wide evidence and send singular messages; restricted planning conversations and sub-agents remain scoped.
 
 ## Transparency Contract
@@ -254,7 +254,7 @@ THE watch activity surface SHALL reflect current subscription state rather than 
 
 THE SYSTEM SHALL NOT present a separate current-attention pane, open-work list, deterministic work search, cross-scope resource explorer, or Conversation/Work view selector
 
-THE composer SHALL provide a compact action that submits a normal read-only Coordinator message requesting a current-work briefing
+THE composer SHALL provide a compact action that submits a normal Coordinator message requesting a bounded whole-stack check-in and coordination pass through existing owners within verified standing authority
 
 THE briefing action SHALL preserve the user's draft and SHALL NOT create a separate message, streaming, persistence, or cancellation path
 
@@ -269,9 +269,22 @@ AND SHALL instruct the Coordinator to query relevant current transcript rows, ti
 WHEN the Coordinator dispatches a model request
 THE SYSTEM SHALL NOT automatically inject current activity facts into its system instructions or conversation context
 
-WHEN the user requests a current-work briefing through the composer action
-THE SYSTEM SHALL submit a normal read-only message requesting fresh relational facts, decisions or blockers needing user attention, and actively progressing work
-AND SHALL request supporting history only where needed, distinguish observed facts from uncertainty, and prohibit message delivery, mutation, and polling loops for that briefing
+WHEN the user requests a check-in through the composer action
+THE SYSTEM SHALL submit a normal message requesting a broad fresh check of commissioned work and selective intervention through established owners within verified standing scope and approvals
+AND SHALL direct the Coordinator to leave healthy progressing work alone, avoid redundant nudges, replanning or assignments merely to demonstrate activity, and not infer that an idle owner is stalled
+AND SHALL direct the Coordinator to investigate blocked or waiting owners before treating them as healthy or stalled, take the smallest recovery step allowed by existing authority through the established owner, and verify resumed work rather than message acceptance; progress elsewhere SHALL NOT discharge a blocked obligation
+AND SHALL reconcile later decisions and completed work before reviving questions or replaying earlier answers
+AND SHALL direct the Coordinator to recover unanswered user decisions from history and verify that each remains unresolved and material before prioritizing user input, while advancing independent authorized work first
+AND SHALL preserve prior decisions, corrections, pauses and gates; a repeated check-in SHALL NOT itself expand authority or reset them
+AND SHALL distinguish requested action and message acceptance from verified completion without requiring an announcement for every routine delivery
+AND SHALL lead the check-in briefing with still-needed user input, presenting genuine choices through `ask_user_question` with context and a recommendation, then explain what changed, why it matters and what happens next in concrete language understandable without intervening history, naming the actual work rather than opaque coordination labels, with useful links and grounded status where appropriate, without requiring a fixed report template or announcements for factual watch events
+
+AND SHALL include process or evidence limits when material to understanding or a decision, without indefinite polling or waiting for all owners to finish
+
+WHEN processing events without a user request for a briefing
+THE SYSTEM SHALL direct the Coordinator to report only needed user action or decisions, meaningful goal-level results, or new blockers or risks materially changing the plan; otherwise it SHALL continue authorized work quietly
+AND SHALL NOT treat routine check results, message deliveries or unchanged waiting as user-facing milestones
+AND SHALL include compact hypothetical bad-versus-good wording and silence examples in both language-specific system prompts, distinguishing requests from verified outcomes without treating examples as incident facts
 
 ---
 
@@ -336,7 +349,7 @@ AND SHALL use the shared tool-free continuation pipeline and protected accepted-
 AND SHALL describe its actual capability boundaries without promising an ambient working directory, conversation creation, or background monitoring
 AND SHALL NOT inject live activity facts into summary generation
 
-THE instructions SHALL prioritize unresolved workstreams, objectives, scoped user authority and preferences, corrections, decisions, blockers, dependencies, obligations, and next actions
+THE instructions SHALL prioritize unresolved workstreams, objectives, scoped user authority and preferences including reporting preferences, corrections, decisions, blockers, dependencies, obligations, and next actions
 AND SHALL preserve owner identities and delegation relationships, with durable target references distinct from historical transcript references when available
 AND SHALL distinguish direct user instructions, delegate requests, Coordinator commitments, and historical observations without promoting a delegate request or inherited assertion into user authority
 AND SHALL distinguish delivery acceptance, acknowledgement, execution, and verified completion

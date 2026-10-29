@@ -45,3 +45,46 @@ Tool availability is separated from retained declarations and historical calls. 
 **Progress:** All listed requirements complete.
 
 Active Responses exchanges retain original output envelopes, including assistant phase, through tool rounds, retry, and restart. Settled public history does not yet retain provider-owned assistant phase; that separate limitation is tracked in task 41010. Existing historical tools whose authentic declarations were never captured require catalog reconnection before valid replay.
+
+## Capacity-policy specification
+
+REQ-LLM-004j–004m have backend implementation and bounded deterministic
+qualification under task 44018. Shared prepared-request accounting reserves the
+selected model's full output allowance; counting has one bounded optional attempt
+and labelled fallback. Capacity diagnostics identify deliberate prefix changes.
+UI delivery, full integration validation, deployment and production recovery
+remain separate gates. ADR-146 records the decisions.
+
+Qualification reuses focused fixtures rather than claiming cache performance:
+`capacity_diagnostics_prefix_causes_are_multiple_and_content_free` covers a cold
+comparison, unchanged appended history, and classified deliberate invalidation;
+`skill_catalog_survives_tool_loop_and_refreshes_on_new_input` covers frozen turn
+guidance/skill metadata and new-turn refresh. Stale-result tests cover a stable
+rendered prefix after clearing, recent images, and original interpretation and
+corrections. `sqlite_runtime_anthropic_withdrawal_preserves_failed_exchange_after_reopen_and_retry`
+and `native_withdrawal_keeps_prefix_and_replays_original_position` cover live
+policy withdrawal and replay ordering. Responses fixtures
+`websocket_continuation_requires_exact_prefix_including_server_output` and
+`websocket_continuation_resets_on_non_prefix_or_property_change` cover exact
+private prefixes and required resets. `upgrade_model_state_guard_tests` covers
+permitted changes and rejects in-flight or fenced changes. These fixtures verify
+request/state preservation, not model understanding, actual provider cache
+residency, cache hit rate, or cross-route reuse. No paid long-session evaluation
+has been performed.
+
+The API integration fixture
+`accepted_model_switch_recreates_ordinary_request_limits_and_preserves_pressure_input`
+qualifies accepted model changes followed by actual ordinary dispatch through the
+direct-turn worker: 200,000 context / 16,000 output → 64,000 / 8,000 →
+200,000 / 16,000. Each persisted ordinary capacity plan and captured provider
+request uses the selected model and full output reservation after runtime
+recreation. Additional input pressure after another downgrade produces an
+ordinary `needs_compaction` plan and one real summary request using the smaller
+model and full 8,000-token reservation. Its original user input remains stored;
+the exhausted state contains the mock-generated summary. All seven owning API
+model-guard tests pass. These deterministic fixtures do not establish model
+understanding, cache hits, or full cross-provider interoperability.
+
+Independent specs-only review is recorded in
+`docs/reviews/context-capacity-spec-review.md`; independent implementation review
+and final integration remain delivery gates.

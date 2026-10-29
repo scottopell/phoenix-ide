@@ -67,6 +67,7 @@ pub const SPA_ROUTES: &[SpaRoute] = &[
         pattern: "/global/:slug",
     },
     SpaRoute::Exact("/settings/llm-language"),
+    SpaRoute::Exact("/settings/slack"),
     SpaRoute::Exact("/codex/login"),
     SpaRoute::Param {
         prefix: "/c/",

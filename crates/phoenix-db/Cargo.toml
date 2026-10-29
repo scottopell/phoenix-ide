@@ -54,7 +54,7 @@ sha2 = "0.11"
 
 # Async trait objects for the MessageRetriever seam (Arc<dyn MessageRetriever>).
 async-trait = "0.1"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "sync", "macros"] }
 
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain

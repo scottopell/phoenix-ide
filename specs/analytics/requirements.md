@@ -45,3 +45,24 @@ Phoenix SHOULD persist commit/PR/yield facts when outcome attribution becomes a 
 ### REQ-AN-010: Trajectory-Compatible Export
 
 Phoenix SHALL provide a Trajectory-compatible export adapter that projects Phoenix analytics sessions into an external session format without making Trajectory the source of truth.
+
+### REQ-AN-011: Explain Capacity and Cache Boundaries
+
+WHEN a request is planned, including a local refusal before provider dispatch
+THE SYSTEM SHALL expose content-free diagnostics for selected model and route, effective context limit, preferred output reservation, retained input count and counting method, uncertainty, reduction action and amount, and classified planning outcome
+AND SHALL correlate those diagnostics with provider usage and request timing when an attempt exists
+AND SHALL represent absence of an attempt or provider usage explicitly rather than fabricate zero usage.
+
+WHEN a historical request prefix changes
+THE SYSTEM SHALL identify known causes among clearing, compaction, guidance refresh, model/route switch, and tool-policy change, allowing multiple causes
+AND SHALL distinguish a known intentional change from unexplained observed cache loss
+AND SHALL NOT claim that a cache miss's provider-internal cause or monetary cost is known without supporting evidence.
+
+THE SYSTEM SHALL extend the existing local request metrics and usage surfaces rather than introduce a second analytics or transcript authority
+AND SHALL store independently addressable durable facts relationally
+AND SHALL derive aggregates without persisting prompts, reasoning, tool bodies, credentials, or a duplicate transcript.
+
+WHEN evaluating a context policy
+THE SYSTEM SHALL report input occupancy, cache reads and writes where available, output usage, counting error where comparable, provider TTFT, and semantic continuity separately
+AND SHALL include cold, warm, clearing, compaction, rewarm, and model-switch cases
+AND SHALL NOT equate cache hit rate, transport payload savings, or request success with preserved understanding.

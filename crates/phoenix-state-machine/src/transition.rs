@@ -259,6 +259,8 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         | ErrorKind::Cancelled
         | ErrorKind::SubAgentError
         | ErrorKind::ContextExhausted
+        | ErrorKind::ContextCapacityConflict
+        | ErrorKind::PlannedContextPressure
         | ErrorKind::OutputTokensExhausted
         | ErrorKind::TurnLimitExhausted
         | ErrorKind::ContentFilter => {
@@ -2165,8 +2167,21 @@ fn handle_core_error_retry(
     }
 }
 
-/// Handles continuation-related events: `LlmError`/`RetryTimeout` during
-/// `AwaitingContinuation`, and `UserTriggerContinuation` from Idle.
+/// Build the durable transition for an explicitly admitted changed-model replan.
+#[must_use]
+pub fn replan_continuation_failure(
+    failure: &RecoverableContinuationFailure,
+) -> CoreTransitionResult {
+    let mut request = failure.request.clone();
+    request.attempt += 1;
+    CoreTransitionResult::new(CoreState::AwaitingContinuation {
+        request: request.clone(),
+    })
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::notify_state_change())
+    .with_effect(Effect::RequestContinuation { request })
+}
+
 fn handle_core_continuation(
     state: &CoreState,
     context: &ConvContext,
@@ -2231,7 +2246,9 @@ fn handle_core_continuation(
         (
             CoreState::RecoverableContinuationFailure { failure },
             CoreEvent::UserTriggerContinuation { operation_id },
-        ) if failure.request.operation_id == operation_id => {
+        ) if failure.request.operation_id == operation_id
+            && failure.error_kind != ErrorKind::ContextCapacityConflict =>
+        {
             let mut request = failure.request.clone();
             request.attempt += 1;
             Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
@@ -2246,7 +2263,7 @@ fn handle_core_continuation(
             CoreState::RecoverableContinuationFailure { .. },
             CoreEvent::UserTriggerContinuation { operation_id },
         ) => {
-            tracing::debug!(%operation_id, "Absorbing stale UserTriggerContinuation for continuation failure");
+            tracing::debug!(%operation_id, "Absorbing stale continuation trigger for continuation failure");
             Ok(CoreTransitionResult::new(state.clone()))
         }
 
@@ -2466,6 +2483,7 @@ pub fn transition_parent(
                     idempotent: false,
                 })
                 .with_effect(Effect::PersistUserInputMessage {
+                    origin: phoenix_core::domain::db_schema::InputOrigin::UserApi,
                     content: phoenix_core::domain::db_schema::MessageContent::user(annotations),
                     message_id: uuid::Uuid::new_v4().to_string(),
                 })
@@ -2527,6 +2545,7 @@ pub fn transition_parent(
                 ..
             },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                source,
                 request_id,
                 answers,
                 annotations,
@@ -2569,7 +2588,14 @@ pub fn transition_parent(
                 }))
                 .with_effect(Effect::PersistUserInputMessage {
                     content: phoenix_core::domain::db_schema::MessageContent::user(user_text),
-                    message_id: uuid::Uuid::new_v4().to_string(),
+                    message_id: source.as_ref().map_or_else(
+                        || uuid::Uuid::new_v4().to_string(),
+                        |s| s.message_id.clone(),
+                    ),
+                    origin: source
+                        .map_or(phoenix_core::domain::db_schema::InputOrigin::UserApi, |s| {
+                            s.origin
+                        }),
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -2777,6 +2803,25 @@ pub fn transition_parent(
                 CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
             ),
         ) => Err(TransitionError::ContextExhausted),
+
+        (
+            ParentState::ContextExhausted { .. },
+            ParentEvent::Core(CoreEvent::UserTriggerContinuation { operation_id }),
+        ) => {
+            let request = ContinuationSummaryRequest {
+                operation_id,
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            };
+            Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
+                    request: request.clone(),
+                }))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestContinuation { request }),
+            )
+        }
 
         (state @ ParentState::ContextExhausted { .. }, _event) => {
             Ok(ParentTransitionResult::new(state.clone()))
@@ -3300,37 +3345,34 @@ pub fn transition_parent(
             .with_effect(Effect::notify_state_change()))
         }
 
-        // Intercepted before core delegation — spec rule
-        // BackendRejectsContextExhausted (bedrock.allium).
         (
-            ParentState::Core(CoreState::LlmRequesting { .. }),
+            pressure_state,
             ParentEvent::Core(CoreEvent::LlmError {
                 message,
-                error_kind: ErrorKind::ContextExhausted,
+                error_kind: ErrorKind::ContextExhausted | ErrorKind::PlannedContextPressure,
                 ..
             }),
-        ) => {
-            // Stable, human-oriented summary — the raw backend message can
-            // carry provider-specific strings and is persisted for the UI
-            // banner / clipboard / seed-draft, so it is logged separately
-            // rather than interpolated into user-facing text.
-            // `message` may describe either an authoritative provider rejection
-            // or a locally classified planned-capacity limit (REQ-LLM-004f
-            // preflight fit check) — both converge here because neither has a
-            // partial response to build a continuation summary from.
-            tracing::warn!(
-                detail = %message,
-                "request classified as context-window exhausted; converging parent to ContextExhausted"
-            );
-            let summary = "Context limit reached before the turn could complete. \
-                Continue to compact and resume, or start a new conversation."
-                .to_string();
-            Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
-                summary: summary.clone(),
-            })
-            .with_effect(Effect::persist_continuation_message(&summary))
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::NotifyContextExhausted { summary }))
+        ) if matches!(
+            pressure_state,
+            ParentState::Core(CoreState::LlmRequesting { .. })
+        ) || matches!(pressure_state, ParentState::Core(CoreState::ServerOverloadRetrying { retry })
+                if matches!(retry.target, ServerOverloadTarget::Ordinary)
+                    && matches!(retry.phase, ServerOverloadPhase::InFlight)) =>
+        {
+            tracing::warn!(detail = %message, "request context pressure requires durable compaction");
+            let request = ContinuationSummaryRequest {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            };
+            Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
+                    request: request.clone(),
+                }))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestContinuation { request }),
+            )
         }
 
         // ============================================================
@@ -6322,46 +6364,40 @@ mod tests {
         ));
     }
 
-    // Bug class (task 60008): a parent that exhausts context must never
-    // land in ConvState::Error — the /continue recovery precondition
-    // (db.rs) gates on ConvState::ContextExhausted, so an Error landing
-    // strands the conversation with no recovery path. Both the
-    // internal-threshold path and the backend-rejection path
-    // (LlmErrorKind::ContextWindowExceeded → ErrorKind::ContextExhausted)
-    // must converge on ContextExhausted.
     #[test]
-    fn parent_context_exhausted_llm_error_routes_to_context_exhausted() {
-        let result = transition(
-            &ConvState::LlmRequesting { attempt: 1 },
-            &test_context(),
-            Event::LlmError {
-                message: "context_length_exceeded".to_string(),
-                error_kind: ErrorKind::ContextExhausted,
-                attempt: 1,
-                recovery_in_progress: false,
-                observed_at: chrono::Utc::now(),
-                resets_at: None,
-            },
-        )
-        .unwrap();
-
-        // reason: only ContextExhausted is expected; every other ConvState variant is a
-        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match &result.new_state {
-            ConvState::ContextExhausted { summary } => {
-                // Stable summary — the raw backend message must NOT leak
-                // into user-facing persisted text.
-                assert!(summary.contains("Context limit reached"));
-                assert!(!summary.contains("context_length_exceeded"));
-            }
-            other => panic!("expected ContextExhausted, got {other:?}"),
+    fn parent_context_exhausted_llm_error_requests_real_handoff_without_fake_message() {
+        for (message, error_kind) in [
+            ("context_length_exceeded", ErrorKind::ContextExhausted),
+            ("local planned pressure", ErrorKind::PlannedContextPressure),
+        ] {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                Event::LlmError {
+                    message: message.to_string(),
+                    error_kind,
+                    attempt: 1,
+                    recovery_in_progress: false,
+                    observed_at: chrono::Utc::now(),
+                    resets_at: None,
+                },
+            )
+            .unwrap();
+            let ConvState::AwaitingContinuation { request } = &result.new_state else {
+                panic!("context pressure must enter durable summary generation");
+            };
+            assert_eq!(request.attempt, 1);
+            assert!(request.rejected_tool_calls.is_empty());
+            assert!(matches!(result.effects.first(), Some(Effect::PersistState)));
+            assert!(result.effects.iter().any(|effect| matches!(effect, Effect::RequestContinuation { request: dispatched } if dispatched == request)));
+            assert!(!result.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::PersistMessage { .. }
+                    | Effect::ContinuationCommit { .. }
+                    | Effect::NotifyContextExhausted { .. }
+                    | Effect::ScheduleRetry { .. }
+            )));
         }
-        // The resulting state must satisfy the /continue precondition.
-        assert!(matches!(
-            result.new_state,
-            ConvState::ContextExhausted { .. }
-        ));
     }
 
     // The interception is scoped to ContextExhausted only — other
@@ -6396,6 +6432,74 @@ mod tests {
     // non-retryable; assert the attempt counter is irrelevant (any attempt
     // value still converges on ContextExhausted, never Error).
     #[test]
+    fn exhausted_parent_regenerates_summary_without_committing_a_notice() {
+        let result = transition(
+            &ConvState::ContextExhausted {
+                summary: "legacy notice".to_string(),
+            },
+            &test_context(),
+            Event::UserTriggerContinuation {
+                operation_id: "recovery".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(result.new_state, ConvState::AwaitingContinuation { request } if request.operation_id == "recovery")
+        );
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestContinuation { .. })));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ContinuationCommit { .. })));
+    }
+
+    #[test]
+    fn unchanged_capacity_conflict_cannot_retry_compaction() {
+        let state = ConvState::RecoverableContinuationFailure {
+            failure: RecoverableContinuationFailure {
+                request: ContinuationSummaryRequest {
+                    operation_id: "fixed-conflict".to_string(),
+                    rejected_tool_calls: vec![],
+                    attempt: 1,
+                },
+                error_kind: ErrorKind::ContextCapacityConflict,
+                message: "Required input cannot fit".to_string(),
+            },
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserTriggerContinuation {
+                operation_id: "fixed-conflict".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result.new_state, state);
+        assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn authorized_model_replan_preserves_operation_and_advances_attempt() {
+        let failure = RecoverableContinuationFailure {
+            request: ContinuationSummaryRequest {
+                operation_id: "fixed".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 2,
+            },
+            error_kind: ErrorKind::ContextCapacityConflict,
+            message: "cannot fit".to_string(),
+        };
+        let result = replan_continuation_failure(&failure);
+        assert!(
+            matches!(result.new_state, CoreState::AwaitingContinuation { request } if request.operation_id == "fixed" && request.attempt == 3)
+        );
+        assert!(result.effects.iter().any(|effect| matches!(effect, Effect::RequestContinuation { request } if request.operation_id == "fixed" && request.attempt == 3)));
+    }
+
+    #[test]
     fn parent_context_exhausted_converges_regardless_of_attempt() {
         for attempt in 1..=MAX_RETRY_ATTEMPTS {
             let result = transition(
@@ -6412,8 +6516,8 @@ mod tests {
             )
             .unwrap();
             assert!(
-                matches!(result.new_state, ConvState::ContextExhausted { .. }),
-                "attempt {attempt} should converge on ContextExhausted"
+                matches!(result.new_state, ConvState::AwaitingContinuation { .. }),
+                "attempt {attempt} should enter real handoff generation"
             );
         }
     }
@@ -8044,6 +8148,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercise successive question identities and stale responses together.
     fn question_request_identity_is_fresh_and_rejects_stale_actions() {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
@@ -8098,6 +8203,7 @@ mod tests {
                 &q2,
                 &test_context(),
                 Event::UserQuestionResponse {
+                    source: None,
                     request_id: Some(q1_id.clone()),
                     answers: answers.clone(),
                     annotations: None,
@@ -8119,12 +8225,19 @@ mod tests {
             &q2,
             &test_context(),
             Event::UserQuestionResponse {
+                source: Some(phoenix_core::domain::sm_event::QuestionAnswerSource {
+                    message_id: "slack-answer-input".into(),
+                    origin: phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                        request_id: "slack-answer-request".into(),
+                    },
+                }),
                 request_id: Some(q2_id.clone()),
                 answers,
                 annotations: None,
             },
         )
         .unwrap();
+        assert!(answered.effects.iter().any(|effect|matches!(effect,Effect::PersistUserInputMessage {message_id,origin:phoenix_core::domain::db_schema::InputOrigin::SlackGateway {request_id},..} if message_id=="slack-answer-input" && request_id=="slack-answer-request")));
         assert!(matches!(
             answered.new_state,
             ConvState::LlmRequesting { attempt: 1 }
@@ -8141,6 +8254,7 @@ mod tests {
             &q2,
             &test_context(),
             Event::UserQuestionResponse {
+                source: None,
                 request_id: None,
                 answers: std::collections::HashMap::new(),
                 annotations: None,
@@ -8438,6 +8552,7 @@ mod tests {
             &state,
             &test_context(),
             Event::UserQuestionResponse {
+                source: None,
                 request_id: Some(request_id),
                 answers,
                 annotations: None,

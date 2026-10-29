@@ -8,6 +8,7 @@ use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage,
 };
 use super::LlmError;
+use phoenix_core::domain::llm_types::UsageObservation;
 use phoenix_core::domain::provider_replay::{
     AnthropicPrivateBlock, AnthropicResponseIdentity, AnthropicResponseSet, ContentIndex,
     ProviderReplayUpdate,
@@ -20,6 +21,132 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+#[derive(Serialize)]
+struct AnthropicCountInput {
+    model: String,
+    messages: Vec<AnthropicMessage>,
+    system: Vec<AnthropicSystemBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicToolEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinkingConfig>,
+}
+
+impl From<AnthropicRequest> for AnthropicCountInput {
+    fn from(request: AnthropicRequest) -> Self {
+        let AnthropicRequest {
+            model,
+            messages,
+            system,
+            tools,
+            thinking,
+            max_tokens: _,
+            output_config,
+            speed: _,
+            stream: _,
+            tags: _,
+        } = request;
+        let _generation_effort = output_config.map(|AnthropicOutputConfig { effort }| effort);
+        Self {
+            model,
+            messages,
+            system,
+            tools,
+            thinking,
+        }
+    }
+}
+
+fn count_sources_supported(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if matches!(
+                fields.get("type").and_then(serde_json::Value::as_str),
+                Some("image" | "document")
+            ) && fields
+                .get("source")
+                .and_then(|source| source.get("type"))
+                .and_then(serde_json::Value::as_str)
+                != Some("base64")
+            {
+                return false;
+            }
+            fields.values().all(count_sources_supported)
+        }
+        serde_json::Value::Array(items) => items.iter().all(count_sources_supported),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => true,
+    }
+}
+
+pub(crate) async fn count_input(
+    spec: &ModelSpec,
+    request_name: &super::models::RequestModelName,
+    auth: &super::ResolvedAuth,
+    custom_headers: &[(String, String)],
+    request: &LlmRequest,
+) -> Result<Option<super::ProviderInputCount>, LlmError> {
+    let fast = is_fast_mode(spec, None, request);
+    let binding = supports_thinking_binding(spec, None);
+    let native = supports_native_tool_changes(spec, None);
+    let mut wire = translate_request_with_tool_policy(spec, request, fast, binding, native)?;
+    wire.model = request_name.as_str().to_owned();
+    let body = serde_json::to_value(AnthropicCountInput::from(wire))
+        .map_err(|_| LlmError::invalid_request("Cannot serialize counting input"))?;
+    if !count_sources_supported(&body) || body.get("mcp_servers").is_some() {
+        return Ok(None);
+    }
+    // Server tools (including tool search) have no supported complete count.
+    if body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| tools.iter().any(|tool| tool.get("type").is_some()))
+    {
+        return Ok(None);
+    }
+    let mut builder = Client::new()
+        .post("https://api.anthropic.com/v1/messages/count_tokens")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json");
+    builder = match auth.style {
+        super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
+        super::AuthStyle::PlainBearer => builder.bearer_auth(&auth.credential),
+    };
+    let mut beta = anthropic_beta_tokens(false, fast, binding);
+    if native {
+        beta.push(INLINE_TOOLS_BETA);
+    }
+    if !beta.is_empty() {
+        builder = builder.header("anthropic-beta", beta.join(", "));
+    }
+    builder = apply_source_header(builder, custom_headers);
+    let response = builder
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| LlmError::network("Input count transport failed"))?;
+    if !response.status().is_success() {
+        return Err(LlmError::network(format!(
+            "Input count returned HTTP {}",
+            response.status()
+        )));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| LlmError::network("Invalid input count response"))?;
+    let tokens = value
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| LlmError::network("Missing input token count"))?;
+    Ok(Some(super::ProviderInputCount::AnthropicEstimate {
+        tokens,
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentBlockKind {
     None,
@@ -31,6 +158,7 @@ enum CurrentBlockKind {
 
 /// Accumulates state across Anthropic SSE stream events to assemble the final response.
 struct StreamAccumulator {
+    usage_observation: UsageObservation,
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
@@ -64,6 +192,7 @@ struct StreamAccumulator {
 impl StreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest, requested_fast: bool) -> Self {
         Self {
+            usage_observation: UsageObservation::default(),
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_tokens: 0,
@@ -120,6 +249,22 @@ impl StreamAccumulator {
                     .pointer("/message/model")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
+                self.usage_observation = UsageObservation {
+                    input_total: [
+                        "input_tokens",
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                    ]
+                    .iter()
+                    .all(|field| v["message"]["usage"][field].as_u64().is_some()),
+                    output: false,
+                    cache_write: v["message"]["usage"]["cache_creation_input_tokens"]
+                        .as_u64()
+                        .is_some(),
+                    cache_read: v["message"]["usage"]["cache_read_input_tokens"]
+                        .as_u64()
+                        .is_some(),
+                };
                 self.input_tokens = v
                     .pointer("/message/usage/input_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -153,6 +298,7 @@ impl StreamAccumulator {
                 if let Some(details) = v.pointer("/delta/stop_details") {
                     self.stop_details = serde_json::from_value(details.clone()).ok();
                 }
+                self.usage_observation.output |= v["usage"]["output_tokens"].as_u64().is_some();
                 self.output_tokens = v
                     .pointer("/usage/output_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -448,6 +594,7 @@ impl StreamAccumulator {
                 "Anthropic dropped preserved-thinking blocks after prefix mismatch"
             );
         }
+        response.usage_observation = self.usage_observation;
         telemetry.attach_success(&mut response);
         Ok(response)
     }
@@ -1574,6 +1721,13 @@ fn normalize_response_with_diagnostics(
             cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
         },
     );
+    response.usage_observation = UsageObservation {
+        input_total: resp.usage.cache_creation_input_tokens.is_some()
+            && resp.usage.cache_read_input_tokens.is_some(),
+        output: true,
+        cache_write: resp.usage.cache_creation_input_tokens.is_some(),
+        cache_read: resp.usage.cache_read_input_tokens.is_some(),
+    };
     response.provider_replay = provider_replay;
     Ok(response)
 }
@@ -1906,6 +2060,33 @@ mod tests {
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
+    }
+
+    #[test]
+    fn counting_declines_unsupported_image_and_document_sources() {
+        for kind in ["image", "document"] {
+            for source in ["url", "file"] {
+                assert!(!count_sources_supported(
+                    &serde_json::json!({"messages":[{"content":[{"type":kind,"source":{"type":source}}]}]})
+                ));
+            }
+            assert!(count_sources_supported(
+                &serde_json::json!({"messages":[{"content":[{"type":kind,"source":{"type":"base64","data":"AA=="}}]}]})
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn counting_declines_whole_native_server_tool_request() {
+        let request = test_request_with_tools();
+        let auth = super::super::ResolvedAuth {
+            credential: "unused-test".into(),
+            style: super::super::AuthStyle::ApiKey,
+        };
+        let count = count_input(&test_spec(true), &"test-wire".into(), &auth, &[], &request)
+            .await
+            .unwrap();
+        assert_eq!(count, None);
     }
 
     fn tool_policy_request() -> LlmRequest {
@@ -2767,6 +2948,50 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 7);
         assert_eq!(resp.usage.output_tokens, 11);
     }
+
+    #[tokio::test]
+    async fn capacity_usage_observation_anthropic_missing_cache_is_unknown_total() {
+        for cache_present in [false, true] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut acc = StreamAccumulator::new(Instant::now(), &test_request(), false);
+            let mut usage = serde_json::json!({"input_tokens":0});
+            if cache_present {
+                usage["cache_creation_input_tokens"] = 0.into();
+                usage["cache_read_input_tokens"] = 0.into();
+            }
+            acc.process_event(
+                "message_start",
+                &serde_json::json!({"message":{"id":"m","model":"claude-opus-5-5","usage":usage}})
+                    .to_string(),
+                &tx,
+            )
+            .await
+            .unwrap();
+            acc.process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text","text":"ok"}}"#,
+                &tx,
+            )
+            .await
+            .unwrap();
+            acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+                .await
+                .unwrap();
+            acc.process_event(
+                "message_delta",
+                r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
+                &tx,
+            )
+            .await
+            .unwrap();
+            let response = acc.into_response_with_diagnostics(None).unwrap();
+            assert_eq!(response.usage.context_window_used(), 0);
+            assert_eq!(response.usage_observation.input_total, cache_present);
+            assert_eq!(response.usage_observation.cache_read, cache_present);
+            assert!(response.usage_observation.output);
+        }
+    }
+
     #[test]
     fn counts_only_content_free_dropped_thinking_transformations() {
         let event = serde_json::json!({

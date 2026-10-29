@@ -15,6 +15,7 @@ mod event_presentation;
 pub(crate) mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
+mod goal_commands;
 pub(crate) mod handlers;
 mod installation_ownership;
 mod lifecycle_handlers;
@@ -66,6 +67,7 @@ pub struct AppState {
     #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
     pub platform: PlatformCapability,
     pub mcp_manager: Arc<McpClientManager>,
+    pub(crate) slack_gateway_access: Arc<tokio::sync::Mutex<crate::slack_gateway::BudgetWindow>>,
     pub credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
     pub password: Option<OwnerPassword>,
@@ -311,6 +313,7 @@ impl AppState {
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
         let resource_monitor = runtime.work_scope_load().memory_monitor();
         Ok(Self {
+            slack_gateway_access: crate::slack_gateway::access_gate(),
             runtime,
             llm_registry,
             db,
