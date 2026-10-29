@@ -50,6 +50,7 @@ pub(crate) fn db_error(error: GoalDbError) -> DbError {
         GoalDbError::Control(error) => super::control::db_error(error),
         GoalDbError::Admission(error) => error,
         other @ (GoalDbError::Busy
+        | GoalDbError::Invalid(_)
         | GoalDbError::TargetChanged
         | GoalDbError::Domain(_)
         | GoalDbError::RetryConflict
