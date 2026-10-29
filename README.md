@@ -328,6 +328,7 @@ falls back to `LOGNAME`.
 
 ## Documentation
 
+- [Saved Goals API](docs/saved-goals.md) — Authenticated examples for recording objectives, reading history, and changing saved status
 - `specs/` — Per-tool and subsystem specs using the [spEARS methodology](SPEARS.md)
 - [LAUNCHD.md](LAUNCHD.md) — macOS launchd deployment and socket activation
 - [TLS.md](TLS.md) — HTTPS, HTTP/2, private CA, and deployment workflow
