@@ -100,7 +100,7 @@ async fn preparation_count(db: &Database) -> i64 {
 }
 
 #[tokio::test]
-async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatching() {
+async fn goal_preparation_migration_follows_conversation_tool_migrations() {
     let db = fixture().await;
     let migrations: Vec<(i64, String)> =
         sqlx::query_as("SELECT version,name FROM _migrations WHERE version>=143 ORDER BY version")
@@ -115,6 +115,11 @@ async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatchin
             (145, "coordinator_goal_preparations".into())
         ]
     );
+}
+
+#[tokio::test]
+async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatching() {
+    let db = fixture().await;
     let (caller, source_product, source_call, turn) = coordinator_source(&db, "prep-retry").await;
     let (transcript, owner) = ordinary(&db, "prep-retry-owner").await;
     let before = counts(&db).await;

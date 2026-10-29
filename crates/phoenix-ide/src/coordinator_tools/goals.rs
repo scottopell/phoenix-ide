@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::api::goal_commands::GoalCommandService;
+use crate::api::GoalCommandService;
 use crate::runtime::RuntimeManager;
 use crate::tools::{Tool, ToolContext, ToolOutput};
 

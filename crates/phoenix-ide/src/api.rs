@@ -16,6 +16,7 @@ pub(crate) mod federation;
 mod git_handlers;
 pub(crate) mod global_read;
 mod goal_commands;
+pub(crate) use goal_commands::GoalCommandService;
 pub(crate) mod handlers;
 mod installation_ownership;
 mod lifecycle_handlers;
