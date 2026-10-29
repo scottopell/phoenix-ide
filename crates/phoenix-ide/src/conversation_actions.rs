@@ -141,7 +141,8 @@ fn resolve_intent(
         ));
     }
     let cwd = if internal {
-        crate::conversation_cwd::validate_conversation_cwd(&req.cwd).map(|cwd| cwd.into_raw())
+        crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
+            .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
     } else {
         crate::conversation_cwd::normalize_product_creation_cwd_intent(
             &req.cwd,
@@ -200,10 +201,7 @@ pub(crate) async fn accept_create(
             |resolution| resolve_intent(runtime, &req, &source, resolution),
         )
         .await
-        .map_err(|error| match error {
-            DbError::ProductCreationIntentInvalid(message) => AppError::BadRequest(message),
-            error => db_to_app(error),
-        })?;
+        .map_err(db_to_app)?;
     let job: ProductCreationJobRecord = match outcome {
         ProductCreationAcceptOutcome::Accepted(job)
         | ProductCreationAcceptOutcome::Replayed(job) => job,

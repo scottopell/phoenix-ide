@@ -137,7 +137,7 @@ fn operation_schema() -> Value {
 
 #[async_trait]
 impl Tool for RenameConversation {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "rename_conversation"
     }
     fn description(&self) -> String {
@@ -159,7 +159,7 @@ impl Tool for RenameConversation {
     }
 }
 
-fn rename_detail_response(detail: crate::db::ProductConversationRenameDetail) -> Value {
+fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -> Value {
     let route = crate::api::product_conversations::product_route(
         detail.slug.as_deref(),
         detail.product_conversation_id.as_str(),
@@ -184,7 +184,7 @@ impl RenameConversation {
                     .read_product_conversation_rename_detail(&ctx.conversation_id, reference)
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(rename_detail_response(detail))
+                Ok(rename_detail_response(&detail))
             }
             RenameRequest::Read { operation_id } => {
                 let receipt = self
@@ -246,7 +246,7 @@ impl RenameConversation {
 
 #[async_trait]
 impl Tool for CreateConversation {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "create_conversation"
     }
     fn description(&self) -> String {

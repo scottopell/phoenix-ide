@@ -46,6 +46,7 @@ pub enum ProductCreationOrigin {
         source_call: phoenix_core::domain::db_schema::SourceToolCall,
     },
 }
+#[derive(Clone, Copy)]
 pub enum ProductCreationResolution<'a> {
     Existing(&'a ProductCreationJobRecord),
     New { default_llm_language: LlmLanguage },

@@ -1560,6 +1560,7 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn db_to_app(error: DbError) -> AppError {
     match error {
+        DbError::ProductCreationIntentInvalid(message) => AppError::BadRequest(message),
         DbError::ConversationTitleInvalid => AppError::BadRequest(
             "title must contain between 1 and 200 Unicode scalar values after trimming".to_owned(),
         ),
