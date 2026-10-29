@@ -165,13 +165,20 @@ enum ControlCommitCut {
     },
 }
 
-struct ControlCommitAuthority<F: FnOnce()> {
+pub(super) struct ControlCommitAuthority<F: FnOnce()> {
     unresolved: bool,
     on_authority_lost: Option<F>,
 }
 
 impl<F: FnOnce()> ControlCommitAuthority<F> {
-    fn classified(&mut self) {
+    pub(super) fn new(on_authority_lost: F) -> Self {
+        Self {
+            unresolved: true,
+            on_authority_lost: Some(on_authority_lost),
+        }
+    }
+
+    pub(super) fn classified(&mut self) {
         self.unresolved = false;
     }
 }

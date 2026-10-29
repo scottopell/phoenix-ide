@@ -5917,6 +5917,31 @@ class GenericOrdinaryForwardHistoryTests(unittest.TestCase):
         ))
         return registry
 
+    def test_immutable_target140_fixture_admits_exact_prefixes(self) -> None:
+        registry = self.root / "immutable-target140-2d66.rs"
+        registry.write_bytes(gzip.decompress(
+            (ROOT / "tests/devpy/fixtures/migrations-through-140-2d66.rs.gz").read_bytes()
+        ))
+        self.assertEqual(
+            helper.sha256(registry),
+            "f2dd8cf9c30438ead4848d3fec21bd90813badc8928bf6f99dbae82d0e620dc4",
+        )
+        target = helper.migration_registry(registry, qualified_current_target=False)
+        self.assertEqual(target, tuple(compiled_ledger(140)))
+        for through in (129, 131):
+            for source_kind in ("local_head", "published_release"):
+                with self.subTest(through=through, source_kind=source_kind):
+                    manifest = dataclasses.replace(
+                        self.ordinary_manifest(self.database(through=through), registry),
+                        source_kind=source_kind,
+                    )
+                    with mock.patch.object(helper, "Launchctl") as launchctl:
+                        plan = helper.ordinary_forward_admission_plan(manifest)
+                    launchctl.assert_not_called()
+                    self.assertEqual(plan.source, tuple(compiled_ledger(through)))
+                    self.assertEqual(plan.target, target)
+                    self.assertEqual(plan.pending, tuple(row for row in target if row[0] > through))
+
     def test_source123_generic_prefix_preserves_structural_qualification(self) -> None:
         for valid_structure in (True, False):
             with self.subTest(valid_structure=valid_structure):

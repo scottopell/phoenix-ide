@@ -23,6 +23,9 @@ pub mod user_commands;
 pub use round::{CommittedGoalRound, GoalRoundCheckpoint};
 
 #[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
 mod writer_tests;
 
 #[derive(Debug, thiserror::Error)]
@@ -582,13 +585,33 @@ impl Database {
     /// Returns at most 100 immutable changes, oldest first, after the supplied owner version.
     ///
     /// # Errors
-    /// Returns a database error or rejects malformed persisted history/actor/binding data.
+    /// Rejects missing/non-ordinary owners, database errors, or malformed history/actor/binding data.
     pub async fn conversation_goal_history(
         &self,
         owner: &ProductConversationId,
         after: GoalVersion,
     ) -> Result<Vec<GoalHistoryEntry>> {
+        self.conversation_goal_history_with_cut(
+            owner,
+            after,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn conversation_goal_history_with_cut(
+        &self,
+        owner: &ProductConversationId,
+        after: GoalVersion,
+        #[cfg(test)] cut: Option<snapshot_tests::HistoryReadCut>,
+    ) -> Result<Vec<GoalHistoryEntry>> {
         let mut tx = self.pool().begin().await?;
+        Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
+        #[cfg(test)]
+        if let Some(cut) = cut {
+            cut.pause().await;
+        }
         let entries = history_tx(&mut tx, owner, after).await?;
         tx.commit().await?;
         Ok(entries)

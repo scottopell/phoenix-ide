@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 mod checkpoint;
 
-async fn fixture() -> Database {
+pub(super) async fn fixture() -> Database {
     Database::open_in_memory()
         .await
         .unwrap()
@@ -21,7 +21,7 @@ async fn fixture() -> Database {
         .unwrap()
 }
 
-async fn ordinary(db: &Database, name: &str) -> (String, ProductConversationId) {
+pub(super) async fn ordinary(db: &Database, name: &str) -> (String, ProductConversationId) {
     let conversation = db
         .create_conversation(name, name, "/tmp", true, None, None)
         .await
@@ -29,7 +29,7 @@ async fn ordinary(db: &Database, name: &str) -> (String, ProductConversationId) 
     (conversation.id, conversation.product_conversation_id)
 }
 
-fn at() -> GoalTimestampUs {
+pub(super) fn at() -> GoalTimestampUs {
     GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros() + 1_000_000).unwrap()
 }
 
@@ -57,7 +57,7 @@ fn create(
     }
 }
 
-async fn counts(db: &Database) -> (i64, i64, i64, i64, i64, i64, i64) {
+pub(super) async fn counts(db: &Database) -> (i64, i64, i64, i64, i64, i64, i64) {
     sqlx::query_as(
         "SELECT
         (SELECT COUNT(*) FROM conversation_goal_ids),
@@ -285,8 +285,15 @@ async fn user_goal_commands_retain_typed_receipts_and_control_attribution() {
         },
     };
     let receipt = db
-        .apply_user_goal_command(&command, &transcript, at())
+        .apply_user_goal_command(
+            &command,
+            &transcript,
+            || Ok(at()),
+            || panic!("authority lost"),
+        )
         .await
+        .established()
+        .unwrap()
         .unwrap();
     let GoalUserResult::Accepted { ref entry } = receipt.result else {
         panic!("expected accepted goal");
@@ -300,9 +307,16 @@ async fn user_goal_commands_retain_typed_receipts_and_control_attribution() {
     ));
     let before = counts(&db).await;
     assert_eq!(
-        db.apply_user_goal_command(&command, &transcript, at())
-            .await
-            .unwrap(),
+        db.apply_user_goal_command(
+            &command,
+            &transcript,
+            || Ok(at()),
+            || panic!("authority lost")
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
         receipt
     );
     assert_eq!(counts(&db).await, before);
@@ -311,10 +325,17 @@ async fn user_goal_commands_retain_typed_receipts_and_control_attribution() {
         ..command
     };
     assert!(matches!(
-        db.apply_user_goal_command(&stale, &transcript, at())
-            .await
-            .unwrap()
-            .result,
+        db.apply_user_goal_command(
+            &stale,
+            &transcript,
+            || Ok(at()),
+            || panic!("authority lost")
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap()
+        .result,
         GoalUserResult::Rejected {
             reason: GoalUserRefusal::Version,
             ..
