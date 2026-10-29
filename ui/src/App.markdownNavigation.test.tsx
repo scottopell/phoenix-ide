@@ -37,7 +37,12 @@ vi.mock('./pages/CoordinatorPage', async importOriginal => {
   };
 });
 
-vi.mock('./cache', () => ({ cacheDB: { getConversation: vi.fn().mockResolvedValue(null), putConversation: vi.fn().mockResolvedValue(undefined) } }));
+vi.mock('./cache', () => ({ cacheDB: {
+  init: vi.fn().mockResolvedValue(undefined),
+  getPendingOps: vi.fn().mockResolvedValue([]),
+  getConversation: vi.fn().mockResolvedValue(null),
+  putConversation: vi.fn().mockResolvedValue(undefined),
+} }));
 
 vi.mock('./components/DesktopLayout', () => ({
   DesktopLayout: ({ children }: { children: ReactNode }) => {

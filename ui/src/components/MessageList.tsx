@@ -92,7 +92,9 @@ import {
   type TranscriptPositioningEvent,
   type TranscriptPositioningInput,
 } from '../conversation/transcriptPositioning';
+import { OwnedTouchTargets, type OwnedTouchStop } from './ownedTouchTarget';
 import { findConversationFragmentElement } from './viewer-find/conversationFragmentElement';
+
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -861,6 +863,20 @@ function MessageListImpl({
   const activeToolUseId = activeToolUseIdFromState(convState);
 
   const detachGestureListenersRef = useRef<(() => void) | null>(null);
+  const retainedStopRef = useRef<(receipt: OwnedTouchStop) => void>(() => {});
+  const ownedTouchTargetsRef = useRef<OwnedTouchTargets | null>(null);
+  if (!ownedTouchTargetsRef.current) {
+    ownedTouchTargetsRef.current = new OwnedTouchTargets(receipt => retainedStopRef.current(receipt));
+  }
+  const committedTouchOwnerRef = useRef(conversationId);
+  const touchRefRevisionRef = useRef(0);
+  const seenTouchStopsRef = useRef(new WeakSet<TouchEvent>());
+  useLayoutEffect(() => {
+    const controller = ownedTouchTargetsRef.current!;
+    committedTouchOwnerRef.current = conversationId;
+    if (scrollerRef.current) controller.bind(scrollerRef.current, committedTouchOwnerRef.current);
+    return () => controller.clear();
+  }, [conversationId]);
   const settleSnapRafRef = useRef(0);
   const tailFollowRafRef = useRef(0);
   const settleWatchTimerRef = useRef(0);
@@ -1030,7 +1046,17 @@ function MessageListImpl({
     detachGestureListenersRef.current?.();
     detachGestureListenersRef.current = null;
     scrollerRef.current = ref instanceof HTMLElement ? ref : null;
+    const refRevision = ++touchRefRevisionRef.current;
+    if (!(ref instanceof HTMLElement)) {
+      retainedStopRef.current = () => {};
+      queueMicrotask(() => {
+        if (touchRefRevisionRef.current === refRevision && !scrollerRef.current) {
+          ownedTouchTargetsRef.current!.clear();
+        }
+      });
+    }
     if (ref instanceof HTMLElement) {
+      ownedTouchTargetsRef.current!.bind(ref, committedTouchOwnerRef.current);
       ref.id = 'messages';
       ref.dataset['appScrollOwner'] = '';
       dispatchScrollEvent({
@@ -1084,6 +1110,7 @@ function MessageListImpl({
       const ownedTouches = (e: TouchEvent): Touch[] =>
         Array.from(e.touches).filter((t) => scrollerTouchIdsRef.current.has(t.identifier));
       const onTouchStart = (e: TouchEvent) => {
+        ownedTouchTargetsRef.current!.start(e);
         const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
         for (const id of Array.from(scrollerTouchIdsRef.current)) {
           if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
@@ -1142,11 +1169,15 @@ function MessageListImpl({
           requestFromUpwardIntent();
         }
       };
-      const resolveTouchStop = (e: TouchEvent, type: 'touchEnded' | 'touchCancelled') => {
+      const resolveTouchStop = (e: TouchEvent, type: 'touchEnded' | 'touchCancelled', receipt?: OwnedTouchStop) => {
+        const identifiers = receipt?.identifiers ?? Array.from(e.changedTouches).map(touch => touch.identifier);
+        const admitted = receipt !== undefined || identifiers.some(id => scrollerTouchIdsRef.current.has(id));
+        if (admitted && seenTouchStopsRef.current.has(e)) return;
+        if (admitted) seenTouchStopsRef.current.add(e);
         lastTouchAtMs.current = Date.now();
-        let owned = false;
-        for (const touch of Array.from(e.changedTouches)) {
-          if (scrollerTouchIdsRef.current.delete(touch.identifier)) owned = true;
+        let owned = receipt !== undefined;
+        for (const id of identifiers) {
+          if (scrollerTouchIdsRef.current.delete(id)) owned = true;
         }
         // Prune anything the browser no longer reports as down, so a touch
         // whose row was unmounted before it lifted cannot hold the gesture
@@ -1170,12 +1201,17 @@ function MessageListImpl({
         armStaleGestureTimer();
         dispatchScrollEvent({
           type,
-          remainingTouches: scrollerTouchIdsRef.current.size,
+          remainingTouches: receipt?.remainingIdentifiers.length ?? scrollerTouchIdsRef.current.size,
           snapshot: snapshotOf(ref),
         });
       };
-      const onTouchEnd = (e: TouchEvent) => resolveTouchStop(e, 'touchEnded');
-      const onTouchCancel = (e: TouchEvent) => resolveTouchStop(e, 'touchCancelled');
+      retainedStopRef.current = receipt => resolveTouchStop(receipt.event, receipt.type, receipt);
+      const onTouchEnd = (e: TouchEvent) => {
+        if (!ownedTouchTargetsRef.current!.stop(e)) resolveTouchStop(e, 'touchEnded');
+      };
+      const onTouchCancel = (e: TouchEvent) => {
+        if (!ownedTouchTargetsRef.current!.stop(e)) resolveTouchStop(e, 'touchCancelled');
+      };
       const onWheel = (e: WheelEvent) => {
         abandonStaleGesture();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
