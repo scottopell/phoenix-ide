@@ -31,18 +31,53 @@ pub struct ResolveGlobalReferenceRequest {
     pub reference: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedReferenceKind {
+    ProductConversation,
+    Conversation,
+    Message,
+    Chain,
+    Work,
+}
+
+impl ResolvedReferenceKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ProductConversation => "product_conversation",
+            Self::Conversation => "conversation",
+            Self::Message => "message",
+            Self::Chain => "chain",
+            Self::Work => "work",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolveGlobalReferenceResponse {
-    pub kind: String,
+    pub kind: ResolvedReferenceKind,
     pub id: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub href: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub title: Option<String>,
     pub work_scope: ResolvedWorkScope,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+pub(crate) const MAX_CONVERSATION_READ_CURSOR: usize = 1_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResolvedWorkScope {
     Missing,
     Unavailable {
@@ -60,7 +95,7 @@ pub enum ResolvedWorkScope {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkScopeUnavailableReason {
     RecordNotFound,
@@ -68,7 +103,7 @@ pub enum WorkScopeUnavailableReason {
     ReadFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolvedEnvironmentKind {
     CoordinatorHome,
@@ -77,10 +112,26 @@ pub enum ResolvedEnvironmentKind {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerPathSemantics {
     ServerFilesystem,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ConversationReadPage {
+    pub content: String,
+    pub next_cursor: Option<usize>,
+}
+
+fn local_read_content(page: ConversationReadPage) -> String {
+    match page.next_cursor {
+        Some(next_cursor) => format!(
+            "{}\n[… more content; call read_conversation again with cursor={next_cursor}]",
+            page.content
+        ),
+        None => page.content,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1089,6 +1140,21 @@ impl GlobalReadService {
         conversation: &str,
         cursor: usize,
     ) -> Result<String, String> {
+        self.read_conversation_page(conversation, cursor)
+            .await
+            .map(local_read_content)
+    }
+
+    pub(crate) async fn read_conversation_page(
+        &self,
+        conversation: &str,
+        cursor: usize,
+    ) -> Result<ConversationReadPage, String> {
+        if cursor > MAX_CONVERSATION_READ_CURSOR {
+            return Err(format!(
+                "cursor exceeds maximum {MAX_CONVERSATION_READ_CURSOR}"
+            ));
+        }
         let target = resolve_conversation_read_target(self, conversation).await?;
         let (transcript_id, message_id, evidence_label) = match &target {
             ConversationReadTarget::StableCurrent { transcript_id } => {
@@ -1107,6 +1173,10 @@ impl GlobalReadService {
         if let Some(message_id) = message_id {
             read_conversation_around_message(&self.db, &conv, message_id)
                 .await
+                .map(|content| ConversationReadPage {
+                    content,
+                    next_cursor: None,
+                })
                 .map_err(|e| format!("read failed: {e}"))
         } else {
             read_conversation_page(&self.db, &conv, cursor, evidence_label)
@@ -1124,33 +1194,6 @@ impl GlobalReadService {
             .await
             .map(|conversation| conversation.product_conversation_id.to_string())
             .map_err(|error| error.to_string())
-    }
-
-    pub(crate) async fn conversation_display_identity(
-        &self,
-        conversation_id: &str,
-    ) -> Result<serde_json::Value, String> {
-        let conversation = self
-            .db
-            .get_conversation(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let aggregate = self
-            .db
-            .get_ordinary_product_conversation(&conversation.product_conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let root = aggregate.root.conversation;
-        let display_name = root
-            .title
-            .clone()
-            .filter(|name| !name.trim().is_empty())
-            .or_else(|| root.slug.clone().filter(|slug| !slug.trim().is_empty()))
-            .unwrap_or_else(|| "Untitled conversation".to_string());
-        Ok(serde_json::json!({
-            "display_name": display_name,
-            "transcript_slug": conversation.slug,
-        }))
     }
 
     pub(crate) async fn resolve_message_target(
@@ -1310,7 +1353,7 @@ async fn read_conversation_page(
     conv: &Conversation,
     cursor: usize,
     evidence_label: &str,
-) -> Result<String, DbError> {
+) -> Result<ConversationReadPage, DbError> {
     let stable = ordinary_product_citation(db, conv).await?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
         let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
@@ -1329,9 +1372,12 @@ async fn read_conversation_page(
         "{stable_header}{evidence_label}: @transcript:{} — {}\nupdated: {}\n---\n",
         conv.id, title, conv.updated_at
     );
-    let body = render_message_page(db, conv, cursor).await?;
-    header.push_str(&body);
-    Ok(header)
+    let page = render_message_page(db, conv, cursor).await?;
+    header.push_str(&page.content);
+    Ok(ConversationReadPage {
+        content: header,
+        next_cursor: page.next_cursor,
+    })
 }
 
 async fn read_conversation_around_message(
@@ -1388,12 +1434,24 @@ async fn read_conversation_around_message(
     Ok(out)
 }
 
+fn conversation_page_end(cursor: usize) -> usize {
+    cursor
+        .saturating_add(READ_PAGE_CHARS)
+        .min(MAX_CONVERSATION_READ_CURSOR)
+}
+
 async fn render_message_page(
     db: &crate::db::Database,
     conv: &Conversation,
     cursor: usize,
-) -> Result<String, DbError> {
-    let end = cursor.saturating_add(READ_PAGE_CHARS);
+) -> Result<ConversationReadPage, DbError> {
+    if cursor >= MAX_CONVERSATION_READ_CURSOR {
+        return Ok(ConversationReadPage {
+            content: "(conversation read limit reached)".to_string(),
+            next_cursor: None,
+        });
+    }
+    let end = conversation_page_end(cursor);
     let mut out = String::new();
     let mut pos = 0usize;
     let mut has_more = false;
@@ -1432,14 +1490,21 @@ async fn render_message_page(
         }
     }
     if out.is_empty() && !has_more {
-        return Ok("(end of conversation)".to_string());
+        return Ok(ConversationReadPage {
+            content: "(end of conversation)".to_string(),
+            next_cursor: None,
+        });
     }
     if has_more {
-        Ok(format!(
-            "{out}\n[… more content; call read_conversation again with cursor={end}]"
-        ))
+        Ok(ConversationReadPage {
+            content: out,
+            next_cursor: Some(end),
+        })
     } else {
-        Ok(out)
+        Ok(ConversationReadPage {
+            content: out,
+            next_cursor: None,
+        })
     }
 }
 
@@ -1452,17 +1517,29 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
         .unwrap_or(false)
 }
 
+pub(super) fn exact_conversation_href(transcript_id: &str, message_id: Option<&str>) -> String {
+    let encoded_transcript =
+        super::product_conversations::percent_encode_route_segment(transcript_id);
+    let base = format!("/c/{encoded_transcript}?source_transcript={encoded_transcript}");
+    match message_id {
+        Some(message_id) => format!(
+            "{base}#message-{}",
+            super::product_conversations::percent_encode_route_segment(message_id)
+        ),
+        None => base,
+    }
+}
+
 fn conversation_href(conv: &Conversation) -> String {
-    format!("/c/{}?source_transcript={}", conv.id, conv.id)
+    exact_conversation_href(&conv.id, None)
 }
 
 fn conversation_message_href(conv: &Conversation, message: Option<(&str, MessageType)>) -> String {
-    let base = conversation_href(conv);
     match message {
         Some((message_id, message_type)) if message_type_has_rendered_anchor(message_type) => {
-            format!("{base}#message-{message_id}")
+            exact_conversation_href(&conv.id, Some(message_id))
         }
-        _ => base,
+        _ => conversation_href(conv),
     }
 }
 
@@ -2086,7 +2163,7 @@ async fn resolve_reference_impl(
         }
         let current = resolve_current_member_and_work_scope(service, id).await?;
         return Ok(ResolveGlobalReferenceResponse {
-            kind: "product_conversation".to_string(),
+            kind: ResolvedReferenceKind::ProductConversation,
             id: typed_id.to_string(),
             href: Some(super::product_conversations::canonical_route(&aggregate)),
             title: aggregate.root.conversation.title.clone().or(aggregate
@@ -2241,7 +2318,7 @@ async fn resolve_conversation(
     });
     let title = conv.title.clone().or(conv.slug.clone());
     ResolveGlobalReferenceResponse {
-        kind: "conversation".to_string(),
+        kind: ResolvedReferenceKind::Conversation,
         id: conv.id.clone(),
         href,
         title: title.clone(),
@@ -2286,7 +2363,7 @@ async fn resolve_message(
         .await
         .map_err(|error| AppError::Internal(format!("sender attribution failed: {error}")))?;
     Ok(ResolveGlobalReferenceResponse {
-        kind: "message".to_string(),
+        kind: ResolvedReferenceKind::Message,
         id: message.message_id.clone(),
         href,
         title,
@@ -2346,7 +2423,7 @@ async fn resolve_chain(
         |member| format!("@transcript:{member}"),
     );
     Ok(ResolveGlobalReferenceResponse {
-        kind: "chain".to_string(),
+        kind: ResolvedReferenceKind::Chain,
         id: root_id.to_string(),
         href: Some(crate::api::product_conversations::product_route(
             root.slug.as_deref(),
@@ -2413,7 +2490,7 @@ async fn resolve_work(
         .or(current.slug.clone())
         .unwrap_or_else(|| current.id.clone());
     Ok(ResolveGlobalReferenceResponse {
-        kind: "work".to_string(),
+        kind: ResolvedReferenceKind::Work,
         id: id.to_string(),
         href: Some(href),
         title: Some(title),
@@ -3262,12 +3339,12 @@ mod previous_transcripts_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_global_search_hits, message_id_fragment, render_full_message_text,
-        render_global_message_line, resolve_conversation_read_target, resolve_reference_impl,
-        resolve_work_scope, split_fragment, ConversationReadTarget,
+        conversation_page_end, format_global_search_hits, message_id_fragment,
+        render_full_message_text, render_global_message_line, resolve_conversation_read_target,
+        resolve_reference_impl, resolve_work_scope, split_fragment, ConversationReadTarget,
         CoordinatorWorkScopeTargetError, GlobalMessageTarget, GlobalMessageTargetError,
         GlobalReadService, ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
-        WorkScopeUnavailableReason,
+        WorkScopeUnavailableReason, MAX_CONVERSATION_READ_CURSOR, READ_PAGE_CHARS,
     };
     use std::sync::Arc;
 
@@ -3407,6 +3484,24 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("closed"), "{error}");
+    }
+
+    #[test]
+    fn local_read_content_preserves_the_local_continuation_instruction() {
+        assert_eq!(
+            local_read_content(ConversationReadPage {
+                content: "page".to_string(),
+                next_cursor: Some(7),
+            }),
+            "page\n[… more content; call read_conversation again with cursor=7]"
+        );
+        assert_eq!(
+            local_read_content(ConversationReadPage {
+                content: "terminal".to_string(),
+                next_cursor: None,
+            }),
+            "terminal"
+        );
     }
 
     #[tokio::test]
@@ -3738,6 +3833,35 @@ mod tests {
         );
         assert!(!rendered.contains("@conv:"));
         assert!(!rendered.contains("Global"));
+    }
+
+    #[tokio::test]
+    async fn read_conversation_rejects_oversized_cursor_before_target_resolution() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+
+        let error = service
+            .read_conversation("not-a-reference", MAX_CONVERSATION_READ_CURSOR + 1)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!("cursor exceeds maximum {MAX_CONVERSATION_READ_CURSOR}")
+        );
+    }
+
+    #[test]
+    fn conversation_page_end_never_exceeds_the_cursor_cap() {
+        assert_eq!(conversation_page_end(0), READ_PAGE_CHARS);
+        assert_eq!(
+            conversation_page_end(MAX_CONVERSATION_READ_CURSOR - 1),
+            MAX_CONVERSATION_READ_CURSOR
+        );
+        assert_eq!(
+            conversation_page_end(MAX_CONVERSATION_READ_CURSOR),
+            MAX_CONVERSATION_READ_CURSOR
+        );
     }
 
     #[tokio::test]
