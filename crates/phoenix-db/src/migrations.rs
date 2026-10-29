@@ -757,6 +757,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "product_conversation_rename_receipts",
         sql: include_str!("migrations/product_conversation_rename_receipts.sql"),
     },
+    Migration {
+        version: 145,
+        name: "coordinator_goal_preparations",
+        sql: include_str!("conversation_goals/prepared.sql"),
+    },
 
 ];
 

@@ -6067,6 +6067,7 @@ impl RuntimeManager {
                         .await
                         .map_err(|error| error.to_string())?,
                 );
+                coordinator_tools.extend(crate::coordinator_tools::goal_tools(self.clone()));
                 ToolRegistryExecutor::builtin_only(
                     ToolRegistry::coordinator(coordinator_tools, coordinator_catalog.clone()),
                     agent_catalog.clone(),

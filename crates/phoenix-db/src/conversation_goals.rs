@@ -19,6 +19,7 @@ pub mod control;
 pub mod execution;
 pub mod round;
 pub mod user_commands;
+pub mod prepared;
 
 pub use round::{CommittedGoalRound, GoalRoundCheckpoint};
 
@@ -30,6 +31,8 @@ mod writer_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GoalDbError {
+    #[error("{0}")]
+    Invalid(&'static str),
     #[error("goal execution binding conflicts with its retained admission")]
     BindingConflict,
     #[error("goal mutation requires a settled turn boundary")]

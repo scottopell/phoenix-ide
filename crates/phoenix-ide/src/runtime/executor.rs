@@ -9111,6 +9111,12 @@ where
             tool_ctx = tool_ctx.with_svg_assistant_message_id(&assistant_message.message_id);
         }
 
+        if let Some(turn) = &self.active_direct_turn {
+            tool_ctx = tool_ctx.with_direct_turn_id(
+                phoenix_core::domain::sm_event::DirectTurnTurnId(turn.turn_id.0),
+            );
+        }
+
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
         let storage = self.storage.clone();

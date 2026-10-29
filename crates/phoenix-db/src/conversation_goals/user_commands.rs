@@ -1,3 +1,4 @@
+use phoenix_core::domain::conversation_goal::GoalAgentSource;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -230,7 +231,51 @@ async fn reject_tx(
     })
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum GoalControlAuthority<'a> {
+    Owner,
+    Coordinator { caller: &'a str, source: &'a GoalAgentSource },
+}
+
+impl GoalControlAuthority<'_> {
+    async fn require(self, tx: &mut GoalTx<'_>) -> Result<()> {
+        if let Self::Coordinator { caller, .. } = self {
+            super::prepared::require_coordinator(tx, caller).await?;
+        }
+        Ok(())
+    }
+
+    fn actor(self, input: &GoalUserCommand) -> GoalActor {
+        match self {
+            Self::Owner => GoalActor::UserControl {
+                principal_id: input.principal_id,
+                request_id: input.request_id,
+                command: input.change.command().1,
+            },
+            Self::Coordinator { source, .. } => GoalActor::Coordinator(source.clone()),
+        }
+    }
+}
+
 impl Database {
+    pub async fn retained_coordinator_goal_command(&self, caller: &str, input: &GoalUserCommand) -> Result<Option<GoalUserReceipt>> {
+        let mut tx = self.pool().begin().await?;
+        super::prepared::require_coordinator(&mut tx, caller).await?;
+        let result = retained_tx(&mut tx, input).await?;
+        tx.rollback().await?;
+        Ok(result)
+    }
+
+    pub async fn apply_coordinator_goal_command<F: FnOnce()>(
+        &self, caller: &str, source: &GoalAgentSource, input: &GoalUserCommand,
+        expected_transcript: &str, host_gate_busy: bool,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>, on_authority_lost: F,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        self.control_goal_command(input, expected_transcript,
+            GoalControlAuthority::Coordinator { caller, source }, clock, host_gate_busy,
+            on_authority_lost, #[cfg(test)] UserCommitCut::None).await
+    }
+
     /// Read an exact receipt for an ordinary owner before checking admission for a new write.
     ///
     /// The transcript argument is a prior caller sample; this read resolves the live target itself.
@@ -304,9 +349,11 @@ impl Database {
         tx: &mut GoalTx<'_>,
         input: &GoalUserCommand,
         expected_transcript: &str,
+        requester: GoalControlAuthority<'_>,
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         host_gate_busy: bool,
     ) -> Result<GoalUserReceipt> {
+        requester.require(tx).await?;
         let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
         if let Some(retained) = retained_tx(tx, input).await? {
             return Ok(retained);
@@ -331,11 +378,7 @@ impl Database {
             let receipt = reject_tx(tx, input, reason, observed, at).await?;
             return Ok(receipt);
         }
-        let actor = GoalActor::UserControl {
-            principal_id: input.principal_id,
-            request_id: input.request_id,
-            command: input.change.command().1,
-        };
+        let actor = requester.actor(input);
         let mutation = GoalMutation {
             owner: input.owner.clone(),
             expected_version: input.expected_version,
@@ -406,6 +449,20 @@ impl Database {
         on_authority_lost: F,
         #[cfg(test)] cut: UserCommitCut,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        self.control_goal_command(input, expected_transcript, GoalControlAuthority::Owner, clock,
+            host_gate_busy, on_authority_lost, #[cfg(test)] cut).await
+    }
+
+    pub(crate) async fn control_goal_command<F: FnOnce()>(
+        &self,
+        input: &GoalUserCommand,
+        expected_transcript: &str,
+        requester: GoalControlAuthority<'_>,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        host_gate_busy: bool,
+        on_authority_lost: F,
+        #[cfg(test)] cut: UserCommitCut,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
         let mut connection = match self.pool().acquire().await {
             Ok(connection) => connection,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
@@ -416,7 +473,7 @@ impl Database {
         };
         let mut authority = super::control::ControlCommitAuthority::new(on_authority_lost);
         let result = self
-            .user_goal_command_tx(&mut tx, input, expected_transcript, clock, host_gate_busy)
+            .user_goal_command_tx(&mut tx, input, expected_transcript, requester, clock, host_gate_busy)
             .await;
         let attempted = match result {
             Ok(receipt) => {
