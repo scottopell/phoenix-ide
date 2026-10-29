@@ -53,17 +53,17 @@ export class OwnedTouchTargets {
   stop(event: TouchEvent): boolean {
     if (!event.isTrusted || !this.scroller || !event.target) return false;
     if (this.seen.has(event)) return true;
-    if (!Array.from(this.ownedTargets.values()).includes(event.target)) return false;
-    const identifiers = Array.from(event.changedTouches).filter(touch =>
+    const ownedTarget = Array.from(this.ownedTargets.values()).includes(event.target);
+    const identifiers = ownedTarget ? Array.from(event.changedTouches).filter(touch =>
       this.ownedTargets.get(touch.identifier) === (touch.target ?? event.target),
-    ).map(touch => touch.identifier);
-    if (identifiers.length === 0) return false;
-    this.seen.add(event);
-    for (const id of identifiers) { this.ownedTargets.delete(id); this.release(id); }
+    ).map(touch => touch.identifier) : [];
     const live = new Set(Array.from(event.touches).map(touch => touch.identifier));
     for (const id of Array.from(this.ownedTargets.keys())) {
       if (!live.has(id)) { this.ownedTargets.delete(id); this.release(id); }
     }
+    if (identifiers.length === 0) return false;
+    this.seen.add(event);
+    for (const id of identifiers) { this.ownedTargets.delete(id); this.release(id); }
     try {
       this.receive({ [admittedTouchStop]: true, event, identifiers,
         remainingIdentifiers: Array.from(this.ownedTargets.keys()), target: event.target,

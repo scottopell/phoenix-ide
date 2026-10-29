@@ -54,8 +54,35 @@ it('admits two matching identifiers on one target once', () => {
 it('foreign or untrusted receipts cannot consume a matching receipt', () => {
   const m = model(); m.controller.start(m.event('touchstart'));
   const fn = requiredTouchEvidence(m.listeners[0], 'first target listener').fn;
-  fn(m.event('touchend', [2])); fn(m.event('touchend', [1], false));
+  fn({ ...m.event('touchend', [2]), touches: [{ identifier: 1, target: m.target }] } as unknown as TouchEvent);
+  fn(m.event('touchend', [1], false));
   expect(m.receive).not.toHaveBeenCalled(); fn(m.event('touchend')); expect(m.receive).toHaveBeenCalledTimes(1);
+});
+for (const foreignTarget of [false, true]) it(`prunes trusted live-list absence without a receipt, foreignTarget=${foreignTarget}`, () => {
+  const m = model(); m.controller.start(m.event('touchstart'));
+  const stale = requiredTouchEvidence(m.listeners[0], 'first target listener').fn;
+  const end = { ...m.event('touchend', [2]), target: foreignTarget ? {} : m.target } as TouchEvent;
+  expect(m.controller.stop(end)).toBe(false);
+  expect(m.target.removeEventListener).toHaveBeenCalledTimes(2);
+  expect(m.receive).not.toHaveBeenCalled();
+  stale(m.event('touchend'));
+  expect(m.receive).not.toHaveBeenCalled();
+});
+it('preserves a still-live owned contact on a trusted foreign-target release', () => {
+  const m = model(); m.controller.start(m.event('touchstart'));
+  const end = { ...m.event('touchend', [2]), target: {},
+    touches: [{ identifier: 1, target: m.target }] } as unknown as TouchEvent;
+  expect(m.controller.stop(end)).toBe(false);
+  expect(m.target.removeEventListener).not.toHaveBeenCalled();
+  requiredTouchEvidence(m.listeners[0], 'first target listener').fn(m.event('touchend'));
+  expect(m.receive).toHaveBeenCalledTimes(1);
+});
+it('untrusted live-list absence cannot release owned resources', () => {
+  const m = model(); m.controller.start(m.event('touchstart'));
+  expect(m.controller.stop(m.event('touchend', [2], false))).toBe(false);
+  expect(m.target.removeEventListener).not.toHaveBeenCalled();
+  requiredTouchEvidence(m.listeners[0], 'first target listener').fn(m.event('touchend'));
+  expect(m.receive).toHaveBeenCalledTimes(1);
 });
 it('clear disposes outstanding resources and invalidates captured callbacks without a synthetic release', () => {
   const m = model(); m.controller.start(m.event('touchstart')); const fn = requiredTouchEvidence(m.listeners[0], 'first target listener').fn;
