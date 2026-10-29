@@ -192,6 +192,16 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
             "{name}"
         );
     }
+    for name in ["prepare_goal", "apply_goal"] {
+        let description = &definitions
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap()
+            .description;
+        assert!(description.contains("persisted autoContinue preference"));
+        assert!(description.contains("explicitly enabled"));
+        assert!(description.contains("does not enable it"));
+    }
     assert!(f
         .runtime
         .coordinator_tool_registry("goal-native-target", None)
