@@ -119,7 +119,7 @@ async fn seed(pool: &SqlitePool, prefix: u32) {
         ] {
             sqlx::query("INSERT INTO product_creation_resource_reservations(id, request_id, generation, repository_identity, resource_identity, status, created_at_unix_micros, updated_at_unix_micros, ownership_token) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 5, 6, ?7)")
                 .bind(format!("{id}-{generation}")).bind(id).bind(generation).bind("repo東京\0identity")
-                .bind(format!("resource-{id}-{generation}")).bind(status).bind((generation > 1).then_some("token東京\0"))
+                .bind(format!("resource-{id}-{generation}")).bind(status).bind((generation > 1).then_some("token東京"))
                 .execute(pool).await.unwrap();
         }
     }
@@ -303,8 +303,14 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
             .unwrap(),
         ProductCreationAcceptOutcome::Replayed(_)
     ));
+    sqlx::raw_sql("INSERT INTO slack_gateway_bindings(binding_id, workspace, owner, channel, thread_ts, kind, creation_id) VALUES('new-binding', 'ws', 'owner', 'channel', '2', 'explicit', 'new-slack');
+        INSERT INTO slack_gateway_requests(request_id, workspace, owner, channel, message_ts, thread_ts, kind, instruction, context, source_url, binding_id, accepted_at_unix_micros, input_id, observed_at_unix_micros, trigger_kind) VALUES('new-slack-source', 'ws', 'owner', 'channel', '2', '2', 'explicit', 'literal', 'context', 'https://example.invalid', 'new-binding', 5, 'new-input', 5, 'prefix');")
+        .execute(&pool).await.unwrap();
     let mut intent = retained.intent;
     intent.images.clear();
+    intent.origin = ProductCreationOrigin::SlackGateway {
+        request_id: "new-slack-source".into(),
+    };
     let ProductCreationAcceptOutcome::Accepted(accepted) = db
         .accept_product_creation("new-slack", &intent)
         .await
@@ -312,6 +318,13 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
     else {
         panic!("expected new Slack acceptance");
     };
+    let bound_product: String = sqlx::query_scalar(
+        "SELECT product_id FROM slack_gateway_bindings WHERE binding_id='new-binding'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bound_product, accepted.product_conversation_id.as_str());
     assert_eq!(accepted.intent.origin, intent.origin);
     assert_eq!(
         db.get_product_creation_job("new-slack")
