@@ -1052,14 +1052,7 @@ mod tests {
         let opaque_transcript_id = "opaque/segment?x=1&state=50%";
         state
             .db
-            .create_conversation(
-                opaque_transcript_id,
-                "opaque",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
+            .create_conversation(opaque_transcript_id, "opaque", "/tmp", true, None, None)
             .await
             .unwrap();
         for index in 0..180 {
@@ -1377,9 +1370,7 @@ mod tests {
                 "summary": ""
             }
         });
-        assert!(
-            serde_json::from_value::<RemoteResolveReferenceResponse>(valid.clone()).is_ok()
-        );
+        assert!(serde_json::from_value::<RemoteResolveReferenceResponse>(valid.clone()).is_ok());
 
         for field in ["kind", "id", "href", "title", "work_scope", "summary"] {
             let mut missing = valid.clone();
