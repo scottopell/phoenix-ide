@@ -281,7 +281,7 @@ fn validated_creation_directory(cwd: &str, home: &std::path::Path) -> Result<Str
         return Err("cwd must name an existing directory, not a file".into());
     }
     let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-    crate::conversation_cwd::validate_conversation_cwd(&canonical.to_string_lossy())
+    crate::conversation_cwd::validate_conversation_cwd(canonical.to_string_lossy())
         .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
         .map_err(|error| error.to_string())
 }
