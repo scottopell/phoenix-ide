@@ -30,6 +30,10 @@ pub struct PreparedGoalAction {
 }
 
 impl PreparedGoalAction {
+    /// Build the owner command represented by this immutable preparation.
+    ///
+    /// # Errors
+    /// Returns an integrity error when a state preparation has no observed Goal.
     pub fn command(&self, principal_id: Uuid) -> Result<super::user_commands::GoalUserCommand> {
         use super::user_commands::{GoalUserChange, GoalUserCommand};
         let change = match &self.intent {
@@ -187,6 +191,11 @@ pub(super) async fn require_retained_preparation(
 }
 
 impl Database {
+    /// Read the current Goal and history after the supplied version.
+    ///
+    /// # Errors
+    /// Rejects a non-current Coordinator, an unavailable ordinary target,
+    /// malformed retained Goal data, or a storage failure.
     pub async fn read_coordinator_goals(
         &self,
         caller: &str,
@@ -211,6 +220,10 @@ impl Database {
         Ok((current, history))
     }
 
+    /// Check that the caller is the current Coordinator head.
+    ///
+    /// # Errors
+    /// Rejects a non-current Coordinator or a storage failure.
     pub async fn require_current_coordinator(&self, caller: &str) -> Result<()> {
         let mut tx = self.pool().begin().await?;
         require_coordinator(&mut tx, caller).await?;
@@ -218,6 +231,11 @@ impl Database {
         Ok(())
     }
 
+    /// Retain an immutable action attributed to the Coordinator's live tool call.
+    ///
+    /// # Errors
+    /// Rejects invalid source provenance, unavailable callers or targets,
+    /// conflicting retries, inapplicable intents, malformed data, or storage failures.
     pub async fn prepare_coordinator_goal_action(
         &self,
         caller: &str,
@@ -302,6 +320,11 @@ impl Database {
         })
     }
 
+    /// Read a retained action by its preparation reference.
+    ///
+    /// # Errors
+    /// Rejects a non-current Coordinator, an unknown reference,
+    /// malformed preparation data, or a storage failure.
     pub async fn read_coordinator_goal_preparation(
         &self,
         caller: &str,

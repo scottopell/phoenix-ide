@@ -289,6 +289,11 @@ impl GoalControlAuthority<'_> {
 }
 
 impl Database {
+    /// Read an exact Coordinator receipt for a retained preparation.
+    ///
+    /// # Errors
+    /// Rejects a non-current Coordinator, a missing or changed preparation,
+    /// conflicting receipt identity, malformed data, or a storage failure.
     pub async fn retained_coordinator_goal_command(
         &self,
         caller: &str,
@@ -302,6 +307,7 @@ impl Database {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_coordinator_goal_command<F: FnOnce()>(
         &self,
         caller: &str,
@@ -393,6 +399,7 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn user_goal_command_tx(
         &self,
         tx: &mut GoalTx<'_>,
