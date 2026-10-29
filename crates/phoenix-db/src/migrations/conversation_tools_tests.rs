@@ -285,7 +285,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    db.run_migrations().await.unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
