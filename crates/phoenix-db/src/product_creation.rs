@@ -135,7 +135,12 @@ impl ProductCreationOrigin {
                     source_call: *source_call,
                 })
             }
-            _ => Err(sqlx::Error::Decode(
+            InputOrigin::UnknownHistorical
+            | InputOrigin::UserApi
+            | InputOrigin::InternalConversation { .. }
+            | InputOrigin::SystemGenerated
+            | InputOrigin::SlackGateway { .. }
+            | InputOrigin::SubscriptionEvent { .. } => Err(sqlx::Error::Decode(
                 "internal creation origin requires a source-call locator".into(),
             )),
         }
