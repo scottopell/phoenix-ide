@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_core::domain::db_schema::SourceToolCall;
 use phoenix_db::conversation_goals::prepared::{GoalPreparationIntent, PreparedGoalAction};
+use phoenix_db::workflow::LocalAuthorityResult;
 
 use phoenix_core::domain::conversation_goal::{GoalHistoryEntry, GoalTimestampUs, GoalVersion};
 use phoenix_core::domain::product_conversation::ProductConversationId;
@@ -81,10 +81,21 @@ impl GoalCommandService {
         intent: GoalPreparationIntent,
         turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId,
     ) -> Result<PreparedGoalAction, AppError> {
-        let _authority = self.runtime.acquire_local_authority_pass()
+        let _authority = self
+            .runtime
+            .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-        let result = self.runtime.db().prepare_coordinator_goal_action(caller, owner, source_tool_call, turn_id, intent).await.map_err(goal_error)?;
-        self.runtime.db().require_current_coordinator(caller).await.map_err(goal_error)?;
+        let result = self
+            .runtime
+            .db()
+            .prepare_coordinator_goal_action(caller, owner, source_tool_call, turn_id, intent)
+            .await
+            .map_err(goal_error)?;
+        self.runtime
+            .db()
+            .require_current_coordinator(caller)
+            .await
+            .map_err(goal_error)?;
         self.publication_result(Ok(result))
     }
 
@@ -93,59 +104,157 @@ impl GoalCommandService {
         caller: &str,
         reference: uuid::Uuid,
     ) -> Result<PreparedGoalAction, AppError> {
-        let _authority = self.runtime.acquire_local_authority_pass()
+        let _authority = self
+            .runtime
+            .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-        let result = self.runtime.db().read_coordinator_goal_preparation(caller, reference).await.map_err(goal_error);
+        let result = self
+            .runtime
+            .db()
+            .read_coordinator_goal_preparation(caller, reference)
+            .await
+            .map_err(goal_error);
         self.publication_result(result)
     }
 
     pub(crate) async fn authorize_coordinator(&self, caller: &str) -> Result<(), AppError> {
-        self.runtime.db().require_current_coordinator(caller).await.map_err(goal_error)
+        self.runtime
+            .db()
+            .require_current_coordinator(caller)
+            .await
+            .map_err(goal_error)
     }
 
     pub(crate) async fn read_coordinator(
-        &self, caller: &str, owner: &ProductConversationId, after: GoalVersion,
+        &self,
+        caller: &str,
+        owner: &ProductConversationId,
+        after: GoalVersion,
     ) -> Result<(Option<GoalHistoryEntry>, Vec<GoalHistoryEntry>), AppError> {
-        let _authority = self.runtime.acquire_local_authority_pass()
+        let _authority = self
+            .runtime
+            .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-        let result = self.runtime.db().read_coordinator_goals(caller, owner, after).await.map_err(goal_error);
-        self.runtime.db().require_current_coordinator(caller).await.map_err(goal_error)?;
+        let result = self
+            .runtime
+            .db()
+            .read_coordinator_goals(caller, owner, after)
+            .await
+            .map_err(goal_error);
+        self.runtime
+            .db()
+            .require_current_coordinator(caller)
+            .await
+            .map_err(goal_error)?;
         self.publication_result(result)
     }
 
-    pub(crate) async fn apply_prepared(&self, caller: &str, reference: uuid::Uuid) -> Result<GoalUserReceipt, AppError> {
-        let _authority = self.runtime.acquire_local_authority_pass()
+    pub(crate) async fn apply_prepared(
+        &self,
+        caller: &str,
+        reference: uuid::Uuid,
+    ) -> Result<GoalUserReceipt, AppError> {
+        let _authority = self
+            .runtime
+            .acquire_local_authority_pass()
             .map_err(|()| AppError::Internal("local authority is closed".into()))?;
         let action = self.prepared_snapshot(caller, reference).await?;
         let db = self.runtime.db();
-        let instance = db.instance_id().await.map_err(crate::api::product_conversations::db_to_app)?;
-        let principal = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, format!("coordinator-goal-tools:{instance}").as_bytes());
+        let instance = db
+            .instance_id()
+            .await
+            .map_err(crate::api::product_conversations::db_to_app)?;
+        let principal = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("coordinator-goal-tools:{instance}").as_bytes(),
+        );
         let command = action.command(principal).map_err(goal_error)?;
-        let result = self.apply_coordinator_command(caller, &action, &command).await;
-        db.require_current_coordinator(caller).await.map_err(goal_error)?;
+        let result = self
+            .apply_coordinator_command(caller, &action, &command)
+            .await;
+        db.require_current_coordinator(caller)
+            .await
+            .map_err(goal_error)?;
         self.publication_result(result)
     }
 
     async fn apply_coordinator_command(
-        &self, caller: &str, action: &PreparedGoalAction, command: &GoalUserCommand,
+        &self,
+        caller: &str,
+        action: &PreparedGoalAction,
+        command: &GoalUserCommand,
     ) -> Result<GoalUserReceipt, AppError> {
         let db = self.runtime.db();
-        if let Some(receipt) = db.retained_coordinator_goal_command(caller, command).await.map_err(goal_error)? {
+        if let Some(receipt) = db
+            .retained_coordinator_goal_command(caller, command)
+            .await
+            .map_err(goal_error)?
+        {
             return Ok(receipt);
         }
-        let transcript = db.get_ordinary_product_conversation(&action.owner).await
-            .map_err(crate::api::product_conversations::db_to_app)?.latest_transcript_row_id;
-        let clock = || GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros()).map_err(phoenix_db::conversation_goals::GoalDbError::from);
-        let lost = || self.runtime.signal_fatal_local_authority("coordinator_goal_command_write");
-        let Some(_product_guard) = self.runtime.try_lock_product_message_admission(action.owner.as_str()).await else {
-            return self.established_receipt(db.apply_coordinator_goal_command(caller, &action.source, command, &transcript, true, clock, lost).await);
+        let transcript = db
+            .get_ordinary_product_conversation(&action.owner)
+            .await
+            .map_err(crate::api::product_conversations::db_to_app)?
+            .latest_transcript_row_id;
+        let clock = || {
+            GoalTimestampUs::parse(chrono::Utc::now().timestamp_micros())
+                .map_err(phoenix_db::conversation_goals::GoalDbError::from)
         };
-        let transcript = db.get_ordinary_product_conversation(&action.owner).await
-            .map_err(crate::api::product_conversations::db_to_app)?.latest_transcript_row_id;
-        let Some(_acceptance_guard) = self.runtime.try_lock_message_acceptance(&transcript).await else {
-            return self.established_receipt(db.apply_coordinator_goal_command(caller, &action.source, command, &transcript, true, clock, lost).await);
+        let lost = || {
+            self.runtime
+                .signal_fatal_local_authority("coordinator_goal_command_write")
         };
-        self.established_receipt(db.apply_coordinator_goal_command(caller, &action.source, command, &transcript, false, clock, lost).await)
+        let Some(_product_guard) = self
+            .runtime
+            .try_lock_product_message_admission(action.owner.as_str())
+            .await
+        else {
+            return self.established_receipt(
+                db.apply_coordinator_goal_command(
+                    caller,
+                    &action.source,
+                    command,
+                    &transcript,
+                    true,
+                    clock,
+                    lost,
+                )
+                .await,
+            );
+        };
+        let transcript = db
+            .get_ordinary_product_conversation(&action.owner)
+            .await
+            .map_err(crate::api::product_conversations::db_to_app)?
+            .latest_transcript_row_id;
+        let Some(_acceptance_guard) = self.runtime.try_lock_message_acceptance(&transcript).await
+        else {
+            return self.established_receipt(
+                db.apply_coordinator_goal_command(
+                    caller,
+                    &action.source,
+                    command,
+                    &transcript,
+                    true,
+                    clock,
+                    lost,
+                )
+                .await,
+            );
+        };
+        self.established_receipt(
+            db.apply_coordinator_goal_command(
+                caller,
+                &action.source,
+                command,
+                &transcript,
+                false,
+                clock,
+                lost,
+            )
+            .await,
+        )
     }
 
     pub(super) async fn current(

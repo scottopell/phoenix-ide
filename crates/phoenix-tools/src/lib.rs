@@ -630,7 +630,10 @@ impl ToolContext {
     }
 
     #[must_use]
-    pub fn with_direct_turn_id(mut self, turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId) -> Self {
+    pub fn with_direct_turn_id(
+        mut self,
+        turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId,
+    ) -> Self {
         self.direct_turn_id = Some(turn_id);
         self
     }

@@ -17,9 +17,9 @@ mod admission;
 pub mod checkpoint;
 pub mod control;
 pub mod execution;
+pub mod prepared;
 pub mod round;
 pub mod user_commands;
-pub mod prepared;
 
 pub use round::{CommittedGoalRound, GoalRoundCheckpoint};
 
