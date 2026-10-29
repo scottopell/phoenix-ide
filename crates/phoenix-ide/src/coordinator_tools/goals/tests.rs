@@ -119,11 +119,12 @@ impl Fixture {
 
     async fn prepare(&self, action: Value) -> Value {
         value(
-            self.invoke(
-                "prepare_goal",
-                json!({"target":self.target(),"action":action}),
-            )
-            .await,
+            &self
+                .invoke(
+                    "prepare_goal",
+                    json!({"target":self.target(),"action":action}),
+                )
+                .await,
         )
     }
 
@@ -156,7 +157,7 @@ impl Fixture {
     }
 }
 
-fn value(output: ToolOutput) -> Value {
+fn value(output: &ToolOutput) -> Value {
     assert!(output.is_success(), "{}", output.output());
     serde_json::from_str(output.output()).unwrap()
 }
@@ -196,15 +197,15 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
         .coordinator_tool_registry("goal-native-target", None)
         .await
         .is_err());
-    let prepared = value(f.invoke("prepare_goal", json!({"target":f.target(),"action":{"operation":"create","objective":"Native goal journey"}})).await);
+    let prepared = value(&f.invoke("prepare_goal", json!({"target":f.target(),"action":{"operation":"create","objective":"Native goal journey"}})).await);
     assert_eq!(prepared["expected_version"], 0);
     assert!(f.db.conversation_goal(&f.owner).await.unwrap().is_none());
     let action = json!({"action_reference":prepared["action_reference"]});
-    let accepted = value(f.invoke("apply_goal", action.clone()).await);
+    let accepted = value(&f.invoke("apply_goal", action.clone()).await);
     assert_eq!(accepted["receipt"]["result"]["outcome"], "accepted");
-    let replayed = value(f.invoke("apply_goal", action).await);
+    let replayed = value(&f.invoke("apply_goal", action).await);
     assert_eq!(accepted, replayed);
-    let read = value(f.invoke("read_goal", json!({"target":f.target()})).await);
+    let read = value(&f.invoke("read_goal", json!({"target":f.target()})).await);
     assert_eq!(read["history"].as_array().unwrap().len(), 1);
     assert_eq!(read["execution_state_included"], false);
     let workflows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflows")
@@ -416,7 +417,7 @@ async fn native_goal_tools_recheck_coordinator_role_on_every_operation() {
         let output = tool
             .run(
                 input,
-                super::super::tests::context(&ordinary).with_direct_turn_id(f.turn_id),
+                super::super::tests::context(ordinary).with_direct_turn_id(f.turn_id),
             )
             .await;
         assert!(!output.is_success(), "{name} accepted an ordinary caller");
@@ -438,7 +439,7 @@ async fn native_goal_explicit_replacement_and_dispositions_preserve_history_with
     let create = f
         .prepare(json!({"operation":"create","objective":"first approved objective"}))
         .await;
-    value(f.apply(&create).await);
+    value(&f.apply(&create).await);
     let first = f.db.conversation_goal(&f.owner).await.unwrap().unwrap();
     assert!(!f.invoke("prepare_goal", json!({"target":f.target(),"action":{"operation":"create","objective":"blind overwrite"}})).await.is_success());
     let replace = f
@@ -450,7 +451,7 @@ async fn native_goal_explicit_replacement_and_dispositions_preserve_history_with
         f.db.conversation_goal(&f.owner).await.unwrap().unwrap(),
         first
     );
-    value(f.apply(&replace).await);
+    value(&f.apply(&replace).await);
     let replacement = f.db.conversation_goal(&f.owner).await.unwrap().unwrap();
     assert_ne!(replacement.goal_id(), first.goal_id());
     assert_eq!(replacement.objective().as_str(), "explicit replacement");
@@ -462,7 +463,7 @@ async fn native_goal_explicit_replacement_and_dispositions_preserve_history_with
         let prepared = f
             .prepare(json!({"operation":"state","disposition":disposition}))
             .await;
-        value(f.apply(&prepared).await);
+        value(&f.apply(&prepared).await);
         assert_eq!(
             f.db.conversation_goal(&f.owner)
                 .await
@@ -507,7 +508,7 @@ async fn native_goal_conflict_and_busy_receipts_replay_without_new_mutations() {
     let winner = f
         .prepare(json!({"operation":"create","objective":"newer approval"}))
         .await;
-    value(f.apply(&winner).await);
+    value(&f.apply(&winner).await);
     let refused = f.apply(&stale).await;
     assert!(!refused.is_success());
     let receipt: Value = serde_json::from_str(refused.output()).unwrap();
@@ -570,11 +571,11 @@ async fn native_goal_target_rollover_follows_live_owner_and_replays_old_referenc
     assert_eq!(successor.product_conversation_id, f.owner);
     let before = f.work_counts().await;
     let accepted = f.apply(&prepared).await;
-    value(accepted.clone());
+    value(&accepted);
     let retry = f.apply(&prepared).await;
     assert!(retry.is_success());
     assert_eq!(retry.output(), accepted.output());
-    let read = value(f.invoke("read_goal", json!({"target":f.target()})).await);
+    let read = value(&f.invoke("read_goal", json!({"target":f.target()})).await);
     assert_eq!(read["history"].as_array().unwrap().len(), 1);
     assert_eq!(f.work_counts().await, before);
 }
@@ -587,7 +588,7 @@ async fn native_goal_tools_refuse_suspended_reactivation_and_stop_expansion() {
     let prepared = f
         .prepare(json!({"operation":"create","objective":"suspension boundary"}))
         .await;
-    value(f.apply(&prepared).await);
+    value(&f.apply(&prepared).await);
     let current = f.db.conversation_goal(&f.owner).await.unwrap().unwrap();
     let suspend = GoalUserCommand {
         owner: f.owner.clone(),
@@ -694,7 +695,7 @@ async fn native_goal_prepared_reference_survives_coordinator_continuation() {
     };
     let ctx = || super::super::tests::context(&successor.id);
     let accepted = executor.execute(apply(), ctx()).await.unwrap();
-    value(accepted.clone());
+    value(&accepted);
     let replay = executor.execute(apply(), ctx()).await.unwrap();
     assert!(replay.is_success());
     assert_eq!(replay.output(), accepted.output());
@@ -723,7 +724,7 @@ async fn native_goal_receipt_replays_after_database_reopen_and_service_reconstru
         .prepare(json!({"operation":"create","objective":"retained after reopen"}))
         .await;
     let accepted = f.apply(&prepared).await;
-    value(accepted.clone());
+    value(&accepted);
     let caller = f.caller.clone();
     let owner = f.owner.clone();
     let before = f.work_counts().await;
@@ -787,7 +788,7 @@ async fn native_goal_accepted_and_refused_receipts_replay_through_coordinator_su
         .prepare(json!({"operation":"create","objective":"accepted before continuation"}))
         .await;
     let accepted = f.apply(&accepted_ref).await;
-    value(accepted.clone());
+    value(&accepted);
     let busy_ref = f.prepare(json!({"operation":"state","disposition":{"state":"blocked","reason":"refused before continuation"}})).await;
     let gate = f
         .runtime
@@ -909,7 +910,7 @@ async fn native_goal_reopen_preserves_pending_preparation_and_refused_receipt() 
         )
         .await
         .unwrap();
-    value(applied);
+    value(&applied);
     assert_eq!(
         db.conversation_goal_history(&owner, GoalVersion::INITIAL)
             .await
