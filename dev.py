@@ -10204,6 +10204,15 @@ class PreparedCandidate:
 
 
 @dataclasses.dataclass(frozen=True)
+class PrebuiltLocalCandidateInputs:
+    binary: Path
+    binary_sha256: str
+    migration_registry: Path
+    migration_registry_sha256: str
+    source: LocalCandidateSource
+
+
+@dataclasses.dataclass(frozen=True)
 class DisposableLaunchdValidationInputs:
     prepared_artifact: Path
 
@@ -10255,12 +10264,21 @@ class ProdDeployControllerOptions:
     candidate_source_root: Path | None = None
     candidate_source_commit: str | None = None
 
-    def require_local_candidate_source(self, release: str | None) -> LocalCandidateSource | None:
+    def require_local_candidate_source(
+        self,
+        release: str | None,
+        *,
+        prebuilt_source: LocalCandidateSource | None = None,
+    ) -> LocalCandidateSource | None:
         if (self.candidate_source_root is None) != (self.candidate_source_commit is None):
             raise SystemExit(
                 "--candidate-source-root and --candidate-source-commit must be provided together"
             )
-        if self.candidate_source_root is None:
+        if prebuilt_source is not None and self.candidate_source_root is not None:
+            raise SystemExit(
+                "verified prebuilt local candidate cannot be combined with candidate source flags"
+            )
+        if prebuilt_source is None and self.candidate_source_root is None:
             return None
         if self.enabled:
             raise SystemExit(
@@ -10298,10 +10316,13 @@ class ProdDeployControllerOptions:
             raise SystemExit(
                 "explicit candidate source cannot be combined with release or prepared-artifact pins"
             )
-        return _validated_local_candidate_source(LocalCandidateSource(
-            root=self.candidate_source_root,
-            commit=self.candidate_source_commit,
-        ))
+        return _validated_local_candidate_source(
+            prebuilt_source
+            or LocalCandidateSource(
+                root=self.candidate_source_root,
+                commit=self.candidate_source_commit,
+            )
+        )
 
     def require_controller_source(self, release: str | None) -> None:
         if self.same_schema_refresh:
@@ -11058,6 +11079,40 @@ def _prepare_prepared_artifact(directory: Path, expected_full_commit: str) -> Pr
         raise SystemExit("prepared standalone artifact identity does not match receipt and expected commit")
     return PreparedCandidate(binary=binary, source_kind=ProdSourceKind.PREPARED_ARTIFACT, source_commit=expected_full_commit, identity=identity)
 
+
+
+def _verify_prebuilt_local_candidate(
+    inputs: PrebuiltLocalCandidateInputs,
+    source: LocalCandidateSource,
+) -> PreparedCandidate:
+    if inputs.source != source:
+        raise SystemExit("prebuilt local candidate source does not match selected source")
+    artifacts = (
+        ("binary", inputs.binary, inputs.binary_sha256),
+        ("migration registry", inputs.migration_registry, inputs.migration_registry_sha256),
+    )
+    for description, path, expected_sha256 in artifacts:
+        if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+            raise SystemExit(f"prebuilt local candidate {description} SHA-256 is not exact")
+        if not path.is_file() or path.is_symlink():
+            raise SystemExit(f"prebuilt local candidate {description} is not a regular file")
+        if _file_sha256(path) != expected_sha256:
+            raise SystemExit(f"prebuilt local candidate {description} SHA-256 mismatch")
+    identity = RuntimeIdentity.from_value(_binary_identity(inputs.binary))
+    if identity.git_sha != source.commit:
+        raise SystemExit(
+            "prebuilt local candidate embedded identity does not match selected source"
+        )
+    for description, path, expected_sha256 in artifacts:
+        if _file_sha256(path) != expected_sha256:
+            raise SystemExit(f"prebuilt local candidate {description} changed during validation")
+    return PreparedCandidate(
+        binary=inputs.binary,
+        source_kind=ProdSourceKind.LOCAL_HEAD,
+        source_commit=source.commit,
+        identity=identity,
+        migration_registry=inputs.migration_registry,
+    )
 
 
 def _prepare_local_candidate(
@@ -13385,6 +13440,7 @@ def launchd_prod_deploy(
     *,
     controller: "ProdDeployControllerOptions | None" = None,
     compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+    prebuilt_local_candidate: PrebuiltLocalCandidateInputs | None = None,
 ):
     """Prepare a candidate, then hand transactional activation to launchd."""
     import uuid
@@ -13393,19 +13449,32 @@ def launchd_prod_deploy(
     if controller.systemd_current_schema_upgrade:
         raise SystemExit("protected systemd current-schema mode cannot use this backend")
     controller.require_controller_source(release)
-    explicit_candidate_source = controller.require_local_candidate_source(release)
+    explicit_candidate_source = controller.require_local_candidate_source(
+        release,
+        prebuilt_source=(
+            prebuilt_local_candidate.source
+            if prebuilt_local_candidate is not None
+            else None
+        ),
+    )
     trusted_controller_commit = None
-    prebuilt_local_candidate = None
+    prepared_local_candidate = None
     if explicit_candidate_source is not None:
         trusted_controller_commit = _trusted_controller_head()
-        prebuilt_local_candidate = _prepare_local_candidate(
-            target=None,
-            candidate_source=explicit_candidate_source,
-            **(
-                {"compiler_cache_setup": compiler_cache_setup}
-                if compiler_cache_setup is not None
-                else {}
-            ),
+        prepared_local_candidate = (
+            _verify_prebuilt_local_candidate(
+                prebuilt_local_candidate, explicit_candidate_source
+            )
+            if prebuilt_local_candidate is not None
+            else _prepare_local_candidate(
+                target=None,
+                candidate_source=explicit_candidate_source,
+                **(
+                    {"compiler_cache_setup": compiler_cache_setup}
+                    if compiler_cache_setup is not None
+                    else {}
+                ),
+            )
         )
     if (controller.prepared_artifact is not None
             and controller.expected_full_commit == PREPARED_SOURCE128_COMMIT
@@ -13432,9 +13501,9 @@ def launchd_prod_deploy(
         if _trusted_controller_head() != trusted_controller_commit:
             raise SystemExit("trusted controller source changed while the isolated build was running")
         if (
-            prebuilt_local_candidate is None
-            or prebuilt_local_candidate.migration_registry is None
-            or not prebuilt_local_candidate.migration_registry.is_file()
+            prepared_local_candidate is None
+            or prepared_local_candidate.migration_registry is None
+            or not prepared_local_candidate.migration_registry.is_file()
         ):
             raise SystemExit("isolated candidate build did not preserve migrations.rs")
 
@@ -13453,8 +13522,8 @@ def launchd_prod_deploy(
         else "published_release" if release else "local_head"
     )
     source_commit = (
-        prebuilt_local_candidate.source_commit
-        if prebuilt_local_candidate is not None
+        prepared_local_candidate.source_commit
+        if prepared_local_candidate is not None
         else None
     )
     release_commit = None
@@ -13525,8 +13594,8 @@ def launchd_prod_deploy(
             prepared = (
                 _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
                 if release
-                else prebuilt_local_candidate
-                if prebuilt_local_candidate is not None
+                else prepared_local_candidate
+                if prepared_local_candidate is not None
                 else _prepare_local_candidate(
                     target=None,
                     **(
