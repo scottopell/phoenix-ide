@@ -1196,6 +1196,33 @@ impl GlobalReadService {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) async fn conversation_display_identity(
+        &self,
+        conversation_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let aggregate = self
+            .db
+            .get_ordinary_product_conversation(&conversation.product_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let root = aggregate.root.conversation;
+        let display_name = root
+            .title
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| root.slug.clone().filter(|slug| !slug.trim().is_empty()))
+            .unwrap_or_else(|| "Untitled conversation".to_string());
+        Ok(serde_json::json!({
+            "display_name": display_name,
+            "transcript_slug": conversation.slug,
+        }))
+    }
+
     pub(crate) async fn resolve_message_target(
         &self,
         target: &str,
@@ -3489,14 +3516,14 @@ mod tests {
     #[test]
     fn local_read_content_preserves_the_local_continuation_instruction() {
         assert_eq!(
-            local_read_content(ConversationReadPage {
+            super::local_read_content(super::ConversationReadPage {
                 content: "page".to_string(),
                 next_cursor: Some(7),
             }),
             "page\n[… more content; call read_conversation again with cursor=7]"
         );
         assert_eq!(
-            local_read_content(ConversationReadPage {
+            super::local_read_content(super::ConversationReadPage {
                 content: "terminal".to_string(),
                 next_cursor: None,
             }),
