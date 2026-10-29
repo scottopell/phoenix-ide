@@ -86,7 +86,7 @@ fn rename_detail_uses_shared_encoded_canonical_route_with_stable_id_fallback() {
         title: Some("東京 / name".into()),
         slug: Some("東京 / name".into()),
     };
-    let response = rename_detail_response(detail.clone());
+    let response = rename_detail_response(&detail);
     assert_eq!(
         response["canonical_route"],
         "/c/%E6%9D%B1%E4%BA%AC%20%2F%20name"
@@ -94,7 +94,7 @@ fn rename_detail_uses_shared_encoded_canonical_route_with_stable_id_fallback() {
     assert_eq!(response["detail"]["name_revision"], 7);
     detail.slug = None;
     assert_eq!(
-        rename_detail_response(detail)["canonical_route"],
+        rename_detail_response(&detail)["canonical_route"],
         "/c/pc_test"
     );
 }
