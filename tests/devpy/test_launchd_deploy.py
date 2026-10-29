@@ -2122,6 +2122,67 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(output_root / "source", cargo_calls[0][1])
             self.assertIn(str(output_root / "target"), cargo_calls[0][0])
 
+    def test_candidate_prod_build_preserves_tracked_symlink_and_original_build_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            candidate_root = root / "candidate"
+            (candidate_root / "ui").mkdir(parents=True)
+            tracked_target = candidate_root / "skills" / "tracked-skill"
+            tracked_target.mkdir(parents=True)
+            tracked_link = candidate_root / ".agents" / "skills" / "tracked-skill"
+            tracked_link.parent.mkdir(parents=True)
+            tracked_link.symlink_to("../../skills/tracked-skill")
+            output_root = root / "output"
+            output_root.mkdir()
+            source = self.dev.LocalCandidateSource(candidate_root, "a" * 40)
+            build_error = RuntimeError("original cargo failure")
+            cargo_reached = False
+
+            def run(command, **kwargs):
+                nonlocal cargo_reached
+                if command[:3] == ["git", "rev-parse", "--absolute-git-dir"]:
+                    return subprocess.CompletedProcess(command, 0, f"{root / 'git-dir'}\n", "")
+                if command[:2] == ["pnpm", "install"]:
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if command[:3] == ["git", "status", "--porcelain"]:
+                    copied_link = Path(kwargs["cwd"]) / ".agents" / "skills" / "tracked-skill"
+                    link_matches_index = (
+                        copied_link.is_symlink()
+                        and copied_link.readlink() == Path("../../skills/tracked-skill")
+                    )
+                    status = "" if link_matches_index else " D .agents/skills/tracked-skill\n"
+                    return subprocess.CompletedProcess(command, 0, status, "")
+                if command[:2] == ["cargo", "build"]:
+                    cargo_reached = True
+                    raise build_error
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(
+                self.dev, "_validated_local_candidate_source", return_value=source
+            ), mock.patch.object(
+                self.dev, "ensure_corepack_pnpm"
+            ), mock.patch.object(
+                self.dev, "node_env", return_value={}
+            ), mock.patch.object(
+                self.dev, "_compiler_cache_subprocess_env", return_value=("cargo", {})
+            ), mock.patch.object(
+                self.dev, "_production_cargo_feature_args", return_value=[]
+            ), mock.patch.object(
+                self.dev.subprocess, "run", side_effect=run
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    self.dev.prod_build(
+                        strip=False,
+                        target=None,
+                        candidate_source=source,
+                        candidate_output_root=output_root,
+                    )
+
+            self.assertIs(build_error, raised.exception)
+            self.assertTrue(cargo_reached)
+            self.assertTrue(tracked_link.is_symlink())
+            self.assertFalse((output_root / "source").exists())
+
     def test_candidate_identity_mismatch_fails_before_deploy_claim(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

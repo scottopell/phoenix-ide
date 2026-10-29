@@ -8172,6 +8172,7 @@ def prod_build(
         shutil.copytree(
             candidate_source.root,
             worktree,
+            symlinks=True,
             ignore=shutil.ignore_patterns(".git", "target", "node_modules"),
         )
     print(f"Building from commit: {commit}")
