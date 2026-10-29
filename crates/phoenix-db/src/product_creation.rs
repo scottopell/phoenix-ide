@@ -2545,8 +2545,8 @@ mod product_creation_tests {
         else {
             panic!("expected a Coordinator successor");
         };
-        for request in [&request_id[..], "missing-request"] {
-            for caller in [&coordinator.id[..], "ordinary-or-missing"] {
+        for request in [request_id.as_str(), "missing-request"] {
+            for caller in [coordinator.id.as_str(), "ordinary-or-missing"] {
                 assert!(matches!(
                     db.read_product_creation_status_as_coordinator(caller, request)
                         .await,
@@ -2571,7 +2571,7 @@ mod product_creation_tests {
             .execute(db.pool())
             .await
             .unwrap();
-        for request in [&request_id[..], "missing-request"] {
+        for request in [request_id.as_str(), "missing-request"] {
             assert!(matches!(
                 db.read_product_creation_status_as_coordinator(&successor.id, request)
                     .await,
