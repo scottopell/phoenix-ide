@@ -203,7 +203,7 @@ impl GoalCommandService {
         };
         let lost = || {
             self.runtime
-                .signal_fatal_local_authority("coordinator_goal_command_write")
+                .signal_fatal_local_authority("coordinator_goal_command_write");
         };
         let Some(_product_guard) = self
             .runtime
