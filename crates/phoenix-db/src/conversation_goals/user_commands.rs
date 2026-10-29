@@ -6,7 +6,17 @@ use super::{
     GoalDbError, GoalDisposition, GoalError, GoalHistoryEntry, GoalId, GoalMutation, GoalText,
     GoalTimestampUs, GoalTx, GoalUserCommandKind, GoalVersion, ProductConversationId, Result,
 };
-use crate::Database;
+use crate::{workflow::LocalAuthorityResult, Database};
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum UserCommitCut {
+    None,
+    LostAcknowledgement,
+    RolledBack,
+    LostClassification,
+    LostRollbackAcknowledgement,
+}
 use sqlx::Row;
 
 pub struct GoalUserCommand {
@@ -221,18 +231,24 @@ async fn reject_tx(
 }
 
 impl Database {
-    /// Read an exact user goal-command receipt after revalidating the ordinary owner's live target.
+    /// Read an exact receipt for an ordinary owner before checking admission for a new write.
+    ///
+    /// The transcript argument is a prior caller sample; this read resolves the live target itself.
     ///
     /// # Errors
     /// Rejects unavailable owners, changed request payloads and malformed or missing schema.
     pub async fn retained_user_goal_command(
         &self,
         input: &GoalUserCommand,
-        expected_transcript: &str,
+        _expected_transcript: &str,
     ) -> Result<Option<GoalUserReceipt>> {
         let mut tx = self.pool().begin().await?;
-        admission::require_target_tx(&mut tx, &input.owner, expected_transcript).await?;
+        let live = Self::get_ordinary_product_conversation_on(&mut tx, &input.owner).await?;
         let retained = retained_tx(&mut tx, input).await?;
+        if retained.is_none() {
+            admission::require_target_tx(&mut tx, &input.owner, &live.latest_transcript_row_id)
+                .await?;
+        }
         tx.commit().await?;
         Ok(retained)
     }
@@ -241,44 +257,68 @@ impl Database {
     ///
     /// # Errors
     /// Rejects changed/unavailable targets, conflicting request identity and storage failures.
-    pub async fn apply_user_goal_command(
+    pub async fn apply_user_goal_command<F: FnOnce()>(
         &self,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        at: GoalTimestampUs,
-    ) -> Result<GoalUserReceipt> {
-        self.user_goal_command(input, expected_transcript, at, false)
-            .await
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        on_authority_lost: F,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        self.user_goal_command(
+            input,
+            expected_transcript,
+            clock,
+            false,
+            on_authority_lost,
+            #[cfg(test)]
+            UserCommitCut::None,
+        )
+        .await
     }
 
     /// Retain a busy refusal when the host could not acquire its existing admission gates.
     ///
     /// # Errors
     /// Rejects changed/unavailable targets, conflicting request identity and storage failures.
-    pub async fn reject_busy_user_goal_command(
+    pub async fn reject_busy_user_goal_command<F: FnOnce()>(
         &self,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        at: GoalTimestampUs,
-    ) -> Result<GoalUserReceipt> {
-        self.user_goal_command(input, expected_transcript, at, true)
-            .await
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        on_authority_lost: F,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        self.user_goal_command(
+            input,
+            expected_transcript,
+            clock,
+            true,
+            on_authority_lost,
+            #[cfg(test)]
+            UserCommitCut::None,
+        )
+        .await
     }
 
-    async fn user_goal_command(
+    async fn user_goal_command_tx(
         &self,
+        tx: &mut GoalTx<'_>,
         input: &GoalUserCommand,
         expected_transcript: &str,
-        at: GoalTimestampUs,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
         host_gate_busy: bool,
     ) -> Result<GoalUserReceipt> {
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        admission::require_target_tx(&mut tx, &input.owner, expected_transcript).await?;
-        if let Some(retained) = retained_tx(&mut tx, input).await? {
-            tx.commit().await?;
+        let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
+        if let Some(retained) = retained_tx(tx, input).await? {
             return Ok(retained);
         }
-        let current = current_tx(&mut tx, &input.owner).await?;
+        let target = if host_gate_busy {
+            &live.latest_transcript_row_id
+        } else {
+            expected_transcript
+        };
+        admission::require_target_tx(tx, &input.owner, target).await?;
+        let at = clock()?;
+        let current = current_tx(tx, &input.owner).await?;
         let observed = current
             .as_ref()
             .map_or(GoalVersion::INITIAL, super::GoalSnapshot::version);
@@ -288,8 +328,7 @@ impl Database {
             } else {
                 GoalUserRefusal::Version
             };
-            let receipt = reject_tx(&mut tx, input, reason, observed, at).await?;
-            tx.commit().await?;
+            let receipt = reject_tx(tx, input, reason, observed, at).await?;
             return Ok(receipt);
         }
         let actor = GoalActor::UserControl {
@@ -310,12 +349,10 @@ impl Database {
             },
             change: input.change.mutation_change()?,
         };
-        match admission::require_settled_tx(&mut tx, &mutation, expected_transcript).await {
+        match admission::require_settled_tx(tx, &mutation, expected_transcript).await {
             Ok(()) => {}
             Err(GoalDbError::Busy) => {
-                let receipt =
-                    reject_tx(&mut tx, input, GoalUserRefusal::Busy, observed, at).await?;
-                tx.commit().await?;
+                let receipt = reject_tx(tx, input, GoalUserRefusal::Busy, observed, at).await?;
                 return Ok(receipt);
             }
             Err(error) => return Err(error),
@@ -326,8 +363,7 @@ impl Database {
                 if matches!(&input.change, GoalUserChange::State { .. }) =>
             {
                 let receipt =
-                    reject_tx(&mut tx, input, GoalUserRefusal::Transition, observed, at).await?;
-                tx.commit().await?;
+                    reject_tx(tx, input, GoalUserRefusal::Transition, observed, at).await?;
                 return Ok(receipt);
             }
             Err(error) => return Err(error.into()),
@@ -336,9 +372,9 @@ impl Database {
             .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
             .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
             .bind(next.goal_id().as_str()).bind(next.version().get()).bind(at.get())
-            .execute(&mut *tx).await?;
+            .execute(&mut **tx).await?;
         let entry = apply_goal_tx(
-            &mut tx,
+            tx,
             &mutation,
             Some(expected_transcript),
             at,
@@ -346,14 +382,13 @@ impl Database {
         )
         .await?;
         crate::coordinator_watches::goal_facts::settled_change_tx(
-            &mut tx,
+            tx,
             self.goal_control_installation(),
             &entry,
             expected_transcript,
         )
         .await
         .map_err(GoalDbError::from)?;
-        tx.commit().await?;
         Ok(GoalUserReceipt {
             request_id: input.request_id,
             result: GoalUserResult::Accepted {
@@ -361,4 +396,107 @@ impl Database {
             },
         })
     }
+
+    async fn user_goal_command<F: FnOnce()>(
+        &self,
+        input: &GoalUserCommand,
+        expected_transcript: &str,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        host_gate_busy: bool,
+        on_authority_lost: F,
+        #[cfg(test)] cut: UserCommitCut,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        let mut connection = match self.pool().acquire().await {
+            Ok(connection) => connection,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let mut tx = match sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let mut authority = super::control::ControlCommitAuthority::new(on_authority_lost);
+        let result = self
+            .user_goal_command_tx(&mut tx, input, expected_transcript, clock, host_gate_busy)
+            .await;
+        let attempted = match result {
+            Ok(receipt) => {
+                #[cfg(not(test))]
+                let committed = tx.commit().await;
+                #[cfg(test)]
+                let committed = if matches!(cut, UserCommitCut::RolledBack) {
+                    tx.rollback()
+                        .await
+                        .and(Err(sqlx::Error::Protocol("injected rollback".into())))
+                } else {
+                    tx.commit().await
+                };
+                #[cfg(test)]
+                let committed = match cut {
+                    UserCommitCut::LostAcknowledgement | UserCommitCut::LostClassification
+                        if committed.is_ok() =>
+                    {
+                        Err(sqlx::Error::Protocol(
+                            "injected lost acknowledgement".into(),
+                        ))
+                    }
+                    UserCommitCut::None
+                    | UserCommitCut::LostAcknowledgement
+                    | UserCommitCut::RolledBack
+                    | UserCommitCut::LostClassification
+                    | UserCommitCut::LostRollbackAcknowledgement => committed,
+                };
+                match committed {
+                    Ok(()) => {
+                        authority.classified();
+                        return LocalAuthorityResult::DurableFactEstablished(Ok(receipt));
+                    }
+                    Err(error) => GoalDbError::Sqlx(error),
+                }
+            }
+            Err(error) => {
+                let rolled_back = tx.rollback().await.is_ok();
+                #[cfg(test)]
+                let rolled_back =
+                    rolled_back && !matches!(cut, UserCommitCut::LostRollbackAcknowledgement);
+                if rolled_back {
+                    authority.classified();
+                    return LocalAuthorityResult::DurableFactEstablished(Err(error));
+                }
+                error
+            }
+        };
+        let Ok(mut lookup) =
+            sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await
+        else {
+            return LocalAuthorityResult::DurableFactUnclassified;
+        };
+        let retained = retained_tx(&mut lookup, input).await;
+        #[cfg(test)]
+        let retained = if matches!(cut, UserCommitCut::LostClassification) {
+            Err(GoalDbError::Sqlx(sqlx::Error::Protocol(
+                "injected receipt lookup failure".into(),
+            )))
+        } else {
+            retained
+        };
+        let released = lookup.rollback().await;
+        match (retained, released) {
+            (Ok(Some(receipt)), Ok(())) => {
+                authority.classified();
+                LocalAuthorityResult::DurableFactEstablished(Ok(receipt))
+            }
+            (Ok(None), Ok(())) => {
+                authority.classified();
+                LocalAuthorityResult::DurableFactEstablished(Err(attempted))
+            }
+            (Err(GoalDbError::RetryConflict), Ok(())) => {
+                authority.classified();
+                LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::RetryConflict))
+            }
+            _ => LocalAuthorityResult::DurableFactUnclassified,
+        }
+    }
 }
+
+#[cfg(test)]
+mod tests;
