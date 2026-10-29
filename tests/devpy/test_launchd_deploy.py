@@ -2259,6 +2259,75 @@ class PreparationTests(unittest.TestCase):
                     self.dev.launchd_prod_deploy(controller=controller)
             claim.assert_not_called()
 
+    def test_prebuilt_local_candidate_rejects_invalid_inputs_before_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = self.dev.LocalCandidateSource(root / "source", "a" * 40)
+            source.root.mkdir()
+            binary = root / "phoenix-ide"
+            binary.write_bytes(b"candidate")
+            registry = root / "migrations.rs"
+            registry.write_text("registry\n")
+            binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            registry_sha256 = hashlib.sha256(registry.read_bytes()).hexdigest()
+            inputs = self.dev.PrebuiltLocalCandidateInputs(
+                binary=binary,
+                binary_sha256=binary_sha256,
+                migration_registry=registry,
+                migration_registry_sha256=registry_sha256,
+                source=source,
+            )
+            controller = self.dev.ProdDeployControllerOptions(backend="launchd")
+            cases = (
+                (
+                    "binary SHA",
+                    dataclasses.replace(inputs, binary_sha256="b" * 64),
+                    self.dev.RuntimeIdentity("1.40.0", source.commit),
+                    [source],
+                ),
+                (
+                    "migration registry SHA",
+                    dataclasses.replace(inputs, migration_registry_sha256="b" * 64),
+                    self.dev.RuntimeIdentity("1.40.0", source.commit),
+                    [source],
+                ),
+                (
+                    "embedded identity",
+                    inputs,
+                    self.dev.RuntimeIdentity("1.40.0", "b" * 40),
+                    [source],
+                ),
+                (
+                    "changed while the isolated build was running",
+                    inputs,
+                    self.dev.RuntimeIdentity("1.40.0", source.commit),
+                    [source, dataclasses.replace(source, commit="b" * 40)],
+                ),
+            )
+            for message, candidate, identity, validated_sources in cases:
+                with self.subTest(message=message), mock.patch.object(
+                    self.dev.sys, "platform", "darwin"
+                ), mock.patch.object(
+                    self.dev,
+                    "_validated_local_candidate_source",
+                    side_effect=validated_sources,
+                ), mock.patch.object(
+                    self.dev, "_trusted_controller_head", return_value="c" * 40
+                ), mock.patch.object(
+                    self.dev, "_binary_identity", return_value=identity
+                ), mock.patch.object(
+                    self.dev, "prod_build"
+                ) as build, mock.patch.object(
+                    self.dev, "_claim_launchd_deploy"
+                ) as claim:
+                    with self.assertRaisesRegex(SystemExit, message):
+                        self.dev.launchd_prod_deploy(
+                            controller=controller,
+                            prebuilt_local_candidate=candidate,
+                        )
+                build.assert_not_called()
+                claim.assert_not_called()
+
     def test_local_candidate_binds_exact_head_to_typed_identity(self):
         commit = "abc123def456" + "0" * 28
         identity = self.dev.RuntimeIdentity("2.0.0", commit)
@@ -4432,18 +4501,14 @@ class PreparationTests(unittest.TestCase):
             registry = root / "candidate-migrations.rs"
             registry.write_text("candidate registry\n")
             identity = self.dev.RuntimeIdentity("1.40.0", source_commit)
-            prepared = self.dev.PreparedCandidate(
+            prebuilt = self.dev.PrebuiltLocalCandidateInputs(
                 binary=binary,
-                source_kind=self.dev.ProdSourceKind.LOCAL_HEAD,
-                source_commit=source_commit,
-                identity=identity,
+                binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                 migration_registry=registry,
+                migration_registry_sha256=hashlib.sha256(registry.read_bytes()).hexdigest(),
+                source=source,
             )
-            controller = self.dev.ProdDeployControllerOptions(
-                backend="launchd",
-                candidate_source_root=source_root,
-                candidate_source_commit=source_commit,
-            )
+            controller = self.dev.ProdDeployControllerOptions(backend="launchd")
 
             def run(command, **_kwargs):
                 if "--protocol-version" in command:
@@ -4464,9 +4529,11 @@ class PreparationTests(unittest.TestCase):
                     )
 
             stage_file_spy = mock.Mock(side_effect=stage_file)
-            prepare_patcher = mock.patch.object(
-                self.dev, "_prepare_local_candidate", return_value=prepared
-            )
+            ordinary_manifests = []
+
+            def preflight_ordinary(manifest_path, _helper):
+                ordinary_manifests.append(json.loads(manifest_path.read_text()))
+
             patches = (
                 mock.patch.object(self.dev.sys, "platform", "darwin"),
                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"),
@@ -4488,7 +4555,14 @@ class PreparationTests(unittest.TestCase):
                 mock.patch.object(
                     self.dev, "_stage_disposable_validation_file", stage_file_spy
                 ),
-                mock.patch.object(self.dev, "_preflight_ordinary_launchd_policy"),
+                mock.patch.object(
+                    self.dev,
+                    "_preflight_ordinary_launchd_policy",
+                    side_effect=preflight_ordinary,
+                ),
+                mock.patch.object(
+                    self.dev, "prod_build", side_effect=AssertionError("unexpected rebuild")
+                ),
                 mock.patch.object(
                     self.dev, "_ensure_newsyslog_config", side_effect=SystemExit("sudo required")
                 ),
@@ -4497,12 +4571,15 @@ class PreparationTests(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 for patcher in patches:
                     stack.enter_context(patcher)
-                prepare = stack.enter_context(prepare_patcher)
                 with self.assertRaisesRegex(SystemExit, "sudo required"):
-                    self.dev.launchd_prod_deploy(controller=controller)
+                    self.dev.launchd_prod_deploy(
+                        controller=controller,
+                        prebuilt_local_candidate=prebuilt,
+                    )
 
-            prepare.assert_called_once()
-            self.assertEqual(source, prepare.call_args.kwargs["candidate_source"])
+            self.assertEqual(1, len(ordinary_manifests))
+            self.assertEqual("local_head", ordinary_manifests[0]["source_kind"])
+            self.assertEqual(source_commit, ordinary_manifests[0]["source_commit"])
             self.assertEqual(trusted_commit, materialize.call_args.args[0])
             self.assertEqual("local_head", materialize.call_args.args[2])
             self.assertEqual(1, len(registry_copies))
