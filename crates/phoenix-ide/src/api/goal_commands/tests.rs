@@ -43,6 +43,10 @@ impl Fixture {
             .await
             .unwrap();
         let owner = conversation.product_conversation_id.clone();
+        state.runtime.db().set_auto_continue_on_context_exhaustion(
+            &owner,
+            phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+        ).await.unwrap();
         Self {
             router: create_router(state.clone()),
             state,
@@ -165,6 +169,68 @@ async fn goal_routes_require_owner_authentication_and_do_not_mount_peer_routes()
     let (status, _) = request(isolated, "GET", "/api/federation/goals", Value::Null, true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(fixture.snapshot().await, before);
+}
+
+#[tokio::test]
+async fn owner_goal_create_and_replace_require_explicit_auto_continue_without_partial_receipts() {
+    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion as Preference;
+
+    let f = Fixture::new().await;
+    let db = f.state.runtime.db();
+    db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Disabled)
+        .await
+        .unwrap();
+    let before = f.snapshot().await;
+    let (status, refusal) = f
+        .call("POST", "", create_request(0, "disabled create"))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["error_type"], "goal_requires_auto_continue");
+    assert!(refusal["error"]
+        .as_str()
+        .unwrap()
+        .contains("enable automatic continuation"));
+    assert_eq!(f.snapshot().await, before);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_user_requests")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipts, 0);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&f.owner)
+            .await
+            .unwrap(),
+        Preference::Disabled
+    );
+
+    db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Enabled)
+        .await
+        .unwrap();
+    let command = create_request(0, "enabled create");
+    let accepted = f.call("POST", "", command.clone()).await;
+    assert_eq!(accepted.0, StatusCode::OK, "{}", accepted.1);
+    db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Disabled)
+        .await
+        .unwrap();
+    let before_replacement = f.snapshot().await;
+    assert_eq!(f.call("POST", "", command).await, accepted);
+    let (status, refusal) = f
+        .call("POST", "", create_request(1, "disabled replacement"))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["error_type"], "goal_requires_auto_continue");
+    assert_eq!(f.snapshot().await, before_replacement);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_user_requests")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipts, 1);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&f.owner)
+            .await
+            .unwrap(),
+        Preference::Disabled
+    );
 }
 
 #[tokio::test]

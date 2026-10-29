@@ -33,6 +33,10 @@ mod writer_tests;
 pub enum GoalDbError {
     #[error("{0}")]
     Invalid(&'static str),
+    #[error(
+        "enable automatic continuation on this ProductConversation before creating or replacing its Goal"
+    )]
+    AutoContinueDisabled,
     #[error("goal execution binding conflicts with its retained admission")]
     BindingConflict,
     #[error("goal mutation requires a settled turn boundary")]
@@ -385,6 +389,33 @@ async fn action_is_claimed_tx(tx: &mut GoalTx<'_>, mutation: &GoalMutation) -> R
     Ok(false)
 }
 
+async fn auto_continue_enabled_tx(
+    tx: &mut GoalTx<'_>,
+    owner: &ProductConversationId,
+) -> Result<bool> {
+    let enabled: Option<bool> = sqlx::query_scalar(
+        "SELECT auto_continue_on_context_exhaustion FROM product_conversations WHERE id=?",
+    )
+    .bind(owner.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    enabled.ok_or_else(|| {
+        GoalDbError::Admission(crate::DbError::ProductConversationUnavailable(
+            owner.clone(),
+        ))
+    })
+}
+
+async fn require_auto_continue_tx(
+    tx: &mut GoalTx<'_>,
+    owner: &ProductConversationId,
+) -> Result<()> {
+    if !auto_continue_enabled_tx(tx, owner).await? {
+        return Err(GoalDbError::AutoContinueDisabled);
+    }
+    Ok(())
+}
+
 async fn apply_goal_tx(
     tx: &mut GoalTx<'_>,
     mutation: &GoalMutation,
@@ -426,6 +457,9 @@ async fn apply_goal_tx(
     }
     let current = current_tx(tx, &mutation.owner).await?;
     let next = mutation.advance(current.as_ref())?;
+    if matches!(&mutation.change, GoalChange::Create { .. }) {
+        require_auto_continue_tx(tx, &mutation.owner).await?;
+    }
     let (kind, report_turn) = match &mutation.change {
         GoalChange::Create { goal_id, objective } => {
             sqlx::query(

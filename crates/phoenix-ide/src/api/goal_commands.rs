@@ -144,6 +144,9 @@ fn goal_error(error: GoalDbError) -> AppError {
     match error {
         GoalDbError::Invalid(message) => AppError::BadRequest(message.into()),
         GoalDbError::Admission(error) => super::product_conversations::db_to_app(error),
+        error @ GoalDbError::AutoContinueDisabled => AppError::Conflict(Box::new(
+            ConflictErrorResponse::new(error.to_string(), "goal_requires_auto_continue"),
+        )),
         error @ (GoalDbError::RetryConflict | GoalDbError::TargetChanged | GoalDbError::Busy) => {
             AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 error.to_string(),

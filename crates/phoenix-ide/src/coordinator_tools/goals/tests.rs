@@ -17,6 +17,7 @@ struct Fixture {
     runtime: Arc<RuntimeManager>,
     caller: String,
     owner: ProductConversationId,
+    target_transcript: String,
     turn_id: DirectTurnTurnId,
     executor: ToolRegistryExecutor,
 }
@@ -44,6 +45,12 @@ impl Fixture {
             .await
             .unwrap();
         let owner = target.product_conversation_id;
+        db.set_auto_continue_on_context_exhaustion(
+            &owner,
+            phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
         let accepted = db
             .workflow_repository()
             .accept_authoritative_turn(&runtime_input(&caller, "native-goal-source"))
@@ -71,6 +78,7 @@ impl Fixture {
             runtime,
             caller,
             owner,
+            target_transcript: target.id,
             turn_id: DirectTurnTurnId(turn_id.0),
             executor,
         }
@@ -211,6 +219,118 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
         .await
         .unwrap();
     assert_eq!((workflows, turns, queue), (1, 1, 0));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_goal_creation_and_replacement_require_auto_continue_at_apply() {
+    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion as Preference;
+
+    let f = Fixture::new().await;
+    let db = &f.db;
+    let owner = &f.owner;
+    let pref = |enabled| async move {
+        db.set_auto_continue_on_context_exhaustion(
+            owner,
+            if enabled {
+                Preference::Enabled
+            } else {
+                Preference::Disabled
+            },
+        )
+        .await
+        .unwrap();
+    };
+    let target_messages = || async {
+        serde_json::to_value(f.db.get_messages(&f.target_transcript).await.unwrap()).unwrap()
+    };
+    let before_messages = target_messages().await;
+    pref(false).await;
+
+    let first = f
+        .prepare(json!({"operation":"create","objective":"first approved objective"}))
+        .await;
+    let refused_create = f.apply(&first).await;
+    assert!(!refused_create.is_success());
+    assert!(refused_create
+        .output()
+        .contains("enable automatic continuation"));
+    assert!(f.db.conversation_goal(&f.owner).await.unwrap().is_none());
+    assert!(f
+        .db
+        .conversation_goal_history(
+            &f.owner,
+            phoenix_core::domain::conversation_goal::GoalVersion::INITIAL
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(f
+        .db
+        .pending_coordinator_watch_events(64)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(target_messages().await, before_messages);
+    assert!(!f
+        .db
+        .auto_continue_on_context_exhaustion(&f.owner)
+        .await
+        .unwrap()
+        .is_enabled());
+
+    pref(true).await;
+    let enabled_create = f
+        .prepare(json!({"operation":"create","objective":"first approved objective"}))
+        .await;
+    assert!(f.apply(&enabled_create).await.is_success());
+    pref(false).await;
+    let accepted_replay = f.apply(&enabled_create).await;
+    assert!(
+        accepted_replay.is_success(),
+        "accepted Coordinator replay is historical while disabled"
+    );
+
+    let replacement = f
+        .prepare(json!({"operation":"replace","objective":"replacement while disabled"}))
+        .await;
+    let refused_replace = f.apply(&replacement).await;
+    assert!(!refused_replace.is_success());
+    assert!(refused_replace
+        .output()
+        .contains("enable automatic continuation"));
+    assert_eq!(
+        f.db.conversation_goal(&f.owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .objective()
+            .as_str(),
+        "first approved objective"
+    );
+    assert_eq!(
+        f.db.conversation_goal_history(
+            &f.owner,
+            phoenix_core::domain::conversation_goal::GoalVersion::INITIAL
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(target_messages().await, before_messages);
+    assert!(!f
+        .db
+        .auto_continue_on_context_exhaustion(&f.owner)
+        .await
+        .unwrap()
+        .is_enabled());
+
+    pref(true).await;
+    let new_replacement = f
+        .prepare(json!({"operation":"replace","objective":"replacement after explicit enable"}))
+        .await;
+    assert!(f.apply(&new_replacement).await.is_success());
 }
 
 #[tokio::test]

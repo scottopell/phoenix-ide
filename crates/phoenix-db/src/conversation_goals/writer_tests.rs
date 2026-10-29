@@ -26,6 +26,12 @@ pub(super) async fn ordinary(db: &Database, name: &str) -> (String, ProductConve
         .create_conversation(name, name, "/tmp", true, None, None)
         .await
         .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &conversation.product_conversation_id,
+        crate::AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
     (conversation.id, conversation.product_conversation_id)
 }
 
@@ -89,6 +95,220 @@ async fn release(db: &Database, owner: &ProductConversationId) {
     .established()
     .expect("classified control")
     .unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn goal_admission_requires_enabled_preference_but_legacy_safety_exits_remain_available() {
+    let db = fixture().await;
+    let (transcript, owner) = ordinary(&db, "goal-prerequisite").await;
+    db.set_auto_continue_on_context_exhaustion(
+        &owner,
+        crate::AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    let first = create(
+        &owner,
+        GoalVersion::INITIAL,
+        "goal-prerequisite",
+        "create-off",
+    );
+    let before = counts(&db).await;
+    assert!(matches!(
+        db.apply_conversation_goal(&first, &transcript, at()).await,
+        Err(GoalDbError::AutoContinueDisabled)
+    ));
+    assert_eq!(counts(&db).await, before);
+
+    db.set_auto_continue_on_context_exhaustion(
+        &owner,
+        crate::AutoContinueOnContextExhaustion::Enabled,
+    )
+    .await
+    .unwrap();
+    let accepted = db
+        .apply_conversation_goal(&first, &transcript, at())
+        .await
+        .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &owner,
+        crate::AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&owner)
+            .await
+            .unwrap(),
+        crate::AutoContinueOnContextExhaustion::Disabled
+    );
+
+    let suspension_actor = GoalActor::GeneratedHost {
+        action_id: GoalText::parse("suspend-prerequisite").unwrap(),
+    };
+    let suspended = GoalMutation {
+        owner: owner.clone(),
+        expected_version: accepted.snapshot().version(),
+        action_id: GoalText::parse("suspend-prerequisite").unwrap(),
+        attribution: GoalAttribution {
+            requested_by: suspension_actor.clone(),
+            applied_by: suspension_actor,
+        },
+        change: GoalChange::SetDisposition {
+            goal_id: accepted.snapshot().goal_id().clone(),
+            disposition: GoalDisposition::Suspended(GoalText::parse("paused").unwrap()),
+        },
+    };
+    let suspended_entry = db
+        .apply_conversation_goal(&suspended, &transcript, at())
+        .await
+        .unwrap();
+    db.set_auto_continue_on_context_exhaustion(
+        &owner,
+        crate::AutoContinueOnContextExhaustion::Disabled,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.apply_conversation_goal(&first, &transcript, at())
+            .await
+            .unwrap(),
+        accepted
+    );
+    let replacement = create(
+        &owner,
+        suspended_entry.snapshot().version(),
+        "goal-replacement-off",
+        "replace-off",
+    );
+    let before_replacement = counts(&db).await;
+    assert!(matches!(
+        db.apply_conversation_goal(&replacement, &transcript, at())
+            .await,
+        Err(GoalDbError::AutoContinueDisabled)
+    ));
+    assert_eq!(counts(&db).await, before_replacement);
+
+    let activation_actor = GoalActor::GeneratedHost {
+        action_id: GoalText::parse("resume-prerequisite").unwrap(),
+    };
+    let activation = GoalMutation {
+        owner: owner.clone(),
+        expected_version: suspended_entry.snapshot().version(),
+        action_id: GoalText::parse("resume-prerequisite").unwrap(),
+        attribution: GoalAttribution {
+            requested_by: activation_actor.clone(),
+            applied_by: activation_actor,
+        },
+        change: GoalChange::SetDisposition {
+            goal_id: accepted.snapshot().goal_id().clone(),
+            disposition: GoalDisposition::Blocked(GoalText::parse("reactivate").unwrap()),
+        },
+    };
+    assert!(matches!(
+        db.apply_conversation_goal(&activation, &transcript, at())
+            .await,
+        Err(GoalDbError::Domain(GoalError::Inapplicable))
+    ));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn disabled_legacy_goals_preserve_reads_metadata_and_all_safety_exits() {
+    let db = fixture().await;
+    for (name, disposition) in [
+        (
+            "complete",
+            GoalDisposition::Complete(GoalText::parse("done").unwrap()),
+        ),
+        (
+            "suspend",
+            GoalDisposition::Suspended(GoalText::parse("pause").unwrap()),
+        ),
+        (
+            "exhaust",
+            GoalDisposition::Exhausted(GoalText::parse("limit").unwrap()),
+        ),
+    ] {
+        let (transcript, owner) = ordinary(&db, name).await;
+        let first = create(&owner, GoalVersion::INITIAL, name, "create");
+        let admitted = db
+            .apply_conversation_goal(&first, &transcript, at())
+            .await
+            .unwrap();
+        db.set_auto_continue_on_context_exhaustion(
+            &owner,
+            crate::AutoContinueOnContextExhaustion::Disabled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.conversation_goal(&owner).await.unwrap().as_ref(),
+            Some(admitted.snapshot())
+        );
+        assert_eq!(
+            db.apply_conversation_goal(&first, &transcript, at())
+                .await
+                .unwrap(),
+            admitted
+        );
+        let mut current = admitted;
+        for (action, state) in [
+            (
+                "block",
+                GoalDisposition::Blocked(GoalText::parse("waiting").unwrap()),
+            ),
+            ("underway", GoalDisposition::Underway),
+            ("exit", disposition),
+        ] {
+            let actor = GoalActor::GeneratedHost {
+                action_id: GoalText::parse(action).unwrap(),
+            };
+            let mutation = GoalMutation {
+                owner: owner.clone(),
+                expected_version: current.snapshot().version(),
+                action_id: GoalText::parse(action).unwrap(),
+                attribution: GoalAttribution {
+                    requested_by: actor.clone(),
+                    applied_by: actor,
+                },
+                change: GoalChange::SetDisposition {
+                    goal_id: current.snapshot().goal_id().clone(),
+                    disposition: state,
+                },
+            };
+            current = db
+                .apply_conversation_goal(&mutation, &transcript, at())
+                .await
+                .unwrap();
+        }
+        db.apply_goal_control(
+            &ControlRequest {
+                owner: owner.clone(),
+                principal_id: Uuid::new_v4(),
+                request_id: Uuid::new_v4(),
+                command: ControlCommand::Stop,
+                expected_control_version: 0,
+            },
+            at(),
+            || panic!("unexpected authority loss"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            db.conversation_goal(&owner).await.unwrap().as_ref(),
+            Some(current.snapshot())
+        );
+        assert_eq!(
+            db.auto_continue_on_context_exhaustion(&owner)
+                .await
+                .unwrap(),
+            crate::AutoContinueOnContextExhaustion::Disabled
+        );
+    }
 }
 
 #[tokio::test]

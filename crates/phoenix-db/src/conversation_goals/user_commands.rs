@@ -527,7 +527,8 @@ impl Database {
         .await
     }
 
-    #[cfg_attr(test, allow(clippy::too_many_arguments, clippy::too_many_lines))]
+    #[allow(clippy::too_many_lines)]
+    #[cfg_attr(test, allow(clippy::too_many_arguments))]
     async fn control_goal_command<F: FnOnce()>(
         &self,
         input: &GoalUserCommand,

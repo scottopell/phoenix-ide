@@ -25566,6 +25566,12 @@ mod goal_report_cancellation_checkpoint_tests {
             .await
             .unwrap();
         let owner = conversation.product_conversation_id;
+        db.set_auto_continue_on_context_exhaustion(
+            &owner,
+            phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .unwrap();
         db.watch_product_conversation(&owner).await.unwrap();
         let actor = GoalActor::GeneratedHost {
             action_id: GoalText::parse("seed-goal").unwrap(),
