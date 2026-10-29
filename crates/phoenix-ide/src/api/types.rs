@@ -48,7 +48,8 @@ pub struct CreateConversationRequest {
 pub struct CreateProductConversationRequest {
     pub request_id: String,
     pub cwd: String,
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
     pub objective: String,

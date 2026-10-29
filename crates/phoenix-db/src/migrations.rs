@@ -17,6 +17,9 @@ mod local_goal_watch;
 mod retire_commission_review;
 mod settle_historical_continuation;
 
+#[cfg(test)]
+mod conversation_tools_tests;
+
 struct Migration {
     version: u32,
     name: &'static str,
@@ -743,6 +746,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 142,
         name: "slack_gateway_v1",
         sql: include_str!("migrations/slack_gateway.sql"),
+    },
+    Migration {
+        version: 143,
+        name: "agent_creation_provenance",
+        sql: include_str!("migrations/agent_creation_provenance.sql"),
+    },
+    Migration {
+        version: 144,
+        name: "product_conversation_rename_receipts",
+        sql: include_str!("migrations/product_conversation_rename_receipts.sql"),
     },
 
 ];
@@ -12062,6 +12075,14 @@ async fn apply_migration_body(
     if migration.version == 113 {
         settle_historical_continuation::run(tx).await?;
     } else {
+        #[cfg(test)]
+        {
+            let sql = conversation_tools_tests::body_sql(tx, migration.sql).await?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_ref()))
+                .execute(&mut **tx)
+                .await?;
+        }
+        #[cfg(not(test))]
         sqlx::raw_sql(migration.sql).execute(&mut **tx).await?;
         if migration.version == 114 {
             sqlx::query(

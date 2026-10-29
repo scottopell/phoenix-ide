@@ -4,6 +4,7 @@ use super::*;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 pub use phoenix_core::domain::product_creation::ProductCreationProvisioningStage;
 use phoenix_core::llm_language::LlmLanguage;
+use sqlx::SqliteConnection;
 
 const PRODUCT_CREATION_MAX_ATTEMPTS: i64 = 4;
 const PRODUCT_CREATION_RETRY_DELAYS_SECONDS: [i64; 3] = [2, 10, 30];
@@ -36,40 +37,127 @@ pub struct ProductCreationImage {
 pub enum ProductCreationOrigin {
     UnknownHistorical,
     UserApi,
-    SlackGateway { request_id: String },
+    SlackGateway {
+        request_id: String,
+    },
+    InternalConversation {
+        product_conversation_id: ProductConversationId,
+        transcript_id: String,
+        source_call: phoenix_core::domain::db_schema::SourceToolCall,
+    },
 }
+pub enum ProductCreationResolution<'a> {
+    Existing(&'a ProductCreationJobRecord),
+    New { default_llm_language: LlmLanguage },
+}
+
 impl ProductCreationOrigin {
     fn as_str(&self) -> &'static str {
         match self {
             Self::UnknownHistorical => "unknown_historical",
             Self::UserApi => "user_api",
             Self::SlackGateway { .. } => "slack_gateway",
+            Self::InternalConversation { .. } => "internal_conversation",
         }
     }
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        match row.try_get::<String, _>("objective_origin")?.as_str() {
-            "unknown_historical" => Ok(Self::UnknownHistorical),
-            "user_api" => Ok(Self::UserApi),
-            "slack_gateway" => Ok(Self::SlackGateway {
+        use phoenix_core::domain::db_schema::InputOrigin;
+        let kind: String = row.try_get("objective_origin")?;
+        let origin = match kind.as_str() {
+            "unknown_historical" => InputOrigin::UnknownHistorical,
+            "user_api" => InputOrigin::UserApi,
+            "slack_gateway" => InputOrigin::SlackGateway {
                 request_id: row.try_get("objective_slack_request_id")?,
-            }),
-            value => Err(sqlx::Error::Decode(
-                format!("invalid creation origin: {value}").into(),
+            },
+            "internal_conversation" => {
+                let product_id: Option<String> =
+                    row.try_get("objective_source_product_conversation_id")?;
+                let transcript_id: Option<String> =
+                    row.try_get("objective_source_transcript_id")?;
+                let product_id = product_id.ok_or_else(|| {
+                    sqlx::Error::Decode("missing internal creation product source".into())
+                })?;
+                let transcript_id = transcript_id.ok_or_else(|| {
+                    sqlx::Error::Decode("missing internal creation transcript source".into())
+                })?;
+                InputOrigin::InternalConversation {
+                    product_conversation_id: ProductConversationId::parse(&product_id)
+                        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+                    transcript_id,
+                    source_call: None,
+                }
+            }
+            value => {
+                return Err(sqlx::Error::Decode(
+                    format!("invalid creation origin: {value}").into(),
+                ))
+            }
+        };
+        let source_product_id: Option<String> =
+            row.try_get("objective_source_product_conversation_id")?;
+        let source_transcript_id: Option<String> = row.try_get("objective_source_transcript_id")?;
+        let source_message_id: Option<String> = row.try_get("objective_source_message_id")?;
+        let source_tool_use_id: Option<String> = row.try_get("objective_source_tool_use_id")?;
+        let origin = origin
+            .with_source_call_columns(source_message_id, source_tool_use_id)
+            .map_err(|error| sqlx::Error::Decode(error.into()))?;
+        match origin {
+            InputOrigin::UnknownHistorical
+                if source_product_id.is_none() && source_transcript_id.is_none() =>
+            {
+                Ok(Self::UnknownHistorical)
+            }
+            InputOrigin::UserApi
+                if source_product_id.is_none() && source_transcript_id.is_none() =>
+            {
+                Ok(Self::UserApi)
+            }
+            InputOrigin::SlackGateway { request_id }
+                if source_product_id.is_none() && source_transcript_id.is_none() =>
+            {
+                Ok(Self::SlackGateway { request_id })
+            }
+            InputOrigin::InternalConversation {
+                product_conversation_id,
+                transcript_id,
+                source_call: Some(source_call),
+            } => {
+                if source_product_id.as_deref() != Some(product_conversation_id.as_str())
+                    || source_transcript_id.as_deref() != Some(transcript_id.as_str())
+                {
+                    return Err(sqlx::Error::Decode(
+                        "invalid internal creation source columns".into(),
+                    ));
+                }
+                Ok(Self::InternalConversation {
+                    product_conversation_id,
+                    transcript_id,
+                    source_call: *source_call,
+                })
+            }
+            _ => Err(sqlx::Error::Decode(
+                "internal creation origin requires a source-call locator".into(),
             )),
         }
     }
     #[must_use]
     pub fn input_origin(&self) -> phoenix_core::domain::db_schema::InputOrigin {
+        use phoenix_core::domain::db_schema::InputOrigin;
         match self {
-            Self::UnknownHistorical => {
-                phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
-            }
-            Self::UserApi => phoenix_core::domain::db_schema::InputOrigin::UserApi,
-            Self::SlackGateway { request_id } => {
-                phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
-                    request_id: request_id.clone(),
-                }
-            }
+            Self::UnknownHistorical => InputOrigin::UnknownHistorical,
+            Self::UserApi => InputOrigin::UserApi,
+            Self::SlackGateway { request_id } => InputOrigin::SlackGateway {
+                request_id: request_id.clone(),
+            },
+            Self::InternalConversation {
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            } => InputOrigin::InternalConversation {
+                product_conversation_id: product_conversation_id.clone(),
+                transcript_id: transcript_id.clone(),
+                source_call: Some(Box::new(source_call.clone())),
+            },
         }
     }
 }
@@ -238,6 +326,45 @@ pub struct ProductCreationPublishInput {
     pub git_publication: Option<ProductCreationGitPublicationFacts>,
 }
 
+async fn require_creation_origin_tx(
+    conn: &mut SqliteConnection,
+    current_gc_transcript_id: Option<&str>,
+    origin: &ProductCreationOrigin,
+) -> DbResult<()> {
+    match (current_gc_transcript_id, origin) {
+        (
+            Some(caller),
+            ProductCreationOrigin::InternalConversation {
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            },
+        ) if caller == transcript_id
+            && !source_call.message_id.is_empty()
+            && !source_call.tool_use_id.is_empty() =>
+        {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT product_conversation_id FROM conversations WHERE id = ?1",
+            )
+            .bind(caller)
+            .fetch_optional(conn)
+            .await?;
+            if owner.as_deref() == Some(product_conversation_id.as_str()) {
+                Ok(())
+            } else {
+                Err(DbError::CurrentCoordinatorRequired)
+            }
+        }
+        (
+            None,
+            ProductCreationOrigin::UserApi
+            | ProductCreationOrigin::UnknownHistorical
+            | ProductCreationOrigin::SlackGateway { .. },
+        ) => Ok(()),
+        _ => Err(DbError::CurrentCoordinatorRequired),
+    }
+}
+
 fn normalize_product_creation_intent(intent: &ProductCreationIntent) -> DbResult<()> {
     if intent.cwd.trim().is_empty() {
         return Err(DbError::Serialization(
@@ -378,8 +505,16 @@ impl Database {
         &self,
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
+        let mut connection = self.pool.acquire().await?;
+        Self::get_product_creation_job_on(&mut connection, request_id).await
+    }
+
+    async fn get_product_creation_job_on(
+        connection: &mut sqlx::SqliteConnection,
+        request_id: &str,
+    ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.objective_slack_request_id, j.model, j.effort, j.llm_language, j.status,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.objective_origin, j.objective_source_product_conversation_id, j.objective_source_transcript_id, j.objective_source_message_id, j.objective_source_tool_use_id, j.model, j.effort, j.llm_language, j.status,
                     j.provisioning_stage, j.stage_updated_at_unix_micros,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,
@@ -403,7 +538,7 @@ impl Database {
         )
         .bind(request_id)
         .try_map(parse_product_creation_job_row)
-        .fetch_optional(&self.pool)
+        .fetch_optional(connection)
         .await
         .map_err(DbError::Sqlx)
     }
@@ -428,6 +563,33 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    pub async fn product_creation_project_options_as_coordinator(
+        &self,
+        transcript_id: &str,
+    ) -> DbResult<Vec<(String, String)>> {
+        let mut tx = self.pool.begin().await?;
+        crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id).await?;
+        let projects = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, canonical_path FROM projects ORDER BY id LIMIT 51",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(projects)
+    }
+
+    pub async fn get_product_creation_job_as_coordinator(
+        &self,
+        transcript_id: &str,
+        request_id: &str,
+    ) -> DbResult<Option<ProductCreationJobRecord>> {
+        let mut tx = self.pool.begin().await?;
+        crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id).await?;
+        let job = Self::get_product_creation_job_on(&mut tx, request_id).await?;
+        tx.commit().await?;
+        Ok(job)
+    }
+
     #[allow(clippy::too_many_lines)] // One transaction reserves identity, source binding, and objective.
     pub async fn accept_product_creation(
         &self,
@@ -435,11 +597,30 @@ impl Database {
         intent: &ProductCreationIntent,
     ) -> DbResult<ProductCreationAcceptOutcome> {
         normalize_product_creation_intent(intent)?;
+        self.accept_product_creation_resolved(request_id, None, |_| Ok(intent.clone()))
+            .await
+    }
+
+    /// Serializes caller authorization, durable winner selection, and new-intent validation.
+    /// The resolver sees the existing accepted job before it is asked to prepare a candidate.
+    pub async fn accept_product_creation_resolved<F>(
+        &self,
+        request_id: &str,
+        current_gc_transcript_id: Option<&str>,
+        resolve: F,
+    ) -> DbResult<ProductCreationAcceptOutcome>
+    where
+        F: FnOnce(ProductCreationResolution<'_>) -> DbResult<ProductCreationIntent>,
+    {
         let accepted_product_conversation_id = ProductConversationId::new();
         let now = unix_micros_now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(transcript_id) = current_gc_transcript_id {
+            super::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id)
+                .await?;
+        }
         let existing = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
                     provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token,
@@ -466,28 +647,50 @@ impl Database {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(existing) = existing {
+            let candidate = resolve(ProductCreationResolution::Existing(&existing))?;
+            require_creation_origin_tx(&mut tx, current_gc_transcript_id, &candidate.origin)
+                .await?;
             tx.rollback().await?;
-            return Ok(if existing.intent.matches_retry(intent) {
+            return Ok(if existing.intent.matches_retry(&candidate) {
                 ProductCreationAcceptOutcome::Replayed(existing)
             } else {
                 ProductCreationAcceptOutcome::Conflict(existing)
             });
         }
+        let language: Option<String> =
+            sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'default_llm_language'")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let intent = resolve(ProductCreationResolution::New {
+            default_llm_language: language
+                .as_deref()
+                .map(LlmLanguage::parse_or_default)
+                .unwrap_or_default(),
+        })?;
+        require_creation_origin_tx(&mut tx, current_gc_transcript_id, &intent.origin).await?;
+        normalize_product_creation_intent(&intent)?;
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
-                request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
+                request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id,
+                objective_source_product_conversation_id, objective_source_transcript_id,
+                objective_source_message_id, objective_source_tool_use_id,
+                model, effort, llm_language, status,
                 accepted_at_unix_micros, updated_at_unix_micros, stage_updated_at_unix_micros
-            ) VALUES (?1, ?2, ?3, ?4, ?9, ?10, ?5, ?6, ?7, 'accepted', ?8, ?8, ?8)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?14, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'accepted', ?13, ?13, ?13)",
         )
         .bind(request_id)
         .bind(accepted_product_conversation_id.as_str())
         .bind(&intent.cwd)
         .bind(&intent.objective)
+        .bind(intent.origin.as_str())
+        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { product_conversation_id, .. } => Some(product_conversation_id.as_str()), _ => None })
+        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { transcript_id, .. } => Some(transcript_id.as_str()), _ => None })
+        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.message_id.as_str()), _ => None })
+        .bind(match &intent.origin { ProductCreationOrigin::InternalConversation { source_call, .. } => Some(source_call.tool_use_id.as_str()), _ => None })
         .bind(&intent.model)
         .bind(intent.effort.map(ModelEffort::as_wire_name))
         .bind(intent.llm_language.as_str())
         .bind(now)
-        .bind(intent.origin.as_str())
         .bind(intent.origin.input_origin().slack_request_id())
         .execute(&mut *tx)
         .await?;
@@ -499,7 +702,7 @@ impl Database {
                 .ok_or_else(|| {
                     DbError::Serialization("raced product creation disappeared".to_string())
                 })?;
-            return Ok(if existing.intent.matches_retry(intent) {
+            return Ok(if existing.intent.matches_retry(&intent) {
                 ProductCreationAcceptOutcome::Replayed(existing)
             } else {
                 ProductCreationAcceptOutcome::Conflict(existing)
@@ -562,7 +765,7 @@ impl Database {
                  status = 'accepted'
                  OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
-             ) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort,
+             ) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
                  llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
                  accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
@@ -630,7 +833,7 @@ impl Database {
                           accepted_at_unix_micros ASC, request_id ASC
                  LIMIT 1
              )
-             RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort,
+             RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
                  llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
                  accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
@@ -1298,7 +1501,7 @@ impl Database {
         cursor: Option<(i64, String)>,
     ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
         sqlx::query(
-            "SELECT request_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
+            "SELECT request_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
                     published_product_id, updated_at_unix_micros, last_error,
                     CASE WHEN j.status = 'delivery_failed' AND EXISTS (
                       SELECT 1 FROM product_conversations product
@@ -1344,7 +1547,7 @@ impl Database {
                 intent: ProductCreationIntent {
                     cwd: row.try_get("cwd")?,
                     objective: row.try_get("objective")?,
-            origin: ProductCreationOrigin::from_row(&row)?,
+                    origin: ProductCreationOrigin::from_row(&row)?,
                     model: row.try_get("model")?,
                     effort: row
                         .try_get::<Option<String>, _>("effort")?
@@ -1767,7 +1970,7 @@ impl Database {
         let lease_until = now + lease_duration;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, model, effort, llm_language, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort, llm_language, status,
                     provisioning_stage, stage_updated_at_unix_micros,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token, claim_lease_until_unix_micros,
@@ -2171,6 +2374,42 @@ mod product_creation_tests {
                 .await
                 .unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn coordinator_creation_status_decodes_ordered_image_rows() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let mut request = intent("/tmp", "ordered images");
+        request.images = vec![
+            ProductCreationImage {
+                media_type: "image/png".into(),
+                data: "first".into(),
+            },
+            ProductCreationImage {
+                media_type: "image/jpeg".into(),
+                data: "second".into(),
+            },
+        ];
+        let request_id = uuid::Uuid::new_v4().to_string();
+        db.accept_product_creation(&request_id, &request)
+            .await
+            .unwrap();
+        let read = db
+            .get_product_creation_job_as_coordinator(&coordinator.id, &request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.intent.images, request.images);
+        assert_eq!(read.intent.origin, ProductCreationOrigin::UserApi);
+        assert!(matches!(
+            db.get_product_creation_job_as_coordinator("not-current-gc", &request_id)
+                .await,
+            Err(DbError::CurrentCoordinatorRequired)
+        ));
     }
 
     fn intent(request_cwd: &str, objective: &str) -> ProductCreationIntent {
@@ -3666,6 +3905,109 @@ mod product_creation_tests {
             job.intent.origin.input_origin(),
             phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical
         );
+    }
+
+    #[tokio::test]
+    async fn internal_creation_replay_accepts_new_locator_and_retains_first_source() {
+        use phoenix_core::domain::db_schema::SourceToolCall;
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, Default::default())
+            .await
+            .unwrap();
+        let product_conversation_id = coordinator.product_conversation_id;
+        let mut accepted_intent = intent("/repo/origin", "objective");
+        accepted_intent.origin = ProductCreationOrigin::InternalConversation {
+            product_conversation_id: product_conversation_id.clone(),
+            transcript_id: coordinator.id.clone(),
+            source_call: SourceToolCall {
+                message_id: "message-a".to_string(),
+                tool_use_id: "call-a".to_string(),
+            },
+        };
+        db.accept_product_creation_resolved("internal-origin", Some(&coordinator.id), |_| {
+            Ok(accepted_intent.clone())
+        })
+        .await
+        .unwrap();
+
+        let mut replay_intent = accepted_intent.clone();
+        replay_intent.origin = ProductCreationOrigin::InternalConversation {
+            product_conversation_id,
+            transcript_id: coordinator.id.clone(),
+            source_call: SourceToolCall {
+                message_id: "message-b".to_string(),
+                tool_use_id: "call-b".to_string(),
+            },
+        };
+        let ProductCreationAcceptOutcome::Replayed(job) = db
+            .accept_product_creation_resolved("internal-origin", Some(&coordinator.id), |_| {
+                Ok(replay_intent.clone())
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected same-owner replay")
+        };
+        assert_eq!(job.intent.origin, accepted_intent.origin);
+    }
+
+    #[tokio::test]
+    async fn internal_creation_requires_trusted_current_coordinator_admission() {
+        use phoenix_core::domain::db_schema::SourceToolCall;
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, Default::default())
+            .await
+            .unwrap();
+        let mut candidate = intent("/repo/origin", "objective");
+        candidate.origin = ProductCreationOrigin::InternalConversation {
+            product_conversation_id: coordinator.product_conversation_id,
+            transcript_id: coordinator.id.clone(),
+            source_call: SourceToolCall {
+                message_id: "message".into(),
+                tool_use_id: "call".into(),
+            },
+        };
+        assert!(matches!(
+            db.accept_product_creation("untrusted-origin", &candidate)
+                .await,
+            Err(DbError::CurrentCoordinatorRequired)
+        ));
+        assert!(matches!(
+            db.accept_product_creation_resolved("wrong-head-origin", Some("not-current"), |_| Ok(
+                candidate.clone()
+            ))
+            .await,
+            Err(DbError::CurrentCoordinatorRequired)
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs WHERE request_id IN ('untrusted-origin', 'wrong-head-origin')")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_acceptance_uses_existing_job_before_candidate_validation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let original = intent("/repo/origin", "objective");
+        db.accept_product_creation("resolved-winner", &original)
+            .await
+            .unwrap();
+        let mut resolver_saw_job = false;
+        let result = db
+            .accept_product_creation_resolved("resolved-winner", None, |existing| {
+                let ProductCreationResolution::Existing(existing) = existing else {
+                    panic!("durable winner is provided to resolver");
+                };
+                resolver_saw_job = true;
+                let mut unvalidated = existing.intent.clone();
+                unvalidated.cwd.clear();
+                Ok(unvalidated)
+            })
+            .await
+            .unwrap();
+        assert!(resolver_saw_job);
+        assert!(matches!(result, ProductCreationAcceptOutcome::Conflict(_)));
     }
 
     #[tokio::test]

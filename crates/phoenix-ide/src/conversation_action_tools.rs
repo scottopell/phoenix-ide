@@ -1,0 +1,387 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use phoenix_core::domain::llm_types::ModelEffort;
+use phoenix_core::domain::product_conversation::ProductConversationId;
+use phoenix_core::llm_language::LlmLanguage;
+use phoenix_tools::{Tool, ToolContext, ToolOutput};
+use serde::{Deserialize, Deserializer};
+use serde_json::{json, Value};
+
+use crate::api::types::CreateProductConversationRequest;
+use crate::conversation_actions::{
+    accept_create, normalize_product_conversation_title, CreateSource,
+};
+use crate::db::{
+    NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameResult,
+    ProductConversationRenameSource,
+};
+use crate::runtime::RuntimeManager;
+
+pub(crate) async fn tools(
+    runtime: Arc<RuntimeManager>,
+    transcript_id: &str,
+) -> Result<Vec<Arc<dyn Tool>>, crate::db::DbError> {
+    match runtime
+        .db()
+        .require_current_coordinator_transcript(transcript_id)
+        .await
+    {
+        Ok(()) => Ok(vec![
+            Arc::new(RenameConversation(runtime.clone())),
+            Arc::new(CreateConversation(runtime)),
+        ]),
+        Err(crate::db::DbError::CurrentCoordinatorRequired) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+struct OperationId(String);
+
+impl<'de> Deserialize<'de> for OperationId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let parsed = uuid::Uuid::parse_str(&value).map_err(serde::de::Error::custom)?;
+        if parsed.to_string() != value {
+            return Err(serde::de::Error::custom(
+                "use a canonical lowercase hyphenated UUID",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum RenameRequest {
+    Detail {
+        reference: String,
+    },
+    Read {
+        operation_id: OperationId,
+    },
+    Rename {
+        operation_id: OperationId,
+        product_conversation_id: ProductConversationId,
+        expected_root_transcript_id: String,
+        expected_name_revision: i64,
+        title: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CreateStart {
+    SubmitObjective,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum CreateRequest {
+    Options {
+        cwd: Option<String>,
+    },
+    Read {
+        request_id: OperationId,
+    },
+    Create {
+        request_id: OperationId,
+        cwd: String,
+        objective: String,
+        start: CreateStart,
+        model: Option<String>,
+        effort: Option<ModelEffort>,
+        llm_language: Option<LlmLanguage>,
+    },
+}
+
+struct RenameConversation(Arc<RuntimeManager>);
+struct CreateConversation(Arc<RuntimeManager>);
+
+fn output(result: Result<Value, String>) -> ToolOutput {
+    match result {
+        Ok(value) => ToolOutput::success(value.to_string()),
+        Err(error) => ToolOutput::error(json!({"status": "error", "error": error}).to_string()),
+    }
+}
+
+async fn mutation_source(
+    runtime: &RuntimeManager,
+    ctx: &ToolContext,
+) -> Result<ProductConversationRenameSource, String> {
+    runtime
+        .db()
+        .require_current_coordinator_transcript(&ctx.conversation_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let call = ctx
+        .source_tool_call()
+        .ok_or("Trusted source tool-call identity unavailable")?;
+    let source = runtime
+        .db()
+        .get_conversation(&ctx.conversation_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(ProductConversationRenameSource {
+        product_conversation_id: source.product_conversation_id,
+        transcript_id: source.id,
+        message_id: call.message_id,
+        tool_use_id: call.tool_use_id,
+    })
+}
+
+fn operation_schema() -> Value {
+    json!({"type":"string", "format":"uuid", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"})
+}
+
+#[async_trait]
+impl Tool for RenameConversation {
+    fn name(&self) -> &str {
+        "rename_conversation"
+    }
+    fn description(&self) -> String {
+        "Current Global Coordinator only. Detail resolves a reference to immutable product/root identity and naming revision; use those exact values for rename. A rename updates the title (1-200 characters) and allocated slug, never the immutable product/work identity. Choose a new operation UUID for each intentional rename; read/retry the same operation UUID after an uncertain result. Durable replay reports the historical receipt, not current title/lifecycle.".into()
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object", "additionalProperties":false, "required":["op"], "properties":{
+            "op":{"type":"string","enum":["detail","read","rename"]},
+            "reference":{"type":"string","description":"Required for detail; product id or slug.","minLength":1},
+            "operation_id":operation_schema(),
+            "product_conversation_id":{"type":"string","description":"Required for rename; immutable product id returned by detail, never a slug or transcript.","minLength":1},
+            "expected_root_transcript_id":{"type":"string","description":"Required for rename; returned by detail.","minLength":1},
+            "expected_name_revision":{"type":"integer","description":"Required for rename; returned by detail.","minimum":0},
+            "title":{"type":"string","description":"Required for rename.","minLength":1,"maxLength":200}
+        }})
+    }
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        output(self.run_inner(input, ctx).await)
+    }
+}
+
+fn rename_detail_response(detail: crate::db::ProductConversationRenameDetail) -> Value {
+    let route = crate::api::product_conversations::product_route(
+        detail.slug.as_deref(),
+        detail.product_conversation_id.as_str(),
+    );
+    json!({"status":"detail", "canonical_route":route, "detail":detail})
+}
+
+impl RenameConversation {
+    async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
+        self.0
+            .db()
+            .require_current_coordinator_transcript(&ctx.conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let request: RenameRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
+        match request {
+            RenameRequest::Detail { reference } => {
+                let reference = reference.strip_prefix("@conv:").unwrap_or(&reference);
+                let detail = self
+                    .0
+                    .db()
+                    .read_product_conversation_rename_detail(&ctx.conversation_id, reference)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(rename_detail_response(detail))
+            }
+            RenameRequest::Read { operation_id } => {
+                let receipt = self
+                    .0
+                    .db()
+                    .read_product_conversation_rename_receipt(&ctx.conversation_id, &operation_id.0)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(
+                    json!({"status":if receipt.is_some() {"applied"} else {"unknown"}, "receipt":receipt, "historical":true}),
+                )
+            }
+            RenameRequest::Rename {
+                operation_id,
+                product_conversation_id,
+                expected_root_transcript_id,
+                expected_name_revision,
+                title,
+            } => {
+                let source = mutation_source(&self.0, &ctx).await?;
+                let title =
+                    normalize_product_conversation_title(&title).map_err(|e| e.to_string())?;
+                let command = ProductConversationRenameCommand {
+                    operation_id: operation_id.0,
+                    product_conversation_id,
+                    expected_root_transcript_id,
+                    expected_name_revision,
+                    title: NormalizedConversationTitle::parse(&title).map_err(|e| e.to_string())?,
+                    source,
+                };
+                let _authority = self
+                    .0
+                    .acquire_local_authority_pass()
+                    .map_err(|()| "local authority is closed")?;
+                let result = self
+                    .0
+                    .db()
+                    .rename_product_conversation(&ctx.conversation_id, &command)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(match result {
+                    ProductConversationRenameResult::Applied(receipt) => {
+                        json!({"status":"applied", "receipt":receipt})
+                    }
+                    ProductConversationRenameResult::Replayed(receipt) => {
+                        json!({"status":"replayed", "receipt":receipt, "historical":true})
+                    }
+                    ProductConversationRenameResult::Stale => {
+                        json!({"status":"stale", "next":"read detail; use a new operation UUID with a fresh root/revision"})
+                    }
+                    ProductConversationRenameResult::Conflict => json!({"status":"conflict"}),
+                    ProductConversationRenameResult::NotFound => json!({"status":"not_found"}),
+                    ProductConversationRenameResult::Unavailable => json!({"status":"unavailable"}),
+                })
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CreateConversation {
+    fn name(&self) -> &str {
+        "create_conversation"
+    }
+    fn description(&self) -> String {
+        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id for canonical pending/ready/failure status. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object", "additionalProperties":false,"required":["op"],"properties":{
+            "op":{"type":"string","enum":["options","read","create"]},"request_id":operation_schema(),
+            "cwd":{"type":"string","description":"Optional path for options to normalize; required exact normalized absolute cwd for create.","minLength":1},
+            "objective":{"type":"string","description":"Required nonblank literal objective for create.","minLength":1},
+            "start":{"type":"string","enum":["submit_objective"],"description":"Required for create; explicitly submits the objective and may start execution."},
+            "model":{"type":"string"},"effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]},
+            "llm_language":{"type":"string","enum":["phoenix-native","caveman"]}
+        }})
+    }
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        output(self.run_inner(input, ctx).await)
+    }
+}
+
+impl CreateConversation {
+    async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
+        self.0
+            .db()
+            .require_current_coordinator_transcript(&ctx.conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let request: CreateRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
+        match request {
+            CreateRequest::Options { cwd } => {
+                let cwd = cwd
+                    .map(|cwd| {
+                        crate::conversation_cwd::normalize_product_creation_cwd_intent(
+                            &cwd,
+                            self.0.runtime_home(),
+                        )
+                    })
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                let mut projects = self
+                    .0
+                    .db()
+                    .product_creation_project_options_as_coordinator(&ctx.conversation_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let truncated = projects.len() > 50;
+                projects.truncate(50);
+                let projects: Vec<_> = projects
+                    .into_iter()
+                    .map(|(id, cwd)| json!({"project_id":id,"cwd":cwd}))
+                    .collect();
+                let registry = self.0.model_registry();
+                let routes = registry.available_execution_routes();
+                let models: Vec<_> = routes.into_iter().map(|route| json!({"model":route.model,"supported_efforts":route.supported_efforts})).collect();
+                Ok(
+                    json!({"status":"options","cwd":cwd,"projects":projects,"projects_truncated":truncated,"models":models,"default_model":registry.default_model_id(),"default_llm_language":self.0.db().get_default_llm_language().await.map_err(|e| e.to_string())?}),
+                )
+            }
+            CreateRequest::Read { request_id } => {
+                let job = self
+                    .0
+                    .db()
+                    .get_product_creation_job_as_coordinator(&ctx.conversation_id, &request_id.0)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let Some(job) = job else {
+                    return Ok(json!({"status":"unknown", "request_id":request_id.0}));
+                };
+                let route = if job.status == "published" {
+                    let aggregate = self
+                        .0
+                        .db()
+                        .get_ordinary_product_conversation(&job.product_conversation_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Some(crate::api::product_conversations::canonical_route(
+                        &aggregate,
+                    ))
+                } else {
+                    None
+                };
+                let delivery_retryable = self
+                    .0
+                    .db()
+                    .product_creation_delivery_retryable(&job.request_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let status = crate::api::handlers::product_creation_status_response(
+                    job,
+                    delivery_retryable,
+                    route,
+                )
+                .map_err(|e| e.to_string())?;
+                serde_json::to_value(status).map_err(|e| e.to_string())
+            }
+            CreateRequest::Create {
+                request_id,
+                cwd,
+                objective,
+                start: CreateStart::SubmitObjective,
+                model,
+                effort,
+                llm_language,
+            } => {
+                let source = mutation_source(&self.0, &ctx).await?;
+                let source_call = ctx
+                    .source_tool_call()
+                    .ok_or("Trusted source tool-call identity unavailable")?;
+                let accepted = accept_create(
+                    &self.0,
+                    CreateProductConversationRequest {
+                        request_id: request_id.0,
+                        cwd,
+                        objective,
+                        model,
+                        effort,
+                        llm_language,
+                        images: Vec::new(),
+                    },
+                    CreateSource::CurrentCoordinator {
+                        product_conversation_id: source.product_conversation_id,
+                        transcript_id: source.transcript_id,
+                        source_call,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(
+                    json!({"status":"accepted", "request_id":accepted.request_id,"product_conversation_id":accepted.product_conversation_id,"next":"read request_id; accepted does not imply ready"}),
+                )
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "conversation_action_tools/tests.rs"]
+mod tests;

@@ -6056,16 +6056,19 @@ impl RuntimeManager {
                     crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(
                         crate::skills::builtin::default_extract_dir().as_deref(),
                     );
+                let mut coordinator_tools = crate::coordinator_tools::tools(
+                    service,
+                    send_chat,
+                    self.work_scope_load.clone(),
+                    self.db.clone(),
+                );
+                coordinator_tools.extend(
+                    crate::conversation_action_tools::tools(self.clone(), conversation_id)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                );
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(
-                        crate::coordinator_tools::tools(
-                            service,
-                            send_chat,
-                            self.work_scope_load.clone(),
-                            self.db.clone(),
-                        ),
-                        coordinator_catalog.clone(),
-                    ),
+                    ToolRegistry::coordinator(coordinator_tools, coordinator_catalog.clone()),
                     agent_catalog.clone(),
                 )
                 .with_coordinator_skill_catalog(coordinator_catalog)

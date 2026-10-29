@@ -40,6 +40,12 @@ pub use prompt_projection::{
 };
 pub mod conversation_goals;
 mod conversation_name;
+mod product_conversation_rename;
+pub use product_conversation_rename::{
+    NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,
+    ProductConversationRenameReceipt, ProductConversationRenameResult,
+    ProductConversationRenameSource,
+};
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -323,6 +329,12 @@ pub enum DbError {
     Sqlx(#[from] sqlx::Error),
     #[error("Conversation not found: {0}")]
     ConversationNotFound(String),
+    #[error("conversation title must be nonblank and at most 200 Unicode scalar values")]
+    ConversationTitleInvalid,
+    #[error("the current persisted Global Coordinator transcript is required")]
+    CurrentCoordinatorRequired,
+    #[error("Invalid product creation intent: {0}")]
+    ProductCreationIntentInvalid(String),
     #[error("Conversation already exists: {0}")]
     ConversationAlreadyExists(String),
     #[error("Message not found: {0}")]
@@ -783,6 +795,7 @@ pub struct ConversationCreationMetadataUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationNameBaseline {
     owner: phoenix_core::domain::product_conversation::ProductConversationId,
+    root_transcript_id: String,
     revision: i64,
 }
 

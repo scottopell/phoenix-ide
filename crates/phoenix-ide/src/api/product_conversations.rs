@@ -238,20 +238,7 @@ pub async fn regenerate_product_conversation_name(
     Ok(Json(list_row(&projection)))
 }
 
-fn normalize_product_conversation_title(title: &str) -> Result<String, AppError> {
-    let normalized = title.trim();
-    if normalized.is_empty() {
-        return Err(AppError::BadRequest(
-            "Product conversation title cannot be empty".to_string(),
-        ));
-    }
-    if normalized.chars().count() > 200 {
-        return Err(AppError::BadRequest(
-            "Product conversation title must be at most 200 characters".to_string(),
-        ));
-    }
-    Ok(normalized.to_string())
-}
+use crate::conversation_actions::normalize_product_conversation_title;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AggregateCursor {
@@ -763,7 +750,7 @@ pub async fn get_product_conversation(
     .await
 }
 
-pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
+pub(crate) fn product_route(slug: Option<&str>, product_id: &str) -> String {
     use std::fmt::Write;
     let mut route = String::from(PRODUCT_CONVERSATION_ROUTE_PREFIX);
     for byte in slug.unwrap_or(product_id).bytes() {
@@ -776,7 +763,7 @@ pub(super) fn product_route(slug: Option<&str>, product_id: &str) -> String {
     route
 }
 
-pub(super) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
+pub(crate) fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
     product_route(
         aggregate.root.conversation.slug.as_deref(),
         aggregate.product_conversation.id().as_str(),
@@ -865,7 +852,9 @@ mod creation_allowed_actions_tests {
     }
 }
 
-fn list_row(projection: &ProductConversationListProjection) -> ProductConversationListRow {
+pub(crate) fn list_row(
+    projection: &ProductConversationListProjection,
+) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
         canonical_route: product_route(
@@ -1569,8 +1558,11 @@ fn decode_cursor(cursor: &str) -> Result<AggregateCursor, AppError> {
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(super) fn db_to_app(error: DbError) -> AppError {
+pub(crate) fn db_to_app(error: DbError) -> AppError {
     match error {
+        DbError::ConversationTitleInvalid => AppError::BadRequest(
+            "title must contain between 1 and 200 Unicode scalar values after trimming".to_owned(),
+        ),
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
         DbError::ProductConversationUnavailable(id) => {
             AppError::Conflict(Box::new(super::types::ConflictErrorResponse::new(

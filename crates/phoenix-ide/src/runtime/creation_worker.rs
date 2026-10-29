@@ -462,7 +462,17 @@ async fn expand_product_creation_objective(
     manager: &RuntimeManager,
     conversation_id: &str,
     objective: &str,
+    origin: &crate::db::ProductCreationOrigin,
 ) -> Result<crate::send_chat_service::ExpandedDispatchMessage, String> {
+    let policy = match origin {
+        crate::db::ProductCreationOrigin::UnknownHistorical
+        | crate::db::ProductCreationOrigin::UserApi => {
+            crate::send_chat_service::MessageExpansionPolicy::ExpandReferences
+        }
+        crate::db::ProductCreationOrigin::InternalConversation { .. } => {
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        }
+    };
     let conversation = manager
         .db()
         .get_conversation(conversation_id)
@@ -473,7 +483,7 @@ async fn expand_product_creation_objective(
         conversation_id,
         &conversation.cwd,
         objective,
-        crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
+        policy,
     )
     .await
     .map_err(|error| error.to_string())
@@ -612,15 +622,19 @@ async fn deliver_product_creation_objective_inner(
             media_type: image.media_type.clone(),
         })
         .collect();
-    let expanded =
-        match expand_product_creation_objective(manager, &conversation_id, &job.intent.objective)
-            .await
-        {
-            Ok(expanded) => expanded,
-            Err(error) => {
-                return Err(persist_retryable_delivery_failure(manager, claimed, &error).await?);
-            }
-        };
+    let expanded = match expand_product_creation_objective(
+        manager,
+        &conversation_id,
+        &job.intent.objective,
+        &job.intent.origin,
+    )
+    .await
+    {
+        Ok(expanded) => expanded,
+        Err(error) => {
+            return Err(persist_retryable_delivery_failure(manager, claimed, &error).await?);
+        }
+    };
     checkpoint_product_creation_stage(
         manager,
         claimed,
@@ -4344,6 +4358,45 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
+    async fn internal_creation_objective_is_literal_agent_content() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "literal-objective",
+            "literal-objective",
+            root.path().to_str().unwrap(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let manager = test_runtime_manager(db);
+        let origin = crate::db::ProductCreationOrigin::InternalConversation {
+            product_conversation_id: "coordinator-product".parse().unwrap(),
+            transcript_id: "coordinator-source".into(),
+            source_call: phoenix_core::domain::db_schema::SourceToolCall {
+                message_id: "assistant-source".into(),
+                tool_use_id: "create-call".into(),
+            },
+        };
+        // Neither a missing @file nor an unknown /skill may be expanded for agent input.
+        for objective in ["Read @missing.md", "/missing-skill @missing.md"] {
+            let expanded = expand_product_creation_objective(
+                &manager,
+                "literal-objective",
+                objective,
+                &origin,
+            )
+            .await
+            .unwrap();
+            assert_eq!(expanded.display_text, objective);
+            assert!(expanded.llm_text.is_none());
+            assert!(expanded.skill_invocation.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn initial_objective_expands_against_published_conversation_root() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("notes.md"), "published root contents").unwrap();
@@ -4372,6 +4425,7 @@ mod product_creation_delivery_replay_tests {
             &manager,
             "expanded-product-objective",
             "Read @notes.md",
+            &crate::db::ProductCreationOrigin::UserApi,
         )
         .await
         .unwrap();

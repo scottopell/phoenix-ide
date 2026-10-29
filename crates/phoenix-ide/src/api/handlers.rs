@@ -2112,7 +2112,7 @@ async fn get_product_conversation_creation(
     product_creation_status_response(job, delivery_retryable, route).map(Json)
 }
 
-fn product_creation_status_response(
+pub(crate) fn product_creation_status_response(
     job: crate::db::ProductCreationJobRecord,
     delivery_retryable: bool,
     canonical_route: Option<String>,
@@ -2225,111 +2225,16 @@ async fn delete_product_conversation_creation(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn create_product_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateProductConversationRequest>,
 ) -> Result<(StatusCode, Json<ProductConversationCreateAcceptedResponse>), AppError> {
-    let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
-        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
-    })?;
-    uuid::Uuid::parse_str(&req.request_id)
-        .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_string()))?;
-    let existing_job = state
-        .db
-        .get_product_creation_job(&req.request_id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    if req.objective.trim().is_empty() && req.images.is_empty() {
-        return Err(AppError::BadRequest(
-            "Product creation requires objective text or an image".to_string(),
-        ));
-    }
-    if req
-        .images
-        .iter()
-        .any(|image| image.media_type.trim().is_empty() || image.data.trim().is_empty())
-    {
-        return Err(AppError::BadRequest(
-            "Product creation images require a media type and non-empty payload".to_string(),
-        ));
-    }
-    if req.images.len() > 20
-        || req
-            .images
-            .iter()
-            .map(|image| image.data.len())
-            .sum::<usize>()
-            > 35_000_000
-    {
-        return Err(AppError::BadRequest(
-            "Product creation images exceed the request limit".to_string(),
-        ));
-    }
-    if existing_job.is_none() && state.llm_registry.get(&req.model).is_none() {
-        return Err(AppError::BadRequest(format!(
-            "Unknown or unavailable model '{}'",
-            req.model
-        )));
-    }
-    if let Some(effort) = req.effort {
-        if existing_job.is_none() && !state.llm_registry.supports_effort(&req.model, effort) {
-            return Err(AppError::BadRequest(format!(
-                "Model '{}' does not support effort '{effort:?}'",
-                req.model
-            )));
-        }
-    }
-    let canonical_cwd = match existing_job.as_ref() {
-        Some(existing) if req.cwd == existing.intent.cwd => existing.intent.cwd.clone(),
-        _ => crate::conversation_cwd::normalize_product_creation_cwd_intent(
-            &req.cwd,
-            state.runtime_env.home(),
-        )
-        .map_err(|error| AppError::BadRequest(error.to_string()))?,
-    };
-    let selected_llm_language = match (req.llm_language, existing_job.as_ref()) {
-        (Some(language), _) => language,
-        (None, Some(existing)) => existing.intent.llm_language,
-        (None, None) => state
-            .runtime
-            .db()
-            .get_default_llm_language()
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?,
-    };
-    let intent = crate::db::ProductCreationIntent {
-        origin: phoenix_db::ProductCreationOrigin::UserApi,
-        cwd: canonical_cwd,
-        objective: req.objective,
-        model: Some(req.model),
-        effort: req.effort,
-        llm_language: selected_llm_language,
-        images: req
-            .images
-            .into_iter()
-            .map(|image| crate::db::ProductCreationImage {
-                media_type: image.media_type,
-                data: image.data,
-            })
-            .collect(),
-    };
-    let accepted = match state
-        .db
-        .accept_product_creation(&req.request_id, &intent)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        crate::db::ProductCreationAcceptOutcome::Conflict(_) => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "request_id conflicts with immutable creation intent",
-                "product_creation_request_conflict",
-            ))));
-        }
-        crate::db::ProductCreationAcceptOutcome::Accepted(job)
-        | crate::db::ProductCreationAcceptOutcome::Replayed(job) => job,
-    };
-    state.runtime.kick_creation_worker();
+    let accepted = crate::conversation_actions::accept_create(
+        &state.runtime,
+        req,
+        crate::conversation_actions::CreateSource::UserApi,
+    )
+    .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(ProductConversationCreateAcceptedResponse {
@@ -2464,6 +2369,28 @@ mod product_creation_acceptance_tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.intent.llm_language, LlmLanguage::Caveman);
+    }
+
+    #[tokio::test]
+    async fn model_is_optional_for_product_creation() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let app = create_router(state.clone());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut body = request_body(&request_id, directory.path().to_str().unwrap());
+        body.as_object_mut().unwrap().remove("model");
+        let response = post_creation(&app, &body).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job = state
+            .db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.intent.model,
+            Some(state.llm_registry.default_model_id())
+        );
     }
 
     #[tokio::test]
