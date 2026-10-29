@@ -384,6 +384,7 @@ AND SHALL reject reuse of a request identity for a different intent rather than 
 WHEN the Coordinator reconciles an uncertain creation result
 THE SYSTEM SHALL return the original durable request and product identities and observed creation status
 AND SHALL distinguish acceptance from publication, objective delivery, runtime execution, and completion
+AND SHALL derive the complete native readback, including publication identity, route, and execution evidence, from one persistence snapshot that also validates the current Coordinator's authority
 AND SHALL NOT implicitly cancel, restart, or repeat an intentional creation under a new identity.
 
 THE SYSTEM SHALL preserve public user API, historical, and Slack gateway origin decoding and objective-delivery behavior independently of the Coordinator's literal-input policy.

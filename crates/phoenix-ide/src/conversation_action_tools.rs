@@ -307,41 +307,49 @@ struct NativeCreationStatus {
     allowed_actions: [&'static str; 1],
 }
 
-async fn native_creation_status(
-    runtime: &RuntimeManager,
-    job: phoenix_db::ProductCreationJobRecord,
-) -> Result<NativeCreationStatus, String> {
-    let initial_objective_execution = runtime
-        .db()
-        .product_creation_initial_execution(&job.request_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let publication = if let Some(conversation_id) = job.published_conversation_id {
-        let aggregate = runtime
-            .db()
-            .get_ordinary_product_conversation(&job.product_conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Some(NativeCreationPublication {
-            conversation_id,
-            canonical_route: crate::api::product_conversations::canonical_route(&aggregate),
-        })
-    } else {
-        None
-    };
-    Ok(NativeCreationStatus {
-        request_id: job.request_id,
-        product_conversation_id: job.product_conversation_id,
-        status: job.status,
-        provisioning_stage: job.provisioning_stage,
-        provisioning_stage_updated_at: job.stage_updated_at,
-        retry_at: job.retry_at.or(job.delivery_retry_at),
-        error: job.last_error,
-        publication,
-        initial_objective_execution,
+fn native_creation_status(status: phoenix_db::ProductCreationStatusRead) -> NativeCreationStatus {
+    NativeCreationStatus {
+        request_id: status.request_id,
+        product_conversation_id: status.product_conversation_id,
+        status: status.status,
+        provisioning_stage: status.provisioning_stage,
+        provisioning_stage_updated_at: status.stage_updated_at,
+        retry_at: status.retry_at,
+        error: status.error,
+        publication: status.publication.map(|publication| NativeCreationPublication {
+            conversation_id: publication.conversation_id,
+            canonical_route: crate::api::product_conversations::canonical_route(&publication.aggregate),
+        }),
+        initial_objective_execution: status.initial_objective_execution,
         execution_interpretation: "Publication means initial input accepted, not objective completed. Unavailable means no attributable outcome is retained; never infer success from later turns.",
         allowed_actions: ["read"],
-    })
+    }
+}
+
+async fn read_native_creation_status(
+    runtime: &RuntimeManager,
+    transcript_id: &str,
+    request_id: &str,
+) -> Result<Option<NativeCreationStatus>, String> {
+    runtime
+        .db()
+        .read_product_creation_status_as_coordinator(transcript_id, request_id)
+        .await
+        .map(|status| status.map(native_creation_status))
+        .map_err(|error| error.to_string())
+}
+
+async fn native_creation_acceptance_receipt(
+    runtime: &RuntimeManager,
+    transcript_id: &str,
+    request_id: &str,
+) -> Result<Value, String> {
+    let accepted = read_native_creation_status(runtime, transcript_id, request_id)
+        .await?
+        .ok_or("Accepted creation request is no longer available; reconcile request_id")?;
+    Ok(
+        json!({"status":"accepted", "request_id":accepted.request_id,"product_conversation_id":accepted.product_conversation_id,"next":"read request_id; accepted does not imply ready"}),
+    )
 }
 
 impl CreateConversation {
@@ -386,17 +394,13 @@ impl CreateConversation {
                 )
             }
             CreateRequest::Read { request_id } => {
-                let job = self
-                    .0
-                    .db()
-                    .get_product_creation_job_as_coordinator(&ctx.conversation_id, &request_id.0)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let Some(job) = job else {
+                let status =
+                    read_native_creation_status(&self.0, &ctx.conversation_id, &request_id.0)
+                        .await?;
+                let Some(status) = status else {
                     return Ok(json!({"status":"unknown", "request_id":request_id.0}));
                 };
-                serde_json::to_value(native_creation_status(&self.0, job).await?)
-                    .map_err(|error| error.to_string())
+                serde_json::to_value(status).map_err(|error| error.to_string())
             }
             CreateRequest::Create {
                 request_id,
@@ -430,9 +434,12 @@ impl CreateConversation {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                Ok(
-                    json!({"status":"accepted", "request_id":accepted.request_id,"product_conversation_id":accepted.product_conversation_id,"next":"read request_id; accepted does not imply ready"}),
+                native_creation_acceptance_receipt(
+                    &self.0,
+                    &ctx.conversation_id,
+                    &accepted.request_id,
                 )
+                .await
             }
         }
     }

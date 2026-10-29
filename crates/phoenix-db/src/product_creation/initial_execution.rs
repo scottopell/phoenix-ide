@@ -19,6 +19,14 @@ impl Database {
         &self,
         request_id: &str,
     ) -> DbResult<ProductCreationInitialExecution> {
+        let mut connection = self.pool.acquire().await?;
+        Self::product_creation_initial_execution_on(&mut connection, request_id).await
+    }
+
+    pub(super) async fn product_creation_initial_execution_on(
+        connection: &mut SqliteConnection,
+        request_id: &str,
+    ) -> DbResult<ProductCreationInitialExecution> {
         let state: Option<String> = sqlx::query_scalar(
             "SELECT CASE
               WHEN EXISTS (SELECT 1 FROM steering_messages q
@@ -41,7 +49,7 @@ impl Database {
              WHERE j.request_id = ?1 AND j.status = 'published'",
         )
         .bind(request_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(connection)
         .await?;
         Ok(match state.as_deref() {
             Some("queued") => ProductCreationInitialExecution::Queued,

@@ -155,6 +155,81 @@ async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) 
 }
 
 #[tokio::test]
+async fn native_creation_read_and_submit_receipt_require_current_snapshot_authority() {
+    let (runtime, db, gc) = native_runtime().await;
+    let dir = tempfile::tempdir().unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let registry = tools(runtime.clone(), &gc).await.unwrap();
+    let create = registry
+        .iter()
+        .find(|tool| tool.name() == "create_conversation")
+        .unwrap();
+    let accepted = create
+        .run(
+            json!({
+                "op":"create", "request_id":request_id,
+                "cwd":dir.path().to_string_lossy(), "objective":"snapshot objective",
+                "start":"submit_objective", "model":"gpt-5.6-sol"
+            }),
+            native_context(&gc),
+        )
+        .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(accepted.output()).unwrap()["status"],
+        "accepted"
+    );
+    assert!(read_native_creation_status(&runtime, &gc, &request_id)
+        .await
+        .is_ok());
+    assert!(
+        native_creation_acceptance_receipt(&runtime, &gc, &request_id)
+            .await
+            .is_ok()
+    );
+    db.update_conversation_state(
+        &gc,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: "snapshot successor".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let crate::db::ContinueOutcome::Created(successor) =
+        db.continue_conversation(&gc).await.unwrap()
+    else {
+        panic!("expected Coordinator successor");
+    };
+    assert!(read_native_creation_status(&runtime, &gc, &request_id)
+        .await
+        .is_err());
+    assert!(
+        native_creation_acceptance_receipt(&runtime, &gc, &request_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        read_native_creation_status(&runtime, &successor.id, &request_id)
+            .await
+            .is_ok()
+    );
+    sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
+        .bind(&successor.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        read_native_creation_status(&runtime, &successor.id, &request_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        native_creation_acceptance_receipt(&runtime, &successor.id, &request_id)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
     let (runtime, db, gc) = native_runtime().await;
     let root = db
@@ -197,6 +272,18 @@ async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
     assert!(matches!(denied, ToolOutput::Error { .. }));
     let renamed = db.get_conversation(&root.id).await.unwrap();
     assert_eq!(renamed.title.as_deref(), Some("Native 東京"));
+    db.delete_conversation(&root.id).await.unwrap();
+    let historical = rename
+        .run(
+            json!({"op":"read", "operation_id":operation}),
+            native_context(&gc),
+        )
+        .await;
+    let historical: Value = serde_json::from_str(historical.output()).unwrap();
+    assert_eq!(historical["status"], "applied");
+    assert_eq!(historical["historical"], true);
+    assert_eq!(historical["receipt"], applied["receipt"]);
+    assert!(historical.get("detail").is_none());
     sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
         .bind(&gc)
         .execute(db.pool())

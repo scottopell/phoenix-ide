@@ -248,6 +248,25 @@ pub struct ProductCreationJobRecord {
     pub deletion_requested_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug)]
+pub struct ProductCreationPublicationRead {
+    pub conversation_id: String,
+    pub aggregate: ProductConversationAggregate,
+}
+
+#[derive(Debug)]
+pub struct ProductCreationStatusRead {
+    pub request_id: String,
+    pub product_conversation_id: ProductConversationId,
+    pub status: String,
+    pub provisioning_stage: ProductCreationProvisioningStage,
+    pub stage_updated_at: DateTime<Utc>,
+    pub retry_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub publication: Option<ProductCreationPublicationRead>,
+    pub initial_objective_execution: ProductCreationInitialExecution,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductCreationRecoveryJobRecord {
     pub request_id: String,
@@ -597,6 +616,72 @@ impl Database {
         let job = Self::get_product_creation_job_on(&mut tx, request_id).await?;
         tx.commit().await?;
         Ok(job)
+    }
+
+    /// Read native creation reconciliation evidence and current Coordinator authority together.
+    /// # Errors
+    /// Returns an error if persisted Coordinator authority or snapshot decoding fails.
+    pub async fn read_product_creation_status_as_coordinator(
+        &self,
+        transcript_id: &str,
+        request_id: &str,
+    ) -> DbResult<Option<ProductCreationStatusRead>> {
+        self.read_product_creation_status_as_coordinator_inner(
+            transcript_id,
+            request_id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn read_product_creation_status_as_coordinator_inner(
+        &self,
+        transcript_id: &str,
+        request_id: &str,
+        #[cfg(test)] after_job: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
+        >,
+    ) -> DbResult<Option<ProductCreationStatusRead>> {
+        let mut tx = self.pool.begin().await?;
+        crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id).await?;
+        let Some(job) = Self::get_product_creation_job_on(&mut tx, request_id).await? else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        #[cfg(test)]
+        if let Some(after_job) = after_job {
+            after_job.await;
+        }
+        let initial_objective_execution =
+            Self::product_creation_initial_execution_on(&mut tx, request_id).await?;
+        let publication = if job.status == "published" {
+            let conversation_id = job.published_conversation_id.ok_or_else(|| {
+                DbError::Serialization("published creation has no transcript identity".into())
+            })?;
+            let aggregate =
+                Self::get_ordinary_product_conversation_on(&mut tx, &job.product_conversation_id)
+                    .await?;
+            Some(ProductCreationPublicationRead {
+                conversation_id,
+                aggregate,
+            })
+        } else {
+            None
+        };
+        let status = ProductCreationStatusRead {
+            request_id: job.request_id,
+            product_conversation_id: job.product_conversation_id,
+            status: job.status,
+            provisioning_stage: job.provisioning_stage,
+            stage_updated_at: job.stage_updated_at,
+            retry_at: job.retry_at.or(job.delivery_retry_at),
+            error: job.last_error,
+            publication,
+            initial_objective_execution,
+        };
+        tx.rollback().await?;
+        Ok(Some(status))
     }
 
     #[allow(clippy::too_many_lines)] // One transaction reserves identity, source binding, and objective.
@@ -2431,6 +2516,242 @@ mod product_creation_tests {
         assert_eq!(read.intent.origin, ProductCreationOrigin::UserApi);
         assert!(matches!(
             db.get_product_creation_job_as_coordinator("not-current-gc", &request_id)
+                .await,
+            Err(DbError::CurrentCoordinatorRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordinator_creation_snapshot_denies_predecessor_and_revoked_heads() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        db.accept_product_creation(&request_id, &intent("/tmp", "snapshot authority"))
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &coordinator.id,
+            &ConvState::ContextExhausted {
+                summary: "continue coordinator".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::ContinueOutcome::Created(successor) =
+            db.continue_conversation(&coordinator.id).await.unwrap()
+        else {
+            panic!("expected a Coordinator successor");
+        };
+        for request in [&request_id[..], "missing-request"] {
+            for caller in [&coordinator.id[..], "ordinary-or-missing"] {
+                assert!(matches!(
+                    db.read_product_creation_status_as_coordinator(caller, request)
+                        .await,
+                    Err(DbError::CurrentCoordinatorRequired)
+                ));
+            }
+        }
+        let status = db
+            .read_product_creation_status_as_coordinator(&successor.id, &request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, "accepted");
+        assert_eq!(status.request_id, request_id);
+        assert!(db
+            .read_product_creation_status_as_coordinator(&successor.id, "missing-request")
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("UPDATE conversations SET coordinator_head = 0 WHERE id = ?1")
+            .bind(&successor.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for request in [&request_id[..], "missing-request"] {
+            assert!(matches!(
+                db.read_product_creation_status_as_coordinator(&successor.id, request)
+                    .await,
+                Err(DbError::CurrentCoordinatorRequired)
+            ));
+        }
+    }
+
+    async fn complete_queued_creation(db: &Database, delivery: &ClaimedProductCreationJob) {
+        let fingerprint = format!("product-create:{}", delivery.job.request_id);
+        db.append_product_creation_steering_entry(
+            delivery,
+            &delivery_entry(delivery),
+            &fingerprint,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .complete_product_creation_delivery(
+                &delivery.job.request_id,
+                &delivery.claim,
+                &SteeringAcceptanceFingerprint::Exact(fingerprint),
+                &delivery.job.intent,
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn coordinator_creation_snapshot_does_not_mix_acceptance_with_committed_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("creation-snapshot.db").to_str().unwrap())
+            .await
+            .unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        db.accept_product_creation(&request_id, &intent("/repo/a", "inspect repository"))
+            .await
+            .unwrap();
+        let snapshot = db
+            .read_product_creation_status_as_coordinator_inner(
+                &coordinator.id,
+                &request_id,
+                Some(Box::pin(async {
+                    let delivery = staged_delivery(&db, &request_id).await;
+                    complete_queued_creation(&db, &delivery).await;
+                })),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.status, "accepted");
+        assert_eq!(
+            snapshot.provisioning_stage,
+            ProductCreationProvisioningStage::ValidateIntent
+        );
+        assert!(snapshot.publication.is_none());
+        assert_eq!(
+            snapshot.initial_objective_execution,
+            ProductCreationInitialExecution::Unavailable
+        );
+        let fresh = db
+            .read_product_creation_status_as_coordinator(&coordinator.id, &request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.status, "published");
+        assert_eq!(
+            fresh.provisioning_stage,
+            ProductCreationProvisioningStage::FinalizePublication
+        );
+        assert!(fresh.publication.is_some());
+        assert_eq!(
+            fresh.initial_objective_execution,
+            ProductCreationInitialExecution::Queued
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn coordinator_creation_snapshot_keeps_execution_route_and_authority_coherent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("execution-snapshot.db").to_str().unwrap())
+            .await
+            .unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let delivery = staged_delivery(&db, &request_id).await;
+        let pending = db
+            .read_product_creation_status_as_coordinator(&coordinator.id, &request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, "delivery_pending");
+        assert!(pending.publication.is_none());
+        assert_eq!(
+            pending.initial_objective_execution,
+            ProductCreationInitialExecution::Unavailable
+        );
+        complete_queued_creation(&db, &delivery).await;
+        let conversation_id = delivery.job.published_conversation_id.clone().unwrap();
+        let old_slug = db.get_conversation(&conversation_id).await.unwrap().slug;
+        let snapshot = db
+            .read_product_creation_status_as_coordinator_inner(
+                &coordinator.id,
+                &request_id,
+                Some(Box::pin(async {
+                    let content = MessageContent::User(UserContent::new(delivery.job.intent.objective.clone()));
+                    let message = Message {
+                        message_id: request_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        sequence_id: 1,
+                        origin: delivery.job.intent.origin.input_origin(),
+                        message_type: content.message_type(),
+                        content,
+                        display_data: None,
+                        usage_data: None,
+                        created_at: Utc::now(),
+                    };
+                    db.commit_steering_drain(
+                        &conversation_id,
+                        &[message],
+                        &ConvState::LlmRequesting { attempt: 0 },
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+                    let mut writer = db.pool.begin().await.unwrap();
+                    sqlx::query("UPDATE conversations SET slug = 'snapshot-renamed', name_revision = name_revision + 1 WHERE id = ?1")
+                        .bind(&conversation_id)
+                        .execute(&mut *writer)
+                        .await
+                        .unwrap();
+                    sqlx::query("UPDATE conversations SET coordinator_head = 0 WHERE id = ?1")
+                        .bind(&coordinator.id)
+                        .execute(&mut *writer)
+                        .await
+                        .unwrap();
+                    writer.commit().await.unwrap();
+                })),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.status, "published");
+        assert_eq!(
+            snapshot.initial_objective_execution,
+            ProductCreationInitialExecution::Queued
+        );
+        let publication = snapshot.publication.unwrap();
+        assert_eq!(publication.conversation_id, conversation_id);
+        assert_eq!(publication.aggregate.root.conversation.slug, old_slug);
+        assert!(matches!(
+            publication.aggregate.root.conversation.state,
+            ConvState::Idle
+        ));
+        assert_eq!(
+            db.product_creation_initial_execution(&request_id)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Running
+        );
+        assert_eq!(
+            db.get_conversation(&conversation_id)
+                .await
+                .unwrap()
+                .slug
+                .as_deref(),
+            Some("snapshot-renamed")
+        );
+        assert!(matches!(
+            db.read_product_creation_status_as_coordinator(&coordinator.id, &request_id)
                 .await,
             Err(DbError::CurrentCoordinatorRequired)
         ));
