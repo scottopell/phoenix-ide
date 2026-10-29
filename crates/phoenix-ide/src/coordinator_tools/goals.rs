@@ -116,7 +116,11 @@ impl GoalTool {
             format!("Invalid {} input: {error}. Read the tool schema; authority and versions are server-derived.", self.name())
         };
         let refusal = |error: crate::api::handlers::AppError| {
-            format!("{} refused: {}. Verify current Coordinator authority and an ordinary open @conv target. Read Goal/history before explicitly reconsidering; do not blind-retry with a fresh preparation.", self.name(), super::app_error_message(error))
+            let message = match error {
+                crate::api::handlers::AppError::Conflict(response) => response.error,
+                other => super::app_error_message(other),
+            };
+            format!("{} refused: {}. Verify current Coordinator authority and an ordinary open @conv target. Read Goal/history before explicitly reconsidering; do not blind-retry with a fresh preparation.", self.name(), message)
         };
         self.service
             .authorize_coordinator(&ctx.conversation_id)

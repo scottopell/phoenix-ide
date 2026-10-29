@@ -28,6 +28,9 @@ impl Fixture {
     }
 
     async fn with_db(db: crate::db::Database) -> Self {
+        phoenix_db::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         let caller = db
             .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
             .await
@@ -252,9 +255,13 @@ async fn native_goal_creation_and_replacement_require_auto_continue_at_apply() {
         .await;
     let refused_create = f.apply(&first).await;
     assert!(!refused_create.is_success());
-    assert!(refused_create
-        .output()
-        .contains("enable automatic continuation"));
+    assert!(
+        refused_create
+            .output()
+            .contains("enable automatic continuation"),
+        "{}",
+        refused_create.output()
+    );
     assert!(f.db.conversation_goal(&f.owner).await.unwrap().is_none());
     assert!(f
         .db
