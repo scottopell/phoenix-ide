@@ -879,6 +879,7 @@ fn is_runtime_state_name(name: &str) -> bool {
         || name == "share_tokens"
         || name == "auth_sessions"
         || name == "mcp_disabled_servers"
+        || name == "plugins"
         || name == "mcp_oauth_tokens"
         || name == "mcp_oauth_removals"
         || name == "sub_agent_personas"

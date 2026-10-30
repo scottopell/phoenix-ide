@@ -138,6 +138,16 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
         Ok(disabled) => manager.set_disabled_servers(disabled).await,
         Err(error) => tracing::warn!(error = %error, "Failed to load disabled MCP servers"),
     }
+    let disabled_plugins: std::collections::HashSet<String> = db
+        .get_plugins()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| !record.enabled)
+        .map(|record| record.name)
+        .collect();
+    phoenix_plugins::filter::set_disabled(disabled_plugins.clone());
+    manager.set_disabled_plugins(disabled_plugins).await;
     if let Err(error) = manager.start_background_discovery().await {
         tracing::warn!(error = %error, "MCP discovery task terminated unexpectedly");
     }
