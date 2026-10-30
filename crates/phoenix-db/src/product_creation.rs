@@ -3601,6 +3601,79 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn recorded_cancel_classifies_initial_receipt_before_watch_and_occurrence_consumption() {
+        for watched in [false, true] {
+            let (db, request, conversation) = initial_execution_fixture(watched).await;
+            sqlx::query("INSERT INTO execution_cancel_observations(conversation_id) VALUES (?1)")
+                .bind(&conversation)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.update_conversation_state(
+                &conversation,
+                &ConvState::CancellingSubAgents {
+                    pending: vec![],
+                    completed_results: vec![],
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                    spawn_tool_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            let pending: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM execution_cancel_observations WHERE conversation_id = ?1),
+                        (SELECT COUNT(*) FROM steering_execution_occurrences WHERE conversation_id = ?1)",
+            )
+            .bind(&conversation)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(pending, (1, 1));
+            db.update_conversation_state(&conversation, &ConvState::Idle)
+                .await
+                .unwrap();
+            let receipt: (String, Option<String>) = sqlx::query_as(
+                "SELECT terminal_kind, failure_reason FROM product_creation_initial_execution_receipts WHERE request_id = ?1",
+            )
+            .bind(&request)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(receipt, ("Cancelled".into(), None));
+            let remaining: (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM execution_cancel_observations WHERE conversation_id = ?1),
+                        (SELECT COUNT(*) FROM steering_execution_occurrences WHERE conversation_id = ?1)",
+            )
+            .bind(&conversation)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(remaining, (0, 0));
+            let events = db.pending_coordinator_watch_events(16).await.unwrap();
+            assert_eq!(events.len(), usize::from(watched));
+            if watched {
+                assert_eq!(events[0].outcome.label(), "cancelled");
+            }
+            sqlx::query("DELETE FROM coordinator_watch_events WHERE source_transcript_id = ?1")
+                .bind(&conversation)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.update_conversation_state(&conversation, &ConvState::LlmRequesting { attempt: 1 })
+                .await
+                .unwrap();
+            db.update_conversation_state(&conversation, &ConvState::Idle)
+                .await
+                .unwrap();
+            db.delete_conversation(&conversation).await.unwrap();
+            assert_eq!(
+                db.product_creation_initial_execution(&request).await.unwrap(),
+                ProductCreationInitialExecution::Cancelled
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cancelled_initial_objective_is_retained_after_occurrence_consumption() {
         let (db, request, conversation) = initial_execution_fixture(false).await;
         db.update_conversation_state(

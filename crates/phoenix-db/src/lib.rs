@@ -16237,6 +16237,12 @@ pub(crate) async fn record_initial_execution_outcome_tx(
             | ConvState::HandedOff { .. } => None,
         };
         if let Some(terminal) = outcome {
+            let terminal = crate::coordinator_watches::consume_execution_cancel_tx(
+                tx,
+                conversation_id,
+                terminal,
+            )
+            .await?;
             if matches!(
                 &source_kind,
                 crate::coordinator_watches::MessageExecutionSource::Steering

@@ -515,6 +515,25 @@ pub(crate) async fn record_creation_event_tx(
     .await
 }
 
+pub(crate) async fn consume_execution_cancel_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    transcript_id: &str,
+    terminal: phoenix_workflow::TurnTerminal,
+) -> DbResult<phoenix_workflow::TurnTerminal> {
+    let cancelled =
+        sqlx::query("DELETE FROM execution_cancel_observations WHERE conversation_id = ?1")
+            .bind(transcript_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+            > 0;
+    Ok(if cancelled {
+        phoenix_workflow::TurnTerminal::Cancelled
+    } else {
+        terminal
+    })
+}
+
 #[allow(clippy::too_many_arguments)] // One transaction binds the complete source occurrence and terminal fact.
 async fn record_watch_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
