@@ -252,6 +252,27 @@ fn parse_canonical_conversation_reference(
     })
 }
 
+// The shortest rendered visible row is 77 chars. Page ends are capped at the
+// 1_000_000-char cursor ceiling, so cover that ceiling plus one has-more
+// lookahead char, then align to 64 rows: ceil(1_000_001 / 77 / 64) * 64 =
+// 12_992. Because every physical row consumes this budget, each request makes
+// at most 203 bounded history reads; this is a work bound, not a time bound.
+pub(crate) const FEDERATED_READ_SCAN_LIMIT: usize = 12_992;
+
+#[cfg(test)]
+const FEDERATED_READ_MAX_DB_READS: usize =
+    FEDERATED_READ_SCAN_LIMIT.div_ceil(BOUNDED_READ_MESSAGE_BATCH.get());
+#[cfg(test)]
+const FEDERATED_READ_TEST_CONTENT_LIMIT: usize = 65 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BoundedReadError {
+    #[error("federated conversation read exceeded the physical scan budget of {limit} messages")]
+    ScanBudgetExhausted { limit: usize },
+    #[error("{0}")]
+    Read(String),
+}
+
 #[derive(Clone)]
 pub(crate) struct GlobalReadService {
     db: crate::db::Database,
@@ -1196,13 +1217,31 @@ impl GlobalReadService {
         conversation: &str,
         cursor: usize,
         content_limit: NonZeroUsize,
-    ) -> Result<ConversationReadPage, String> {
+    ) -> Result<ConversationReadPage, BoundedReadError> {
+        self.read_conversation_page_bounded_with_scan_limit(
+            conversation,
+            cursor,
+            content_limit,
+            NonZeroUsize::new(FEDERATED_READ_SCAN_LIMIT).unwrap(),
+        )
+        .await
+    }
+
+    async fn read_conversation_page_bounded_with_scan_limit(
+        &self,
+        conversation: &str,
+        cursor: usize,
+        content_limit: NonZeroUsize,
+        scan_limit: NonZeroUsize,
+    ) -> Result<ConversationReadPage, BoundedReadError> {
         if cursor > MAX_CONVERSATION_READ_CURSOR {
-            return Err(format!(
+            return Err(BoundedReadError::Read(format!(
                 "cursor exceeds maximum {MAX_CONVERSATION_READ_CURSOR}"
-            ));
+            )));
         }
-        let target = resolve_conversation_read_target(self, conversation).await?;
+        let target = resolve_conversation_read_target(self, conversation)
+            .await
+            .map_err(BoundedReadError::Read)?;
         let (transcript_id, message_id, evidence_label) = match &target {
             ConversationReadTarget::StableCurrent { transcript_id } => {
                 (transcript_id, None, "current evidence")
@@ -1213,16 +1252,24 @@ impl GlobalReadService {
             } => (transcript_id, message_id.as_deref(), "exact evidence"),
         };
         if message_id.is_some() {
-            return Err("remote exact-message reads are not paged".to_string());
+            return Err(BoundedReadError::Read(
+                "remote exact-message reads are not paged".to_string(),
+            ));
         }
         let conversation = self
             .db
             .get_conversation(transcript_id.as_str())
             .await
-            .map_err(|error| format!("transcript not found: {error}"))?;
-        render_bounded_message_page(self, conversation, cursor, evidence_label, content_limit)
-            .await
-            .map_err(|error| format!("read failed: {error}"))
+            .map_err(|error| BoundedReadError::Read(format!("transcript not found: {error}")))?;
+        render_bounded_message_page(
+            self,
+            conversation,
+            cursor,
+            evidence_label,
+            content_limit,
+            scan_limit,
+        )
+        .await
     }
 
     pub(crate) async fn product_conversation_id_for_transcript(
@@ -1613,8 +1660,11 @@ async fn render_bounded_message_page(
     cursor: usize,
     evidence_label: &str,
     content_limit: NonZeroUsize,
-) -> Result<ConversationReadPage, DbError> {
-    let stable = ordinary_product_citation(&service.db, &conv).await?;
+    scan_limit: NonZeroUsize,
+) -> Result<ConversationReadPage, BoundedReadError> {
+    let stable = ordinary_product_citation(&service.db, &conv)
+        .await
+        .map_err(|error| BoundedReadError::Read(format!("read failed: {error}")))?;
     let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
         let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
         format!("Conversation @conv:{id}\nconversation link: {route}\n")
@@ -1645,21 +1695,28 @@ async fn render_bounded_message_page(
     let mut position = 0usize;
     let mut has_more = false;
     let mut after_sequence = 0;
+    let mut scanned = 0usize;
     let mut sender_kinds = std::collections::HashMap::new();
     loop {
+        let remaining = scan_limit.get() - scanned;
+        let batch_limit = NonZeroUsize::new(remaining.min(BOUNDED_READ_MESSAGE_BATCH.get()))
+            .expect("a nonzero scan budget has nonzero remaining capacity");
         let messages = service
             .db
             .get_bounded_read_messages_after_limited(
                 &conv.id,
                 after_sequence,
-                BOUNDED_READ_MESSAGE_BATCH,
+                batch_limit,
                 content_limit,
             )
-            .await?;
+            .await
+            .map_err(|error| BoundedReadError::Read(format!("read failed: {error}")))?;
         if messages.is_empty() {
             break;
         }
+        let reached_eof = messages.len() < batch_limit.get();
         for message in messages {
+            scanned += 1;
             after_sequence = message.sequence_id;
             if message.hidden {
                 continue;
@@ -1670,7 +1727,8 @@ async fn render_bounded_message_page(
                 &message,
                 &mut sender_kinds,
             )
-            .await?;
+            .await
+            .map_err(|error| BoundedReadError::Read(format!("read failed: {error}")))?;
             for character in line.chars() {
                 if position >= end {
                     has_more = true;
@@ -1685,8 +1743,13 @@ async fn render_bounded_message_page(
                 break;
             }
         }
-        if has_more {
+        if has_more || reached_eof {
             break;
+        }
+        if scanned == scan_limit.get() {
+            return Err(BoundedReadError::ScanBudgetExhausted {
+                limit: scan_limit.get(),
+            });
         }
     }
 
@@ -3660,14 +3723,17 @@ mod tests {
         conversation_page_end, exact_conversation_href, format_global_search_hits,
         message_id_fragment, render_full_message_text, render_global_message_line,
         resolve_conversation_read_target, resolve_reference_impl, resolve_work_scope,
-        split_fragment, ConversationReadTarget, CoordinatorWorkScopeTargetError,
+        split_fragment, BoundedReadError, ConversationReadTarget, CoordinatorWorkScopeTargetError,
         GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService, ResolvedEnvironmentKind,
         ResolvedWorkScope, ServerPathSemantics, WorkScopeUnavailableReason,
-        MAX_CONVERSATION_READ_CURSOR, READ_PAGE_CHARS,
+        FEDERATED_READ_MAX_DB_READS, FEDERATED_READ_SCAN_LIMIT, MAX_CONVERSATION_READ_CURSOR,
+        READ_PAGE_CHARS,
     };
     use std::sync::Arc;
 
-    use crate::db::MessageRetriever;
+    use crate::db::{
+        MessageRetriever, SqliteReadFamily, SqliteReadFamilyOutcome, SqliteSnapshotWindow,
+    };
 
     #[test]
     fn exact_conversation_href_keeps_dot_only_transcripts_out_of_path_segments() {
@@ -4197,6 +4263,279 @@ mod tests {
             conversation_page_end(MAX_CONVERSATION_READ_CURSOR),
             MAX_CONVERSATION_READ_CURSOR
         );
+    }
+
+    async fn add_bounded_read_message(
+        db: &crate::db::Database,
+        conversation: &str,
+        id: &str,
+        text: &str,
+        hidden: bool,
+    ) {
+        let display_data = hidden.then(|| serde_json::json!({"hidden": true}));
+        db.add_message(
+            id,
+            conversation,
+            &phoenix_core::domain::db_schema::MessageContent::user(text),
+            display_data.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn bounded_read_with_scan_limit(
+        db: &crate::db::Database,
+        cursor: usize,
+        scan_limit: usize,
+    ) -> Result<super::ConversationReadPage, BoundedReadError> {
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        service
+            .read_conversation_page_bounded_with_scan_limit(
+                "@transcript:scan-budget",
+                cursor,
+                std::num::NonZeroUsize::new(FEDERATED_READ_TEST_CONTENT_LIMIT).unwrap(),
+                std::num::NonZeroUsize::new(scan_limit).unwrap(),
+            )
+            .await
+    }
+
+    fn bounded_history_read_attempts(db: &crate::db::Database) -> u64 {
+        let sampled = db.sample_sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour);
+        let family = SqliteReadFamily::LatestBoundedHistory.index();
+        SqliteReadFamilyOutcome::ALL
+            .into_iter()
+            .map(|outcome| sampled.report.read_family_outcomes[family][outcome.index()])
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_final_allowed_row_can_prove_has_more() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        add_bounded_read_message(&db, "scan-budget", "scan-1", &"a".repeat(4_000), false).await;
+        add_bounded_read_message(&db, "scan-budget", "scan-2", &"b".repeat(4_000), false).await;
+        add_bounded_read_message(&db, "scan-budget", "scan-3", "tail", false).await;
+
+        let reads_before = bounded_history_read_attempts(&db);
+        let page = bounded_read_with_scan_limit(&db, 0, 2).await.unwrap();
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+        assert_eq!(page.next_cursor, Some(READ_PAGE_CHARS));
+        assert!(!page.content.contains("(end of conversation)"));
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_fails_closed_for_hidden_or_visible_rows_beyond_budget() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..3 {
+            add_bounded_read_message(
+                &db,
+                "scan-budget",
+                &format!("hidden-{index}"),
+                "hidden",
+                true,
+            )
+            .await;
+        }
+        let reads_before = bounded_history_read_attempts(&db);
+        assert!(matches!(
+            bounded_read_with_scan_limit(&db, 0, 2).await,
+            Err(BoundedReadError::ScanBudgetExhausted { limit: 2 })
+        ));
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        add_bounded_read_message(&db, "scan-budget", "hidden-1", "hidden", true).await;
+        add_bounded_read_message(&db, "scan-budget", "hidden-2", "hidden", true).await;
+        add_bounded_read_message(&db, "scan-budget", "visible-tail", "tail", false).await;
+        let reads_before = bounded_history_read_attempts(&db);
+        assert!(matches!(
+            bounded_read_with_scan_limit(&db, 0, 2).await,
+            Err(BoundedReadError::ScanBudgetExhausted { limit: 2 })
+        ));
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_caps_final_fetch_and_database_reads() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..65 {
+            add_bounded_read_message(
+                &db,
+                "scan-budget",
+                &format!("hidden-{index}"),
+                "hidden",
+                true,
+            )
+            .await;
+        }
+
+        let reads_before = bounded_history_read_attempts(&db);
+        let eof = bounded_read_with_scan_limit(&db, 0, 66).await.unwrap();
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 2);
+        assert_eq!(eof.next_cursor, None);
+
+        add_bounded_read_message(&db, "scan-budget", "hidden-65", "hidden", true).await;
+        let reads_before = bounded_history_read_attempts(&db);
+        assert!(matches!(
+            bounded_read_with_scan_limit(&db, 0, 65).await,
+            Err(BoundedReadError::ScanBudgetExhausted { limit: 65 })
+        ));
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_requires_observed_eof_at_the_exact_budget() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        add_bounded_read_message(&db, "scan-budget", "hidden-1", "hidden", true).await;
+        add_bounded_read_message(&db, "scan-budget", "hidden-2", "hidden", true).await;
+
+        let reads_before = bounded_history_read_attempts(&db);
+        assert!(matches!(
+            bounded_read_with_scan_limit(&db, 0, 2).await,
+            Err(BoundedReadError::ScanBudgetExhausted { limit: 2 })
+        ));
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_counts_cursor_prefix_and_discards_partial_page() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        add_bounded_read_message(&db, "scan-budget", "visible-prefix", "visible", false).await;
+        add_bounded_read_message(&db, "scan-budget", "hidden-1", "hidden", true).await;
+        add_bounded_read_message(&db, "scan-budget", "hidden-2", "hidden", true).await;
+
+        let reads_before = bounded_history_read_attempts(&db);
+        assert!(matches!(
+            bounded_read_with_scan_limit(&db, 1, 2).await,
+            Err(BoundedReadError::ScanBudgetExhausted { limit: 2 })
+        ));
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_accepts_observed_eof_and_exact_transcript_continuation() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        add_bounded_read_message(&db, "scan-budget", "only", "short", false).await;
+        let reads_before = bounded_history_read_attempts(&db);
+        let eof = bounded_read_with_scan_limit(&db, 0, 3).await.unwrap();
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+        assert_eq!(eof.next_cursor, None);
+        assert!(eof.content.contains("short"));
+
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("scan-budget", "scan-budget", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        add_bounded_read_message(
+            &db,
+            "scan-budget",
+            "first",
+            &format!("first-page-only-marker{}", "a".repeat(4_000)),
+            false,
+        )
+        .await;
+        add_bounded_read_message(
+            &db,
+            "scan-budget",
+            "second",
+            &format!("{}second-page-tail-marker", "b".repeat(4_000)),
+            false,
+        )
+        .await;
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let reads_before = bounded_history_read_attempts(&db);
+        let first = service
+            .read_conversation_page_bounded_with_scan_limit(
+                "@transcript:scan-budget",
+                0,
+                std::num::NonZeroUsize::new(FEDERATED_READ_TEST_CONTENT_LIMIT).unwrap(),
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+        let cursor = first.next_cursor.expect("first page should continue");
+        let reads_before = bounded_history_read_attempts(&db);
+        let second = service
+            .read_conversation_page_bounded_with_scan_limit(
+                "@transcript:scan-budget",
+                cursor,
+                std::num::NonZeroUsize::new(FEDERATED_READ_TEST_CONTENT_LIMIT).unwrap(),
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bounded_history_read_attempts(&db) - reads_before, 1);
+        assert!(second.content.contains("second-page-tail-marker"));
+        assert!(!second.content.contains("first-page-only-marker"));
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn federated_scan_limit_covers_the_cursor_cap_with_bounded_db_reads() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("", "", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "",
+            "",
+            &phoenix_core::domain::db_schema::MessageContent::Tool(
+                phoenix_core::domain::db_schema::ToolContent::new("", "", false),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let conversation = db.get_conversation("").await.unwrap();
+        let message = db
+            .get_bounded_read_messages_after_limited(
+                "",
+                0,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let rendered = render_bounded_message_line_with_cache(
+            &db,
+            &conversation,
+            &message,
+            &mut std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rendered.chars().count(), 77);
+        assert_eq!(FEDERATED_READ_SCAN_LIMIT, 12_992);
+        assert!(
+            FEDERATED_READ_SCAN_LIMIT * rendered.chars().count() > MAX_CONVERSATION_READ_CURSOR
+        );
+        assert_eq!(FEDERATED_READ_MAX_DB_READS, 203);
     }
 
     #[tokio::test]

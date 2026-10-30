@@ -763,7 +763,21 @@ async fn read_conversation_with_limits(
             content: page.content,
         })
         .into_response(),
-        Ok(Err(error)) => federation_error(StatusCode::UNPROCESSABLE_ENTITY, &error),
+        Ok(Err(error)) => bounded_read_error_response(error),
+    }
+}
+
+fn bounded_read_error_response(error: super::global_read::BoundedReadError) -> Response {
+    match error {
+        super::global_read::BoundedReadError::ScanBudgetExhausted { limit } => federation_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!(
+                "conversation scan budget of {limit} physical messages was exhausted; no page or EOF result was returned. This API version cannot resume the scan, and retrying the unchanged request will not advance; inspect the transcript locally."
+            ),
+        ),
+        super::global_read::BoundedReadError::Read(message) => {
+            federation_error(StatusCode::UNPROCESSABLE_ENTITY, &message)
+        }
     }
 }
 
@@ -2216,6 +2230,22 @@ mod tests {
 
         assert!(matches!(error, FederationClientError::ResponseTooLarge(8)));
         assert_eq!(body.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn scan_budget_exhaustion_uses_actionable_422_federation_envelope() {
+        let response = bounded_read_error_response(
+            super::super::global_read::BoundedReadError::ScanBudgetExhausted { limit: 3 },
+        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = value["error"].as_str().unwrap();
+        assert!(message.contains("scan budget of 3 physical messages was exhausted"));
+        assert!(message.contains("no page or EOF result was returned"));
+        assert!(message.contains("retrying the unchanged request will not advance"));
     }
 
     #[test]
