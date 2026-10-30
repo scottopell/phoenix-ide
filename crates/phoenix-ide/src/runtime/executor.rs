@@ -57,7 +57,9 @@ use tracing::Instrument;
 
 mod capacity;
 mod continuation;
+mod tool_execution;
 use capacity::{CapacityDecision, CountingBudget, RequestCapacity, SuccessorCapacity};
+use tool_execution::ToolExecutionSlot;
 #[cfg(test)]
 mod provider_tool_policy_tests;
 use continuation::{
@@ -759,7 +761,7 @@ fn count_trusted_envelopes(messages: &[LlmMessage]) -> usize {
 ///
 /// The `generation` stamp lets the executor distinguish an outcome for the
 /// still-in-flight tool from a stale one belonging to an intentionally aborted
-/// task (see `ConversationRuntime::tool_request_generation`). An intentional
+/// task (see `ToolExecutionSlot`). An intentional
 /// `Effect::AbortTool` / backstop teardown aborts the task, dropping the
 /// sender, so the synthetic `Failed` looks identical to a genuine panic; the
 /// executor discards any forwarded outcome whose generation is no longer
@@ -2029,8 +2031,7 @@ where
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
     exhausted_maintenance: bool,
     broadcast_tx: SseBroadcaster,
-    /// Token to cancel running tool execution
-    tool_cancel_token: Option<CancellationToken>,
+    tool_execution: ToolExecutionSlot,
     /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection.
     llm_task_handle: Option<tokio::task::JoinHandle<()>>,
     /// Active provider attempt retained outside the task for cancellation metrics.
@@ -2086,32 +2087,6 @@ where
     llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
     terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
-    /// Generation/epoch tag for the in-flight tool task, mirroring
-    /// `llm_request_generation`. Incremented at each tool dispatch (the
-    /// `tool_task_handle` spawn site) and at the `CancellingTool` backstop's
-    /// forced teardown (`handle_cancelling_tool_timeout`, which aborts the
-    /// wedged task and drops its sender). The tool outcome forwarder stamps the
-    /// dispatching generation onto every outcome it forwards; select-loop-side
-    /// routing discards any tool outcome whose generation != this current value.
-    ///
-    /// NOT bumped on `Effect::AbortTool`: that only cancels the token, and the
-    /// cooperative tool task then produces a real `Aborted` outcome the state
-    /// machine consumes to reach Idle. That outcome carries the still-current
-    /// dispatch generation and must not be discarded.
-    ///
-    /// Identity guard the state machine's id/state gate cannot fully provide:
-    /// the reducer accepts a tool outcome only when the `tool_use_id` matches
-    /// the current tool AND the conversation is in a tool state. After a forced
-    /// cancellation reaches Idle, an aborted tool task's forwarder can still
-    /// enqueue a stale outcome; if the NEXT turn's tool call happens to REUSE
-    /// the same `tool_use_id` while that stale outcome is still queued, the
-    /// id/state gate would accept the stale failure as the new tool's result.
-    /// `tool_use_id` uniqueness across turns is provider-dependent, not
-    /// structurally enforced. Bumping the generation on the next dispatch (and
-    /// on the forced teardown) makes the stale outcome's generation old, so it
-    /// is dropped; the live tool's current-generation outcome still matches. See
-    /// specs/bedrock REQ-BED-005a.
-    tool_request_generation: u64,
     /// Executor-internal, generation-tagged tool-outcome channel, mirroring
     /// `llm_outcome_tx`. The forwarder sends `(dispatch_generation, outcome)`;
     /// the select loop routes the outcome to `process_outcome` only when the
@@ -2168,14 +2143,6 @@ where
     /// liveness backstop structural: adding a future waiting state means handling
     /// it in `deadline_for` and `handle_deadline_expiry`, nowhere else.
     deadline: Option<tokio::time::Instant>,
-    /// Handle to the currently-spawned tool execution task. Retained so the
-    /// cancellation backstop can abort an uncooperative tool task that never
-    /// observes its token. Mirrors `llm_task_handle`. Replaced when a new tool
-    /// spawns; aborting it drops the tool's outcome sender, but a resulting
-    /// stale `Failed`/late `ToolComplete` is rejected by the state machine once
-    /// the conversation has already left `CancellingTool` (id/state mismatch ->
-    /// logged, harmless).
-    tool_task_handle: Option<tokio::task::JoinHandle<()>>,
     fatal_local_authority_rx: Option<watch::Receiver<Option<&'static str>>>,
     fatal_external_effect_cancellation: Option<CancellationToken>,
     #[cfg(test)]
@@ -2386,7 +2353,7 @@ where
             acknowledged_event_rx,
             handoff_review_rx: None,
             exhausted_maintenance: false,
-            tool_cancel_token: None,
+            tool_execution: ToolExecutionSlot::default(),
             llm_task_handle: None,
             active_llm_attempt: None,
             retry_timer_handle: None,
@@ -2398,7 +2365,6 @@ where
             llm_outcome_rx,
             terminal_transition_retry: None,
             terminal_settlement_attempt: TerminalSettlementAttempt::Initial,
-            tool_request_generation: 0,
             tool_outcome_tx,
             tool_outcome_rx,
             retry_outcome_tx,
@@ -2412,7 +2378,6 @@ where
             steering_queue: Vec::new(),
             steering_projection_gate: None,
             deadline: None,
-            tool_task_handle: None,
             fatal_local_authority_rx: Some(fatal_local_authority_fence.subscribe()),
             fatal_external_effect_cancellation: Some(
                 fatal_local_authority_fence.external_effect_cancellation(),
@@ -3158,7 +3123,7 @@ where
                     if self.tool_outcome_is_stale(generation) {
                         tracing::debug!(
                             outcome_generation = generation,
-                            current_generation = self.tool_request_generation,
+                            current_generation = self.tool_execution.generation(),
                             state = self.state.variant_name(),
                             "Ignoring stale tool outcome — task superseded (abort/new dispatch)"
                         );
@@ -3402,15 +3367,8 @@ where
         generation != self.llm_request_generation
     }
 
-    /// Whether a forwarded tool outcome stamped with `generation` belongs to a
-    /// superseded tool task. Stale when its generation no longer matches the
-    /// current tool generation — a later tool dispatch opened a newer one, or the
-    /// `CancellingTool` backstop's forced teardown bumped it. Closes the
-    /// same-id-reuse race the state machine's id/state gate alone cannot (a stale
-    /// outcome whose `tool_use_id` the next round happens to reuse). See
-    /// `tool_request_generation`.
     fn tool_outcome_is_stale(&self, generation: u64) -> bool {
-        generation != self.tool_request_generation
+        self.tool_execution.is_stale(generation)
     }
 
     /// Whether a forwarded `RetryTimeout` stamped with `generation` belongs to a
@@ -5432,7 +5390,7 @@ where
         if matches!(old_state, ConvState::CancellingTool { .. })
             && !matches!(self.state, ConvState::CancellingTool { .. })
         {
-            self.tool_task_handle = None;
+            self.tool_execution.release_task();
         }
 
         let entered_waiting_variant = old_state.variant_name() != self.state.variant_name();
@@ -5517,10 +5475,7 @@ where
             return;
         };
         let tool_use_id = current_tool.id.clone();
-        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
-        if let Some(handle) = self.tool_task_handle.take() {
-            handle.abort();
-        }
+        self.tool_execution.abort_task_and_invalidate();
         if let Err(error) = self
             .process_outcome(EffectOutcome::Tool(ToolExecOutcome::Failed {
                 tool_use_id,
@@ -5690,10 +5645,7 @@ where
         // Bump the tool generation so the aborted task's forwarded outcome is
         // stale and discarded by the select loop rather than applied to a later
         // round that may reuse the same `tool_use_id`.
-        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
-        if let Some(handle) = self.tool_task_handle.take() {
-            handle.abort();
-        }
+        self.tool_execution.abort_task_and_invalidate();
 
         // Drive the cooperative cancellation arm with a synthetic ToolAborted.
         if let Err(e) = self.process_event(Event::ToolAborted { tool_use_id }).await {
@@ -6263,13 +6215,7 @@ where
         if let Some(attempt_capture) = self.active_llm_attempt.take() {
             let _ = attempt_capture.finalize_cancelled();
         }
-        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
-        if let Some(token) = self.tool_cancel_token.take() {
-            token.cancel();
-        }
-        if let Some(handle) = self.tool_task_handle.take() {
-            handle.abort();
-        }
+        self.tool_execution.cancel_and_abort();
     }
 
     async fn abort_external_effects(&mut self) {
@@ -6286,13 +6232,7 @@ where
                 }
             }
         }
-        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
-        if let Some(token) = self.tool_cancel_token.take() {
-            token.cancel();
-        }
-        if let Some(handle) = self.tool_task_handle.take() {
-            handle.abort();
-        }
+        self.tool_execution.cancel_and_abort();
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7560,9 +7500,7 @@ where
         match effect {
             ControlEffect::AbortTool { tool_use_id } => {
                 tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
-                if let Some(token) = self.tool_cancel_token.take() {
-                    token.cancel();
-                }
+                self.tool_execution.request_cancel();
                 Ok(None)
             }
             ControlEffect::CancelSubAgents { ids, cause } => {
@@ -9021,21 +8959,13 @@ where
         // physically cannot send an LlmOutcome or other type.
         let (tool_tx, tool_rx) = oneshot::channel::<ToolExecOutcome>();
 
-        // Open a fresh generation for this tool dispatch, mirroring the LLM
-        // path. The forwarder stamps it onto the outcome; the select loop
-        // discards an outcome whose generation has been superseded by a later
-        // dispatch or an intentional `Effect::AbortTool` / backstop teardown.
-        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
-        let dispatch_generation = self.tool_request_generation;
         let tool_outcome_tx = self.tool_outcome_tx.clone();
-
-        // Create cancellation token for this tool execution
         let cancel_token = self
             .fatal_external_effect_cancellation
             .as_ref()
             .map(CancellationToken::child_token)
             .unwrap_or_default();
-        self.tool_cancel_token = Some(cancel_token.clone());
+        let dispatch_generation = self.tool_execution.begin_dispatch(cancel_token.clone());
         let cancel_token_check = cancel_token.clone();
 
         // Create ToolContext for this invocation. The scope-defining worktree
@@ -9176,11 +9106,7 @@ where
                 () = tool_execution => {}
             }
         });
-        // Retain the handle so the cancellation backstop (REQ-BED-005a) can
-        // abort an uncooperative tool task that never observes its token.
-        // Replacing any prior handle is correct: only one tool executes at a
-        // time, and a prior completed task's handle is inert.
-        self.tool_task_handle = Some(tool_task);
+        self.tool_execution.retain_task(tool_task);
 
         // Forward the typed outcome — a dropped sender becomes a typed Failed
         // outcome so a panicked/aborted tool task can never wedge the
@@ -19114,7 +19040,7 @@ mod authoritative_user_message_effect_tests {
         let (tool_started_tx, tool_started_rx) = oneshot::channel();
         let (tool_dropped_tx, tool_dropped_rx) = oneshot::channel();
         let tool_cancel_token = CancellationToken::new();
-        rt.tool_cancel_token = Some(tool_cancel_token.clone());
+        rt.tool_execution.begin_dispatch(tool_cancel_token.clone());
         rt.llm_task_handle = Some(tokio::spawn(async move {
             struct NotifyDrop(Option<oneshot::Sender<()>>);
             impl Drop for NotifyDrop {
@@ -19128,7 +19054,7 @@ mod authoritative_user_message_effect_tests {
             let _ = llm_started_tx.send(());
             std::future::pending::<()>().await;
         }));
-        rt.tool_task_handle = Some(tokio::spawn(async move {
+        rt.tool_execution.retain_task(tokio::spawn(async move {
             struct NotifyDrop(Option<oneshot::Sender<()>>);
             impl Drop for NotifyDrop {
                 fn drop(&mut self) {
@@ -19164,7 +19090,7 @@ mod authoritative_user_message_effect_tests {
         let (llm_dropped_tx, llm_dropped_rx) = oneshot::channel();
         let (tool_dropped_tx, tool_dropped_rx) = oneshot::channel();
         let tool_cancel_token = CancellationToken::new();
-        rt.tool_cancel_token = Some(tool_cancel_token.clone());
+        rt.tool_execution.begin_dispatch(tool_cancel_token.clone());
         rt.llm_task_handle = Some(tokio::spawn(async move {
             struct NotifyDrop(Option<oneshot::Sender<()>>);
             impl Drop for NotifyDrop {
@@ -19178,7 +19104,7 @@ mod authoritative_user_message_effect_tests {
             let _ = llm_started_tx.send(());
             std::future::pending::<()>().await;
         }));
-        rt.tool_task_handle = Some(tokio::spawn(async move {
+        rt.tool_execution.retain_task(tokio::spawn(async move {
             struct NotifyDrop(Option<oneshot::Sender<()>>);
             impl Drop for NotifyDrop {
                 fn drop(&mut self) {
@@ -21680,7 +21606,16 @@ mod steer_drain_detector_tests {
             vec![],
         );
         let independent = tokio::spawn(async { std::future::pending::<()>().await });
-        rt.tool_task_handle = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        let token = CancellationToken::new();
+        let generation = rt.tool_execution.begin_dispatch(token.clone());
+        let (started, start) = oneshot::channel();
+        let (held, dropped) = oneshot::channel::<()>();
+        rt.tool_execution.retain_task(tokio::spawn(async move {
+            let _held = held;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        start.await.unwrap();
 
         assert_eq!(
             ConversationRuntime::<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>::deadline_for(&rt.state),
@@ -21703,7 +21638,12 @@ mod steer_drain_detector_tests {
             tool_results[0].content,
             "bash wait exceeded its bounded settlement deadline"
         );
-        assert!(rt.tool_task_handle.is_none());
+        assert!(dropped.await.is_err(), "the wait task was aborted");
+        assert!(rt.tool_outcome_is_stale(generation));
+        assert!(
+            !token.is_cancelled(),
+            "the wait task's process token stays live"
+        );
         assert!(!independent.is_finished());
         rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
             provider_replay: None,
@@ -22110,7 +22050,7 @@ mod steer_drain_detector_tests {
             bash_wait_executing_state("wait-cutoff-race", "b-cutoff-race", Some(0)),
             vec![],
         );
-        let stale_generation = rt.tool_request_generation;
+        let stale_generation = rt.tool_execution.generation();
         let fence = Arc::clone(&rt.fatal_local_authority_fence);
         let (write_started, write_release) = storage.gate_tool_round_persist();
         rt.deadline = Some(tokio::time::Instant::now());
@@ -22325,7 +22265,9 @@ mod steer_drain_detector_tests {
             vec![],
         );
         rt.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-        rt.tool_task_handle = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        rt.tool_execution.begin_dispatch(CancellationToken::new());
+        rt.tool_execution
+            .retain_task(tokio::spawn(async { std::future::pending::<()>().await }));
         let independent = tokio::spawn(async { std::future::pending::<()>().await });
         let runtime = tokio::spawn(rt.run_inner());
         tokio::task::yield_now().await;
@@ -22437,7 +22379,7 @@ mod steer_drain_detector_tests {
             bash_wait_executing_state("wait-stale", "b-stale", Some(0)),
             vec![],
         );
-        let stale_generation = rt.tool_request_generation;
+        let stale_generation = rt.tool_execution.generation();
         rt.handle_deadline_expiry().await;
         assert!(rt.tool_outcome_is_stale(stale_generation));
         assert_eq!(
@@ -29108,7 +29050,7 @@ mod llm_generation_guard_tests {
         assert!(rt.llm_outcome_is_stale(1));
         assert!(storage.recorded_messages().is_empty());
         assert!(tools.recorded_executions().is_empty());
-        assert!(rt.tool_task_handle.is_none());
+        assert_eq!(rt.tool_execution.generation(), 0);
     }
 
     #[tokio::test]
@@ -29369,8 +29311,7 @@ mod tool_generation_guard_tests {
         let mut rt = runtime_tool_executing("X");
 
         // Simulate a dispatch having opened generation 1.
-        rt.tool_request_generation = 1;
-        let dispatched_gen = rt.tool_request_generation;
+        let dispatched_gen = rt.tool_execution.begin_dispatch(CancellationToken::new());
 
         rt.execute_effect(Effect::AbortTool {
             tool_use_id: "X".to_string(),
@@ -29379,7 +29320,8 @@ mod tool_generation_guard_tests {
         .expect("AbortTool executes");
 
         assert_eq!(
-            rt.tool_request_generation, dispatched_gen,
+            rt.tool_execution.generation(),
+            dispatched_gen,
             "AbortTool must NOT bump the generation — the cooperative Aborted outcome \
              carries this generation and must remain current"
         );
@@ -29387,6 +29329,97 @@ mod tool_generation_guard_tests {
             !rt.tool_outcome_is_stale(dispatched_gen),
             "the cooperative tool's Aborted outcome must still be current after AbortTool"
         );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_keeps_current_generation_and_continues_the_round() {
+        let mut rt = runtime_tool_executing("denied");
+        let tools = Arc::new(
+            MockToolExecutor::new().with_tool("bash", crate::tools::ToolOutput::success("allowed")),
+        );
+        rt.tool_executor = Arc::new(tools.clone());
+        rt.storage.seed_tool_admission_policy(
+            "conv-tool-gen",
+            phoenix_core::domain::tool_availability::ToolAvailability::all(
+                tools.definitions().await,
+            ),
+        );
+        let denied = ToolCall::new(
+            "denied",
+            ToolInput::from(crate::tools::BashToolInput::run("git add -A")),
+        );
+        let allowed = ToolCall::new(
+            "allowed",
+            ToolInput::from(crate::tools::BashToolInput::run("git status --short")),
+        );
+        rt.state = ConvState::ToolExecuting {
+            current_tool: denied.clone(),
+            remaining_tools: vec![allowed.clone()],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::new(
+                "denial-round".to_string(),
+                [&denied, &allowed]
+                    .into_iter()
+                    .map(|call| ContentBlock::ToolUse {
+                        id: call.id.clone(),
+                        name: call.name().to_string(),
+                        input: call.input.to_value(),
+                    })
+                    .collect(),
+                None,
+                None,
+            ),
+        };
+        rt.llm_client
+            .queue_response(phoenix_llm::LlmResponse::non_streaming(
+                vec![ContentBlock::text("done")],
+                true,
+                phoenix_llm::Usage::default(),
+            ));
+
+        rt.execute_effect(Effect::ExecuteTool { tool: denied })
+            .await
+            .unwrap();
+        let (denial_generation, denial) = rt.tool_outcome_rx.recv().await.unwrap();
+        assert!(!rt.tool_outcome_is_stale(denial_generation));
+        assert!(tools.recorded_executions().is_empty());
+        let ToolExecOutcome::Completed(result) = &denial else {
+            panic!("denial must produce a completed error result");
+        };
+        assert_eq!(result.tool_use_id, "denied");
+        assert!(result.is_error());
+        assert!(result.output().contains("command_safety_rejected"));
+
+        rt.process_outcome(EffectOutcome::Tool(denial))
+            .await
+            .unwrap();
+        let (allowed_generation, outcome) = rt.tool_outcome_rx.recv().await.unwrap();
+        assert!(rt.tool_outcome_is_stale(denial_generation));
+        assert!(!rt.tool_outcome_is_stale(allowed_generation));
+        assert_eq!(tools.recorded_executions().len(), 1);
+        assert_eq!(
+            tools.recorded_executions()[0].1["cmd"],
+            "git status --short"
+        );
+        rt.process_outcome(EffectOutcome::Tool(outcome))
+            .await
+            .unwrap();
+
+        let (generation, outcome) = rt.llm_outcome_rx.recv().await.unwrap();
+        rt.process_generation_tagged_llm_outcome(generation, outcome)
+            .await;
+        assert!(matches!(rt.state, ConvState::Idle));
+        let requests = rt.llm_client.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(
+                |block| matches!(block, ContentBlock::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "denied" && content.contains("command_safety_rejected"))
+            ));
     }
 
     /// The #4 race the id/state gate alone CANNOT catch: a forced cancel reaches
@@ -29401,16 +29434,14 @@ mod tool_generation_guard_tests {
     async fn stale_tool_outcome_with_reused_id_is_rejected_by_generation_guard() {
         // Round 1 dispatches a tool with id "X" → generation 1.
         let mut rt = runtime_tool_executing("X");
-        rt.tool_request_generation = 1;
-        let round1_gen = rt.tool_request_generation;
+        let round1_gen = rt.tool_execution.begin_dispatch(CancellationToken::new());
 
         // A forced cancellation reaches Idle. Round 1's wedged tool task is still
         // in flight; its forwarder will later enqueue a stale outcome stamped
         // with `round1_gen`. A new tool round then dispatches a tool that REUSES
         // id "X", bumping the generation (mirrors the dispatch site opening a
         // fresh generation on every tool round).
-        rt.tool_request_generation = rt.tool_request_generation.wrapping_add(1);
-        let round2_gen = rt.tool_request_generation;
+        let round2_gen = rt.tool_execution.begin_dispatch(CancellationToken::new());
         assert_ne!(
             round1_gen, round2_gen,
             "the reused-id round opens a new generation"
@@ -29454,9 +29485,9 @@ mod tool_generation_guard_tests {
     #[tokio::test]
     async fn current_generation_tool_outcome_is_not_stale() {
         let mut rt = runtime_tool_executing("X");
-        rt.tool_request_generation = 5;
+        let generation = rt.tool_execution.begin_dispatch(CancellationToken::new());
         assert!(
-            !rt.tool_outcome_is_stale(5),
+            !rt.tool_outcome_is_stale(generation),
             "an outcome stamped with the current generation must be processed"
         );
     }
