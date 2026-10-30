@@ -85,9 +85,9 @@ impl Database {
         Ok(match state.as_deref() {
             Some("queued") => ProductCreationInitialExecution::Queued,
             Some("running") => ProductCreationInitialExecution::Running,
-            Some("completed") | Some("Completed") => ProductCreationInitialExecution::Completed,
-            Some("failed") | Some("Failed") => ProductCreationInitialExecution::Failed,
-            Some("cancelled") | Some("Cancelled") => ProductCreationInitialExecution::Cancelled,
+            Some("completed" | "Completed") => ProductCreationInitialExecution::Completed,
+            Some("failed" | "Failed") => ProductCreationInitialExecution::Failed,
+            Some("cancelled" | "Cancelled") => ProductCreationInitialExecution::Cancelled,
             Some("awaiting_user_response") => ProductCreationInitialExecution::AwaitingUserResponse,
             Some("awaiting_task_approval") => ProductCreationInitialExecution::AwaitingTaskApproval,
             _ => ProductCreationInitialExecution::Unavailable,

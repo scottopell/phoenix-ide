@@ -12084,7 +12084,6 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
 async fn migration_149_backfill_image_replay_identity(
     tx: &mut Transaction<'_, Sqlite>,
 ) -> DbResult<()> {
-    use sha2::{Digest, Sha256};
     let mut cursor = 0_i64;
     loop {
         let row: Option<(i64, String, i64, String, String)> = sqlx::query_as(
@@ -12102,7 +12101,7 @@ async fn migration_149_backfill_image_replay_identity(
             .bind(request_id)
             .bind(ordinal)
             .bind(media_type)
-            .bind(format!("{:X}", Sha256::digest(data.as_bytes())))
+            .bind(crate::product_creation::creation_image_data_sha256(&data))
             .execute(&mut **tx)
             .await?;
     }
@@ -19383,13 +19382,12 @@ with tempfile.TemporaryDirectory() as directory:
         let identity: Vec<(String, String)> = sqlx::query_as(
             "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
         ).fetch_all(&pool).await.unwrap();
-        use sha2::{Digest, Sha256};
-        let expected = format!("{:X}", Sha256::digest("exact UTF8 é".as_bytes()));
+        let expected = "763DAB0258E0A3A46C75E194A4414076B85FB08CF3366C59849282EA89FA78C2";
         assert_eq!(
             identity,
             vec![
-                ("live-image".into(), expected.clone()),
-                ("orphan-image".into(), expected)
+                ("live-image".into(), expected.into()),
+                ("orphan-image".into(), expected.into())
             ]
         );
         let orphan_payloads: i64 = sqlx::query_scalar(

@@ -190,13 +190,23 @@ pub struct ImageReplayIdentity {
     data_sha256: String,
 }
 
+pub(crate) fn creation_image_data_sha256(data: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(data.as_bytes()) {
+        write!(&mut encoded, "{byte:02X}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
 impl ImageReplayIdentity {
     fn of(ordinal: usize, image: &ProductCreationImage) -> Self {
-        use sha2::{Digest, Sha256};
         Self {
             ordinal: i64::try_from(ordinal).expect("bounded creation image count"),
             media_type: image.media_type.clone(),
-            data_sha256: format!("{:X}", Sha256::digest(image.data.as_bytes())),
+            data_sha256: creation_image_data_sha256(&image.data),
         }
     }
 }
@@ -4034,7 +4044,6 @@ mod product_creation_tests {
 
     #[tokio::test]
     async fn two_retired_creation_images_preserve_order_bytes_and_conflict_identity() {
-        use sha2::{Digest, Sha256};
         let images = vec![
             ProductCreationImage {
                 media_type: "image/png".into(),
@@ -4085,12 +4094,12 @@ mod product_creation_tests {
                 (
                     0,
                     "image/png".into(),
-                    format!("{:X}", Sha256::digest(b"first-image-bytes"))
+                    "8134BF8B15730236857BC533E6FB018A7E3F20FC05CC8A1EC1DE70FFC66906F3".into()
                 ),
                 (
                     1,
                     "image/jpeg".into(),
-                    format!("{:X}", Sha256::digest(b"second-image-bytes"))
+                    "3B164D76A96163B96FB2AA5E4450A0E825B41C29D428796B57E496CB6CD7C48A".into()
                 ),
             ]
         );
