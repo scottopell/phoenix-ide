@@ -23,6 +23,15 @@ static READ_ADMISSION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
 const REMOTE_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
+const REMOTE_STABLE_CONTINUATION_ERROR: &str = "remote @conv continuation is not source-bound; read @conv at cursor 0, then continue with the exact @transcript:<id> shown in that page's evidence header";
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 
 #[derive(Deserialize)]
 pub struct IssueEnrollmentRequest {
@@ -282,6 +291,22 @@ pub struct RemoteReadConversationRequest {
     pub cursor: usize,
 }
 
+fn validate_remote_cursor_target(
+    target: &RemoteConversationTarget,
+    cursor: usize,
+) -> Result<(), &'static str> {
+    if cursor > 0 && matches!(target, RemoteConversationTarget::ProductConversation { .. }) {
+        return Err(REMOTE_STABLE_CONTINUATION_ERROR);
+    }
+    Ok(())
+}
+
+impl RemoteReadConversationRequest {
+    fn validate_cursor_target(&self) -> Result<(), &'static str> {
+        validate_remote_cursor_target(&self.target, self.cursor)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteReadConversationResponse {
@@ -290,6 +315,7 @@ pub struct RemoteReadConversationResponse {
     pub source_instance_id: InstanceId,
     pub requested: RemoteConversationTarget,
     pub cursor: usize,
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub next_cursor: Option<usize>,
     pub content: String,
 }
@@ -430,21 +456,24 @@ pub async fn read_remote_conversation(
     }
     let requested = RemoteConversationTarget::parse(reference)?;
     require_bounded_read_target(&requested)?;
+    validate_remote_cursor_target(&requested, cursor)
+        .map_err(|error| FederationClientError::RemoteRejected(error.to_string()))?;
     let peer_id = resolve_saved_peer_id(db, selector).await?;
     let peer = db
         .federation_peer_connection(peer_id)
         .await?
         .ok_or(FederationClientError::PeerNotFound)?;
     let caller = db.instance_id().await?;
+    let request = RemoteReadConversationRequest {
+        destination_instance_id: peer_id,
+        target: requested.clone(),
+        cursor,
+    };
     let response: RemoteReadConversationResponse = send_bounded_peer_request(
         format!("{}api/federation/peer/read-conversation", peer.base_url),
         peer.bearer_credential.expose(),
         &peer.tls_trust,
-        &RemoteReadConversationRequest {
-            destination_instance_id: peer_id,
-            target: requested.clone(),
-            cursor,
-        },
+        &request,
     )
     .await?;
     if response.destination_instance_id != peer_id || response.source_instance_id != peer_id {
@@ -699,6 +728,9 @@ async fn read_conversation_with_limits(
     };
     if request.destination_instance_id != destination {
         return federation_error(StatusCode::CONFLICT, "destination instance mismatch");
+    }
+    if let Err(error) = request.validate_cursor_target() {
+        return federation_error(StatusCode::BAD_REQUEST, error);
     }
     if let Err(error) = require_bounded_read_target(&request.target) {
         return federation_error(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string());
@@ -965,6 +997,70 @@ mod tests {
         assert_eq!(first.len(), "phx_peer_".len() + 43);
     }
 
+    #[test]
+    fn remote_read_response_requires_explicit_nullable_next_cursor() {
+        let destination = InstanceId::new();
+        let caller = InstanceId::new();
+        let response = RemoteReadConversationResponse {
+            destination_instance_id: destination,
+            caller_instance_id: caller,
+            source_instance_id: destination,
+            requested: RemoteConversationTarget::ExactTranscript {
+                transcript_id: "transcript".to_string(),
+                message_id: None,
+            },
+            cursor: 0,
+            next_cursor: None,
+            content: "page".to_string(),
+        };
+        let explicit_null = serde_json::to_value(response).unwrap();
+        let decoded: RemoteReadConversationResponse =
+            serde_json::from_value(explicit_null.clone()).unwrap();
+        assert_eq!(decoded.next_cursor, None);
+
+        let mut explicit_number = explicit_null.clone();
+        explicit_number["next_cursor"] = serde_json::json!(42);
+        let decoded: RemoteReadConversationResponse =
+            serde_json::from_value(explicit_number).unwrap();
+        assert_eq!(decoded.next_cursor, Some(42));
+
+        let mut missing = explicit_null;
+        missing.as_object_mut().unwrap().remove("next_cursor");
+        let error = serde_json::from_value::<RemoteReadConversationResponse>(missing).unwrap_err();
+        assert!(error.to_string().contains("missing field `next_cursor`"));
+    }
+
+    #[test]
+    fn remote_stable_reference_continuation_requires_exact_transcript() {
+        let product = RemoteReadConversationRequest {
+            destination_instance_id: InstanceId::new(),
+            target: RemoteConversationTarget::ProductConversation {
+                product_conversation_id: "product".to_string(),
+            },
+            cursor: 0,
+        };
+        assert_eq!(product.validate_cursor_target(), Ok(()));
+
+        let product_continuation = RemoteReadConversationRequest {
+            cursor: 1,
+            ..product
+        };
+        assert_eq!(
+            product_continuation.validate_cursor_target(),
+            Err(REMOTE_STABLE_CONTINUATION_ERROR)
+        );
+
+        let exact_continuation = RemoteReadConversationRequest {
+            destination_instance_id: InstanceId::new(),
+            target: RemoteConversationTarget::ExactTranscript {
+                transcript_id: "transcript".to_string(),
+                message_id: None,
+            },
+            cursor: 1,
+        };
+        assert_eq!(exact_continuation.validate_cursor_target(), Ok(()));
+    }
+
     #[tokio::test]
     async fn saved_peer_selection_accepts_uuid_or_unique_name_and_refuses_ambiguity() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
@@ -1069,6 +1165,40 @@ mod tests {
         assert!(
             matches!(error, FederationClientError::RemoteRejected(message) if message.contains("cursor exceeds maximum"))
         );
+    }
+
+    #[tokio::test]
+    async fn remote_read_cursor_target_guard_runs_before_peer_lookup() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+
+        let continuation_error =
+            read_remote_conversation(&state.db, "missing-peer", "@conv:missing-product", 1)
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            continuation_error,
+            FederationClientError::RemoteRejected(message)
+                if message == REMOTE_STABLE_CONTINUATION_ERROR
+        ));
+
+        let first_page_error =
+            read_remote_conversation(&state.db, "missing-peer", "@conv:missing-product", 0)
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            first_page_error,
+            FederationClientError::PeerNotFound
+        ));
+
+        let exact_error = read_remote_conversation(
+            &state.db,
+            "missing-peer",
+            "@transcript:missing-transcript",
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(exact_error, FederationClientError::PeerNotFound));
     }
 
     #[test]
@@ -1182,6 +1312,171 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&admission_body).unwrap(),
             serde_json::json!({"error": "remote read admission limit reached"})
         );
+    }
+
+    #[tokio::test]
+    async fn remote_pages_require_exact_transcript_after_product_continuation() {
+        use crate::db::ContinueOutcome;
+        use phoenix_core::domain::sm_state::ConvState;
+        use tower::ServiceExt as _;
+
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .create_conversation("transition-t1", "transition", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..180 {
+            state
+                .db
+                .add_message(
+                    &format!("transition-t1-message-{index}"),
+                    "transition-t1",
+                    &crate::db::MessageContent::user(format!(
+                        "transition T1 message {index} {}",
+                        "x".repeat(80)
+                    )),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let product_id: String = sqlx::query_scalar(
+            "SELECT product_conversation_id FROM conversations WHERE id = 'transition-t1'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        let caller = InstanceId::new();
+        let bearer = format!("phx_peer_{}", "c".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                "caller",
+                &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
+            )
+            .await
+            .unwrap();
+        let destination = state.db.instance_id().await.unwrap();
+        let app = crate::api::handlers::create_router(state.clone());
+        let request = |target, cursor| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/federation/peer/read-conversation")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(axum::body::Body::from(
+                    serde_json::to_string(&RemoteReadConversationRequest {
+                        destination_instance_id: destination,
+                        target,
+                        cursor,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        let stable_target = || RemoteConversationTarget::ProductConversation {
+            product_conversation_id: product_id.clone(),
+        };
+        let exact_t1 = || RemoteConversationTarget::ExactTranscript {
+            transcript_id: "transition-t1".to_string(),
+            message_id: None,
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request(stable_target(), 0))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(first.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let first: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        let next_cursor = first.next_cursor.expect("T1 must span multiple pages");
+        assert!(first.content.contains("@transcript:transition-t1"));
+
+        state
+            .db
+            .update_conversation_state(
+                "transition-t1",
+                &ConvState::ContextExhausted {
+                    summary: "continue to T2".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(successor) = state
+            .db
+            .continue_conversation("transition-t1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected transition T2");
+        };
+        state
+            .db
+            .update_conversation_state(
+                "transition-t1",
+                &ConvState::HandedOff {
+                    successor_conv_id: successor.id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "transition-t2-message",
+                &successor.id,
+                &crate::db::MessageContent::user("successor-only-marker".to_string()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let current = app
+            .clone()
+            .oneshot(request(stable_target(), 0))
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(current.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let current: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(current
+            .content
+            .contains(&format!("@transcript:{}", successor.id)));
+        assert!(current.content.contains("successor-only-marker"));
+
+        let refused = app
+            .clone()
+            .oneshot(request(stable_target(), next_cursor))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(refused.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": REMOTE_STABLE_CONTINUATION_ERROR})
+        );
+
+        let pinned = app.oneshot(request(exact_t1(), next_cursor)).await.unwrap();
+        assert_eq!(pinned.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(pinned.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let pinned: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pinned.cursor, next_cursor);
+        assert_eq!(pinned.requested, exact_t1());
+        assert!(pinned.content.contains("transition T1 message"));
+        assert!(!pinned.content.contains("successor-only-marker"));
     }
 
     #[allow(clippy::too_many_lines)]
