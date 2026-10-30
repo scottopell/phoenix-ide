@@ -99,7 +99,7 @@ fn resolve_intent(
             objective: req.objective.clone(),
             origin,
             model: req.model.clone().or_else(|| existing.intent.model.clone()),
-            effort: req.effort.or(existing.intent.effort),
+            effort: req.effort,
             llm_language: req.llm_language.unwrap_or(existing.intent.llm_language),
             images: requested_images(req),
         });
@@ -426,6 +426,98 @@ mod tests {
         .unwrap();
         assert_eq!(api_intent.cwd, req.cwd);
         assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_omitted_effort_but_conflicts_when_explicit_effort_is_omitted() {
+        use phoenix_core::domain::llm_types::ModelEffort;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::PhoenixNative)
+            .await
+            .unwrap();
+        let source = CreateSource::CurrentCoordinator {
+            product_conversation_id: coordinator.product_conversation_id.clone(),
+            transcript_id: coordinator.id.clone(),
+            source_call: SourceToolCall {
+                message_id: "effort-message".into(),
+                tool_use_id: "effort-call".into(),
+            },
+        };
+        let initial = runtime(
+            db.clone(),
+            ModelRegistry::new(&LlmConfig {
+                openai_api_key: Some("test-never-dispatched".into()),
+                default_model: Some("gpt-5.6-sol".into()),
+                ..LlmConfig::default()
+            }),
+        );
+        let changed_defaults = runtime(
+            db.clone(),
+            ModelRegistry::new(&LlmConfig {
+                openai_api_key: Some("test-never-dispatched".into()),
+                default_model: Some("gpt-6.1-sol".into()),
+                ..LlmConfig::default()
+            }),
+        );
+        assert_ne!(
+            initial.model_registry().default_model_id(),
+            changed_defaults.model_registry().default_model_id()
+        );
+        assert!(initial
+            .model_registry()
+            .effective_effort("gpt-5.6-sol", None)
+            .level()
+            .is_some());
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for effort in [None, Some(ModelEffort::Medium)] {
+            db.set_default_llm_language(LlmLanguage::PhoenixNative)
+                .await
+                .unwrap();
+            let mut req = request(cwd.to_str().unwrap());
+            req.effort = effort;
+            let ProductCreationAcceptOutcome::Accepted(accepted) = db
+                .accept_product_creation_resolved(
+                    &req.request_id,
+                    Some(&coordinator.id),
+                    |resolution| resolve_test_intent(&initial, &req, &source, resolution),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("first request must be accepted");
+            };
+            assert_eq!(accepted.intent.effort, effort);
+            assert_eq!(accepted.intent.model.as_deref(), Some("gpt-5.6-sol"));
+            assert_eq!(accepted.intent.llm_language, LlmLanguage::PhoenixNative);
+            db.set_default_llm_language(LlmLanguage::Caveman)
+                .await
+                .unwrap();
+            req.effort = None;
+            let outcome = db
+                .accept_product_creation_resolved(
+                    &req.request_id,
+                    Some(&coordinator.id),
+                    |resolution| resolve_test_intent(&changed_defaults, &req, &source, resolution),
+                )
+                .await
+                .unwrap();
+            if effort.is_some() {
+                assert!(matches!(outcome, ProductCreationAcceptOutcome::Conflict(_)));
+            } else {
+                let ProductCreationAcceptOutcome::Replayed(replayed) = outcome else {
+                    panic!("originally omitted effort must replay after defaults change");
+                };
+                assert_eq!(replayed.intent, accepted.intent);
+                assert!(replayed.intent.effort.is_none());
+                assert_eq!(
+                    replayed.product_conversation_id,
+                    accepted.product_conversation_id
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -599,10 +599,26 @@ mod tests {
                 prompt.contains("Never use private handlers or database writes to bypass the API")
             );
             assert!(!prompt.contains("Documented Phoenix API operations"));
-            assert!(
-                prompt.contains("rename_conversation") && prompt.contains("create_conversation")
-            );
-            assert!(!prompt.contains("No dedicated lifecycle tools are provided"));
+            assert!(prompt.contains(
+                "No dedicated project/task/workspace/approval/lifecycle mutation tools except installed create_conversation/rename_conversation."
+            ));
+            assert!(prompt.contains(
+                "use create_conversation to inspect options and explicitly submit a new conversation objective"
+            ));
+            assert!(prompt.contains(
+                "rename_conversation to resolve and rename an existing conversation"
+            ));
+            assert!(prompt.contains(
+                "Prefer these installed native tools for supported creation and rename operations"
+            ));
+            assert!(prompt.contains("subject to user authority and endpoint-specific contracts"));
+            for blanket_denial in [
+                "No dedicated project/task/workspace/approval/lifecycle mutation tools.",
+                "No project/task/workspace/approval/lifecycle mutation tools.",
+                "No dedicated lifecycle tools are provided",
+            ] {
+                assert!(!prompt.contains(blanket_denial), "{language:?}: {blanket_denial}");
+            }
             assert!(!prompt.contains("only exposes query/send/skill"));
         }
     }
