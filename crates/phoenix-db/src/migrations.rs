@@ -767,6 +767,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "retain_product_creation_receipts",
         sql: include_str!("migrations/retain_product_creation_receipts.sql"),
     },
+    Migration {
+        version: 148,
+        name: "product_creation_initial_execution_receipts",
+        sql: include_str!("migrations/product_creation_initial_execution_receipts.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "product_creation_image_retirement",
+        sql: include_str!("migrations/product_creation_image_retirement.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -12071,6 +12081,48 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
+async fn migration_149_backfill_image_replay_identity(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<()> {
+    use sha2::{Digest, Sha256};
+    let mut cursor = 0_i64;
+    loop {
+        let row: Option<(i64, String, i64, String, String)> = sqlx::query_as(
+            "SELECT rowid, request_id, ordinal, media_type, data FROM product_creation_job_images
+             WHERE rowid > ?1 ORDER BY rowid LIMIT 1",
+        )
+        .bind(cursor)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((rowid, request_id, ordinal, media_type, data)) = row else {
+            break;
+        };
+        cursor = rowid;
+        sqlx::query("INSERT INTO product_creation_image_replay_identity (request_id, ordinal, media_type, data_sha256) VALUES (?1, ?2, ?3, ?4)")
+            .bind(request_id)
+            .bind(ordinal)
+            .bind(media_type)
+            .bind(format!("{:X}", Sha256::digest(data.as_bytes())))
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO product_creation_retired_images (request_id)
+         SELECT j.request_id FROM product_creation_jobs j
+         WHERE j.published_product_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = j.published_product_id)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM product_creation_job_images WHERE request_id IN
+         (SELECT request_id FROM product_creation_retired_images)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn apply_migration_body(
     tx: &mut Transaction<'_, Sqlite>,
     migration: &Migration,
@@ -12093,6 +12145,9 @@ async fn apply_migration_body(
         }
         #[cfg(not(test))]
         sqlx::raw_sql(migration.sql).execute(&mut **tx).await?;
+        if migration.version == 149 {
+            migration_149_backfill_image_replay_identity(tx).await?;
+        }
         if migration.version == 114 {
             sqlx::query(
                 "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
@@ -15071,6 +15126,8 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (149, "product_creation_image_retirement"),
+            (148, "product_creation_initial_execution_receipts"),
             (147, "retain_product_creation_receipts"),
             (146, "retain_product_conversation_rename_receipts"),
             (144, "product_conversation_rename_receipts"),
@@ -19300,6 +19357,64 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(column, ("INTEGER".to_string(), 1));
+    }
+
+    #[test]
+    fn initial_execution_receipt_registry_retains_sparse_reserved_slot() {
+        assert_eq!(MIGRATIONS.last().unwrap().version, 149);
+        assert!(!MIGRATIONS.iter().any(|migration| migration.version == 145));
+        assert_eq!(MIGRATIONS.len(), 146);
+    }
+
+    #[tokio::test]
+    async fn image_retirement_migration_backfills_live_and_orphan_receipts_from_148() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_through_for_test(&pool, 148).await.unwrap();
+        for request in ["live-image", "orphan-image"] {
+            sqlx::query("INSERT INTO product_creation_jobs (request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros) VALUES (?1, ?1, '/tmp', 'objective', 'caveman', 'accepted', 1, 1)")
+                .bind(request).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO product_creation_job_images (request_id, ordinal, media_type, data) VALUES (?1, 0, 'image/png', 'exact UTF8 é')")
+                .bind(request).execute(&pool).await.unwrap();
+        }
+        sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
+            .execute(&pool).await.unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let identity: Vec<(String, String)> = sqlx::query_as(
+            "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
+        ).fetch_all(&pool).await.unwrap();
+        use sha2::{Digest, Sha256};
+        let expected = format!("{:X}", Sha256::digest("exact UTF8 é".as_bytes()));
+        assert_eq!(
+            identity,
+            vec![
+                ("live-image".into(), expected.clone()),
+                ("orphan-image".into(), expected)
+            ]
+        );
+        let orphan_payloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'orphan-image'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphan_payloads, 0);
+        let live_payloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'live-image'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live_payloads, 1);
+        let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id = 'orphan-image'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(retired, 1);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]

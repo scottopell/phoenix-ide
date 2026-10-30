@@ -10,7 +10,7 @@
 -- no stale/local canonical fallback, and no creation-time file or skill expansion.
 -- Excludes: Git command details, database representation, HTTP and UI layout.
 --
--- Requirement traceability: REQ-CCR-001 through REQ-CCR-010.
+-- Requirement traceability: REQ-CCR-001 through REQ-CCR-015.
 
 ------------------------------------------------------------
 -- Config
@@ -643,9 +643,41 @@ rule AmbiguousCleanupPreservesRecord {
 -- Surfaces
 ------------------------------------------------------------
 
+contract CreationReceiptRetention {
+    @invariant InitialTerminalReceiptIndependentOfWatch
+        -- The first completed, failed or cancelled outcome of the exact accepted
+        -- initial objective is retained atomically before its execution occurrence
+        -- is consumed. This holds for normal and captured direct-turn settlement,
+        -- with or without an active watch. The receipt belongs to the accepted
+        -- request and its exact original transcript, preserves an actual failure
+        -- reason, and survives restart and target deletion. Later turns cannot
+        -- overwrite it. Erased pre-receipt evidence is not fabricated. Missing
+        -- operation-specific evidence is unavailable, never inferred from current
+        -- transcript state, publication or a successor. A receipt grants no
+        -- execution, recovery or retargeting authority.
+
+    @invariant CreationImagePayloadLifetime
+        -- Accepted delivery bytes remain unchanged while any transcript of the
+        -- published product exists. Deleting the last transcript atomically
+        -- retires creation-request delivery payloads; deleting only the original
+        -- with a surviving successor does not. Historical identity/provenance and
+        -- ordered image replay identity remain: ordinal, media type and SHA-256
+        -- of the exact accepted UTF-8 data string, not the payload. Identical
+        -- retries reconcile without enqueue, bootstrap, resource reservation or
+        -- retargeting; changed bytes, media type, order or count conflict.
+        -- Retirement is distinct from an originally empty image list and from
+        -- missing/partial live payload corruption, which is a hard error.
+        -- Upgrade derives replay identity before retiring orphan product payloads
+        -- in the same transaction. Independent transcript attachments are outside
+        -- this creation-request delivery lifetime.
+
+}
+
 surface CreationControls {
     facing user: CreationUser
     context job: CreationJob
+    contracts:
+        fulfils CreationReceiptRetention
 
     exposes:
         job.status
@@ -688,7 +720,7 @@ surface ReadyConversationNavigation {
 -- requires original_publication_live(job), including at already-held claim sinks.
 -- original_publication_live(job) requires the exact original transcript and its
 -- ordinary product to exist; a successor transcript never substitutes for it.
--- Missing originals retain accepted identity, intent and provenance, but are
+-- Missing originals retain accepted identity, intent identity and provenance, but are
 -- excluded from delivery claim scans, retry/recovery and deadline scheduling.
 -- hidden_from_normal_surfaces(conversation_id) excludes normal list, route,
 -- transcript, and navigation exposure; exact-request recovery remains visible.

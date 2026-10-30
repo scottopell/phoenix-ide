@@ -13,6 +13,34 @@ pub enum ProductCreationInitialExecution {
     Unavailable,
 }
 
+pub(crate) async fn record_initial_execution_receipt_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    message_id: &str,
+    terminal: &phoenix_workflow::TurnTerminal,
+) -> DbResult<()> {
+    let (terminal_kind, reason) = match terminal {
+        phoenix_workflow::TurnTerminal::Completed => ("Completed", None),
+        phoenix_workflow::TurnTerminal::Cancelled => ("Cancelled", None),
+        phoenix_workflow::TurnTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
+    };
+    sqlx::query(
+        "INSERT INTO product_creation_initial_execution_receipts
+            (request_id, terminal_kind, failure_reason)
+         SELECT j.request_id, ?3, ?4
+         FROM product_creation_jobs j
+         WHERE j.published_conversation_id = ?1 AND j.request_id = ?2
+         ON CONFLICT(request_id) DO NOTHING",
+    )
+    .bind(conversation_id)
+    .bind(message_id)
+    .bind(terminal_kind)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 impl Database {
     /// Read exact initial-objective evidence independently of creation publication.
     pub async fn product_creation_initial_execution(
@@ -29,6 +57,7 @@ impl Database {
     ) -> DbResult<ProductCreationInitialExecution> {
         let state: Option<String> = sqlx::query_scalar(
             "SELECT CASE
+              WHEN r.request_id IS NOT NULL THEN r.terminal_kind
               WHEN EXISTS (SELECT 1 FROM steering_messages q
                 WHERE q.conversation_id = j.published_conversation_id AND q.message_id = j.request_id)
                 THEN 'queued'
@@ -46,6 +75,7 @@ impl Database {
                 ORDER BY e.source_generation DESC, e.occurred_at_us DESC, e.event_id DESC LIMIT 1), 'unavailable')
              END
              FROM product_creation_jobs j
+             LEFT JOIN product_creation_initial_execution_receipts r ON r.request_id = j.request_id
              LEFT JOIN conversations c ON c.id = j.published_conversation_id
              WHERE j.request_id = ?1 AND j.published_conversation_id IS NOT NULL",
         )
@@ -55,9 +85,9 @@ impl Database {
         Ok(match state.as_deref() {
             Some("queued") => ProductCreationInitialExecution::Queued,
             Some("running") => ProductCreationInitialExecution::Running,
-            Some("completed") => ProductCreationInitialExecution::Completed,
-            Some("failed") => ProductCreationInitialExecution::Failed,
-            Some("cancelled") => ProductCreationInitialExecution::Cancelled,
+            Some("completed") | Some("Completed") => ProductCreationInitialExecution::Completed,
+            Some("failed") | Some("Failed") => ProductCreationInitialExecution::Failed,
+            Some("cancelled") | Some("Cancelled") => ProductCreationInitialExecution::Cancelled,
             Some("awaiting_user_response") => ProductCreationInitialExecution::AwaitingUserResponse,
             Some("awaiting_task_approval") => ProductCreationInitialExecution::AwaitingTaskApproval,
             _ => ProductCreationInitialExecution::Unavailable,

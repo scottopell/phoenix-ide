@@ -397,7 +397,7 @@ AND SHALL derive the complete native readback, including publication identity, r
 AND SHALL NOT implicitly cancel, restart, or repeat an intentional creation under a new identity.
 
 WHEN the published product or its original transcript is deleted
-THE SYSTEM SHALL retain the accepted request identity, literal immutable intent, first source provenance, reserved product identity, and original publication identity
+THE SYSTEM SHALL retain the accepted request identity, immutable intent identity, first source provenance, reserved product identity, and original publication identity
 AND SHALL reconcile an identical retry to that historical acceptance rather than create another product or repeat work
 AND SHALL reject changed-intent reuse of that request identity
 AND SHALL expose the original publication as historical without a live route, even when the product survives through a successor transcript
@@ -405,3 +405,37 @@ AND SHALL NOT claim, renew, deliver, complete, retry, recover, or schedule recon
 AND SHALL report only exact retained terminal execution evidence, or unavailable execution when that evidence is absent, without retargeting the original objective to a successor.
 
 THE SYSTEM SHALL preserve public user API, historical, and Slack gateway origin decoding and objective-delivery behavior independently of the Coordinator's literal-input policy.
+
+
+### REQ-CCR-014: Operation-Owned Initial Execution Evidence
+
+WHEN the exact accepted initial objective settles as completed, failed, or cancelled
+THE SYSTEM SHALL atomically retain its first terminal outcome with consumption of that objective's execution occurrence, independently of watch registration and notification delivery
+AND SHALL bind the receipt to the accepted request and its original published transcript, preserve an actual failure reason, and retain it across process restart and target deletion
+AND SHALL apply the same contract to captured initial objectives settled by a direct turn.
+
+WHEN operation-specific evidence is absent
+THE SYSTEM SHALL report initial execution as unavailable rather than infer a terminal outcome from publication, an unrelated later turn, the transcript's latest state, or a successor
+AND SHALL NOT treat retained evidence as authority for execution, recovery, or retargeting.
+
+### REQ-CCR-015: Creation Image Payload Lifetime
+
+WHILE any transcript of the published product exists
+THE SYSTEM SHALL retain the accepted creation-request image delivery payloads without changing their bytes.
+
+WHEN the product's last transcript is hard-deleted
+THE SYSTEM SHALL atomically retire those delivery payloads while retaining historical creation status, original identities, provenance, and bounded ordered image replay identity
+AND SHALL NOT retire payloads when only the original transcript is deleted with a surviving continuation.
+
+WHERE delivery payloads are retired
+THE SYSTEM SHALL reconcile identical request retry to the retained original receipt and conflict on a changed image count, order, media type, or exact accepted data
+AND SHALL retain each image's ordinal, media type, and SHA-256 digest of the exact accepted UTF-8 data string, not its payload
+AND SHALL structurally distinguish retired payloads from an originally empty image list and from missing or partially corrupted live delivery data
+AND SHALL fail on live payload corruption rather than silently substitute empty intent
+AND SHALL NOT bootstrap, reserve resources, enqueue an objective, or retarget a successor during replay.
+
+WHEN upgrading stored creation receipts
+THE SYSTEM SHALL atomically derive replay identity from retained payloads before retiring payloads whose published product no longer exists
+AND SHALL NOT fabricate erased execution outcomes.
+
+This payload lifetime concerns creation-request delivery copies only, not independent transcript attachments.

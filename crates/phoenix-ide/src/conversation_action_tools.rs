@@ -371,10 +371,15 @@ impl CreateConversation {
         let mut projects = Vec::new();
         let mut after_id = None::<String>;
         while projects.len() < 51 {
-            let candidates = self.0.db()
+            let candidates = self
+                .0
+                .db()
                 .product_creation_project_options_as_coordinator(transcript_id, after_id.as_deref())
-                .await.map_err(|error| error.to_string())?;
-            let Some((last_id, _)) = candidates.last() else { break; };
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some((last_id, _)) = candidates.last() else {
+                break;
+            };
             after_id = Some(last_id.clone());
             let home = self.0.runtime_home().to_path_buf();
             let usable = tokio::task::spawn_blocking(move || {

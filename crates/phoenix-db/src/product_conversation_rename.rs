@@ -441,25 +441,64 @@ mod tests {
     #[tokio::test]
     async fn archived_root_refuses_new_rename_without_changing_identity() {
         let db = Database::open_in_memory().await.unwrap();
-        let root = db.create_conversation("archived-root", "archived-root", "/tmp", true, None, None).await.unwrap();
-        let gc = db.get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default()).await.unwrap();
-        let detail = db.read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str()).await.unwrap();
+        let root = db
+            .create_conversation("archived-root", "archived-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let detail = db
+            .read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str())
+            .await
+            .unwrap();
         assert!(detail.can_rename);
         let mut command = test_command(uuid::Uuid::new_v4().to_string(), detail.name_revision);
         command.product_conversation_id = root.product_conversation_id.clone();
         command.expected_root_transcript_id = root.id.clone();
         command.source.product_conversation_id = gc.product_conversation_id;
         command.source.transcript_id = gc.id.clone();
-        sqlx::query("UPDATE conversations SET archived=1 WHERE id=?1").bind(&root.id).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived=1 WHERE id=?1")
+            .bind(&root.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         let before = db.get_conversation(&root.id).await.unwrap();
-        assert!(!db.read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str()).await.unwrap().can_rename);
-        assert_eq!(db.rename_product_conversation(&gc.id, &command).await.unwrap(), ProductConversationRenameResult::Unavailable);
+        assert!(
+            !db.read_product_conversation_rename_detail(
+                &gc.id,
+                root.product_conversation_id.as_str()
+            )
+            .await
+            .unwrap()
+            .can_rename
+        );
+        assert_eq!(
+            db.rename_product_conversation(&gc.id, &command)
+                .await
+                .unwrap(),
+            ProductConversationRenameResult::Unavailable
+        );
         let after = db.get_conversation(&root.id).await.unwrap();
         assert_eq!(after.title, before.title);
         assert_eq!(after.slug, before.slug);
         assert_eq!(after.updated_at, before.updated_at);
-        assert_eq!(db.read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str()).await.unwrap().name_revision, detail.name_revision);
-        assert!(db.read_product_conversation_rename_receipt(&gc.id, &command.operation_id).await.unwrap().is_none());
+        assert_eq!(
+            db.read_product_conversation_rename_detail(
+                &gc.id,
+                root.product_conversation_id.as_str()
+            )
+            .await
+            .unwrap()
+            .name_revision,
+            detail.name_revision
+        );
+        assert!(db
+            .read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

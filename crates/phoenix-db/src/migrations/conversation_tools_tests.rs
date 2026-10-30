@@ -256,6 +256,8 @@ fn registered_identity_order_and_exact_bodies() {
         (144, "product_conversation_rename_receipts"),
         (146, "retain_product_conversation_rename_receipts"),
         (147, "retain_product_creation_receipts"),
+        (148, "product_creation_initial_execution_receipts"),
+        (149, "product_creation_image_retirement"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -270,6 +272,11 @@ fn registered_identity_order_and_exact_bodies() {
         (RECEIPTS, 144),
         (RETAIN_RECEIPTS, 146),
         (RETAIN_CREATION, 147),
+        (
+            include_str!("product_creation_initial_execution_receipts.sql"),
+            148,
+        ),
+        (include_str!("product_creation_image_retirement.sql"), 149),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -348,7 +355,7 @@ async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomic
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
     )
@@ -379,7 +386,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -392,7 +399,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
         }
     );
     assert!(matches!(
-        db.accept_product_creation("old-slack", &retained.intent)
+        db.accept_product_creation("old-slack", &retained.intent.live_intent().unwrap())
             .await
             .unwrap(),
         ProductCreationAcceptOutcome::Replayed(_)
@@ -400,7 +407,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
     sqlx::raw_sql("INSERT INTO slack_gateway_bindings(binding_id, workspace, owner, channel, thread_ts, kind, creation_id) VALUES('new-binding', 'ws', 'owner', 'channel', '2', 'explicit', 'new-slack');
         INSERT INTO slack_gateway_requests(request_id, workspace, owner, channel, message_ts, thread_ts, kind, instruction, context, source_url, binding_id, accepted_at_unix_micros, input_id, observed_at_unix_micros, trigger_kind) VALUES('new-slack-source', 'ws', 'owner', 'channel', '2', '2', 'explicit', 'literal', 'context', 'https://example.invalid', 'new-binding', 5, 'new-input', 5, 'prefix');")
         .execute(&pool).await.unwrap();
-    let mut intent = retained.intent;
+    let mut intent = retained.intent.live_intent().unwrap();
     intent.images.clear();
     intent.origin = ProductCreationOrigin::SlackGateway {
         request_id: "new-slack-source".into(),
@@ -440,9 +447,26 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let pool = fixture(prefix, populated).await;
             run_through_for_test(&pool, 142).await.unwrap();
             let before = snapshot(&mut pool.acquire().await.unwrap()).await;
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
+            let live_images: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_job_images")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            let replay_identities: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_image_replay_identity")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(replay_identities, live_images);
+            let retired: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_retired_images")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(retired, 0);
             clean(&mut conn).await;
             let ledger = snapshot(&mut conn).await.ledger;
             assert_eq!(
@@ -455,7 +479,9 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                     (143, "agent_creation_provenance"),
                     (144, "product_conversation_rename_receipts"),
                     (146, "retain_product_conversation_rename_receipts"),
-                    (147, "retain_product_creation_receipts")
+                    (147, "retain_product_creation_receipts"),
+                    (148, "product_creation_initial_execution_receipts"),
+                    (149, "product_creation_image_retirement")
                 ]
             );
             drop(conn);
@@ -495,7 +521,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
             .await
             .unwrap();
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         clean(&mut conn).await;
@@ -517,7 +543,92 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 6);
+}
+
+#[tokio::test]
+async fn image_retirement_ledger_failure_restores_payload_schema_and_retries() {
+    let pool = fixture(148, true).await;
+    sqlx::query("UPDATE product_creation_jobs SET status='published', published_product_id='deleted-product', published_conversation_id='deleted-transcript' WHERE request_id='old-history'")
+        .execute(&pool).await.unwrap();
+    let before: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!before.is_empty());
+    sqlx::raw_sql("CREATE TRIGGER image_retirement_ledger_fault BEFORE INSERT ON _migrations WHEN NEW.version=149 BEGIN SELECT RAISE(ABORT,'image retirement ledger fault'); END;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = run_pending_migrations(&pool).await.unwrap_err();
+    assert!(
+        error.to_string().contains("image retirement ledger fault"),
+        "{error}"
+    );
+    let after_rollback: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after_rollback, before,
+        "migration rollback restores image bytes"
+    );
+    for object in [
+        "product_creation_image_replay_identity",
+        "product_creation_retired_images",
+        "product_creation_retire_images_after_product_delete",
+        "product_creation_identity_no_update",
+        "product_creation_identity_no_delete",
+    ] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)")
+                .bind(object)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!exists, "{object} must roll back");
+    }
+    let ledger_entry: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version=149")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger_entry, 0);
+    sqlx::raw_sql("DROP TRIGGER image_retirement_ledger_fault")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    let restored: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected_live: Vec<_> = before
+        .iter()
+        .filter(|row| row.0 != "old-history")
+        .cloned()
+        .collect();
+    assert_eq!(restored, expected_live);
+    let retired: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id='old-history'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retired, 1);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_image_replay_identity")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(identity_count as usize, before.len());
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -589,7 +700,7 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
     let ledger_entry: (i64, String) =
         sqlx::query_as("SELECT version, name FROM _migrations WHERE version=147")
             .fetch_one(&pool)

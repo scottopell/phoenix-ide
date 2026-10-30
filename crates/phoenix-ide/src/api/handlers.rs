@@ -2697,7 +2697,7 @@ mod product_creation_acceptance_tests {
                     request_id,
                     &delivery.claim,
                     &crate::db::SteeringAcceptanceFingerprint::Exact(fingerprint),
-                    &delivery.job.intent,
+                    &delivery.job.intent.live_intent().unwrap(),
                 )
                 .await
                 .unwrap());

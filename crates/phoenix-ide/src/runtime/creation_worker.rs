@@ -551,7 +551,7 @@ async fn complete_already_accepted_product_creation_delivery(
             .product_creation_objective_already_durably_accepted(
                 &job.request_id,
                 Some(exact_fingerprint),
-                &job.intent,
+                &job.intent.live_intent().map_err(str::to_string)?,
             )
             .await
             .map_err(|error| error.to_string())?
@@ -562,7 +562,7 @@ async fn complete_already_accepted_product_creation_delivery(
                     &job.request_id,
                     &claimed.claim,
                     exact_fingerprint,
-                    &job.intent,
+                    &job.intent.live_intent().map_err(str::to_string)?,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -614,8 +614,8 @@ async fn deliver_product_creation_objective_inner(
     {
         return Ok(());
     }
-    let images = job
-        .intent
+    let live_intent = job.intent.live_intent().map_err(str::to_string)?;
+    let images = live_intent
         .images
         .iter()
         .map(|image| crate::db::ImageData {
@@ -682,7 +682,7 @@ async fn deliver_product_creation_objective_inner(
                 "product-create:{}",
                 job.request_id
             )),
-            &job.intent,
+            &job.intent.live_intent().map_err(str::to_string)?,
         )
         .await
         .map_err(|error| error.to_string())?;
