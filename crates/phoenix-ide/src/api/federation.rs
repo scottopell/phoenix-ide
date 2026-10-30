@@ -303,11 +303,9 @@ pub async fn resolve_saved_peer_id(
         return Err(FederationClientError::InvalidPeerSelector);
     }
     if let Ok(id) = InstanceId::from_str(selector) {
-        return db
-            .federation_peer_connection(id)
-            .await?
-            .map(|_| id)
-            .ok_or(FederationClientError::PeerNotFound);
+        if db.federation_peer_connection(id).await?.is_some() {
+            return Ok(id);
+        }
     }
     let ids: Vec<String> = sqlx::query_scalar(
         "SELECT peer_instance_id FROM federation_peer_connections
@@ -566,6 +564,23 @@ pub async fn resolve_reference(
     State(state): State<AppState>,
     Json(request): Json<RemoteResolveReferenceRequest>,
 ) -> Response {
+    Box::pin(resolve_reference_with_limits(
+        peer,
+        state,
+        request,
+        &READ_ADMISSION,
+        REMOTE_READ_DEADLINE,
+    ))
+    .await
+}
+
+async fn resolve_reference_with_limits(
+    peer: PeerAuthenticated,
+    state: AppState,
+    request: RemoteResolveReferenceRequest,
+    admission: &std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: std::time::Duration,
+) -> Response {
     let destination = match state.db.instance_id().await {
         Ok(id) => id,
         Err(error) => {
@@ -584,9 +599,19 @@ pub async fn resolve_reference(
         state.message_retriever.clone(),
     );
     let reference = request.target.reference();
-    let resolution = match service.resolve_reference(&reference).await {
-        Ok(resolution) => resolution,
-        Err(error) => return error.into_response(),
+    let resolution = match execute_bounded_remote_read(
+        admission,
+        deadline,
+        Box::pin(service.resolve_reference_bounded(
+            &reference,
+            std::num::NonZeroUsize::new(MAX_REMOTE_RESPONSE_BYTES).unwrap(),
+        )),
+    )
+    .await
+    {
+        Err(error) => return remote_read_limit_response(error),
+        Ok(Ok(resolution)) => resolution,
+        Ok(Err(error)) => return error.into_response(),
     };
     Json(RemoteResolveReferenceResponse {
         destination_instance_id: destination,
@@ -613,10 +638,22 @@ pub async fn read_conversation(
     .await
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteReadLimitError {
     Admission,
     Deadline,
+}
+
+fn remote_read_limit_response(error: RemoteReadLimitError) -> Response {
+    match error {
+        RemoteReadLimitError::Admission => federation_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "remote read admission limit reached",
+        ),
+        RemoteReadLimitError::Deadline => {
+            federation_error(StatusCode::GATEWAY_TIMEOUT, "remote read deadline exceeded")
+        }
+    }
 }
 
 async fn execute_bounded_remote_read<T, F>(
@@ -662,17 +699,15 @@ async fn read_conversation_with_limits(
     let read = execute_bounded_remote_read(
         admission,
         deadline,
-        Box::pin(service.read_conversation_page(&request.target.reference(), request.cursor)),
+        Box::pin(service.read_conversation_page_bounded(
+            &request.target.reference(),
+            request.cursor,
+            std::num::NonZeroUsize::new(MAX_REMOTE_RESPONSE_BYTES).unwrap(),
+        )),
     )
     .await;
     match read {
-        Err(RemoteReadLimitError::Admission) => federation_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "remote read admission limit reached",
-        ),
-        Err(RemoteReadLimitError::Deadline) => {
-            federation_error(StatusCode::GATEWAY_TIMEOUT, "remote read deadline exceeded")
-        }
+        Err(error) => remote_read_limit_response(error),
         Ok(Ok(page)) => Json(RemoteReadConversationResponse {
             destination_instance_id: destination,
             caller_instance_id: peer.caller_instance_id,
@@ -954,6 +989,20 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let uuid_shaped_name = InstanceId::new().to_string();
+        let uuid_named_peer = InstanceId::new();
+        state
+            .db
+            .save_federation_peer_connection(
+                uuid_named_peer,
+                &uuid_shaped_name,
+                &"https://uuid-name.example".parse().unwrap(),
+                &token("e"),
+                &PeerTlsTrust::PlatformRoots,
+            )
+            .await
+            .unwrap();
+
         assert_eq!(
             resolve_saved_peer_id(&state.db, &first.to_string())
                 .await
@@ -963,6 +1012,12 @@ mod tests {
         assert_eq!(
             resolve_saved_peer_id(&state.db, "unique").await.unwrap(),
             first
+        );
+        assert_eq!(
+            resolve_saved_peer_id(&state.db, &uuid_shaped_name)
+                .await
+                .unwrap(),
+            uuid_named_peer
         );
         state
             .db
@@ -1019,11 +1074,17 @@ mod tests {
     #[tokio::test]
     async fn bounded_remote_read_rejects_exhausted_admission_and_deadline() {
         let exhausted = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tracked_polls = polls.clone();
+        let work = std::future::poll_fn(move |_| {
+            tracked_polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(1)
+        });
         assert_eq!(
-            execute_bounded_remote_read(&exhausted, std::time::Duration::from_secs(1), async { 1 })
-                .await,
+            execute_bounded_remote_read(&exhausted, std::time::Duration::from_secs(1), work).await,
             Err(RemoteReadLimitError::Admission)
         );
+        assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         let admitted = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         assert_eq!(
@@ -1036,6 +1097,52 @@ mod tests {
             Err(RemoteReadLimitError::Deadline)
         );
         assert_eq!(admitted.available_permits(), 1);
+        let deadline_response = remote_read_limit_response(RemoteReadLimitError::Deadline);
+        assert_eq!(deadline_response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let deadline_body =
+            axum::body::to_bytes(deadline_response.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&deadline_body).unwrap(),
+            serde_json::json!({"error": "remote read deadline exceeded"})
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_reference_with_limits_enforces_admission_before_resolution() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let destination_instance_id = state.db.instance_id().await.unwrap();
+        let peer = || PeerAuthenticated {
+            caller_instance_id: InstanceId::new(),
+            caller_display_name: "peer".to_string(),
+        };
+        let request = || RemoteResolveReferenceRequest {
+            destination_instance_id,
+            target: RemoteConversationTarget::ExactTranscript {
+                transcript_id: "missing-transcript".to_string(),
+                message_id: Some("missing-message".to_string()),
+            },
+        };
+
+        let exhausted = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let admission_response = resolve_reference_with_limits(
+            peer(),
+            state,
+            request(),
+            &exhausted,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(admission_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let admission_body =
+            axum::body::to_bytes(admission_response.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&admission_body).unwrap(),
+            serde_json::json!({"error": "remote read admission limit reached"})
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1071,6 +1178,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let oversized_message_id = "remote-oversized-attachment-message";
+        let hidden_image_payload = "base64-payload-must-not-cross-federation";
+        let hidden_file_path = "/private/path/must-not-cross-federation.txt";
+        state
+            .db
+            .add_message(
+                oversized_message_id,
+                "remote-transcript",
+                &crate::db::MessageContent::user_with_attachments(
+                    "z".repeat(MAX_REMOTE_RESPONSE_BYTES + 1),
+                    vec![phoenix_core::domain::db_schema::ImageData {
+                        data: hidden_image_payload.to_string(),
+                        media_type: "image/png".to_string(),
+                    }],
+                    vec![phoenix_core::domain::db_schema::FileAttachment {
+                        original_name: "private.txt".to_string(),
+                        media_type: "text/plain".to_string(),
+                        size_bytes: 42,
+                        stored_path: hidden_file_path.to_string(),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let product_id: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'remote-transcript'",
         )
@@ -1167,6 +1300,51 @@ mod tests {
             opaque.resolution.href.as_deref(),
             Some(expected_opaque_href.as_str())
         );
+
+        let oversized_exact = serde_json::to_value(RemoteResolveReferenceRequest {
+            destination_instance_id: destination,
+            target: RemoteConversationTarget::ExactTranscript {
+                transcript_id: "remote-transcript".to_string(),
+                message_id: Some(oversized_message_id.to_string()),
+            },
+        })
+        .unwrap();
+        let oversized_exact = app
+            .clone()
+            .oneshot(request(
+                "/api/federation/peer/resolve-reference",
+                oversized_exact,
+                Some(&bearer),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oversized_exact.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(oversized_exact.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let oversized_exact: RemoteResolveReferenceResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            oversized_exact.resolution.kind,
+            super::super::global_read::ResolvedReferenceKind::Message
+        );
+        assert_eq!(oversized_exact.resolution.id, oversized_message_id);
+        assert!(oversized_exact
+            .resolution
+            .summary
+            .contains(super::super::global_read::OVERSIZED_REMOTE_MESSAGE_MARKER));
+        assert!(oversized_exact
+            .resolution
+            .summary
+            .contains("[2 attachment(s) are not shown in remote bounded reads]"));
+        assert!(!oversized_exact
+            .resolution
+            .summary
+            .contains(hidden_image_payload));
+        assert!(!oversized_exact
+            .resolution
+            .summary
+            .contains(hidden_file_path));
 
         let exact = |cursor| {
             serde_json::to_value(RemoteReadConversationRequest {

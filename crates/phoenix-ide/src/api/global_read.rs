@@ -1,11 +1,14 @@
 use super::AppState;
-use crate::db::MessageContent;
-use crate::db::{Conversation, DbError, MessageType, RetrievalRequest, RetrievalScope};
+use crate::db::{
+    BoundedReadMessage, BoundedReadMessageContent, Conversation, DbError, MessageContent,
+    MessageType, RetrievalRequest, RetrievalScope,
+};
 use axum::{extract::State, Json};
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::handlers::AppError;
@@ -13,6 +16,7 @@ use super::handlers::AppError;
 const SEARCH_TOP_K: usize = 10;
 const READ_PAGE_CHARS: usize = 7000;
 const READ_MESSAGE_BATCH: i64 = 64;
+const BOUNDED_READ_MESSAGE_BATCH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const READ_TARGET_SIDE_MESSAGES: i64 = 32;
 #[derive(Debug, PartialEq, Eq)]
 enum ConversationReadTarget {
@@ -75,6 +79,8 @@ where
 }
 
 pub(crate) const MAX_CONVERSATION_READ_CURSOR: usize = 1_000_000;
+pub(super) const OVERSIZED_REMOTE_MESSAGE_MARKER: &str =
+    "(message content omitted: remote materialization limit exceeded)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -1185,6 +1191,40 @@ impl GlobalReadService {
         }
     }
 
+    pub(crate) async fn read_conversation_page_bounded(
+        &self,
+        conversation: &str,
+        cursor: usize,
+        content_limit: NonZeroUsize,
+    ) -> Result<ConversationReadPage, String> {
+        if cursor > MAX_CONVERSATION_READ_CURSOR {
+            return Err(format!(
+                "cursor exceeds maximum {MAX_CONVERSATION_READ_CURSOR}"
+            ));
+        }
+        let target = resolve_conversation_read_target(self, conversation).await?;
+        let (transcript_id, message_id, evidence_label) = match &target {
+            ConversationReadTarget::StableCurrent { transcript_id } => {
+                (transcript_id, None, "current evidence")
+            }
+            ConversationReadTarget::Exact {
+                transcript_id,
+                message_id,
+            } => (transcript_id, message_id.as_deref(), "exact evidence"),
+        };
+        if message_id.is_some() {
+            return Err("remote exact-message reads are not paged".to_string());
+        }
+        let conversation = self
+            .db
+            .get_conversation(transcript_id.as_str())
+            .await
+            .map_err(|error| format!("transcript not found: {error}"))?;
+        render_bounded_message_page(self, conversation, cursor, evidence_label, content_limit)
+            .await
+            .map_err(|error| format!("read failed: {error}"))
+    }
+
     pub(crate) async fn product_conversation_id_for_transcript(
         &self,
         conversation_id: &str,
@@ -1235,6 +1275,32 @@ impl GlobalReadService {
         reference: &str,
     ) -> Result<ResolveGlobalReferenceResponse, AppError> {
         resolve_reference_impl(self, reference).await
+    }
+
+    pub(crate) async fn resolve_reference_bounded(
+        &self,
+        raw: &str,
+        content_limit: NonZeroUsize,
+    ) -> Result<ResolveGlobalReferenceResponse, AppError> {
+        let reference = raw.trim();
+        if let Some(rest) = reference.strip_prefix("@transcript:") {
+            let (id, fragment) = split_fragment(rest);
+            if let Some(fragment) = fragment {
+                let message_id = message_id_fragment(fragment).ok_or_else(|| {
+                    AppError::BadRequest(
+                        "transcript fragment must be #message-<message_id>".to_string(),
+                    )
+                })?;
+                let conversation = self
+                    .db
+                    .get_conversation(id)
+                    .await
+                    .map_err(map_db_not_found)?;
+                return resolve_bounded_message(self, conversation, message_id, content_limit)
+                    .await;
+            }
+        }
+        self.resolve_reference(reference).await
     }
 }
 
@@ -1522,7 +1588,13 @@ async fn render_message_page(
             next_cursor: None,
         });
     }
-    if has_more {
+    if has_more && end == MAX_CONVERSATION_READ_CURSOR {
+        out.push_str("\n(conversation read limit reached)");
+        Ok(ConversationReadPage {
+            content: out,
+            next_cursor: None,
+        })
+    } else if has_more {
         Ok(ConversationReadPage {
             content: out,
             next_cursor: Some(end),
@@ -1533,6 +1605,172 @@ async fn render_message_page(
             next_cursor: None,
         })
     }
+}
+
+async fn render_bounded_message_page(
+    service: &GlobalReadService,
+    conv: Conversation,
+    cursor: usize,
+    evidence_label: &str,
+    content_limit: NonZeroUsize,
+) -> Result<ConversationReadPage, DbError> {
+    let stable = ordinary_product_citation(&service.db, &conv).await?;
+    let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
+        let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
+        format!("Conversation @conv:{id}\nconversation link: {route}\n")
+    });
+    let title = stable.as_ref().map_or_else(
+        || {
+            conv.title
+                .as_deref()
+                .or(conv.slug.as_deref())
+                .unwrap_or(&conv.id)
+        },
+        |(_, _, title)| title.as_str(),
+    );
+    let mut header = format!(
+        "{stable_header}{evidence_label}: @transcript:{} — {}\nupdated: {}\n---\n",
+        conv.id, title, conv.updated_at
+    );
+    if cursor >= MAX_CONVERSATION_READ_CURSOR {
+        header.push_str("(conversation read limit reached)");
+        return Ok(ConversationReadPage {
+            content: header,
+            next_cursor: None,
+        });
+    }
+
+    let end = conversation_page_end(cursor);
+    let mut out = String::new();
+    let mut position = 0usize;
+    let mut has_more = false;
+    let mut after_sequence = 0;
+    let mut sender_kinds = std::collections::HashMap::new();
+    loop {
+        let messages = service
+            .db
+            .get_bounded_read_messages_after_limited(
+                &conv.id,
+                after_sequence,
+                BOUNDED_READ_MESSAGE_BATCH,
+                content_limit,
+            )
+            .await?;
+        if messages.is_empty() {
+            break;
+        }
+        for message in messages {
+            after_sequence = message.sequence_id;
+            if message.hidden {
+                continue;
+            }
+            let line = render_bounded_message_line_with_cache(
+                &service.db,
+                &conv,
+                &message,
+                &mut sender_kinds,
+            )
+            .await?;
+            for character in line.chars() {
+                if position >= end {
+                    has_more = true;
+                    break;
+                }
+                if position >= cursor {
+                    out.push(character);
+                }
+                position += 1;
+            }
+            if has_more {
+                break;
+            }
+        }
+        if has_more {
+            break;
+        }
+    }
+
+    if out.is_empty() && !has_more {
+        header.push_str("(end of conversation)");
+        return Ok(ConversationReadPage {
+            content: header,
+            next_cursor: None,
+        });
+    }
+    if has_more && end == MAX_CONVERSATION_READ_CURSOR {
+        out.push_str("\n(conversation read limit reached)");
+        header.push_str(&out);
+        Ok(ConversationReadPage {
+            content: header,
+            next_cursor: None,
+        })
+    } else {
+        header.push_str(&out);
+        Ok(ConversationReadPage {
+            content: header,
+            next_cursor: has_more.then_some(end),
+        })
+    }
+}
+
+async fn render_bounded_message_line_with_cache(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    message: &BoundedReadMessage,
+    sender_kinds: &mut std::collections::HashMap<
+        phoenix_core::domain::product_conversation::ProductConversationId,
+        Option<phoenix_core::domain::product_conversation::ProductConversationKind>,
+    >,
+) -> Result<String, DbError> {
+    let role = attributed_role(message.message_type, &message.origin);
+    let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
+    let sender = attributed_sender_with_cache(db, &message.origin, sender_kinds).await?;
+    Ok(format!(
+        "[{}{} · {} · {}]({}) @transcript:{}#message-{}\n{}\n\n",
+        role,
+        sender,
+        message.created_at.format("%Y-%m-%d %H:%M"),
+        message.message_id,
+        href,
+        conv.id,
+        message.message_id,
+        render_bounded_message_text(message)
+    ))
+}
+
+fn render_bounded_message_text(message: &BoundedReadMessage) -> String {
+    let mut text = match &message.content {
+        BoundedReadMessageContent::Oversized => OVERSIZED_REMOTE_MESSAGE_MARKER.to_string(),
+        BoundedReadMessageContent::Materialized(content) => match content {
+            MessageContent::User(content) => content.llm_text().to_string(),
+            MessageContent::Agent(blocks) => blocks
+                .iter()
+                .map(ContentBlock::render_text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            MessageContent::Tool(content) => content.content.clone(),
+            MessageContent::System(content) => content.text.clone(),
+            MessageContent::Error(content) => content.message.clone(),
+            MessageContent::Continuation(content) => content.summary.clone(),
+            MessageContent::Skill(content) => {
+                format!("/{} {}\n{}", content.name, content.trigger, content.body)
+            }
+        },
+    };
+    let attachment_count = message.file_count.saturating_add(message.image_count);
+    if attachment_count > 0 {
+        tracing::debug!(
+            message_id = %message.message_id,
+            file_count = message.file_count,
+            image_count = message.image_count,
+            "remote bounded read omits attachment payloads"
+        );
+        let _ = write!(
+            text,
+            "\n[{attachment_count} attachment(s) are not shown in remote bounded reads]"
+        );
+    }
+    text
 }
 
 fn message_is_hidden(message: &crate::db::Message) -> bool {
@@ -2403,6 +2641,55 @@ async fn resolve_message(
             conv.id,
             message.created_at,
             trim_chars(render_full_message_text(&message).trim(), 240)
+        ),
+    })
+}
+
+async fn resolve_bounded_message(
+    service: &GlobalReadService,
+    conv: Conversation,
+    message_id: &str,
+    content_limit: NonZeroUsize,
+) -> Result<ResolveGlobalReferenceResponse, AppError> {
+    let message = service
+        .db
+        .get_bounded_read_message_by_id_in_conversation(&conv.id, message_id, content_limit)
+        .await
+        .map_err(|error| {
+            if let DbError::MessageNotFound(_) = error {
+                AppError::NotFound("message reference target not found".to_string())
+            } else {
+                AppError::Internal("bounded message read failed".to_string())
+            }
+        })?;
+
+    if message.hidden {
+        return Err(AppError::NotFound(
+            "message reference target not found".to_string(),
+        ));
+    }
+    let href = Some(conversation_message_href(
+        &conv,
+        Some((&message.message_id, message.message_type)),
+    ));
+    let title = conv.title.clone().or(conv.slug.clone());
+    let sender = attributed_sender_with_stable(&service.db, &message.origin)
+        .await
+        .map_err(|error| AppError::Internal(format!("sender attribution failed: {error}")))?;
+    Ok(ResolveGlobalReferenceResponse {
+        kind: ResolvedReferenceKind::Message,
+        id: message.message_id.clone(),
+        href,
+        title,
+        work_scope: resolve_work_scope(service, &conv).await,
+        summary: format!(
+            "{}{} message {} in @transcript:{} at {}: {}",
+            attributed_role(message.message_type, &message.origin),
+            sender,
+            message.message_id,
+            conv.id,
+            message.created_at,
+            trim_chars(render_bounded_message_text(&message).trim(), 240)
         ),
     })
 }
@@ -3889,6 +4176,124 @@ mod tests {
             conversation_page_end(MAX_CONVERSATION_READ_CURSOR),
             MAX_CONVERSATION_READ_CURSOR
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_remote_read_and_exact_resolve_omit_oversized_content() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("bounded-remote", "bounded-remote", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "bounded-remote-message",
+            "bounded-remote",
+            &phoenix_core::domain::db_schema::MessageContent::user("x".repeat(2048)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let limit = std::num::NonZeroUsize::new(64).unwrap();
+
+        let page = service
+            .read_conversation_page_bounded("@transcript:bounded-remote", 0, limit)
+            .await
+            .unwrap();
+        assert!(
+            page.content
+                .contains(super::OVERSIZED_REMOTE_MESSAGE_MARKER),
+            "{}",
+            page.content
+        );
+        assert!(!page.content.contains(&"x".repeat(256)));
+
+        let resolved = service
+            .resolve_reference_bounded(
+                "@transcript:bounded-remote#message-bounded-remote-message",
+                limit,
+            )
+            .await
+            .unwrap();
+        assert!(
+            resolved
+                .summary
+                .contains(super::OVERSIZED_REMOTE_MESSAGE_MARKER),
+            "{}",
+            resolved.summary
+        );
+        assert!(!resolved.summary.contains(&"x".repeat(128)));
+    }
+
+    #[tokio::test]
+    async fn conversation_page_at_cursor_cap_is_terminal_and_explicit() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let conv = db
+            .create_conversation("cursor-cap", "cursor-cap", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "cursor-cap-message",
+            &conv.id,
+            &phoenix_core::domain::db_schema::MessageContent::user(
+                "x".repeat(MAX_CONVERSATION_READ_CURSOR + 1024),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let page = super::render_message_page(&db, &conv, MAX_CONVERSATION_READ_CURSOR - 1)
+            .await
+            .unwrap();
+        assert_eq!(page.next_cursor, None);
+        assert!(page.content.ends_with("(conversation read limit reached)"));
+
+        let at_cap = super::render_message_page(&db, &conv, MAX_CONVERSATION_READ_CURSOR)
+            .await
+            .unwrap();
+        assert_eq!(at_cap.next_cursor, None);
+        assert_eq!(at_cap.content, "(conversation read limit reached)");
+    }
+
+    #[tokio::test]
+    async fn bounded_conversation_page_reaching_cursor_cap_is_terminal_and_explicit() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "bounded-cursor-cap",
+            "bounded-cursor-cap",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for index in 0..2 {
+            db.add_message(
+                &format!("bounded-cursor-cap-{index}"),
+                "bounded-cursor-cap",
+                &phoenix_core::domain::db_schema::MessageContent::user("x".repeat(600_000)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+
+        let page = service
+            .read_conversation_page_bounded(
+                "@transcript:bounded-cursor-cap",
+                MAX_CONVERSATION_READ_CURSOR - 1,
+                std::num::NonZeroUsize::new(700_000).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.next_cursor, None);
+        assert!(page.content.ends_with("(conversation read limit reached)"));
     }
 
     #[tokio::test]
