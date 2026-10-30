@@ -202,6 +202,25 @@ pub struct ContinuationHandoffCandidate {
 /// Maximum pending steering entries permitted per conversation.
 pub const MAX_STEERING_QUEUE_DEPTH: usize = 5;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundedReadMessageContent {
+    Materialized(MessageContent),
+    Oversized,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedReadMessage {
+    pub message_id: String,
+    pub sequence_id: i64,
+    pub message_type: MessageType,
+    pub content: BoundedReadMessageContent,
+    pub created_at: DateTime<Utc>,
+    pub origin: InputOrigin,
+    pub hidden: bool,
+    pub file_count: usize,
+    pub image_count: usize,
+}
+
 /// Resolved spawn settings written in the child's creation transaction.
 pub struct SubAgentExecution<'a> {
     pub connection: &'a str,
@@ -225,6 +244,7 @@ use sqlx::sqlite::{
 use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
 use sqlx_core::transaction::TransactionManager;
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -14132,6 +14152,50 @@ impl Database {
         .await
     }
 
+    /// Get message metadata and a bounded content prefix for remote-read rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bounded query or content decoding fails.
+    pub async fn get_bounded_read_messages_after_limited(
+        &self,
+        conversation_id: &str,
+        after_sequence: i64,
+        limit: NonZeroUsize,
+        content_limit: NonZeroUsize,
+    ) -> DbResult<Vec<BoundedReadMessage>> {
+        let row_limit = i64::try_from(limit.get())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let prefix_limit = bounded_read_prefix_limit(content_limit)?;
+        self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
+            sqlx::query(
+                "SELECT m.message_id, m.sequence_id, m.message_type, \
+                        substr(CAST(m.content AS BLOB), 1, ?4) AS content_prefix, \
+                        m.created_at, m.origin_kind, m.origin_product_conversation_id, \
+                        m.origin_transcript_id, m.origin_subscription_event_id, \
+                        m.origin_source_message_id, m.origin_source_tool_use_id, \
+                        m.origin_slack_request_id, \
+                        CASE WHEN json_valid(m.display_data) \
+                                  AND json_type(m.display_data, '$.hidden') = 'true' \
+                             THEN 1 ELSE 0 END AS hidden, \
+                        (SELECT COUNT(*) FROM message_files mf WHERE mf.message_id = m.message_id) AS file_count, \
+                        (SELECT COUNT(*) FROM message_images mi WHERE mi.message_id = m.message_id) AS image_count \
+                 FROM messages m \
+                 WHERE m.conversation_id = ?1 AND m.sequence_id > ?2 \
+                 ORDER BY m.sequence_id ASC LIMIT ?3",
+            )
+            .bind(conversation_id)
+            .bind(after_sequence)
+            .bind(row_limit)
+            .bind(prefix_limit)
+            .try_map(move |row| parse_bounded_read_message_row(row, content_limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(DbError::Sqlx)
+        })
+        .await
+    }
+
     /// Get the inclusive message range `[start_sequence, end_sequence]`.
     ///
     /// # Errors
@@ -14237,6 +14301,42 @@ impl Database {
     ) -> DbResult<Message> {
         self.get_message_by_id_for_conversation(Some(conversation_id), message_id)
             .await
+    }
+
+    /// Get one conversation-scoped message with a bounded content prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::MessageNotFound`] when the scoped identity is absent,
+    /// or a database/decoding error when retrieval fails.
+    pub async fn get_bounded_read_message_by_id_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        content_limit: NonZeroUsize,
+    ) -> DbResult<BoundedReadMessage> {
+        let prefix_limit = bounded_read_prefix_limit(content_limit)?;
+        sqlx::query(
+            "SELECT m.message_id, m.sequence_id, m.message_type, \
+                    substr(CAST(m.content AS BLOB), 1, ?3) AS content_prefix, \
+                    m.created_at, m.origin_kind, m.origin_product_conversation_id, \
+                    m.origin_transcript_id, m.origin_subscription_event_id, \
+                    m.origin_source_message_id, m.origin_source_tool_use_id, \
+                    m.origin_slack_request_id, \
+                    CASE WHEN json_valid(m.display_data) \
+                              AND json_type(m.display_data, '$.hidden') = 'true' \
+                         THEN 1 ELSE 0 END AS hidden, \
+                    (SELECT COUNT(*) FROM message_files mf WHERE mf.message_id = m.message_id) AS file_count, \
+                    (SELECT COUNT(*) FROM message_images mi WHERE mi.message_id = m.message_id) AS image_count \
+             FROM messages m WHERE m.conversation_id = ?1 AND m.message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(prefix_limit)
+        .try_map(move |row| parse_bounded_read_message_row(row, content_limit))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::MessageNotFound(message_id.to_string()))
     }
 
     async fn get_message_by_id_for_conversation(
@@ -16494,6 +16594,52 @@ fn parse_prompt_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
         display_data,
         usage_data,
         created_at,
+    })
+}
+
+fn bounded_read_prefix_limit(content_limit: NonZeroUsize) -> DbResult<i64> {
+    let prefix_limit = content_limit
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| DbError::Serialization("bounded read content limit overflow".to_string()))?;
+    i64::try_from(prefix_limit).map_err(|error| DbError::Serialization(error.to_string()))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn parse_bounded_read_message_row(
+    row: SqliteRow,
+    content_limit: NonZeroUsize,
+) -> Result<BoundedReadMessage, sqlx::Error> {
+    let message_type = parse_message_type(&row.try_get::<String, _>("message_type")?);
+    let content_prefix: Vec<u8> = row.try_get("content_prefix")?;
+    let content = if content_prefix.len() > content_limit.get() {
+        BoundedReadMessageContent::Oversized
+    } else {
+        let content_text = String::from_utf8(content_prefix).map_err(|error| {
+            prompt_decode_error(format!("invalid message content UTF-8: {error}"))
+        })?;
+        let content_value = serde_json::from_str(&content_text).unwrap_or_default();
+        let content =
+            MessageContent::from_stored_json(message_type, content_value).unwrap_or_else(|_| {
+                MessageContent::error(format!("Failed to parse {message_type} message"))
+            });
+        BoundedReadMessageContent::Materialized(content)
+    };
+    let file_count = usize::try_from(row.try_get::<i64, _>("file_count")?)
+        .map_err(|error| prompt_decode_error(format!("invalid file count: {error}")))?;
+    let image_count = usize::try_from(row.try_get::<i64, _>("image_count")?)
+        .map_err(|error| prompt_decode_error(format!("invalid image count: {error}")))?;
+
+    Ok(BoundedReadMessage {
+        message_id: row.try_get("message_id")?,
+        sequence_id: row.try_get("sequence_id")?,
+        message_type,
+        content,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        origin: decode_origin(&row)?,
+        hidden: row.try_get::<i64, _>("hidden")? != 0,
+        file_count,
+        image_count,
     })
 }
 
@@ -22751,6 +22897,177 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![4, 5]
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_projection_enforces_content_bytes_and_preserves_metadata() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("bounded", "bounded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO slack_gateway_requests (
+                 request_id, workspace, owner, channel, message_ts, thread_ts, kind,
+                 instruction, context, source_url, accepted_at_unix_micros, input_id,
+                 observed_at_unix_micros, trigger_kind
+             ) VALUES (
+                 'slack-request-bounded', 'workspace', 'owner', 'channel', 'message-ts',
+                 'thread-ts', 'baseline', '', '', 'https://example.invalid/slack', 0,
+                 'slack-input-bounded', 0, 'prefix'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.add_message_with_seq_and_origin(
+            "bounded-message",
+            "bounded",
+            1,
+            &MessageContent::user_with_attachments(
+                "bounded body",
+                vec![ImageData {
+                    data: "large-image-payload".to_string(),
+                    media_type: "image/png".to_string(),
+                }],
+                vec![FileAttachment {
+                    original_name: "notes.txt".to_string(),
+                    media_type: "text/plain".to_string(),
+                    size_bytes: 20,
+                    stored_path: "/store/notes.txt".to_string(),
+                }],
+            ),
+            Some(&serde_json::json!({"hidden": true})),
+            None,
+            &phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                request_id: "slack-request-bounded".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let raw: Vec<u8> =
+            sqlx::query_scalar("SELECT CAST(content AS BLOB) FROM messages WHERE message_id = ?1")
+                .bind("bounded-message")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+
+        let exact = db
+            .get_bounded_read_messages_after_limited(
+                "bounded",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(raw.len()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        let BoundedReadMessageContent::Materialized(content) = &exact[0].content else {
+            panic!("content at its exact byte bound must materialize");
+        };
+        assert!(matches!(content, MessageContent::User(_)));
+        let (images, files) = content.attachments();
+        assert!(images.is_empty());
+        assert!(files.is_empty());
+        assert!(!raw
+            .windows("large-image-payload".len())
+            .any(|window| window == b"large-image-payload"));
+        assert!(!raw
+            .windows("/store/notes.txt".len())
+            .any(|window| window == b"/store/notes.txt"));
+        assert!(exact[0].hidden);
+        assert_eq!(exact[0].file_count, 1);
+        assert_eq!(exact[0].image_count, 1);
+        assert_eq!(
+            exact[0].origin,
+            phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                request_id: "slack-request-bounded".to_string(),
+            }
+        );
+
+        let oversized = db
+            .get_bounded_read_messages_after_limited(
+                "bounded",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(raw.len() - 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            oversized[0].content,
+            BoundedReadMessageContent::Oversized
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_classifies_a_split_multibyte_prefix_before_utf8_decode() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("unicode", "unicode", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "unicode-message",
+            "unicode",
+            &MessageContent::user("prefix é suffix"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let raw: Vec<u8> =
+            sqlx::query_scalar("SELECT CAST(content AS BLOB) FROM messages WHERE message_id = ?1")
+                .bind("unicode-message")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let first_multibyte_byte = raw.iter().position(|byte| *byte == 0xc3).unwrap();
+        assert_eq!(
+            &raw[first_multibyte_byte..first_multibyte_byte + 2],
+            &[0xc3, 0xa9]
+        );
+        assert!(std::str::from_utf8(&raw[..=first_multibyte_byte]).is_err());
+
+        let bounded = db
+            .get_bounded_read_message_by_id_in_conversation(
+                "unicode",
+                "unicode-message",
+                NonZeroUsize::new(first_multibyte_byte).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            bounded.content,
+            BoundedReadMessageContent::Oversized
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_exact_message_lookup_is_scoped_to_its_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        for conversation in ["scope-a", "scope-b"] {
+            db.create_conversation(conversation, conversation, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.add_message(
+            "scoped-message",
+            "scope-a",
+            &MessageContent::user("body"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let error = db
+            .get_bounded_read_message_by_id_in_conversation(
+                "scope-b",
+                "scoped-message",
+                NonZeroUsize::new(1024).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::MessageNotFound(id) if id == "scoped-message"));
     }
 
     /// A freshly-migrated DB (base SCHEMA + all versioned migrations, the path
