@@ -29366,7 +29366,11 @@ mod tool_generation_guard_tests {
         rt.execute_effect(Effect::ExecuteTool { tool: denied })
             .await
             .unwrap();
-        let (denial_generation, denial) = rt.tool_outcome_rx.recv().await.unwrap();
+        let (denial_generation, denial) =
+            tokio::time::timeout(Duration::from_secs(30), rt.tool_outcome_rx.recv())
+                .await
+                .expect("permission denial outcome must reach the runtime")
+                .expect("tool outcome channel stays open for the denied call");
         assert!(!rt.tool_outcome_is_stale(denial_generation));
         assert!(tools.recorded_executions().is_empty());
         let ToolExecOutcome::Completed(result) = &denial else {
@@ -29379,7 +29383,11 @@ mod tool_generation_guard_tests {
         rt.process_outcome(EffectOutcome::Tool(denial))
             .await
             .unwrap();
-        let (allowed_generation, outcome) = rt.tool_outcome_rx.recv().await.unwrap();
+        let (allowed_generation, outcome) =
+            tokio::time::timeout(Duration::from_secs(30), rt.tool_outcome_rx.recv())
+                .await
+                .expect("the allowed tool after the denial must complete")
+                .expect("tool outcome channel stays open for the allowed call");
         assert!(rt.tool_outcome_is_stale(denial_generation));
         assert!(!rt.tool_outcome_is_stale(allowed_generation));
         assert_eq!(tools.recorded_executions().len(), 1);
@@ -29391,7 +29399,11 @@ mod tool_generation_guard_tests {
             .await
             .unwrap();
 
-        let (generation, outcome) = rt.llm_outcome_rx.recv().await.unwrap();
+        let (generation, outcome) =
+            tokio::time::timeout(Duration::from_secs(30), rt.llm_outcome_rx.recv())
+                .await
+                .expect("the model must receive the completed round and respond")
+                .expect("model outcome channel stays open after the tool round");
         rt.process_generation_tagged_llm_outcome(generation, outcome)
             .await;
         assert!(matches!(rt.state, ConvState::Idle));
