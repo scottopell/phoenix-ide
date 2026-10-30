@@ -1033,10 +1033,12 @@ pub fn merge_duration_into_display_data(
 }
 #[must_use]
 pub fn tool_result_message_content(result: &ToolResult) -> MessageContent {
-    MessageContent::Tool(tool_result_content(result))
+    MessageContent::Tool(tool_result_transcript_content(result))
 }
 
-fn tool_result_content(result: &ToolResult) -> ToolContent {
+/// Project a result for transcript consumers, replacing trusted instructions with a receipt.
+#[must_use]
+pub fn tool_result_transcript_content(result: &ToolResult) -> ToolContent {
     let persisted_output = match &result.outcome {
         ToolOutcome::TrustedInstructions { .. } => {
             "Authenticated built-in skill instructions were delivered for this live request."
@@ -1089,7 +1091,7 @@ impl FinalizedToolResult {
             conversation_id,
             sequence_id,
             created_at,
-            tool_result_content(result),
+            tool_result_transcript_content(result),
             merge_duration_into_display_data(result.display_data(), result.duration_ms),
         );
         Self { row, disposition }
