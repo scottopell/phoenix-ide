@@ -681,7 +681,11 @@ class LinuxReceiptEvidenceTests(unittest.TestCase):
                        GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
                        GITHUB_REPOSITORY="scottopell/phoenix-ide",
                        GITHUB_STEP_SUMMARY=str(summary), GITHUB_OUTPUT=str(output))
-            for overrides in [{"ARTIFACT_ID": ""}, {"RECEIPT_SHA256": ""}, {}]:
+            for overrides in [
+                {"ARTIFACT_ID": ""}, {"ARTIFACT_ID": "0"}, {"ARTIFACT_ID": "not-an-id"},
+                {"RECEIPT_SHA256": ""}, {"RECEIPT_SHA256": "a" * 63},
+                {"RECEIPT_SHA256": "g" * 64}, {},
+            ]:
                 summary.unlink(missing_ok=True)
                 output.unlink(missing_ok=True)
                 result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell],

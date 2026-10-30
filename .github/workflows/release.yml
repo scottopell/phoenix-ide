@@ -390,8 +390,8 @@ jobs:
           CONTROLLER_COMMIT: ${{ needs.gate.outputs.controller_commit }}
         run: |
           set -euo pipefail
-          [[ "$RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
           {
             printf '## Exact Linux preparation receipt evidence\n\n'
             printf 'repository: `%s`\n\nworkflow: `.github/workflows/release.yml`\n\n' "$GITHUB_REPOSITORY"
