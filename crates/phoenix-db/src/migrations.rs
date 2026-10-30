@@ -19362,7 +19362,7 @@ with tempfile.TemporaryDirectory() as directory:
     fn initial_execution_receipt_registry_retains_sparse_reserved_slot() {
         assert_eq!(MIGRATIONS.last().unwrap().version, 149);
         assert!(!MIGRATIONS.iter().any(|migration| migration.version == 145));
-        assert_eq!(MIGRATIONS.len(), 146);
+        assert_eq!(MIGRATIONS.len(), 147);
     }
 
     #[tokio::test]
