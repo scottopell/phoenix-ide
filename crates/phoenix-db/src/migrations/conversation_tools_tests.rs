@@ -535,6 +535,10 @@ async fn unsupported_lineage_refuses_before_schema_or_row_mutation() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Checks schema, child data and rollback in one registered migration journey"
+)]
 async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomically() {
     let pool = fixture(146, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
@@ -705,7 +709,7 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
         retained_ids,
         (
             target.product_conversation_id.to_string(),
-            target.id.to_string()
+            target.id.clone()
         )
     );
     assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);

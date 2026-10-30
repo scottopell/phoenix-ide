@@ -404,6 +404,10 @@ async fn native_registered_create_freezes_literal_intent_and_reconciles_same_req
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Exercises registered tool authorization, publication, deletion and identity replay end to end"
+)]
 async fn native_registered_creation_read_replays_historical_publication_after_target_deletion() {
     use crate::db::ProductCreationProvisioningStage as Stage;
     use phoenix_core::domain::db_schema::{ConvMode, Conversation};

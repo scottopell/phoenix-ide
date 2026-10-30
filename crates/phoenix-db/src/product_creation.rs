@@ -2527,6 +2527,10 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Checks retained identity through publication, deletion and replay"
+    )]
     async fn coordinator_creation_history_survives_target_deletion_and_replays_identity() {
         use phoenix_core::domain::db_schema::SourceToolCall;
 
@@ -6986,6 +6990,10 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Checks foundation lifecycle and retained creation receipt through publication and deletion"
+    )]
     async fn git_product_creation_publish_keeps_repository_foundation_dormant() {
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("req-cascade", &intent("/repo/hidden", "owner"))
