@@ -154,6 +154,17 @@ async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) 
     (runtime, db, coordinator.id)
 }
 
+fn assert_immutable_creation_conflict(changed: &ToolOutput) {
+    assert!(matches!(changed, ToolOutput::Error { .. }));
+    assert_eq!(
+        serde_json::from_str::<Value>(changed.output()).unwrap(),
+        json!({
+            "status": "error",
+            "error": "request_id conflicts with immutable creation intent",
+        })
+    );
+}
+
 #[tokio::test]
 async fn native_creation_read_and_submit_receipt_require_current_snapshot_authority() {
     let (runtime, db, gc) = native_runtime().await;
@@ -201,14 +212,7 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
             native_context(&gc),
         )
         .await;
-    assert!(matches!(changed, ToolOutput::Error { .. }));
-    assert_eq!(
-        serde_json::from_str::<Value>(changed.output()).unwrap(),
-        json!({
-            "status": "error",
-            "error": "request_id conflicts with immutable creation intent",
-        })
-    );
+    assert_immutable_creation_conflict(&changed);
     assert!(read_native_creation_status(&runtime, &gc, &request_id)
         .await
         .is_ok());
@@ -614,14 +618,7 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     let mut changed = request.clone();
     changed["objective"] = json!("changed historical intent");
     let conflict = create.run(changed, native_context(&gc)).await;
-    assert!(matches!(conflict, ToolOutput::Error { .. }));
-    assert_eq!(
-        serde_json::from_str::<Value>(conflict.output()).unwrap(),
-        json!({
-            "status": "error",
-            "error": "request_id conflicts with immutable creation intent",
-        })
-    );
+    assert_immutable_creation_conflict(&conflict);
     sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
         .bind(&gc)
         .execute(db.pool())
