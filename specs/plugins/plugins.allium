@@ -1,0 +1,548 @@
+-- allium: 3
+-- specs/plugins/plugins.allium
+--
+-- User-Level Agent Plugins (Agent Plugins specification 1.1.0).
+--
+-- Scope: plugin install/remove/enable/disable lifecycle, manifest and
+--        component loading with scoped failure boundaries, containment,
+--        the stdio runtime environment contract, and status surfacing.
+-- Includes: plugin identity by manifest name; skills and MCP as the two
+--        portable component types; the shared plugins root with managed and
+--        unmanaged provenance.
+-- Excludes: skill invocation and delivery semantics (specs/skills/);
+--           MCP connection lifecycle, OAuth, and reload reconciliation
+--           (specs/mcp/); API route shapes and UI layout.
+--
+-- Requirement traceability: REQ-AP-001 through REQ-AP-012.
+
+use "../skills/skills.allium" as skills
+use "../mcp/mcp.allium" as mcp
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Plugins are installed and discovered exclusively under one
+    -- user-level root. No working-directory, ancestor, or repository
+    -- path contributes plugins (REQ-AP-001).
+    plugins_root: String
+
+    -- The single recognized specification version. Recognition is pinned
+    -- to the exact canonical schema identifiers; unrecognized versions
+    -- reject the plugin (REQ-AP-003, REQ-AP-012).
+    recognized_spec: String = "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json"
+
+    -- The deprecated two-endpoint HTTP+SSE transport from the plugin MCP
+    -- configuration is skipped as unsupported, consistent with the MCP
+    -- client's native-transport decision (mcp/REQ-MCP-019).
+    plugin_sse_transport_native: Boolean = false
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Per-plugin lifecycle state. Loading is a scan-time activity, not a
+-- lifecycle state: a plugin is discovered with its load outcome attached.
+enum PluginPhase { installed | removing }
+
+-- Why the plugin directory exists: Phoenix installed it, or another
+-- harness did and Phoenix merely loads it (REQ-AP-009).
+enum Provenance { managed | unmanaged }
+
+-- Component-type discriminant for scoped failure reporting.
+enum ComponentType { skills | mcp }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One component load outcome within a plugin scan.
+value LoadEntry {
+    component: ComponentType
+    item: String
+    outcome: String         -- "loaded" | "skipped" | "rejected" | "disabled"
+    reason: String?
+}
+
+-- One manifest or component diagnostic, reported to logs and surfaced in
+-- status (REQ-AP-010).
+value Diagnostic {
+    plugin_name: String?
+    component: ComponentType?
+    path: String?
+    severity: String        -- "debug" | "warn"
+    message: String
+}
+
+-- One validated server entry from mcp.json, before runtime resolution:
+-- exactly one closed variant, placeholders not yet expanded. The
+-- deprecated sse transport never reaches this type (it is a skip with a
+-- diagnostic).
+value ServerSpec {
+    server: String          -- key within the plugin's mcpServers map
+    transport: mcp/Transport
+    command: String?        -- when transport = stdio
+    args: List<String>      -- when transport = stdio
+    configured_env: Map<String, String> -- when transport = stdio
+    cwd: String?            -- when transport = stdio; null means plugin root
+    url: String?            -- when transport = http
+    headers: Map<String, String> -- when transport = http
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One installed plugin, keyed by manifest name.
+entity Plugin {
+    name: String
+    version: String?
+    phase: PluginPhase
+    enabled: Boolean
+    provenance: Provenance
+    root: String
+
+    -- Per-component load outcome, retained until the next scan.
+    load_report: List<LoadEntry> when phase = installed
+
+    -- Set when a registry record exists but the plugin root is absent
+    -- (a shared-root harness removed the directory).
+    missing: Boolean when phase = installed
+
+    -- True once removal (or a missing root) has made the plugin's data
+    -- directory eligible for an explicit purge (REQ-AP-009).
+    purgeable: Boolean when phase = installed | removing
+
+    transitions phase {
+        installed -> removing
+        terminal: removing
+    }
+}
+
+-- The skills an enabled plugin contributes to the skill catalog, under
+-- namespaced names ranked below every user skill source (REQ-AP-005).
+entity PluginSkillContribution {
+    plugin_name: String
+    skill_name: String
+    namespaced_name: String
+    source_dir: String
+}
+
+-- One MCP server an enabled plugin contributes to the MCP configuration
+-- merge, keyed <plugin>.<server> and merged after every user configuration
+-- file so user configuration wins collisions (REQ-AP-006).
+entity PluginServerContribution {
+    plugin_name: String
+    plugin_root: String
+    server_key: String      -- "<plugin>.<server>"
+    spec: ServerSpec
+}
+
+-- The runtime-resolved form of one plugin stdio server: the environment
+-- contract fully applied, ready to spawn (REQ-AP-006).
+entity ResolvedPluginServer {
+    server_key: String
+    plugin_root: String
+    data_dir: String
+    command: String
+    args: List<String>
+    env: Map<String, String>
+    cwd: String
+}
+
+------------------------------------------------------------
+-- Actors
+------------------------------------------------------------
+
+-- The Phoenix server process: scans, loads, expands, and surfaces.
+actor Server {}
+
+-- A human operator: installs, removes, enables, disables, purges data.
+actor Operator {}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface PluginControl {
+    facing: Operator
+
+    context plugin: Plugin
+
+    exposes:
+        plugin.name
+        plugin.version
+        plugin.enabled
+        plugin.provenance
+        plugin.phase
+        plugin.load_report when plugin.phase = installed
+        plugin.missing when plugin.phase = installed
+
+    provides:
+        DisablePlugin(plugin)
+            when plugin.enabled and plugin.phase = installed
+        EnablePlugin(plugin)
+            when not plugin.enabled and plugin.phase = installed
+        RemovePlugin(plugin)
+            when plugin.phase = installed
+        PurgePluginData(plugin)
+            when plugin.purgeable
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- manifest_valid(path): parse and validate plugin.json against the 1.1.0
+--   manifest schema; returns manifest fields or null when the manifest is
+--   absent or invalid. Unknown top-level fields and a non-object extensions
+--   value are reported as diagnostics and otherwise ignored; a type
+--   violation, a bad name, or an unrecognized $schema identifier returns
+--   null (whole-plugin rejection) (REQ-AP-003).
+-- spec_versions_match(plugin, mcp_doc): both plugin.json and mcp.json
+--   declare the same recognized specification version (REQ-AP-012).
+-- skills_dir_valid(plugin_root): the skills location is a directory or
+--   absent; a present regular file named skills invalidates the component
+--   (REQ-AP-004).
+-- mcp_location_valid(plugin_root): mcp.json is a regular file or absent; a
+--   present directory named mcp.json invalidates the component (REQ-AP-004).
+-- loaded_skills(plugin): List of skill directories that loaded from the
+--   plugin's skills tree: immediate children with a valid, contained
+--   SKILL.md (REQ-AP-004, REQ-AP-005).
+-- loaded_servers(plugin): List<ServerSpec> of servers that validated from
+--   the plugin's mcp.json under the per-server failure boundary: the sse
+--   transport, unknown transports, command-shape violations, and env entries
+--   declaring PLUGIN_ROOT or PLUGIN_DATA are skipped with diagnostics
+--   (REQ-AP-004, REQ-AP-006).
+-- load_components(plugin): produce the plugin's full List<LoadEntry>,
+--   covering both component types' scoped outcomes (REQ-AP-004).
+-- provenance_for(plugin_root): managed when Phoenix installed the
+--   directory, unmanaged when another harness did (REQ-AP-009).
+-- registry_enabled(name): the persisted enabled/disabled registry state;
+--   absent record means enabled (REQ-AP-008).
+-- duplicate_name_loaded(name): another already-accepted scan candidate
+--   declared the same manifest name (REQ-AP-002).
+-- skill_namespaced(plugin_name, skill_name): "<plugin>:<skill>" (REQ-AP-005).
+-- data_dir_for(plugin_name): config.plugins_root + "/data/" + name — the
+--   dedicated PLUGIN_DATA directory, keyed by plugin name alone so an
+--   update cannot move or reset it (REQ-AP-006).
+-- expand_placeholders(text, plugin_root, data_dir): single textual pass
+--   replacing ${PLUGIN_ROOT} and ${PLUGIN_DATA}; other placeholder-like
+--   text stays literal (REQ-AP-006).
+-- env_overlay(base_env, configured_env, plugin_root, data_dir): expand
+--   configured values, overlay them on the base environment, then set
+--   client-owned PLUGIN_ROOT and PLUGIN_DATA last, overriding equivalents
+--   (REQ-AP-006).
+-- cwd_resolved(cwd, plugin_root, data_dir): null resolves to the plugin
+--   root; explicit values must be ./-relative or ${PLUGIN_ROOT}/
+--   ${PLUGIN_DATA}-anchored and resolve inside their boundary; other or
+--   escaping values are invalid (REQ-AP-006).
+-- command_allowed(command): a bare executable name or a plugin-relative
+--   path beginning ./ (REQ-AP-004).
+-- within_boundary(path, boundary): the resolved realpath stays inside
+--   the resolved boundary directory, following symlinks; links inside are
+--   allowed; null resolves to the boundary itself (REQ-AP-007).
+-- inherited_environment(): the base environment Phoenix chooses for
+--   plugin subprocesses (REQ-AP-006).
+
+------------------------------------------------------------
+-- Rules: discovery and lifecycle
+------------------------------------------------------------
+
+-- Scan materializes one Plugin per valid manifest. The root scan itself is
+-- a black box over the shared directory; invalid siblings produce
+-- diagnostics and continue (REQ-AP-002).
+rule PluginDiscovered {
+    when: PluginCandidateScanned(plugin_root)
+
+    let manifest = manifest_valid(plugin_root)
+
+    requires: manifest != null
+    requires: not duplicate_name_loaded(manifest.name)
+
+    ensures: Plugin.created(
+        name: manifest.name,
+        version: manifest.version,
+        phase: installed,
+        enabled: registry_enabled(manifest.name),
+        provenance: provenance_for(plugin_root),
+        root: plugin_root,
+        missing: false,
+        purgeable: false,
+        load_report: [])
+}
+
+-- A duplicate manifest name in one scan: first discovered wins, later
+-- siblings are reported, not loaded (REQ-AP-002).
+rule DuplicatePluginNameReported {
+    when: PluginCandidateScanned(plugin_root)
+
+    let manifest = manifest_valid(plugin_root)
+
+    requires: manifest != null
+    requires: duplicate_name_loaded(manifest.name)
+
+    ensures: Diagnostic.created(
+        plugin_name: manifest.name,
+        path: plugin_root,
+        severity: "warn",
+        message: "duplicate plugin name; first discovered wins")
+}
+
+-- An invalid or absent manifest in a candidate directory: report and
+-- continue with siblings; the plugin is not materialized at all.
+rule InvalidManifestSkipped {
+    when: PluginCandidateScanned(plugin_root)
+
+    requires: manifest_valid(plugin_root) = null
+
+    ensures: Diagnostic.created(
+        plugin_name: null,
+        path: plugin_root,
+        severity: "debug",
+        message: "no valid manifest; skipping directory")
+}
+
+-- Loading an enabled plugin: resolve both component types under the
+-- scoped failure boundaries (REQ-AP-004). Disabled plugins load nothing.
+rule PluginComponentsLoad {
+    when: plugins: Plugin.created
+
+    requires: plugins.enabled
+
+    ensures: plugins.load_report = load_components(plugins)
+}
+
+-- A disabled plugin contributes nothing: no skills, no MCP servers, no
+-- connections (REQ-AP-008). Existing connections to its servers are
+-- removed through the MCP manager's reload reconciliation.
+rule PluginDisabled {
+    when: DisablePlugin(plugin)
+
+    requires: plugin.enabled and plugin.phase = installed
+
+    ensures: plugin.enabled = false
+}
+
+rule PluginEnabled {
+    when: EnablePlugin(plugin)
+
+    requires: not plugin.enabled and plugin.phase = installed
+
+    ensures: plugin.enabled = true
+}
+
+-- Remove begins the removing phase: the plugin directory is deleted, its
+-- components stop contributing, and its registry record is retained for the
+-- data-purge decision. PLUGIN_DATA is never deleted here (REQ-AP-009).
+rule PluginRemovalRequested {
+    when: RemovePlugin(plugin)
+
+    requires: plugin.phase = installed
+
+    ensures:
+        plugin.phase = removing
+        plugin.enabled = false
+        plugin.purgeable = true
+        plugin.load_report = null
+        plugin.missing = null
+}
+
+-- Purge is a separate explicit action, available only after removal or for
+-- a missing root: it deletes the plugin's data directory and forgets the
+-- plugin. Retained-by-default keeps a reinstall from losing plugin state
+-- (REQ-AP-009).
+rule PluginDataPurged {
+    when: PurgePluginData(plugin)
+
+    requires: plugin.purgeable
+
+    ensures: not exists plugin
+}
+
+-- A registered-but-absent root: report, retain the record, continue. Another
+-- harness sharing the root may have removed the directory (REQ-AP-009).
+rule RegisteredPluginRootMissing {
+    when: plugins: Plugin.missing becomes true
+
+    ensures: plugins.purgeable = true
+}
+
+------------------------------------------------------------
+-- Rules: component contribution
+------------------------------------------------------------
+
+-- An enabled plugin's skills join the skill catalog under the namespaced
+-- name, ranked below every user skill source; the catalog rides the
+-- existing turn-scoped advertisement (skills/REQ-SK-009).
+rule PluginSkillsContribute {
+    when: plugins: Plugin.created
+
+    requires: plugins.enabled
+    requires: skills_dir_valid(plugins.root)
+
+    ensures: for skill in loaded_skills(plugins):
+        PluginSkillContribution.created(
+            plugin_name: plugins.name,
+            skill_name: skill.name,
+            namespaced_name: skill_namespaced(plugins.name, skill.name),
+            source_dir: skill.dir)
+
+    @guidance
+        -- The skill catalog consumes these contributions through the
+        -- existing discovery precedence: plugin skills rank below every
+        -- user skill source, and the catalog advertises the namespaced
+        -- name with a plugin provenance marker (REQ-AP-005, REQ-AP-010).
+        -- Nested sub-skill directories beyond the immediate children of
+        -- skills/ are ignored: plugin trees are non-recursive, unlike the
+        -- recursive sub-skill extension in non-plugin directories.
+}
+
+-- An enabled plugin's MCP servers join the MCP configuration after all
+-- user configuration files, keyed <plugin>.<server>; user configuration
+-- wins collisions through the existing first-seen-wins merge
+-- (mcp/REQ-MCP-001) (REQ-AP-006).
+rule PluginServersContribute {
+    when: plugins: Plugin.created
+
+    requires: plugins.enabled
+
+    ensures: for spec in loaded_servers(plugins):
+        PluginServerContribution.created(
+            plugin_name: plugins.name,
+            plugin_root: plugins.root,
+            server_key: plugins.name + "." + spec.server,
+            spec: spec)
+
+    @guidance
+        -- The MCP configuration merge consumes these contributions after
+        -- every user configuration file, preserving first-seen-wins so
+        -- user configuration always wins a collision. streamable-http
+        -- maps to the existing HTTP transport; stdio servers additionally
+        -- pass through StdioEnvironmentContract before spawning. Server
+        -- tools surface through live tool resolution (mcp/REQ-MCP-014).
+}
+
+------------------------------------------------------------
+-- Rules: stdio runtime environment
+------------------------------------------------------------
+
+-- Every stdio server from a plugin runs with the client-owned environment
+-- last: PLUGIN_ROOT and PLUGIN_DATA are set by Phoenix and override any
+-- equivalent configured names; placeholders are expanded in one textual pass
+-- over args, env values, and cwd only; the data directory exists and is
+-- writable before launch (REQ-AP-006).
+rule StdioEnvironmentContract {
+    when: contribution: PluginServerContribution.created
+
+    requires: contribution.spec.transport = stdio
+    requires: command_allowed(contribution.spec.command)
+    requires: within_boundary(contribution.spec.cwd,
+        contribution.plugin_root)
+
+    let data_dir = data_dir_for(contribution.plugin_name)
+
+    ensures: ResolvedPluginServer.created(
+        server_key: contribution.server_key,
+        plugin_root: contribution.plugin_root,
+        data_dir: data_dir,
+        command: contribution.spec.command,
+        args: expand_args(contribution.spec.args,
+            contribution.plugin_root, data_dir),
+        env: env_overlay(
+            inherited_environment(),
+            contribution.spec.configured_env,
+            contribution.plugin_root,
+            data_dir),
+        cwd: cwd_resolved(contribution.spec.cwd,
+            contribution.plugin_root, data_dir))
+
+    @guidance
+        -- expand_args applies expand_placeholders to each element
+        -- individually; command is never expanded. env_overlay order:
+        -- base environment, expand configured values, overlay configured
+        -- entries, then set client-owned PLUGIN_ROOT and PLUGIN_DATA last,
+        -- overriding equivalent names (REQ-AP-006). The data directory is
+        -- created and made writable before the first spawn and preserved
+        -- across plugin updates.
+}
+
+-- A stdio server whose command or cwd violates the contract is skipped
+-- with a diagnostic; sibling servers and other component types continue
+-- (REQ-AP-004, REQ-AP-007).
+rule StdioServerRejected {
+    when: contribution: PluginServerContribution.created
+
+    requires: contribution.spec.transport = stdio
+    requires: not command_allowed(contribution.spec.command)
+        or not within_boundary(contribution.spec.cwd,
+            contribution.plugin_root)
+
+    ensures: Diagnostic.created(
+        plugin_name: contribution.plugin_name,
+        component: mcp,
+        severity: "warn",
+        message: "stdio server rejected: command shape or containment")
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Plugins exist only under the user-level root. No working directory,
+-- project ancestor, or repository path ever contributes a plugin
+-- (REQ-AP-001).
+invariant PluginsAreUserLevelOnly {
+    for p in Plugins:
+        starts_with(p.root, config.plugins_root)
+}
+
+-- A disabled plugin contributes neither component type (REQ-AP-008).
+invariant DisabledPluginsContributeNothing {
+    for p in Plugins:
+        not p.enabled implies
+            not exists PluginSkillContribution{plugin_name: p.name}
+            and not exists PluginServerContribution{plugin_name: p.name}
+}
+
+-- The deprecated sse transport is never natively run from a plugin
+-- (REQ-AP-004, mcp/REQ-MCP-019).
+invariant PluginSseNotNative {
+    not config.plugin_sse_transport_native
+}
+
+-- Plugin skill names are always namespaced: a plugin skill can never
+-- shadow or collide with a bare user skill name (REQ-AP-005).
+invariant PluginSkillsAreNamespaced {
+    for c in PluginSkillContributions:
+        contains(c.namespaced_name, ":")
+        and c.namespaced_name = skill_namespaced(c.plugin_name, c.skill_name)
+}
+
+-- Plugin MCP servers are always plugin-keyed: user configuration wins any
+-- collision through the existing first-seen-wins merge (REQ-AP-006).
+invariant PluginServersArePluginKeyed {
+    for c in PluginServerContributions:
+        starts_with(c.server_key, c.plugin_name + ".")
+}
+
+-- The data directory is keyed by plugin name alone: an update changes the
+-- manifest version, never the data location, so plugin state survives
+-- updates (REQ-AP-006, REQ-AP-009).
+invariant DataDirKeyedByName {
+    for p in Plugins:
+        data_dir_for(p.name) = config.plugins_root + "/data/" + p.name
+}
+
+-- Every resolved stdio path stays inside its boundary: the working
+-- directory resolves within the plugin root, and the client-owned
+-- environment variables name the real root and data directories
+-- (REQ-AP-007).
+invariant ResolvedPathsContained {
+    for s in ResolvedPluginServers:
+        within_boundary(s.cwd, s.plugin_root)
+        and s.env["PLUGIN_ROOT"] = s.plugin_root
+        and s.env["PLUGIN_DATA"] = s.data_dir
+}
