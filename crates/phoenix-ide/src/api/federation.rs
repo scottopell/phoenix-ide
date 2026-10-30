@@ -1314,13 +1314,59 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn remote_pages_require_exact_transcript_after_product_continuation() {
-        use crate::db::ContinueOutcome;
-        use phoenix_core::domain::sm_state::ConvState;
+    fn peer_read_conversation_request(
+        bearer: &str,
+        destination_instance_id: InstanceId,
+        target: RemoteConversationTarget,
+        cursor: usize,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/federation/peer/read-conversation")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(axum::body::Body::from(
+                serde_json::to_string(&RemoteReadConversationRequest {
+                    destination_instance_id,
+                    target,
+                    cursor,
+                })
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    async fn decode_successful_remote_read(
+        response: axum::response::Response,
+    ) -> RemoteReadConversationResponse {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), MAX_REMOTE_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn peer_read_conversation(
+        app: &axum::Router,
+        bearer: &str,
+        destination_instance_id: InstanceId,
+        target: RemoteConversationTarget,
+        cursor: usize,
+    ) -> axum::response::Response {
         use tower::ServiceExt as _;
 
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        app.clone()
+            .oneshot(peer_read_conversation_request(
+                bearer,
+                destination_instance_id,
+                target,
+                cursor,
+            ))
+            .await
+            .unwrap()
+    }
+
+    async fn create_paginated_transition_source(state: &AppState) -> String {
         state
             .db
             .create_conversation("transition-t1", "transition", "/tmp", true, None, None)
@@ -1342,61 +1388,17 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let product_id: String = sqlx::query_scalar(
+        sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'transition-t1'",
         )
         .fetch_one(state.db.pool())
         .await
-        .unwrap();
-        let caller = InstanceId::new();
-        let bearer = format!("phx_peer_{}", "c".repeat(43));
-        state
-            .db
-            .replace_federation_enrollment(
-                caller,
-                "caller",
-                &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
-            )
-            .await
-            .unwrap();
-        let destination = state.db.instance_id().await.unwrap();
-        let app = crate::api::handlers::create_router(state.clone());
-        let request = |target, cursor| {
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/federation/peer/read-conversation")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(axum::body::Body::from(
-                    serde_json::to_string(&RemoteReadConversationRequest {
-                        destination_instance_id: destination,
-                        target,
-                        cursor,
-                    })
-                    .unwrap(),
-                ))
-                .unwrap()
-        };
-        let stable_target = || RemoteConversationTarget::ProductConversation {
-            product_conversation_id: product_id.clone(),
-        };
-        let exact_t1 = || RemoteConversationTarget::ExactTranscript {
-            transcript_id: "transition-t1".to_string(),
-            message_id: None,
-        };
+        .unwrap()
+    }
 
-        let first = app
-            .clone()
-            .oneshot(request(stable_target(), 0))
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(first.into_body(), MAX_REMOTE_RESPONSE_BYTES)
-            .await
-            .unwrap();
-        let first: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
-        let next_cursor = first.next_cursor.expect("T1 must span multiple pages");
-        assert!(first.content.contains("@transcript:transition-t1"));
+    async fn continue_transition_source(state: &AppState) -> String {
+        use crate::db::ContinueOutcome;
+        use phoenix_core::domain::sm_state::ConvState;
 
         state
             .db
@@ -1437,27 +1439,49 @@ mod tests {
             )
             .await
             .unwrap();
+        successor.id
+    }
 
-        let current = app
-            .clone()
-            .oneshot(request(stable_target(), 0))
+    #[tokio::test]
+    async fn remote_pages_require_exact_transcript_after_product_continuation() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let product_id = create_paginated_transition_source(&state).await;
+        let caller = InstanceId::new();
+        let bearer = format!("phx_peer_{}", "c".repeat(43));
+        state
+            .db
+            .replace_federation_enrollment(
+                caller,
+                "caller",
+                &FederationCredentialVerifier::from_bearer(bearer.as_bytes()),
+            )
             .await
             .unwrap();
-        assert_eq!(current.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(current.into_body(), MAX_REMOTE_RESPONSE_BYTES)
-            .await
-            .unwrap();
-        let current: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        let destination = state.db.instance_id().await.unwrap();
+        let app = crate::api::handlers::create_router(state.clone());
+        let stable_target = || RemoteConversationTarget::ProductConversation {
+            product_conversation_id: product_id.clone(),
+        };
+        let exact_t1 = || RemoteConversationTarget::ExactTranscript {
+            transcript_id: "transition-t1".to_string(),
+            message_id: None,
+        };
+
+        let first = peer_read_conversation(&app, &bearer, destination, stable_target(), 0).await;
+        let first = decode_successful_remote_read(first).await;
+        let next_cursor = first.next_cursor.expect("T1 must span multiple pages");
+        assert!(first.content.contains("@transcript:transition-t1"));
+
+        let successor_id = continue_transition_source(&state).await;
+        let current = peer_read_conversation(&app, &bearer, destination, stable_target(), 0).await;
+        let current = decode_successful_remote_read(current).await;
         assert!(current
             .content
-            .contains(&format!("@transcript:{}", successor.id)));
+            .contains(&format!("@transcript:{successor_id}")));
         assert!(current.content.contains("successor-only-marker"));
 
-        let refused = app
-            .clone()
-            .oneshot(request(stable_target(), next_cursor))
-            .await
-            .unwrap();
+        let refused =
+            peer_read_conversation(&app, &bearer, destination, stable_target(), next_cursor).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(refused.into_body(), MAX_REMOTE_RESPONSE_BYTES)
             .await
@@ -1467,12 +1491,9 @@ mod tests {
             serde_json::json!({"error": REMOTE_STABLE_CONTINUATION_ERROR})
         );
 
-        let pinned = app.oneshot(request(exact_t1(), next_cursor)).await.unwrap();
-        assert_eq!(pinned.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(pinned.into_body(), MAX_REMOTE_RESPONSE_BYTES)
-            .await
-            .unwrap();
-        let pinned: RemoteReadConversationResponse = serde_json::from_slice(&body).unwrap();
+        let pinned =
+            peer_read_conversation(&app, &bearer, destination, exact_t1(), next_cursor).await;
+        let pinned = decode_successful_remote_read(pinned).await;
         assert_eq!(pinned.cursor, next_cursor);
         assert_eq!(pinned.requested, exact_t1());
         assert!(pinned.content.contains("transition T1 message"));
