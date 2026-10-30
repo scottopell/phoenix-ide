@@ -201,8 +201,14 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
             native_context(&gc),
         )
         .await;
-    let changed: Value = serde_json::from_str(changed.output()).unwrap();
-    assert_eq!(changed["status"], "conflict", "{changed}");
+    assert!(matches!(changed, ToolOutput::Error { .. }));
+    assert_eq!(
+        serde_json::from_str::<Value>(changed.output()).unwrap(),
+        json!({
+            "status": "error",
+            "error": "request_id conflicts with immutable creation intent",
+        })
+    );
     assert!(read_native_creation_status(&runtime, &gc, &request_id)
         .await
         .is_ok());
@@ -477,7 +483,7 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     assert!(db
         .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
             request_id: request_id.clone(),
-            claim: claimed.claim,
+            claim: claimed.claim.clone(),
             conversation: Conversation {
                 id: conversation_id.clone(),
                 product_conversation_id: job.product_conversation_id.clone(),
@@ -516,8 +522,44 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
         .await
         .unwrap());
     let read_request = json!({"op":"read", "request_id":request_id});
+    let staged = create.run(read_request.clone(), native_context(&gc)).await;
+    let staged: Value = serde_json::from_str(staged.output()).unwrap();
+    assert_eq!(staged["status"], "delivery_pending", "{staged}");
+    assert!(staged["publication"].is_null());
+    let delivery = crate::db::ClaimedProductCreationJob {
+        claim: claimed.claim,
+        job: db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    };
+    let fingerprint = format!("product-create:{request_id}");
+    let entry = phoenix_core::domain::sm_event::SteerEntry {
+        text: delivery.job.intent.objective.clone(),
+        origin: delivery.job.intent.origin.input_origin(),
+        message_id: request_id.clone(),
+        llm_text: None,
+        images: Vec::new(),
+        files: Vec::new(),
+        user_agent: None,
+        skill_invocation: None,
+    };
+    db.append_product_creation_steering_entry(&delivery, &entry, &fingerprint)
+        .await
+        .unwrap();
+    assert!(db
+        .complete_product_creation_delivery(
+            &request_id,
+            &delivery.claim,
+            &crate::db::SteeringAcceptanceFingerprint::Exact(fingerprint),
+            &delivery.job.intent,
+        )
+        .await
+        .unwrap());
     let live = create.run(read_request.clone(), native_context(&gc)).await;
     let live: Value = serde_json::from_str(live.output()).unwrap();
+    assert_eq!(live["status"], "published", "{live}");
     assert_eq!(live["publication"]["kind"], "available", "{live}");
     assert_eq!(live["publication"]["conversation_id"], conversation_id);
     assert!(live["publication"]["canonical_route"].as_str().is_some());
@@ -572,9 +614,13 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     let mut changed = request.clone();
     changed["objective"] = json!("changed historical intent");
     let conflict = create.run(changed, native_context(&gc)).await;
+    assert!(matches!(conflict, ToolOutput::Error { .. }));
     assert_eq!(
-        serde_json::from_str::<Value>(conflict.output()).unwrap()["status"],
-        "conflict"
+        serde_json::from_str::<Value>(conflict.output()).unwrap(),
+        json!({
+            "status": "error",
+            "error": "request_id conflicts with immutable creation intent",
+        })
     );
     sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1")
         .bind(&gc)
