@@ -1,0 +1,20 @@
+[package]
+name = "phoenix-plugins"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Agent Plugins specification 1.1.0 loading for Phoenix IDE: manifest validation, scoped component failure boundaries, stdio environment expansion, and containment. Pure — no runtime wiring."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
