@@ -9,6 +9,7 @@
 
 pub mod device;
 pub mod scenario;
+mod throttle;
 pub mod touch;
 
 mod cdp;

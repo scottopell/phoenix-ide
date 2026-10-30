@@ -26,7 +26,6 @@
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::{
-    emulation::SetCpuThrottlingRateParams,
     performance::{EnableParams as PerfEnableParams, GetMetricsParams},
     tracing::{EndParams, StartParams as TraceStartParams, TraceConfig},
 };
@@ -670,13 +669,7 @@ async fn action_metrics(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
 /// Issue `Emulation.setCPUThrottlingRate` on the page. `rate == 1` means
 /// "no throttle" (CDP accepts 1 as the identity).
 async fn apply_throttle(session: &Arc<RwLock<BrowserSession>>, rate: f64) -> Result<(), String> {
-    let guard = session.read().await;
-    guard
-        .page
-        .execute(SetCpuThrottlingRateParams::new(rate))
-        .await
-        .map_err(|e| format!("Emulation.setCPUThrottlingRate failed: {e}"))?;
-    Ok(())
+    session.write().await.set_throttle_rate(rate).await
 }
 
 #[allow(clippy::result_large_err)]
@@ -688,7 +681,7 @@ fn validate_throttle_rate(rate: Option<f64>) -> Result<f64, ToolOutput> {
     };
     // Allium ThrottleRateWellFormed / invariant: rate < 1 must never be
     // representable as established override state.
-    if rate < 1.0 {
+    if !rate.is_finite() || rate < 1.0 {
         return Err(ToolOutput::error(format!(
             "Invalid rate {rate}: must be >= 1 (1 = no throttling)"
         )));
@@ -704,15 +697,7 @@ async fn action_throttle(session: &Arc<RwLock<BrowserSession>>, rate: Option<f64
     if let Err(e) = apply_throttle(session, rate).await {
         return ToolOutput::error(e);
     }
-    // ThrottleSetEstablishesOverride / ThrottleClearRestoresDefault:
-    // rate == 1 clears the override (None), else records it. rate is
-    // already validated >= 1, so `<= 1.0` is exactly "rate is 1".
-    let clears = rate <= 1.0;
-    with_profiling(session, |st| {
-        st.throttle_rate = if clears { None } else { Some(rate) };
-    })
-    .await;
-    if clears {
+    if rate <= 1.0 {
         ToolOutput::success("CPU throttling cleared (rate=1, browser default).")
     } else {
         ToolOutput::success(format!("CPU throttling set to {rate}x slowdown."))
@@ -1225,7 +1210,7 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
         ToolOutput::error("run_scenario warmup + runs exceeds the supported u32 run count")
     })?;
     if let Some(tr) = input.throttle_rate {
-        if tr < 1.0 {
+        if !tr.is_finite() || tr < 1.0 {
             return Err(ToolOutput::error(format!(
                 "Invalid throttle_rate {tr}: must be >= 1 (1 = no throttling)"
             )));
@@ -1248,7 +1233,11 @@ async fn action_run_scenario(
     input: &ProfileInput,
     plan: ScenarioPlan,
 ) -> ToolOutput {
-    let owner = match session.read().await.scenario_owner() {
+    let owner = match session.try_read() {
+        Ok(guard) => guard.scenario_owner(),
+        Err(_) => return ToolOutput::error("Browser session is busy; scenario was not started"),
+    };
+    let owner = match owner {
         Ok(owner) => owner,
         Err(error) => return ToolOutput::error(error),
     };
@@ -1263,10 +1252,13 @@ async fn action_run_scenario(
             guard = session.write() => guard,
         };
         let mut guard = guard;
-        let prior_throttle = guard.profiling
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .throttle_rate;
+        let prior_throttle = match guard.throttle_rate() {
+            Ok(rate) => rate,
+            Err(error) => {
+                let _ = output.send(ToolOutput::error(error));
+                return;
+            }
+        };
 
         let mut outcome = {
         let operation = async {
@@ -1293,16 +1285,8 @@ async fn action_run_scenario(
         }
         };
 
-        let page = guard.page.clone();
-        let profiling = guard.profiling.clone();
         let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
-            let (touch, throttle) = tokio::join!(guard.cancel_touch(), async {
-                page.execute(SetCpuThrottlingRateParams::new(prior_throttle.unwrap_or(1.0)))
-                    .await
-                    .map_err(|error| format!("Throttle restoration failed: {error}"))?;
-                profiling.lock().unwrap_or_else(std::sync::PoisonError::into_inner).throttle_rate = prior_throttle;
-                Ok::<_, String>(())
-            });
+            let (touch, throttle) = guard.restore_scenario_state(prior_throttle).await;
             match (touch, throttle) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(touch), Err(throttle)) => Err(format!("Touch cancellation failed: {touch}; {throttle}")),
@@ -1366,18 +1350,9 @@ async fn run_scenario_locked(
     } = plan;
     let warnings = build_methodology_warnings(input, &steps, gc_per_run, &reset);
     if let Some(rate) = input.throttle_rate {
-        if let Err(error) = session
-            .page
-            .execute(SetCpuThrottlingRateParams::new(rate))
-            .await
-        {
-            return ToolOutput::error(error.to_string());
+        if let Err(error) = session.set_throttle_rate(rate).await {
+            return ToolOutput::error(error);
         }
-        session
-            .profiling
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .throttle_rate = Some(rate);
     }
 
     let mut samples = Vec::with_capacity(runs as usize);
@@ -1430,6 +1405,7 @@ async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), Strin
             .map(|_| ())
             .map_err(|e| format!("reload failed: {e}")),
         Step::Click { selector } => {
+            let _input = session.lock_native_input().await;
             let el = session
                 .page
                 .find_element(selector)
@@ -1441,6 +1417,7 @@ async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), Strin
                 .map_err(|e| format!("click on {selector} failed: {e}"))
         }
         Step::Type { selector, text } => {
+            let _input = session.lock_native_input().await;
             let el = session
                 .page
                 .find_element(selector)
@@ -2497,6 +2474,285 @@ async fn action_coverage_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn throttle_test_session() -> Option<(
+        phoenix_browser::BrowserSessionManager,
+        Arc<RwLock<BrowserSession>>,
+    )> {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return None;
+        }
+        let manager = phoenix_browser::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("profile-throttle-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        Some((manager, session))
+    }
+
+    fn mutation_scenario() -> ProfileInput {
+        parse_profile_input(json!({
+            "action": "run_scenario", "warmup": 0, "runs": 1,
+            "throttle_rate": 2,
+            "reset": {"kind": "navigate", "url": "about:blank#unexpected-reset"},
+            "steps": [{"kind": "eval", "expression": "globalThis.unexpectedScenario = true"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scenario_admission_returns_busy_before_write_release_and_never_queues_worker() {
+        let Some((manager, session)) = throttle_test_session().await else {
+            return;
+        };
+        let guard = session.write().await;
+        let owner = guard.scenario_owner().unwrap();
+        let page = guard.page.clone();
+        let before_url = page.url().await.unwrap();
+        let input = mutation_scenario();
+        let plan = validate_run_scenario(&input).unwrap();
+        let mut admission = Box::pin(action_run_scenario(&session, &input, plan));
+        let std::task::Poll::Ready(output) = futures::poll!(&mut admission) else {
+            panic!("admission waited for the held session write lock");
+        };
+        assert!(output.output().contains("busy"));
+        drop(admission);
+        // A rejected admission must not leave a worker waiting on the held lock.
+        let (entered, worker_entered) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        owner
+            .start(move |_| async move {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+            })
+            .expect("rejection must not reserve the scenario owner");
+        worker_entered.await.unwrap();
+        drop(guard);
+        assert_eq!(page.url().await.unwrap(), before_url);
+        assert_eq!(
+            session.read().await.throttle_rate().unwrap().to_bits(),
+            1.0_f64.to_bits()
+        );
+        release.send(()).unwrap();
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn standalone_throttle_holds_write_lock_through_acknowledged_state_commit() {
+        let Some((manager, session)) = throttle_test_session().await else {
+            return;
+        };
+        let mut action = Box::pin(action_throttle(&session, Some(4.0)));
+        // On the current-thread runtime the CDP driver cannot acknowledge until yielded to.
+        assert!(futures::poll!(&mut action).is_pending());
+        assert!(
+            session.try_read().is_err(),
+            "dispatch must own a write, not a read, lease"
+        );
+        let mut observer = Box::pin(session.write());
+        assert!(futures::poll!(&mut observer).is_pending());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let observe = async {
+                let guard = observer.await;
+                assert_eq!(
+                    guard.throttle_rate().unwrap().to_bits(),
+                    4.0_f64.to_bits(),
+                    "queued writer observed an acknowledgement/state-commit gap"
+                );
+            };
+            let (output, ()) = tokio::join!(&mut action, observe);
+            assert!(output.output().contains("4x"));
+        })
+        .await
+        .expect("dispatch and queued observer complete");
+        drop(action);
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn unknown_throttle_blocks_scenario_before_reset_and_explicit_setup() {
+        let Some((manager, session)) = throttle_test_session().await else {
+            return;
+        };
+        let page = session.read().await.page.clone();
+        let before_url = page.url().await.unwrap();
+        {
+            let mut guard = session.write().await;
+            {
+                let mut dispatch = Box::pin(guard.set_throttle_rate(4.0));
+                assert!(futures::poll!(&mut dispatch).is_pending());
+            }
+            assert!(guard.throttle_rate().is_err());
+        }
+        let input = mutation_scenario();
+        let plan = validate_run_scenario(&input).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            action_run_scenario(&session, &input, plan),
+        )
+        .await
+        .unwrap();
+        assert!(output.output().contains("CPU throttle is unknown"));
+        assert_eq!(
+            page.url().await.unwrap(),
+            before_url,
+            "scenario reset must not run"
+        );
+        assert!(
+            session.read().await.throttle_rate().is_err(),
+            "scenario setup/cleanup must not mask unknown prior state"
+        );
+        assert!(page
+            .evaluate("globalThis.unexpectedScenario === undefined")
+            .await
+            .unwrap()
+            .into_value::<bool>()
+            .unwrap());
+        let output = action_throttle(&session, Some(1.0)).await;
+        assert!(output.output().contains("cleared"));
+        assert_eq!(
+            session.read().await.throttle_rate().unwrap().to_bits(),
+            1.0_f64.to_bits()
+        );
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn failed_scenario_restores_acknowledged_prior_throttle() {
+        let Some((manager, session)) = throttle_test_session().await else {
+            return;
+        };
+        action_throttle(&session, Some(4.0)).await;
+        assert_eq!(
+            session.read().await.throttle_rate().unwrap().to_bits(),
+            4.0_f64.to_bits()
+        );
+        let input = parse_profile_input(json!({
+            "action": "run_scenario", "warmup": 0, "runs": 1,
+            "throttle_rate": 2, "reset": "none", "gc_per_run": false,
+            "steps": [{"kind": "eval", "expression": "throw new Error('injected-scenario-failure')"}]
+        })).unwrap();
+        let plan = validate_run_scenario(&input).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            action_run_scenario(&session, &input, plan),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.output().contains("injected-scenario-failure"),
+            "{}",
+            output.output()
+        );
+        assert_eq!(
+            session.read().await.throttle_rate().unwrap().to_bits(),
+            4.0_f64.to_bits()
+        );
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    async fn assert_selector_step_waits_for_reference_cleanup(step: Step, expected: Value) {
+        use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = phoenix_browser::BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(
+            WorkScopeId::parse(format!("profile-native-input-{}", uuid::Uuid::new_v4())).unwrap(),
+        );
+        let session = manager.get_session(&scope).await.expect("Chrome session");
+        {
+            let mut session = session.write().await;
+            let page = session.page.clone();
+            page.goto("about:blank").await.unwrap();
+            page.evaluate(r#"document.body.innerHTML = '<button id="guarded">Guarded</button><button id="target" onclick="window.clicks++">Target</button><input id="text" onclick="window.focusClicks++">'; window.clicks = 0; window.focusClicks = 0;"#).await.unwrap();
+            let lease = session.lock_native_input().await;
+            let input_lock = tokio::sync::OwnedMutexGuard::mutex(&lease).clone();
+            page.evaluate("globalThis.__phoenixReferenceInputGuard.arm(document.querySelector('#guarded'), 'profile-cleanup'); true").await.unwrap();
+
+            let mut operation = Box::pin(run_step(&mut session, &step));
+            assert!(
+                futures::poll!(&mut operation).is_pending(),
+                "step must wait while cleanup owns native input"
+            );
+            let mut next_input = Box::pin(input_lock.lock_owned());
+            assert!(futures::poll!(&mut next_input).is_pending());
+            assert_eq!(
+                page.evaluate(
+                    "[window.clicks, window.focusClicks, document.querySelector('#text').value]"
+                )
+                .await
+                .unwrap()
+                .into_value::<Value>()
+                .unwrap(),
+                json!([0, 0, ""])
+            );
+            assert!(futures::poll!(&mut operation).is_pending());
+
+            page.evaluate(
+                "globalThis.__phoenixReferenceInputGuard.cancel('profile-cleanup'); true",
+            )
+            .await
+            .unwrap();
+            drop(lease);
+            // Tokio's FIFO mutex reserves the released lease for the already-polled step.
+            assert!(
+                futures::poll!(&mut next_input).is_pending(),
+                "run_step must queue for the native-input lease before any CDP work"
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    biased;
+                    _ = &mut next_input => panic!("step released native input before completing"),
+                    result = &mut operation => result.expect("selector step succeeds after guard cleanup"),
+                }
+            }).await.expect("selector step completes");
+            drop(operation);
+            let _next_input = next_input.await;
+            assert_eq!(
+                page.evaluate(
+                    "[window.clicks, window.focusClicks, document.querySelector('#text').value]"
+                )
+                .await
+                .unwrap()
+                .into_value::<Value>()
+                .unwrap(),
+                expected
+            );
+        }
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn click_step_waits_for_cancelled_reference_guard_cleanup() {
+        assert_selector_step_waits_for_reference_cleanup(
+            Step::Click {
+                selector: "#target".to_string(),
+            },
+            json!([1, 0, ""]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn type_step_waits_for_cancelled_reference_guard_cleanup() {
+        assert_selector_step_waits_for_reference_cleanup(
+            Step::Type {
+                selector: "#text".to_string(),
+                text: "native lease".to_string(),
+            },
+            json!([0, 1, "native lease"]),
+        )
+        .await;
+    }
 
     #[test]
     fn touch_and_pause_steps_deserialize_for_exclusive_scenario_dispatch() {

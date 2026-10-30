@@ -543,8 +543,8 @@ pub struct ConsoleEntry {
 
 /// Conversation-scoped performance-profiling state (REQ-BT-019).
 ///
-/// Models the three independent capture sub-machines plus the CPU-throttle
-/// override and trace buffer from `browser-profiling.allium`. It hangs off
+/// Models the three independent capture sub-machines and trace buffer
+/// from `browser-profiling.allium`. It hangs off
 /// [`BrowserSession`] so the precondition gates are enforced per conversation
 /// (invariant `ProfilingConversationScoped`) and reset structurally when the
 /// session dies (rule `SessionDeathResetsAllCaptures`) — dropping the session
@@ -557,10 +557,6 @@ pub struct ProfilingState {
     pub tracing_active: bool,
     /// JS coverage sub-machine (REQ-BT-019.11). idle when false.
     pub coverage_active: bool,
-    /// CPU-throttle override (REQ-BT-019.2). `None` = browser default; a
-    /// `Some(rate)` always carries `rate >= 1` (invariant
-    /// `ThrottleRateWellFormed`), set only via the gated throttle action.
-    pub throttle_rate: Option<f64>,
     /// Buffered `Tracing.dataCollected` events. Non-empty only while
     /// `tracing_active` (invariant `TraceBufferOnlyWhileActive`): cleared
     /// before arming on start, drained-then-cleared on stop.
@@ -676,6 +672,7 @@ pub struct BrowserSession {
     pub page: Page,
     device: crate::device::DeviceState,
     touch: crate::touch::TouchState,
+    throttle: crate::throttle::ThrottleState,
     scenario_owner: std::sync::Weak<crate::scenario::ScenarioOwner>,
     /// Conversation-scoped profiling state (REQ-BT-019). The
     /// `browser_profile` tool reads/mutates this through the session guard;
@@ -3047,6 +3044,29 @@ impl BrowserSessionManager {
 }
 
 impl BrowserSession {
+    /// # Errors
+    /// Returns an error if no CPU throttle rate is known after an incomplete dispatch.
+    pub fn throttle_rate(&self) -> Result<f64, String> {
+        self.throttle.known()
+    }
+
+    /// # Errors
+    /// Returns an error for a nonfinite rate, a rate below 1, or a failed CDP command.
+    pub async fn set_throttle_rate(&mut self, rate: f64) -> Result<(), String> {
+        self.throttle.set(&self.page, rate).await
+    }
+
+    /// Cancel contact and restore CPU throttling independently under the caller's deadline.
+    pub async fn restore_scenario_state(
+        &mut self,
+        rate: f64,
+    ) -> (Result<(), String>, Result<(), String>) {
+        tokio::join!(
+            self.touch.cancel_on(&self.page),
+            self.throttle.set(&self.page, rate),
+        )
+    }
+
     /// # Errors
     /// Returns an error if the session's weak scenario-owner reference cannot
     /// be upgraded because no managed owner remains alive.

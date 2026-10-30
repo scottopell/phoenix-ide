@@ -312,46 +312,50 @@ impl LaunchSlot {
         let LaunchState::Pending(pending) = state else {
             unreachable!()
         };
-        let result = pending
-            .initialize(
-                &self.profile,
-                &self.key,
-                #[cfg(test)]
-                fault,
-            )
-            .await;
-        match result {
-            Ok(page) => {
-                BrowserSession::inject_react_helper(&page).await;
-                let reference_guard_available =
-                    BrowserSession::install_reference_guard(&page).await;
-                let mut device = crate::device::DeviceState::default();
-                device
-                    .configure(&page, crate::device::DeviceConfig::default())
-                    .await
-                    .map_err(BrowserError::OperationFailed)?;
-                let LaunchState::Pending(pending) = std::mem::replace(state, LaunchState::Stopped)
-                else {
-                    unreachable!()
-                };
-                let session = Arc::new(RwLock::new((*pending).into_session(
-                    page,
-                    reference_guard_available,
-                    device,
-                    Arc::downgrade(&self.scenario_owner),
-                )));
-                *state = LaunchState::Ready(session.clone());
-                BrowserSessionManager::setup_session_listeners(session).await;
-                Ok(())
-            }
-            Err(error) => {
-                // The aggregate stays in the slot even if cleanup fails.
-                if let Err(cleanup) = self.stop_state(state).await {
-                    tracing::warn!(%cleanup, "partial browser cleanup failed; retaining exact launch");
-                }
-                Err(error)
+        let result = async {
+            let page = pending
+                .initialize(
+                    &self.profile,
+                    &self.key,
+                    #[cfg(test)]
+                    fault,
+                )
+                .await?;
+            BrowserSession::inject_react_helper(&page).await;
+            let reference_guard_available = BrowserSession::install_reference_guard(&page).await;
+            let mut device = crate::device::DeviceState::default();
+            apply_initial_device(device.configure(&page, crate::device::DeviceConfig::default()))
+                .await?;
+            Ok((page, reference_guard_available, device))
+        }
+        .await;
+        let (page, reference_guard_available, device) =
+            self.retain_initialization_failure(state, result).await?;
+        let LaunchState::Pending(pending) = std::mem::replace(state, LaunchState::Stopped) else {
+            unreachable!()
+        };
+        let session = Arc::new(RwLock::new((*pending).into_session(
+            page,
+            reference_guard_available,
+            device,
+            Arc::downgrade(&self.scenario_owner),
+        )));
+        *state = LaunchState::Ready(session.clone());
+        BrowserSessionManager::setup_session_listeners(session).await;
+        Ok(())
+    }
+
+    async fn retain_initialization_failure<T>(
+        &self,
+        state: &mut LaunchState,
+        result: Result<T, BrowserError>,
+    ) -> Result<T, BrowserError> {
+        if result.is_err() {
+            if let Err(cleanup) = self.stop_state(state).await {
+                tracing::warn!(%cleanup, "partial browser cleanup failed; retaining exact launch");
             }
         }
+        result
     }
 
     async fn stop_state(
@@ -463,6 +467,19 @@ impl LaunchSlot {
     }
 }
 
+async fn apply_initial_device(
+    operation: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), BrowserError> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), operation)
+        .await
+        .map_err(|_| {
+            BrowserError::OperationFailed(
+                "default device initialization timed out after 15 seconds".into(),
+            )
+        })?
+        .map_err(BrowserError::OperationFailed)
+}
+
 impl PendingBrowser {
     async fn initialize(
         &mut self,
@@ -562,6 +579,7 @@ impl PendingBrowser {
             page,
             device,
             touch: crate::touch::TouchState::default(),
+            throttle: crate::throttle::ThrottleState::default(),
             scenario_owner,
             profiling: Arc::new(StdMutex::new(ProfilingState::default())),
             trace_complete: Arc::new(tokio::sync::Notify::new()),
@@ -834,6 +852,85 @@ pub(super) mod tests {
             },
         );
         slot
+    }
+
+    async fn assert_default_device_failure_retains_cleanup(failing_command: usize, pending: bool) {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let commands = AtomicUsize::new(0);
+        let mut device = crate::device::DeviceState::default();
+        let mut state = slot.state.write().await;
+        *state = LaunchState::InjectedPending(InjectedPending {
+            failures_remaining: 1,
+            stop_attempts: stop_attempts.clone(),
+            dropped: dropped.clone(),
+        });
+        let result =
+            apply_initial_device(device.apply(crate::device::DeviceConfig::default(), async {
+                for command in 1..=2 {
+                    commands.fetch_add(1, Ordering::SeqCst);
+                    if pending && command == 1 {
+                        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    }
+                    if command == failing_command {
+                        if pending {
+                            return std::future::pending::<Result<(), String>>().await;
+                        }
+                        return Err(format!("injected device command {command} failure"));
+                    }
+                }
+                Ok(())
+            }))
+            .await;
+        let error = slot
+            .retain_initialization_failure(&mut state, result)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(if pending {
+            "default device initialization timed out"
+        } else {
+            "injected device command"
+        }));
+        assert_eq!(commands.load(Ordering::SeqCst), failing_command);
+        assert!(device.known().is_err());
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(matches!(&*state, LaunchState::InjectedPending(_)));
+        drop(state);
+        assert!(manager.get_session(&scope).await.is_err());
+        assert!(slot.driver.lock().unwrap().is_none());
+        let permit = manager.begin_retirement(&scope).await;
+        assert_eq!(permit.instances.len(), 1);
+        assert_eq!(
+            manager.complete_retirement(&permit).await,
+            BrowserRetirementOutcome::Retired
+        );
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!manager.is_active(&scope).await);
+    }
+
+    #[tokio::test]
+    async fn default_device_first_command_error_attempts_cleanup_and_retains_authority() {
+        assert_default_device_failure_retains_cleanup(1, false).await;
+    }
+
+    #[tokio::test]
+    async fn default_device_second_command_error_attempts_cleanup_and_retains_authority() {
+        assert_default_device_failure_retains_cleanup(2, false).await;
+    }
+
+    #[tokio::test]
+    async fn default_device_pending_command_times_out_and_retains_cleanup_authority() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            assert_default_device_failure_retains_cleanup(2, true),
+        )
+        .await
+        .expect("device deadline must settle initialization and permit exact-slot cleanup");
     }
 
     #[test]
