@@ -14174,6 +14174,7 @@ impl Database {
                         m.created_at, m.origin_kind, m.origin_product_conversation_id, \
                         m.origin_transcript_id, m.origin_subscription_event_id, \
                         m.origin_source_message_id, m.origin_source_tool_use_id, \
+                        m.origin_slack_request_id, \
                         CASE WHEN json_valid(m.display_data) \
                                   AND json_type(m.display_data, '$.hidden') = 'true' \
                              THEN 1 ELSE 0 END AS hidden, \
@@ -14321,6 +14322,7 @@ impl Database {
                     m.created_at, m.origin_kind, m.origin_product_conversation_id, \
                     m.origin_transcript_id, m.origin_subscription_event_id, \
                     m.origin_source_message_id, m.origin_source_tool_use_id, \
+                    m.origin_slack_request_id, \
                     CASE WHEN json_valid(m.display_data) \
                               AND json_type(m.display_data, '$.hidden') = 'true' \
                          THEN 1 ELSE 0 END AS hidden, \
@@ -22920,7 +22922,9 @@ mod tests {
                 }],
             ),
             Some(&serde_json::json!({"hidden": true})),
-            None,
+            Some(phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                request_id: "slack-request-bounded".to_string(),
+            }),
         )
         .await
         .unwrap();
@@ -22957,6 +22961,12 @@ mod tests {
         assert!(exact[0].hidden);
         assert_eq!(exact[0].file_count, 1);
         assert_eq!(exact[0].image_count, 1);
+        assert_eq!(
+            exact[0].origin,
+            phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                request_id: "slack-request-bounded".to_string(),
+            }
+        );
 
         let oversized = db
             .get_bounded_read_messages_after_limited(
