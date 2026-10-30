@@ -462,7 +462,13 @@ impl BrowserProfileTool {
                     Ok(plan) => plan,
                     Err(error) => return error,
                 };
-                on_browser!(session => action_run_scenario(&session, &input, plan).await)
+                on_browser!(session => {
+                    let owner = match access.scenario_owner(&session).await {
+                        Ok(owner) => owner,
+                        Err(error) => return ToolOutput::error(error),
+                    };
+                    action_run_scenario(&session, owner, &input, plan).await
+                })
             }
             ProfileAction::Metrics => on_browser!(session => action_metrics(&session).await),
             ProfileAction::Throttle => {
@@ -831,11 +837,12 @@ struct RunSample {
 }
 
 /// Why a single run did not yield a sample.
+#[derive(Debug)]
 enum RunError {
     /// A readiness step did not satisfy in time — fails the whole op,
     /// names the step (REQ-BT-019.1 / `BlockedScenarioYieldsNoSamples`).
     Blocked(String),
-    /// Infrastructure failure (metrics snapshot) — abort the op.
+    /// Infrastructure or action dispatch failure — abort the op.
     Infra(String),
 }
 
@@ -901,9 +908,7 @@ async fn run_one(
     let measured_start = match setup_end {
         Some(idx) => {
             for step in &steps[..=idx] {
-                if let Err(reason) = run_step(session, step).await {
-                    return Err(RunError::Blocked(reason));
-                }
+                run_step(session, step).await?;
             }
             idx + 1
         }
@@ -924,9 +929,7 @@ async fn run_one(
     // Dispatch the REMAINING (measured) steps. A readiness failure here
     // also blocks the whole operation (REQ-BT-019.1).
     for step in &steps[measured_start..] {
-        if let Err(reason) = run_step(session, step).await {
-            return Err(RunError::Blocked(reason));
-        }
+        run_step(session, step).await?;
     }
 
     // CLOSE the window: read the in-page accumulators in one call
@@ -1230,17 +1233,10 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
 
 async fn action_run_scenario(
     session: &Arc<RwLock<BrowserSession>>,
+    owner: Arc<phoenix_browser::scenario::ScenarioOwner>,
     input: &ProfileInput,
     plan: ScenarioPlan,
 ) -> ToolOutput {
-    let owner = match session.try_read() {
-        Ok(guard) => guard.scenario_owner(),
-        Err(_) => return ToolOutput::error("Browser session is busy; scenario was not started"),
-    };
-    let owner = match owner {
-        Ok(owner) => owner,
-        Err(error) => return ToolOutput::error(error),
-    };
     let session = session.clone();
     let input = input.clone();
     let (mut output, result) = tokio::sync::oneshot::channel();
@@ -1369,25 +1365,21 @@ async fn run_scenario_locked(
     scenario_success_output(&samples, runs, warmup, &warnings).await
 }
 
-/// Execute one scenario step. `Err(reason)` means a readiness step did not
-/// satisfy within its timeout — the caller fails the whole operation.
-async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), String> {
+/// Execute one scenario step, distinguishing readiness from dispatch failures.
+async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), RunError> {
     match step {
-        Step::TouchStart { x, y } => {
-            session
-                .dispatch_touch(phoenix_browser::touch::TouchAction::Start { x: *x, y: *y })
-                .await
-        }
-        Step::TouchMove { x, y } => {
-            session
-                .dispatch_touch(phoenix_browser::touch::TouchAction::Move { x: *x, y: *y })
-                .await
-        }
-        Step::TouchEnd => {
-            session
-                .dispatch_touch(phoenix_browser::touch::TouchAction::End)
-                .await
-        }
+        Step::TouchStart { x, y } => session
+            .dispatch_touch(phoenix_browser::touch::TouchAction::Start { x: *x, y: *y })
+            .await
+            .map_err(RunError::Infra),
+        Step::TouchMove { x, y } => session
+            .dispatch_touch(phoenix_browser::touch::TouchAction::Move { x: *x, y: *y })
+            .await
+            .map_err(RunError::Infra),
+        Step::TouchEnd => session
+            .dispatch_touch(phoenix_browser::touch::TouchAction::End)
+            .await
+            .map_err(RunError::Infra),
         Step::Pause { milliseconds } => {
             tokio::time::sleep(Duration::from_millis(*milliseconds)).await;
             Ok(())
@@ -1397,54 +1389,55 @@ async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), Strin
             .goto(url)
             .await
             .map(|_| ())
-            .map_err(|e| format!("navigate to {url} failed: {e}")),
+            .map_err(|e| RunError::Infra(format!("navigate to {url} failed: {e}"))),
         Step::Reload => session
             .page
             .reload()
             .await
             .map(|_| ())
-            .map_err(|e| format!("reload failed: {e}")),
+            .map_err(|e| RunError::Infra(format!("reload failed: {e}"))),
         Step::Click { selector } => {
             let _input = session.lock_native_input().await;
-            let el = session
-                .page
-                .find_element(selector)
-                .await
-                .map_err(|e| format!("click: element {selector} not found: {e}"))?;
+            let el = session.page.find_element(selector).await.map_err(|e| {
+                RunError::Infra(format!("click: element {selector} not found: {e}"))
+            })?;
             el.click()
                 .await
                 .map(|_| ())
-                .map_err(|e| format!("click on {selector} failed: {e}"))
+                .map_err(|e| RunError::Infra(format!("click on {selector} failed: {e}")))
         }
         Step::Type { selector, text } => {
             let _input = session.lock_native_input().await;
-            let el = session
-                .page
-                .find_element(selector)
-                .await
-                .map_err(|e| format!("type: element {selector} not found: {e}"))?;
+            let el =
+                session.page.find_element(selector).await.map_err(|e| {
+                    RunError::Infra(format!("type: element {selector} not found: {e}"))
+                })?;
             el.click()
                 .await
-                .map_err(|e| format!("type: focus {selector} failed: {e}"))?;
+                .map_err(|e| RunError::Infra(format!("type: focus {selector} failed: {e}")))?;
             el.type_str(text)
                 .await
                 .map(|_| ())
-                .map_err(|e| format!("type into {selector} failed: {e}"))
+                .map_err(|e| RunError::Infra(format!("type into {selector} failed: {e}")))
         }
-        Step::Key { key, modifiers } => run_key_step(session, key, modifiers).await,
+        Step::Key { key, modifiers } => run_key_step(session, key, modifiers)
+            .await
+            .map_err(RunError::Infra),
         Step::Eval { expression } => session
             .page
             .evaluate(expression.clone())
             .await
             .map(|_| ())
-            .map_err(|e| format!("eval failed: {e}")),
+            .map_err(|e| RunError::Infra(format!("eval failed: {e}"))),
         Step::WaitSelector { selector, timeout } => {
             let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
             let check = format!(
                 "document.querySelector({}) !== null",
                 serde_json::to_string(selector).unwrap_or_default()
             );
-            poll(session, &check, to, &format!("wait_selector {selector}")).await
+            poll(session, &check, to, &format!("wait_selector {selector}"))
+                .await
+                .map_err(RunError::Blocked)
         }
         Step::WaitTiming { mark, timeout } => {
             let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
@@ -1452,14 +1445,18 @@ async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), Strin
                 "performance.getEntriesByName({}, 'mark').length > 0",
                 serde_json::to_string(mark).unwrap_or_default()
             );
-            poll(session, &check, to, &format!("wait_timing {mark}")).await
+            poll(session, &check, to, &format!("wait_timing {mark}"))
+                .await
+                .map_err(RunError::Blocked)
         }
         Step::WaitEval {
             expression,
             timeout,
         } => {
             let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
-            poll(session, &format!("!!({expression})"), to, "wait_eval").await
+            poll(session, &format!("!!({expression})"), to, "wait_eval")
+                .await
+                .map_err(RunError::Blocked)
         }
     }
 }
@@ -2509,35 +2506,83 @@ mod tests {
         let Some((manager, session)) = throttle_test_session().await else {
             return;
         };
-        let guard = session.write().await;
-        let owner = guard.scenario_owner().unwrap();
-        let page = guard.page.clone();
+        let owner = manager.scenario_owner_for_session(&session).await.unwrap();
+        let page = session.read().await.page.clone();
         let before_url = page.url().await.unwrap();
-        let input = mutation_scenario();
-        let plan = validate_run_scenario(&input).unwrap();
-        let mut admission = Box::pin(action_run_scenario(&session, &input, plan));
-        let std::task::Poll::Ready(output) = futures::poll!(&mut admission) else {
-            panic!("admission waited for the held session write lock");
-        };
-        assert!(output.output().contains("busy"));
-        drop(admission);
-        // A rejected admission must not leave a worker waiting on the held lock.
         let (entered, worker_entered) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
+        let worker_session = session.clone();
         owner
             .start(move |_| async move {
+                let _guard = worker_session.write().await;
                 entered.send(()).unwrap();
                 released.await.unwrap();
             })
-            .expect("rejection must not reserve the scenario owner");
+            .unwrap();
         worker_entered.await.unwrap();
-        drop(guard);
-        assert_eq!(page.url().await.unwrap(), before_url);
-        assert_eq!(
-            session.read().await.throttle_rate().unwrap().to_bits(),
-            1.0_f64.to_bits()
+        let input = mutation_scenario();
+        let plan = validate_run_scenario(&input).unwrap();
+        let resolved = manager.scenario_owner_for_session(&session).await.unwrap();
+        assert!(Arc::ptr_eq(&owner, &resolved));
+        let mut admission = Box::pin(action_run_scenario(&session, resolved, &input, plan));
+        let std::task::Poll::Ready(output) = futures::poll!(&mut admission) else {
+            panic!("competing admission waited for the running worker's session lock");
+        };
+        assert!(
+            output.output().contains("Another browser scenario"),
+            "{}",
+            output.output()
         );
+        drop(admission);
         release.send(()).unwrap();
+        let guard = session.read().await;
+        assert_eq!(page.url().await.unwrap(), before_url);
+        assert_eq!(guard.throttle_rate().unwrap().to_bits(), 1.0_f64.to_bits());
+        drop(guard);
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
+    #[tokio::test]
+    async fn run_one_preserves_touch_dispatch_infra_and_readiness_blocked() {
+        let Some((manager, session)) = throttle_test_session().await else {
+            return;
+        };
+        let mut guard = session.write().await;
+        guard.page.goto("about:blank").await.unwrap();
+        let expected = guard
+            .dispatch_touch(phoenix_browser::touch::TouchAction::Move { x: 1.0, y: 1.0 })
+            .await
+            .expect_err("touch move without enabled touch/contact must fail");
+        let ready = Step::WaitEval {
+            expression: "true".into(),
+            timeout: None,
+        };
+        // Exercise both the untimed setup loop and measured-step loop.
+        for steps in [
+            vec![Step::TouchMove { x: 1.0, y: 1.0 }, ready.clone()],
+            vec![ready, Step::TouchMove { x: 1.0, y: 1.0 }],
+        ] {
+            let error = run_one(&mut guard, &steps, 0, &Reset::Skip, false)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, RunError::Infra(ref reason) if reason == &expected),
+                "{error:?}"
+            );
+        }
+        let blocked = [Step::WaitEval {
+            expression: "false".into(),
+            timeout: Some(ScenarioWaitTimeout(Duration::ZERO)),
+        }];
+        let error = run_one(&mut guard, &blocked, 0, &Reset::Skip, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RunError::Blocked(ref reason) if reason.contains("wait_eval")),
+            "{error:?}"
+        );
+        guard.ensure_touch_idle().unwrap();
+        drop(guard);
         manager.shutdown_all().await.expect("browser shutdown");
     }
 
@@ -2592,7 +2637,12 @@ mod tests {
         let plan = validate_run_scenario(&input).unwrap();
         let output = tokio::time::timeout(
             Duration::from_secs(5),
-            action_run_scenario(&session, &input, plan),
+            action_run_scenario(
+                &session,
+                manager.scenario_owner_for_session(&session).await.unwrap(),
+                &input,
+                plan,
+            ),
         )
         .await
         .unwrap();
@@ -2639,7 +2689,12 @@ mod tests {
         let plan = validate_run_scenario(&input).unwrap();
         let output = tokio::time::timeout(
             Duration::from_secs(10),
-            action_run_scenario(&session, &input, plan),
+            action_run_scenario(
+                &session,
+                manager.scenario_owner_for_session(&session).await.unwrap(),
+                &input,
+                plan,
+            ),
         )
         .await
         .unwrap();

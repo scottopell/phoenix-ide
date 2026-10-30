@@ -204,6 +204,10 @@ impl LaunchSlot {
         )
     }
 
+    pub(super) fn scenario_owner(&self) -> Arc<crate::scenario::ScenarioOwner> {
+        self.scenario_owner.clone()
+    }
+
     pub(super) fn ready(&self) -> Option<Arc<RwLock<BrowserSession>>> {
         self.state.try_read().ok().and_then(|state| match &*state {
             #[cfg(test)]

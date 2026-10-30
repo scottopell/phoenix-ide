@@ -120,6 +120,97 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
     (ctx, manager)
 }
 
+#[tokio::test]
+async fn registered_native_scenario_admits_under_unrelated_lock_and_rejects_competitor() {
+    require_chrome!();
+    let (ctx, manager) = test_context("scenario-lock-admission");
+    let session = ctx.browser().await.expect("Chrome session");
+    let guard = session.write().await;
+    guard.page.goto("about:blank").await.unwrap();
+    let registry = crate::ToolRegistry::direct(Vec::new());
+    let profile = registry.find_tool("browser_profile").unwrap();
+    let input = json!({
+        "action": "run_scenario", "runs": 1, "warmup": 0,
+        "reset": "none", "gc_per_run": false, "throttle_rate": 2,
+        "steps": [
+            {"kind": "wait_eval", "expression": "true"},
+            {"kind": "eval", "expression": "globalThis.admittedScenario = 1"}
+        ]
+    });
+    let mut first = Box::pin(profile.run(input.clone(), ctx.clone()));
+    assert!(
+        futures::poll!(&mut first).is_pending(),
+        "unrelated session lock must not reject admission"
+    );
+    let mut competing = Box::pin(profile.run(input, ctx.clone()));
+    let std::task::Poll::Ready(rejected) = futures::poll!(&mut competing) else {
+        panic!("competing admission waited for the session lock");
+    };
+    assert!(
+        rejected.output().contains("Another browser scenario"),
+        "{}",
+        rejected.output()
+    );
+    assert!(!rejected.is_success());
+    let not_executed = guard
+        .page
+        .evaluate("globalThis.admittedScenario === undefined")
+        .await
+        .unwrap();
+    assert!(not_executed.into_value::<bool>().unwrap());
+    drop(competing);
+    drop(guard);
+    let output = tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap();
+    assert!(output.is_success(), "{}", output.output());
+    let guard = session.read().await;
+    assert!(guard
+        .page
+        .evaluate("globalThis.admittedScenario === 1")
+        .await
+        .unwrap()
+        .into_value::<bool>()
+        .unwrap());
+    assert_eq!(guard.throttle_rate().unwrap().to_bits(), 1.0_f64.to_bits());
+    drop(guard);
+    manager.shutdown_all().await.expect("browser shutdown");
+}
+
+#[tokio::test]
+async fn scenario_owner_lookup_rejects_foreign_replaced_and_retiring_launches() {
+    require_chrome!();
+    let (ctx, manager) = test_context("scenario-owner-identity");
+    let old = ctx.browser().await.unwrap();
+    let owner = manager.scenario_owner_for_session(&old).await.unwrap();
+    let foreign = BrowserSessionManager::new();
+    assert!(foreign.scenario_owner_for_session(&old).await.is_err());
+    manager.kill_session(&ctx.work_scope).await.unwrap();
+    let replacement = ctx.browser().await.unwrap();
+    let replacement_owner = manager
+        .scenario_owner_for_session(&replacement)
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    assert!(!Arc::ptr_eq(&owner, &replacement_owner));
+    assert!(manager.scenario_owner_for_session(&old).await.is_err());
+    let guard = replacement.write().await;
+    assert!(Arc::ptr_eq(
+        &replacement_owner,
+        &manager
+            .scenario_owner_for_session(&replacement)
+            .await
+            .unwrap()
+    ));
+    let _permit = manager.begin_retirement(&ctx.work_scope).await;
+    assert!(manager
+        .scenario_owner_for_session(&replacement)
+        .await
+        .is_err());
+    drop(guard);
+    manager.shutdown_all().await.expect("browser shutdown");
+}
+
 #[test]
 fn test_contexts_have_isolated_and_rediscoverable_browser_scopes() {
     let (first, _) = test_context("first");

@@ -2080,6 +2080,48 @@ impl BrowserSessionManager {
         self.get_session_with_creator(work_scope, actor).await
     }
 
+    /// Resolve the broker for an exact registered session without locking the session.
+    ///
+    /// # Errors
+    /// Rejects absent, retiring, or teardown-failed launches.
+    pub async fn scenario_owner_for_session(
+        &self,
+        session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<crate::scenario::ScenarioOwner>, String> {
+        let state = self.state.read().await;
+        self.ensure_accepting_sessions()
+            .map_err(|error| error.to_string())?;
+        let (key, entry) = state
+            .sessions
+            .iter()
+            .find(|(_, entry)| {
+                entry
+                    .session
+                    .ready()
+                    .is_some_and(|registered| Arc::ptr_eq(&registered, session))
+            })
+            .ok_or_else(|| "Scenario requires a currently managed browser session".to_string())?;
+        if Self::scope_is_fenced(&state, &entry.scope).is_some()
+            || state
+                .retirements
+                .get(&BrowserRetirementFenceKey::Session(key.clone()))
+                .is_some_and(|retirement| retirement.fenced)
+            || entry.teardown_failed.load(Ordering::SeqCst)
+            || entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|attempt| attempt.result().is_none())
+        {
+            return Err(
+                "Scenario requires a live browser session; launch is retiring or teardown failed"
+                    .into(),
+            );
+        }
+        Ok(entry.session.scenario_owner())
+    }
+
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///

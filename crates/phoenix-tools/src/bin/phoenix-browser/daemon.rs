@@ -106,17 +106,34 @@ impl Drop for Owner {
     }
 }
 
-struct Existing(Arc<RwLock<BrowserSession>>);
+struct Existing {
+    session: Arc<RwLock<BrowserSession>>,
+    manager: Arc<BrowserSessionManager>,
+}
 #[async_trait]
 impl BrowserAccess for Existing {
     async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String> {
-        Ok(self.0.clone())
+        Ok(self.session.clone())
+    }
+
+    async fn scenario_owner(
+        &self,
+        session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String> {
+        self.manager.scenario_owner_for_session(session).await
     }
 }
 struct Unavailable;
 #[async_trait]
 impl BrowserAccess for Unavailable {
     async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String> {
+        Err("browser state is gone; use open URL".into())
+    }
+
+    async fn scenario_owner(
+        &self,
+        _session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String> {
         Err("browser state is gone; use open URL".into())
     }
 }
@@ -536,7 +553,10 @@ impl State {
             operation,
             browser_lifetime,
         } = ready;
-        let access = Existing(browser.clone());
+        let access = Existing {
+            session: browser.clone(),
+            manager: self.manager.clone(),
+        };
         if *operation == BrowserOperation::Eval {
             let response = match BrowserEvalTool::evaluate(request.input.clone(), &access).await {
                 Ok(value) => {
@@ -1172,6 +1192,55 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn existing_access_rejects_competing_scenario_while_worker_holds_session_lock() {
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = BrowserSessionManager::new();
+        let scope =
+            ResourceScopeKey::Unattached(format!("existing-owner-{}", uuid::Uuid::new_v4()));
+        let session = manager.get_session(&scope).await.unwrap();
+        let owner = manager.scenario_owner_for_session(&session).await.unwrap();
+        let (entered, worker_entered) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker_session = session.clone();
+        owner
+            .start(move |_| async move {
+                let _guard = worker_session.write().await;
+                entered.send(()).unwrap();
+                released.await.unwrap();
+            })
+            .unwrap();
+        worker_entered.await.unwrap();
+        let access = Existing {
+            session,
+            manager: manager.clone(),
+        };
+        let mut admission = Box::pin(BrowserOperation::Profile.execute(
+            json!({
+                "action":"run_scenario", "runs":1, "warmup":0,
+                "steps":[{"kind":"eval", "expression":"true"}]
+            }),
+            &access,
+        ));
+        let std::task::Poll::Ready(output) = futures::poll!(&mut admission) else {
+            panic!("existing-session scenario admission waited for the worker's lock");
+        };
+        assert!(!output.is_success());
+        assert!(
+            output.output().contains("Another browser scenario"),
+            "{}",
+            output.output()
+        );
+        drop(admission);
+        release.send(()).unwrap();
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
     #[test]
     fn evaluation_error_values_remain_data_instead_of_artifact_handles() {
         let details = serde_json::from_value(json!({
@@ -1214,7 +1283,13 @@ mod tests {
         browser.read().await.page.goto("about:blank").await.unwrap();
         browser.read().await.page.evaluate("document.body.innerHTML = Array.from({length:100}, (_,i) => `<button>${i} ${'accessible action '.repeat(5)}</button>`).join('')").await.unwrap();
         let output = BrowserOperation::Snapshot
-            .execute(json!({"interactive":true}), &Existing(browser.clone()))
+            .execute(
+                json!({"interactive":true}),
+                &Existing {
+                    session: browser.clone(),
+                    manager: state.manager.clone(),
+                },
+            )
             .await;
         assert!(output.is_success(), "{}", output.output());
         let checkpoint = browser.read().await.snapshot_checkpoint().unwrap();
