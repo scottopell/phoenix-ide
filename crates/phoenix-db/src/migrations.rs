@@ -14955,7 +14955,10 @@ mod tests {
         }
     }
 
-    fn validate_current_schema_with_controller(database_path: &std::path::Path, migrated: bool) {
+    fn validate_current_schema_with_controller(
+        database_path: &std::path::Path,
+        through: u32,
+    ) -> Result<(), String> {
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -14965,21 +14968,44 @@ mod tests {
         let registry = repository.join("crates/phoenix-db/src/migrations.rs");
         let script = r#"
 import importlib.util
+import sqlite3
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
+database = Path(sys.argv[2])
+through = int(sys.argv[4])
+print(f"schema={through} python={sys.executable} python_version={sys.version} "
+      f"sqlite={sqlite3.sqlite_version} database={database}", file=sys.stderr)
+
+def report_exception(kind, error, traceback):
+    cause = error
+    while cause is not None:
+        if isinstance(cause, sqlite3.Error):
+            print(f"sqlite_errorcode={getattr(cause, 'sqlite_errorcode', None)} "
+                  f"sqlite_errorname={getattr(cause, 'sqlite_errorname', None)}",
+                  file=sys.stderr)
+        cause = cause.__cause__
+    for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm")):
+        print(f"{path}: size={path.stat().st_size if path.exists() else 'absent'}",
+              file=sys.stderr)
+    sys.__excepthook__(kind, error, traceback)
+
+sys.excepthook = report_exception
 spec = importlib.util.spec_from_file_location("migration_contract_helper", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 source = Path(sys.argv[3])
 ledger = module.migration_registry(source, qualified_current_target=False)
-assert ledger[-1][0] > 128
+if ledger[-1][0] <= 128:
+    raise AssertionError("fixture requires a registry newer than the qualified target")
 try:
     module.migration_registry(source)
 except module.ActivationError as error:
-    assert "newer than the qualified target" in str(error)
+    if "newer than the qualified target" not in str(error):
+        raise
 else:
     raise AssertionError("incident controller accepted an unqualified newer registry")
 with tempfile.TemporaryDirectory() as directory:
@@ -14987,25 +15013,46 @@ with tempfile.TemporaryDirectory() as directory:
     entries = "".join(f'    Migration {{ version: {version}, name: "{name}", sql: "" }},\n'
                       for version, name in ledger if version <= 128)
     registry.write_text("const MIGRATIONS: &[Migration] = &[\n" + entries + "];\n")
-    module.validate_current_schema_database(
-        Path(sys.argv[2]), registry, migrated=sys.argv[4] == "target"
-    )
+    expected = tuple(entry for entry in ledger if entry[0] <= through)
+    for migrated in ((False, True) if through == 128 else (False,)):
+        actual = module.validate_current_schema_database(database, registry, migrated=migrated)
+        if actual != expected:
+            raise AssertionError(f"schema={through} migrated={migrated}: "
+                                 f"expected ledger {expected!r}, got {actual!r}")
+    if through == 128:
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("DROP TABLE product_conversation_sources")
+            connection.commit()
+        try:
+            module.validate_current_schema_database(database, registry, migrated=True)
+        except module.ActivationError as error:
+            expected_error = "ProductConversation schema: missing table(s) product_conversation_sources"
+            if expected_error not in str(error):
+                raise
+        else:
+            raise AssertionError("controller accepted a schema missing product_conversation_sources")
 "#;
         let output = std::process::Command::new("python3")
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .arg("-c")
+            .args(["-I", "-B", "-c"])
             .arg(script)
             .arg(helper)
             .arg(database_path)
             .arg(registry)
-            .arg(if migrated { "target" } else { "baseline" })
+            .arg(through.to_string())
             .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "controller rejected compiled migration schema: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .map_err(|error| {
+                format!("could not launch controller for schema {through}: {error}")
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "controller rejected compiled schema {through} ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ))
+        }
     }
 
     async fn seal_current_schema_snapshot_fixture(path: &std::path::Path) {
@@ -15050,15 +15097,19 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(fictional_members, 0);
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(db.pool())
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(db.pool())
             .await
             .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
         seal_current_schema_snapshot_fixture(&path).await;
 
-        validate_current_schema_with_controller(&path, false);
+        if let Err(error) = validate_current_schema_with_controller(&path, 123) {
+            let preserved = directory.keep();
+            panic!("{error}\nfixture retained at {}", preserved.display());
+        }
 
         let db = crate::Database::open(path_text).await.unwrap();
         let target_count = MIGRATIONS
@@ -15069,16 +15120,19 @@ with tempfile.TemporaryDirectory() as directory:
             run_through_for_test(db.pool(), 128).await.unwrap() as usize,
             target_count
         );
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(db.pool())
+        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(db.pool())
             .await
             .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
         db.pool().close().await;
         drop(db);
         seal_current_schema_snapshot_fixture(&path).await;
 
-        validate_current_schema_with_controller(&path, false);
-        validate_current_schema_with_controller(&path, true);
+        if let Err(error) = validate_current_schema_with_controller(&path, 128) {
+            let preserved = directory.keep();
+            panic!("{error}\nfixture retained at {}", preserved.display());
+        }
     }
 
     #[tokio::test]
