@@ -1110,13 +1110,11 @@ fn build_methodology_warnings(
 fn validate_touch_step(
     device: Option<phoenix_browser::device::DeviceConfig>,
     action: phoenix_browser::touch::TouchAction,
-) -> Result<(), ToolOutput> {
+) -> Result<(), String> {
     let Some(device) = device else {
-        return Err(ToolOutput::error(
-            "Touch scenarios require an explicit device configuration",
-        ));
+        return Err("Touch scenarios require an explicit device configuration".to_string());
     };
-    device.validate_touch(action).map_err(ToolOutput::error)
+    device.validate_touch(action)
 }
 
 struct ScenarioPlan {
@@ -1133,14 +1131,12 @@ struct ScenarioPlan {
 /// (`RunScenarioCollectsRawSamples` / `RunScenarioRejectsInlineNavigation`).
 #[allow(clippy::result_large_err)]
 fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutput> {
-    let steps = match &input.steps {
-        Some(s) if !s.is_empty() => s.clone(),
-        _ => {
-            return Err(ToolOutput::error(
-                "run_scenario requires a non-empty `steps` array",
-            ))
-        }
-    };
+    let steps = input
+        .steps
+        .as_ref()
+        .filter(|steps| !steps.is_empty())
+        .cloned()
+        .ok_or_else(|| ToolOutput::error("run_scenario requires a non-empty `steps` array"))?;
 
     // REQ-BT-019.14 / RunScenarioRejectsInlineNavigation: a navigate/
     // reload inside `steps` would reset cumulative page state mid-run.
@@ -1180,13 +1176,14 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
             Step::TouchStart { x, y } if !contact_active => {
                 contact_active = true;
                 let action = phoenix_browser::touch::TouchAction::Start { x: *x, y: *y };
-                validate_touch_step(input.device, action)?;
+                validate_touch_step(input.device, action).map_err(ToolOutput::error)?;
             }
             Step::TouchMove { x, y } if contact_active => {
                 validate_touch_step(
                     input.device,
                     phoenix_browser::touch::TouchAction::Move { x: *x, y: *y },
-                )?;
+                )
+                .map_err(ToolOutput::error)?;
             }
             Step::TouchEnd if contact_active => contact_active = false,
             Step::TouchStart { .. } | Step::TouchMove { .. } | Step::TouchEnd => {
@@ -1202,7 +1199,15 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
                     ));
                 }
             }
-            _ => {}
+            Step::Navigate { .. }
+            | Step::Reload
+            | Step::Click { .. }
+            | Step::Type { .. }
+            | Step::Key { .. }
+            | Step::Eval { .. }
+            | Step::WaitSelector { .. }
+            | Step::WaitTiming { .. }
+            | Step::WaitEval { .. } => {}
         }
     }
     if contact_active {
@@ -1449,26 +1454,7 @@ async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), Strin
                 .map(|_| ())
                 .map_err(|e| format!("type into {selector} failed: {e}"))
         }
-        Step::Key { key, modifiers } => {
-            let ctrl = modifiers.iter().any(|m| m == "ctrl" || m == "control");
-            let shift = modifiers.iter().any(|m| m == "shift");
-            let alt = modifiers.iter().any(|m| m == "alt");
-            let meta = modifiers
-                .iter()
-                .any(|m| m == "meta" || m == "cmd" || m == "command");
-            let js = format!(
-                "(function(){{var o={{key:{key:?},code:{key:?},ctrlKey:{ctrl},shiftKey:{shift},\
-                 altKey:{alt},metaKey:{meta},bubbles:true,cancelable:true,composed:true}};\
-                 window.dispatchEvent(new KeyboardEvent('keydown',o));\
-                 window.dispatchEvent(new KeyboardEvent('keyup',o));return 'ok';}})()"
-            );
-            session
-                .page
-                .evaluate(js)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("key {key} failed: {e}"))
-        }
+        Step::Key { key, modifiers } => run_key_step(session, key, modifiers).await,
         Step::Eval { expression } => session
             .page
             .evaluate(expression.clone())
@@ -1501,6 +1487,31 @@ async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), Strin
     }
 }
 
+async fn run_key_step(
+    session: &BrowserSession,
+    key: &str,
+    modifiers: &[String],
+) -> Result<(), String> {
+    let ctrl = modifiers.iter().any(|m| m == "ctrl" || m == "control");
+    let shift = modifiers.iter().any(|m| m == "shift");
+    let alt = modifiers.iter().any(|m| m == "alt");
+    let meta = modifiers
+        .iter()
+        .any(|m| m == "meta" || m == "cmd" || m == "command");
+    let js = format!(
+        "(function(){{var o={{key:{key:?},code:{key:?},ctrlKey:{ctrl},shiftKey:{shift},\
+         altKey:{alt},metaKey:{meta},bubbles:true,cancelable:true,composed:true}};\
+         window.dispatchEvent(new KeyboardEvent('keydown',o));\
+         window.dispatchEvent(new KeyboardEvent('keyup',o));return 'ok';}})()"
+    );
+    session
+        .page
+        .evaluate(js)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("key {key} failed: {e}"))
+}
+
 async fn bounded_eval<F>(
     timeout: Duration,
     future: F,
@@ -1530,9 +1541,8 @@ async fn poll(
         let eval_start = Instant::now();
         let outcome = bounded_eval(remaining, guard.page.evaluate(predicate.to_string())).await;
         slowest_round_trip = slowest_round_trip.max(eval_start.elapsed());
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(_) => return Err(format!("{step_name} not satisfied within {timeout:?} (CDP eval exceeded remaining timeout)")),
+        let Ok(outcome) = outcome else {
+            return Err(format!("{step_name} not satisfied within {timeout:?} (CDP eval exceeded remaining timeout)"));
         };
         match outcome {
             Ok(res) => {
