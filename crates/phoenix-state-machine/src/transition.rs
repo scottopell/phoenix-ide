@@ -30,6 +30,7 @@ use phoenix_core::domain::mode_context::ModeContext;
 use phoenix_core::domain::retry_policy::{
     AutoRetryPolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
 };
+use phoenix_core::domain::tool_round::CompletedToolRound;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -1181,11 +1182,13 @@ fn handle_core_tool_complete(
             && remaining_tools.is_empty()
             && pending_sub_agents.is_empty() =>
         {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in last-tool transition");
+            let checkpoint = CompletedToolRound::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                std::iter::once(result),
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in last-tool transition");
 
             Ok(
                 CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
@@ -1204,13 +1207,13 @@ fn handle_core_tool_complete(
             && remaining_tools.is_empty()
             && !pending_sub_agents.is_empty() =>
         {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect(
-                    "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
-                );
+            let checkpoint = CompletedToolRound::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                std::iter::once(result),
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in last-tool-with-subagents transition");
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
@@ -1258,12 +1261,14 @@ fn handle_core_tool_complete(
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(spawned);
 
-            let mut all_results = completed_results.clone();
             let spawn_id = result.tool_use_id.clone();
-            all_results.push(result);
-
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
+            let checkpoint = CompletedToolRound::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                std::iter::once(result),
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: all_pending.clone(),
@@ -1386,15 +1391,16 @@ fn handle_core_cancellation(
                 tool_use_id: aborted_id,
             },
         ) if *tool_use_id == aborted_id => {
-            let all_results = build_cancellation_results(
-                completed_results,
-                tool_use_id,
-                "Cancelled by user",
-                skipped_tools,
-            );
+            let cancellation_results =
+                build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in cancellation transition");
+            let checkpoint = CompletedToolRound::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                cancellation_results,
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in cancellation transition");
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -1428,15 +1434,16 @@ fn handle_core_cancellation(
                 result: _,
             },
         ) if *tool_use_id == completed_id => {
-            let all_results = build_cancellation_results(
-                completed_results,
-                tool_use_id,
-                "Cancelled by user",
-                skipped_tools,
-            );
+            let cancellation_results =
+                build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
+            let checkpoint = CompletedToolRound::new(
+                assistant_message.clone(),
+                completed_results.clone(),
+                cancellation_results,
+            )
+            .map(CheckpointData::ToolRound)
+            .expect("tool_use/tool_result count mismatch in cancellation-complete transition");
 
             if pending_sub_agents.is_empty() {
                 Ok(CoreTransitionResult::new(CoreState::Idle)
@@ -1493,16 +1500,14 @@ fn handle_core_cancellation(
 /// Builds the tool results list for cancellation transitions, including the
 /// cancelled current tool and skipped remaining tools.
 fn build_cancellation_results(
-    completed_results: &[ToolResult],
     cancelled_tool_id: &str,
     cancel_reason: &str,
     skipped_tools: &[ToolCall],
 ) -> Vec<ToolResult> {
-    let mut all_results = completed_results.to_vec();
-    all_results.push(ToolResult::cancelled(
+    let mut all_results = vec![ToolResult::cancelled(
         cancelled_tool_id.to_string(),
         cancel_reason,
-    ));
+    )];
     for tool in skipped_tools {
         all_results.push(ToolResult::cancelled(
             tool.id.clone(),
@@ -7902,7 +7907,8 @@ mod tests {
                 }
             })
             .expect("should persist a tool-round checkpoint with the rejection");
-        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        let CheckpointData::ToolRound(round) = checkpoint;
+        let tool_results = round.results();
         assert_eq!(tool_results.len(), 1);
         match &tool_results[0].outcome {
             ToolOutcome::Error { output, .. } => {
@@ -9512,7 +9518,8 @@ mod tests {
                     }
                 })
                 .expect("Direct rejection must persist a tool result");
-            let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+            let CheckpointData::ToolRound(round) = checkpoint;
+            let tool_results = round.results();
             assert!(matches!(
                 &tool_results[0].outcome,
                 ToolOutcome::Error { output, .. }

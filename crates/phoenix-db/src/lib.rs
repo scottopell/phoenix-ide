@@ -2,9 +2,10 @@
 //!
 //! Provides persistence for conversations and messages.
 
-use phoenix_core::domain::tool_result_identity::{
-    latest_tool_result_message_id, tool_result_message_id,
-};
+use phoenix_core::domain::tool_result_identity::latest_tool_result_message_id;
+#[cfg(test)]
+use phoenix_core::domain::tool_result_identity::tool_result_message_id;
+use phoenix_core::domain::tool_round::{tool_result_message, CompletedToolRound, ToolRoundError};
 
 mod slack_gateway;
 pub use slack_gateway::*;
@@ -25,6 +26,8 @@ pub use request_capacity::CapacityDiagnosticRow;
 mod git_repository_reconciliation;
 mod message_attachments;
 mod svg_artifacts;
+#[cfg(test)]
+mod tool_round_materialization_tests;
 pub use svg_artifacts::SvgArtifact;
 mod lineage;
 mod migrations;
@@ -12526,7 +12529,7 @@ impl Database {
                     unfinished.push(tool_id);
                 }
             }
-            let (agent_msg, tool_msgs) = build_materialized_tool_round(
+            let round = build_materialized_tool_round(
                 &conv_id,
                 start_seq,
                 &materialized_at,
@@ -12537,19 +12540,19 @@ impl Database {
                 &sub_agent_outcomes,
             );
 
-            // Pairing invariant: every `tool_use` in the assistant message gets
-            // exactly one result. Refuse to persist a mis-paired chain.
-            let tool_use_count = assistant_message.tool_uses().len();
-            if tool_use_count != tool_msgs.len() {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    tool_uses = tool_use_count,
-                    results = tool_msgs.len(),
-                    "in-flight tool round has mismatched tool_use/result counts; \
-                     skipping materialization, leaving to orphan repair",
-                );
-                continue;
-            }
+            let (agent_msg, tool_msgs) = match round {
+                Ok(messages) => messages,
+                Err(ToolRoundError::ResultCountMismatch { tool_uses, results }) => {
+                    tracing::warn!(
+                        conv_id = %conv_id,
+                        tool_uses,
+                        results,
+                        "in-flight tool round has mismatched tool_use/result counts; \
+                         skipping materialization, leaving to orphan repair",
+                    );
+                    continue;
+                }
+            };
 
             let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
@@ -12636,7 +12639,7 @@ impl Database {
             tracing::info!(
                 conv_id = %conv_id,
                 completed = completed_results.len(),
-                interrupted = tool_use_count - completed_results.len(),
+                interrupted = tool_msgs.len() - completed_results.len(),
                 "materialized in-flight tool round on restart",
             );
         }
@@ -15923,7 +15926,18 @@ fn build_materialized_tool_round(
         String,
         phoenix_core::domain::sm_state::SubAgentOutcome,
     >,
-) -> (Message, Vec<Message>) {
+) -> Result<(Message, Vec<Message>), ToolRoundError> {
+    let round = CompletedToolRound::new(
+        assistant_message.clone(),
+        completed_results.to_vec(),
+        interrupted_tool_ids.iter().map(|tool_id| {
+            ToolResult::error(
+                tool_id.clone(),
+                "[Tool execution interrupted by server restart]".to_string(),
+            )
+        }),
+    )?;
+    let assistant_message = round.assistant_message();
     let mut next_seq = start_seq;
 
     let agent_content = MessageContent::agent(assistant_message.content.clone());
@@ -15950,13 +15964,9 @@ fn build_materialized_tool_round(
         sub_agent_outcomes,
     );
 
-    let mut tool_msgs: Vec<Message> = Vec::new();
-
-    // Completed tools keep their real output — except a `spawn_agents`
-    // placeholder whose sub-agents were still pending, which is rewritten into
-    // the interrupted fan-in (content + display) computed above.
-    for result in completed_results {
-        let (output, is_error, display): (String, bool, Option<serde_json::Value>) =
+    let mut tool_msgs = Vec::with_capacity(round.results().len());
+    for (ordinal, result) in round.results().iter().enumerate() {
+        let (output, is_error, display) = if ordinal < completed_results.len() {
             match spawn_fan_ins.get(&result.tool_use_id) {
                 Some((content, display)) => (content.clone(), false, Some(display.clone())),
                 None => (
@@ -15964,50 +15974,27 @@ fn build_materialized_tool_round(
                     result.is_error(),
                     merge_duration_into_display(result.display_data(), result.duration_ms),
                 ),
-            };
-        let content = MessageContent::tool_with_images(
-            &result.tool_use_id,
-            output,
-            is_error,
-            result.images().to_vec(),
-        );
-        tool_msgs.push(Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-            message_id: tool_result_message_id(&assistant_message.message_id, &result.tool_use_id),
-            conversation_id: conv_id.to_string(),
-            sequence_id: next_seq,
-            message_type: content.message_type(),
-            content,
-            display_data: display,
-            usage_data: None,
-            created_at: *now,
-        });
+            }
+        } else {
+            (result.output().to_string(), true, None)
+        };
+        tool_msgs.push(tool_result_message(
+            &assistant_message.message_id,
+            conv_id,
+            next_seq,
+            *now,
+            ToolContent {
+                tool_use_id: result.tool_use_id.clone(),
+                content: output,
+                is_error,
+                images: result.images().to_vec(),
+            },
+            display,
+        ));
         next_seq += 1;
     }
 
-    // The in-flight/cancelling tool and every queued-but-unstarted tool were
-    // interrupted.
-    for tool_id in interrupted_tool_ids {
-        let content = MessageContent::tool(
-            tool_id,
-            "[Tool execution interrupted by server restart]",
-            true,
-        );
-        tool_msgs.push(Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-            message_id: tool_result_message_id(&assistant_message.message_id, tool_id),
-            conversation_id: conv_id.to_string(),
-            sequence_id: next_seq,
-            message_type: content.message_type(),
-            content,
-            display_data: None,
-            usage_data: None,
-            created_at: *now,
-        });
-        next_seq += 1;
-    }
-
-    (agent_msg, tool_msgs)
+    Ok((agent_msg, tool_msgs))
 }
 
 async fn insert_message_tx(

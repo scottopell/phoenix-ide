@@ -14,8 +14,9 @@ use phoenix_core::domain::sm_event::{
     DirectTurnAttemptAuthority, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
     SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
 };
+use phoenix_core::domain::tool_round::CompletedToolRound;
+pub use phoenix_core::domain::tool_round::ToolRoundError as PersistError;
 use serde_json::Value;
-use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -28,18 +29,7 @@ use std::time::Duration;
 /// is structurally unrepresentable.
 #[derive(Debug, Clone)]
 pub enum CheckpointData {
-    /// A complete tool round: assistant message + all tool results.
-    /// Constructor enforces matching counts.
-    ToolRound {
-        assistant_message: AssistantMessage,
-        tool_results: Vec<ToolResult>,
-    },
-}
-
-/// Errors from `CheckpointData` constructors
-#[derive(Debug, Clone)]
-pub enum PersistError {
-    ResultCountMismatch { tool_uses: usize, results: usize },
+    ToolRound(CompletedToolRound),
 }
 
 /// Transcript payload owned by one steering-drain commit.
@@ -59,19 +49,6 @@ pub enum SteeringDrainPostCommit {
     ContinueExistingLlm,
 }
 
-impl fmt::Display for PersistError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PersistError::ResultCountMismatch { tool_uses, results } => {
-                write!(
-                    f,
-                    "tool_use count ({tool_uses}) != tool_result count ({results})"
-                )
-            }
-        }
-    }
-}
-
 impl CheckpointData {
     /// Construct a `ToolRound` checkpoint, enforcing that the number of
     /// `tool_use` blocks in the assistant message matches the number of
@@ -85,17 +62,8 @@ impl CheckpointData {
         assistant_message: AssistantMessage,
         tool_results: Vec<ToolResult>,
     ) -> Result<Self, PersistError> {
-        let tool_use_count = assistant_message.tool_uses().len();
-        if tool_use_count != tool_results.len() {
-            return Err(PersistError::ResultCountMismatch {
-                tool_uses: tool_use_count,
-                results: tool_results.len(),
-            });
-        }
-        Ok(Self::ToolRound {
-            assistant_message,
-            tool_results,
-        })
+        CompletedToolRound::new(assistant_message, tool_results, std::iter::empty())
+            .map(Self::ToolRound)
     }
 }
 
