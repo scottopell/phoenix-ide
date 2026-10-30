@@ -120,6 +120,97 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
     (ctx, manager)
 }
 
+#[tokio::test]
+async fn registered_native_scenario_admits_under_unrelated_lock_and_rejects_competitor() {
+    require_chrome!();
+    let (ctx, manager) = test_context("scenario-lock-admission");
+    let session = ctx.browser().await.expect("Chrome session");
+    let guard = session.write().await;
+    guard.page.goto("about:blank").await.unwrap();
+    let registry = crate::ToolRegistry::direct(Vec::new());
+    let profile = registry.find_tool("browser_profile").unwrap();
+    let input = json!({
+        "action": "run_scenario", "runs": 1, "warmup": 0,
+        "reset": "none", "gc_per_run": false, "throttle_rate": 2,
+        "steps": [
+            {"kind": "wait_eval", "expression": "true"},
+            {"kind": "eval", "expression": "globalThis.admittedScenario = 1"}
+        ]
+    });
+    let mut first = Box::pin(profile.run(input.clone(), ctx.clone()));
+    assert!(
+        futures::poll!(&mut first).is_pending(),
+        "unrelated session lock must not reject admission"
+    );
+    let mut competing = Box::pin(profile.run(input, ctx.clone()));
+    let std::task::Poll::Ready(rejected) = futures::poll!(&mut competing) else {
+        panic!("competing admission waited for the session lock");
+    };
+    assert!(
+        rejected.output().contains("Another browser scenario"),
+        "{}",
+        rejected.output()
+    );
+    assert!(!rejected.is_success());
+    let not_executed = guard
+        .page
+        .evaluate("globalThis.admittedScenario === undefined")
+        .await
+        .unwrap();
+    assert!(not_executed.into_value::<bool>().unwrap());
+    drop(competing);
+    drop(guard);
+    let output = tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap();
+    assert!(output.is_success(), "{}", output.output());
+    let guard = session.read().await;
+    assert!(guard
+        .page
+        .evaluate("globalThis.admittedScenario === 1")
+        .await
+        .unwrap()
+        .into_value::<bool>()
+        .unwrap());
+    assert_eq!(guard.throttle_rate().unwrap().to_bits(), 1.0_f64.to_bits());
+    drop(guard);
+    manager.shutdown_all().await.expect("browser shutdown");
+}
+
+#[tokio::test]
+async fn scenario_owner_lookup_rejects_foreign_replaced_and_retiring_launches() {
+    require_chrome!();
+    let (ctx, manager) = test_context("scenario-owner-identity");
+    let old = ctx.browser().await.unwrap();
+    let owner = manager.scenario_owner_for_session(&old).await.unwrap();
+    let foreign = BrowserSessionManager::new();
+    assert!(foreign.scenario_owner_for_session(&old).await.is_err());
+    manager.kill_session(&ctx.work_scope).await.unwrap();
+    let replacement = ctx.browser().await.unwrap();
+    let replacement_owner = manager
+        .scenario_owner_for_session(&replacement)
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    assert!(!Arc::ptr_eq(&owner, &replacement_owner));
+    assert!(manager.scenario_owner_for_session(&old).await.is_err());
+    let guard = replacement.write().await;
+    assert!(Arc::ptr_eq(
+        &replacement_owner,
+        &manager
+            .scenario_owner_for_session(&replacement)
+            .await
+            .unwrap()
+    ));
+    let _permit = manager.begin_retirement(&ctx.work_scope).await;
+    assert!(manager
+        .scenario_owner_for_session(&replacement)
+        .await
+        .is_err());
+    drop(guard);
+    manager.shutdown_all().await.expect("browser shutdown");
+}
+
 #[test]
 fn test_contexts_have_isolated_and_rediscoverable_browser_scopes() {
     let (first, _) = test_context("first");
@@ -3242,3 +3333,332 @@ async fn browser_snapshot_refs_trigger_react_handlers() {
     shutdown_test(manager, server).await;
     outcome.expect("React reference interaction journey");
 }
+// Draft insertion into crates/phoenix-tools/src/browser/tests.rs (inside its
+// existing test module). Uses its existing test_context(); keep opt-in/ignored.
+
+fn acceptance_text(output: &crate::ToolOutput) -> &str {
+    match output {
+        crate::ToolOutput::Success { output, .. } | crate::ToolOutput::Error { output, .. } => {
+            output
+        }
+        crate::ToolOutput::TrustedInstructions(_) => panic!("unexpected trusted instructions"),
+    }
+}
+
+fn acceptance_value(output: &crate::ToolOutput) -> serde_json::Value {
+    let text = acceptance_text(output)
+        .strip_prefix("<javascript_result>")
+        .and_then(|text| text.strip_suffix("</javascript_result>"))
+        .expect("browser_eval JSON result wrapper");
+    serde_json::from_str(text).expect("browser_eval returned JSON")
+}
+
+fn touch_fixture_url() -> String {
+    use base64::Engine as _;
+    let html = r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>html,body{margin:0}#target{width:300px;height:240px;background:#def}</style>
+<div id="target"></div><script>
+window.touchTrace=[]; window.geometry=[]; window.active=false; window.mutation=null;
+const target=document.querySelector('#target');
+for (const type of ['touchstart','touchmove','touchend','touchcancel']) target.addEventListener(type,e=>{
+  const t=e.changedTouches[0];
+  window.touchTrace.push({type,isTrusted:e.isTrusted,identifier:t?.identifier??null,
+    touches:e.touches.length,targetTouches:e.targetTouches.length,
+    x:t?.clientX??null,y:t?.clientY??null,active:window.active});
+  if(type==='touchstart') window.active=true;
+  if(type==='touchend'||type==='touchcancel') window.active=false;
+});
+</script>"#;
+    format!(
+        "data:text/html;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(html)
+    )
+}
+
+fn touch_device() -> serde_json::Value {
+    serde_json::json!({"width":390,"height":844,"device_scale_factor":1,"mobile":true,"touch":true})
+}
+
+fn scenario(steps: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"action":"run_scenario","runs":1,"warmup":0,"throttle_rate":1,
+        "gc_per_run":false,"reset":"none","device":touch_device(),"steps":steps})
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly installed Chrome/Chromium; run the named acceptance test directly"]
+async fn registry_resolved_browser_tools_compose_trusted_touch_and_release_after_failure() {
+    assert!(
+        chrome_available(),
+        "acceptance test requires installed Chrome/Chromium"
+    );
+    let registry = crate::ToolRegistry::direct(Vec::new());
+    let profile = registry
+        .find_tool("browser_profile")
+        .expect("registered browser_profile");
+    let navigate = registry
+        .find_tool("browser_navigate")
+        .expect("registered browser_navigate");
+    let eval = registry
+        .find_tool("browser_eval")
+        .expect("registered browser_eval");
+    let schema = profile.input_schema();
+    assert_eq!(
+        schema["properties"]["device"]["properties"]["touch"]["type"],
+        "boolean"
+    );
+    assert!(
+        schema["properties"]["device"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "touch"),
+        "device.touch must be required: {schema}"
+    );
+    let description = schema["properties"]["steps"]["description"]
+        .as_str()
+        .expect("steps description");
+    for step in ["touch_start", "touch_move", "touch_end", "pause"] {
+        assert!(
+            description.contains(step),
+            "profile schema omits {step}: {description}"
+        );
+    }
+
+    let (ctx, manager) = test_context(&format!("touch-acceptance-{}", std::process::id()));
+    let result = tokio::spawn(async move {
+        let nav = navigate.run(serde_json::json!({"url":touch_fixture_url()}), ctx.clone()).await;
+        assert!(nav.is_success(), "browser_navigate failed: {}", nav.output());
+
+        let journey = serde_json::json!([
+            {"kind":"wait_selector","selector":"#target"},
+            {"kind":"touch_start","x":100,"y":100},
+            {"kind":"touch_move","x":120,"y":115},
+            {"kind":"eval","expression":"(()=>{const target=document.querySelector('#target');const before=target.getBoundingClientRect().height;window.geometry=[];window.mutation={before,heldBefore:window.active,at:performance.now()};target.style.height='260px';const after=target.getBoundingClientRect().height;window.mutation.after=after;window.mutation.heldAfter=window.active;let count=0;const sample=()=>{if(!window.active)return;const r=target.getBoundingClientRect();window.geometry.push({time:performance.now(),height:r.height,x:r.x,y:r.y,width:r.width,top:r.top,right:r.right,bottom:r.bottom,left:r.left,held:window.active});if(++count<8&&window.active)requestAnimationFrame(sample)};requestAnimationFrame(sample);return window.mutation})()"},
+            {"kind":"pause","milliseconds":120},
+            {"kind":"touch_end"}
+        ]);
+        let completed = profile.run(scenario(&journey), ctx.clone()).await;
+        assert!(completed.is_success(), "scenario cleanup failed: {}", completed.output());
+        assert_eq!(completed.display_data().expect("scenario display_data")["outcome"], "completed", "scenario output={} display={:?}", completed.output(), completed.display_data());
+        let evidence = eval.run(serde_json::json!({"expression":"({trace:window.touchTrace,geometry:window.geometry,mutation:window.mutation})"}), ctx.clone()).await;
+        let evidence = acceptance_value(&evidence);
+        let trace = evidence["trace"].as_array().expect("touch trace");
+        let event = |kind: &str| trace.iter().find(|item| item["type"] == kind).unwrap_or_else(|| panic!("missing {kind}: {trace:?}"));
+        let start = event("touchstart"); let moved = event("touchmove"); let end = event("touchend");
+        assert!(start["isTrusted"].as_bool().unwrap() && moved["isTrusted"].as_bool().unwrap() && end["isTrusted"].as_bool().unwrap());
+        assert_eq!(start["identifier"], moved["identifier"]); assert_eq!(start["identifier"], end["identifier"]);
+        assert_eq!(start["touches"], 1); assert_eq!(moved["touches"], 1); assert_eq!(end["touches"], 0);
+        let mutation = &evidence["mutation"];
+        assert_eq!(mutation["heldBefore"], true); assert_eq!(mutation["heldAfter"], true);
+        assert_eq!(mutation["before"], 240.0); assert_eq!(mutation["after"], 260.0);
+        let geometry = evidence["geometry"].as_array().expect("geometry samples");
+        assert!(!geometry.is_empty(), "rAF sampling started during the measured held-contact window");
+        for sample in geometry {
+            assert_eq!(sample["held"], true, "sample must be taken while contact is held: {sample}");
+            for key in ["time","height","x","y","width","top","right","bottom","left"] {
+                assert!(sample[key].as_f64().is_some_and(f64::is_finite), "non-finite/missing geometry {key}: {sample}");
+            }
+        }
+
+        // Complete the balanced plan shape after the deliberate evaluation failure.
+        let failed = profile.run(scenario(&serde_json::json!([
+            {"kind":"wait_selector","selector":"#target"},
+            {"kind":"touch_start","x":100,"y":100},
+            {"kind":"eval","expression":"throw Error('acceptance failure while held')"},
+            {"kind":"touch_end"}
+        ])), ctx.clone()).await;
+        assert!(!failed.is_success(), "expected intentional evaluation failure");
+        assert!(failed.output().contains("acceptance failure while held"), "wrong failure: {}", failed.output());
+        let tail = eval.run(serde_json::json!({"expression":"window.touchTrace.slice(-4)"}), ctx.clone()).await;
+        let tail = acceptance_value(&tail);
+        assert!(tail.as_array().unwrap().iter().any(|item| item["type"] == "touchcancel"), "failure did not release the active contact with touchcancel: {tail}");
+        let recovered = profile.run(scenario(&serde_json::json!([
+            {"kind":"wait_selector","selector":"#target"},
+            {"kind":"touch_start","x":100,"y":100},
+            {"kind":"touch_end"}
+        ])), ctx).await;
+        assert!(recovered.is_success(), "next gesture failed: {}", recovered.output());
+    }).await;
+    let shutdown = manager.shutdown_all().await;
+    assert!(
+        shutdown.is_ok(),
+        "browser manager shutdown failed: {shutdown:?}"
+    );
+    result.expect("acceptance scenario task panicked");
+}
+
+fn assert_aborted_touch_evidence(evidence: &crate::ToolOutput) {
+    let evidence = acceptance_value(evidence);
+    let trace = evidence["trace"].as_array().expect("touch trace");
+    assert!(trace
+        .iter()
+        .any(|e| e["type"] == "touchstart" && e["isTrusted"] == true));
+    assert!(
+        trace
+            .iter()
+            .any(|e| e["type"] == "touchcancel" && e["isTrusted"] == true && e["active"] == true),
+        "missing trusted cancel: {trace:?}"
+    );
+    assert!(
+        !trace.iter().any(|e| e["type"] == "touchend"),
+        "caller abort must not synthesize touchend: {trace:?}"
+    );
+    assert_eq!(evidence["active"], false);
+}
+
+async fn touch_abort_fixture() -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture server");
+    let addr = listener.local_addr().expect("fixture server address");
+    let server = tokio::spawn(async move {
+        let mut held_tx = Some(held_tx);
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = [0u8; 2048];
+            let Ok(Ok(count)) =
+                tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request)).await
+            else {
+                continue;
+            };
+            let request = String::from_utf8_lossy(&request[..count]);
+            let (status, content_type, body) = if request.starts_with("GET /held ") {
+                if let Some(tx) = held_tx.take() {
+                    let _ = tx.send(());
+                }
+                ("200 OK", "text/plain", "held")
+            } else if request.starts_with("GET / ") {
+                (
+                    "200 OK",
+                    "text/html",
+                    r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><div id="target" style="width:300px;height:240px;background:#def"></div><script>window.touchTrace=[];window.active=false;const t=document.querySelector('#target');for(const type of ['touchstart','touchend','touchcancel'])t.addEventListener(type,e=>{window.touchTrace.push({type,isTrusted:e.isTrusted,active:window.active});if(type==='touchstart')window.active=true;if(type==='touchend'||type==='touchcancel')window.active=false})</script>"#,
+                )
+            } else {
+                ("404 Not Found", "text/plain", "not found")
+            };
+            let response = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    (addr, held_rx, server)
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly installed Chrome/Chromium; run the named acceptance test directly"]
+async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch() {
+    assert!(
+        chrome_available(),
+        "acceptance test requires installed Chrome/Chromium"
+    );
+    let (addr, held_rx, server) = touch_abort_fixture().await;
+    let (ctx, manager) = test_context(&format!("touch-abort-{}", std::process::id()));
+    let registry = crate::ToolRegistry::direct(Vec::new());
+    let profile = registry
+        .find_tool("browser_profile")
+        .expect("registered browser_profile");
+    let navigate = registry
+        .find_tool("browser_navigate")
+        .expect("registered browser_navigate");
+    let eval = registry
+        .find_tool("browser_eval")
+        .expect("registered browser_eval");
+
+    let result = tokio::spawn(async move {
+        let nav = navigate
+            .run(json!({"url":format!("http://{addr}/")}), ctx.clone())
+            .await;
+        assert!(nav.is_success(), "navigate failed: {}", nav.output());
+        let plan = scenario(&json!([
+            {"kind":"wait_selector","selector":"#target","timeout":"5s"},
+            {"kind":"touch_start","x":100,"y":100},
+            {"kind":"eval","expression":"window.active ? (fetch('/held'), true) : false"},
+            {"kind":"wait_eval","expression":"false","timeout":"60s"},
+            {"kind":"touch_end"}
+        ]));
+        let caller_ctx = ctx.clone();
+        let caller_profile = profile.clone();
+        let caller = tokio::spawn(async move { caller_profile.run(plan, caller_ctx).await });
+        tokio::time::timeout(Duration::from_secs(5), held_rx)
+            .await
+            .expect("fixture /held request timed out")
+            .expect("fixture notification sender dropped");
+        caller.abort();
+        let cancelled = caller
+            .await
+            .expect_err("scenario caller completed before abort");
+        assert!(
+            cancelled.is_cancelled(),
+            "caller did not cancel: {cancelled}"
+        );
+
+        let evidence = eval
+            .run(
+                json!({"expression":"({trace:window.touchTrace,active:window.active})"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            evidence.is_success(),
+            "post-abort evidence failed: {}",
+            evidence.output()
+        );
+        assert_aborted_touch_evidence(&evidence);
+
+        let recovery = scenario(&json!([
+            {"kind":"wait_selector","selector":"#target","timeout":"5s"},
+            {"kind":"touch_start","x":100,"y":100},
+            {"kind":"touch_end"}
+        ]));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = profile.run(recovery.clone(), ctx.clone()).await;
+            if output.is_success() {
+                break;
+            }
+            assert!(
+                output
+                    .output()
+                    .contains("Another browser scenario or its cleanup is still running"),
+                "recovery scenario failed: {}",
+                output.output()
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owner did not finish after caller abort"
+            );
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut result = result;
+    let outcome = tokio::time::timeout(Duration::from_secs(20), &mut result).await;
+    if outcome.is_err() {
+        result.abort();
+        let _ = result.await;
+    }
+    let shutdown = tokio::time::timeout(Duration::from_secs(5), manager.shutdown_all()).await;
+    server.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    assert!(
+        shutdown.expect("browser shutdown timed out").is_ok(),
+        "browser manager shutdown failed"
+    );
+    outcome
+        .expect("acceptance scenario timed out")
+        .expect("acceptance scenario task panicked");
+}
+
+// Caller abort is distinct from an executed-step failure: the scenario owner must
+// observe cancellation independently of the caller's JoinHandle.
+// Registry schema and tool registration are checked against the resolved profile tool;
+// no concrete BrowserProfileTool constructor or guessed output text is used.
+// The test remains opt-in and has no environment-dependent green return path.
+// eval expressions use JavaScript expression syntax and return fixture evidence.
+// The rAF sampler begins inside the measured scenario, after readiness and touch start.
+// Height mutation is a real DOM style change and is checked before and after while held.
+// Failure plan ends with touch_end so it passes touch-step balance validation.
+// Failure output and a recorded touchcancel are both asserted.
+// Manager shutdown occurs after the spawned scenario result, including panic results.

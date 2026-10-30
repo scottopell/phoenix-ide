@@ -49,6 +49,15 @@ pub trait BrowserAccess: Send + Sync {
     /// # Errors
     /// Returns an error when the session is unavailable or cannot be started.
     async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String>;
+
+    /// Resolve the exact launch's broker without acquiring the session lock.
+    ///
+    /// # Errors
+    /// Returns an error when the session is no longer managed or is retiring.
+    async fn scenario_owner(
+        &self,
+        session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String>;
 }
 
 struct ValidationBoundary(AtomicBool);
@@ -59,6 +68,14 @@ impl BrowserAccess for ValidationBoundary {
         self.0.store(true, Ordering::Relaxed);
         Err("input validation reached the browser boundary".into())
     }
+
+    async fn scenario_owner(
+        &self,
+        _session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String> {
+        self.0.store(true, Ordering::Relaxed);
+        Err("input validation reached the scenario boundary".into())
+    }
 }
 
 #[async_trait]
@@ -67,6 +84,15 @@ impl BrowserAccess for ToolContext {
         ToolContext::browser(self)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn scenario_owner(
+        &self,
+        session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String> {
+        self.browser_sessions
+            .scenario_owner_for_session(session)
+            .await
     }
 }
 
@@ -166,6 +192,13 @@ mod access_tests {
         async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err("session expired; navigate to create a new browser".to_string())
+        }
+
+        async fn scenario_owner(
+            &self,
+            _session: &Arc<RwLock<BrowserSession>>,
+        ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String> {
+            panic!("unavailable browser cannot supply a scenario session")
         }
     }
 

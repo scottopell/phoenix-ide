@@ -424,7 +424,9 @@ pub enum BrowserError {
     #[error("browser session access denied for this actor")]
     AccessDenied,
 
-    #[error("browser retirement is in progress for {work_scope}; session admission is fenced until repair reopens admission")]
+    #[error(
+        "browser retirement is in progress for {work_scope}; session admission is fenced until repair reopens admission"
+    )]
     RetirementFenced { work_scope: ResourceScopeKey },
 }
 
@@ -541,8 +543,8 @@ pub struct ConsoleEntry {
 
 /// Conversation-scoped performance-profiling state (REQ-BT-019).
 ///
-/// Models the three independent capture sub-machines plus the CPU-throttle
-/// override and trace buffer from `browser-profiling.allium`. It hangs off
+/// Models the three independent capture sub-machines and trace buffer
+/// from `browser-profiling.allium`. It hangs off
 /// [`BrowserSession`] so the precondition gates are enforced per conversation
 /// (invariant `ProfilingConversationScoped`) and reset structurally when the
 /// session dies (rule `SessionDeathResetsAllCaptures`) — dropping the session
@@ -555,10 +557,6 @@ pub struct ProfilingState {
     pub tracing_active: bool,
     /// JS coverage sub-machine (REQ-BT-019.11). idle when false.
     pub coverage_active: bool,
-    /// CPU-throttle override (REQ-BT-019.2). `None` = browser default; a
-    /// `Some(rate)` always carries `rate >= 1` (invariant
-    /// `ThrottleRateWellFormed`), set only via the gated throttle action.
-    pub throttle_rate: Option<f64>,
     /// Buffered `Tracing.dataCollected` events. Non-empty only while
     /// `tracing_active` (invariant `TraceBufferOnlyWhileActive`): cleared
     /// before arming on start, drained-then-cleared on stop.
@@ -672,6 +670,10 @@ pub struct BrowserSession {
     profiling_tasks: Vec<JoinHandle<()>>,
     /// The current page (public for tool access)
     pub page: Page,
+    device: crate::device::DeviceState,
+    touch: crate::touch::TouchState,
+    throttle: crate::throttle::ThrottleState,
+    scenario_owner: std::sync::Weak<crate::scenario::ScenarioOwner>,
     /// Conversation-scoped profiling state (REQ-BT-019). The
     /// `browser_profile` tool reads/mutates this through the session guard;
     /// the trace-listener task appends events when `tracing_active`.
@@ -2078,6 +2080,48 @@ impl BrowserSessionManager {
         self.get_session_with_creator(work_scope, actor).await
     }
 
+    /// Resolve the broker for an exact registered session without locking the session.
+    ///
+    /// # Errors
+    /// Rejects absent, retiring, or teardown-failed launches.
+    pub async fn scenario_owner_for_session(
+        &self,
+        session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<crate::scenario::ScenarioOwner>, String> {
+        let state = self.state.read().await;
+        self.ensure_accepting_sessions()
+            .map_err(|error| error.to_string())?;
+        let (key, entry) = state
+            .sessions
+            .iter()
+            .find(|(_, entry)| {
+                entry
+                    .session
+                    .ready()
+                    .is_some_and(|registered| Arc::ptr_eq(&registered, session))
+            })
+            .ok_or_else(|| "Scenario requires a currently managed browser session".to_string())?;
+        if Self::scope_is_fenced(&state, &entry.scope).is_some()
+            || state
+                .retirements
+                .get(&BrowserRetirementFenceKey::Session(key.clone()))
+                .is_some_and(|retirement| retirement.fenced)
+            || entry.teardown_failed.load(Ordering::SeqCst)
+            || entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|attempt| attempt.result().is_none())
+        {
+            return Err(
+                "Scenario requires a live browser session; launch is retiring or teardown failed"
+                    .into(),
+            );
+        }
+        Ok(entry.session.scenario_owner())
+    }
+
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
@@ -3038,6 +3082,98 @@ impl BrowserSessionManager {
                 tracing::warn!(%error, "idle browser termination did not complete");
             }
         }
+    }
+}
+
+impl BrowserSession {
+    /// # Errors
+    /// Returns an error if no CPU throttle rate is known after an incomplete dispatch.
+    pub fn throttle_rate(&self) -> Result<f64, String> {
+        self.throttle.known()
+    }
+
+    /// # Errors
+    /// Returns an error for a nonfinite rate, a rate below 1, or a failed CDP command.
+    pub async fn set_throttle_rate(&mut self, rate: f64) -> Result<(), String> {
+        self.throttle.set(&self.page, rate).await
+    }
+
+    /// Cancel contact and restore CPU throttling independently under the caller's deadline.
+    pub async fn restore_scenario_state(
+        &mut self,
+        rate: f64,
+    ) -> (Result<(), String>, Result<(), String>) {
+        tokio::join!(
+            self.touch.cancel_on(&self.page),
+            self.throttle.set(&self.page, rate),
+        )
+    }
+
+    /// # Errors
+    /// Returns an error if the session's weak scenario-owner reference cannot
+    /// be upgraded because no managed owner remains alive.
+    pub fn scenario_owner(&self) -> Result<Arc<crate::scenario::ScenarioOwner>, String> {
+        self.scenario_owner
+            .upgrade()
+            .ok_or_else(|| "Scenario requires a managed browser session".into())
+    }
+
+    /// # Errors
+    /// Returns an error if the device configuration is unknown, touch is disabled,
+    /// coordinates are nonfinite or outside the valid viewport bounds, the
+    /// contact transition is invalid, or CDP touch dispatch fails.
+    pub async fn dispatch_touch(
+        &mut self,
+        action: crate::touch::TouchAction,
+    ) -> Result<(), String> {
+        self.device.known()?.validate_touch(action)?;
+        self.touch.dispatch(&self.page, action).await
+    }
+
+    /// # Errors
+    /// Returns an error if the touch contact is active or its state is unknown.
+    pub fn ensure_touch_idle(&self) -> Result<(), String> {
+        self.touch.idle()
+    }
+    /// # Errors
+    /// Returns an error if a required CDP touch cancellation fails.
+    pub async fn cancel_touch(&mut self) -> Result<(), String> {
+        self.touch.cancel_on(&self.page).await
+    }
+    /// # Errors
+    /// Returns an error if no device configuration has been acknowledged or a
+    /// device configuration operation left the state unknown.
+    pub fn device_config(&self) -> Result<crate::device::DeviceConfig, String> {
+        self.device.known()
+    }
+
+    /// # Errors
+    /// Returns an error if the touch contact is not idle or CDP fails to apply
+    /// touch emulation or device metrics.
+    pub async fn configure_device(
+        &mut self,
+        config: crate::device::DeviceConfig,
+    ) -> Result<(), String> {
+        self.touch.idle()?;
+        self.device.configure(&self.page, config).await
+    }
+
+    /// # Errors
+    /// Returns an error if the touch contact is not idle, the device configuration
+    /// is unknown, either dimension is outside 1..=16384, or CDP fails to apply
+    /// the resized device metrics.
+    pub async fn resize_viewport(&mut self, width: u32, height: u32) -> Result<(), String> {
+        self.touch.idle()?;
+        let config = self.device.known()?.resized(width, height)?;
+        let page = &self.page;
+        self.device
+            .apply(config, async {
+                page.execute(config.metrics())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .await
     }
 }
 
