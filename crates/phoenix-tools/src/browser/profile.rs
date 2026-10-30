@@ -75,7 +75,7 @@ const TRACKED_METRICS: &[&str] = &[
 // Input
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ProfileInput {
     action: ProfileAction,
     /// `trace_start`: comma-separated category override.
@@ -109,6 +109,9 @@ struct ProfileInput {
     /// opts out (and raises a methodology warning).
     #[serde(default)]
     reset: Option<ResetSpec>,
+    /// Explicit session-persistent device configuration for scenario runs.
+    #[serde(default)]
+    device: Option<phoenix_browser::device::DeviceConfig>,
     /// `heap_snapshot`: optional baseline snapshot path to diff against.
     #[serde(default)]
     baseline: Option<String>,
@@ -140,6 +143,13 @@ enum ProfileAction {
 fn parse_profile_input(input: Value) -> Result<ProfileInput, ToolOutput> {
     let input: ProfileInput = serde_json::from_value(input)
         .map_err(|error| ToolOutput::error(format!("Invalid input: {error}")))?;
+    if input.action == ProfileAction::RunScenario
+        && input.steps.as_ref().is_some_and(|steps| steps.len() > 512)
+    {
+        return Err(ToolOutput::error(
+            "run_scenario accepts at most 512 steps",
+        ));
+    }
     if input.action == ProfileAction::Throttle {
         validate_throttle_rate(input.rate)?;
     }
@@ -222,6 +232,18 @@ enum Step {
         key: String,
         #[serde(default)]
         modifiers: Vec<String>,
+    },
+    TouchStart {
+        x: f64,
+        y: f64,
+    },
+    TouchMove {
+        x: f64,
+        y: f64,
+    },
+    TouchEnd,
+    Pause {
+        milliseconds: u64,
     },
     Eval {
         expression: String,
@@ -342,7 +364,8 @@ impl Tool for BrowserProfileTool {
                 },
                 "steps": {
                     "type": "array",
-                    "description": "run_scenario only: ordered steps. Each step is an object with a `kind`: click{selector}, type{selector,text}, key{key,modifiers?}, eval{expression}, wait_selector{selector,timeout?}, wait_timing{mark,timeout?}, wait_eval{expression,timeout?}. The page-anchored measurement window opens AFTER the FIRST wait_* readiness step satisfies (REQ-BT-019.20): steps up to and including it are UNTIMED setup (page load + framework mount + async settle), the remaining steps are measured. Put the readiness wait FIRST so mount/settle is excluded. NOTE: navigate/reload are NOT allowed in steps — put navigation in `reset` instead. With no wait_* step the window opens immediately after reset and methodology_warnings flags it (mount/settle then unavoidably in-window).",
+                    "maxItems": 512,
+                    "description": "run_scenario only: 1–512 ordered steps: click, type, key, touch_start{x,y}, touch_move{x,y}, touch_end, pause{milliseconds}, eval, wait_selector, wait_timing, wait_eval. Each pause is at most 5000ms and total pause time at most 30000ms. Touch requires device.touch=true and finite CSS-pixel coordinates within the configured viewport. First readiness wait is untimed setup; remaining steps are measured. Managed navigate/reload steps are rejected; use reset (this does not fence navigation initiated by arbitrary eval or click handlers).",
                     "items": { "type": "object" }
                 },
                 "runs": {
@@ -367,6 +390,18 @@ impl Tool for BrowserProfileTool {
                         { "type": "string", "enum": ["none"] },
                         { "type": "object" }
                     ]
+                },
+                "device": {
+                    "type": "object",
+                    "description": "Explicit touch-capable device configuration for run_scenario; width and height are 1–16384 CSS pixels, device_scale_factor is finite and in (0,10], and touch must be true for touch steps. This is not physical-device emulation.",
+                    "properties": {
+                        "width": {"type":"integer", "minimum":1, "maximum":16384},
+                        "height": {"type":"integer", "minimum":1, "maximum":16384},
+                        "device_scale_factor": {"type":"number", "exclusiveMinimum":0, "maximum":10},
+                        "mobile": {"type":"boolean"}, "touch": {"type":"boolean"}
+                    },
+                    "required": ["width", "height", "device_scale_factor", "mobile", "touch"],
+                    "additionalProperties": false
                 },
                 "baseline": {
                     "type": "string",
@@ -479,18 +514,21 @@ Actions:
   gc_heap         — Force GC (HeapProfiler.collectGarbage) then read
                     JSHeapUsedSize, so the memory number is deterministic.
 
-  run_scenario    — THE harness. Params: steps (non-empty array), runs
+  run_scenario    — THE harness. Params: steps (1–512 ordered steps), runs
                     (int >= 1), warmup (int >= 0, DEFAULT 1 — cold
                     JIT/first-paint excluded; explicit 0 is allowed but
                     warned), throttle_rate (optional, restored after),
                     gc_per_run (bool, DEFAULT true), reset (see below).
                     Step kinds: click{selector}, type{selector,text},
-                    key{key,modifiers?}, eval{expression},
-                    wait_selector{selector,timeout?},
-                    wait_timing{mark,timeout?},
-                    wait_eval{expression,timeout?}.
-                    navigate/reload are REJECTED inside steps — put
-                    navigation in `reset`.
+                    key{key,modifiers?}, touch_start{x,y},
+                    touch_move{x,y}, touch_end, pause{milliseconds},
+                    eval{expression}, wait_selector{selector,timeout?},
+                    wait_timing{mark,timeout?}, wait_eval{expression,timeout?}.
+                    Each pause is <=5000ms; total pause time <=30000ms.
+                    Touch requires device.touch=true and finite CSS-pixel
+                    coordinates within its configured viewport. Managed
+                    navigate/reload steps are REJECTED — use `reset`;
+                    this does not fence navigation from eval or click handlers.
                     PAGE-ANCHORED WINDOW (REQ-BT-019.20): the measured
                     window opens AFTER the FIRST wait_* readiness step
                     satisfies. Steps up to and including it are UNTIMED
@@ -578,12 +616,18 @@ async fn read_metrics(
     session: &Arc<RwLock<BrowserSession>>,
 ) -> Result<std::collections::BTreeMap<String, f64>, String> {
     let guard = session.read().await;
-    guard
+    read_metrics_locked(&guard).await
+}
+
+async fn read_metrics_locked(
+    session: &BrowserSession,
+) -> Result<std::collections::BTreeMap<String, f64>, String> {
+    session
         .page
         .execute(PerfEnableParams::default())
         .await
         .map_err(|e| format!("Performance.enable failed: {e}"))?;
-    let resp = guard
+    let resp = session
         .page
         .execute(GetMetricsParams::default())
         .await
@@ -814,17 +858,16 @@ enum RunError {
 
 /// Perform the per-run reset (REQ-BT-019.18) BEFORE the before-snapshot.
 /// A reset failure is an infra error for the run — never a bogus sample.
-async fn do_reset(session: &Arc<RwLock<BrowserSession>>, reset: &Reset) -> Result<(), RunError> {
-    let guard = session.read().await;
+async fn do_reset(session: &mut BrowserSession, reset: &Reset) -> Result<(), RunError> {
     match reset {
         Reset::Skip => Ok(()),
-        Reset::ReloadCurrent | Reset::Reload => guard
+        Reset::ReloadCurrent | Reset::Reload => session
             .page
             .reload()
             .await
             .map(|_| ())
             .map_err(|e| RunError::Infra(format!("per-run reset (reload) failed: {e}"))),
-        Reset::Navigate(url) => guard
+        Reset::Navigate(url) => session
             .page
             .goto(url)
             .await
@@ -848,7 +891,7 @@ async fn do_reset(session: &Arc<RwLock<BrowserSession>>, reset: &Reset) -> Resul
 ///   collectGarbage then a heap-only read (strictly outside the window,
 ///   F5 does not apply to a one-shot gauge) → emit one sample.
 async fn run_one(
-    session: &Arc<RwLock<BrowserSession>>,
+    session: &mut BrowserSession,
     steps: &[Step],
     run_index: u32,
     reset: &Reset,
@@ -889,8 +932,7 @@ async fn run_one(
     // returns defaults, and the longtask observer is installed regardless
     // via document-start injection.
     {
-        let guard = session.read().await;
-        let _ = guard
+        let _ = session
             .page
             .evaluate("window.__phoenix && window.__phoenix.__perfReset && window.__phoenix.__perfReset()")
             .await;
@@ -910,12 +952,11 @@ async fn run_one(
     // helper / shape mismatch is the absent default, never a fabricated
     // value.
     let reading: PerfReading = {
-        let guard = session.read().await;
         let script = "window.__phoenix && window.__phoenix.__perfRead \
             ? window.__phoenix.__perfRead() \
             : JSON.stringify({script_ms:0,long_tasks:0,wall_ms:null,dom_nodes:0,\
             react_status:'absent',react_commits:null,react_actual_ms:null})";
-        match guard.page.evaluate(script).await {
+        match session.page.evaluate(script).await {
             Ok(res) => match res.into_value::<String>() {
                 Ok(json) => {
                     serde_json::from_str(&json).unwrap_or_else(|_| PerfReading::absent_default())
@@ -932,20 +973,19 @@ async fn run_one(
     // the heap field is null + gc_ran=false — never a mid-cycle value.
     let (gc_ran, js_heap_used) = if gc_per_run {
         {
-            let guard = session.read().await;
-            if let Err(e) = guard.page.execute(HeapEnableParams::default()).await {
+            if let Err(e) = session.page.execute(HeapEnableParams::default()).await {
                 return Err(RunError::Infra(format!(
                     "per-run forced GC (HeapProfiler.enable) failed: {e}"
                 )));
             }
-            if let Err(e) = guard.page.execute(CollectGarbageParams::default()).await {
+            if let Err(e) = session.page.execute(CollectGarbageParams::default()).await {
                 return Err(RunError::Infra(format!(
                     "per-run forced GC (collectGarbage) failed: {e}"
                 )));
             }
         }
         // Heap-only read at the single post-full-GC point.
-        match read_metrics(session).await {
+        match read_metrics_locked(session).await {
             Ok(m) => (true, m.get("JSHeapUsedSize").copied()),
             Err(e) => return Err(RunError::Infra(format!("post-GC heap read failed: {e}"))),
         }
@@ -1069,6 +1109,18 @@ fn build_methodology_warnings(
 /// is acquired, so a structurally invalid scenario fails with the real
 /// error even when Chrome is unavailable (Codex P2). Single validation
 /// site — no parallel re-checking in [`action_run_scenario`].
+fn validate_touch_step(
+    device: Option<phoenix_browser::device::DeviceConfig>,
+    action: phoenix_browser::touch::TouchAction,
+) -> Result<(), ToolOutput> {
+    let Some(device) = device else {
+        return Err(ToolOutput::error(
+            "Touch scenarios require an explicit device configuration",
+        ));
+    };
+    device.validate_touch(action).map_err(ToolOutput::error)
+}
+
 struct ScenarioPlan {
     steps: Vec<Step>,
     runs: u32,
@@ -1107,7 +1159,11 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
             | Step::Eval { .. }
             | Step::WaitSelector { .. }
             | Step::WaitTiming { .. }
-            | Step::WaitEval { .. } => None,
+            | Step::WaitEval { .. }
+            | Step::TouchStart { .. }
+            | Step::TouchMove { .. }
+            | Step::TouchEnd
+            | Step::Pause { .. } => None,
         };
         if let Some(kind) = kind {
             return Err(ToolOutput::error(format!(
@@ -1117,6 +1173,44 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
                  measured window opens). No samples produced."
             )));
         }
+    }
+
+    let mut contact_active = false;
+    let mut pause_total = 0u64;
+    for step in &steps {
+        match step {
+            Step::TouchStart { x, y } if !contact_active => {
+                contact_active = true;
+                let action = phoenix_browser::touch::TouchAction::Start { x: *x, y: *y };
+                validate_touch_step(input.device, action)?;
+            }
+            Step::TouchMove { x, y } if contact_active => {
+                validate_touch_step(
+                    input.device,
+                    phoenix_browser::touch::TouchAction::Move { x: *x, y: *y },
+                )?;
+            }
+            Step::TouchEnd if contact_active => contact_active = false,
+            Step::TouchStart { .. } | Step::TouchMove { .. } | Step::TouchEnd => {
+                return Err(ToolOutput::error(
+                    "Touch steps must be balanced start/move/end sequences",
+                ));
+            }
+            Step::Pause { milliseconds } => {
+                pause_total = pause_total.saturating_add(*milliseconds);
+                if *milliseconds > 5_000 || pause_total > 30_000 {
+                    return Err(ToolOutput::error(
+                        "Pauses are bounded to 5000ms each and 30000ms per run",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if contact_active {
+        return Err(ToolOutput::error(
+            "Touch sequence must end before the run finishes",
+        ));
     }
 
     let runs = input.runs.unwrap_or(1);
@@ -1151,6 +1245,114 @@ async fn action_run_scenario(
     input: &ProfileInput,
     plan: ScenarioPlan,
 ) -> ToolOutput {
+    let owner = match session.read().await.scenario_owner() {
+        Ok(owner) => owner,
+        Err(error) => return ToolOutput::error(error),
+    };
+    let session = session.clone();
+    let input = input.clone();
+    let (mut output, result) = tokio::sync::oneshot::channel();
+    if let Err(error) = owner.start(move |mut cancelled| async move {
+        let guard = tokio::select! {
+            biased;
+            () = output.closed() => return,
+            () = phoenix_browser::scenario::cancelled(&mut cancelled) => return,
+            guard = session.write() => guard,
+        };
+        let mut guard = guard;
+        let prior_throttle = guard.profiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .throttle_rate;
+
+        let mut outcome = {
+        let operation = async {
+            if let Err(error) = guard.ensure_touch_idle() {
+                return ToolOutput::error(error);
+            }
+            if let Some(device) = input.device {
+                match tokio::time::timeout(Duration::from_secs(15), guard.configure_device(device)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return ToolOutput::error(format!("Device configuration failed: {error}")),
+                    Err(_) => return ToolOutput::error("Device configuration timed out; effective configuration is unknown"),
+                }
+            } else if let Err(error) = guard.device_config() {
+                return ToolOutput::error(error);
+            }
+            run_scenario_locked(&mut guard, &input, plan).await
+        };
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            () = output.closed() => None,
+            () = phoenix_browser::scenario::cancelled(&mut cancelled) => Some(ToolOutput::error("Browser scenario cancelled by session termination")),
+            result = &mut operation => Some(result),
+        }
+        };
+
+        let page = guard.page.clone();
+        let profiling = guard.profiling.clone();
+        let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+            let (touch, throttle) = tokio::join!(guard.cancel_touch(), async {
+                page.execute(SetCpuThrottlingRateParams::new(prior_throttle.unwrap_or(1.0)))
+                    .await
+                    .map_err(|error| format!("Throttle restoration failed: {error}"))?;
+                profiling.lock().unwrap_or_else(std::sync::PoisonError::into_inner).throttle_rate = prior_throttle;
+                Ok::<_, String>(())
+            });
+            match (touch, throttle) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(touch), Err(throttle)) => Err(format!("Touch cancellation failed: {touch}; {throttle}")),
+                (Err(touch), Ok(())) => Err(format!("Touch cancellation failed: {touch}")),
+                (Ok(()), Err(throttle)) => Err(throttle),
+            }
+        }).await;
+        let cleanup_error = match cleanup {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("Scenario cleanup exceeded its 5-second deadline; acknowledgement incomplete".into()),
+        };
+        drop(guard);
+        if let Some(error) = cleanup_error {
+            tracing::warn!(%error, "browser scenario cleanup incomplete");
+            outcome = outcome.map(|outcome| scenario_cleanup_failure(Some(outcome), &error));
+        }
+        if let Some(outcome) = outcome {
+            let _ = output.send(outcome);
+        }
+    }) {
+        return ToolOutput::error(error);
+    }
+    let result = result
+        .await
+        .unwrap_or_else(|_| ToolOutput::error("Browser scenario task ended without a result"));
+    drop(owner);
+    result
+}
+
+fn scenario_cleanup_failure(original: Option<ToolOutput>, error: &str) -> ToolOutput {
+    let Some(mut original) = original else {
+        return ToolOutput::error(format!("Scenario cleanup failed: {error}"));
+    };
+    let mut failure = ToolOutput::error(format!(
+        "{}\nScenario cleanup failed: {error}",
+        original.output()
+    ))
+    .with_images(original.images().to_vec());
+    if let Some(display) = original.display_data() {
+        failure = failure.with_display(display.clone());
+    }
+    if let Some(usage) = original.take_llm_usage() {
+        failure = failure.with_llm_usage(usage);
+    }
+    failure
+}
+
+async fn run_scenario_locked(
+    session: &mut BrowserSession,
+    input: &ProfileInput,
+    plan: ScenarioPlan,
+) -> ToolOutput {
     let ScenarioPlan {
         steps,
         runs,
@@ -1159,104 +1361,73 @@ async fn action_run_scenario(
         gc_per_run,
         reset,
     } = plan;
-
-    // REQ-BT-019.16/.18: methodology warnings — metadata flagging an
-    // unguarded run. Carried ALONGSIDE samples, never in place of them.
     let warnings = build_methodology_warnings(input, &steps, gc_per_run, &reset);
-
-    // Capture the prior throttle so it can be restored on return — whether
-    // the operation completes OR is blocked (Allium @guidance).
-    let prior_throttle = with_profiling(session, |st| st.throttle_rate)
-        .await
-        .flatten();
-
-    // Apply the scenario throttle for the duration of the operation.
-    if let Some(tr) = input.throttle_rate {
-        if let Err(e) = apply_throttle(session, tr).await {
-            return ToolOutput::error(e);
+    if let Some(rate) = input.throttle_rate {
+        if let Err(error) = session
+            .page
+            .execute(SetCpuThrottlingRateParams::new(rate))
+            .await
+        {
+            return ToolOutput::error(error.to_string());
         }
+        session
+            .profiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .throttle_rate = Some(rate);
     }
 
-    let mut samples: Vec<RunSample> = Vec::with_capacity(runs as usize);
-
-    // Warmup runs execute identically but their samples are discarded
-    // (Allium @guidance). Throttle is restored on every exit path below.
+    let mut samples = Vec::with_capacity(runs as usize);
     for global_idx in 0..total_runs {
         let is_warmup = global_idx < warmup;
-        // Warmup runs execute identically (including the per-run reset)
-        // but are discarded.
-        match run_one(
-            session,
-            &steps,
-            global_idx.saturating_sub(warmup),
-            &reset,
-            gc_per_run,
-        )
-        .await
-        {
-            Ok(sample) => {
-                if !is_warmup {
-                    samples.push(sample);
-                }
-            }
-            Err(RunError::Blocked(reason)) => {
-                // Restore throttle then fail with ZERO samples (REQ-BT-019.1
-                // / BlockedScenarioYieldsNoSamples). Never a partial set.
-                restore_throttle(session, prior_throttle).await;
-                return ToolOutput::error(format!(
-                    "run_scenario blocked: {reason}. No samples returned (a measurement \
-                     against an indeterminate state is worse than no measurement)."
-                ))
-                .with_display(json!({
-                    "outcome": "blocked",
-                    "blocked_step": reason,
-                    "raw_samples": [],
-                    "methodology_warnings": warnings,
-                }));
-            }
-            Err(RunError::Infra(msg)) => {
-                restore_throttle(session, prior_throttle).await;
-                return ToolOutput::error(msg);
-            }
+        match run_one(session, &steps, global_idx.saturating_sub(warmup), &reset, gc_per_run).await {
+            Ok(sample) => if !is_warmup { samples.push(sample); },
+            Err(RunError::Blocked(reason)) => return ToolOutput::error(format!(
+                "run_scenario blocked: {reason}. No samples returned (a measurement against an indeterminate state is worse than no measurement)."
+            )).with_display(json!({"outcome":"blocked","blocked_step":reason,"raw_samples":[],"methodology_warnings":warnings})),
+            Err(RunError::Infra(error)) => return ToolOutput::error(error),
         }
     }
-
-    // Restore throttle on success too (Allium @guidance).
-    restore_throttle(session, prior_throttle).await;
     scenario_success_output(&samples, runs, warmup, &warnings).await
-}
-
-/// Restore the throttle to its pre-scenario value. `None` means "browser
-/// default" → re-issue rate 1 to clear any scenario override.
-async fn restore_throttle(session: &Arc<RwLock<BrowserSession>>, prior: Option<f64>) {
-    let rate = prior.unwrap_or(1.0);
-    if let Err(e) = apply_throttle(session, rate).await {
-        // Capability gap: cannot restore throttle (page gone, etc.).
-        tracing::debug!(error = %e, "run_scenario: failed to restore CPU throttle");
-    }
-    with_profiling(session, |st| st.throttle_rate = prior).await;
 }
 
 /// Execute one scenario step. `Err(reason)` means a readiness step did not
 /// satisfy within its timeout — the caller fails the whole operation.
-async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<(), String> {
-    let guard = session.read().await;
+async fn run_step(session: &mut BrowserSession, step: &Step) -> Result<(), String> {
     match step {
-        Step::Navigate { url } => guard
+        Step::TouchStart { x, y } => {
+            session
+                .dispatch_touch(phoenix_browser::touch::TouchAction::Start { x: *x, y: *y })
+                .await
+        }
+        Step::TouchMove { x, y } => {
+            session
+                .dispatch_touch(phoenix_browser::touch::TouchAction::Move { x: *x, y: *y })
+                .await
+        }
+        Step::TouchEnd => {
+            session
+                .dispatch_touch(phoenix_browser::touch::TouchAction::End)
+                .await
+        }
+        Step::Pause { milliseconds } => {
+            tokio::time::sleep(Duration::from_millis(*milliseconds)).await;
+            Ok(())
+        }
+        Step::Navigate { url } => session
             .page
             .goto(url)
             .await
             .map(|_| ())
             .map_err(|e| format!("navigate to {url} failed: {e}")),
-        Step::Reload => guard
+        Step::Reload => session
             .page
             .reload()
             .await
             .map(|_| ())
             .map_err(|e| format!("reload failed: {e}")),
         Step::Click { selector } => {
-            let _input = guard.lock_native_input().await;
-            let el = guard
+            let el = session
                 .page
                 .find_element(selector)
                 .await
@@ -1267,8 +1438,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
                 .map_err(|e| format!("click on {selector} failed: {e}"))
         }
         Step::Type { selector, text } => {
-            let _input = guard.lock_native_input().await;
-            let el = guard
+            let el = session
                 .page
                 .find_element(selector)
                 .await
@@ -1294,14 +1464,14 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
                  window.dispatchEvent(new KeyboardEvent('keydown',o));\
                  window.dispatchEvent(new KeyboardEvent('keyup',o));return 'ok';}})()"
             );
-            guard
+            session
                 .page
                 .evaluate(js)
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("key {key} failed: {e}"))
         }
-        Step::Eval { expression } => guard
+        Step::Eval { expression } => session
             .page
             .evaluate(expression.clone())
             .await
@@ -1313,7 +1483,7 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
                 "document.querySelector({}) !== null",
                 serde_json::to_string(selector).unwrap_or_default()
             );
-            poll(&guard, &check, to, &format!("wait_selector {selector}")).await
+            poll(session, &check, to, &format!("wait_selector {selector}")).await
         }
         Step::WaitTiming { mark, timeout } => {
             let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
@@ -1321,22 +1491,32 @@ async fn run_step(session: &Arc<RwLock<BrowserSession>>, step: &Step) -> Result<
                 "performance.getEntriesByName({}, 'mark').length > 0",
                 serde_json::to_string(mark).unwrap_or_default()
             );
-            poll(&guard, &check, to, &format!("wait_timing {mark}")).await
+            poll(session, &check, to, &format!("wait_timing {mark}")).await
         }
         Step::WaitEval {
             expression,
             timeout,
         } => {
             let to = timeout.map_or(DEFAULT_WAIT_TIMEOUT, |timeout| timeout.0);
-            poll(&guard, &format!("!!({expression})"), to, "wait_eval").await
+            poll(session, &format!("!!({expression})"), to, "wait_eval").await
         }
     }
+}
+
+async fn bounded_eval<F>(
+    timeout: Duration,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout(timeout, future).await
 }
 
 /// Poll a boolean JS predicate until truthy or the timeout elapses.
 /// `Err` names the blocking step so the harness can report it.
 async fn poll(
-    guard: &tokio::sync::RwLockReadGuard<'_, BrowserSession>,
+    guard: &BrowserSession,
     predicate: &str,
     timeout: Duration,
     step_name: &str,
@@ -1348,9 +1528,14 @@ async fn poll(
     let mut slowest_round_trip = Duration::ZERO;
     loop {
         attempts += 1;
+        let remaining = timeout.saturating_sub(start.elapsed());
         let eval_start = Instant::now();
-        let outcome = guard.page.evaluate(predicate.to_string()).await;
+        let outcome = bounded_eval(remaining, guard.page.evaluate(predicate.to_string())).await;
         slowest_round_trip = slowest_round_trip.max(eval_start.elapsed());
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => return Err(format!("{step_name} not satisfied within {timeout:?} (CDP eval exceeded remaining timeout)")),
+        };
         match outcome {
             Ok(res) => {
                 if let Ok(true) = res.into_value::<bool>() {
@@ -1370,7 +1555,7 @@ async fn poll(
                  {slowest_round_trip:?})"
             ));
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(interval.min(timeout.saturating_sub(start.elapsed()))).await;
     }
 }
 
@@ -2306,6 +2491,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn touch_and_pause_steps_deserialize_for_exclusive_scenario_dispatch() {
+        let steps: Vec<Step> = serde_json::from_value(json!([
+            {"kind":"touch_start","x":10,"y":20},
+            {"kind":"touch_move","x":12,"y":24},
+            {"kind":"pause","milliseconds":100},
+            {"kind":"touch_end"}
+        ]))
+        .expect("touch and pause steps");
+        assert!(matches!(steps[0], Step::TouchStart { .. }));
+        assert!(matches!(steps[1], Step::TouchMove { .. }));
+        assert!(matches!(steps[2], Step::Pause { milliseconds: 100 }));
+        assert!(matches!(steps[3], Step::TouchEnd));
+    }
+
+    #[tokio::test]
+    async fn readiness_eval_cannot_exceed_remaining_timeout() {
+        let result = bounded_eval(Duration::ZERO, std::future::pending::<()>()).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn input_schema_lists_all_actions() {
         let tool = BrowserProfileTool;
         let schema = tool.input_schema();
@@ -2317,6 +2523,22 @@ mod tests {
             assert!(names.contains(a), "schema missing action {a}");
         }
         assert_eq!(names.len(), PROFILE_ACTIONS.len());
+    }
+
+    #[test]
+    fn run_scenario_accepts_512_benign_steps_without_browser_access() {
+        let steps = vec![json!({"kind":"eval","expression":"0"}); 512];
+        let input = json!({"action":"run_scenario", "steps":steps});
+        assert!(BrowserProfileTool::validate_input(input).is_ok());
+        assert_eq!(BrowserProfileTool.input_schema()["properties"]["steps"]["maxItems"], 512);
+    }
+
+    #[test]
+    fn run_scenario_rejects_513_steps_during_input_validation() {
+        let steps = vec![json!({"kind":"eval","expression":"0"}); 513];
+        let input = json!({"action":"run_scenario", "steps":steps});
+        let error = BrowserProfileTool::validate_input(input).expect_err("513 steps exceed the limit");
+        assert!(error.output().contains("at most 512 steps"));
     }
 
     #[test]

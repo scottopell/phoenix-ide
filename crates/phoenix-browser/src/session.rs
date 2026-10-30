@@ -10,17 +10,17 @@ pub use console::ConsoleNavigationCapture;
 use launch_slot::{LaunchSlot, ProfilePolicy};
 
 use chromiumoxide::{
+    Page,
     browser::{Browser, BrowserConfig},
     cdp::js_protocol::runtime::{ConsoleApiCalledType, RemoteObject},
-    Page,
 };
 use futures::StreamExt;
 use serde::{Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -28,7 +28,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use phoenix_core::process_identity::{
-    current_process_identity, process_identity_matches, ProcessIdentity,
+    ProcessIdentity, current_process_identity, process_identity_matches,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
@@ -424,7 +424,9 @@ pub enum BrowserError {
     #[error("browser session access denied for this actor")]
     AccessDenied,
 
-    #[error("browser retirement is in progress for {work_scope}; session admission is fenced until repair reopens admission")]
+    #[error(
+        "browser retirement is in progress for {work_scope}; session admission is fenced until repair reopens admission"
+    )]
     RetirementFenced { work_scope: ResourceScopeKey },
 }
 
@@ -672,6 +674,9 @@ pub struct BrowserSession {
     profiling_tasks: Vec<JoinHandle<()>>,
     /// The current page (public for tool access)
     pub page: Page,
+    device: crate::device::DeviceState,
+    touch: crate::touch::TouchState,
+    scenario_owner: std::sync::Weak<crate::scenario::ScenarioOwner>,
     /// Conversation-scoped profiling state (REQ-BT-019). The
     /// `browser_profile` tool reads/mutates this through the session guard;
     /// the trace-listener task appends events when `tracing_active`.
@@ -3041,6 +3046,54 @@ impl BrowserSessionManager {
     }
 }
 
+impl BrowserSession {
+    pub fn scenario_owner(&self) -> Result<Arc<crate::scenario::ScenarioOwner>, String> {
+        self.scenario_owner
+            .upgrade()
+            .ok_or_else(|| "Scenario requires a managed browser session".into())
+    }
+
+    pub async fn dispatch_touch(
+        &mut self,
+        action: crate::touch::TouchAction,
+    ) -> Result<(), String> {
+        self.device.known()?.validate_touch(action)?;
+        self.touch.dispatch(&self.page, action).await
+    }
+
+    pub fn ensure_touch_idle(&self) -> Result<(), String> {
+        self.touch.idle()
+    }
+    pub async fn cancel_touch(&mut self) -> Result<(), String> {
+        self.touch.cancel_on(&self.page).await
+    }
+    pub fn device_config(&self) -> Result<crate::device::DeviceConfig, String> {
+        self.device.known()
+    }
+
+    pub async fn configure_device(
+        &mut self,
+        config: crate::device::DeviceConfig,
+    ) -> Result<(), String> {
+        self.touch.idle()?;
+        self.device.configure(&self.page, config).await
+    }
+
+    pub async fn resize_viewport(&mut self, width: u32, height: u32) -> Result<(), String> {
+        self.touch.idle()?;
+        let config = self.device.known()?.resized(width, height)?;
+        let page = &self.page;
+        self.device
+            .apply(config, async {
+                page.execute(config.metrics())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .await
+    }
+}
+
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         // Abort background tasks so their I/O registrations are released immediately.
@@ -3075,9 +3128,9 @@ impl Default for BrowserSessionManager {
 #[cfg(test)]
 mod profile_marker_tests {
     use super::{
+        BrowserLaunchIdentity, BrowserProfileMarker, PROFILE_MARKER_VERSION,
         delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch, profile_marker_path,
-        read_profile_marker, write_profile_marker_atomic, BrowserLaunchIdentity,
-        BrowserProfileMarker, PROFILE_MARKER_VERSION,
+        read_profile_marker, write_profile_marker_atomic,
     };
     use phoenix_core::process_identity::ProcessIdentity;
 
@@ -3228,9 +3281,11 @@ mod profile_marker_tests {
         assert!(profile.exists());
         let error = prepare_profile_dir_for_launch(root.path(), key)
             .expect_err("stale group marker cannot synthesize drain authority");
-        assert!(error
-            .to_string()
-            .contains("no retained launch-group drain authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("no retained launch-group drain authority")
+        );
         assert!(profile_marker_path(&profile).exists());
         assert!(profile.exists());
     }
@@ -3294,10 +3349,12 @@ mod lifecycle_hook_tests {
         let profile = super::user_data_dir_for_key(runtime_env.tmp_root(), scope_key);
 
         assert_eq!(profile.parent(), Some(runtime_env.tmp_root()));
-        assert!(profile
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(super::USER_DATA_DIR_PREFIX)));
+        assert!(
+            profile
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(super::USER_DATA_DIR_PREFIX))
+        );
         assert_eq!(
             super::user_data_dir_glob(&runtime_env),
             runtime_env.tmp_root().join("phoenix-chrome-*")
@@ -3898,7 +3955,7 @@ mod console_level_tests {
 
 #[cfg(test)]
 mod console_arg_tests {
-    use super::{extract_console_arg_text, truncate_unicode_safe, MAX_CAPTURE_ARG_BYTES};
+    use super::{MAX_CAPTURE_ARG_BYTES, extract_console_arg_text, truncate_unicode_safe};
     use chromiumoxide::cdp::js_protocol::runtime::RemoteObject;
     use serde_json::json;
 

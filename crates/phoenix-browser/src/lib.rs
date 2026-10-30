@@ -7,6 +7,10 @@
 //! phoenix-tools, which depends on this crate. See `specs/browser-tool/` for
 //! the behavioural contract.
 
+pub mod device;
+pub mod scenario;
+pub mod touch;
+
 mod cdp;
 mod navigation;
 pub mod process_group;
@@ -17,8 +21,8 @@ pub mod snapshot;
 
 pub use screencast::{ScreencastBroker, ScreencastEvent};
 pub use session::{
-    cascade_browser_on_delete, fetcher_cache_dir, truncate_unicode_safe, user_data_dir_glob,
     BrowserError, BrowserSession, BrowserSessionGuard, BrowserSessionLifecycleEvent,
     BrowserSessionLifecycleSink, BrowserSessionManager, ConsoleEntry, ConsoleLevel, ProfilingState,
-    ScopeLivenessHook,
+    ScopeLivenessHook, cascade_browser_on_delete, fetcher_cache_dir, truncate_unicode_safe,
+    user_data_dir_glob,
 };

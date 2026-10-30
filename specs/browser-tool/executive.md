@@ -16,6 +16,14 @@ Console logs are captured through one ordered CDP reader that associates per-tar
 
 Navigation uses one bounded native CDP connection for destination dispatch, current-URL reload, and document readiness. It handles same-document completion without a missing-load-event timeout, returns native navigation errors, and avoids leaving a library navigation watcher queued after timeout. Reload checks the observed loader before dispatch.
 
+### Reusable device and touch primitives
+
+`browser_profile run_scenario` accepts a session-persistent device configuration and single-contact `touch_start`, `touch_move`, `touch_end`, and bounded `pause` steps. `DeviceState` acknowledges configuration only after CDP success; `TouchState` preserves contact identity and sends empty `touchPoints` arrays for end/cancel. `BrowserSession::resize_viewport` preserves device scale, mobile mode, and touch emulation. `ScenarioOwner` holds broker-side task custody independently of the session lock, while scenario execution and cleanup retain exclusive session access.
+
+The scope is reusable input/configuration primitives, not retained visual diagnostics or application-specific gesture assertions. CDP acknowledgement is neither physical-device equivalence nor proof of paint. Managed navigation and scenario reset are gated by contact state; arbitrary eval- or click-initiated navigation is not fenced. The 512-step limit, 5000ms per-pause limit, and 30000ms total pause limit per run do not impose a total scenario wall-time deadline. Device application has a 15-second deadline; contact cancellation and throttle restoration share a five-second cleanup deadline.
+
+Verification evidence supplied for this work: v3 focused suite **31 passed**; v7 touch suite **7 passed**; v8 registered-tool checks **1 native passed + 1 CLI passed**. The new abort and 512-step tests are **pending execution**; those earlier results do not verify the latest additions. No build or browser test was run for this documentation update.
+
 ## Status Summary
 
 ### Core Requirements
@@ -41,6 +49,8 @@ Navigation uses one bounded native CDP connection for destination dispatch, curr
 | **REQ-BT-017:** React Component Access | ✅ Complete | `browser_inject_react_devtools` + `browser_remove_react_devtools`; `window.__phoenix` helper via `__REACT_DEVTOOLS_GLOBAL_HOOK__` |
 | **REQ-BT-018:** Live Browser View Side Panel | ✅ Complete | View-only CDP screencast relay via `/api/conversations/:id/browser-view` WS; mutex with prose/diff slot; auto-mount-when-empty on first `browser_*` tool |
 | **REQ-BT-019:** Systematic Web Performance Testing | 🟡 In Progress | `browser_profile` tool (action enum). Tier 0+1 + cheap Tier 2; lading-style scenario harness returns raw per-run samples (never averaged). Lifecycle in `browser-profiling.allium`. Network emulation deferred (REQ-BT-019-NG-NETEMU) |
+| **REQ-BT-019.21:** Persistent scenario device configuration | 🟡 Implemented; verification incomplete | Validated `DeviceConfig`, acknowledged/unknown `DeviceState`, persistent configuration, preserving resize; evidence and pending checks above. |
+| **REQ-BT-019.22:** Persistent touch contact and scenario cleanup | 🟡 Implemented; verification incomplete | Single-contact state, balanced steps, bounded pauses, broker-owned scenario cleanup; new abort and 512-step tests pending execution. |
 | **REQ-BT-025:** Accessibility Snapshots and Element References | ✅ Complete | `browser_snapshot`; main-document AX tree and interactive filtering; exact-node click/type refs; explicit limits and large-output artifacts. Rendering/schema/browser regressions cover reference lifetime, native/React input, shadow roots, iframe exclusion, replacement at native input dispatch, navigation, cancellation, forwarded activation, and typing focus retargeting. Snapshot collection has an 8 MiB wire cap; spilled files are private and retired with their refs/session. |
 
 ### WorkScope Ownership

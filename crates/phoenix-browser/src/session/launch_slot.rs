@@ -1,17 +1,17 @@
 use super::{
-    console, delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch,
-    profile_marker_path, user_data_dir_for_key, write_profile_marker_atomic, BrowserError,
-    BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch, BrowserRetirementFenceKey,
-    BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
-    BrowserSessionLifecycleSink, BrowserSessionLookup, BrowserSessionManager,
-    BrowserSessionRegistryState, ProfileDeletionProof, ProfilingState, MAX_CONSOLE_LOGS,
+    BrowserError, BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch,
+    BrowserRetirementFenceKey, BrowserSession, BrowserSessionLifecycleEvent,
+    BrowserSessionLifecycleKind, BrowserSessionLifecycleSink, BrowserSessionLookup,
+    BrowserSessionManager, BrowserSessionRegistryState, MAX_CONSOLE_LOGS, ProfileDeletionProof,
+    ProfilingState, console, delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch,
+    profile_marker_path, user_data_dir_for_key, write_profile_marker_atomic,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_group::OwnedChromeGroup;
 use chromiumoxide::{
+    Page,
     browser::Browser,
     fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
-    Page,
 };
 use futures::StreamExt;
 use phoenix_core::process_identity::current_process_identity;
@@ -43,6 +43,7 @@ impl ProfilePolicy {
 pub(super) struct LaunchSlot {
     pub(super) identity: BrowserLaunchIdentity,
     pub(super) profile: PathBuf,
+    scenario_owner: Arc<crate::scenario::ScenarioOwner>,
     key: String,
     state: RwLock<LaunchState>,
     changed: Notify,
@@ -87,6 +88,7 @@ impl LaunchSlot {
         Arc::new(Self {
             profile: policy.path(root, key, &identity.launch_uuid),
             identity,
+            scenario_owner: Arc::new(crate::scenario::ScenarioOwner::default()),
             key: key.to_owned(),
             state: RwLock::new(LaunchState::Reserved),
             changed: Notify::new(),
@@ -323,13 +325,21 @@ impl LaunchSlot {
                 BrowserSession::inject_react_helper(&page).await;
                 let reference_guard_available =
                     BrowserSession::install_reference_guard(&page).await;
+                let mut device = crate::device::DeviceState::default();
+                device
+                    .configure(&page, crate::device::DeviceConfig::default())
+                    .await
+                    .map_err(BrowserError::OperationFailed)?;
                 let LaunchState::Pending(pending) = std::mem::replace(state, LaunchState::Stopped)
                 else {
                     unreachable!()
                 };
-                let session = Arc::new(RwLock::new(
-                    (*pending).into_session(page, reference_guard_available),
-                ));
+                let session = Arc::new(RwLock::new((*pending).into_session(
+                    page,
+                    reference_guard_available,
+                    device,
+                    Arc::downgrade(&self.scenario_owner),
+                )));
                 *state = LaunchState::Ready(session.clone());
                 BrowserSessionManager::setup_session_listeners(session).await;
                 Ok(())
@@ -392,6 +402,7 @@ impl LaunchSlot {
     }
 
     pub(super) async fn stop_and_delete(&self) -> Result<(), BrowserError> {
+        self.scenario_owner.close();
         let mut state = self.state.write().await;
         if matches!(&*state, LaunchState::PreSpawnFailed(_)) {
             *state = LaunchState::Stopped;
@@ -417,7 +428,7 @@ impl LaunchSlot {
             | LaunchState::Stopped => {
                 return Err(BrowserError::LaunchFailed(
                     "no stopped profile authority".into(),
-                ))
+                ));
             }
         };
         let unmarked = matches!(&*state, LaunchState::Pending(pending) if !pending.marker);
@@ -525,7 +536,13 @@ impl PendingBrowser {
         }
     }
 
-    fn into_session(self, page: Page, reference_guard_available: bool) -> BrowserSession {
+    fn into_session(
+        self,
+        page: Page,
+        reference_guard_available: bool,
+        device: crate::device::DeviceState,
+        scenario_owner: std::sync::Weak<crate::scenario::ScenarioOwner>,
+    ) -> BrowserSession {
         BrowserSession {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             owned_group: match self.authority {
@@ -543,6 +560,9 @@ impl PendingBrowser {
             reference_guard_available,
             reference_input_lock: Arc::new(tokio::sync::Mutex::new(())),
             page,
+            device,
+            touch: crate::touch::TouchState::default(),
+            scenario_owner,
             profiling: Arc::new(StdMutex::new(ProfilingState::default())),
             trace_complete: Arc::new(tokio::sync::Notify::new()),
             console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
@@ -585,7 +605,7 @@ async fn select_executable() -> Result<PathBuf, BrowserError> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::session::{session_key, BrowserRetirementOutcome, ScopedSession};
+    use crate::session::{BrowserRetirementOutcome, ScopedSession, session_key};
     use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
