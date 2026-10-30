@@ -5,7 +5,7 @@
 use phoenix_core::domain::tool_result_identity::latest_tool_result_message_id;
 #[cfg(test)]
 use phoenix_core::domain::tool_result_identity::tool_result_message_id;
-use phoenix_core::domain::tool_round::{tool_result_message, CompletedToolRound, ToolRoundError};
+use phoenix_core::domain::tool_round::{tool_result_message, ToolRoundAssembly, ToolRoundError};
 
 mod slack_gateway;
 pub use slack_gateway::*;
@@ -15927,7 +15927,7 @@ fn build_materialized_tool_round(
         phoenix_core::domain::sm_state::SubAgentOutcome,
     >,
 ) -> Result<(Message, Vec<Message>), ToolRoundError> {
-    let round = CompletedToolRound::new(
+    let round = ToolRoundAssembly::new(
         assistant_message.clone(),
         completed_results.to_vec(),
         interrupted_tool_ids.iter().map(|tool_id| {

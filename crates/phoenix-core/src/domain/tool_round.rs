@@ -8,9 +8,11 @@ use super::db_schema::{
 use super::sm_state::AssistantMessage;
 use super::tool_result_identity::tool_result_message_id;
 
-/// An assistant turn and its complete, caller-ordered result sequence.
+/// An unvalidated assistant/result payload with matching cardinality and supplied order.
+///
+/// Identity matching and persistence admissibility are not established by this assembly.
 #[derive(Debug, Clone)]
-pub struct CompletedToolRound {
+pub struct ToolRoundAssembly {
     assistant_message: AssistantMessage,
     tool_results: Vec<ToolResult>,
 }
@@ -31,7 +33,7 @@ impl fmt::Display for ToolRoundError {
     }
 }
 
-impl CompletedToolRound {
+impl ToolRoundAssembly {
     /// Append a policy-produced tail to completed results without reordering.
     ///
     /// # Errors
@@ -139,7 +141,7 @@ mod tests {
             ToolResult::error("c".into(), "concrete failure".into()),
             ToolResult::cancelled("d".into(), "cancelled"),
         ];
-        let round = CompletedToolRound::new(
+        let round = ToolRoundAssembly::new(
             assistant.clone(),
             results[..2].to_vec(),
             results[2..].iter().cloned(),
@@ -153,14 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn assembly_preserves_supplied_order_and_existing_identifier_acceptance() {
-        let round = CompletedToolRound::new(
+    fn assembly_preserves_completed_prefix_and_recovered_result_order() {
+        let round = ToolRoundAssembly::new(
             assistant(&["a", "b", "c"]),
-            vec![ToolResult::success("c".into(), "recovered".into())],
-            [
-                ToolResult::error("duplicate".into(), "first".into()),
-                ToolResult::error("duplicate".into(), "second".into()),
+            vec![
+                ToolResult::success("a".into(), "completed".into()),
+                ToolResult::success("c".into(), "recovered".into()),
             ],
+            [ToolResult::error("b".into(), "interrupted".into())],
         )
         .unwrap();
         assert_eq!(
@@ -169,16 +171,17 @@ mod tests {
                 .iter()
                 .map(|result| result.tool_use_id.as_str())
                 .collect::<Vec<_>>(),
-            ["c", "duplicate", "duplicate"]
+            ["a", "c", "b"]
         );
-        assert_eq!(round.results()[1].output(), "first");
-        assert_eq!(round.results()[2].output(), "second");
+        assert_eq!(round.results()[0].output(), "completed");
+        assert_eq!(round.results()[1].output(), "recovered");
+        assert_eq!(round.results()[2].output(), "interrupted");
     }
 
     #[test]
     fn incomplete_and_overfull_rounds_return_the_existing_count_error() {
         for count in [0, 2] {
-            let error = CompletedToolRound::new(
+            let error = ToolRoundAssembly::new(
                 assistant(&["a"]),
                 vec![],
                 (0..count).map(|_| ToolResult::error("a".into(), "error".into())),

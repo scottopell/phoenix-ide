@@ -14,22 +14,18 @@ use phoenix_core::domain::sm_event::{
     DirectTurnAttemptAuthority, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
     SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
 };
-use phoenix_core::domain::tool_round::CompletedToolRound;
+use phoenix_core::domain::tool_round::ToolRoundAssembly;
 pub use phoenix_core::domain::tool_round::ToolRoundError as PersistError;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
-// ============================================================================
-// CheckpointData — atomic persistence gate (REQ-BED-007, FM-2 Prevention)
-// ============================================================================
-
-/// Data to persist atomically. The `ToolRound` variant enforces that assistant
-/// messages and tool results are always written together — half-written history
-/// is structurally unrepresentable.
+/// Atomic persistence payload holding an assistant message and its supplied results.
+/// Construction checks cardinality only; identity matching and storage admissibility
+/// remain outside this payload.
 #[derive(Debug, Clone)]
 pub enum CheckpointData {
-    ToolRound(CompletedToolRound),
+    ToolRound(ToolRoundAssembly),
 }
 
 /// Transcript payload owned by one steering-drain commit.
@@ -62,7 +58,7 @@ impl CheckpointData {
         assistant_message: AssistantMessage,
         tool_results: Vec<ToolResult>,
     ) -> Result<Self, PersistError> {
-        CompletedToolRound::new(assistant_message, tool_results, std::iter::empty())
+        ToolRoundAssembly::new(assistant_message, tool_results, std::iter::empty())
             .map(Self::ToolRound)
     }
 }

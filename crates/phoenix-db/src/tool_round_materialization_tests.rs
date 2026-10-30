@@ -135,48 +135,45 @@ fn restart_spawn_fan_in_replaces_display_and_duration_but_preserves_images() {
             result: "answer".into(),
         },
     )]);
-    for interrupted_id in ["unfinished", "spawn"] {
-        let (_, rows) = build_materialized_tool_round(
-            "conversation",
-            10,
-            &now,
-            &assistant,
-            &completed,
-            &[interrupted_id.into()],
-            &pending,
-            &outcomes,
-        )
-        .unwrap();
-        assert_eq!(
-            rows[0].content,
-            MessageContent::Tool(ToolContent {
-                tool_use_id: "spawn".into(),
-                content:
-                    "Sub-agent results (1 completed):\n\nTask: \"investigate\"\nResult: answer"
-                        .into(),
-                is_error: false,
-                images: vec![image.clone()],
-            })
-        );
-        assert_eq!(
-            rows[0].display_data,
-            Some(serde_json::json!({
-                "type": "subagent_summary",
-                "results": [{"agent_id":"child","task":"investigate","outcome":{"type":"success","result":"answer"}}],
-            }))
-        );
-        assert_eq!(rows[0].created_at, now);
-        assert_eq!(rows[0].sequence_id, 11);
-        assert_eq!(rows[0].message_id, "tool-result:5:round:spawn");
-        assert_eq!(
-            rows[1].content,
-            MessageContent::Tool(ToolContent {
-                tool_use_id: interrupted_id.into(),
-                content: "[Tool execution interrupted by server restart]".into(),
-                is_error: true,
-                images: vec![],
-            })
-        );
-        assert!(rows[1].display_data.is_none());
-    }
+    let (_, rows) = build_materialized_tool_round(
+        "conversation",
+        10,
+        &now,
+        &assistant,
+        &completed,
+        &["unfinished".into()],
+        &pending,
+        &outcomes,
+    )
+    .unwrap();
+    assert_eq!(
+        rows[0].content,
+        MessageContent::Tool(ToolContent {
+            tool_use_id: "spawn".into(),
+            content: "Sub-agent results (1 completed):\n\nTask: \"investigate\"\nResult: answer"
+                .into(),
+            is_error: false,
+            images: vec![image],
+        })
+    );
+    assert_eq!(
+        rows[0].display_data,
+        Some(serde_json::json!({
+            "type": "subagent_summary",
+            "results": [{"agent_id":"child","task":"investigate","outcome":{"type":"success","result":"answer"}}],
+        }))
+    );
+    assert_eq!(rows[0].created_at, now);
+    assert_eq!(rows[0].sequence_id, 11);
+    assert_eq!(rows[0].message_id, "tool-result:5:round:spawn");
+    assert_eq!(
+        rows[1].content,
+        MessageContent::Tool(ToolContent {
+            tool_use_id: "unfinished".into(),
+            content: "[Tool execution interrupted by server restart]".into(),
+            is_error: true,
+            images: vec![],
+        })
+    );
+    assert!(rows[1].display_data.is_none());
 }

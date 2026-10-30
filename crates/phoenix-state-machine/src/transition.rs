@@ -30,7 +30,7 @@ use phoenix_core::domain::mode_context::ModeContext;
 use phoenix_core::domain::retry_policy::{
     AutoRetryPolicy, GENERIC_MAX_ATTEMPTS, OVERLOAD_MAX_ATTEMPTS,
 };
-use phoenix_core::domain::tool_round::CompletedToolRound;
+use phoenix_core::domain::tool_round::ToolRoundAssembly;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -1182,7 +1182,7 @@ fn handle_core_tool_complete(
             && remaining_tools.is_empty()
             && pending_sub_agents.is_empty() =>
         {
-            let checkpoint = CompletedToolRound::new(
+            let checkpoint = ToolRoundAssembly::new(
                 assistant_message.clone(),
                 completed_results.clone(),
                 std::iter::once(result),
@@ -1207,7 +1207,7 @@ fn handle_core_tool_complete(
             && remaining_tools.is_empty()
             && !pending_sub_agents.is_empty() =>
         {
-            let checkpoint = CompletedToolRound::new(
+            let checkpoint = ToolRoundAssembly::new(
                 assistant_message.clone(),
                 completed_results.clone(),
                 std::iter::once(result),
@@ -1262,7 +1262,7 @@ fn handle_core_tool_complete(
             all_pending.extend(spawned);
 
             let spawn_id = result.tool_use_id.clone();
-            let checkpoint = CompletedToolRound::new(
+            let checkpoint = ToolRoundAssembly::new(
                 assistant_message.clone(),
                 completed_results.clone(),
                 std::iter::once(result),
@@ -1394,7 +1394,7 @@ fn handle_core_cancellation(
             let cancellation_results =
                 build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = CompletedToolRound::new(
+            let checkpoint = ToolRoundAssembly::new(
                 assistant_message.clone(),
                 completed_results.clone(),
                 cancellation_results,
@@ -1437,7 +1437,7 @@ fn handle_core_cancellation(
             let cancellation_results =
                 build_cancellation_results(tool_use_id, "Cancelled by user", skipped_tools);
 
-            let checkpoint = CompletedToolRound::new(
+            let checkpoint = ToolRoundAssembly::new(
                 assistant_message.clone(),
                 completed_results.clone(),
                 cancellation_results,
