@@ -412,6 +412,8 @@ THE SYSTEM SHALL preserve public user API, historical, and Slack gateway origin 
 WHEN the exact accepted initial objective settles as completed, failed, or cancelled
 THE SYSTEM SHALL atomically retain its first terminal outcome with consumption of that objective's execution occurrence, independently of watch registration and notification delivery
 AND SHALL bind the receipt to the accepted request and its original published transcript, preserve an actual failure reason, and retain it across process restart and target deletion
+AND SHALL carry that exact objective failure reason through native status readback, separately from provisioning failure, before and after target deletion
+AND SHALL represent native initial execution as a status-tagged outcome whose failed variant requires the retained reason, rather than construct a failed read model that omits it
 AND SHALL apply the same contract to captured initial objectives settled by a direct turn.
 
 WHEN operation-specific evidence is absent

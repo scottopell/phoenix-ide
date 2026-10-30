@@ -561,12 +561,49 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
         )
         .await
         .unwrap());
-    let live = create.run(read_request.clone(), native_context(&gc)).await;
-    let live: Value = serde_json::from_str(live.output()).unwrap();
-    assert_eq!(live["status"], "published", "{live}");
-    assert_eq!(live["publication"]["kind"], "available", "{live}");
-    assert_eq!(live["publication"]["conversation_id"], conversation_id);
-    assert!(live["publication"]["canonical_route"].as_str().is_some());
+    let content = phoenix_core::domain::db_schema::MessageContent::User(
+        phoenix_core::domain::db_schema::UserContent::new(delivery.job.intent.objective.clone()),
+    );
+    db.commit_steering_drain(
+        &conversation_id,
+        &[phoenix_core::domain::db_schema::Message {
+            message_id: request_id.clone(),
+            conversation_id: conversation_id.clone(),
+            sequence_id: 1,
+            origin: delivery.job.intent.origin.input_origin(),
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        }],
+        &phoenix_core::domain::sm_state::ConvState::LlmRequesting { attempt: 0 },
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    db.update_conversation_state(
+        &conversation_id,
+        &phoenix_core::domain::sm_state::ConvState::Error {
+            message: "native initial objective failure".into(),
+            error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+            resets_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let failed = create.run(read_request.clone(), native_context(&gc)).await;
+    let failed: Value = serde_json::from_str(failed.output()).unwrap();
+    assert_eq!(failed["status"], "published", "{failed}");
+    assert_eq!(failed["error"], Value::Null, "{failed}");
+    assert_eq!(
+        failed["initial_objective_execution"],
+        json!({"status":"failed", "reason":"native initial objective failure"}),
+        "{failed}"
+    );
+    assert_eq!(failed["publication"]["kind"], "available", "{failed}");
+    assert_eq!(failed["publication"]["conversation_id"], conversation_id);
+    assert!(failed["publication"]["canonical_route"].as_str().is_some());
 
     db.delete_conversation(&conversation_id).await.unwrap();
     let historical = create.run(read_request.clone(), native_context(&gc)).await;
@@ -585,7 +622,11 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
         conversation_id
     );
     assert!(historical["publication"].get("canonical_route").is_none());
-    assert_eq!(historical["initial_objective_execution"], "unavailable");
+    assert_eq!(
+        historical["initial_objective_execution"],
+        json!({"status":"failed", "reason":"native initial objective failure"})
+    );
+    assert_eq!(historical["error"], Value::Null, "{historical}");
     let replay = create
         .run(
             request.clone(),
@@ -802,7 +843,10 @@ async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_director
         .await;
     let read: Value = serde_json::from_str(read.output()).unwrap();
     assert_eq!(read["allowed_actions"], json!(["read"]));
-    assert_eq!(read["initial_objective_execution"], "unavailable");
+    assert_eq!(
+        read["initial_objective_execution"],
+        json!({"status":"unavailable"})
+    );
     assert!(read["execution_interpretation"]
         .as_str()
         .unwrap()

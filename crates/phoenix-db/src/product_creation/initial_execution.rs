@@ -1,12 +1,12 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProductCreationInitialExecution {
     Queued,
     Running,
     Completed,
-    Failed,
+    Failed { reason: String },
     Cancelled,
     AwaitingUserResponse,
     AwaitingTaskApproval,
@@ -55,25 +55,41 @@ impl Database {
         connection: &mut SqliteConnection,
         request_id: &str,
     ) -> DbResult<ProductCreationInitialExecution> {
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT CASE
-              WHEN r.request_id IS NOT NULL THEN r.terminal_kind
-              WHEN EXISTS (SELECT 1 FROM steering_messages q
-                WHERE q.conversation_id = j.published_conversation_id AND q.message_id = j.request_id)
-                THEN 'queued'
-              WHEN EXISTS (SELECT 1 FROM steering_execution_occurrences o
-                WHERE o.conversation_id = j.published_conversation_id AND o.message_id = j.request_id)
-                THEN CASE
-                  WHEN c.id IS NULL THEN 'unavailable'
-                  WHEN c.state_kind = 'awaiting_user_response' THEN 'awaiting_user_response'
-                  WHEN c.state_kind = 'awaiting_task_approval' THEN 'awaiting_task_approval'
-                  ELSE 'running' END
-              ELSE COALESCE((SELECT e.terminal_kind FROM coordinator_watch_events e
-                WHERE e.source_transcript_id = j.published_conversation_id
+        let row = sqlx::query(
+            "WITH selected_watch_event AS (
+                SELECT e.terminal_kind, e.terminal_reason
+                FROM coordinator_watch_events e
+                JOIN product_creation_jobs j
+                  ON e.source_transcript_id = j.published_conversation_id
+                 AND e.source_occurrence_id = j.request_id
+                WHERE j.request_id = ?1
                   AND e.source_occurrence_kind = 'steering'
-                  AND e.source_occurrence_id = j.request_id
-                ORDER BY e.source_generation DESC, e.occurred_at_us DESC, e.event_id DESC LIMIT 1), 'unavailable')
-             END
+                ORDER BY e.source_generation DESC, e.occurred_at_us DESC, e.event_id DESC
+                LIMIT 1
+             )
+             SELECT CASE
+               WHEN r.request_id IS NOT NULL THEN r.terminal_kind
+               WHEN EXISTS (SELECT 1 FROM steering_messages q
+                 WHERE q.conversation_id = j.published_conversation_id AND q.message_id = j.request_id)
+                 THEN 'queued'
+               WHEN EXISTS (SELECT 1 FROM steering_execution_occurrences o
+                 WHERE o.conversation_id = j.published_conversation_id AND o.message_id = j.request_id)
+                 THEN CASE
+                   WHEN c.id IS NULL THEN 'unavailable'
+                   WHEN c.state_kind = 'awaiting_user_response' THEN 'awaiting_user_response'
+                   WHEN c.state_kind = 'awaiting_task_approval' THEN 'awaiting_task_approval'
+                   ELSE 'running' END
+               ELSE COALESCE((SELECT terminal_kind FROM selected_watch_event), 'unavailable')
+             END AS terminal_kind,
+             CASE
+               WHEN r.request_id IS NOT NULL THEN r.failure_reason
+               WHEN NOT EXISTS (SELECT 1 FROM steering_messages q
+                 WHERE q.conversation_id = j.published_conversation_id AND q.message_id = j.request_id)
+                AND NOT EXISTS (SELECT 1 FROM steering_execution_occurrences o
+                 WHERE o.conversation_id = j.published_conversation_id AND o.message_id = j.request_id)
+                 THEN (SELECT terminal_reason FROM selected_watch_event)
+               ELSE NULL
+             END AS failure_reason
              FROM product_creation_jobs j
              LEFT JOIN product_creation_initial_execution_receipts r ON r.request_id = j.request_id
              LEFT JOIN conversations c ON c.id = j.published_conversation_id
@@ -82,14 +98,23 @@ impl Database {
         .bind(request_id)
         .fetch_optional(connection)
         .await?;
-        Ok(match state.as_deref() {
-            Some("queued") => ProductCreationInitialExecution::Queued,
-            Some("running") => ProductCreationInitialExecution::Running,
-            Some("completed" | "Completed") => ProductCreationInitialExecution::Completed,
-            Some("failed" | "Failed") => ProductCreationInitialExecution::Failed,
-            Some("cancelled" | "Cancelled") => ProductCreationInitialExecution::Cancelled,
-            Some("awaiting_user_response") => ProductCreationInitialExecution::AwaitingUserResponse,
-            Some("awaiting_task_approval") => ProductCreationInitialExecution::AwaitingTaskApproval,
+        let Some(row) = row else {
+            return Ok(ProductCreationInitialExecution::Unavailable);
+        };
+        let state: String = row.try_get("terminal_kind")?;
+        let reason: Option<String> = row.try_get("failure_reason")?;
+        Ok(match state.as_str() {
+            "queued" => ProductCreationInitialExecution::Queued,
+            "running" => ProductCreationInitialExecution::Running,
+            "completed" | "Completed" => ProductCreationInitialExecution::Completed,
+            "failed" | "Failed" => ProductCreationInitialExecution::Failed {
+                reason: reason.ok_or_else(|| {
+                    sqlx::Error::Decode("failed initial execution is missing failure reason".into())
+                })?,
+            },
+            "cancelled" | "Cancelled" => ProductCreationInitialExecution::Cancelled,
+            "awaiting_user_response" => ProductCreationInitialExecution::AwaitingUserResponse,
+            "awaiting_task_approval" => ProductCreationInitialExecution::AwaitingTaskApproval,
             _ => ProductCreationInitialExecution::Unavailable,
         })
     }

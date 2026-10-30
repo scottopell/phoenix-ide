@@ -645,6 +645,9 @@ rule AmbiguousCleanupPreservesRecord {
 
 contract CreationReceiptRetention {
     @invariant InitialTerminalReceiptIndependentOfWatch
+        -- Native initial execution is status-tagged; a failed result includes its
+        -- exact retained objective reason, distinct from provisioning failure.
+        -- The same selected row supplies kind and reason before and after deletion.
         -- The first completed, failed or cancelled outcome of the exact accepted
         -- initial objective is retained atomically before its execution occurrence
         -- is consumed. This holds for normal and captured direct-turn settlement,

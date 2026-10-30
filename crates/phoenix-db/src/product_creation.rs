@@ -3579,7 +3579,9 @@ mod product_creation_tests {
             db.product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
-            ProductCreationInitialExecution::Failed
+            ProductCreationInitialExecution::Failed {
+                reason: "initial failure".into(),
+            }
         );
         db.update_conversation_state(&conversation, &ConvState::LlmRequesting { attempt: 0 })
             .await
@@ -3591,7 +3593,9 @@ mod product_creation_tests {
             db.product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
-            ProductCreationInitialExecution::Failed
+            ProductCreationInitialExecution::Failed {
+                reason: "initial failure".into(),
+            }
         );
     }
 
@@ -3666,7 +3670,9 @@ mod product_creation_tests {
             db.product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
-            ProductCreationInitialExecution::Failed
+            ProductCreationInitialExecution::Failed {
+                reason: "original objective failed".into(),
+            }
         );
         db.pool().close().await;
         let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -3675,7 +3681,9 @@ mod product_creation_tests {
                 .product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
-            ProductCreationInitialExecution::Failed
+            ProductCreationInitialExecution::Failed {
+                reason: "original objective failed".into(),
+            }
         );
         let receipt_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM product_creation_initial_execution_receipts WHERE request_id = ?1",
@@ -3709,7 +3717,9 @@ mod product_creation_tests {
                     error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
                     resets_at: None,
                 },
-                ProductCreationInitialExecution::Failed,
+                ProductCreationInitialExecution::Failed {
+                    reason: "original objective failed".into(),
+                },
                 Some("original objective failed"),
             ),
         ] {
@@ -3879,14 +3889,18 @@ mod product_creation_tests {
             db.product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
-            ProductCreationInitialExecution::Failed
+            ProductCreationInitialExecution::Failed {
+                reason: "captured objective failure".into(),
+            }
         );
         db.delete_conversation(&conversation).await.unwrap();
         assert_eq!(
             db.product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
-            ProductCreationInitialExecution::Failed
+            ProductCreationInitialExecution::Failed {
+                reason: "captured objective failure".into(),
+            }
         );
     }
 
@@ -3929,7 +3943,9 @@ mod product_creation_tests {
             db.product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
-            ProductCreationInitialExecution::Failed
+            ProductCreationInitialExecution::Failed {
+                reason: "context exhausted".into(),
+            }
         );
         let coordinator = db
             .get_or_create_coordinator(None, LlmLanguage::default())
@@ -4182,6 +4198,44 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn legacy_watched_initial_failure_keeps_exact_reason_after_receipt_absence() {
+        let (db, request, conversation) = initial_execution_fixture(true).await;
+        db.update_conversation_state(
+            &conversation,
+            &ConvState::Error {
+                message: "legacy objective diagnostic".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                resets_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM product_creation_initial_execution_receipts WHERE request_id = ?1",
+        )
+        .bind(&request)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let expected = ProductCreationInitialExecution::Failed {
+            reason: "legacy objective diagnostic".into(),
+        };
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            expected
+        );
+        db.delete_conversation(&conversation).await.unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
     async fn creation_history_keeps_exact_terminal_evidence_after_target_deletion() {
         for (terminal, expected) in [
             (ConvState::Idle, ProductCreationInitialExecution::Completed),
@@ -4191,7 +4245,9 @@ mod product_creation_tests {
                     error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
                     resets_at: None,
                 },
-                ProductCreationInitialExecution::Failed,
+                ProductCreationInitialExecution::Failed {
+                    reason: "initial failure".into(),
+                },
             ),
         ] {
             let (db, request, conversation) = initial_execution_fixture(true).await;
