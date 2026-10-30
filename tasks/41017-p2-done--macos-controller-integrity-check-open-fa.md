@@ -37,3 +37,11 @@ The same result reproduces with a one-table, one-row database created by upstrea
 Historical code in SQLite's [official `apple-osx` branch](https://github.com/sqlite/sqlite/blob/154e36ab544c0b6a478c0166c63a29b14ce96b0c/src/wal.c#L1380-L1386) passes the read-only main-file flag into WAL opening and selects `READONLY | WAL` without `CREATE`. The [official test-disabling commit](https://github.com/sqlite/sqlite/commit/cbce71044386a923aee50766f2cea0ecc4bff5ca) records the Apple-specific restriction. These sources corroborate the measured mechanism; they are not the exact source of the installed Apple binary.
 
 Local Codex evidence is under `target/controller-contract-validation-20261030/sqlite-build-comparison/`: the C probe, library source IDs, VFS flag/error logs, native creation logs, and sidecar matrix. The production recommendation remains to qualify the actual selected controller SQLite build with a cleanly closed WAL-file read probe, rather than bypassing validation or requiring only a numeric Python/SQLite version.
+
+## Resolution: managed controller runtime
+
+User selected the uv-managed runtime approach: "this sounds portable since I always use/require UV when working with this project, lets make it happen".
+
+`dev.py` declares managed-only CPython 3.13 in its inline uv configuration, including for copied controllers launched with `uv run` outside the checkout. Activation and restart retain their existing resolved absolute interpreter binding for the helper. The Rust contract test and relevant CI unit-test commands explicitly request managed Python 3.13 through uv. The existing tracing-dependency bootstrap checks the active interpreter rather than selecting another Python. No SQLite capability probes, runtime fallback search, or conditional test skipping were added.
+
+The default Rust contract test now passes without environment overrides, including when PATH contains a failing `python3` shim. Direct `dev.py`, `uv run dev.py`, and a copied controller launched from `/tmp` select managed Python 3.13.14, whose built-in upstream SQLite is 3.53.1. Focused check-plan and tracing tests pass (38 and 41 cases respectively).

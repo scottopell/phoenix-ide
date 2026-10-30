@@ -1,9 +1,12 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.13,<3.14"
 # dependencies = [
 #   "taskmd>=1.0,<2",
 # ]
+#
+# [tool.uv]
+# python-preference = "only-managed"
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -517,7 +520,7 @@ def _bootstrap_dev_tracing(environ: dict[str, str] | None = None) -> None:
 
     probe = subprocess.run(
         [
-            "uv", "run", "--offline", *_dev_trace_uv_args(),
+            "uv", "run", "--offline", "--python", sys.executable, *_dev_trace_uv_args(),
             "python", "-c",
             "import opentelemetry.sdk; "
             "import opentelemetry.exporter.otlp.proto.http.trace_exporter",

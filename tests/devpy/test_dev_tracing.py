@@ -144,6 +144,8 @@ class DevTracingTests(unittest.TestCase):
             self.dev._bootstrap_dev_tracing({})
 
         self.assertIn("--offline", run.call_args.args[0])
+        command = run.call_args.args[0]
+        self.assertEqual(sys.executable, command[command.index("--python") + 1])
         execvpe.assert_not_called()
         self.assertFalse(self.dev._DEV_TRACE_AVAILABLE)
 

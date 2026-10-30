@@ -15032,8 +15032,18 @@ with tempfile.TemporaryDirectory() as directory:
         else:
             raise AssertionError("controller accepted a schema missing product_conversation_sources")
 "#;
-        let output = std::process::Command::new("python3")
-            .args(["-I", "-B", "-c"])
+        let output = std::process::Command::new("uv")
+            .args([
+                "run",
+                "--no-project",
+                "--managed-python",
+                "--python",
+                "3.13",
+                "python",
+                "-I",
+                "-B",
+                "-c",
+            ])
             .arg(script)
             .arg(helper)
             .arg(database_path)
@@ -15041,7 +15051,7 @@ with tempfile.TemporaryDirectory() as directory:
             .arg(through.to_string())
             .output()
             .map_err(|error| {
-                format!("could not launch controller for schema {through}: {error}")
+                format!("could not launch controller through uv for schema {through}: {error}")
             })?;
         if output.status.success() {
             Ok(())
