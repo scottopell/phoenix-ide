@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::db_schema as schema;
 use phoenix_core::domain::product_conversation::{
     ContinuationOpeningAuthority, OrdinaryProductConversationLifecycle, ProductConversation,
     ProductConversationId, ProductConversationKind,
@@ -62,6 +63,49 @@ pub struct ProductConversationListProjection {
     pub latest_state: crate::ConvState,
     pub latest_continued_in_conv_id: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrdinaryProductConversationMetadataProjection {
+    pub resolved: ResolvedProductConversation,
+    pub lifecycle: OrdinaryProductConversationLifecycle,
+    pub root_transcript_row_id: String,
+    pub root_slug: Option<String>,
+    pub root_title: Option<String>,
+    pub latest_transcript_row_id: String,
+}
+
+fn ordinary_metadata_projection_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    resolved: ResolvedProductConversation,
+) -> DbResult<OrdinaryProductConversationMetadataProjection> {
+    let product_conversation_id = row
+        .try_get::<String, _>("product_conversation_id")?
+        .parse::<ProductConversationId>()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    if product_conversation_id != resolved.product_conversation_id {
+        return Err(DbError::Serialization(format!(
+            "resolved ordinary ProductConversation {} but metadata belongs to {product_conversation_id}",
+            resolved.product_conversation_id
+        )));
+    }
+    let lifecycle = row.try_get::<String, _>("ordinary_lifecycle")?;
+    let lifecycle =
+        OrdinaryProductConversationLifecycle::from_db_str(&lifecycle).ok_or_else(|| {
+            DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
+        })?;
+    let root_slug: Option<String> = row.try_get("root_slug")?;
+    let root_title = row
+        .try_get::<Option<String>, _>("root_title")?
+        .or_else(|| root_slug.as_deref().map(schema::title_from_slug));
+    Ok(OrdinaryProductConversationMetadataProjection {
+        resolved,
+        lifecycle,
+        root_transcript_row_id: row.try_get("root_transcript_row_id")?,
+        root_slug,
+        root_title,
+        latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -898,6 +942,76 @@ impl Database {
             segments,
             source,
         })
+    }
+
+    /// Resolves one ordinary reference and reads only stable aggregate metadata in one snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or staged, and a
+    /// database or decode error when persisted identity, lifecycle, or transcript topology is
+    /// invalid.
+    pub async fn read_ordinary_product_conversation_metadata(
+        &self,
+        reference: &str,
+    ) -> DbResult<OrdinaryProductConversationMetadataProjection> {
+        let mut connection = self.pool.acquire().await?;
+        let mut transaction = connection.begin().await?;
+        let result = async {
+            let resolved = Self::resolve_ordinary_product_conversation_on(&mut transaction, reference)
+                .await?;
+            let row = sqlx::query(
+                "WITH RECURSIVE transcript(id, ordinal) AS (
+                     SELECT root.id, 0
+                     FROM conversations root
+                     WHERE root.product_conversation_id = ?1
+                       AND root.runtime_role = 'user'
+                       AND root.parent_conversation_id IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM conversations predecessor
+                           WHERE predecessor.product_conversation_id = root.product_conversation_id
+                             AND predecessor.continued_in_conv_id = root.id
+                       )
+                     UNION ALL
+                     SELECT successor.id, transcript.ordinal + 1
+                     FROM transcript
+                     JOIN conversations predecessor ON predecessor.id = transcript.id
+                     JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+                     WHERE successor.product_conversation_id = ?1
+                       AND successor.runtime_role = 'user'
+                       AND successor.parent_conversation_id IS NULL
+                 )
+                 SELECT product.id AS product_conversation_id, product.ordinary_lifecycle,
+                        root.id AS root_transcript_row_id, root.slug AS root_slug,
+                        root.title AS root_title,
+                        latest.id AS latest_transcript_row_id
+                 FROM product_conversations product
+                 JOIN transcript root_ranked ON root_ranked.ordinal = 0
+                 JOIN conversations root ON root.id = root_ranked.id
+                 JOIN transcript latest_ranked ON latest_ranked.ordinal = (SELECT MAX(ordinal) FROM transcript)
+                 JOIN conversations latest ON latest.id = latest_ranked.id
+                 WHERE product.id = ?1 AND product.kind = 'ordinary'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM product_creation_jobs creation
+                       WHERE creation.product_conversation_id = product.id
+                         AND creation.status <> 'published'
+                   )
+                 LIMIT 1",
+            )
+            .bind(resolved.product_conversation_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(row) = row else {
+                return Err(DbError::Serialization(format!(
+                    "ordinary ProductConversation {} has no parent transcript root",
+                    resolved.product_conversation_id
+                )));
+            };
+            ordinary_metadata_projection_from_row(&row, resolved)
+        }
+        .await;
+        transaction.rollback().await?;
+        result
     }
 
     /// Reads topology, cursor watermarks, and its bounded message page from one `SQLite` snapshot.
@@ -2463,6 +2577,129 @@ mod tests {
             .unwrap();
         }
         (db, root)
+    }
+
+    #[tokio::test]
+    async fn metadata_projection_rejects_staged_product() {
+        let (db, root) = performance_fixture(2, 2).await;
+        sqlx::query("INSERT INTO product_creation_jobs(request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros, published_product_id, published_conversation_id, provisioning_stage, stage_updated_at_unix_micros, objective_origin) VALUES ('metadata-staged-job', ?1, '/tmp', '', 'phoenix-native', 'delivery_pending', 1, 1, ?1, ?2, 'bootstrap_initial_turn', 1, 'user_api')")
+            .bind(root.product_conversation_id.as_str())
+            .bind(&root.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.read_ordinary_product_conversation_metadata(root.product_conversation_id.as_str())
+                .await,
+            Err(DbError::ConversationNotFound(_))
+        ));
+        sqlx::query("DELETE FROM product_creation_jobs WHERE request_id = 'metadata-staged-job'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_projection_skips_oversized_message_and_handoff_payload_decoding() {
+        let (db, root) = performance_fixture(2, 2).await;
+        let successor: String =
+            sqlx::query_scalar("SELECT continued_in_conv_id FROM conversations WHERE id = ?1")
+                .bind(&root.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let continuation_message = "metadata-test-continuation".to_string();
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             SELECT ?1, ?2, COALESCE(MAX(sequence_id), 0) + 1, 'continuation', ?3, '2026-01-02T00:00:00Z'
+             FROM messages WHERE conversation_id = ?2",
+        )
+        .bind(&continuation_message)
+        .bind(&root.id)
+        .bind(serde_json::to_string(&MessageContent::Continuation(ContinuationContent {
+                summary: "summary".into(),
+            }))
+            .unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let accepted_message: String = sqlx::query_scalar(
+            "SELECT message_id FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id, message_id LIMIT 1",
+        )
+        .bind(&successor)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO completed_continuation_handoffs (
+                 predecessor_conversation_id, successor_conversation_id,
+                 continuation_message_id, accepted_successor_message_id, opening_authority
+             ) VALUES (?1, ?2, ?3, ?4, 'user_authorized_instruction')",
+        )
+        .bind(&root.id)
+        .bind(&successor)
+        .bind(&continuation_message)
+        .bind(&accepted_message)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let newest_message: String = sqlx::query_scalar(
+            "SELECT message_id FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id DESC, message_id DESC LIMIT 1",
+        )
+        .bind(&successor)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let poison = format!("{}{{", "x".repeat(2 * 1024 * 1024));
+        for message_id in [&continuation_message, &accepted_message, &newest_message] {
+            sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = ?2")
+                .bind(&poison)
+                .bind(message_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+
+        assert!(db
+            .get_ordinary_product_conversation(&root.product_conversation_id)
+            .await
+            .is_err());
+        assert!(db
+            .read_ordinary_product_conversation_snapshot(&root.id, None, None, 10)
+            .await
+            .is_err());
+
+        let metadata = db
+            .read_ordinary_product_conversation_metadata(&root.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.resolved.product_conversation_id,
+            root.product_conversation_id
+        );
+        assert_eq!(metadata.root_transcript_row_id, root.id);
+        assert_eq!(metadata.latest_transcript_row_id, successor);
+        assert_eq!(
+            metadata.lifecycle,
+            OrdinaryProductConversationLifecycle::Open
+        );
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let history = db
+            .read_ordinary_product_conversation_metadata(&root.product_conversation_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            history.lifecycle,
+            OrdinaryProductConversationLifecycle::History
+        );
+        assert_eq!(history.root_transcript_row_id, root.id);
+        assert_eq!(history.latest_transcript_row_id, successor);
     }
 
     async fn measure_snapshot_stages(db: &Database, reference: &str) -> (u128, u128, u128, u128) {

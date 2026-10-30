@@ -1371,9 +1371,9 @@ async fn resolve_conversation_read_target(
 ) -> Result<ConversationReadTarget, String> {
     match parse_canonical_conversation_reference(raw, true).map_err(|error| error.to_string())? {
         CanonicalConversationReference::StableProductConversation(id) => {
-            let snapshot = service
+            let metadata = service
                 .db
-                .read_ordinary_product_conversation_snapshot(id.as_str(), None, None, 1)
+                .read_ordinary_product_conversation_metadata(id.as_str())
                 .await
                 .map_err(|error| {
                     if matches!(error, crate::db::DbError::ConversationNotFound(_)) {
@@ -1382,12 +1382,12 @@ async fn resolve_conversation_read_target(
                         format!("ProductConversation read failed: {error}")
                     }
                 })?;
-            if snapshot.aggregate.product_conversation.id() != &id {
+            if metadata.resolved.product_conversation_id != id {
                 return Err("ProductConversation reference not found".to_string());
             }
             Ok(ConversationReadTarget::StableCurrent {
                 transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
-                    snapshot.aggregate.latest_transcript_row_id,
+                    metadata.latest_transcript_row_id,
                 )
                 .map_err(|error| error.to_string())?,
             })
@@ -2486,15 +2486,14 @@ async fn resolve_reference_impl(
         }
         let typed_id = phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
-        let snapshot = service
+        let metadata = service
             .db
-            .read_ordinary_product_conversation_snapshot(id, None, None, 1)
+            .read_ordinary_product_conversation_metadata(id)
             .await
             .map_err(map_db_not_found)?;
-        if snapshot.aggregate.product_conversation.id().as_str() != id {
+        if metadata.resolved.product_conversation_id.as_str() != id {
             return Err(AppError::NotFound(id.to_string()));
         }
-        let aggregate = snapshot.aggregate;
         #[cfg(test)]
         if let Some(hook) = &service.stable_resolution_test_hook {
             hook.snapshot_read.add_permits(1);
@@ -2508,16 +2507,15 @@ async fn resolve_reference_impl(
         return Ok(ResolveGlobalReferenceResponse {
             kind: ResolvedReferenceKind::ProductConversation,
             id: typed_id.to_string(),
-            href: Some(super::product_conversations::canonical_route(&aggregate)),
-            title: aggregate.root.conversation.title.clone().or(aggregate
-                .root
-                .conversation
-                .slug
-                .clone()),
+            href: Some(super::product_conversations::product_route(
+                metadata.root_slug.as_deref(),
+                metadata.resolved.product_conversation_id.as_str(),
+            )),
+            title: metadata.root_title.or(metadata.root_slug),
             work_scope: current.work_scope,
             summary: format!(
                 "stable ProductConversation @conv:{typed_id}; root transcript @transcript:{}; current transcript @transcript:{}; state {}; updated {}",
-                aggregate.root.conversation.id,
+                metadata.root_transcript_row_id,
                 current.id,
                 current.state.variant_name(),
                 current.updated_at.to_rfc3339()
@@ -4601,6 +4599,92 @@ mod tests {
             resolved.summary
         );
         assert!(!resolved.summary.contains(&"x".repeat(128)));
+    }
+
+    #[tokio::test]
+    async fn stable_bounded_resolution_does_not_decode_oversized_newest_message() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation(
+                "stable-metadata-only",
+                "stable-metadata-only",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let product_id = root.product_conversation_id.clone();
+        let fallback_title = phoenix_core::domain::db_schema::title_from_slug(
+            root.slug.as_deref().expect("root slug"),
+        );
+        sqlx::query("UPDATE conversations SET title = NULL WHERE id = ?1")
+            .bind(&root.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.add_message(
+            "stable-metadata-only-seed",
+            &root.id,
+            &phoenix_core::domain::db_schema::MessageContent::user("seed"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "stable-metadata-only-message",
+            &root.id,
+            &phoenix_core::domain::db_schema::MessageContent::user("newest payload"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let oversized_len = 2 * 1024 * 1024_i64;
+        sqlx::query("UPDATE messages SET content = zeroblob(?1) WHERE message_id = ?2")
+            .bind(oversized_len)
+            .bind("stable-metadata-only-message")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let stored: (String, i64) = sqlx::query_as(
+            "SELECT typeof(content), length(content) FROM messages WHERE message_id = ?1",
+        )
+        .bind("stable-metadata-only-message")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored, ("blob".to_string(), oversized_len));
+        let decoding_snapshot = db
+            .read_ordinary_product_conversation_snapshot(product_id.as_str(), None, None, 1)
+            .await;
+        assert!(matches!(
+            decoding_snapshot,
+            Err(crate::db::DbError::Sqlx(_))
+        ));
+
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let limit = std::num::NonZeroUsize::new(64).unwrap();
+        let resolved = service
+            .resolve_reference_bounded(&format!("@conv:{product_id}"), limit)
+            .await
+            .unwrap();
+        assert_eq!(resolved.id, product_id.as_str());
+        assert_eq!(resolved.title.as_deref(), Some(fallback_title.as_str()));
+        assert!(resolved
+            .summary
+            .contains("current transcript @transcript:stable-metadata-only"));
+
+        let page = service
+            .read_conversation_page_bounded(&format!("@conv:{product_id}"), 0, limit)
+            .await
+            .unwrap();
+        assert!(page
+            .content
+            .contains(super::OVERSIZED_REMOTE_MESSAGE_MARKER));
+        assert!(!page.content.contains("newest payload"));
     }
 
     #[tokio::test]

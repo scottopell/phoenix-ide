@@ -233,6 +233,10 @@ AND SHALL preserve explicit historical evidence, Global Coordinator routing, and
 WHEN a stable ProductConversation reference is resolved
 THE SYSTEM SHALL resolve the current transcript member and its attached WorkScope from one database point in time
 
+WHEN a stable ProductConversation reference is resolved through a bounded global conversation-read or reference-resolution surface
+THE SYSTEM SHALL resolve its eligible ordinary identity and topology from metadata
+AND SHALL NOT deserialize message content, continuation handoff content, or continuation opening content solely to resolve that identity
+
 WHEN an exact transcript-row reference is resolved
 THE SYSTEM SHALL resolve only that historical member's attached WorkScope and SHALL NOT substitute a current or successor member
 
