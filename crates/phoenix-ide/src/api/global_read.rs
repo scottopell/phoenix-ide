@@ -252,13 +252,16 @@ fn parse_canonical_conversation_reference(
     })
 }
 
-// The shortest rendered visible row is 77 chars. Page ends are capped at the
-// 1_000_000-char cursor ceiling, so cover that ceiling plus one has-more
-// lookahead char, then align to 64 rows: ceil(1_000_001 / 77 / 64) * 64 =
-// 12_992. Because every physical row consumes this budget, each request makes
-// at most 203 bounded history reads; this is a work bound, not a time bound.
+// Conservatively reserve 77 chars per rendered visible row. Page ends are
+// capped at the 1_000_000-char cursor ceiling, so cover that ceiling plus one
+// has-more lookahead char, then align to 64 rows:
+// ceil(1_000_001 / 77 / 64) * 64 = 12_992. Because every physical row consumes
+// this budget, each request makes at most 203 bounded history reads; this is a
+// work bound, not a time bound.
 pub(crate) const FEDERATED_READ_SCAN_LIMIT: usize = 12_992;
 
+#[cfg(test)]
+const FEDERATED_READ_RENDERED_ROW_FLOOR: usize = 77;
 #[cfg(test)]
 const FEDERATED_READ_MAX_DB_READS: usize =
     FEDERATED_READ_SCAN_LIMIT.div_ceil(BOUNDED_READ_MESSAGE_BATCH.get());
@@ -3726,8 +3729,9 @@ mod tests {
         resolve_work_scope, split_fragment, BoundedReadError, ConversationReadTarget,
         CoordinatorWorkScopeTargetError, GlobalMessageTarget, GlobalMessageTargetError,
         GlobalReadService, ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
-        WorkScopeUnavailableReason, FEDERATED_READ_MAX_DB_READS, FEDERATED_READ_SCAN_LIMIT,
-        FEDERATED_READ_TEST_CONTENT_LIMIT, MAX_CONVERSATION_READ_CURSOR, READ_PAGE_CHARS,
+        WorkScopeUnavailableReason, FEDERATED_READ_MAX_DB_READS, FEDERATED_READ_RENDERED_ROW_FLOOR,
+        FEDERATED_READ_SCAN_LIMIT, FEDERATED_READ_TEST_CONTENT_LIMIT, MAX_CONVERSATION_READ_CURSOR,
+        READ_PAGE_CHARS,
     };
     use std::sync::Arc;
 
@@ -4530,10 +4534,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(rendered.chars().count(), 77);
+        assert!(
+            rendered.chars().count() >= FEDERATED_READ_RENDERED_ROW_FLOOR,
+            "minimal rendered row must preserve the conservative scan-limit floor"
+        );
         assert_eq!(FEDERATED_READ_SCAN_LIMIT, 12_992);
         assert!(
-            FEDERATED_READ_SCAN_LIMIT * rendered.chars().count() > MAX_CONVERSATION_READ_CURSOR
+            FEDERATED_READ_SCAN_LIMIT * FEDERATED_READ_RENDERED_ROW_FLOOR
+                > MAX_CONVERSATION_READ_CURSOR
         );
         assert_eq!(FEDERATED_READ_MAX_DB_READS, 203);
     }
