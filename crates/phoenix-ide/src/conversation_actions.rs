@@ -260,9 +260,9 @@ where
         )
         .await
         .map_err(db_to_app)?;
-    let job: ProductCreationJobRecord = match outcome {
-        ProductCreationAcceptOutcome::Accepted(job)
-        | ProductCreationAcceptOutcome::Replayed(job) => job,
+    let (job, newly_accepted): (ProductCreationJobRecord, bool) = match outcome {
+        ProductCreationAcceptOutcome::Accepted(job) => (job, true),
+        ProductCreationAcceptOutcome::Replayed(job) => (job, false),
         ProductCreationAcceptOutcome::Conflict(_) => {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 "request_id conflicts with immutable creation intent",
@@ -270,7 +270,9 @@ where
             ))));
         }
     };
-    runtime.kick_creation_worker();
+    if newly_accepted {
+        runtime.kick_creation_worker();
+    }
     Ok(CreateAccepted {
         request_id: job.request_id,
         product_conversation_id: job.product_conversation_id,

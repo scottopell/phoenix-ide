@@ -387,4 +387,12 @@ AND SHALL distinguish acceptance from publication, objective delivery, runtime e
 AND SHALL derive the complete native readback, including publication identity, route, and execution evidence, from one persistence snapshot that also validates the current Coordinator's authority
 AND SHALL NOT implicitly cancel, restart, or repeat an intentional creation under a new identity.
 
+WHEN the published product or its original transcript is deleted
+THE SYSTEM SHALL retain the accepted request identity, literal immutable intent, first source provenance, reserved product identity, and original publication identity
+AND SHALL reconcile an identical retry to that historical acceptance rather than create another product or repeat work
+AND SHALL reject changed-intent reuse of that request identity
+AND SHALL expose the original publication as historical without a live route, even when the product survives through a successor transcript
+AND SHALL NOT claim, renew, deliver, complete, retry, recover, or schedule reconciliation deadlines for delivery to the missing original transcript, including through an already-held claim
+AND SHALL report only exact retained terminal execution evidence, or unavailable execution when that evidence is absent, without retargeting the original objective to a successor.
+
 THE SYSTEM SHALL preserve public user API, historical, and Slack gateway origin decoding and objective-delivery behavior independently of the Coordinator's literal-input policy.

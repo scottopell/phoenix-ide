@@ -762,7 +762,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "retain_product_conversation_rename_receipts",
         sql: include_str!("migrations/retain_product_conversation_rename_receipts.sql"),
     },
-
+    Migration {
+        version: 147,
+        name: "retain_product_creation_receipts",
+        sql: include_str!("migrations/retain_product_creation_receipts.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -15067,6 +15071,7 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (147, "retain_product_creation_receipts"),
             (146, "retain_product_conversation_rename_receipts"),
             (144, "product_conversation_rename_receipts"),
             (143, "agent_creation_provenance"),

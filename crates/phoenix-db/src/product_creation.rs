@@ -94,7 +94,7 @@ impl ProductCreationOrigin {
             value => {
                 return Err(sqlx::Error::Decode(
                     format!("invalid creation origin: {value}").into(),
-                ))
+                ));
             }
         };
         let source_product_id: Option<String> =
@@ -249,9 +249,14 @@ pub struct ProductCreationJobRecord {
 }
 
 #[derive(Debug)]
-pub struct ProductCreationPublicationRead {
-    pub conversation_id: String,
-    pub aggregate: ProductConversationAggregate,
+pub enum ProductCreationPublicationRead {
+    Available {
+        conversation_id: String,
+        aggregate: ProductConversationAggregate,
+    },
+    Historical {
+        conversation_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -655,17 +660,31 @@ impl Database {
         }
         let initial_objective_execution =
             Self::product_creation_initial_execution_on(&mut tx, request_id).await?;
-        let publication = if job.status == "published" {
-            let conversation_id = job.published_conversation_id.ok_or_else(|| {
-                DbError::Serialization("published creation has no transcript identity".into())
-            })?;
-            let aggregate =
-                Self::get_ordinary_product_conversation_on(&mut tx, &job.product_conversation_id)
+        let publication = if let Some(conversation_id) = job.published_conversation_id {
+            let transcript_exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)")
+                    .bind(&conversation_id)
+                    .fetch_one(&mut *tx)
                     .await?;
-            Some(ProductCreationPublicationRead {
-                conversation_id,
-                aggregate,
-            })
+            if !transcript_exists {
+                Some(ProductCreationPublicationRead::Historical { conversation_id })
+            } else {
+                match Self::get_ordinary_product_conversation_on(
+                    &mut tx,
+                    &job.product_conversation_id,
+                )
+                .await
+                {
+                    Ok(aggregate) => Some(ProductCreationPublicationRead::Available {
+                        conversation_id,
+                        aggregate,
+                    }),
+                    Err(DbError::ConversationNotFound(_)) => {
+                        Some(ProductCreationPublicationRead::Historical { conversation_id })
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         } else {
             None
         };
@@ -872,7 +891,9 @@ impl Database {
                  status = 'accepted'
                  OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
-             ) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
+             ) AND (published_conversation_id IS NULL OR EXISTS (
+                 SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id
+             )) RETURNING request_id, product_conversation_id, cwd, objective, objective_origin, objective_slack_request_id, objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id, model, effort,
                  llm_language, status, provisioning_stage, stage_updated_at_unix_micros,
                  accepted_at_unix_micros, updated_at_unix_micros,
                  attempt_count, claim_generation, claim_worker_id, claim_token,
@@ -933,9 +954,12 @@ impl Database {
                  updated_at_unix_micros = ?4
              WHERE request_id = (
                  SELECT request_id FROM product_creation_jobs
-                 WHERE status = 'accepted'
+                 WHERE (status = 'accepted'
                     OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?4)
-                    OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?4)
+                    OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?4))
+                   AND (published_conversation_id IS NULL OR EXISTS (
+                     SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id
+                   ))
                  ORDER BY CASE status WHEN 'accepted' THEN accepted_at_unix_micros ELSE retry_at_unix_micros END ASC,
                           accepted_at_unix_micros ASC, request_id ASC
                  LIMIT 1
@@ -1227,7 +1251,9 @@ impl Database {
              WHERE request_id = ?3 AND status IN ('claimed', 'delivery_pending')
                AND claim_generation = ?4
                AND claim_worker_id = ?5 AND claim_token = ?6
-               AND claim_lease_until_unix_micros > ?2",
+               AND claim_lease_until_unix_micros > ?2
+               AND (status = 'claimed' OR EXISTS (SELECT 1 FROM conversations c
+                    WHERE c.id = product_creation_jobs.published_conversation_id))",
         )
         .bind(datetime_to_unix_micros(now + lease_duration))
         .bind(datetime_to_unix_micros(now))
@@ -1275,6 +1301,7 @@ impl Database {
                  last_error = ?5,
                  updated_at_unix_micros = ?6
              WHERE request_id = ?1 AND status = 'delivery_pending'
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id)
                AND delivery_attempt_count = ?7 AND claim_generation = ?8
                AND claim_worker_id = ?9 AND claim_token = ?10
                AND claim_lease_until_unix_micros > ?6",
@@ -1502,6 +1529,7 @@ impl Database {
             "SELECT request_id, delivery_attempt_count
              FROM product_creation_jobs
              WHERE status = 'delivery_pending'
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id)
                AND (delivery_retry_at_unix_micros IS NULL OR delivery_retry_at_unix_micros <= ?1)
                AND (claim_lease_until_unix_micros IS NULL OR claim_lease_until_unix_micros <= ?1)
              ORDER BY delivery_retry_at_unix_micros, updated_at_unix_micros, request_id
@@ -1522,6 +1550,7 @@ impl Database {
                  claim_lease_until_unix_micros = ?3,
                  updated_at_unix_micros = ?4
              WHERE request_id = ?5 AND status = 'delivery_pending'
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id)
                AND (delivery_retry_at_unix_micros IS NULL OR delivery_retry_at_unix_micros <= ?4)
                AND (claim_lease_until_unix_micros IS NULL OR claim_lease_until_unix_micros <= ?4)
                AND delivery_attempt_count = ?6",
@@ -1563,6 +1592,7 @@ impl Database {
              SET status = 'delivery_pending', delivery_attempt_count = 1,
                  delivery_retry_at_unix_micros = ?1, updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND status = 'delivery_failed'
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id)
                AND EXISTS (
                  SELECT 1 FROM product_conversations product
                  WHERE product.id = product_creation_jobs.published_product_id
@@ -1584,7 +1614,9 @@ impl Database {
 
     pub async fn product_creation_delivery_retryable(&self, request_id: &str) -> DbResult<bool> {
         let retryable: bool = sqlx::query_scalar(
-            "SELECT CASE WHEN j.status = 'delivery_failed' AND EXISTS (
+            "SELECT CASE WHEN j.status = 'delivery_failed'
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = j.published_conversation_id)
+               AND EXISTS (
                SELECT 1 FROM product_conversations product
                WHERE product.id = j.published_product_id
                  AND product.kind = 'ordinary'
@@ -1635,6 +1667,9 @@ impl Database {
                     'delivery_pending',
                     'cleanup_ambiguous'
                   )
+               AND (status NOT IN ('delivery_pending', 'delivery_failed') OR EXISTS (
+                    SELECT 1 FROM conversations c WHERE c.id = j.published_conversation_id
+               ))
                AND (?1 IS NULL OR updated_at_unix_micros < ?1
                     OR (updated_at_unix_micros = ?1 AND request_id < ?2))
              ORDER BY updated_at_unix_micros DESC, request_id DESC
@@ -1700,6 +1735,7 @@ impl Database {
             "SELECT published_conversation_id
              FROM product_creation_jobs
              WHERE request_id = ?1 AND status = 'delivery_pending'
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = product_creation_jobs.published_conversation_id)
                AND claim_generation = ?2 AND claim_worker_id = ?3 AND claim_token = ?4
                AND claim_lease_until_unix_micros > ?5
                AND provisioning_stage = 'bootstrap_initial_turn'
@@ -2420,7 +2456,12 @@ impl Database {
                      WHEN claim_lease_until_unix_micros IS NULL THEN delivery_retry_at_unix_micros
                      WHEN delivery_retry_at_unix_micros > claim_lease_until_unix_micros THEN delivery_retry_at_unix_micros
                      ELSE claim_lease_until_unix_micros
-                 END FROM product_creation_jobs WHERE status = 'delivery_pending'
+                 END FROM product_creation_jobs
+                 WHERE status = 'delivery_pending'
+                   AND EXISTS (
+                       SELECT 1 FROM conversations c
+                       WHERE c.id = product_creation_jobs.published_conversation_id
+                   )
                  UNION ALL
                  SELECT CASE
                             WHEN cleanup_lease_until_unix_micros IS NOT NULL
@@ -2483,6 +2524,196 @@ mod product_creation_tests {
                 .await
                 .unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn coordinator_creation_history_survives_target_deletion_and_replays_identity() {
+        use phoenix_core::domain::db_schema::SourceToolCall;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut accepted_intent = intent("/repo/history", "historical objective");
+        accepted_intent.origin = ProductCreationOrigin::InternalConversation {
+            product_conversation_id: coordinator.product_conversation_id.clone(),
+            transcript_id: coordinator.id.clone(),
+            source_call: SourceToolCall {
+                message_id: "history-message".into(),
+                tool_use_id: "history-call".into(),
+            },
+        };
+        db.accept_product_creation_resolved(&request_id, Some(&coordinator.id), |_| {
+            Ok(accepted_intent.clone())
+        })
+        .await
+        .unwrap();
+        let claimed = db
+            .claim_next_product_creation(
+                "history-worker",
+                "history-token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let job = db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation_id = format!("history-{}", uuid::Uuid::new_v4());
+        advance_to_metadata(&db, &request_id, &claimed.claim).await;
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: request_id.clone(),
+                claim: claimed.claim,
+                conversation: published_conversation(
+                    &conversation_id,
+                    job.product_conversation_id.clone(),
+                    WorkScopeId::new(),
+                    "/repo/history",
+                ),
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: "/repo/history".into(),
+                },
+                git_publication: None,
+            })
+            .await
+            .unwrap());
+
+        db.delete_conversation(&conversation_id).await.unwrap();
+        let snapshot = db
+            .read_product_creation_status_as_coordinator(&coordinator.id, &request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.request_id, request_id);
+        assert_eq!(
+            snapshot.product_conversation_id,
+            job.product_conversation_id
+        );
+        assert_eq!(snapshot.intent.objective, "historical objective");
+        assert_eq!(snapshot.intent.origin, accepted_intent.origin);
+        assert!(matches!(
+            snapshot.publication,
+            Some(ProductCreationPublicationRead::Historical { conversation_id: id }) if id == conversation_id
+        ));
+        assert_eq!(
+            snapshot.initial_objective_execution,
+            ProductCreationInitialExecution::Unavailable
+        );
+        let ProductCreationAcceptOutcome::Replayed(replay) = db
+            .accept_product_creation_resolved(&request_id, Some(&coordinator.id), |_| {
+                Ok(accepted_intent.clone())
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("identical request must replay historical creation");
+        };
+        assert_eq!(replay.product_conversation_id, job.product_conversation_id);
+        let mut changed = accepted_intent;
+        changed.objective = "changed objective".into();
+        assert!(matches!(
+            db.accept_product_creation_resolved(&request_id, Some(&coordinator.id), |_| {
+                Ok(changed.clone())
+            })
+            .await
+            .unwrap(),
+            ProductCreationAcceptOutcome::Conflict(_)
+        ));
+        assert!(db
+            .claim_next_product_creation(
+                "history-replay-worker",
+                "history-replay-token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn coordinator_creation_history_deletion_fences_queued_delivery_and_recovery() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "coordinator_creation_history_delivery").await;
+        let conversation_id = delivery
+            .job
+            .published_conversation_id
+            .clone()
+            .expect("staged job has a published transcript");
+        assert!(db.next_product_creation_deadline().await.unwrap().is_some());
+        db.delete_conversation(&conversation_id).await.unwrap();
+        assert_eq!(db.next_product_creation_deadline().await.unwrap(), None);
+        assert!(db
+            .append_product_creation_steering_entry(
+                &delivery,
+                &delivery_entry(&delivery),
+                &format!("product-create:{}", delivery.job.request_id),
+            )
+            .await
+            .is_err());
+
+        assert!(!db
+            .renew_product_creation_claim(
+                &delivery.job.request_id,
+                &delivery.claim,
+                Utc::now(),
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .complete_product_creation_delivery(
+                &delivery.job.request_id,
+                &delivery.claim,
+                &SteeringAcceptanceFingerprint::Exact(format!(
+                    "product-create:{}",
+                    delivery.job.request_id
+                )),
+                &delivery.job.intent,
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .schedule_product_creation_delivery_retry(
+                &delivery.job.request_id,
+                &delivery.claim,
+                "target deleted",
+                Utc::now(),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .claim_next_product_creation_delivery(
+                "history-recovery",
+                "history-token",
+                Utc::now(),
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!db
+            .retry_failed_product_creation_delivery(&delivery.job.request_id)
+            .await
+            .unwrap());
+        assert!(!db
+            .product_creation_delivery_retryable(&delivery.job.request_id)
+            .await
+            .unwrap());
+        assert!(!db
+            .list_product_creation_recovery_jobs(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|job| job.request_id == delivery.job.request_id));
     }
 
     #[tokio::test]
@@ -2729,13 +2960,16 @@ mod product_creation_tests {
             snapshot.initial_objective_execution,
             ProductCreationInitialExecution::Queued
         );
-        let publication = snapshot.publication.unwrap();
-        assert_eq!(publication.conversation_id, conversation_id);
-        assert_eq!(publication.aggregate.root.conversation.slug, old_slug);
-        assert!(matches!(
-            publication.aggregate.root.conversation.state,
-            ConvState::Idle
-        ));
+        let ProductCreationPublicationRead::Available {
+            conversation_id: published_conversation_id,
+            aggregate,
+        } = snapshot.publication.unwrap()
+        else {
+            panic!("live publication must include its aggregate");
+        };
+        assert_eq!(published_conversation_id, conversation_id);
+        assert_eq!(aggregate.root.conversation.slug, old_slug);
+        assert!(matches!(aggregate.root.conversation.state, ConvState::Idle));
         assert_eq!(
             db.product_creation_initial_execution(&request_id)
                 .await
@@ -3094,6 +3328,107 @@ mod product_creation_tests {
         );
         assert_eq!(
             db.product_creation_initial_execution("unknown-request")
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_history_original_transcript_deletion_does_not_retarget_successor() {
+        let (db, request, original) = initial_execution_fixture(false).await;
+        let job = db
+            .get_product_creation_job(&request)
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_conversation_state(
+            &original,
+            &ConvState::ContextExhausted {
+                summary: "continue ordinary product".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::ContinueOutcome::Created(successor) =
+            db.continue_conversation(&original).await.unwrap()
+        else {
+            panic!("expected ordinary successor");
+        };
+        db.delete_conversation(&original).await.unwrap();
+        assert!(db.get_conversation(&successor.id).await.unwrap().is_some());
+        assert_eq!(
+            successor.product_conversation_id,
+            job.product_conversation_id
+        );
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Unavailable
+        );
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let snapshot = db
+            .read_product_creation_status_as_coordinator(&coordinator.id, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(snapshot.publication, Some(ProductCreationPublicationRead::Historical { conversation_id }) if conversation_id == original)
+        );
+        assert!(
+            matches!(db.accept_product_creation(&request, &job.intent).await.unwrap(), ProductCreationAcceptOutcome::Replayed(retained) if retained.product_conversation_id == job.product_conversation_id && retained.published_conversation_id.as_deref() == Some(original.as_str()))
+        );
+        assert_eq!(db.next_product_creation_deadline().await.unwrap(), None);
+        let successor_inputs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_messages WHERE conversation_id=?1 AND message_id=?2",
+        )
+        .bind(&successor.id)
+        .bind(&request)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(successor_inputs, 0);
+    }
+
+    #[tokio::test]
+    async fn creation_history_keeps_exact_terminal_evidence_after_target_deletion() {
+        for (terminal, expected) in [
+            (ConvState::Idle, ProductCreationInitialExecution::Completed),
+            (
+                ConvState::Error {
+                    message: "initial failure".into(),
+                    error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                    resets_at: None,
+                },
+                ProductCreationInitialExecution::Failed,
+            ),
+        ] {
+            let (db, request, conversation) = initial_execution_fixture(true).await;
+            db.update_conversation_state(&conversation, &terminal)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.product_creation_initial_execution(&request)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            db.delete_conversation(&conversation).await.unwrap();
+            assert_eq!(
+                db.product_creation_initial_execution(&request)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        let (db, request, conversation) = initial_execution_fixture(false).await;
+        db.delete_conversation(&conversation).await.unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
                 .await
                 .unwrap(),
             ProductCreationInitialExecution::Unavailable
@@ -3967,10 +4302,7 @@ mod product_creation_tests {
             "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = 'not-a-timestamp' WHERE request_id = 'stage-request'",
             "UPDATE product_creation_jobs SET stage_updated_at_unix_micros = -1 WHERE request_id = 'stage-request'",
         ] {
-            assert!(sqlx::query(statement)
-                .execute(db.pool())
-                .await
-                .is_err());
+            assert!(sqlx::query(statement).execute(db.pool()).await.is_err());
         }
     }
 
@@ -6737,16 +7069,41 @@ mod product_creation_tests {
         assert_eq!(repository_count, 0);
         assert_eq!(attachment_count, 0);
         assert_eq!(locator_count, 0);
-        sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
-            .bind(product_id.as_str())
-            .execute(db.pool())
-            .await
-            .unwrap();
-        assert!(db
+        db.delete_conversation("conv-cascade").await.unwrap();
+        let retained = db
             .get_product_creation_job("req-cascade")
             .await
             .unwrap()
+            .expect("published creation receipt survives target deletion");
+        assert_eq!(retained.product_conversation_id, product_id);
+        assert_eq!(
+            retained.published_conversation_id.as_deref(),
+            Some("conv-cascade")
+        );
+        let replay = db
+            .accept_product_creation("req-cascade", &intent("/repo/hidden", "owner"))
+            .await
+            .unwrap();
+        let ProductCreationAcceptOutcome::Replayed(replay) = replay else {
+            panic!("same creation intent must replay the retained receipt");
+        };
+        assert_eq!(replay.product_conversation_id, product_id);
+        assert!(db
+            .claim_next_product_creation(
+                "worker-replay",
+                "token-replay",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
             .is_none());
+        assert!(matches!(
+            db.accept_product_creation("req-cascade", &intent("/repo/hidden", "changed"))
+                .await
+                .unwrap(),
+            ProductCreationAcceptOutcome::Conflict(_)
+        ));
     }
 
     #[tokio::test]

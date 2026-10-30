@@ -287,9 +287,15 @@ fn validated_creation_directory(cwd: &str, home: &std::path::Path) -> Result<Str
 }
 
 #[derive(Serialize)]
-struct NativeCreationPublication {
-    conversation_id: String,
-    canonical_route: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NativeCreationPublication {
+    Available {
+        conversation_id: String,
+        canonical_route: String,
+    },
+    Historical {
+        conversation_id: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -316,9 +322,17 @@ fn native_creation_status(status: phoenix_db::ProductCreationStatusRead) -> Nati
         provisioning_stage_updated_at: status.stage_updated_at,
         retry_at: status.retry_at,
         error: status.error,
-        publication: status.publication.map(|publication| NativeCreationPublication {
-            conversation_id: publication.conversation_id,
-            canonical_route: crate::api::product_conversations::canonical_route(&publication.aggregate),
+        publication: status.publication.map(|publication| match publication {
+            phoenix_db::ProductCreationPublicationRead::Available {
+                conversation_id,
+                aggregate,
+            } => NativeCreationPublication::Available {
+                conversation_id,
+                canonical_route: crate::api::product_conversations::canonical_route(&aggregate),
+            },
+            phoenix_db::ProductCreationPublicationRead::Historical { conversation_id } => {
+                NativeCreationPublication::Historical { conversation_id }
+            }
         }),
         initial_objective_execution: status.initial_objective_execution,
         execution_interpretation: "Publication means initial input accepted, not objective completed. Unavailable means no attributable outcome is retained; never infer success from later turns.",

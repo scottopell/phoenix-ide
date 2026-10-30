@@ -8,6 +8,7 @@ use crate::{Database, DbError, DbResult};
 const PROVENANCE: &str = include_str!("agent_creation_provenance.sql");
 const RECEIPTS: &str = include_str!("product_conversation_rename_receipts.sql");
 const RETAIN_RECEIPTS: &str = include_str!("retain_product_conversation_rename_receipts.sql");
+const RETAIN_CREATION: &str = include_str!("retain_product_creation_receipts.sql");
 const FAULTS: &[&str] = &[
     "DROP TABLE product_creation_jobs;\n",
     "INSERT INTO product_creation_job_images (request_id, ordinal, media_type, data) SELECT request_id, ordinal, media_type, data FROM _phase1_images_before;\n",
@@ -254,6 +255,7 @@ fn registered_identity_order_and_exact_bodies() {
         (143, "agent_creation_provenance"),
         (144, "product_conversation_rename_receipts"),
         (146, "retain_product_conversation_rename_receipts"),
+        (147, "retain_product_creation_receipts"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -263,7 +265,12 @@ fn registered_identity_order_and_exact_bodies() {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, name);
     }
-    for (bytes, version) in [(PROVENANCE, 143), (RECEIPTS, 144), (RETAIN_RECEIPTS, 146)] {
+    for (bytes, version) in [
+        (PROVENANCE, 143),
+        (RECEIPTS, 144),
+        (RETAIN_RECEIPTS, 146),
+        (RETAIN_CREATION, 147),
+    ] {
         let entries = MIGRATIONS
             .iter()
             .filter(|m| m.sql == bytes)
@@ -341,7 +348,7 @@ async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomic
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
     )
@@ -372,7 +379,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -433,7 +440,7 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let pool = fixture(prefix, populated).await;
             run_through_for_test(&pool, 142).await.unwrap();
             let before = snapshot(&mut pool.acquire().await.unwrap()).await;
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             clean(&mut conn).await;
@@ -447,7 +454,8 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                 [
                     (143, "agent_creation_provenance"),
                     (144, "product_conversation_rename_receipts"),
-                    (146, "retain_product_conversation_rename_receipts")
+                    (146, "retain_product_conversation_rename_receipts"),
+                    (147, "retain_product_creation_receipts")
                 ]
             );
             drop(conn);
@@ -487,7 +495,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
             .await
             .unwrap();
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         clean(&mut conn).await;
@@ -509,7 +517,7 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
 }
 
 #[tokio::test]
@@ -524,4 +532,181 @@ async fn unsupported_lineage_refuses_before_schema_or_row_mutation() {
     let mut conn = pool.acquire().await.unwrap();
     assert_eq!(snapshot(&mut conn).await, before);
     clean(&mut conn).await;
+}
+
+#[tokio::test]
+async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomically() {
+    let pool = fixture(146, true).await;
+    let db = Database::from_pool_for_tests(pool.clone(), String::new());
+    let target = db
+        .create_conversation("receipt-target", "receipt-target", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE product_creation_jobs SET status='published', published_product_id=?1, published_conversation_id=?2, objective_origin='internal_conversation', objective_source_product_conversation_id='source-product', objective_source_transcript_id='source-transcript', objective_source_message_id='source-message', objective_source_tool_use_id='source-call' WHERE request_id='old-user'")
+        .bind(target.product_conversation_id.as_str())
+        .bind(target.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO product_creation_jobs(request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros, objective_origin) VALUES('old-unpinned', 'pc_old_unpinned', '/fixture', 'unpinned objective', 'phoenix-native', 'accepted', 5, 6, 'unknown_historical')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO product_creation_job_images(request_id, ordinal, media_type, data) VALUES('old-user', 2, 'image/jpeg', 'ordinal-two')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let initial_fk_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(initial_fk_count, 3);
+    let mut conn = pool.acquire().await.unwrap();
+    let before = snapshot(&mut conn).await;
+    drop(conn);
+    sqlx::raw_sql("CREATE TRIGGER creation_receipt_ledger_fault BEFORE INSERT ON _migrations WHEN NEW.version=147 BEGIN SELECT RAISE(ABORT,'creation receipt ledger fault'); END;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before_rollback = snapshot(&mut pool.acquire().await.unwrap()).await;
+    let error = run_pending_migrations(&pool).await.unwrap_err();
+    assert!(
+        error.to_string().contains("creation receipt ledger fault"),
+        "{error}"
+    );
+    assert_eq!(
+        snapshot(&mut pool.acquire().await.unwrap()).await,
+        before_rollback
+    );
+
+    sqlx::raw_sql("DROP TRIGGER creation_receipt_ledger_fault")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    let ledger_entry: (i64, String) =
+        sqlx::query_as("SELECT version, name FROM _migrations WHERE version=147")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        ledger_entry,
+        (147, "retain_product_creation_receipts".into())
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    let after = snapshot(&mut conn).await;
+    assert_eq!(
+        after.columns, before.columns,
+        "table shape remains unchanged"
+    );
+    assert_eq!(
+        after.data, before.data,
+        "all typed parent and child row bytes survive"
+    );
+    for (kind, name, table, old_sql) in &before.schema {
+        if [
+            "product_creation_job_images",
+            "product_creation_resource_reservations",
+        ]
+        .contains(&table.as_str())
+            || (table == "product_creation_jobs" && kind != "table")
+        {
+            let actual: Option<String> =
+                sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type=?1 AND name=?2")
+                    .bind(kind)
+                    .bind(name)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(&actual, old_sql, "unchanged schema object {name}");
+        }
+    }
+    let outgoing_fk_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs')")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        outgoing_fk_count, 1,
+        "exactly the Slack provenance FK remains"
+    );
+    let removed_receipt_fks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs') WHERE \"from\" IN ('published_product_id', 'published_conversation_id')")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(removed_receipt_fks, 0);
+    let slack_fk: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs') WHERE \"from\"='objective_slack_request_id' AND \"table\"='slack_gateway_requests'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(slack_fk, 1);
+    let job_guards: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('creation_slack_origin_insert', 'product_creation_checkout_pin_immutable')")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(job_guards, 2);
+    let job_indexes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN ('product_creation_jobs_claim_order', 'product_creation_jobs_retry_order', 'product_creation_jobs_cleanup_order', 'product_creation_jobs_delivery_order', 'product_creation_jobs_published_cwd')")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(job_indexes, 5);
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .is_empty());
+    let provenance: (String, String, String, String) = sqlx::query_as("SELECT objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id FROM product_creation_jobs WHERE request_id='old-user'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        provenance,
+        (
+            "source-product".into(),
+            "source-transcript".into(),
+            "source-message".into(),
+            "source-call".into()
+        )
+    );
+    let nonnull_pin: (Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT pin_exact_checkout_oid, pin_logical_base, pin_freshness FROM product_creation_jobs WHERE request_id='old-user'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        nonnull_pin,
+        (
+            Some("frozen-oid".into()),
+            Some("main".into()),
+            Some("fresh".into())
+        )
+    );
+    let null_pin: (Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT pin_exact_checkout_oid, pin_logical_base, pin_freshness FROM product_creation_jobs WHERE request_id='old-unpinned'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(null_pin, (None, None, None));
+    let reservation_token: Option<String> = sqlx::query_scalar(
+        "SELECT ownership_token FROM product_creation_resource_reservations WHERE id='old-user-2'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(reservation_token.as_deref(), Some("token東京"));
+    drop(conn);
+
+    db.delete_conversation(&target.id).await.unwrap();
+    let retained_ids: (String, String) = sqlx::query_as("SELECT published_product_id, published_conversation_id FROM product_creation_jobs WHERE request_id='old-user'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_ids,
+        (
+            target.product_conversation_id.to_string(),
+            target.id.to_string()
+        )
+    );
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
 }
