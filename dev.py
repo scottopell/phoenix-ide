@@ -5560,8 +5560,12 @@ class _QualificationOutputLog:
 
 
 def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
-    if name == "cargo clippy" and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
-        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / "cargo-clippy.full.log"
+    filenames = {
+        "cargo clippy": "cargo-clippy.full.log",
+        "dev.py unit tests": "devpy-unit-tests.full.log",
+    }
+    if name in filenames and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / filenames[name]
     return None
 
 
@@ -6400,6 +6404,8 @@ def cmd_check(
                     "discover",
                     "tests/devpy",
                 ]
+            if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+                unittest_cmd.append("-v")
             run_step("dev.py unit tests", unittest_cmd)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.

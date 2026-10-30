@@ -56,7 +56,7 @@ class QualificationOutputTests(unittest.TestCase):
         self.namespace = namespace
         self.run_step = namespace["run_step"]
 
-    def execute(self, diagnostic, returncode=0, *, timeout=False):
+    def execute(self, diagnostic, returncode=0, *, timeout=False, name="cargo clippy"):
         stream = (io.BytesIO(diagnostic.encode()) if bool(os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"))
                   else io.StringIO(diagnostic))
         process = mock.Mock(pid=12345, stdout=stream, returncode=returncode)
@@ -65,7 +65,10 @@ class QualificationOutputTests(unittest.TestCase):
         with mock.patch.object(self.dev.subprocess, "Popen", return_value=process) as launch, \
              mock.patch.object(self.dev.os, "killpg") as kill, \
              mock.patch.object(self.dev.select, "select", side_effect=lambda streams, *_: (streams, [], [])):
-            result = self.run_step("cargo clippy", ["fixture"], timeout=7)
+            result = self.run_step(name, ["fixture"], timeout=7)
+        launch.assert_called_once()
+        if not timeout:
+            process.wait.assert_called_once_with(timeout=7)
         self.assertEqual(launch.call_args.kwargs["stderr"], subprocess.STDOUT)
         self.assertTrue(launch.call_args.kwargs["start_new_session"])
         qualification = bool(os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"))
@@ -104,6 +107,56 @@ class QualificationOutputTests(unittest.TestCase):
         self.assertEqual(list(diagnostic_dir.iterdir()), [diagnostic_dir / "cargo-clippy.full.log"])
         self.assertFalse((self.directory / "cargo-clippy.full.log").exists())
 
+    def test_unittest_command_is_once_and_verbose_only_with_diagnostics(self):
+        source = ast.parse((ROOT / "dev.py").read_text())
+        check = next(node for node in source.body
+                     if isinstance(node, ast.FunctionDef) and node.name == "cmd_check")
+        block = next(node for node in ast.walk(check) if isinstance(node, ast.If)
+                     and any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                             and isinstance(stmt.value.func, ast.Name)
+                             and stmt.value.func.id == "run_step" and stmt.value.args
+                             and isinstance(stmt.value.args[0], ast.Constant)
+                             and stmt.value.args[0].value == "dev.py unit tests"
+                             for stmt in node.orelse))
+        start = next(index for index, stmt in enumerate(block.orelse)
+                     if isinstance(stmt, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == "unittest_cmd"
+                             for target in stmt.targets))
+        code = compile(ast.Module(body=block.orelse[start:], type_ignores=[]),
+                       str(ROOT / "dev.py"), "exec")
+        for diagnostic in (None, "", str(self.directory)):
+            for profile in (None, self.directory / "profile"):
+                with self.subTest(diagnostic=diagnostic, profile=profile):
+                    env = {} if diagnostic is None else {"PHOENIX_CHECK_DIAGNOSTIC_DIR": diagnostic}
+                    run_step = mock.Mock()
+                    namespace = dict(os=os, sys=sys, ROOT=ROOT, profile_work=profile is not None,
+                                     _CHECK_PROFILE=profile, run_step=run_step)
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        exec(code, namespace)
+                    prefix = ([sys.executable, "-m", "unittest"] if profile is None else
+                              [sys.executable, str(ROOT / "scripts" / "python_unittest_profile.py")])
+                    expected = prefix + ["discover", "tests/devpy"] + (["-v"] if diagnostic else [])
+                    run_step.assert_called_once_with("dev.py unit tests", expected)
+
+    def test_unittest_capture_retains_verbose_summary_skips_and_completion(self):
+        for returncode, ending in ((0, "OK (skipped=1)"),
+                                  (1, "FAILED (failures=1, skipped=1)")):
+            with self.subTest(returncode=returncode):
+                log_path = self.directory / "devpy-unit-tests.full.log"
+                payload = ("test_one (suite.Case.test_one) ... ok\n" * 240
+                           + "test_skip (suite.Case.test_skip) ... skipped 'platform reason'\n"
+                           + "Ran 241 tests in 0.123s\n\n" + ending + "\n")
+                result, _ = self.execute(payload, returncode, name="dev.py unit tests")
+                raw = log_path.read_bytes()
+                self.assertEqual(result, returncode)
+                self.assertTrue(raw.startswith(payload.encode()))
+                self.assertIn(b"platform reason", raw)
+                self.assertIn(b"Ran 241 tests", raw)
+                self.assertIn(b"payload COMPLETE", raw)
+                self.assertIn(f"process_returncode={returncode}".encode(), raw)
+                self.assertFalse((self.directory / "cargo-clippy.full.log").exists())
+                log_path.unlink()
+
     def test_clippy_capture_cap_keeps_failure_and_marks_truncation(self):
         os.environ.pop("PHOENIX_CHECK_DIAGNOSTIC_DIR", None)
         diagnostic_dir = self.directory / "capped-diagnostics"
@@ -127,6 +180,9 @@ class QualificationOutputTests(unittest.TestCase):
         diagnostic = {"PHOENIX_CHECK_DIAGNOSTIC_DIR": str(self.directory)}
         self.assertEqual(self.dev._check_diagnostic_log_path("cargo clippy", diagnostic),
                          self.directory / "cargo-clippy.full.log")
+        self.assertEqual(self.dev._check_diagnostic_log_path("dev.py unit tests", diagnostic),
+                         self.directory / "devpy-unit-tests.full.log")
+        self.assertIsNone(self.dev._check_diagnostic_log_path("dev.py unit tests", {}))
         self.assertIsNone(self.dev._check_diagnostic_log_path("cargo test", diagnostic))
         self.assertIsNone(self.dev._check_diagnostic_log_path("cargo clippy", {"PHOENIX_GOAL_REUSE_DIR": str(self.directory)}))
 
