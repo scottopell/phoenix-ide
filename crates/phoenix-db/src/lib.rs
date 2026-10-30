@@ -22905,9 +22905,24 @@ mod tests {
         db.create_conversation("bounded", "bounded", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.add_message(
+        sqlx::query(
+            "INSERT INTO slack_gateway_requests (
+                 request_id, workspace, owner, channel, message_ts, thread_ts, kind,
+                 instruction, context, source_url, accepted_at_unix_micros, input_id,
+                 observed_at_unix_micros, trigger_kind
+             ) VALUES (
+                 'slack-request-bounded', 'workspace', 'owner', 'channel', 'message-ts',
+                 'thread-ts', 'baseline', '', '', 'https://example.invalid/slack', 0,
+                 'slack-input-bounded', 0, 'prefix'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.add_message_with_seq_and_origin(
             "bounded-message",
             "bounded",
+            1,
             &MessageContent::user_with_attachments(
                 "bounded body",
                 vec![ImageData {
@@ -22922,9 +22937,10 @@ mod tests {
                 }],
             ),
             Some(&serde_json::json!({"hidden": true})),
-            Some(phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+            None,
+            &phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
                 request_id: "slack-request-bounded".to_string(),
-            }),
+            },
         )
         .await
         .unwrap();
