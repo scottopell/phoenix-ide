@@ -2476,7 +2476,7 @@ mod tests {
     use super::*;
 
     async fn throttle_test_session() -> Option<(
-        phoenix_browser::BrowserSessionManager,
+        Arc<phoenix_browser::BrowserSessionManager>,
         Arc<RwLock<BrowserSession>>,
     )> {
         use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
