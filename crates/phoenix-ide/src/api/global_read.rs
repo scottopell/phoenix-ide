@@ -1665,26 +1665,7 @@ async fn render_bounded_message_page(
     content_limit: NonZeroUsize,
     scan_limit: NonZeroUsize,
 ) -> Result<ConversationReadPage, BoundedReadError> {
-    let stable = ordinary_product_citation(&service.db, &conv)
-        .await
-        .map_err(|error| BoundedReadError::Read(format!("read failed: {error}")))?;
-    let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
-        let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
-        format!("Conversation @conv:{id}\nconversation link: {route}\n")
-    });
-    let title = stable.as_ref().map_or_else(
-        || {
-            conv.title
-                .as_deref()
-                .or(conv.slug.as_deref())
-                .unwrap_or(&conv.id)
-        },
-        |(_, _, title)| title.as_str(),
-    );
-    let mut header = format!(
-        "{stable_header}{evidence_label}: @transcript:{} — {}\nupdated: {}\n---\n",
-        conv.id, title, conv.updated_at
-    );
+    let mut header = render_bounded_conversation_header(service, &conv, evidence_label).await?;
     if cursor >= MAX_CONVERSATION_READ_CURSOR {
         header.push_str("(conversation read limit reached)");
         return Ok(ConversationReadPage {
@@ -1777,6 +1758,33 @@ async fn render_bounded_message_page(
             next_cursor: has_more.then_some(end),
         })
     }
+}
+
+async fn render_bounded_conversation_header(
+    service: &GlobalReadService,
+    conv: &Conversation,
+    evidence_label: &str,
+) -> Result<String, BoundedReadError> {
+    let stable = ordinary_product_citation(&service.db, conv)
+        .await
+        .map_err(|error| BoundedReadError::Read(format!("read failed: {error}")))?;
+    let stable_header = stable.as_ref().map_or_else(String::new, |(id, slug, _)| {
+        let route = crate::api::product_conversations::product_route(slug.as_deref(), id);
+        format!("Conversation @conv:{id}\nconversation link: {route}\n")
+    });
+    let title = stable.as_ref().map_or_else(
+        || {
+            conv.title
+                .as_deref()
+                .or(conv.slug.as_deref())
+                .unwrap_or(&conv.id)
+        },
+        |(_, _, title)| title.as_str(),
+    );
+    Ok(format!(
+        "{stable_header}{evidence_label}: @transcript:{} — {}\nupdated: {}\n---\n",
+        conv.id, title, conv.updated_at
+    ))
 }
 
 async fn render_bounded_message_line_with_cache(
