@@ -252,7 +252,7 @@ pub struct ProductCreationJobRecord {
 pub enum ProductCreationPublicationRead {
     Available {
         conversation_id: String,
-        aggregate: ProductConversationAggregate,
+        aggregate: Box<ProductConversationAggregate>,
     },
     Historical {
         conversation_id: String,
@@ -666,9 +666,7 @@ impl Database {
                     .bind(&conversation_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            if !transcript_exists {
-                Some(ProductCreationPublicationRead::Historical { conversation_id })
-            } else {
+            if transcript_exists {
                 match Self::get_ordinary_product_conversation_on(
                     &mut tx,
                     &job.product_conversation_id,
@@ -677,13 +675,15 @@ impl Database {
                 {
                     Ok(aggregate) => Some(ProductCreationPublicationRead::Available {
                         conversation_id,
-                        aggregate,
+                        aggregate: Box::new(aggregate),
                     }),
                     Err(DbError::ConversationNotFound(_)) => {
                         Some(ProductCreationPublicationRead::Historical { conversation_id })
                     }
                     Err(error) => return Err(error),
                 }
+            } else {
+                Some(ProductCreationPublicationRead::Historical { conversation_id })
             }
         } else {
             None
@@ -2597,8 +2597,13 @@ mod product_creation_tests {
             snapshot.product_conversation_id,
             job.product_conversation_id
         );
-        assert_eq!(snapshot.intent.objective, "historical objective");
-        assert_eq!(snapshot.intent.origin, accepted_intent.origin);
+        let retained = db
+            .get_product_creation_job(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.intent.objective, "historical objective");
+        assert_eq!(retained.intent.origin, accepted_intent.origin);
         assert!(matches!(
             snapshot.publication,
             Some(ProductCreationPublicationRead::Historical { conversation_id: id }) if id == conversation_id
@@ -3356,7 +3361,10 @@ mod product_creation_tests {
             panic!("expected ordinary successor");
         };
         db.delete_conversation(&original).await.unwrap();
-        assert!(db.get_conversation(&successor.id).await.unwrap().is_some());
+        assert_eq!(
+            db.get_conversation(&successor.id).await.unwrap().id,
+            successor.id
+        );
         assert_eq!(
             successor.product_conversation_id,
             job.product_conversation_id
