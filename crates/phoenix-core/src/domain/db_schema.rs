@@ -1033,6 +1033,10 @@ pub fn merge_duration_into_display_data(
 }
 #[must_use]
 pub fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    MessageContent::Tool(tool_result_content(result))
+}
+
+fn tool_result_content(result: &ToolResult) -> ToolContent {
     let persisted_output = match &result.outcome {
         ToolOutcome::TrustedInstructions { .. } => {
             "Authenticated built-in skill instructions were delivered for this live request."
@@ -1041,12 +1045,12 @@ pub fn tool_result_message_content(result: &ToolResult) -> MessageContent {
             result.output()
         }
     };
-    MessageContent::tool_with_images(
-        &result.tool_use_id,
-        persisted_output,
-        result.is_error(),
-        result.images().to_vec(),
-    )
+    ToolContent {
+        tool_use_id: result.tool_use_id.clone(),
+        content: persisted_output.to_owned(),
+        is_error: result.is_error(),
+        images: result.images().to_vec(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1080,23 +1084,14 @@ impl FinalizedToolResult {
             ToolOutcome::Error { .. } => FinalizedToolDisposition::Error,
             ToolOutcome::Cancelled { .. } => FinalizedToolDisposition::Cancelled,
         };
-        let row = Message {
-            message_id: super::tool_result_identity::tool_result_message_id(
-                assistant_message_id,
-                &result.tool_use_id,
-            ),
-            conversation_id: conversation_id.to_owned(),
+        let row = super::tool_round::tool_result_message(
+            assistant_message_id,
+            conversation_id,
             sequence_id,
-            message_type: MessageType::Tool,
-            content: tool_result_message_content(result),
             created_at,
-            display_data: merge_duration_into_display_data(
-                result.display_data(),
-                result.duration_ms,
-            ),
-            usage_data: None,
-            origin: InputOrigin::SystemGenerated,
-        };
+            tool_result_content(result),
+            merge_duration_into_display_data(result.display_data(), result.duration_ms),
+        );
         Self { row, disposition }
     }
 

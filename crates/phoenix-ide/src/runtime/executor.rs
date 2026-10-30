@@ -43,8 +43,9 @@ use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
     merge_duration_into_display_data, tool_result_message_content, FinalizedToolDisposition,
-    FinalizedToolResult,
+    FinalizedToolResult, ToolContent,
 };
+use phoenix_core::domain::tool_round::tool_result_message;
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
@@ -9121,10 +9122,8 @@ where
         settlement: &ActiveDirectTurnSettlement,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        let CheckpointData::ToolRound {
-            assistant_message,
-            tool_results,
-        } = data;
+        let CheckpointData::ToolRound(round) = data;
+        let (assistant_message, tool_results) = round.into_parts();
         let new_trusted_results =
             trusted_tool_results(&assistant_message.message_id, &tool_results);
         let conv_id = self.context.conversation_id.clone();
@@ -9201,10 +9200,8 @@ where
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         match data {
-            CheckpointData::ToolRound {
-                assistant_message,
-                tool_results,
-            } => {
+            CheckpointData::ToolRound(round) => {
+                let (assistant_message, tool_results) = round.into_parts();
                 let new_trusted_results =
                     trusted_tool_results(&assistant_message.message_id, &tool_results);
                 let conv_id = self.context.conversation_id.clone();
@@ -9330,10 +9327,8 @@ where
         checkpoint: CheckpointData,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        let CheckpointData::ToolRound {
-            assistant_message,
-            tool_results,
-        } = checkpoint;
+        let CheckpointData::ToolRound(round) = checkpoint;
+        let (assistant_message, tool_results) = round.into_parts();
 
         // Repo-relative normalization (REQ-PROJ-033): `task_file` is relative to
         // the conversation's working_dir. The stored path is relative to the
@@ -9376,25 +9371,22 @@ where
         // contract; `merge_duration_into_display_data` preserves it.
         let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
         for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-            let tool_content = MessageContent::tool_with_images(
-                &result.tool_use_id,
-                result.output(),
-                result.is_error(),
-                result.images().to_vec(),
-            );
+            let tool_content = ToolContent {
+                tool_use_id: result.tool_use_id.clone(),
+                content: result.output().to_owned(),
+                is_error: result.is_error(),
+                images: result.images().to_vec(),
+            };
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
-            tool_msgs.push(crate::db::Message {
-                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-                message_id: tool_result_message_id(&agent_msg.message_id, &result.tool_use_id),
-                conversation_id: conv_id.clone(),
-                sequence_id: *tool_seq,
-                message_type: tool_content.message_type(),
-                content: tool_content,
-                display_data: merged_display,
-                usage_data: None,
-                created_at: Utc::now(),
-            });
+            tool_msgs.push(tool_result_message(
+                &agent_msg.message_id,
+                &conv_id,
+                *tool_seq,
+                Utc::now(),
+                tool_content,
+                merged_display,
+            ));
         }
 
         let proposal = crate::db::ForkProposal {
@@ -25592,8 +25584,9 @@ mod goal_report_cancellation_checkpoint_tests {
                 _ => None,
             })
             .expect("cancellation produces a checkpoint");
-        let CheckpointData::ToolRound { tool_results, .. } = &data;
-        let results = tool_results.clone();
+        let CheckpointData::ToolRound(round) = &data;
+        let tool_results = round.results();
+        let results = tool_results.to_vec();
         assert_eq!(results.len(), 2);
         for result in &results {
             assert!(matches!(result.outcome, ToolOutcome::Cancelled { .. }));
