@@ -1921,6 +1921,7 @@ mod epoch_tests {
             command: "test".to_string(),
             args: Vec::new(),
             env: HashMap::new(),
+            cwd: None,
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }

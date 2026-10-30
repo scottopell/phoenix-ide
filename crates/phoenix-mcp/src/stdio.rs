@@ -5,6 +5,7 @@ use crate::{McpTransport, ServerMessageSink, TransportError};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,7 @@ impl StdioTransport {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
+        cwd: Option<&Path>,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(command);
@@ -51,6 +53,9 @@ impl StdioTransport {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
 
         let mut child = cmd
             .spawn()
@@ -362,6 +367,7 @@ mod tests {
             "/bin/sh",
             &["-c".to_string(), "sleep 30".to_string()],
             &HashMap::new(),
+            None,
             Arc::new(RwLock::new(HashMap::new())),
         )
         .await
