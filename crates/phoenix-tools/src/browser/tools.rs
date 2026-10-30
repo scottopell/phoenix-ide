@@ -151,6 +151,10 @@ impl BrowserNavigateTool {
         let mut guard = session.write().await;
         guard.last_activity = std::time::Instant::now();
 
+        if let Err(error) = guard.ensure_touch_idle() {
+            return ToolOutput::error(format!("Navigation refused: {error}"));
+        }
+
         // Navigate with timeout
         let result = operation_phase(
             BrowserOperationPhase::Navigation,
@@ -907,8 +911,6 @@ impl BrowserResizeTool {
         input: Value,
         access: &(impl super::BrowserAccess + ?Sized),
     ) -> ToolOutput {
-        use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
-
         let input: ResizeInput = match serde_json::from_value(input) {
             Ok(i) => i,
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
@@ -933,30 +935,16 @@ impl BrowserResizeTool {
         let mut guard = session.write().await;
         guard.last_activity = std::time::Instant::now();
 
-        // Set viewport size using CDP Emulation domain
-        let params = SetDeviceMetricsOverrideParams::builder()
-            .width(input.width)
-            .height(input.height)
-            .device_scale_factor(1.0)
-            .mobile(false)
-            .build()
-            .map_err(|e| format!("Invalid params: {e}"));
-
-        let params = match params {
-            Ok(p) => p,
-            Err(e) => return ToolOutput::error(e),
-        };
-
         let result = operation_phase(
             BrowserOperationPhase::Resize,
             timeout,
-            guard.page.execute(params),
+            guard.resize_viewport(input.width, input.height),
         )
         .await;
 
         match result {
-            Ok(Ok(_)) => ToolOutput::success("done"),
-            Ok(Err(e)) => ToolOutput::error(format!("Resize failed: {e}")),
+            Ok(Ok(())) => ToolOutput::success("done"),
+            Ok(Err(error)) => ToolOutput::error(format!("Resize refused or failed: {error}")),
             Err(error) => ToolOutput::error(error),
         }
     }

@@ -3922,7 +3922,8 @@ mod tests {
         assert!(persist.is_some(), "Should have PersistCheckpoint effect");
 
         if let Some(Effect::PersistCheckpoint { data }) = persist {
-            let CheckpointData::ToolRound { tool_results, .. } = data;
+            let CheckpointData::ToolRound(round) = data;
+            let tool_results = round.results();
             assert_eq!(tool_results.len(), 3, "Should have results for all 3 tools");
             assert!(
                 tool_results.iter().all(|r| !r.is_success()),

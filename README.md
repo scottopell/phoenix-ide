@@ -308,7 +308,6 @@ falls back to `LOGNAME`.
 | Variable | Purpose |
 |----------|---------|
 | `PHOENIX_SKIP_BROWSER_TESTS` | `1` → skip browser-tool tests (no Chrome available) |
-| `PHOENIX_SKIP_NETWORK_TESTS` | `1` → skip tests that need outbound network |
 
 ### Dev/build tooling only (read by `./dev.py` / Vite, **not** the server)
 

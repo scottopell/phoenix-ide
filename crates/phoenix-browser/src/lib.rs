@@ -7,6 +7,11 @@
 //! phoenix-tools, which depends on this crate. See `specs/browser-tool/` for
 //! the behavioural contract.
 
+pub mod device;
+pub mod scenario;
+mod throttle;
+pub mod touch;
+
 mod cdp;
 mod navigation;
 pub mod process_group;

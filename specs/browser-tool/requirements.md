@@ -142,7 +142,7 @@ WHEN output from `browser_recent_console_logs` exceeds 4096 bytes
 
 ### REQ-BT-005: Resize Viewport
 
-The `browser_resize` tool SHALL resize the browser viewport to specified width and height in pixels
+The `browser_resize` tool SHALL resize the browser viewport to specified width and height in pixels while preserving the session's acknowledged device scale, mobile mode, and touch emulation. Dimensions SHALL be integers from 1 through 16384 inclusive. WHEN the effective device configuration is unknown after an incomplete CDP configuration or resize, `browser_resize` SHALL fail without dispatch until an explicit complete device configuration is acknowledged.
 
 THE SYSTEM SHALL use a default viewport of 1280×720 pixels when a session starts
 
@@ -546,6 +546,10 @@ WHEN a readiness step's condition is not met within its timeout THE SYSTEM SHALL
 **REQ-BT-019.2 — CPU throttling.**
 THE SYSTEM SHALL set a fixed CPU throttling rate (`Emulation.setCPUThrottlingRate`) for the duration of a scenario and restore the prior rate afterward, so measurements are comparable across hosts and thermal states. A rate of `1` means no throttling.
 
+Standalone throttle dispatch and acknowledgement bookkeeping SHALL occur under one uninterrupted session write guard, so a scenario cannot observe an applied rate paired with stale state. The session SHALL represent throttle state as an acknowledged finite rate of at least 1 or unknown; a fresh browser starts at the known identity rate of 1. Dispatch SHALL mark the rate unknown before awaiting CDP and SHALL establish the requested rate only on acknowledgement. Failure, timeout, or cancellation after dispatch begins SHALL NOT retain a prior rate as acknowledged. Scenario restoration SHALL follow the same acknowledgement rule, independently of contact-cleanup success.
+
+WHEN throttle state is unknown, scenario admission SHALL fail before device mutation, throttle application, reset, or steps, even if an explicit scenario throttle is supplied. On the same browser, only an explicit successful standalone throttle operation SHALL re-establish a rate for subsequent scenario admission; the scenario SHALL NOT guess a prior rate or silently repair unknown state.
+
 **REQ-BT-019.3 — Macro counter snapshot.**
 THE SYSTEM SHALL capture `Performance.getMetrics` before and after each scenario run and report the delta and absolute for at least: ScriptDuration, TaskDuration, LayoutCount, RecalcStyleCount, JSHeapUsedSize, Nodes, JSEventListeners.
 
@@ -592,7 +596,7 @@ THE SYSTEM SHALL distinguish, in every run sample, three React states: `measured
 WHEN the state is not `measured` THE SYSTEM SHALL report the React timing field as null (not `0`) and carry the state discriminator, so "zero React cost" and "React cost not measured" are not the same value. Commit *count* MAY still be reported when React is present (the commit hook fires regardless of build), with the timing field null.
 
 **REQ-BT-019.14 — Counter-reset safety.**
-`Performance.getMetrics` counters are cumulative since document load and reset on navigation. THE SYSTEM SHALL NOT compute a before/after delta across a navigation within a run.
+`Performance.getMetrics` counters are cumulative since document load and reset on navigation. The harness SHALL exclude managed navigation and reload steps from the measured step list. This is not a navigation fence: arbitrary `eval` expressions and click handlers can initiate navigation, and the harness SHALL NOT claim to prevent those document changes.
 THE SYSTEM SHALL reject a `run_scenario` whose `steps` contain a `navigate` or `reload` step (these belong in the per-run `reset`, REQ-BT-019.18, which executes before the before-snapshot), with an error that names the offending step and explains the counter reset — rather than returning a negative or meaningless delta.
 
 **REQ-BT-019.15 — Forced-GC heap inside the run loop, default-on.**
@@ -647,6 +651,28 @@ The pre-REQ-BT-019.20 CDP-counter delta keys (`script_duration`, `task_duration`
 **User Stories:** US-5, US-1, US-2
 
 ---
+
+### REQ-BT-019.21: Persistent scenario device configuration
+
+`browser_profile` with action `run_scenario` SHALL accept an optional `device` object containing required `width`, `height`, `device_scale_factor`, `mobile`, and `touch` fields, with no unknown fields. Width and height SHALL be integers from 1 through 16384 inclusive; scale SHALL be finite, greater than zero, and at most 10. Invalid configuration SHALL fail before browser acquisition.
+
+WHEN an explicit device configuration is supplied, the scenario SHALL apply CDP touch emulation and device metrics before throttling, warmup, resets, or measured steps, with a single 15-second application deadline. Configuration SHALL become acknowledged only after both CDP commands succeed. WHEN application fails, times out, or its future is cancelled after dispatch begins, the session SHALL retain unknown configuration state rather than report a prior or partially applied configuration as acknowledged.
+
+WHEN device configuration is omitted, a scenario SHALL preserve the acknowledged session configuration; unknown configuration SHALL block the scenario before any run. Configuration SHALL persist across tool calls, navigation, and reload within the same managed browser session. A newly created browser SHALL use desktop 1280×720, scale 1, with mobile and touch emulation disabled. Default device initialization SHALL acknowledge both touch-emulation and device-metrics commands within one aggregate 15-second deadline, not a separate budget per command. Failure or deadline expiry SHALL enter the common owned-launch cleanup path without publishing a usable session; the owned Chrome process and associated launch resources SHALL remain under cleanup ownership. No device configuration recovery across browser replacement or Phoenix restart is promised.
+
+Device configuration SHALL NOT change benchmark warmup defaults, first-readiness window boundaries, or raw-sample semantics. CDP acknowledgement SHALL NOT be described as physical-device equivalence or proof of application paint.
+
+### REQ-BT-019.22: Persistent touch contact and scenario cleanup
+
+`run_scenario` SHALL accept `touch_start{x,y}`, `touch_move{x,y}`, `touch_end`, and `pause{milliseconds}` steps. Touch scenarios SHALL supply an explicit `device` with touch enabled; coordinates SHALL be finite nonnegative CSS pixels strictly within its width and height. Step lists SHALL contain at most 512 steps, with balanced single-contact start/move/end sequences validated before browser acquisition. Each pause SHALL be at most 5000ms and total pauses SHALL be at most 30000ms per run. Pauses before the first satisfied readiness step are setup; subsequent pauses contribute to the measured window. Pause durations SHALL be nonnegative integer milliseconds. Step-count and pause bounds SHALL NOT be described as a total scenario wall-time guarantee; other steps, readiness waits, resets, and repeated runs contribute additional time.
+
+The same contact identifier SHALL persist from acknowledged start through moves until end. End and cancel SHALL dispatch empty CDP touch-point arrays. Contact state SHALL become unknown before dispatch and become active or idle only after the corresponding acknowledgement. Invalid sequence transitions SHALL fail without dispatch. Failed or cancelled dispatch SHALL NOT fabricate acknowledgement or idle state.
+
+The broker SHALL own each scenario task independently of the session write lock. The task SHALL hold that write lock across the scenario and cleanup. Cancellation of the shared browser operation's caller future and broker termination SHALL cancel the in-flight operation and request contact cancellation before releasing serialization. For CLI execution, that caller is the daemon's operation future; disconnection or termination of the short-lived CLI client SHALL NOT be described as cancellation of that future. Explicit daemon shutdown cancellation follows the browser CLI lifecycle contract. The broker SHALL signal cancellation before waiting for the session lock. Task registration SHALL precede execution; the session SHALL NOT own a task that owns the session. A competing scenario SHALL return busy without waiting for the running scenario's session write guard; admission SHALL inspect broker task ownership without first taking that session guard. For a caller with a serial operation queue, scenario admission SHALL validate the request and register broker task ownership before entering that queue. An admitted scenario awaiting serial dispatch SHALL exclude competing scenarios just as an executing scenario does. Invalid requests SHALL NOT register scenario ownership, and dispatch authority SHALL be consumed at most once.
+
+Cleanup SHALL use one five-second deadline for contact cancellation and throttle restoration, and SHALL finish before returning a result. Idle contacts SHALL NOT receive synthetic cancellation. Incomplete contact cleanup SHALL remain unknown and block managed `browser_navigate`, scenario execution (including its reset), resize, device mutation, and non-cancel contact dispatch until cancellation is acknowledged or the browser is terminated. This gate SHALL NOT be described as fencing navigation initiated by arbitrary `eval` expressions or click handlers. Cleanup failure SHALL be reported or logged when the caller is absent. Browser destruction may supersede cleanup but SHALL NOT be described as a successful CDP acknowledgement.
+
+Touch dispatch acknowledgement SHALL NOT imply frame arrival, application paint, or satisfaction of an application-specific oracle. Scenario click and type steps SHALL acquire the same native-input lease used by standalone native input before resolving the target or performing CDP input work, and retain it through completion of the step. Benchmark defaults, warmup exclusion, first-readiness timing, and raw per-run samples SHALL remain unchanged.
 
 ## Extended Requirements (Post-MVP)
 
