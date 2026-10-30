@@ -3346,6 +3346,7 @@ async fn registry_resolved_browser_tools_compose_trusted_touch_and_release_after
             {"kind":"touch_end"}
         ]);
         let completed = profile.run(scenario(journey), ctx.clone()).await;
+        assert!(completed.is_success(), "scenario cleanup failed: {}", completed.output());
         assert_eq!(completed.display_data().expect("scenario display_data")["outcome"], "completed", "scenario output={} display={:?}", completed.output(), completed.display_data());
         let evidence = eval.run(serde_json::json!({"expression":"({trace:window.touchTrace,geometry:window.geometry,mutation:window.mutation})"}), ctx.clone()).await;
         let evidence = acceptance_value(&evidence);
@@ -3397,24 +3398,37 @@ async fn registry_resolved_browser_tools_compose_trusted_touch_and_release_after
 #[tokio::test]
 #[ignore = "requires explicitly installed Chrome/Chromium; run the named acceptance test directly"]
 async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch() {
-    assert!(chrome_available(), "acceptance test requires installed Chrome/Chromium");
+    assert!(
+        chrome_available(),
+        "acceptance test requires installed Chrome/Chromium"
+    );
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fixture server");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture server");
     let addr = listener.local_addr().expect("fixture server address");
     let server = tokio::spawn(async move {
         let mut held_tx = Some(held_tx);
         while let Ok((mut socket, _)) = listener.accept().await {
             let mut request = [0u8; 2048];
-            let count = match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request)).await {
-                Ok(Ok(count)) => count,
-                _ => continue,
-            };
+            let count =
+                match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request)).await
+                {
+                    Ok(Ok(count)) => count,
+                    _ => continue,
+                };
             let request = String::from_utf8_lossy(&request[..count]);
             let (status, content_type, body) = if request.starts_with("GET /held ") {
-                if let Some(tx) = held_tx.take() { let _ = tx.send(()); }
+                if let Some(tx) = held_tx.take() {
+                    let _ = tx.send(());
+                }
                 ("200 OK", "text/plain", "held")
             } else if request.starts_with("GET / ") {
-                ("200 OK", "text/html", r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><div id="target" style="width:300px;height:240px;background:#def"></div><script>window.touchTrace=[];window.active=false;const t=document.querySelector('#target');for(const type of ['touchstart','touchend','touchcancel'])t.addEventListener(type,e=>{window.touchTrace.push({type,isTrusted:e.isTrusted,active:window.active});if(type==='touchstart')window.active=true;if(type==='touchend'||type==='touchcancel')window.active=false})</script>"#)
+                (
+                    "200 OK",
+                    "text/html",
+                    r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><div id="target" style="width:300px;height:240px;background:#def"></div><script>window.touchTrace=[];window.active=false;const t=document.querySelector('#target');for(const type of ['touchstart','touchend','touchcancel'])t.addEventListener(type,e=>{window.touchTrace.push({type,isTrusted:e.isTrusted,active:window.active});if(type==='touchstart')window.active=true;if(type==='touchend'||type==='touchcancel')window.active=false})</script>"#,
+                )
             } else {
                 ("404 Not Found", "text/plain", "not found")
             };
@@ -3424,12 +3438,20 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
     });
     let (ctx, manager) = test_context(&format!("touch-abort-{}", std::process::id()));
     let registry = crate::ToolRegistry::direct(Vec::new());
-    let profile = registry.find_tool("browser_profile").expect("registered browser_profile");
-    let navigate = registry.find_tool("browser_navigate").expect("registered browser_navigate");
-    let eval = registry.find_tool("browser_eval").expect("registered browser_eval");
+    let profile = registry
+        .find_tool("browser_profile")
+        .expect("registered browser_profile");
+    let navigate = registry
+        .find_tool("browser_navigate")
+        .expect("registered browser_navigate");
+    let eval = registry
+        .find_tool("browser_eval")
+        .expect("registered browser_eval");
 
     let result = tokio::spawn(async move {
-        let nav = navigate.run(json!({"url":format!("http://{addr}/")}), ctx.clone()).await;
+        let nav = navigate
+            .run(json!({"url":format!("http://{addr}/")}), ctx.clone())
+            .await;
         assert!(nav.is_success(), "navigate failed: {}", nav.output());
         let plan = scenario(json!([
             {"kind":"wait_selector","selector":"#target","timeout":"5s"},
@@ -3441,19 +3463,45 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
         let caller_ctx = ctx.clone();
         let caller_profile = profile.clone();
         let caller = tokio::spawn(async move { caller_profile.run(plan, caller_ctx).await });
-        tokio::time::timeout(Duration::from_secs(5), held_rx).await
-            .expect("fixture /held request timed out").expect("fixture notification sender dropped");
+        tokio::time::timeout(Duration::from_secs(5), held_rx)
+            .await
+            .expect("fixture /held request timed out")
+            .expect("fixture notification sender dropped");
         caller.abort();
-        let cancelled = caller.await.expect_err("scenario caller completed before abort");
-        assert!(cancelled.is_cancelled(), "caller did not cancel: {cancelled}");
+        let cancelled = caller
+            .await
+            .expect_err("scenario caller completed before abort");
+        assert!(
+            cancelled.is_cancelled(),
+            "caller did not cancel: {cancelled}"
+        );
 
-        let evidence = eval.run(json!({"expression":"({trace:window.touchTrace,active:window.active})"}), ctx.clone()).await;
-        assert!(evidence.is_success(), "post-abort evidence failed: {}", evidence.output());
+        let evidence = eval
+            .run(
+                json!({"expression":"({trace:window.touchTrace,active:window.active})"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            evidence.is_success(),
+            "post-abort evidence failed: {}",
+            evidence.output()
+        );
         let evidence = acceptance_value(&evidence);
         let trace = evidence["trace"].as_array().expect("touch trace");
-        assert!(trace.iter().any(|e| e["type"] == "touchstart" && e["isTrusted"] == true));
-        assert!(trace.iter().any(|e| e["type"] == "touchcancel" && e["isTrusted"] == true && e["active"] == true), "missing trusted cancel: {trace:?}");
-        assert!(!trace.iter().any(|e| e["type"] == "touchend"), "caller abort must not synthesize touchend: {trace:?}");
+        assert!(trace
+            .iter()
+            .any(|e| e["type"] == "touchstart" && e["isTrusted"] == true));
+        assert!(
+            trace.iter().any(|e| e["type"] == "touchcancel"
+                && e["isTrusted"] == true
+                && e["active"] == true),
+            "missing trusted cancel: {trace:?}"
+        );
+        assert!(
+            !trace.iter().any(|e| e["type"] == "touchend"),
+            "caller abort must not synthesize touchend: {trace:?}"
+        );
         assert_eq!(evidence["active"], false);
 
         let recovery = scenario(json!([
@@ -3464,9 +3512,20 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let output = profile.run(recovery.clone(), ctx.clone()).await;
-            if output.is_success() { break; }
-            assert!(output.output().contains("Another browser scenario or its cleanup is still running"), "recovery scenario failed: {}", output.output());
-            assert!(tokio::time::Instant::now() < deadline, "owner did not finish after caller abort");
+            if output.is_success() {
+                break;
+            }
+            assert!(
+                output
+                    .output()
+                    .contains("Another browser scenario or its cleanup is still running"),
+                "recovery scenario failed: {}",
+                output.output()
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owner did not finish after caller abort"
+            );
             tokio::task::yield_now().await;
         }
     });
@@ -3479,8 +3538,13 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
     let shutdown = tokio::time::timeout(Duration::from_secs(5), manager.shutdown_all()).await;
     server.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
-    assert!(shutdown.expect("browser shutdown timed out").is_ok(), "browser manager shutdown failed");
-    outcome.expect("acceptance scenario timed out").expect("acceptance scenario task panicked");
+    assert!(
+        shutdown.expect("browser shutdown timed out").is_ok(),
+        "browser manager shutdown failed"
+    );
+    outcome
+        .expect("acceptance scenario timed out")
+        .expect("acceptance scenario task panicked");
 }
 
 // Caller abort is distinct from an executed-step failure: the scenario owner must

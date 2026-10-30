@@ -1,17 +1,17 @@
 use super::{
-    BrowserError, BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch,
-    BrowserRetirementFenceKey, BrowserSession, BrowserSessionLifecycleEvent,
-    BrowserSessionLifecycleKind, BrowserSessionLifecycleSink, BrowserSessionLookup,
-    BrowserSessionManager, BrowserSessionRegistryState, MAX_CONSOLE_LOGS, ProfileDeletionProof,
-    ProfilingState, console, delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch,
-    profile_marker_path, user_data_dir_for_key, write_profile_marker_atomic,
+    console, delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch,
+    profile_marker_path, user_data_dir_for_key, write_profile_marker_atomic, BrowserError,
+    BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch, BrowserRetirementFenceKey,
+    BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
+    BrowserSessionLifecycleSink, BrowserSessionLookup, BrowserSessionManager,
+    BrowserSessionRegistryState, ProfileDeletionProof, ProfilingState, MAX_CONSOLE_LOGS,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_group::OwnedChromeGroup;
 use chromiumoxide::{
-    Page,
     browser::Browser,
     fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
+    Page,
 };
 use futures::StreamExt;
 use phoenix_core::process_identity::current_process_identity;
@@ -605,7 +605,7 @@ async fn select_executable() -> Result<PathBuf, BrowserError> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::session::{BrowserRetirementOutcome, ScopedSession, session_key};
+    use crate::session::{session_key, BrowserRetirementOutcome, ScopedSession};
     use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 

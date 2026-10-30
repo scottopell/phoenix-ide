@@ -21,8 +21,8 @@ pub mod snapshot;
 
 pub use screencast::{ScreencastBroker, ScreencastEvent};
 pub use session::{
+    cascade_browser_on_delete, fetcher_cache_dir, truncate_unicode_safe, user_data_dir_glob,
     BrowserError, BrowserSession, BrowserSessionGuard, BrowserSessionLifecycleEvent,
     BrowserSessionLifecycleSink, BrowserSessionManager, ConsoleEntry, ConsoleLevel, ProfilingState,
-    ScopeLivenessHook, cascade_browser_on_delete, fetcher_cache_dir, truncate_unicode_safe,
-    user_data_dir_glob,
+    ScopeLivenessHook,
 };

@@ -10,17 +10,17 @@ pub use console::ConsoleNavigationCapture;
 use launch_slot::{LaunchSlot, ProfilePolicy};
 
 use chromiumoxide::{
-    Page,
     browser::{Browser, BrowserConfig},
     cdp::js_protocol::runtime::{ConsoleApiCalledType, RemoteObject},
+    Page,
 };
 use futures::StreamExt;
 use serde::{Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex as StdMutex,
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -28,7 +28,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use phoenix_core::process_identity::{
-    ProcessIdentity, current_process_identity, process_identity_matches,
+    current_process_identity, process_identity_matches, ProcessIdentity,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
@@ -3128,9 +3128,9 @@ impl Default for BrowserSessionManager {
 #[cfg(test)]
 mod profile_marker_tests {
     use super::{
-        BrowserLaunchIdentity, BrowserProfileMarker, PROFILE_MARKER_VERSION,
         delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch, profile_marker_path,
-        read_profile_marker, write_profile_marker_atomic,
+        read_profile_marker, write_profile_marker_atomic, BrowserLaunchIdentity,
+        BrowserProfileMarker, PROFILE_MARKER_VERSION,
     };
     use phoenix_core::process_identity::ProcessIdentity;
 
@@ -3281,11 +3281,9 @@ mod profile_marker_tests {
         assert!(profile.exists());
         let error = prepare_profile_dir_for_launch(root.path(), key)
             .expect_err("stale group marker cannot synthesize drain authority");
-        assert!(
-            error
-                .to_string()
-                .contains("no retained launch-group drain authority")
-        );
+        assert!(error
+            .to_string()
+            .contains("no retained launch-group drain authority"));
         assert!(profile_marker_path(&profile).exists());
         assert!(profile.exists());
     }
@@ -3349,12 +3347,10 @@ mod lifecycle_hook_tests {
         let profile = super::user_data_dir_for_key(runtime_env.tmp_root(), scope_key);
 
         assert_eq!(profile.parent(), Some(runtime_env.tmp_root()));
-        assert!(
-            profile
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(super::USER_DATA_DIR_PREFIX))
-        );
+        assert!(profile
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(super::USER_DATA_DIR_PREFIX)));
         assert_eq!(
             super::user_data_dir_glob(&runtime_env),
             runtime_env.tmp_root().join("phoenix-chrome-*")
@@ -3955,7 +3951,7 @@ mod console_level_tests {
 
 #[cfg(test)]
 mod console_arg_tests {
-    use super::{MAX_CAPTURE_ARG_BYTES, extract_console_arg_text, truncate_unicode_safe};
+    use super::{extract_console_arg_text, truncate_unicode_safe, MAX_CAPTURE_ARG_BYTES};
     use chromiumoxide::cdp::js_protocol::runtime::RemoteObject;
     use serde_json::json;
 

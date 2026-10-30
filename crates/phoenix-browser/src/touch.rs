@@ -229,12 +229,10 @@ mod tests {
             assert!(futures::poll!(operation).is_pending());
         }
         assert_eq!(state, TouchState::Unknown);
-        assert!(
-            state
-                .apply(TouchAction::Cancel, async |_| Err("lost ACK".into()))
-                .await
-                .is_err()
-        );
+        assert!(state
+            .apply(TouchAction::Cancel, async |_| Err("lost ACK".into()))
+            .await
+            .is_err());
         assert_eq!(state, TouchState::Unknown);
         state
             .apply(TouchAction::Cancel, async |params| {
@@ -277,14 +275,12 @@ mod tests {
                 TouchAction::Move { x: 1.0, y: 2.0 },
                 TouchAction::End,
             ] {
-                assert!(
-                    state
-                        .apply(forbidden, async |_| panic!(
-                            "unknown contact dispatched input"
-                        ))
-                        .await
-                        .is_err()
-                );
+                assert!(state
+                    .apply(forbidden, async |_| panic!(
+                        "unknown contact dispatched input"
+                    ))
+                    .await
+                    .is_err());
             }
             state
                 .cancel(async |params| {
@@ -301,19 +297,15 @@ mod tests {
     #[tokio::test]
     async fn failed_release_and_failed_cleanup_never_report_idle() {
         let mut state = TouchState::Active;
-        assert!(
-            state
-                .apply(TouchAction::End, async |_| Err("end ACK lost".into()))
-                .await
-                .is_err()
-        );
+        assert!(state
+            .apply(TouchAction::End, async |_| Err("end ACK lost".into()))
+            .await
+            .is_err());
         assert_eq!(state, TouchState::Unknown);
-        assert!(
-            state
-                .cancel(async |_| Err("cancel ACK lost".into()))
-                .await
-                .is_err()
-        );
+        assert!(state
+            .cancel(async |_| Err("cancel ACK lost".into()))
+            .await
+            .is_err());
         assert_eq!(state, TouchState::Unknown);
     }
 
@@ -322,17 +314,14 @@ mod tests {
         let idle = TouchState::Idle;
         assert!(idle.prepare(TouchAction::Move { x: 1.0, y: 1.0 }).is_err());
         assert!(idle.prepare(TouchAction::End).is_err());
-        assert!(
-            idle.prepare(TouchAction::Start {
+        assert!(idle
+            .prepare(TouchAction::Start {
                 x: f64::NAN,
                 y: 1.0
             })
-            .is_err()
-        );
-        assert!(
-            TouchState::Active
-                .prepare(TouchAction::Start { x: 1.0, y: 1.0 })
-                .is_err()
-        );
+            .is_err());
+        assert!(TouchState::Active
+            .prepare(TouchAction::Start { x: 1.0, y: 1.0 })
+            .is_err());
     }
 }

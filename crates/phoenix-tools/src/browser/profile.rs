@@ -146,9 +146,7 @@ fn parse_profile_input(input: Value) -> Result<ProfileInput, ToolOutput> {
     if input.action == ProfileAction::RunScenario
         && input.steps.as_ref().is_some_and(|steps| steps.len() > 512)
     {
-        return Err(ToolOutput::error(
-            "run_scenario accepts at most 512 steps",
-        ));
+        return Err(ToolOutput::error("run_scenario accepts at most 512 steps"));
     }
     if input.action == ProfileAction::Throttle {
         validate_throttle_rate(input.rate)?;
@@ -2530,14 +2528,18 @@ mod tests {
         let steps = vec![json!({"kind":"eval","expression":"0"}); 512];
         let input = json!({"action":"run_scenario", "steps":steps});
         assert!(BrowserProfileTool::validate_input(input).is_ok());
-        assert_eq!(BrowserProfileTool.input_schema()["properties"]["steps"]["maxItems"], 512);
+        assert_eq!(
+            BrowserProfileTool.input_schema()["properties"]["steps"]["maxItems"],
+            512
+        );
     }
 
     #[test]
     fn run_scenario_rejects_513_steps_during_input_validation() {
         let steps = vec![json!({"kind":"eval","expression":"0"}); 513];
         let input = json!({"action":"run_scenario", "steps":steps});
-        let error = BrowserProfileTool::validate_input(input).expect_err("513 steps exceed the limit");
+        let error =
+            BrowserProfileTool::validate_input(input).expect_err("513 steps exceed the limit");
         assert!(error.output().contains("at most 512 steps"));
     }
 
