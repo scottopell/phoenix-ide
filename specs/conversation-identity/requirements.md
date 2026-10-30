@@ -72,7 +72,7 @@ THE SYSTEM SHALL NOT introduce a second ProductConversation name column, an old-
 
 WHEN the current Global Coordinator renames an ordinary ProductConversation through its dedicated naming capability
 THE SYSTEM SHALL require the immutable product identity, canonical root transcript identity, and naming revision returned by a fresh detail read
-AND SHALL commit the shared title and allocated-slug update only if that exact naming baseline and existing lifecycle admission still hold.
+AND SHALL commit the shared title and allocated-slug update only if that exact naming baseline and existing lifecycle admission still hold and the canonical root transcript is not archived.
 
 THE SYSTEM SHALL persist the normalized rename intent, trusted executing source-call identity, and resulting naming receipt under one operation identity in the same transaction as the naming update
 AND SHALL reconcile identical retries from that historical receipt without reapplying the rename, even after a later naming change or permanent deletion of the target ProductConversation
@@ -86,6 +86,7 @@ THE SYSTEM SHALL retain the existing immutable identity and released-slug semant
 
 - Duplicate human names remain identical while projections allocate `base`, `base-2`, and `base-3` under concurrent rename and creation.
 - A failed or fenced rename changes neither name nor projection; History and active Close remain protected.
+- Archiving a canonical root after a detail read refuses a new Coordinator rename without title, slug, revision, or receipt mutation; an identical previously accepted operation remains a historical replay under current Coordinator authority.
 - A Unicode name remains readable in presentation while its current canonical route is correctly encoded; punctuation-only names use the fallback projection.
 - A name equal to an actual UUID or other persisted ID gets a safe collision suffix; a merely UUID-looking unused name is allowed.
 - Rename through a continuation changes the root authority only; exact historical transcript/message references and permanent IDs still resolve.

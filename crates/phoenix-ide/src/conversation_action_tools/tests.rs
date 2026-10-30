@@ -630,6 +630,91 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     assert!(matches!(revoked_replay, ToolOutput::Error { .. }));
 }
 
+async fn insert_project_option(db: &crate::db::Database, id: &str, path: &std::path::Path) {
+    sqlx::query("INSERT INTO projects (id, canonical_path, created_at) VALUES (?1, ?2, ?3)")
+        .bind(id).bind(path.to_str().unwrap()).bind(chrono::Utc::now().to_rfc3339())
+        .execute(db.pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_options_skips_stale_prefix_and_canonicalizes_usable_projects() {
+    let (runtime, db, gc) = native_runtime().await;
+    let tool = CreateConversation(runtime);
+    let temp = tempfile::tempdir().unwrap();
+    for index in 0..70 {
+        insert_project_option(&db, &format!("a-{index:03}"), &temp.path().join(format!("missing-{index}"))).await;
+    }
+    let file = temp.path().join("file");
+    std::fs::write(&file, "fixture").unwrap();
+    insert_project_option(&db, "b-file", &file).await;
+    insert_project_option(&db, "b-root", std::path::Path::new("/")).await;
+    insert_project_option(&db, "z-valid", &temp.path().join(".")).await;
+    let output = tool.run(json!({"op":"options"}), native_context(&gc)).await;
+    let options: Value = serde_json::from_str(output.output()).unwrap();
+    assert_eq!(options["projects_truncated"], false);
+    assert_eq!(options["projects"], json!([{"project_id":"z-valid", "cwd":temp.path().canonicalize().unwrap()}]));
+    let accepted = tool.run(json!({"op":"create", "request_id":uuid::Uuid::new_v4().to_string(),
+        "cwd":options["projects"][0]["cwd"], "objective":"/literal @original", "start":"submit_objective", "model":"gpt-5.6-sol"}), native_context(&gc)).await;
+    assert!(!matches!(accepted, ToolOutput::Error { .. }), "{}", accepted.output());
+}
+
+#[tokio::test]
+async fn native_options_truncates_only_after_fifty_usable_projects() {
+    let (runtime, db, gc) = native_runtime().await;
+    let tool = CreateConversation(runtime);
+    let temp = tempfile::tempdir().unwrap();
+    for index in 0..70 {
+        insert_project_option(&db, &format!("a-{index:03}"), &temp.path().join(format!("missing-{index}"))).await;
+    }
+    for index in 0..50 {
+        let path = temp.path().join(format!("valid-{index:03}"));
+        std::fs::create_dir(&path).unwrap();
+        insert_project_option(&db, &format!("z-{index:03}"), &path).await;
+    }
+    let output = tool.run(json!({"op":"options"}), native_context(&gc)).await;
+    let options: Value = serde_json::from_str(output.output()).unwrap();
+    assert_eq!(options["projects"].as_array().unwrap().len(), 50);
+    assert_eq!(options["projects_truncated"], false);
+    let path = temp.path().join("last-valid");
+    std::fs::create_dir(&path).unwrap();
+    insert_project_option(&db, "z-050", &path).await;
+    let output = tool.run(json!({"op":"options"}), native_context(&gc)).await;
+    let options: Value = serde_json::from_str(output.output()).unwrap();
+    assert_eq!(options["projects"].as_array().unwrap().len(), 50);
+    assert_eq!(options["projects_truncated"], true);
+}
+
+#[tokio::test]
+async fn native_rename_rechecks_archive_but_retains_authorized_replay() {
+    let (runtime, db, gc) = native_runtime().await;
+    let root = db.create_conversation("archive-native", "archive-native", "/tmp", true, None, None).await.unwrap();
+    let tool = RenameConversation(runtime);
+    let detail = tool.run(json!({"op":"detail", "reference":root.product_conversation_id}), native_context(&gc)).await;
+    let detail: Value = serde_json::from_str(detail.output()).unwrap();
+    let mut request = json!({"op":"rename", "operation_id":uuid::Uuid::new_v4().to_string(),
+        "product_conversation_id":detail["detail"]["product_conversation_id"], "expected_root_transcript_id":detail["detail"]["root_transcript_id"],
+        "expected_name_revision":detail["detail"]["name_revision"], "title":"Archive fenced"});
+    let applied = tool.run(request.clone(), native_context(&gc)).await;
+    let applied: Value = serde_json::from_str(applied.output()).unwrap();
+    assert_eq!(applied["status"], "applied");
+    sqlx::query("UPDATE conversations SET archived=1 WHERE id=?1").bind(&root.id).execute(db.pool()).await.unwrap();
+    let replay = tool.run(request.clone(), native_context(&gc)).await;
+    let replay: Value = serde_json::from_str(replay.output()).unwrap();
+    assert_eq!(replay["status"], "replayed");
+    assert_eq!(replay["receipt"], applied["receipt"]);
+    request["operation_id"] = json!(uuid::Uuid::new_v4().to_string());
+    request["expected_name_revision"] = json!(1);
+    let refused = tool.run(request.clone(), native_context(&gc)).await;
+    let refused: Value = serde_json::from_str(refused.output()).unwrap();
+    assert_eq!(refused["status"], "unavailable");
+    assert!(db.read_product_conversation_rename_receipt(&gc, request["operation_id"].as_str().unwrap()).await.unwrap().is_none());
+    sqlx::query("UPDATE conversations SET coordinator_head=0 WHERE id=?1").bind(&gc).execute(db.pool()).await.unwrap();
+    request["operation_id"] = applied["receipt"]["operation_id"].clone();
+    request["expected_name_revision"] = json!(0);
+    let revoked = tool.run(request, native_context(&gc)).await;
+    assert!(matches!(revoked, ToolOutput::Error { .. }));
+}
+
 #[tokio::test]
 async fn native_options_rejects_missing_and_file_cwd_and_returns_usable_directory() {
     let (runtime, db, gc) = native_runtime().await;

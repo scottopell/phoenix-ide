@@ -313,6 +313,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
           navigateRef.current(result.canonical_route);
           return;
         }
+        if (result.kind === 'historical_published') {
+          setCreating(false);
+          return;
+        }
         if (result.kind === 'failed' || result.kind === 'cancelled') {
           setCreating(false);
           setError(result.error || (result.kind === 'cancelled' ? 'Conversation creation cancelled.' : 'Conversation creation failed.'));
@@ -352,8 +356,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const forgetCreationObservation = useCallback((requestId: string) => {
     if (!activeRequestRef.current || creationRequestId(activeRequestRef.current) !== requestId) return;
-    if (!creationObservation || (creationObservation.kind !== 'failed' && creationObservation.kind !== 'cancelled')
-      || (creationObservation.allowed_actions.length !== 0
+    if (!creationObservation || (creationObservation.kind !== 'failed' && creationObservation.kind !== 'cancelled' && creationObservation.kind !== 'historical_published')
+      || (creationObservation.kind !== 'historical_published' && creationObservation.allowed_actions.length !== 0
         && !(creationObservation.kind === 'failed' && creationObservation.status === 'cleanup_ambiguous'))) return;
     void releaseCreation('Stopped observing this terminal creation locally. The server record has not been deleted. You can start a new conversation.');
   }, [creationObservation, releaseCreation]);

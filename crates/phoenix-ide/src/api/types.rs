@@ -105,6 +105,11 @@ pub enum ProductConversationCreationStatusResponse {
         canonical_route: String,
         transcript_row_id: String,
     },
+    HistoricalPublished {
+        request_id: String,
+        product_conversation_id: String,
+        transcript_row_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, TS)]

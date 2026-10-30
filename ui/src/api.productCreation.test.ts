@@ -35,6 +35,7 @@ describe('ProductConversation creation client', () => {
       })),
     { ...identityAndStage, kind: 'cancelled', error: null, allowed_actions: ['start_over', 'delete'] },
     { kind: 'published', request_id: 'req/1', product_conversation_id: 'product-1', transcript_row_id: 'transcript-1', canonical_route: '/c/product-1' },
+    { kind: 'historical_published', request_id: 'req/1', product_conversation_id: 'product-1', transcript_row_id: 'transcript-1' },
   ];
 
   it.each(observations)('GETs the exact request and retains its $kind result', async (observation) => {

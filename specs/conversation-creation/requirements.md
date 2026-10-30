@@ -212,6 +212,11 @@ THE SYSTEM SHALL expose the exact durable request's progress and recovery outcom
 AND the client SHALL remain on a creation or recovery surface until that exact request publishes atomically, fails, or is cancelled
 AND SHALL navigate to the conversation route only after observing atomic publication
 
+WHEN public exact-request status observes a retained creation whose published product or original transcript is absent
+THE SYSTEM SHALL report the original request identity, reserved product identity, and original transcript identity as a historical publication without a live route or mutating recovery action
+AND SHALL distinguish this retained outcome from a request identity that was never accepted
+AND the client SHALL stop polling without navigating, reposting, or retrying that request, while allowing explicit local release of the observation without deleting the server record.
+
 WHEN the same request is retried with the same request identifier and the same creation intent
 THE SYSTEM SHALL replay the original acceptance result rather than creating a second job
 
@@ -375,6 +380,10 @@ WHEN the current Global Coordinator requests an ordinary conversation through it
 THE SYSTEM SHALL use the shared durable creation acceptance and reconciliation path with one canonical request identity and an explicit submit-objective start intent
 AND SHALL accept only nonblank objective text, an existing absolute directory, and validated supported model, effort, and language choices
 AND SHALL NOT accept attachments, caller-authored origin metadata, filesystem references, or skill expansion as part of this capability.
+
+WHEN the Coordinator discovers project directory options
+THE SYSTEM SHALL return only existing, normalized directories satisfying creation's directory floor
+AND SHALL apply its result bound and truncation indicator to usable options rather than stale persisted candidates.
 
 THE SYSTEM SHALL persist the executing product, transcript, assistant message, and tool-use identities as internal-conversation provenance
 AND SHALL deliver Coordinator objective text literally as agent-authored input rather than user-authored input

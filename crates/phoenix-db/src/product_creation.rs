@@ -260,6 +260,12 @@ pub enum ProductCreationPublicationRead {
 }
 
 #[derive(Debug)]
+pub struct PublicProductCreationStatusRead {
+    pub job: ProductCreationJobRecord,
+    pub publication: Option<ProductCreationPublicationRead>,
+}
+
+#[derive(Debug)]
 pub struct ProductCreationStatusRead {
     pub request_id: String,
     pub product_conversation_id: ProductConversationId,
@@ -599,12 +605,14 @@ impl Database {
     pub async fn product_creation_project_options_as_coordinator(
         &self,
         transcript_id: &str,
+        after_id: Option<&str>,
     ) -> DbResult<Vec<(String, String)>> {
         let mut tx = self.pool.begin().await?;
         crate::product_conversation_rename::require_current_gc_tx(&mut tx, transcript_id).await?;
         let projects = sqlx::query_as::<_, (String, String)>(
-            "SELECT id, canonical_path FROM projects ORDER BY id LIMIT 51",
+            "SELECT id, canonical_path FROM projects WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT 64",
         )
+        .bind(after_id)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -640,6 +648,56 @@ impl Database {
         .await
     }
 
+    pub async fn read_public_product_creation_status(
+        &self,
+        request_id: &str,
+    ) -> DbResult<Option<PublicProductCreationStatusRead>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(job) = Self::get_product_creation_job_on(&mut tx, request_id).await? else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let publication = Self::product_creation_publication_on(&mut tx, &job).await?;
+        tx.rollback().await?;
+        Ok(Some(PublicProductCreationStatusRead { job, publication }))
+    }
+
+    async fn product_creation_publication_on(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        job: &ProductCreationJobRecord,
+    ) -> DbResult<Option<ProductCreationPublicationRead>> {
+        let Some(conversation_id) = &job.published_conversation_id else {
+            return Ok(None);
+        };
+        let transcript_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)")
+                .bind(conversation_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        match (transcript_exists, job.status.as_str()) {
+            (true, "published") => {
+                match Self::get_ordinary_product_conversation_on(tx, &job.product_conversation_id)
+                    .await
+                {
+                    Ok(aggregate) => Ok(Some(ProductCreationPublicationRead::Available {
+                        conversation_id: conversation_id.clone(),
+                        aggregate: Box::new(aggregate),
+                    })),
+                    Err(DbError::ConversationNotFound(_)) => {
+                        Ok(Some(ProductCreationPublicationRead::Historical {
+                            conversation_id: conversation_id.clone(),
+                        }))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (true, _) => Ok(None),
+            (false, _) => Ok(Some(ProductCreationPublicationRead::Historical {
+                conversation_id: conversation_id.clone(),
+            })),
+        }
+    }
+
     async fn read_product_creation_status_as_coordinator_inner(
         &self,
         transcript_id: &str,
@@ -660,34 +718,7 @@ impl Database {
         }
         let initial_objective_execution =
             Self::product_creation_initial_execution_on(&mut tx, request_id).await?;
-        let publication = if let Some(conversation_id) = job.published_conversation_id {
-            let transcript_exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)")
-                    .bind(&conversation_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            match (transcript_exists, job.status.as_str()) {
-                (true, "published") => match Self::get_ordinary_product_conversation_on(
-                    &mut tx,
-                    &job.product_conversation_id,
-                )
-                .await
-                {
-                    Ok(aggregate) => Some(ProductCreationPublicationRead::Available {
-                        conversation_id,
-                        aggregate: Box::new(aggregate),
-                    }),
-                    Err(DbError::ConversationNotFound(_)) => {
-                        Some(ProductCreationPublicationRead::Historical { conversation_id })
-                    }
-                    Err(error) => return Err(error),
-                },
-                (true, _) => None,
-                (false, _) => Some(ProductCreationPublicationRead::Historical { conversation_id }),
-            }
-        } else {
-            None
-        };
+        let publication = Self::product_creation_publication_on(&mut tx, &job).await?;
         let status = ProductCreationStatusRead {
             request_id: job.request_id,
             product_conversation_id: job.product_conversation_id,
@@ -2858,6 +2889,56 @@ mod product_creation_tests {
             )
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn public_creation_status_retains_original_after_deletion() {
+        let db = Database::open_in_memory().await.unwrap();
+        assert!(db
+            .read_public_product_creation_status("unknown")
+            .await
+            .unwrap()
+            .is_none());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let delivery = staged_delivery(&db, &request_id).await;
+        let original = delivery.job.published_conversation_id.clone().unwrap();
+        let staged = db
+            .read_public_product_creation_status(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.job.status, "delivery_pending");
+        assert!(staged.publication.is_none());
+
+        complete_queued_creation(&db, &delivery).await;
+        let live = db
+            .read_public_product_creation_status(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.job.status, "published");
+        assert!(
+            matches!(live.publication, Some(ProductCreationPublicationRead::Available {
+            conversation_id, ..
+        }) if conversation_id == original)
+        );
+
+        db.delete_conversation(&original).await.unwrap();
+        let historical = db
+            .read_public_product_creation_status(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.job.request_id, request_id);
+        assert_eq!(
+            historical.job.product_conversation_id,
+            delivery.job.product_conversation_id
+        );
+        assert!(
+            matches!(historical.publication, Some(ProductCreationPublicationRead::Historical {
+            conversation_id
+        }) if conversation_id == original)
+        );
     }
 
     #[tokio::test]

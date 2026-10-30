@@ -367,6 +367,34 @@ async fn native_creation_acceptance_receipt(
 }
 
 impl CreateConversation {
+    async fn project_options(&self, transcript_id: &str) -> Result<(Vec<Value>, bool), String> {
+        let mut projects = Vec::new();
+        let mut after_id = None::<String>;
+        while projects.len() < 51 {
+            let candidates = self.0.db()
+                .product_creation_project_options_as_coordinator(transcript_id, after_id.as_deref())
+                .await.map_err(|error| error.to_string())?;
+            let Some((last_id, _)) = candidates.last() else { break; };
+            after_id = Some(last_id.clone());
+            let home = self.0.runtime_home().to_path_buf();
+            let usable = tokio::task::spawn_blocking(move || {
+                candidates.into_iter().filter_map(|(id, cwd)| {
+                    match validated_creation_directory(&cwd, &home) {
+                        Ok(cwd) => Some(json!({"project_id":id,"cwd":cwd})),
+                        Err(error) => {
+                            tracing::debug!(project_id = %id, cwd = %cwd, %error, "omitting unusable creation project option");
+                            None
+                        }
+                    }
+                }).collect::<Vec<_>>()
+            }).await.map_err(|error| error.to_string())?;
+            projects.extend(usable.into_iter().take(51 - projects.len()));
+        }
+        let truncated = projects.len() > 50;
+        projects.truncate(50);
+        Ok((projects, truncated))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
         self.0
@@ -388,18 +416,7 @@ impl CreateConversation {
                     }),
                     None => None,
                 };
-                let mut projects = self
-                    .0
-                    .db()
-                    .product_creation_project_options_as_coordinator(&ctx.conversation_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let truncated = projects.len() > 50;
-                projects.truncate(50);
-                let projects: Vec<_> = projects
-                    .into_iter()
-                    .map(|(id, cwd)| json!({"project_id":id,"cwd":cwd}))
-                    .collect();
+                let (projects, truncated) = self.project_options(&ctx.conversation_id).await?;
                 let registry = self.0.model_registry();
                 let routes = registry.available_execution_routes();
                 let models: Vec<_> = routes.into_iter().map(|route| json!({"model":route.model,"supported_efforts":route.supported_efforts})).collect();

@@ -43,3 +43,7 @@ This inventory describes callers and route registration in the current source tr
 ## Actual installer/producer main integration
 
 Main `f41de00825ef8993aa2a20d2fbb61d743ae3487a` legitimately contains installer ADR129 and producer ADR130 and is integrated into this branch; the prior normative-prefix dependency is cleared. Naming runtime/UI are unchanged from qualified `c1ed17600`. Newly merged installer prepared-source fixtures derive their synthetic qualified128 registry pin from retained historical fixture bytes rather than the feature's migration129 registry. Production admission remains fixed128 and rejects the identity registry; this does not repin an incident application or authorize host operations. Final exact-head results live in PR #951, not progress-only source updates. No production migration, artifact, release or deployment acceptance follows from this source integration.
+
+## Native archived-root admission alignment
+
+The Coordinator naming detail already withholds rename for an archived canonical root. The mutation now rechecks that same archived bit inside its write transaction before a new naming commit, after historical receipt reconciliation. New DB/native regressions cover detail-to-archive refusal without naming/receipt changes, authorized identical replay after archival, and revoked Coordinator retry. Source/static verification only; successor compiler/test qualification remains pending.
