@@ -53,6 +53,15 @@ cache. The transcript and UI receive only an authenticated-delivery receipt;
 while the live runtime retains the authenticated payload, its bytes are overlaid
 into the latest matching tool result during provider-request assembly.
 
+Restart materialization uses the same typed transcript projection for completed
+trusted skill results in both executing and cancelling tool rounds. The recovered
+rows retain the delivery receipt while preserving ordinary result content, images,
+display data, duration, ordering, scoped identities, and persistence timestamps.
+Coverage for `REQ-SK-008` / `DeliverCoordinatorBuiltinToModel` includes the
+file-backed close/reopen regressions `restart_executing_round_persists_trusted_receipt`
+and `restart_cancelling_round_persists_trusted_receipt`, including repeated reset.
+`restart_preserves_ordinary_skill_body` guards against redacting by tool name.
+
 Extraction prunes unexpected files inside built-in directories that remain
 bundled. Directories for removed or renamed built-ins may remain on disk but are
 excluded by the embedded-name allowlist. Phoenix has no disable configuration;

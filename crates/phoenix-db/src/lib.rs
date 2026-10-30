@@ -16066,29 +16066,26 @@ fn build_materialized_tool_round(
 
     let mut tool_msgs = Vec::with_capacity(round.results().len());
     for (ordinal, result) in round.results().iter().enumerate() {
-        let (output, is_error, display) = if ordinal < completed_results.len() {
+        let mut content = tool_result_transcript_content(result);
+        let display = if ordinal < completed_results.len() {
             match spawn_fan_ins.get(&result.tool_use_id) {
-                Some((content, display)) => (content.clone(), false, Some(display.clone())),
-                None => (
-                    result.output().to_string(),
-                    result.is_error(),
-                    merge_duration_into_display(result.display_data(), result.duration_ms),
-                ),
+                Some((output, display)) => {
+                    content.content.clone_from(output);
+                    content.is_error = false;
+                    Some(display.clone())
+                }
+                None => merge_duration_into_display(result.display_data(), result.duration_ms),
             }
         } else {
-            (result.output().to_string(), true, None)
+            content.is_error = true;
+            None
         };
         tool_msgs.push(tool_result_message(
             &assistant_message.message_id,
             conv_id,
             next_seq,
             *now,
-            ToolContent {
-                tool_use_id: result.tool_use_id.clone(),
-                content: output,
-                is_error,
-                images: result.images().to_vec(),
-            },
+            content,
             display,
         ));
         next_seq += 1;

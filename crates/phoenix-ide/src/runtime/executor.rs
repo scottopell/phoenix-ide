@@ -42,8 +42,8 @@ use crate::system_prompt::{
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
-    merge_duration_into_display_data, tool_result_message_content, FinalizedToolDisposition,
-    FinalizedToolResult, ToolContent,
+    merge_duration_into_display_data, tool_result_message_content, tool_result_transcript_content,
+    FinalizedToolDisposition, FinalizedToolResult,
 };
 use phoenix_core::domain::tool_round::tool_result_message;
 use phoenix_llm::{
@@ -9371,12 +9371,7 @@ where
         // contract; `merge_duration_into_display_data` preserves it.
         let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
         for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-            let tool_content = ToolContent {
-                tool_use_id: result.tool_use_id.clone(),
-                content: result.output().to_owned(),
-                is_error: result.is_error(),
-                images: result.images().to_vec(),
-            };
+            let tool_content = tool_result_transcript_content(result);
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
             tool_msgs.push(tool_result_message(
