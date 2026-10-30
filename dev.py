@@ -4061,27 +4061,6 @@ def _fetcher_download_reachable() -> bool:
     return resp.status == 200
 
 
-def _outbound_https_reachable() -> bool:
-    """Probe whether outbound HTTPS to public hosts works.
-
-    Some browser tests (currently `test_browser_navigate_remote`)
-    actually navigate to real websites; they need real internet, not
-    just a working Chromium. Sandbox networks often block this. We
-    probe `https://example.com` itself — that's the exact host the
-    test hits, so a green probe means the test will work and a red
-    probe means it would fail for environmental reasons (signal we
-    skip via `PHOENIX_SKIP_NETWORK_TESTS=1`).
-    """
-    import urllib.request as ureq
-    import urllib.error as uerr
-    req = ureq.Request("https://example.com/", method="HEAD")
-    try:
-        resp = ureq.urlopen(req, timeout=1.5)
-    except (uerr.HTTPError, uerr.URLError, OSError):
-        return False
-    return 200 <= resp.status < 400
-
-
 def _classify_browser_env() -> None:
     """Pick a Chromium binary or auto-skip browser tests.
 
@@ -4110,26 +4089,6 @@ def _classify_browser_env() -> None:
         return
     os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
     print("  i  Chromium unavailable — skipping browser tests")
-
-
-def _classify_network_env() -> None:
-    """Auto-skip tests that need outbound HTTPS when the env can't make
-    those requests. The probe targets the same host the affected tests
-    hit (currently example.com) so a green probe means the test will
-    work and a red probe means it would fail for environmental reasons.
-
-    Sets `PHOENIX_SKIP_NETWORK_TESTS=1` on probe failure; the Rust
-    `require_network!()` macro reads this and short-circuits each
-    network-dependent test.
-
-    Per the cmd_check probe rule: silent on the green path; prints
-    only when skipping the network-dependent test class.
-    """
-    if "PHOENIX_SKIP_NETWORK_TESTS" in os.environ:
-        return
-    if not _outbound_https_reachable():
-        os.environ["PHOENIX_SKIP_NETWORK_TESTS"] = "1"
-        print("  i  outbound HTTPS: unavailable — skipping remote-network tests")
 
 
 # ===========================================================================
@@ -6441,21 +6400,19 @@ def cmd_check(
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
     if cargo_active:
-        # Classify the environment up front so the Rust suite skips the
-        # classes of tests that would otherwise produce env-noise failures.
+        # Classify browser availability before running the Rust suite.
         #
         # Contract for `./dev.py check`:
         #   - Red == broken code. Never "your network is broken" or
         #     "you don't have Chrome installed".
         #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
-        #     PHOENIX_SKIP_BROWSER_TESTS, PHOENIX_SKIP_NETWORK_TESTS,
+        #     PHOENIX_SKIP_BROWSER_TESTS,
         #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
         #   - Probes print iff classification CHANGES test behavior:
         #     auto-skipping a class, overriding a config, etc. Happy paths
         #     (Chromium found, fetcher reachable, signing works, deps
         #     present) stay silent so a normal-env run is clean.
         _classify_browser_env()
-        _classify_network_env()
 
         # Tests create temporary commits and must never consult an interactive
         # signing agent. Add a process-only override without probing the signer
