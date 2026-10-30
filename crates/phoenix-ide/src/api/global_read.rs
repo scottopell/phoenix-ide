@@ -4547,10 +4547,12 @@ mod tests {
             "minimal rendered row must preserve the conservative scan-limit floor"
         );
         assert_eq!(FEDERATED_READ_SCAN_LIMIT, 12_992);
-        assert!(
-            FEDERATED_READ_SCAN_LIMIT * FEDERATED_READ_RENDERED_ROW_FLOOR
-                > MAX_CONVERSATION_READ_CURSOR
-        );
+        const {
+            assert!(
+                FEDERATED_READ_SCAN_LIMIT * FEDERATED_READ_RENDERED_ROW_FLOOR
+                    > MAX_CONVERSATION_READ_CURSOR
+            );
+        }
         assert_eq!(FEDERATED_READ_MAX_DB_READS, 203);
     }
 
