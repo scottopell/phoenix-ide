@@ -666,8 +666,8 @@ impl Database {
                     .bind(&conversation_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            if transcript_exists {
-                match Self::get_ordinary_product_conversation_on(
+            match (transcript_exists, job.status.as_str()) {
+                (true, "published") => match Self::get_ordinary_product_conversation_on(
                     &mut tx,
                     &job.product_conversation_id,
                 )
@@ -681,9 +681,9 @@ impl Database {
                         Some(ProductCreationPublicationRead::Historical { conversation_id })
                     }
                     Err(error) => return Err(error),
-                }
-            } else {
-                Some(ProductCreationPublicationRead::Historical { conversation_id })
+                },
+                (true, _) => None,
+                (false, _) => Some(ProductCreationPublicationRead::Historical { conversation_id }),
             }
         } else {
             None
@@ -2652,6 +2652,17 @@ mod product_creation_tests {
     async fn coordinator_creation_history_deletion_fences_queued_delivery_and_recovery() {
         let db = Database::open_in_memory().await.unwrap();
         let delivery = staged_delivery(&db, "coordinator_creation_history_delivery").await;
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let pending = db
+            .read_product_creation_status_as_coordinator(&coordinator.id, &delivery.job.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, "delivery_pending");
+        assert!(pending.publication.is_none());
         let conversation_id = delivery
             .job
             .published_conversation_id
@@ -2660,6 +2671,15 @@ mod product_creation_tests {
         assert!(db.next_product_creation_deadline().await.unwrap().is_some());
         db.delete_conversation(&conversation_id).await.unwrap();
         assert_eq!(db.next_product_creation_deadline().await.unwrap(), None);
+        let history = db
+            .read_product_creation_status_as_coordinator(&coordinator.id, &delivery.job.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.status, "delivery_pending");
+        assert!(matches!(history.publication,
+            Some(ProductCreationPublicationRead::Historical { conversation_id: original })
+                if original == conversation_id));
         assert!(db
             .append_product_creation_steering_entry(
                 &delivery,
