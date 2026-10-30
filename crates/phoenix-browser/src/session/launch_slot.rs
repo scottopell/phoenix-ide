@@ -873,6 +873,7 @@ pub(super) mod tests {
                 for command in 1..=2 {
                     commands.fetch_add(1, Ordering::SeqCst);
                     if pending && command == 1 {
+                        // test-timing-allow: consuming 8s of the shared 15s deadline makes a restarted second-command budget exceed the 20s test bound.
                         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                     }
                     if command == failing_command {
