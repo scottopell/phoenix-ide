@@ -13,6 +13,11 @@ path = "src/lib.rs"
 # and the OAuth token/registration store).
 phoenix-core = { path = "../phoenix-core" }
 
+# Agent Plugins 1.1.0 loading core (manifest/mcp.json validation, scoped
+# failure boundaries, the stdio environment contract, containment) for the
+# plugin-config merge after user config (specs/plugins/).
+phoenix-plugins = { path = "../phoenix-plugins" }
+
 # Async transport trait (`McpTransport`, `ServerMessageSink`).
 async-trait = "0.1"
 

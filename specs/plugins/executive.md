@@ -18,18 +18,18 @@ records the scope decision (user-level only, shared root), the naming scheme
 
 | Requirement | Title | Status | Notes |
 |---|---|---|---|
-| REQ-AP-001 | User-Level Install Scope | Not started | No project-level discovery path may exist; enforced by `PluginsAreUserLevelOnly` |
-| REQ-AP-002 | Installed-Plugin Discovery | Not started | One-level scan of the shared root, manifest-name identity, duplicate-name first-seen-wins |
-| REQ-AP-003 | Manifest Validation | Not started | Exact 1.1.0 field set; unknown fields reported and ignored; unrecognized `$schema` rejects |
-| REQ-AP-004 | Component Loading with Scoped Failure Boundaries | Not started | Per-component and per-server failure isolation; wrong-kind component locations invalidate only that component type |
-| REQ-AP-005 | Plugin Skills | Not started | `plugin:skill` namespacing, non-recursive skills tree, lowest precedence under user skills |
-| REQ-AP-006 | Plugin MCP Servers | Not started | `<plugin>.<server>` keys merged after user config; full `${PLUGIN_*}` env contract |
-| REQ-AP-007 | Containment | Not started | Resolved-path containment incl. symlinks for both plugin root and data boundaries |
-| REQ-AP-008 | Enable and Disable | Not started | Persisted registry (SQLite columns, `mcp_disabled_servers` precedent); absent record = enabled |
+| REQ-AP-001 | User-Level Install Scope | Complete | The only plugins root is the home-derived `~/.agents/plugins` (`default_plugins_root`); no working-directory or repository path is ever scanned |
+| REQ-AP-002 | Installed-Plugin Discovery | Partial | `scan_plugins_root` one-level scan with manifest-name identity and duplicate-name first-seen-wins (`phoenix-plugins`); wired into MCP config discovery; the lifecycle registry surfaces it through the UI in phase 4 |
+| REQ-AP-003 | Manifest Validation | Complete | `Manifest::parse` (`phoenix-plugins`): exact 1.1.0 field set, unknown fields reported and ignored, non-object `extensions` ignored, unrecognized `$schema` rejects |
+| REQ-AP-004 | Component Loading with Scoped Failure Boundaries | Partial | `load_plugin` with per-skill, per-server, and per-component-type scopes (`phoenix-plugins`), regression-tested from the specification's own examples; status surfacing in phase 4 |
+| REQ-AP-005 | Plugin Skills | Not started | `plugin:skill` namespacing, non-recursive skills tree, lowest precedence under user skills (phase 3) |
+| REQ-AP-006 | Plugin MCP Servers | Partial | stdio servers resolve the full environment contract and join the MCP merge keyed `<plugin>.<server>` after user config (`plugin_server_configs_under`, `merge_plugin_configs` in `phoenix-mcp`); streamable-http maps to the HTTP transport; `PLUGIN_DATA` create-before-admission implemented; skills-side contribution in phase 3 |
+| REQ-AP-007 | Containment | Complete | `within_boundary` (`phoenix-plugins`): realpath containment following symlinks, consistent lexical fallback for not-yet-existing paths, both plugin-root and data boundaries |
+| REQ-AP-008 | Enable and Disable | Partial | manager-level `disabled_plugins` set with `set_disabled_plugins`/`disable_plugin`/`enable_plugin` filtering config contribution (`phoenix-mcp`); SQLite persistence and API in phase 4 |
 | REQ-AP-009 | Add and Remove Lifecycle | Not started | Local path or git URL add; unmanaged-provenance protection; data retained on remove, explicit purge |
 | REQ-AP-010 | Status Surfacing | Not started | Per-plugin per-component load outcomes and missing-root state |
-| REQ-AP-011 | Extension Namespaces Reserved but Inert | Not started | `dev.scottopell.phoenix-ide/` reserved; all namespaces ignored in v1 |
-| REQ-AP-012 | Version Recognition | Not started | Exact canonical 1.1.0 identifiers; mixed-version packages disable MCP contribution |
+| REQ-AP-011 | Extension Namespaces Reserved but Inert | Complete | All extension namespaces ignored without validation at manifest parse (`Manifest::parse` reports non-object `extensions` and ignores contents); `dev.scottopell.phoenix-ide/` reserved in ADR-191 |
+| REQ-AP-012 | Version Recognition | Complete | Exact canonical 1.1.0 identifiers in `MANIFEST_SCHEMA_URL`/`MCP_SCHEMA_URL`; mixed-version packages disable MCP contribution (`McpDocument::parse`) |
 
 ## Planned implementation phases
 

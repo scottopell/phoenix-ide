@@ -48,6 +48,10 @@ from one that is merely waiting on me.
 THE SYSTEM SHALL read MCP server definitions from the known config files in a
 fixed priority order, merging by server name (first-seen wins).
 
+Plugin-installed servers (specs/plugins/) join the merge after every user
+config file, keyed `<plugin>.<server>`, so user configuration always wins a
+name collision.
+
 For each `mcpServers` entry THE SYSTEM SHALL select a transport:
 
 - an entry with a `command` field is a **stdio** server
@@ -57,12 +61,20 @@ Each entry MAY set `timeoutSeconds` to a positive integer to override the
 five-minute `tools/call` deadline for that server. A changed timeout SHALL take
 effect through config reload reconciliation like any other server config change.
 
+A stdio entry MAY set a working directory. A user-config entry carries none
+and inherits the manager's cwd; a plugin stdio server always carries its
+resolved plugin-root-anchored working directory (specs/plugins/ REQ-AP-006)
+through spawn and respawn unchanged.
+
 WHERE an entry declares neither a usable `command` nor an HTTP `url`
 THE SYSTEM SHALL skip it and record the reason at `debug` level.
 
 **Rationale:** The config schema already distinguishes transports via `type`
 and `command`/`url`. Discovery is the single place transport selection happens,
-so the rest of the system is transport-agnostic above the JSON-RPC layer.
+so the rest of the system is transport-agnostic above the JSON-RPC layer. The
+working directory is part of the stdio spawn configuration and therefore part
+of the reload reconciler's unchanged-vs-restart comparison. A plugin server's
+cwd comes from the plugin loading contract, not the user config format.
 
 ---
 

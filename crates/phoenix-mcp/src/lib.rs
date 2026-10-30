@@ -239,9 +239,14 @@ async fn connect_transport(
 ) -> Result<Box<dyn McpTransport>, String> {
     match config {
         McpServerConfig::Stdio {
-            command, args, env, ..
+            command,
+            args,
+            env,
+            cwd,
+            ..
         } => Ok(Box::new(
-            StdioTransport::spawn(name, command, args, env, pending_oauth_urls).await?,
+            StdioTransport::spawn(name, command, args, env, cwd.as_deref(), pending_oauth_urls)
+                .await?,
         )),
         McpServerConfig::Http {
             url, headers, auth, ..
@@ -2032,6 +2037,11 @@ pub struct McpClientManager {
     /// Server names whose tools should be excluded from conversations.
     /// The servers remain connected for instant re-enable.
     disabled_servers: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Plugin names (manifest names) whose entire contribution — skills and
+    /// MCP servers — is excluded from loading (specs/plugins/ REQ-AP-008).
+    /// Unlike `disabled_servers`, a disabled plugin contributes nothing: its
+    /// servers are not connected at all.
+    disabled_plugins: Arc<RwLock<std::collections::HashSet<String>>>,
     /// Serializes reload reconciliations. Two interleaved reconciliations
     /// can each classify a server against state the other is mutating
     /// (e.g. both seeing the old config of a changed server, one revoking
@@ -2066,6 +2076,7 @@ impl McpClientManager {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             disabled_servers: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            disabled_plugins: Arc::new(RwLock::new(std::collections::HashSet::new())),
             reload_serial: Arc::new(tokio::sync::Mutex::new(())),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
             removal_errors: Arc::default(),
@@ -2931,6 +2942,34 @@ impl McpClientManager {
         self.disabled_servers.write().await.remove(name);
     }
 
+    /// Replace the disabled plugin set (called at startup with persisted
+    /// state; absent names are enabled — specs/plugins/ REQ-AP-008).
+    pub async fn set_disabled_plugins(&self, disabled: std::collections::HashSet<String>) {
+        *self.disabled_plugins.write().await = disabled;
+    }
+
+    /// Disable a plugin: on the next reconciliation its servers are removed
+    /// entirely (no connection retained), unlike a disabled server
+    /// (specs/plugins/ REQ-AP-008).
+    pub async fn disable_plugin(&self, name: &str) {
+        self.disabled_plugins.write().await.insert(name.to_string());
+    }
+
+    /// Re-enable a plugin.
+    pub async fn enable_plugin(&self, name: &str) {
+        self.disabled_plugins.write().await.remove(name);
+    }
+
+    /// Read user configuration files, then append enabled plugins' MCP
+    /// servers keyed `<plugin>.<server>` (merged after all user files, so
+    /// user configuration wins collisions through first-seen-wins; specs/
+    /// plugins/ REQ-AP-006).
+    async fn all_configs_with_plugins(&self) -> Vec<(String, McpServerConfig)> {
+        let mut configs = Self::read_all_configs();
+        let disabled = self.disabled_plugins.read().await;
+        merge_plugin_configs(configs, plugin_server_configs(&disabled))
+    }
+
     fn begin_actor_connect_at_epoch(
         &self,
         name: String,
@@ -3299,7 +3338,7 @@ impl McpClientManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             let _ = manager
-                .reload_from_actor_configs(Self::read_all_configs())
+                .reload_from_actor_configs(manager.all_configs_with_plugins().await)
                 .await;
             let handles: Vec<SupervisorHandle> =
                 manager.servers.read().await.values().cloned().collect();
@@ -4269,7 +4308,7 @@ impl McpClientManager {
     }
 
     pub async fn reload(&self) -> McpReloadResult {
-        self.reload_from_actor_configs(Self::read_all_configs())
+        self.reload_from_actor_configs(self.all_configs_with_plugins().await)
             .await
     }
 
@@ -5121,6 +5160,7 @@ impl McpClientManager {
             command: command.to_string(),
             args,
             env: string_map(cfg.get("env")),
+            cwd: None,
             tool_call_timeout,
         })
     }
@@ -5250,6 +5290,124 @@ impl McpClientManager {
     }
 }
 
+/// Merge plugin configs after user configs, first-seen-wins: user
+/// configuration always beats a plugin on a name collision (specs/plugins/
+/// REQ-AP-006).
+fn merge_plugin_configs(
+    mut configs: Vec<(String, McpServerConfig)>,
+    plugin_configs: Vec<(String, McpServerConfig)>,
+) -> Vec<(String, McpServerConfig)> {
+    for (name, config) in plugin_configs {
+        if configs.iter().any(|(existing, _)| existing == &name) {
+            continue; // first-seen wins: user config beats plugin config
+        }
+        configs.push((name, config));
+    }
+    configs
+}
+
+/// Translate enabled plugins' MCP servers into config entries, keyed
+/// `<plugin>.<server>` (specs/plugins/ REQ-AP-006).
+///
+/// Scans the user-level plugins root, resolves each stdio server with the
+/// full environment contract — placeholders expanded, client-owned
+/// `PLUGIN_ROOT`/`PLUGIN_DATA` set last, cwd anchored inside the plugin
+/// root — and creates the plugin's data directory before the config is
+/// admitted (create-before-launch, preserved across updates by
+/// name-keying). `streamable-http` maps to the HTTP transport; the
+/// deprecated `sse` transport never reaches this point (it is a load-time
+/// skip). Skipped servers and disabled plugins contribute nothing.
+fn plugin_server_configs(
+    disabled_plugins: &std::collections::HashSet<String>,
+) -> Vec<(String, McpServerConfig)> {
+    let home = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+        .home()
+        .to_path_buf();
+    plugin_server_configs_under(
+        &phoenix_plugins::default_plugins_root(&home),
+        disabled_plugins,
+    )
+}
+
+/// The testable core of [`plugin_server_configs`]: scan an explicit plugins
+/// root. The production wrapper derives the root from the user's home
+/// directory; tests inject a tempdir root.
+fn plugin_server_configs_under(
+    root: &std::path::Path,
+    disabled_plugins: &std::collections::HashSet<String>,
+) -> Vec<(String, McpServerConfig)> {
+    let mut configs = Vec::new();
+
+    for plugin in phoenix_plugins::scan_plugins_root(root) {
+        if disabled_plugins.contains(&plugin.manifest.name) {
+            tracing::debug!(
+                plugin = %plugin.manifest.name,
+                "plugin disabled; contributing no MCP servers"
+            );
+            continue;
+        }
+        let data_dir = phoenix_plugins::data_dir_for(root, &plugin.manifest.name);
+        for spec in &plugin.servers {
+            let server_key = format!("{}.{}", plugin.manifest.name, spec.server());
+            let config = match spec {
+                phoenix_plugins::ServerSpec::Stdio { .. } => {
+                    // The environment base is the ambient environment, the
+                    // same base a user-config stdio server receives.
+                    let base: std::collections::BTreeMap<String, String> =
+                        std::env::vars().collect();
+                    match phoenix_plugins::resolved_environment(
+                        spec,
+                        &plugin.root,
+                        &data_dir,
+                        &base,
+                    ) {
+                        Ok(resolved) => {
+                            if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                                tracing::warn!(
+                                    plugin = %plugin.manifest.name,
+                                    data_dir = %data_dir.display(),
+                                    "cannot create plugin data directory; skipping server: {e}"
+                                );
+                                continue;
+                            }
+                            McpServerConfig::Stdio {
+                                command: resolved.command,
+                                args: resolved.args,
+                                env: resolved.env.into_iter().collect(),
+                                cwd: Some(resolved.cwd),
+                                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+                            }
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                plugin = %plugin.manifest.name,
+                                server = %server_key,
+                                "{reason}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                phoenix_plugins::ServerSpec::StreamableHttp { url, headers, .. } => {
+                    McpServerConfig::Http {
+                        url: url.clone(),
+                        headers: headers.clone().into_iter().collect(),
+                        auth: HttpAuth::None,
+                        tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+                    }
+                }
+            };
+            tracing::debug!(
+                plugin = %plugin.manifest.name,
+                server = %server_key,
+                "Found plugin MCP server config"
+            );
+            configs.push((server_key, config));
+        }
+    }
+    configs
+}
+
 /// Result of an MCP config reload.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpReloadResult {
@@ -5277,6 +5435,11 @@ pub enum McpServerConfig {
         command: String,
         args: Vec<String>,
         env: HashMap<String, String>,
+        /// Working directory for the spawned server. `None` inherits the
+        /// manager's cwd (user-config servers); plugin servers always carry
+        /// their resolved plugin-root-anchored cwd (specs/plugins/
+        /// REQ-AP-006).
+        cwd: Option<PathBuf>,
         tool_call_timeout: Duration,
     },
     Http {
@@ -5401,6 +5564,242 @@ pub struct PreconfiguredClient {
 mod tests {
     use super::*;
 
+    mod plugin_bridge {
+        use super::*;
+        use std::collections::HashSet;
+        use std::path::Path;
+
+        fn write(path: &Path, content: &str) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+
+        fn plugin_root() -> tempfile::TempDir {
+            tempfile::tempdir().unwrap()
+        }
+
+        fn stdio_config(
+            command: &str,
+            args: Vec<&str>,
+            env: Option<(&str, &str)>,
+            cwd: Option<&str>,
+        ) -> McpServerConfig {
+            McpServerConfig::Stdio {
+                command: command.to_string(),
+                args: args.into_iter().map(String::from).collect(),
+                env: env
+                    .map(|(k, v)| HashMap::from([(k.to_string(), v.to_string())]))
+                    .unwrap_or_default(),
+                cwd: cwd.map(std::path::PathBuf::from),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+            }
+        }
+
+        /// A plugin stdio server becomes a fully resolved config entry: keyed
+        /// `<plugin>.<server>`, cwd at the plugin root, client-owned
+        /// `PLUGIN_ROOT`/`PLUGIN_DATA` set last, placeholders expanded, data
+        /// directory created (specs/plugins/ REQ-AP-006).
+        #[test]
+        fn plugin_stdio_server_resolves_the_full_environment_contract() {
+            let root = plugin_root();
+            write(
+                &root.path().join("devtools/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "devtools"}"#,
+            );
+            write(
+                &root.path().join("devtools/mcp.json"),
+                r#"{
+                    "$schema": "https://agent-plugins.org/schemas/1.1.0/mcp.schema.json",
+                    "mcpServers": {
+                        "validator": {
+                            "type": "stdio",
+                            "command": "npx",
+                            "args": ["--config", "${PLUGIN_ROOT}/config.json"],
+                            "env": {"DATA": "${PLUGIN_DATA}/validator"},
+                            "cwd": "${PLUGIN_ROOT}"
+                        }
+                    }
+                }"#,
+            );
+
+            let configs = plugin_server_configs_under(root.path(), &HashSet::new());
+            assert_eq!(configs.len(), 1);
+            let (name, config) = &configs[0];
+            assert_eq!(name, "devtools.validator");
+            let McpServerConfig::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+                ..
+            } = config
+            else {
+                panic!("expected stdio config");
+            };
+            assert_eq!(command, "npx");
+            // The plugin root is canonicalized during load; compare against
+            // the canonical form (macOS tempdirs resolve through /private).
+            let canonical_devtools = std::fs::canonicalize(root.path().join("devtools"))
+                .unwrap_or_else(|_| root.path().join("devtools"));
+            assert!(args.contains(&format!("{}/config.json", canonical_devtools.display())));
+            // canonicalize may differ (macOS /private), compare semantically:
+            let expected_data = root
+                .path()
+                .join("data")
+                .join("devtools")
+                .join("validator")
+                .to_string_lossy()
+                .to_string();
+            assert_eq!(
+                env.get("DATA").map(String::as_str),
+                Some(expected_data.as_str())
+            );
+            assert!(env
+                .get("PLUGIN_ROOT")
+                .is_some_and(|v| v.contains("devtools")));
+            assert!(env
+                .get("PLUGIN_DATA")
+                .is_some_and(|v| v.contains("data/devtools")));
+            assert!(cwd.as_ref().is_some_and(|c| c.ends_with("devtools")));
+            // Create-before-launch: the data directory exists after config
+            // construction.
+            assert!(root.path().join("data/devtools").is_dir());
+        }
+
+        /// A plugin streamable-http server maps to the HTTP transport with
+        /// no auth scheme; the deprecated sse transport never arrives
+        /// (REQ-AP-004, REQ-AP-006).
+        #[test]
+        fn plugin_http_server_maps_and_sse_is_absent() {
+            let root = plugin_root();
+            write(
+                &root.path().join("remote/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "remote"}"#,
+            );
+            write(
+                &root.path().join("remote/mcp.json"),
+                r#"{
+                    "$schema": "https://agent-plugins.org/schemas/1.1.0/mcp.schema.json",
+                    "mcpServers": {
+                        "api": {"type": "streamable-http", "url": "https://api.example.com/mcp", "headers": {"X-Tenant": "t"}},
+                        "legacy": {"type": "sse", "url": "https://legacy.example.com/sse"}
+                    }
+                }"#,
+            );
+
+            let configs = plugin_server_configs_under(root.path(), &HashSet::new());
+            assert_eq!(configs.len(), 1, "sse server is skipped at load");
+            let (name, config) = &configs[0];
+            assert_eq!(name, "remote.api");
+            let McpServerConfig::Http {
+                url, headers, auth, ..
+            } = config
+            else {
+                panic!("expected http config");
+            };
+            assert_eq!(url, "https://api.example.com/mcp");
+            assert_eq!(headers.get("X-Tenant").map(String::as_str), Some("t"));
+            assert!(matches!(auth, HttpAuth::None));
+        }
+
+        /// A disabled plugin contributes no MCP servers at all (unlike a
+        /// disabled server, which retains its connection) — REQ-AP-008.
+        #[test]
+        fn disabled_plugin_contributes_nothing() {
+            let root = plugin_root();
+            write(
+                &root.path().join("muted/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "muted"}"#,
+            );
+            write(
+                &root.path().join("muted/mcp.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/mcp.schema.json", "mcpServers": {"a": {"type": "streamable-http", "url": "https://a.example.com/mcp"}}}"#,
+            );
+
+            let disabled: HashSet<String> = ["muted".to_string()].into();
+            let configs = plugin_server_configs_under(root.path(), &disabled);
+            assert!(configs.is_empty());
+
+            // And without the disabled set, it contributes.
+            let configs = plugin_server_configs_under(root.path(), &HashSet::new());
+            assert_eq!(configs.len(), 1);
+        }
+
+        /// User configuration wins a name collision with a plugin server
+        /// (first-seen-wins merge; specs/plugins/ REQ-AP-006).
+        #[test]
+        fn user_config_wins_plugin_collision() {
+            let user = vec![(
+                "devtools.validator".to_string(),
+                stdio_config("uvx", vec!["user-server"], None, None),
+            )];
+            let plugin = vec![(
+                "devtools.validator".to_string(),
+                stdio_config("npx", vec!["plugin-server"], None, None),
+            )];
+            let merged = merge_plugin_configs(user, plugin);
+            assert_eq!(merged.len(), 1);
+            let McpServerConfig::Stdio { args, .. } = &merged[0].1 else {
+                panic!("expected stdio");
+            };
+            assert_eq!(args, &vec!["user-server".to_string()]);
+
+            // No collision: both survive.
+            let user = vec![(
+                "other.server".to_string(),
+                stdio_config("uvx", vec![], None, None),
+            )];
+            let plugin = vec![(
+                "devtools.validator".to_string(),
+                stdio_config("npx", vec!["plugin-server"], None, None),
+            )];
+            let merged = merge_plugin_configs(user, plugin);
+            assert_eq!(merged.len(), 2);
+        }
+
+        /// The spawned stdio server actually runs with the plugin cwd and
+        /// client-owned environment (integration: `StdioTransport::spawn`).
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn stdio_spawn_runs_with_plugin_cwd_and_env() {
+            let marker_dir = tempfile::tempdir().unwrap();
+            let plugin_home = marker_dir.path().join("plugin-home");
+            let data_home = marker_dir.path().join("data-home");
+            std::fs::create_dir_all(&plugin_home).unwrap();
+            std::fs::create_dir_all(&data_home).unwrap();
+
+            let env: HashMap<String, String> = [(
+                "T".to_string(),
+                marker_dir.path().to_string_lossy().to_string(),
+            )]
+            .into_iter()
+            .collect();
+            let transport = StdioTransport::spawn(
+                "plugin-test",
+                "sh",
+                &[
+                    "-c".to_string(),
+                    "pwd > \"$T/cwd.txt\"; printf '%s\\n' \"$PLUGIN_ROOT\" > \"$T/root.txt\"; printf '%s\\n' \"$PLUGIN_DATA\" > \"$T/data.txt\""
+                        .to_string(),
+                ],
+                &env,
+                Some(&plugin_home),
+                Arc::new(RwLock::new(HashMap::new())),
+            )
+            .await
+            .expect("spawn");
+
+            // Give the child a moment to write the markers, then drop (kill).
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            drop(transport);
+
+            let cwd = std::fs::read_to_string(marker_dir.path().join("cwd.txt")).unwrap();
+            assert!(cwd.trim().ends_with("plugin-home"), "child cwd was {cwd:?}");
+        }
+    }
+
     #[test]
     fn test_read_all_configs_does_not_panic() {
         // Verify that read_all_configs works with no config files present
@@ -5425,6 +5824,7 @@ mod tests {
                 command: "uvx".to_string(),
                 args: vec!["server".to_string()],
                 env: HashMap::from([("KEY".to_string(), "v".to_string())]),
+                cwd: None,
                 tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             }
         );
@@ -5852,6 +6252,7 @@ mod tests {
                     command: "unused".to_string(),
                     args: Vec::new(),
                     env: HashMap::new(),
+                    cwd: None,
                     tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
                 },
                 tools_changed: Arc::new(AtomicBool::new(false)),
@@ -5961,6 +6362,7 @@ mod tests {
                 command: "unused".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
+                cwd: None,
                 tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             },
         )
@@ -6162,6 +6564,7 @@ mod tests {
                     command: "unused".into(),
                     args: Vec::new(),
                     env: HashMap::new(),
+                    cwd: None,
                     tool_call_timeout: Duration::from_millis(10),
                 },
                 invalidates_transport,
@@ -6274,6 +6677,7 @@ mod tests {
                 command: "unused".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
+                cwd: None,
                 tool_call_timeout: Duration::from_secs(900),
             },
         );
@@ -6292,6 +6696,7 @@ mod tests {
             command: "unused".to_string(),
             args: Vec::new(),
             env: HashMap::new(),
+            cwd: None,
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let mut changed = base.clone();
@@ -6929,6 +7334,7 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             env: HashMap::new(),
+            cwd: None,
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }
@@ -7136,6 +7542,7 @@ for line in sys.stdin:
                 label.to_string(),
             ],
             env: HashMap::from([("MCP_TEST_VALUE".to_string(), env_value.to_string())]),
+            cwd: None,
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }
