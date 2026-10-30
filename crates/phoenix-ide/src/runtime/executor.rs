@@ -748,24 +748,9 @@ fn count_trusted_envelopes(messages: &[LlmMessage]) -> usize {
         .count()
 }
 
-/// Await a tool task's oneshot outcome and forward it, generation-tagged, to
-/// the executor's tool-outcome channel, mapping a dropped sender to a typed
-/// `Failed` outcome.
-///
-/// A dropped oneshot sender (the tool task panicked or was aborted before it
-/// could `send`) must NOT silently lose the outcome: with no delivery,
-/// `ToolExecuting` never sees `ToolComplete` and a pending `CancellingTool`
-/// waits forever, rejecting all input until restart. `Failed` →
-/// `Event::ToolComplete` (an error `ToolResult`), accepted by both
-/// `ToolExecuting` and `CancellingTool`, so the conversation always progresses.
-///
-/// The `generation` stamp lets the executor distinguish an outcome for the
-/// still-in-flight tool from a stale one belonging to an intentionally aborted
-/// task (see `ToolExecutionSlot`). An intentional
-/// `Effect::AbortTool` / backstop teardown aborts the task, dropping the
-/// sender, so the synthetic `Failed` looks identical to a genuine panic; the
-/// executor discards any forwarded outcome whose generation is no longer
-/// current, even if a later turn reuses the same `tool_use_id`.
+/// Forward a tool outcome with its dispatch generation unchanged.
+/// A dropped sender becomes `Failed`, including when the task panics or is
+/// force-aborted. The receiver rejects stale generations through `ToolExecutionSlot`.
 async fn forward_tool_outcome(
     tool_rx: oneshot::Receiver<ToolExecOutcome>,
     tool_use_id: String,
