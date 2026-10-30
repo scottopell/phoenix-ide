@@ -83,7 +83,7 @@ jobs:
           node --test scripts/test-check-signed-helper.cjs
           python3 scripts/test_release_version.py
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
       - name: Test launchd deployment controller
         run: uv run --no-project --managed-python --python 3.13 python -m unittest tests.devpy.test_launchd_deploy tests.devpy.test_current_schema_prepared_upgrade
       - name: Build a real unsigned Release package
