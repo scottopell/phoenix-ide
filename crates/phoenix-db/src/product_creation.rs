@@ -3651,12 +3651,9 @@ mod product_creation_tests {
     async fn unwatched_terminal_receipt_survives_occurrence_consumption_and_file_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("initial-execution.sqlite");
-        let (db, request, conversation) = initial_execution_fixture_in(
-            Database::open(path.to_str().unwrap()).await.unwrap(),
-            false,
-            None,
-        )
-        .await;
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::run_pending_migrations(db.pool()).await.unwrap();
+        let (db, request, conversation) = initial_execution_fixture_in(db, false, None).await;
         db.update_conversation_state(
             &conversation,
             &ConvState::Error {
@@ -4145,6 +4142,86 @@ mod product_creation_tests {
             .unwrap()
             .is_empty());
         assert_eq!(successor_inputs, 0);
+    }
+
+    #[tokio::test]
+    async fn text_only_creation_final_deletion_replays_without_retired_images() {
+        let (db, request, conversation) = initial_execution_fixture_in(
+            Database::open_in_memory().await.unwrap(),
+            false,
+            Some(vec![]),
+        )
+        .await;
+        let job = db
+            .get_product_creation_job(&request)
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = job.intent.live_intent().unwrap();
+        assert!(accepted.images.is_empty());
+        db.update_conversation_state(&conversation, &ConvState::Idle)
+            .await
+            .unwrap();
+        db.delete_conversation(&conversation).await.unwrap();
+
+        let retained = db
+            .get_product_creation_job(&request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.intent.images,
+            StoredProductCreationImages::Live(vec![])
+        );
+        assert_eq!(retained.intent.live_intent().unwrap(), accepted);
+        let retired_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id = ?1",
+        )
+        .bind(&request)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retired_count, 0);
+        let ProductCreationAcceptOutcome::Replayed(replayed) = db
+            .accept_product_creation(&request, &accepted)
+            .await
+            .unwrap()
+        else {
+            panic!("expected historical text-only replay");
+        };
+        assert_eq!(replayed.product_conversation_id, job.product_conversation_id);
+        assert_eq!(replayed.published_product_id, job.published_product_id);
+        assert_eq!(
+            replayed.published_conversation_id.as_deref(),
+            Some(conversation.as_str())
+        );
+        assert_eq!(replayed.intent.live_intent().unwrap(), accepted);
+        let mut changed = accepted.clone();
+        changed.images.push(ProductCreationImage {
+            media_type: "image/png".into(),
+            data: "added-image".into(),
+        });
+        assert_replay_conflicts(&db, &request, &[changed]).await;
+        assert_eq!(db.next_product_creation_deadline().await.unwrap(), None);
+        assert_eq!(
+            db.product_creation_initial_execution(&request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Completed
+        );
+        let live_targets: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+             (SELECT COUNT(*) FROM product_conversations WHERE id = ?1),
+             (SELECT COUNT(*) FROM conversations WHERE id = ?2),
+             (SELECT COUNT(*) FROM steering_messages WHERE message_id = ?3)",
+        )
+        .bind(job.product_conversation_id.as_str())
+        .bind(&conversation)
+        .bind(&request)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(live_targets, (0, 0, 0));
     }
 
     #[tokio::test]

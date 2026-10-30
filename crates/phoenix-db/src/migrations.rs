@@ -12109,6 +12109,7 @@ async fn migration_149_backfill_image_replay_identity(
         "INSERT INTO product_creation_retired_images (request_id)
          SELECT j.request_id FROM product_creation_jobs j
          WHERE j.published_product_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM product_creation_image_replay_identity i WHERE i.request_id = j.request_id)
            AND NOT EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = j.published_product_id)",
     )
     .execute(&mut **tx)
@@ -19413,6 +19414,57 @@ with tempfile.TemporaryDirectory() as directory:
             .unwrap()
             .is_empty());
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn image_retirement_migration_preserves_text_only_orphan_receipt_from_148() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_through_for_test(&pool, 148).await.unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_jobs
+             (request_id, product_conversation_id, cwd, objective, llm_language, status,
+              accepted_at_unix_micros, updated_at_unix_micros,
+              published_product_id, published_conversation_id)
+             VALUES ('orphan-text', 'orphan-text', '/tmp', 'objective', 'caveman', 'published',
+                     1, 1, 'deleted-product', 'deleted-transcript')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let retained: (String, String, String) = sqlx::query_as(
+            "SELECT status, published_product_id, published_conversation_id
+             FROM product_creation_jobs WHERE request_id = 'orphan-text'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "published".into(),
+                "deleted-product".into(),
+                "deleted-transcript".into()
+            )
+        );
+        let image_rows: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+             (SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id = 'orphan-text'),
+             (SELECT COUNT(*) FROM product_creation_image_replay_identity WHERE request_id = 'orphan-text'),
+             (SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'orphan-text')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(image_rows, (0, 0, 0));
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

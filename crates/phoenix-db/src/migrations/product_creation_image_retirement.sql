@@ -14,7 +14,9 @@ CREATE TRIGGER product_creation_retire_images_after_product_delete
 AFTER DELETE ON product_conversations
 BEGIN
     INSERT INTO product_creation_retired_images (request_id)
-    SELECT request_id FROM product_creation_jobs WHERE published_product_id = OLD.id;
+    SELECT j.request_id FROM product_creation_jobs j
+    WHERE j.published_product_id = OLD.id
+      AND EXISTS (SELECT 1 FROM product_creation_image_replay_identity i WHERE i.request_id = j.request_id);
     DELETE FROM product_creation_job_images
     WHERE request_id IN (SELECT request_id FROM product_creation_jobs WHERE published_product_id = OLD.id);
 END;
