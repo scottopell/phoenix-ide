@@ -599,14 +599,14 @@ async fn resolve_reference_with_limits(
         state.message_retriever.clone(),
     );
     let reference = request.target.reference();
-    let resolution = match execute_bounded_remote_read(
-        admission,
-        deadline,
-        Box::pin(service.resolve_reference_bounded(
-            &reference,
-            std::num::NonZeroUsize::new(MAX_REMOTE_RESPONSE_BYTES).unwrap(),
-        )),
-    )
+    let resolution = match execute_bounded_remote_read(admission, deadline, async move {
+        service
+            .resolve_reference_bounded(
+                &reference,
+                std::num::NonZeroUsize::new(MAX_REMOTE_RESPONSE_BYTES).unwrap(),
+            )
+            .await
+    })
     .await
     {
         Err(error) => return remote_read_limit_response(error),
@@ -642,6 +642,7 @@ pub async fn read_conversation(
 enum RemoteReadLimitError {
     Admission,
     Deadline,
+    Task,
 }
 
 fn remote_read_limit_response(error: RemoteReadLimitError) -> Response {
@@ -653,6 +654,9 @@ fn remote_read_limit_response(error: RemoteReadLimitError) -> Response {
         RemoteReadLimitError::Deadline => {
             federation_error(StatusCode::GATEWAY_TIMEOUT, "remote read deadline exceeded")
         }
+        RemoteReadLimitError::Task => {
+            federation_error(StatusCode::INTERNAL_SERVER_ERROR, "remote read task failed")
+        }
     }
 }
 
@@ -662,14 +666,21 @@ async fn execute_bounded_remote_read<T, F>(
     operation: F,
 ) -> Result<T, RemoteReadLimitError>
 where
-    F: Future<Output = T>,
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
 {
-    let _permit = std::sync::Arc::clone(admission)
+    let permit = std::sync::Arc::clone(admission)
         .try_acquire_owned()
         .map_err(|_| RemoteReadLimitError::Admission)?;
-    tokio::time::timeout(deadline, operation)
-        .await
-        .map_err(|_| RemoteReadLimitError::Deadline)
+    let task = spawn_with_admission_permit(permit, operation);
+    match tokio::time::timeout(deadline, task).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "remote read task failed");
+            Err(RemoteReadLimitError::Task)
+        }
+        Err(_) => Err(RemoteReadLimitError::Deadline),
+    }
 }
 
 async fn read_conversation_with_limits(
@@ -696,15 +707,17 @@ async fn read_conversation_with_limits(
         state.db.clone(),
         state.message_retriever.clone(),
     );
-    let read = execute_bounded_remote_read(
-        admission,
-        deadline,
-        Box::pin(service.read_conversation_page_bounded(
-            &request.target.reference(),
-            request.cursor,
-            std::num::NonZeroUsize::new(MAX_REMOTE_RESPONSE_BYTES).unwrap(),
-        )),
-    )
+    let reference = request.target.reference();
+    let cursor = request.cursor;
+    let read = execute_bounded_remote_read(admission, deadline, async move {
+        service
+            .read_conversation_page_bounded(
+                &reference,
+                cursor,
+                std::num::NonZeroUsize::new(MAX_REMOTE_RESPONSE_BYTES).unwrap(),
+            )
+            .await
+    })
     .await;
     match read {
         Err(error) => remote_read_limit_response(error),
@@ -1087,16 +1100,42 @@ mod tests {
         assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         let admitted = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        assert_eq!(
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let deadline_admission = admitted.clone();
+        let deadline_task = tokio::spawn(async move {
             execute_bounded_remote_read(
-                &admitted,
-                std::time::Duration::ZERO,
-                std::future::pending::<usize>(),
+                &deadline_admission,
+                std::time::Duration::from_millis(10),
+                async move {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                },
             )
-            .await,
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), deadline_task)
+                .await
+                .unwrap()
+                .unwrap(),
             Err(RemoteReadLimitError::Deadline)
         );
-        assert_eq!(admitted.available_permits(), 1);
+        assert!(admitted.clone().try_acquire_owned().is_err());
+        finish_tx.send(()).unwrap();
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            admitted.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(released);
+
         let deadline_response = remote_read_limit_response(RemoteReadLimitError::Deadline);
         assert_eq!(deadline_response.status(), StatusCode::GATEWAY_TIMEOUT);
         let deadline_body =
@@ -1902,33 +1941,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_caller_does_not_release_admission_before_work_finishes() {
+    async fn cancelled_remote_read_caller_does_not_release_admission_before_work_finishes() {
         let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = std::sync::Arc::clone(&admission)
-            .try_acquire_owned()
-            .unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
-        let task = spawn_with_admission_permit(permit, async move {
-            started_tx.send(()).unwrap();
-            finish_rx.await.unwrap();
+        let caller_admission = admission.clone();
+        let caller = tokio::spawn(async move {
+            execute_bounded_remote_read(
+                &caller_admission,
+                std::time::Duration::from_secs(30),
+                async move {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                },
+            )
+            .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(30), started_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
             .await
             .unwrap()
             .unwrap();
 
-        let mut caller = Box::pin(task);
-        assert!(futures::poll!(&mut caller).is_pending());
-        drop(caller);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
         assert!(admission.clone().try_acquire_owned().is_err());
 
         finish_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), admission.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            admission.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(released);
     }
 
     #[tokio::test]

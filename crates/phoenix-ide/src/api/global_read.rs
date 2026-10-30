@@ -1785,7 +1785,11 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
 pub(super) fn exact_conversation_href(transcript_id: &str, message_id: Option<&str>) -> String {
     let encoded_transcript =
         super::product_conversations::percent_encode_route_segment(transcript_id);
-    let base = format!("/c/{encoded_transcript}?source_transcript={encoded_transcript}");
+    let base = if matches!(transcript_id, "." | "..") {
+        format!("/transcript?source_transcript={encoded_transcript}")
+    } else {
+        format!("/c/{encoded_transcript}?source_transcript={encoded_transcript}")
+    };
     match message_id {
         Some(message_id) => format!(
             "{base}#message-{}",
@@ -3653,16 +3657,33 @@ mod previous_transcripts_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        conversation_page_end, format_global_search_hits, message_id_fragment,
-        render_full_message_text, render_global_message_line, resolve_conversation_read_target,
-        resolve_reference_impl, resolve_work_scope, split_fragment, ConversationReadTarget,
-        CoordinatorWorkScopeTargetError, GlobalMessageTarget, GlobalMessageTargetError,
-        GlobalReadService, ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
-        WorkScopeUnavailableReason, MAX_CONVERSATION_READ_CURSOR, READ_PAGE_CHARS,
+        conversation_page_end, exact_conversation_href, format_global_search_hits,
+        message_id_fragment, render_full_message_text, render_global_message_line,
+        resolve_conversation_read_target, resolve_reference_impl, resolve_work_scope,
+        split_fragment, ConversationReadTarget, CoordinatorWorkScopeTargetError,
+        GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService, ResolvedEnvironmentKind,
+        ResolvedWorkScope, ServerPathSemantics, WorkScopeUnavailableReason,
+        MAX_CONVERSATION_READ_CURSOR, READ_PAGE_CHARS,
     };
     use std::sync::Arc;
 
     use crate::db::MessageRetriever;
+
+    #[test]
+    fn exact_conversation_href_keeps_dot_only_transcripts_out_of_path_segments() {
+        assert_eq!(
+            exact_conversation_href(".", None),
+            "/transcript?source_transcript=."
+        );
+        assert_eq!(
+            exact_conversation_href("..", Some("message/#%")),
+            "/transcript?source_transcript=..#message-message%2F%23%25"
+        );
+        assert_eq!(
+            exact_conversation_href("ordinary/id", Some("message")),
+            "/c/ordinary%2Fid?source_transcript=ordinary%2Fid#message-message"
+        );
+    }
 
     #[tokio::test]
     async fn compatibility_resolver_rejects_blank_product_and_bare_references_without_panicking() {
