@@ -10,7 +10,7 @@ The CLI reuses the browser-specific operation boundary from `phoenix-tools` and 
 
 The lifecycle contract is specified in `browser-cli.allium`; browser operation semantics remain in `specs/browser-tool/`.
 
-## Pending qualification: scenario queue admission
+## Scenario queue admission — focused qualification passed
 
 The archive candidate registers a validated `run_scenario` with the broker before the daemon's serial queue. A one-shot permit moves with the queued job into shared profile execution; registration, execution, and cleanup use the same broker task, without a second busy flag or parallel operation worker. Non-scenario serialization and daemon-owned execution after CLI disconnection remain intact.
 
@@ -19,7 +19,7 @@ Added coverage (not executed in this candidate):
 - `socket_scenario_registration_rejects_competitor_before_serial_dispatch`: real socket request admission before worker dispatch, typed `busy` and `invalid_input`, invalid requests without custody, and successful dispatch/recovery. This white-box test deliberately controls dispatch; it does not exercise a full worker queue under load.
 - Broker reservation unit tests cover exclusion before dispatch, abandonment, and close before dispatch.
 
-Qualification remains pending: only edition-2021 single-file rustfmt and the static Rust test-timing check have been run. No compilation, Clippy, Rust tests, or browser execution was performed. The socket regressions require Chrome; client disconnection is covered in source, but an elapsed client read-timeout variant is not independently exercised. Existing published qualification does not qualify this changed candidate.
+The sole host reported strict Clippy and 50 broker/native/daemon tests passing on exact v20 `45a40c5f4d277860e55ef4474120521aaf4082c4`. Exact v23 `947bf516c8a61f8a99a757889abe82f10398ad65` changes only the CLI fixture and passed strict Clippy plus the concurrent socket/CLI regression and touch composition test (1 passed/0 failed/0 ignored each). This is split qualification, not 52 tests executed on v23. The same-origin held-response fixture covers competitor rejection and the disconnected-client branch; an elapsed client read-timeout variant is not independently exercised. Receipt hashes and preserved failure attribution are recorded in the [browser-tool executive](../browser-tool/executive.md). All 3392 source hashes matched and execution custody was released; hosted successor CI is separate.
 
 ## Status Summary
 
