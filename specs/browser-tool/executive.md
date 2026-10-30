@@ -6,6 +6,12 @@ The Phoenix Browser Tool enables AI agents to interact with web pages during dev
 
 The core set covers navigation, JavaScript evaluation, screenshots, viewport control, console log capture with accurate object representation, accessibility snapshots, and dedicated click/type/wait tools that reliably trigger framework event handlers. Click/type accept CSS selectors or snapshot references. Browser availability is automatic — if no system browser is found, a compatible Chromium is downloaded and cached transparently. Post-MVP scope covers PWA-specific inspection (service workers, network sources, offline simulation) and network request capture.
 
+## Pending qualification: CLI scenario admission
+
+The archive candidate extends the existing broker task registration to cover CLI scenarios awaiting serial dispatch. A validated request carries one-shot dispatch authority through the daemon queue into the same shared scenario and cleanup path; native immediate admission retains its existing broker registration path. REQ-BT-019.22 explicitly includes queued ownership and validation before reservation.
+
+Source coverage adds broker reservation/abandonment/close tests, a pre-dispatch real-socket admission test, and a full CLI/socket regression that holds the first scenario at an HTTP fixture boundary, expects the competitor's typed `busy` before release, checks side-effect counts and recovery, and repeats after disconnecting the first client. Only single-file edition-2021 rustfmt and static test-timing validation have run. Compilation, Clippy, tests, and browser qualification are pending; no new runtime pass is claimed. The pre-dispatch test controls dispatch directly rather than saturating the full queue, and elapsed client read-timeout behavior has no separate new regression.
+
 ## Technical Summary
 
 Built using the `chromiumoxide` crate for async CDP communication. Tools are stateless, receiving all context via `ToolContext`. The `ctx.browser()` method provides correct-by-construction session access — WorkScope identity is derived internally, preventing cross-session contamination.

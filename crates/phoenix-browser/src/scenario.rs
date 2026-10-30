@@ -1,8 +1,33 @@
 //! Broker-owned scenario task custody, reachable without the session write lock.
 
-use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+
+type DeferredOperation =
+    Box<dyn FnOnce(watch::Receiver<bool>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+/// One-shot dispatch authority for an already registered broker task.
+pub struct ScenarioPermit {
+    dispatch: tokio::sync::oneshot::Sender<DeferredOperation>,
+    _owner: Arc<ScenarioOwner>,
+}
+
+impl ScenarioPermit {
+    /// # Errors
+    /// Returns an error if the broker stopped the registered task before dispatch.
+    pub fn start<F, Fut>(self, operation: F) -> Result<(), String>
+    where
+        F: FnOnce(watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.dispatch
+            .send(Box::new(move |cancelled| Box::pin(operation(cancelled))))
+            .map_err(|_| "Browser scenario reservation ended before dispatch".into())
+    }
+}
 
 struct Running {
     cancel: watch::Sender<bool>,
@@ -21,6 +46,29 @@ pub struct ScenarioOwner {
 }
 
 impl ScenarioOwner {
+    /// Register custody before a serial caller queues the operation.
+    ///
+    /// # Errors
+    /// Returns the same closing/busy rejection as immediate task registration.
+    pub fn reserve(self: &Arc<Self>) -> Result<ScenarioPermit, String> {
+        let (dispatch, ready) = tokio::sync::oneshot::channel::<DeferredOperation>();
+        self.start(move |mut cancelled| async move {
+            let operation = tokio::select! {
+                biased;
+                () = crate::scenario::cancelled(&mut cancelled) => return,
+                operation = ready => match operation {
+                    Ok(operation) => operation,
+                    Err(_) => return,
+                },
+            };
+            operation(cancelled).await;
+        })?;
+        Ok(ScenarioPermit {
+            dispatch,
+            _owner: self.clone(),
+        })
+    }
+
     /// # Errors
     /// Returns an error if this owner is closing or a previous scenario task,
     /// including its cleanup, has not finished.
@@ -93,6 +141,47 @@ pub async fn cancelled(receiver: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reservation_excludes_work_before_dispatch_and_releases_after_abandonment() {
+        let owner = Arc::new(ScenarioOwner::default());
+        let permit = owner.reserve().unwrap();
+        assert!(owner.reserve().is_err());
+        assert!(owner.start(|_| async {}).is_err());
+        drop(permit);
+        // Await the registered task's exit, not an arbitrary scheduler delay.
+        let handle = owner.state.lock().unwrap().running.take().unwrap().task;
+        handle.await.unwrap();
+        let permit = owner.reserve().unwrap();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        permit
+            .start(|_| async move {
+                done.send(()).unwrap();
+            })
+            .unwrap();
+        finished.await.unwrap();
+        let handle = owner.state.lock().unwrap().running.take().unwrap().task;
+        handle.await.unwrap();
+        assert!(owner.reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_cancels_undispatched_reservation_without_running_operation() {
+        let owner = Arc::new(ScenarioOwner::default());
+        let permit = owner.reserve().unwrap();
+        owner.close();
+        let handle = owner.state.lock().unwrap().running.take().unwrap().task;
+        handle.await.unwrap();
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let effect = executed.clone();
+        assert!(permit
+            .start(|_| async move {
+                effect.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .is_err());
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(owner.reserve().is_err());
+    }
 
     #[tokio::test]
     async fn cleanup_keeps_exclusive_session_custody_after_caller_disappears() {

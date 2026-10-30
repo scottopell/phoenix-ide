@@ -1323,6 +1323,99 @@ fn live_session_input_errors_and_close_ignore_startup_only_idle_config() {
 }
 
 #[test]
+fn concurrent_socket_scenarios_reject_before_fixture_release_without_replaying() {
+    // REQ-BCLI-006, REQ-BT-019.22. These requests cross the real daemon socket.
+    if !chrome_enabled() {
+        return;
+    }
+    for disconnect_first in [false, true] {
+        let cli = BrowserCli::new();
+        let opened = cli.ok(&["open", &fixture()]);
+        let resources = live_resources(&cli);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let scenario = json!({
+            "action":"run_scenario", "runs":1, "warmup":0,
+            "reset":"none", "throttle_rate":1, "gc_per_run":false,
+            "steps":[
+                {"kind":"wait_eval", "expression":"true"},
+                {"kind":"eval", "expression":format!(
+                    "fetch('http://{}/hold').then(() => {{ window.firstRuns = (window.firstRuns || 0) + 1; return true; }})",
+                    listener.local_addr().unwrap())}
+            ]
+        });
+        let mut first = UnixStream::connect(cli.socket()).unwrap();
+        serde_json::to_writer(&mut first, &json!({"command":"profile", "input":scenario})).unwrap();
+        first.write_all(b"\n").unwrap();
+        let mut held =
+            wait_for_observation("first scenario reached held fixture", || {
+                match listener.accept() {
+                    Ok((stream, _)) => Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            });
+        let mut first = if disconnect_first {
+            drop(first);
+            None
+        } else {
+            Some(first)
+        };
+        let second_input = json!({
+            "action":"run_scenario", "runs":1, "warmup":0,
+            "reset":"none", "throttle_rate":1, "gc_per_run":false,
+            "steps":[
+                {"kind":"wait_eval", "expression":"true"},
+                {"kind":"eval", "expression":"window.secondRuns = (window.secondRuns || 0) + 1"}
+            ]
+        })
+        .to_string();
+        // The deadline detects queueing; fixture release is strictly downstream
+        // of the busy response, so elapsed time never establishes readiness.
+        std::thread::scope(|scope| {
+            let (sent, reply) = std::sync::mpsc::channel();
+            let cli = &cli;
+            let second_input = &second_input;
+            scope.spawn(move || {
+                let response = cli.invoke(&["profile", second_input], None, false);
+                sent.send(response).unwrap();
+            });
+            let response = reply.recv_timeout(Duration::from_secs(5));
+            // Always release the fixture, including on regression, so join cannot hang.
+            held.write_all(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let response = response.expect("second scenario queued behind the held first scenario");
+            assert_eq!(response["status"], "error");
+            assert_eq!(response["error"]["code"], "busy");
+            assert_eq!(response["lifetime"], opened["lifetime"]);
+        });
+        drop(held);
+        if let Some(first) = first.as_mut() {
+            first
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut response = String::new();
+            first.read_to_string(&mut response).unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["status"], "success", "{response}");
+            assert_eq!(response["browser_lifetime"], opened["browser_lifetime"]);
+        }
+        // Ordinary eval stays serialized and is a fence after the first operation,
+        // including when its caller disconnected; it must observe exactly one run.
+        assert_eq!(
+            cli.eval("[window.firstRuns || 0, window.secondRuns || 0]"),
+            json!([1, 0])
+        );
+        cli.invoke(&["profile", &second_input], None, true);
+        assert_eq!(
+            cli.eval("[window.firstRuns, window.secondRuns]"),
+            json!([1, 1])
+        );
+        cli.ok(&["close"]);
+        assert_resources_removed(&resources);
+    }
+}
+
+#[test]
 fn close_interrupts_an_active_evaluation_and_cleans_up() {
     if !chrome_enabled() {
         return;

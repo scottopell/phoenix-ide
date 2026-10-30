@@ -419,6 +419,20 @@ impl Tool for BrowserProfileTool {
 }
 
 impl BrowserProfileTool {
+    /// Validate a scenario before registering broker custody or queueing work.
+    ///
+    /// # Errors
+    /// Returns the shared profile input rejection without accessing a browser.
+    #[allow(clippy::result_large_err)]
+    pub fn prepare_scenario(input: Value) -> Result<Option<ValidatedScenario>, ToolOutput> {
+        let input = parse_profile_input(input)?;
+        if input.action != ProfileAction::RunScenario {
+            return Ok(None);
+        }
+        let plan = validate_run_scenario(&input)?;
+        Ok(Some(ValidatedScenario { input, plan }))
+    }
+
     #[allow(clippy::result_large_err)]
     pub(super) fn validate_input(input: Value) -> Result<(), ToolOutput> {
         let input = parse_profile_input(input)?;
@@ -1231,16 +1245,89 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
     })
 }
 
+/// Browser-independent validated request, prior to admission.
+pub struct ValidatedScenario {
+    input: ProfileInput,
+    plan: ScenarioPlan,
+}
+
+/// Validated request with one-shot broker dispatch authority.
+pub struct ReservedScenario {
+    validated: ValidatedScenario,
+    permit: phoenix_browser::scenario::ScenarioPermit,
+}
+
+impl ValidatedScenario {
+    /// # Errors
+    /// Returns the broker's closing/busy rejection without taking a session lock.
+    pub fn reserve(
+        self,
+        owner: &Arc<phoenix_browser::scenario::ScenarioOwner>,
+    ) -> Result<ReservedScenario, String> {
+        Ok(ReservedScenario {
+            validated: self,
+            permit: owner.reserve()?,
+        })
+    }
+}
+
+impl ReservedScenario {
+    pub async fn execute(self, session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
+        action_run_scenario_admitted(
+            session,
+            ScenarioAdmission::Reserved(self.permit),
+            &self.validated.input,
+            self.validated.plan,
+        )
+        .await
+    }
+}
+
+enum ScenarioAdmission {
+    Immediate(Arc<phoenix_browser::scenario::ScenarioOwner>),
+    Reserved(phoenix_browser::scenario::ScenarioPermit),
+}
+
+impl ScenarioAdmission {
+    fn start<F, Fut>(self, operation: F) -> Result<(), String>
+    where
+        F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        match self {
+            Self::Immediate(owner) => owner.start(operation),
+            Self::Reserved(permit) => permit.start(operation),
+        }
+    }
+}
+
 async fn action_run_scenario(
     session: &Arc<RwLock<BrowserSession>>,
     owner: Arc<phoenix_browser::scenario::ScenarioOwner>,
     input: &ProfileInput,
     plan: ScenarioPlan,
 ) -> ToolOutput {
+    let result = action_run_scenario_admitted(
+        session,
+        ScenarioAdmission::Immediate(owner.clone()),
+        input,
+        plan,
+    )
+    .await;
+    drop(owner);
+    result
+}
+
+async fn action_run_scenario_admitted(
+    session: &Arc<RwLock<BrowserSession>>,
+    admission: ScenarioAdmission,
+    input: &ProfileInput,
+    plan: ScenarioPlan,
+) -> ToolOutput {
     let session = session.clone();
     let input = input.clone();
     let (mut output, result) = tokio::sync::oneshot::channel();
-    if let Err(error) = owner.start(move |mut cancelled| async move {
+    if let Err(error) = admission.start(move |mut cancelled| async move {
         let guard = tokio::select! {
             biased;
             () = output.closed() => return,
@@ -1306,11 +1393,9 @@ async fn action_run_scenario(
     }) {
         return ToolOutput::error(error);
     }
-    let result = result
-        .await
-        .unwrap_or_else(|_| ToolOutput::error("Browser scenario task ended without a result"));
-    drop(owner);
     result
+        .await
+        .unwrap_or_else(|_| ToolOutput::error("Browser scenario task ended without a result"))
 }
 
 fn scenario_cleanup_failure(original: Option<ToolOutput>, error: &str) -> ToolOutput {

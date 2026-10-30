@@ -10,6 +10,17 @@ The CLI reuses the browser-specific operation boundary from `phoenix-tools` and 
 
 The lifecycle contract is specified in `browser-cli.allium`; browser operation semantics remain in `specs/browser-tool/`.
 
+## Pending qualification: scenario queue admission
+
+The archive candidate registers a validated `run_scenario` with the broker before the daemon's serial queue. A one-shot permit moves with the queued job into shared profile execution; registration, execution, and cleanup use the same broker task, without a second busy flag or parallel operation worker. Non-scenario serialization and daemon-owned execution after CLI disconnection remain intact.
+
+Added coverage (not executed in this candidate):
+- `concurrent_socket_scenarios_reject_before_fixture_release_without_replaying`: real daemon socket plus CLI; an HTTP fixture holds the first scenario until the second returns typed `busy`; verifies no second side effect, recovery, and the first client's disconnection variant.
+- `socket_scenario_registration_rejects_competitor_before_serial_dispatch`: real socket request admission before worker dispatch, typed `busy` and `invalid_input`, invalid requests without custody, and successful dispatch/recovery. This white-box test deliberately controls dispatch; it does not exercise a full worker queue under load.
+- Broker reservation unit tests cover exclusion before dispatch, abandonment, and close before dispatch.
+
+Qualification remains pending: only edition-2021 single-file rustfmt and the static Rust test-timing check have been run. No compilation, Clippy, Rust tests, or browser execution was performed. The socket regressions require Chrome; client disconnection is covered in source, but an elapsed client read-timeout variant is not independently exercised. Existing published qualification does not qualify this changed candidate.
+
 ## Status Summary
 
 | Requirement | Status | Notes |
