@@ -106,7 +106,7 @@ for(const type of ['touchstart','touchmove','touchend','touchcancel'])target.add
 fn device() -> Value {
     json!({"width":390,"height":844,"device_scale_factor":1,"mobile":true,"touch":true})
 }
-fn plan(steps: Value) -> String {
+fn plan(steps: &Value) -> String {
     json!({"action":"run_scenario","runs":1,"warmup":0,"throttle_rate":1,"gc_per_run":false,"reset":"none","device":device(),"steps":steps}).to_string()
 }
 fn assert_schema(cli: &BrowserCli) {
@@ -148,7 +148,7 @@ fn cli_profile_touch_composition_trust_geometry_and_failure_release() {
     let cli = BrowserCli::new();
     assert_schema(&cli);
     cli.ok(&["open", &fixture_url()]);
-    let successful=cli.ok(&["profile","run_scenario","--input",&plan(json!([
+    let successful=cli.ok(&["profile","run_scenario","--input",&plan(&json!([
         {"kind":"wait_selector","selector":"#target"},
         {"kind":"touch_start","x":100,"y":100},
         {"kind":"touch_move","x":120,"y":115},
@@ -202,7 +202,7 @@ fn cli_profile_touch_composition_trust_geometry_and_failure_release() {
         }
     }
 
-    let failed=cli.invoke(&["profile","run_scenario","--input",&plan(json!([
+    let failed=cli.invoke(&["profile","run_scenario","--input",&plan(&json!([
         {"kind":"wait_selector","selector":"#target"},{"kind":"touch_start","x":100,"y":100},
         {"kind":"eval","expression":"throw Error('acceptance failure while held')"},{"kind":"touch_end"}
     ]))],None,false);
@@ -225,7 +225,7 @@ fn cli_profile_touch_composition_trust_geometry_and_failure_release() {
         "profile",
         "run_scenario",
         "--input",
-        &plan(json!([
+        &plan(&json!([
             {"kind":"wait_selector","selector":"#target"},
             {"kind":"touch_start","x":100,"y":100},
             {"kind":"touch_end"}

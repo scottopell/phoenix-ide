@@ -3247,8 +3247,9 @@ async fn browser_snapshot_refs_trigger_react_handlers() {
 
 fn acceptance_text(output: &crate::ToolOutput) -> &str {
     match output {
-        crate::ToolOutput::Success { output, .. } => output,
-        crate::ToolOutput::Error { output, .. } => output,
+        crate::ToolOutput::Success { output, .. } | crate::ToolOutput::Error { output, .. } => {
+            output
+        }
         crate::ToolOutput::TrustedInstructions(_) => panic!("unexpected trusted instructions"),
     }
 }
@@ -3287,7 +3288,7 @@ fn touch_device() -> serde_json::Value {
     serde_json::json!({"width":390,"height":844,"device_scale_factor":1,"mobile":true,"touch":true})
 }
 
-fn scenario(steps: serde_json::Value) -> serde_json::Value {
+fn scenario(steps: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"action":"run_scenario","runs":1,"warmup":0,"throttle_rate":1,
         "gc_per_run":false,"reset":"none","device":touch_device(),"steps":steps})
 }
@@ -3345,7 +3346,7 @@ async fn registry_resolved_browser_tools_compose_trusted_touch_and_release_after
             {"kind":"pause","milliseconds":120},
             {"kind":"touch_end"}
         ]);
-        let completed = profile.run(scenario(journey), ctx.clone()).await;
+        let completed = profile.run(scenario(&journey), ctx.clone()).await;
         assert!(completed.is_success(), "scenario cleanup failed: {}", completed.output());
         assert_eq!(completed.display_data().expect("scenario display_data")["outcome"], "completed", "scenario output={} display={:?}", completed.output(), completed.display_data());
         let evidence = eval.run(serde_json::json!({"expression":"({trace:window.touchTrace,geometry:window.geometry,mutation:window.mutation})"}), ctx.clone()).await;
@@ -3369,7 +3370,7 @@ async fn registry_resolved_browser_tools_compose_trusted_touch_and_release_after
         }
 
         // Complete the balanced plan shape after the deliberate evaluation failure.
-        let failed = profile.run(scenario(serde_json::json!([
+        let failed = profile.run(scenario(&serde_json::json!([
             {"kind":"wait_selector","selector":"#target"},
             {"kind":"touch_start","x":100,"y":100},
             {"kind":"eval","expression":"throw Error('acceptance failure while held')"},
@@ -3380,7 +3381,7 @@ async fn registry_resolved_browser_tools_compose_trusted_touch_and_release_after
         let tail = eval.run(serde_json::json!({"expression":"window.touchTrace.slice(-4)"}), ctx.clone()).await;
         let tail = acceptance_value(&tail);
         assert!(tail.as_array().unwrap().iter().any(|item| item["type"] == "touchcancel"), "failure did not release the active contact with touchcancel: {tail}");
-        let recovered = profile.run(scenario(serde_json::json!([
+        let recovered = profile.run(scenario(&serde_json::json!([
             {"kind":"wait_selector","selector":"#target"},
             {"kind":"touch_start","x":100,"y":100},
             {"kind":"touch_end"}
@@ -3395,13 +3396,30 @@ async fn registry_resolved_browser_tools_compose_trusted_touch_and_release_after
     result.expect("acceptance scenario task panicked");
 }
 
-#[tokio::test]
-#[ignore = "requires explicitly installed Chrome/Chromium; run the named acceptance test directly"]
-async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch() {
+fn assert_aborted_touch_evidence(evidence: &crate::ToolOutput) {
+    let evidence = acceptance_value(evidence);
+    let trace = evidence["trace"].as_array().expect("touch trace");
+    assert!(trace
+        .iter()
+        .any(|e| e["type"] == "touchstart" && e["isTrusted"] == true));
     assert!(
-        chrome_available(),
-        "acceptance test requires installed Chrome/Chromium"
+        trace
+            .iter()
+            .any(|e| e["type"] == "touchcancel" && e["isTrusted"] == true && e["active"] == true),
+        "missing trusted cancel: {trace:?}"
     );
+    assert!(
+        !trace.iter().any(|e| e["type"] == "touchend"),
+        "caller abort must not synthesize touchend: {trace:?}"
+    );
+    assert_eq!(evidence["active"], false);
+}
+
+async fn touch_abort_fixture() -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -3411,12 +3429,11 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
         let mut held_tx = Some(held_tx);
         while let Ok((mut socket, _)) = listener.accept().await {
             let mut request = [0u8; 2048];
-            let count =
-                match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request)).await
-                {
-                    Ok(Ok(count)) => count,
-                    _ => continue,
-                };
+            let Ok(Ok(count)) =
+                tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request)).await
+            else {
+                continue;
+            };
             let request = String::from_utf8_lossy(&request[..count]);
             let (status, content_type, body) = if request.starts_with("GET /held ") {
                 if let Some(tx) = held_tx.take() {
@@ -3436,6 +3453,17 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
             let _ = socket.write_all(response.as_bytes()).await;
         }
     });
+    (addr, held_rx, server)
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly installed Chrome/Chromium; run the named acceptance test directly"]
+async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch() {
+    assert!(
+        chrome_available(),
+        "acceptance test requires installed Chrome/Chromium"
+    );
+    let (addr, held_rx, server) = touch_abort_fixture().await;
     let (ctx, manager) = test_context(&format!("touch-abort-{}", std::process::id()));
     let registry = crate::ToolRegistry::direct(Vec::new());
     let profile = registry
@@ -3453,7 +3481,7 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
             .run(json!({"url":format!("http://{addr}/")}), ctx.clone())
             .await;
         assert!(nav.is_success(), "navigate failed: {}", nav.output());
-        let plan = scenario(json!([
+        let plan = scenario(&json!([
             {"kind":"wait_selector","selector":"#target","timeout":"5s"},
             {"kind":"touch_start","x":100,"y":100},
             {"kind":"eval","expression":"window.active ? (fetch('/held'), true) : false"},
@@ -3487,24 +3515,9 @@ async fn registry_resolved_browser_scenario_caller_abort_releases_trusted_touch(
             "post-abort evidence failed: {}",
             evidence.output()
         );
-        let evidence = acceptance_value(&evidence);
-        let trace = evidence["trace"].as_array().expect("touch trace");
-        assert!(trace
-            .iter()
-            .any(|e| e["type"] == "touchstart" && e["isTrusted"] == true));
-        assert!(
-            trace.iter().any(|e| e["type"] == "touchcancel"
-                && e["isTrusted"] == true
-                && e["active"] == true),
-            "missing trusted cancel: {trace:?}"
-        );
-        assert!(
-            !trace.iter().any(|e| e["type"] == "touchend"),
-            "caller abort must not synthesize touchend: {trace:?}"
-        );
-        assert_eq!(evidence["active"], false);
+        assert_aborted_touch_evidence(&evidence);
 
-        let recovery = scenario(json!([
+        let recovery = scenario(&json!([
             {"kind":"wait_selector","selector":"#target","timeout":"5s"},
             {"kind":"touch_start","x":100,"y":100},
             {"kind":"touch_end"}
