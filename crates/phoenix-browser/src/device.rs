@@ -176,7 +176,7 @@ mod tests {
         let config = DeviceConfig::default();
         let metrics = config.metrics();
         assert_eq!((metrics.width, metrics.height), (1280, 720));
-        assert_eq!(metrics.device_scale_factor, 1.0);
+        assert_eq!(metrics.device_scale_factor.to_bits(), 1.0_f64.to_bits());
         assert!(!metrics.mobile);
         assert!(!config.touch().enabled);
     }
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn resize_preserves_device_characteristics() {
         let config = mobile().resized(844, 390).unwrap();
-        assert_eq!(config.device_scale_factor, 3.0);
+        assert_eq!(config.device_scale_factor.to_bits(), 3.0_f64.to_bits());
         assert!(config.mobile && config.touch);
         assert_eq!(config.metrics().width, 844);
         assert_eq!(config.metrics().height, 390);
