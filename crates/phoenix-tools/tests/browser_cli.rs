@@ -1377,7 +1377,11 @@ fn concurrent_socket_scenarios_reject_before_fixture_release_without_replaying()
             let cli = &cli;
             let second_input = &second_input;
             scope.spawn(move || {
-                let response = cli.invoke(&["profile", second_input], None, false);
+                let response = cli.invoke(
+                    &["profile", "run_scenario", "--input", second_input],
+                    None,
+                    false,
+                );
                 sent.send(response).unwrap();
             });
             let response = reply.recv_timeout(Duration::from_secs(5));
@@ -1405,7 +1409,11 @@ fn concurrent_socket_scenarios_reject_before_fixture_release_without_replaying()
             cli.eval("[window.firstRuns || 0, window.secondRuns || 0]"),
             json!([1, 0])
         );
-        cli.invoke(&["profile", &second_input], None, true);
+        cli.invoke(
+            &["profile", "run_scenario", "--input", &second_input],
+            None,
+            true,
+        );
         assert_eq!(
             cli.eval("[window.firstRuns, window.secondRuns]"),
             json!([1, 1])
