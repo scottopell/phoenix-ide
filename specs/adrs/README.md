@@ -180,6 +180,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
 | [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
+| [191](191_agent-plugins-are-user-level-shared-root-namespaced-bundles.md) | Agent plugins are user-level-only, shared-root, namespaced bundles | Accepted | REQ-AP-001 through REQ-AP-012 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |
@@ -370,3 +371,5 @@ Capacity planning across ordinary requests, handoffs and model switches is gover
 Generated handoff readability and explicit source authority are governed by [ADR-147](147_readable-generated-handoffs-retain-source-authority.md); automatic initiation remains governed by ADR-054.
 
 Goals schema extraction and refusal of unsupported migration lineages are governed by [187](187_goal-main-migration-identity-reconciliation.md), implementing REQ-COMP-020 without extending deployment compatibility.
+
+User-level agent plugins (Agent Plugins specification 1.1.0) are governed by [ADR-191](191_agent-plugins-are-user-level-shared-root-namespaced-bundles.md): user-level-only shared install root, `plugin:skill` / `<plugin>.<server>` namespacing, and data retention on uninstall.
