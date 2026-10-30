@@ -6622,18 +6622,6 @@ def cmd_check(
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
     if cargo_active:
-        # Classify browser availability before running the Rust suite.
-        #
-        # Contract for `./dev.py check`:
-        #   - Red == broken code. Never "your network is broken" or
-        #     "you don't have Chrome installed".
-        #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
-        #     PHOENIX_SKIP_BROWSER_TESTS,
-        #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
-        #   - Probes print iff classification CHANGES test behavior:
-        #     auto-skipping a class, overriding a config, etc. Happy paths
-        #     (Chromium found, fetcher reachable, signing works, deps
-        #     present) stay silent so a normal-env run is clean.
         _classify_browser_env()
 
         # Tests create temporary commits and must never consult an interactive
