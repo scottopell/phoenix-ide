@@ -627,7 +627,7 @@ async fn image_retirement_ledger_failure_restores_payload_schema_and_retries() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(identity_count as usize, before.len());
+    assert_eq!(usize::try_from(identity_count).unwrap(), before.len());
     assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
 }
 

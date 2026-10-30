@@ -530,10 +530,9 @@ fn decode_stored_creation_images(
         .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
     let retired: bool = row.try_get("images_retired")?;
     if identity.len() > 20
-        || identity
-            .iter()
-            .enumerate()
-            .any(|(n, image)| image.ordinal != n as i64 || image.data_sha256.len() != 64)
+        || identity.iter().enumerate().any(|(n, image)| {
+            i64::try_from(n) != Ok(image.ordinal) || image.data_sha256.len() != 64
+        })
     {
         return Err(sqlx::Error::Decode(
             "creation image identity has missing ordinal".into(),
@@ -554,7 +553,10 @@ fn decode_stored_creation_images(
     }
     let mut images = Vec::with_capacity(payload.len());
     for (n, (image, fingerprint)) in payload.into_iter().zip(&identity).enumerate() {
-        if image.ordinal != n as i64 || image.media_type != fingerprint.media_type {
+        let ordinal = i64::try_from(n).map_err(|_| {
+            sqlx::Error::Decode("creation image ordinal exceeds SQLite integer range".into())
+        })?;
+        if image.ordinal != ordinal || image.media_type != fingerprint.media_type {
             return Err(sqlx::Error::Decode(
                 "creation image order or media type mismatch".into(),
             ));
@@ -1010,21 +1012,20 @@ impl Database {
             sqlx::query("UPDATE slack_gateway_requests SET input_id=?2 WHERE request_id=?1 AND admission_state='accepted'").bind(source_id).bind(request_id).execute(&mut *tx).await?;
         }
         for (ordinal, image) in intent.images.iter().enumerate() {
+            let ordinal_sql = i64::try_from(ordinal)
+                .map_err(|_| DbError::Serialization("too many images".to_string()))?;
             sqlx::query(
                 "INSERT INTO product_creation_job_images (request_id, ordinal, media_type, data)
                  VALUES (?1, ?2, ?3, ?4)",
             )
             .bind(request_id)
-            .bind(
-                i64::try_from(ordinal)
-                    .map_err(|_| DbError::Serialization("too many images".to_string()))?,
-            )
+            .bind(ordinal_sql)
             .bind(&image.media_type)
             .bind(&image.data)
             .execute(&mut *tx)
             .await?;
             sqlx::query("INSERT INTO product_creation_image_replay_identity (request_id, ordinal, media_type, data_sha256) VALUES (?1, ?2, ?3, ?4)")
-                .bind(request_id).bind(i64::try_from(ordinal).expect("bounded creation images"))
+                .bind(request_id).bind(ordinal_sql)
                 .bind(&image.media_type).bind(ImageReplayIdentity::of(ordinal, image).data_sha256)
                 .execute(&mut *tx).await?;
         }
@@ -3788,8 +3789,20 @@ mod product_creation_tests {
         );
     }
 
-    #[tokio::test]
-    async fn captured_direct_turn_settlement_retains_unwatched_initial_outcome() {
+    async fn assert_replay_conflicts(
+        db: &Database,
+        request: &str,
+        changed_intents: &[ProductCreationIntent],
+    ) {
+        for changed in changed_intents {
+            assert!(matches!(
+                db.accept_product_creation(request, changed).await.unwrap(),
+                ProductCreationAcceptOutcome::Conflict(_)
+            ));
+        }
+    }
+
+    async fn accept_and_fail_unwatched_turn(db: &Database, request: &str, conversation: &str) {
         use crate::workflow::{
             AcceptAuthoritativeTurn, PersistedConversationProjection,
             TerminalizeAuthoritativeTurnInput,
@@ -3799,30 +3812,29 @@ mod product_creation_tests {
             TurnCommand, TurnOutcome,
         };
 
-        let (db, request, conversation) = initial_execution_fixture(false).await;
-        let target = ConversationAuthority(conversation.clone());
+        let target = ConversationAuthority(conversation.to_owned());
         let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
-            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
-                origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-                text: "unrelated accepted turn".into(),
-                images: Vec::new(),
-                files: Vec::new(),
-                message_id: "unrelated-turn-message".into(),
-                user_agent: None,
-                skill_invocation: None,
-                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
-            },
-            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
-                text: "unrelated accepted turn".into(),
-                llm_text: None,
-                images: Vec::new(),
-                files: Vec::new(),
-                user_agent: None,
-                skill_invocation: None,
-            },
-        )
-        .to_exact_bytes()
-        .unwrap();
+                    phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                        origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
+                        text: "unrelated accepted turn".into(),
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        message_id: "unrelated-turn-message".into(),
+                        user_agent: None,
+                        skill_invocation: None,
+                        expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+                    },
+                    phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                        text: "unrelated accepted turn".into(),
+                        llm_text: None,
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        user_agent: None,
+                        skill_invocation: None,
+                    },
+                )
+                .to_exact_bytes()
+                .unwrap();
         let repo = db.workflow_repository();
         let accepted = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
@@ -3854,10 +3866,16 @@ mod product_creation_tests {
                 provider_replay_settlement:
                     phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
             },
-            Some(&request),
+            Some(request),
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn captured_direct_turn_settlement_retains_unwatched_initial_outcome() {
+        let (db, request, conversation) = initial_execution_fixture(false).await;
+        accept_and_fail_unwatched_turn(&db, &request, &conversation).await;
         let receipt: (String, Option<String>) = sqlx::query_as(
             "SELECT terminal_kind, failure_reason FROM product_creation_initial_execution_receipts WHERE request_id = ?1",
         )
@@ -3904,6 +3922,135 @@ mod product_creation_tests {
         );
     }
 
+    async fn assert_single_image_conflicts(
+        db: &Database,
+        request: &str,
+        accepted: &ProductCreationIntent,
+    ) {
+        assert_replay_conflicts(
+            db,
+            request,
+            &[
+                ProductCreationIntent {
+                    images: vec![],
+                    ..accepted.clone()
+                },
+                ProductCreationIntent {
+                    images: vec![ProductCreationImage {
+                        data: "different".into(),
+                        ..accepted.images[0].clone()
+                    }],
+                    ..accepted.clone()
+                },
+                ProductCreationIntent {
+                    images: vec![ProductCreationImage {
+                        media_type: "image/jpeg".into(),
+                        ..accepted.images[0].clone()
+                    }],
+                    ..accepted.clone()
+                },
+                ProductCreationIntent {
+                    images: vec![accepted.images[0].clone(), accepted.images[0].clone()],
+                    ..accepted.clone()
+                },
+            ],
+        )
+        .await;
+    }
+
+    async fn assert_two_image_conflicts(
+        db: &Database,
+        request: &str,
+        accepted: &ProductCreationIntent,
+    ) {
+        assert_replay_conflicts(
+            db,
+            request,
+            &[
+                ProductCreationIntent {
+                    images: vec![],
+                    ..accepted.clone()
+                },
+                ProductCreationIntent {
+                    images: vec![accepted.images[0].clone()],
+                    ..accepted.clone()
+                },
+                ProductCreationIntent {
+                    images: vec![accepted.images[1].clone(), accepted.images[0].clone()],
+                    ..accepted.clone()
+                },
+                ProductCreationIntent {
+                    images: vec![
+                        ProductCreationImage {
+                            data: "changed-first".into(),
+                            ..accepted.images[0].clone()
+                        },
+                        accepted.images[1].clone(),
+                    ],
+                    ..accepted.clone()
+                },
+                ProductCreationIntent {
+                    images: vec![
+                        ProductCreationImage {
+                            media_type: "image/webp".into(),
+                            ..accepted.images[0].clone()
+                        },
+                        accepted.images[1].clone(),
+                    ],
+                    ..accepted.clone()
+                },
+            ],
+        )
+        .await;
+    }
+
+    async fn assert_creation_survives_original_deletion(
+        db: &Database,
+        request: &str,
+        original: &str,
+        successor_id: &str,
+        product_conversation_id: &ProductConversationId,
+        job: &ProductCreationJobRecord,
+    ) -> i64 {
+        assert_eq!(
+            db.get_conversation(successor_id).await.unwrap().id,
+            successor_id
+        );
+        assert_eq!(product_conversation_id, &job.product_conversation_id);
+        assert_eq!(
+            db.product_creation_initial_execution(request)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Failed {
+                reason: "context exhausted".into(),
+            }
+        );
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let snapshot = db
+            .read_product_creation_status_as_coordinator(&coordinator.id, request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(snapshot.publication, Some(ProductCreationPublicationRead::Historical { conversation_id }) if conversation_id == original)
+        );
+        assert!(
+            matches!(db.accept_product_creation(request, &job.intent.live_intent().unwrap()).await.unwrap(), ProductCreationAcceptOutcome::Replayed(retained) if retained.product_conversation_id == job.product_conversation_id && retained.published_conversation_id.as_deref() == Some(original))
+        );
+        assert_eq!(db.next_product_creation_deadline().await.unwrap(), None);
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_messages WHERE conversation_id=?1 AND message_id=?2",
+        )
+        .bind(successor_id)
+        .bind(request)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn creation_images_retire_only_after_final_product_transcript_deletion() {
         let (db, request, original) = initial_execution_fixture(false).await;
@@ -3931,46 +4078,15 @@ mod product_creation_tests {
         .bind(&request).fetch_all(db.pool()).await.unwrap();
         assert!(!original_images.is_empty());
         db.delete_conversation(&original).await.unwrap();
-        assert_eq!(
-            db.get_conversation(&successor.id).await.unwrap().id,
-            successor.id
-        );
-        assert_eq!(
-            successor.product_conversation_id,
-            job.product_conversation_id
-        );
-        assert_eq!(
-            db.product_creation_initial_execution(&request)
-                .await
-                .unwrap(),
-            ProductCreationInitialExecution::Failed {
-                reason: "context exhausted".into(),
-            }
-        );
-        let coordinator = db
-            .get_or_create_coordinator(None, LlmLanguage::default())
-            .await
-            .unwrap();
-        let snapshot = db
-            .read_product_creation_status_as_coordinator(&coordinator.id, &request)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(snapshot.publication, Some(ProductCreationPublicationRead::Historical { conversation_id }) if conversation_id == original)
-        );
-        assert!(
-            matches!(db.accept_product_creation(&request, &job.intent.live_intent().unwrap()).await.unwrap(), ProductCreationAcceptOutcome::Replayed(retained) if retained.product_conversation_id == job.product_conversation_id && retained.published_conversation_id.as_deref() == Some(original.as_str()))
-        );
-        assert_eq!(db.next_product_creation_deadline().await.unwrap(), None);
-        let successor_inputs: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM steering_messages WHERE conversation_id=?1 AND message_id=?2",
+        let successor_inputs = assert_creation_survives_original_deletion(
+            &db,
+            &request,
+            &original,
+            &successor.id,
+            &successor.product_conversation_id,
+            &job,
         )
-        .bind(&successor.id)
-        .bind(&request)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        .await;
         let retained_images: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT ordinal, media_type, data FROM product_creation_job_images WHERE request_id = ?1 ORDER BY ordinal",
         ).bind(&request).fetch_all(db.pool()).await.unwrap();
@@ -4001,7 +4117,10 @@ mod product_creation_tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(identity_count as usize, original_images.len());
+        assert_eq!(
+            usize::try_from(identity_count).unwrap(),
+            original_images.len()
+        );
         let retained = db
             .get_product_creation_job(&request)
             .await
@@ -4018,37 +4137,7 @@ mod product_creation_tests {
                 .unwrap(),
             ProductCreationAcceptOutcome::Replayed(_)
         ));
-        for changed in [
-            ProductCreationIntent {
-                images: vec![],
-                ..accepted.clone()
-            },
-            ProductCreationIntent {
-                images: vec![ProductCreationImage {
-                    data: "different".into(),
-                    ..accepted.images[0].clone()
-                }],
-                ..accepted.clone()
-            },
-            ProductCreationIntent {
-                images: vec![ProductCreationImage {
-                    media_type: "image/jpeg".into(),
-                    ..accepted.images[0].clone()
-                }],
-                ..accepted.clone()
-            },
-            ProductCreationIntent {
-                images: vec![accepted.images[0].clone(), accepted.images[0].clone()],
-                ..accepted.clone()
-            },
-        ] {
-            assert!(matches!(
-                db.accept_product_creation(&request, &changed)
-                    .await
-                    .unwrap(),
-                ProductCreationAcceptOutcome::Conflict(_)
-            ));
-        }
+        assert_single_image_conflicts(&db, &request, &accepted).await;
         assert_eq!(db.next_product_creation_deadline().await.unwrap(), None);
         assert!(sqlx::query("PRAGMA foreign_key_check")
             .fetch_all(db.pool())
@@ -4143,47 +4232,7 @@ mod product_creation_tests {
                 .unwrap(),
             ProductCreationAcceptOutcome::Replayed(_)
         ));
-        for changed in [
-            ProductCreationIntent {
-                images: vec![],
-                ..accepted.clone()
-            },
-            ProductCreationIntent {
-                images: vec![accepted.images[0].clone()],
-                ..accepted.clone()
-            },
-            ProductCreationIntent {
-                images: vec![accepted.images[1].clone(), accepted.images[0].clone()],
-                ..accepted.clone()
-            },
-            ProductCreationIntent {
-                images: vec![
-                    ProductCreationImage {
-                        data: "changed-first".into(),
-                        ..accepted.images[0].clone()
-                    },
-                    accepted.images[1].clone(),
-                ],
-                ..accepted.clone()
-            },
-            ProductCreationIntent {
-                images: vec![
-                    ProductCreationImage {
-                        media_type: "image/webp".into(),
-                        ..accepted.images[0].clone()
-                    },
-                    accepted.images[1].clone(),
-                ],
-                ..accepted.clone()
-            },
-        ] {
-            assert!(matches!(
-                db.accept_product_creation(&request, &changed)
-                    .await
-                    .unwrap(),
-                ProductCreationAcceptOutcome::Conflict(_)
-            ));
-        }
+        assert_two_image_conflicts(&db, &request, &accepted).await;
     }
 
     #[tokio::test]
