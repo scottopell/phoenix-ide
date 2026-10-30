@@ -27,6 +27,7 @@ impl ScenarioCancellation {
 }
 
 impl ScenarioPermit {
+    #[must_use]
     pub fn cancellation(&self) -> ScenarioCancellation {
         self.cancellation.clone()
     }

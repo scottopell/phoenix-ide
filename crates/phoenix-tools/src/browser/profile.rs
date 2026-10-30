@@ -1272,6 +1272,7 @@ impl ValidatedScenario {
 }
 
 impl ReservedScenario {
+    #[must_use]
     pub fn cancellation(&self) -> phoenix_browser::scenario::ScenarioCancellation {
         self.permit.cancellation()
     }
