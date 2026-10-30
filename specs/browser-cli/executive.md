@@ -10,7 +10,9 @@ The CLI reuses the browser-specific operation boundary from `phoenix-tools` and 
 
 The lifecycle contract is specified in `browser-cli.allium`; browser operation semantics remain in `specs/browser-tool/`.
 
-## Scenario queue admission — focused qualification passed
+## Scenario queue admission and cancellation — changed source qualification pending
+
+The cancellation correction after published `5a18d28117e24eb9e6a490a20270e4a8a2828800` awaits the reserved scenario's terminal output after scoped cancellation instead of dropping its result future. The caller-visible `operation_cancelled` envelope preserves that output's text and structured data, including cleanup/restoration failures, without interpreting normal cancellation's error flag as cleanup failure. Only reserved scenarios wait for bounded cleanup; ordinary operations retain immediate interruption. New unexecuted source regressions cover a causal owned cleanup gate, terminal-output preservation for successful and failed cleanup, stale cancellation isolation after a broker-task join, and the actual daemon worker/Unix response with real profile contact/throttle/session-lock custody checks and explicit touch-enabled device input. A terminal response is not a task-join barrier; these checks assert cleanup completion, not that the broker task has returned at response time. This does not independently exercise OS signal delivery or hold a real CDP cleanup acknowledgement. A new sole-host exact-source packet, including the existing CLI queue/no-replay and native caller-abort regressions, is required. Prior qualification below does not qualify these changed sources; see the [browser-tool executive](../browser-tool/executive.md) for coverage limits.
 
 The archive candidate registers a validated `run_scenario` with the broker before the daemon's serial queue. A one-shot permit moves with the queued job into shared profile execution; registration, execution, and cleanup use the same broker task, without a second busy flag or parallel operation worker. Non-scenario serialization and daemon-owned execution after CLI disconnection remain intact.
 

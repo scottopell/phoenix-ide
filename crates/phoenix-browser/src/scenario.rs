@@ -13,9 +13,24 @@ type DeferredOperation =
 pub struct ScenarioPermit {
     dispatch: tokio::sync::oneshot::Sender<DeferredOperation>,
     _owner: Arc<ScenarioOwner>,
+    cancellation: ScenarioCancellation,
+}
+
+/// Cancellation authority for exactly one registered scenario, not its owner.
+#[derive(Clone)]
+pub struct ScenarioCancellation(watch::Sender<bool>);
+
+impl ScenarioCancellation {
+    pub fn cancel(&self) {
+        let _ = self.0.send(true);
+    }
 }
 
 impl ScenarioPermit {
+    pub fn cancellation(&self) -> ScenarioCancellation {
+        self.cancellation.clone()
+    }
+
     /// # Errors
     /// Returns an error if the broker stopped the registered task before dispatch.
     pub fn start<F, Fut>(self, operation: F) -> Result<(), String>
@@ -52,7 +67,7 @@ impl ScenarioOwner {
     /// Returns the same closing/busy rejection as immediate task registration.
     pub fn reserve(self: &Arc<Self>) -> Result<ScenarioPermit, String> {
         let (dispatch, ready) = tokio::sync::oneshot::channel::<DeferredOperation>();
-        self.start(move |mut cancelled| async move {
+        let cancellation = self.register(move |mut cancelled| async move {
             let operation = tokio::select! {
                 biased;
                 () = crate::scenario::cancelled(&mut cancelled) => return,
@@ -66,6 +81,7 @@ impl ScenarioOwner {
         Ok(ScenarioPermit {
             dispatch,
             _owner: self.clone(),
+            cancellation,
         })
     }
 
@@ -76,6 +92,14 @@ impl ScenarioOwner {
     where
         F: FnOnce(watch::Receiver<bool>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.register(operation).map(|_| ())
+    }
+
+    fn register<F, Fut>(&self, operation: F) -> Result<ScenarioCancellation, String>
+    where
+        F: FnOnce(watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let mut state = self
             .state
@@ -98,9 +122,10 @@ impl ScenarioOwner {
                 operation(cancelled).await;
             }
         });
+        let cancellation = ScenarioCancellation(cancel.clone());
         state.running = Some(Running { cancel, task });
         let _ = registered.send(());
-        Ok(())
+        Ok(cancellation)
     }
 
     pub(crate) fn close(&self) {
@@ -181,6 +206,42 @@ mod tests {
             .is_err());
         assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(owner.reserve().is_err());
+    }
+
+    #[tokio::test]
+    async fn retired_cancellation_cannot_cancel_successor() {
+        let owner = Arc::new(ScenarioOwner::default());
+        let permit = owner.reserve().unwrap();
+        let retired_cancellation = permit.cancellation();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        permit
+            .start(move |mut cancelled| async move {
+                entered.send(()).unwrap();
+                crate::scenario::cancelled(&mut cancelled).await;
+            })
+            .unwrap();
+        started.await.unwrap();
+        retired_cancellation.cancel();
+        let handle = owner.state.lock().unwrap().running.take().unwrap().task;
+        handle.await.unwrap();
+
+        let permit = owner.reserve().unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        permit
+            .start(move |cancelled| async move {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                done.send(*cancelled.borrow()).unwrap();
+            })
+            .unwrap();
+        started.await.unwrap();
+        retired_cancellation.cancel();
+        release.send(()).unwrap();
+        assert!(!finished.await.unwrap());
+        let handle = owner.state.lock().unwrap().running.take().unwrap().task;
+        handle.await.unwrap();
     }
 
     #[tokio::test]

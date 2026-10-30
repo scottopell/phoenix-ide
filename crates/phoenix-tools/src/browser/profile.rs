@@ -1272,6 +1272,10 @@ impl ValidatedScenario {
 }
 
 impl ReservedScenario {
+    pub fn cancellation(&self) -> phoenix_browser::scenario::ScenarioCancellation {
+        self.permit.cancellation()
+    }
+
     pub async fn execute(self, session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
         action_run_scenario_admitted(
             session,

@@ -909,18 +909,36 @@ async fn run_job(state: &State, job: &mut Job, shutdown: &mut watch::Receiver<bo
     if *shutdown.borrow() {
         return JobResult::Reply(cancelled(state, Some(ready.browser_lifetime)));
     }
-    let operation = async {
-        if let Some(queued) = job.scenario.take() {
-            if !Arc::ptr_eq(&queued.browser, &ready.browser) {
-                return Response::error(
+    if let Some(queued) = job.scenario.take() {
+        if !Arc::ptr_eq(&queued.browser, &ready.browser) {
+            return JobResult::Reply(
+                Response::error(
                     &state.session,
                     Some(&state.lifetime),
                     ErrorCode::StateLost,
                     "reserved browser lifetime ended; scenario was not executed",
                 )
-                .with_browser_lifetime(Some(ready.browser_lifetime.clone()));
+                .with_browser_lifetime(Some(ready.browser_lifetime.clone())),
+            );
+        }
+        let cancellation = queued.scenario.cancellation();
+        let output = match settle_scenario_on_shutdown(
+            queued.scenario.execute(&queued.browser),
+            cancellation,
+            shutdown,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(output) => {
+                return JobResult::Reply(scenario_shutdown_reply(
+                    state,
+                    Some(ready.browser_lifetime),
+                    &output,
+                ));
             }
-            let output = queued.scenario.execute(&queued.browser).await;
+        };
+        return JobResult::Reply(
             adapt(
                 &state.session,
                 Some(&state.lifetime),
@@ -928,15 +946,46 @@ async fn run_job(state: &State, job: &mut Job, shutdown: &mut watch::Receiver<bo
                 &state.image_directory,
             )
             .await
-            .with_browser_lifetime(Some(ready.browser_lifetime.clone()))
-        } else {
-            state.execute(&job.request, &ready).await
-        }
-    };
+            .with_browser_lifetime(Some(ready.browser_lifetime.clone())),
+        );
+    }
     JobResult::Reply(tokio::select! {
-        response = operation => response,
+        response = state.execute(&job.request, &ready) => response,
         _ = shutdown.changed() => cancelled(state, Some(ready.browser_lifetime.clone())),
     })
+}
+
+fn scenario_shutdown_reply(
+    state: &State,
+    browser_lifetime: Option<String>,
+    output: &ToolOutput,
+) -> Response {
+    let mut response = cancelled(state, browser_lifetime);
+    if let Outcome::Error { error } = &mut response.outcome {
+        error.message.push_str(" Scenario terminal result: ");
+        error.message.push_str(output.output());
+        error.details = Some(json!({
+            "tool_text": output.output(),
+            "data": output.display_data(),
+        }));
+    }
+    response
+}
+
+async fn settle_scenario_on_shutdown(
+    operation: impl std::future::Future<Output = ToolOutput>,
+    cancellation: phoenix_browser::scenario::ScenarioCancellation,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<ToolOutput, ToolOutput> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = phoenix_browser::scenario::cancelled(shutdown) => {
+            cancellation.cancel();
+            Err(operation.await)
+        }
+        output = &mut operation => Ok(output),
+    }
 }
 
 async fn worker(
@@ -1281,6 +1330,197 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scenario_shutdown_waits_for_owned_cleanup_before_reply() {
+        let owner = Arc::new(phoenix_browser::scenario::ScenarioOwner::default());
+        let permit = owner.reserve().unwrap();
+        let cancellation = permit.cancellation();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (cleaning, cleanup_started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (result, terminal) = tokio::sync::oneshot::channel();
+        permit
+            .start(move |mut cancelled| async move {
+                entered.send(()).unwrap();
+                phoenix_browser::scenario::cancelled(&mut cancelled).await;
+                cleaning.send(()).unwrap();
+                released.await.unwrap();
+                result
+                    .send(ToolOutput::error("cancelled after cleanup"))
+                    .unwrap();
+            })
+            .unwrap();
+        started.await.unwrap();
+        let (stop, mut shutdown) = watch::channel(false);
+        let mut response = Box::pin(settle_scenario_on_shutdown(
+            async { terminal.await.unwrap() },
+            cancellation,
+            &mut shutdown,
+        ));
+        stop.send(true).unwrap();
+        assert!(futures::poll!(&mut response).is_pending());
+        cleanup_started.await.unwrap();
+        assert!(owner.reserve().is_err());
+        assert!(
+            futures::poll!(&mut response).is_pending(),
+            "cancellation escaped while cleanup was held"
+        );
+        release.send(()).unwrap();
+        let output = response
+            .await
+            .expect_err("shutdown must retain terminal output");
+        assert_eq!(output.output(), "cancelled after cleanup");
+    }
+
+    #[tokio::test]
+    async fn scenario_shutdown_reply_preserves_terminal_cleanup_results() {
+        let state = reader_state();
+        let terminal_data = json!({
+            "outcome":"blocked", "raw_samples":[{"duration":42}],
+            "methodology_warnings":["retained terminal details"]
+        });
+        for text in [
+            "Browser scenario cancelled by session termination",
+            "Browser scenario cancelled by session termination\nScenario cleanup failed: Touch cancellation failed: lost acknowledgement; throttle restoration failed",
+        ] {
+            let owner = Arc::new(phoenix_browser::scenario::ScenarioOwner::default());
+            let permit = owner.reserve().unwrap();
+            let cancellation = permit.cancellation();
+            let (_stop, mut shutdown) = watch::channel(true);
+            let terminal = ToolOutput::error(text).with_display(terminal_data.clone());
+            let terminal = settle_scenario_on_shutdown(
+                std::future::ready(terminal),
+                cancellation,
+                &mut shutdown,
+            )
+            .await
+            .expect_err("shutdown must retain terminal output");
+            let response = scenario_shutdown_reply(&state, Some("browser-id".into()), &terminal);
+            assert_eq!(response.browser_lifetime.as_deref(), Some("browser-id"));
+            let Outcome::Error { error } = response.outcome else {
+                panic!("shutdown must return operation_cancelled");
+            };
+            assert_eq!(error.code, ErrorCode::OperationCancelled);
+            assert!(error.message.contains("effects may have partially executed"));
+            assert!(error.message.contains(text));
+            assert_eq!(error.details, Some(json!({"tool_text":text,"data":terminal_data})));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn worker_scenario_shutdown_reply_has_restored_contact_throttle_and_custody() {
+        use tokio::io::AsyncReadExt;
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/held", fixture.local_addr().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let manager = BrowserSessionManager::new();
+        manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
+        let state = Arc::new(State {
+            manager: manager.clone(),
+            scope: ResourceScopeKey::Unattached(format!("cancel-test:{}", uuid::Uuid::new_v4())),
+            session: "named:cancel-test".into(),
+            lifetime: uuid::Uuid::new_v4().to_string(),
+            idle: Duration::from_secs(300),
+            image_directory: directory.path().join("images"),
+        });
+        let browser = manager.get_session(&state.scope).await.unwrap();
+        {
+            let mut guard = browser.write().await;
+            guard
+                .configure_device(
+                    serde_json::from_value(json!({
+                        "width": 800, "height": 600, "device_scale_factor": 1,
+                        "mobile": true, "touch": true,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            guard.set_throttle_rate(1.5).await.unwrap();
+        }
+        let request = Request {
+            command: "profile".into(),
+            input: json!({
+                "action":"run_scenario", "runs":1, "warmup":0,
+                "device": {
+                    "width":800, "height":600, "device_scale_factor":1,
+                    "mobile":true, "touch":true
+                },
+                "reset":{"kind":"navigate", "url":url}, "throttle_rate":2, "gc_per_run":false,
+                "steps":[
+                    {"kind":"wait_eval", "expression":"true"},
+                    {"kind":"touch_start", "x":10, "y":10},
+                    {"kind":"eval", "expression":"fetch('/cleanup-gate'); true"},
+                    {"kind":"wait_eval", "expression":"false", "timeout":"60s"},
+                    {"kind":"touch_end"}
+                ]
+            }),
+        };
+        // Serve the initial navigation, then hold the fetch reached with active contact.
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let scenario = state.reserve_scenario(&request).await.unwrap();
+        assert!(scenario.is_some());
+        let (jobs, queued) = mpsc::channel(1);
+        let (stop, shutdown) = watch::channel(false);
+        let (completed, _events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(worker(state.clone(), queued, shutdown, completed));
+        jobs.send(Job {
+            request,
+            stream: server,
+            scenario,
+        })
+        .await
+        .unwrap();
+        let fixture_task = tokio::spawn(async move {
+            for held in [false, true] {
+                let (mut stream, _) = fixture.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(stream.read_u8().await.unwrap());
+                }
+                if held {
+                    assert!(headers.starts_with(b"GET /cleanup-gate "));
+                    return stream;
+                }
+                let body = "<html><head><link rel='icon' href='data:,'></head><body style='height:600px'></body></html>";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            unreachable!()
+        });
+        let held = tokio::time::timeout(Duration::from_secs(15), fixture_task)
+            .await
+            .expect("scenario never reached active-contact fetch")
+            .unwrap();
+        stop.send(true).unwrap();
+        let response: Response =
+            tokio::time::timeout(Duration::from_secs(10), protocol::read_message(&mut client))
+                .await
+                .expect("scenario shutdown failed to settle")
+                .unwrap();
+        assert!(
+            matches!(response.outcome, Outcome::Error { error } if error.code == ErrorCode::OperationCancelled)
+        );
+        let guard = browser
+            .try_write()
+            .expect("reply preceded cleanup lock release");
+        guard
+            .ensure_touch_idle()
+            .expect("reply left contact active or unknown");
+        assert_eq!(guard.throttle_rate().unwrap().to_bits(), 1.5_f64.to_bits());
+        drop(guard);
+        drop(held);
+        drop(jobs);
+        assert!(task.await.unwrap().is_none());
+        manager.kill_session(&state.scope).await.unwrap();
+    }
 
     #[tokio::test]
     async fn existing_access_rejects_competing_scenario_while_worker_holds_session_lock() {
