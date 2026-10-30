@@ -122,6 +122,15 @@ for skills (handling the "projects directory" case)
 THE SYSTEM SHALL also scan `$HOME/.claude/skills/` and `$HOME/.agents/skills/`
 when `$HOME` is not an ancestor of the working directory
 
+THE SYSTEM SHALL also load skills from enabled plugins installed under the
+user-level plugins root (specs/plugins/): each plugin's `skills/` tree, scanned
+non-recursively, with every plugin skill surfaced under the namespaced name
+`plugin:skill` derived at discovery from the plugin's manifest name
+
+Plugin skills SHALL rank below every user skill source and built-ins; plugin
+trees are non-recursive (nested sub-skill directories within a plugin tree are
+ignored), and plugin skills SHALL be conversation-audience only
+
 WHEN the same skill name appears at multiple levels
 THE SYSTEM SHALL use the one closest to the working directory (more specific
 overrides parent)
@@ -135,7 +144,13 @@ THE SYSTEM SHALL count them as one skill (content-hash dedup)
 **Rationale:** Skills are contextual -- a project-level `/build` skill
 overrides a user-level `/build` because it's more specific. Symlink and content
 dedup prevent the same skill from appearing twice when accessed through
-different paths (common with symlinked skill directories).
+different paths (common with symlinked skill directories). Plugin skills close
+the gap between the two scan orders: because they load last and carry a
+namespace prefix, a user skill always outranks them and no plugin skill can
+shadow a bare user skill name. Non-recursive plugin trees follow the Agent
+Plugins 1.1.0 loading rule; the recursive sub-skill extension stays confined
+to non-plugin directories. The plugins root, enable/disable state, and the
+loading failure boundaries are governed by specs/plugins/.
 
 ---
 

@@ -85,6 +85,15 @@ pub enum SkillSource {
         /// Absolute path to the extracted SKILL.md file
         path: PathBuf,
     },
+    /// Skill contributed by a user-level plugin (specs/plugins/). The path
+    /// points at the SKILL.md inside the plugin's skills tree; the plugin's
+    /// manifest name drives the namespaced catalog name `plugin:skill`.
+    Plugin {
+        /// Absolute path to the SKILL.md file
+        path: PathBuf,
+        /// The contributing plugin's manifest name
+        plugin_name: String,
+    },
 }
 
 /// Metadata for a skill discovered (filesystem or built-in).
@@ -106,7 +115,9 @@ impl SkillMetadata {
     #[must_use]
     pub fn skill_dir(&self) -> String {
         let path = match &self.source {
-            SkillSource::Filesystem { path, .. } | SkillSource::Builtin { path } => path,
+            SkillSource::Filesystem { path, .. }
+            | SkillSource::Builtin { path }
+            | SkillSource::Plugin { path, .. } => path,
         };
         path.parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -123,6 +134,9 @@ impl SkillMetadata {
         match &self.source {
             SkillSource::Filesystem { path, .. } => format!("(`{}`)", path.display()),
             SkillSource::Builtin { .. } => "(built-in)".to_string(),
+            SkillSource::Plugin { plugin_name, .. } => {
+                format!("(plugin: {plugin_name})")
+            }
         }
     }
 
@@ -130,7 +144,9 @@ impl SkillMetadata {
     #[must_use]
     pub fn skill_md_path(&self) -> &Path {
         match &self.source {
-            SkillSource::Filesystem { path, .. } | SkillSource::Builtin { path } => path,
+            SkillSource::Filesystem { path, .. }
+            | SkillSource::Builtin { path }
+            | SkillSource::Plugin { path, .. } => path,
         }
     }
 }
@@ -554,7 +570,7 @@ fn discover_all_skills_with_options(
         }
     }
 
-    // Scan the built-in extract directory last. Existing name dedup means a
+    // Scan the built-in extract directory. Existing name dedup means a
     // filesystem skill of the same name has already been collected and the
     // built-in is skipped — this is the documented override rule (REQ-BS-002).
     if let Some(bdir) = builtin_dir {
@@ -569,8 +585,106 @@ fn discover_all_skills_with_options(
         }
     }
 
+    // Scan user-level plugins last: plugin skills rank below every user
+    // skill source and built-ins, surface under the namespaced name
+    // `plugin:skill`, and load only from enabled plugins (specs/plugins/
+    // REQ-AP-005). Non-plugin directories keep the recursive sub-skill
+    // extension; plugin trees are non-recursive by the 1.1.0 loading rule.
+    let resolved_plugin_home = match home_override {
+        Some(h) => h.to_path_buf(),
+        None => phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+            .home()
+            .to_path_buf(),
+    };
+    let plugins_root = phoenix_plugins::default_plugins_root(&resolved_plugin_home);
+    for plugin in phoenix_plugins::scan_enabled_plugins(&plugins_root) {
+        for skill_dir in &plugin.skills {
+            collect_plugin_skill(
+                plugin.manifest.name.clone(),
+                skill_dir,
+                &mut skills,
+                &mut seen_names,
+                &mut seen_paths,
+                &mut seen_content,
+            );
+        }
+    }
+
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+/// Collect one plugin skill under its namespaced name (REQ-AP-005):
+/// `<plugin>:<skill>`, derived at discovery and never written into the
+/// skill's frontmatter. Plugin skills are conversation-audience only — a
+/// plugin cannot grant itself Global Coordinator visibility (REQ-SK-008).
+/// The frontmatter `name` must match the parent directory (Agent Skills
+/// format); a mismatch skips the skill rather than surfacing an ambiguous
+/// name.
+fn collect_plugin_skill(
+    plugin_name: String,
+    skill_dir: &phoenix_plugins::SkillDir,
+    skills: &mut Vec<SkillMetadata>,
+    seen_names: &mut HashSet<String>,
+    seen_paths: &mut HashSet<PathBuf>,
+    seen_content: &mut HashSet<u64>,
+) {
+    let skill_md = &skill_dir.skill_md;
+    // Symlink dedup: a skill file reachable through two roots counts once.
+    let canonical = std::fs::canonicalize(skill_md).unwrap_or_else(|_| skill_md.clone());
+    if !seen_paths.insert(canonical) {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(skill_md) else {
+        return;
+    };
+    let content_hash = {
+        let mut hasher = std::hash::DefaultHasher::new();
+        content.hash(&mut hasher);
+        hasher.finish()
+    };
+    if !seen_content.insert(content_hash) {
+        return;
+    }
+    let Some(fm) = parse_skill_frontmatter(&content) else {
+        tracing::debug!(
+            plugin = %plugin_name,
+            skill = %skill_dir.dir.display(),
+            "invalid plugin SKILL.md frontmatter; skipping"
+        );
+        return;
+    };
+    if fm.name != skill_dir.name() {
+        tracing::debug!(
+            plugin = %plugin_name,
+            skill = %skill_dir.name(),
+            frontmatter_name = %fm.name,
+            "plugin skill frontmatter name does not match its directory; skipping"
+        );
+        return;
+    }
+    if fm.audience.unwrap_or_default() != SkillAudience::Conversation {
+        tracing::debug!(
+            plugin = %plugin_name,
+            skill = %fm.name,
+            "plugin skill claims a non-conversation audience; skipping"
+        );
+        return;
+    }
+    let namespaced = format!("{plugin_name}:{}", fm.name);
+    if !seen_names.insert(namespaced.clone()) {
+        return;
+    }
+    skills.push(SkillMetadata {
+        name: namespaced,
+        description: fm.description,
+        argument_hint: fm.argument_hint,
+        audience: SkillAudience::Conversation,
+        source: SkillSource::Plugin {
+            path: skill_md.clone(),
+            plugin_name,
+        },
+    });
 }
 
 fn format_skill_expansion(skill_dir: &str, raw_content: &str, arguments: Option<&str>) -> String {
@@ -618,8 +732,10 @@ pub fn invoke_skill(
         })?;
 
     let raw_content = match &skill.source {
-        SkillSource::Filesystem { .. } => std::fs::read_to_string(skill.skill_md_path())
-            .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?,
+        SkillSource::Filesystem { .. } | SkillSource::Plugin { .. } => {
+            std::fs::read_to_string(skill.skill_md_path())
+                .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?
+        }
         SkillSource::Builtin { .. } => builtin::embedded_skill(skill_name)
             .ok_or_else(|| format!("Built-in skill '{skill_name}' is not embedded"))?,
     };
@@ -921,7 +1037,9 @@ mod tests {
                 );
                 assert_eq!(source_dir, ".claude/skills");
             }
-            SkillSource::Builtin { .. } => panic!("expected Filesystem source"),
+            SkillSource::Builtin { .. } | SkillSource::Plugin { .. } => {
+                panic!("expected Filesystem source")
+            }
         }
     }
 
@@ -944,7 +1062,9 @@ mod tests {
             SkillSource::Filesystem { source_dir, .. } => {
                 assert_eq!(source_dir, ".agents/skills");
             }
-            SkillSource::Builtin { .. } => panic!("expected Filesystem source"),
+            SkillSource::Builtin { .. } | SkillSource::Plugin { .. } => {
+                panic!("expected Filesystem source")
+            }
         }
     }
 
@@ -1026,13 +1146,17 @@ mod tests {
             SkillSource::Filesystem { source_dir, .. } => {
                 assert_eq!(source_dir, ".agents/skills");
             }
-            SkillSource::Builtin { .. } => panic!("expected Filesystem source"),
+            SkillSource::Builtin { .. } | SkillSource::Plugin { .. } => {
+                panic!("expected Filesystem source")
+            }
         }
         match &claude.source {
             SkillSource::Filesystem { source_dir, .. } => {
                 assert_eq!(source_dir, ".claude/skills");
             }
-            SkillSource::Builtin { .. } => panic!("expected Filesystem source"),
+            SkillSource::Builtin { .. } | SkillSource::Plugin { .. } => {
+                panic!("expected Filesystem source")
+            }
         }
     }
 
@@ -1062,7 +1186,9 @@ mod tests {
             SkillSource::Filesystem { source_dir, .. } => {
                 assert_eq!(source_dir, ".claude/skills");
             }
-            SkillSource::Builtin { .. } => panic!("expected Filesystem source"),
+            SkillSource::Builtin { .. } | SkillSource::Plugin { .. } => {
+                panic!("expected Filesystem source")
+            }
         }
     }
 
@@ -1206,7 +1332,9 @@ mod tests {
                 assert!(path.starts_with(&extract_dir));
                 assert!(path.ends_with("SKILL.md"));
             }
-            SkillSource::Filesystem { .. } => panic!("expected Builtin source"),
+            SkillSource::Filesystem { .. } | SkillSource::Plugin { .. } => {
+                panic!("expected Builtin source")
+            }
         }
     }
 
@@ -1251,7 +1379,7 @@ mod tests {
             SkillSource::Filesystem { source_dir, .. } => {
                 assert_eq!(source_dir, ".claude/skills");
             }
-            SkillSource::Builtin { .. } => {
+            SkillSource::Builtin { .. } | SkillSource::Plugin { .. } => {
                 panic!("filesystem spears should shadow built-in (REQ-BS-002)")
             }
         }
@@ -1652,20 +1780,219 @@ mod tests {
         assert!(!content.is_empty());
     }
 
-    #[test]
-    fn test_invoke_skill_no_args_appended_when_no_placeholder() {
-        let tmp = TempDir::new().unwrap();
-        write_skill(
-            tmp.path(),
-            "simple",
-            "simple",
-            "Simple skill",
-            "Do the thing.",
-        );
+    // -------------------------------------------------------------------------
+    // Plugin skills (specs/plugins/ REQ-AP-005)
+    // -------------------------------------------------------------------------
 
-        let skills = discover_skills(tmp.path());
-        let result =
-            invoke_skill("simple", "extra args", SkillAudience::Conversation, &skills).unwrap();
-        assert!(result.body.contains("ARGUMENTS: extra args"));
+    mod plugin_skills {
+        use super::*;
+        use phoenix_plugins::filter;
+
+        fn write(path: &std::path::Path, content: &str) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
+
+        /// The plugin filter is process-global state; these tests
+        /// serialize so one test's disabled set cannot bleed into
+        /// another's discovery.
+        static SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        struct PluginRootGuard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            dir: tempfile::TempDir,
+        }
+
+        impl PluginRootGuard {
+            fn new() -> Self {
+                let lock = SERIALIZE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                filter::reset_for_tests();
+                Self {
+                    _lock: lock,
+                    dir: tempfile::tempdir().unwrap(),
+                }
+            }
+
+            fn path(&self) -> &std::path::Path {
+                self.dir.path()
+            }
+        }
+
+        impl Drop for PluginRootGuard {
+            fn drop(&mut self) {
+                filter::reset_for_tests();
+            }
+        }
+
+        /// Discovering with a plugin under `~/.agents/plugins` surfaces its
+        /// skills namespaced `plugin:skill` with plugin provenance
+        /// (REQ-AP-005).
+        #[test]
+        fn plugin_skills_surface_namespaced_with_provenance() {
+            let guard = PluginRootGuard::new();
+            let home = guard.path();
+            let work = tempfile::tempdir().unwrap();
+
+            write(
+                &home.join(".agents/plugins/devtools/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "devtools"}"#,
+            );
+            write(
+                &home.join(".agents/plugins/devtools/skills/deploy/SKILL.md"),
+                "---\nname: deploy\ndescription: Deploys.\n---\nBody.",
+            );
+
+            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            let plugin_skill = skills
+                .iter()
+                .find(|s| s.name == "devtools:deploy")
+                .expect("namespaced plugin skill is discovered");
+            assert_eq!(plugin_skill.description, "Deploys.");
+            assert!(matches!(
+                &plugin_skill.source,
+                SkillSource::Plugin { plugin_name, .. } if plugin_name == "devtools"
+            ));
+            assert_eq!(plugin_skill.display_location(), "(plugin: devtools)");
+            assert_eq!(plugin_skill.audience, SkillAudience::Conversation);
+        }
+
+        /// A user skill with the same bare name never collides: the plugin
+        /// skill keeps its namespace, and plugins scan last so user skills
+        /// win any literal namespaced collision (REQ-AP-005).
+        #[test]
+        fn user_skills_outrank_plugin_skills() {
+            let guard = PluginRootGuard::new();
+            let home = guard.path();
+            let work = tempfile::tempdir().unwrap();
+
+            write(
+                &work.path().join(".claude/skills/deploy/SKILL.md"),
+                "---\nname: deploy\ndescription: User deploys.\n---\nBody.",
+            );
+            write(
+                &home.join(".agents/plugins/devtools/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "devtools"}"#,
+            );
+            write(
+                &home.join(".agents/plugins/devtools/skills/deploy/SKILL.md"),
+                "---\nname: deploy\ndescription: Plugin deploys.\n---\nBody.",
+            );
+            write(
+                &home.join(".agents/plugins/devtools/skills/deploy/skills/inner/SKILL.md"),
+                "---\nname: inner\ndescription: Nested.\n---\nBody.",
+            );
+
+            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            assert!(skills
+                .iter()
+                .any(|s| s.name == "deploy" && s.description == "User deploys."));
+            assert!(skills
+                .iter()
+                .any(|s| s.name == "devtools:deploy" && s.description == "Plugin deploys."));
+            // Non-recursive: the plugin tree's nested sub-skill is absent.
+            assert!(!skills.iter().any(|s| s.name.contains("inner")));
+        }
+
+        /// A disabled plugin contributes no skills (REQ-AP-008): the
+        /// process-wide filter gates discovery.
+        #[test]
+        fn disabled_plugin_contributes_no_skills() {
+            let guard = PluginRootGuard::new();
+            let home = guard.path();
+            let work = tempfile::tempdir().unwrap();
+
+            write(
+                &home.join(".agents/plugins/devtools/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "devtools"}"#,
+            );
+            write(
+                &home.join(".agents/plugins/devtools/skills/deploy/SKILL.md"),
+                "---\nname: deploy\ndescription: Deploys.\n---\nBody.",
+            );
+
+            filter::set_disabled(["devtools".to_string()]);
+            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            assert!(!skills.iter().any(|s| s.name == "devtools:deploy"));
+        }
+
+        /// Plugin skills are conversation-audience only: frontmatter claiming
+        /// the Global Coordinator audience is skipped (REQ-SK-008).
+        #[test]
+        fn plugin_skill_cannot_claim_coordinator_audience() {
+            let guard = PluginRootGuard::new();
+            let home = guard.path();
+            let work = tempfile::tempdir().unwrap();
+
+            write(
+                &home.join(".agents/plugins/devtools/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "devtools"}"#,
+            );
+            write(
+                &home.join(".agents/plugins/devtools/skills/hidden/SKILL.md"),
+                "---\nname: hidden\ndescription: Claims coordinator.\naudience: global-coordinator\n---\nBody.",
+            );
+
+            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            assert!(!skills.iter().any(|s| s.name.contains("hidden")));
+        }
+
+        /// The frontmatter name must match the skill's parent directory; a
+        /// mismatch skips the skill rather than surfacing an ambiguous name
+        /// (Agent Skills format via REQ-AP-005).
+        #[test]
+        fn mismatched_frontmatter_name_is_skipped() {
+            let guard = PluginRootGuard::new();
+            let home = guard.path();
+            let work = tempfile::tempdir().unwrap();
+
+            write(
+                &home.join(".agents/plugins/devtools/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "devtools"}"#,
+            );
+            write(
+                &home.join(".agents/plugins/devtools/skills/renamed/SKILL.md"),
+                "---\nname: not-renamed\ndescription: Mismatched.\n---\nBody.",
+            );
+
+            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            assert!(!skills.iter().any(|s| s.name.contains("renamed")));
+        }
+
+        /// Plugin skills invoke through the same expansion path: base
+        /// directory, frontmatter stripped, arguments substituted
+        /// (REQ-AP-005 riding REQ-SK-001..005).
+        #[test]
+        fn plugin_skills_invoke_like_filesystem_skills() {
+            let guard = PluginRootGuard::new();
+            let home = guard.path();
+            let work = tempfile::tempdir().unwrap();
+
+            write(
+                &home.join(".agents/plugins/devtools/plugin.json"),
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.1.0/plugin.schema.json", "name": "devtools"}"#,
+            );
+            write(
+                &home.join(".agents/plugins/devtools/skills/deploy/SKILL.md"),
+                "---\nname: deploy\ndescription: Deploys.\n---\nDeploy $ARGUMENTS now.",
+            );
+
+            let skills = discover_skills_with_options(work.path(), Some(home), None);
+            let invocation = invoke_skill(
+                "devtools:deploy",
+                "staging",
+                SkillAudience::Conversation,
+                &skills,
+            )
+            .expect("plugin skill invokes");
+            assert!(invocation.body.contains("Deploy staging now."));
+            assert!(invocation
+                .body
+                .starts_with("Base directory for this skill:"));
+            assert!(invocation.skill_dir.contains("devtools"));
+        }
     }
 }

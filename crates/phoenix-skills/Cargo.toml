@@ -12,6 +12,10 @@ path = "src/lib.rs"
 # Shared domain vocabulary (`SkillInvocation`) and `LlmLanguage`.
 phoenix-core = { path = "../phoenix-core" }
 
+# Agent Plugins 1.1.0 loading core: enabled-plugin scan for the plugin
+# skill source (specs/plugins/ REQ-AP-005).
+phoenix-plugins = { path = "../phoenix-plugins" }
+
 # Built-in skills are embedded into the binary and extracted to disk.
 rust-embed = "8"
 tracing = "0.1"

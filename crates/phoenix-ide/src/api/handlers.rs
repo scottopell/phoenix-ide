@@ -8966,6 +8966,10 @@ fn skill_entries_from_dir(
                 crate::system_prompt::SkillSource::Builtin { path } => {
                     ("builtin".to_string(), path.to_string_lossy().to_string())
                 }
+                crate::system_prompt::SkillSource::Plugin { path, plugin_name } => (
+                    format!("plugin:{plugin_name}"),
+                    path.to_string_lossy().to_string(),
+                ),
             };
             if let Some(prefix) = strip_prefix {
                 if let Ok(rel) = std::path::Path::new(&path).strip_prefix(prefix) {

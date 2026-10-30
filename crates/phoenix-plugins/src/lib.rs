@@ -17,6 +17,8 @@ pub mod manifest;
 pub mod mcp_config;
 pub mod resolve;
 
+pub mod filter;
+
 pub use manifest::Manifest;
 pub use mcp_config::{McpDocument, ServerSpec, ServerValidation};
 pub use resolve::{expand_placeholders, resolved_environment, within_boundary};
@@ -78,6 +80,20 @@ impl SkillDir {
 /// (REQ-AP-002). No recursion.
 #[must_use]
 pub fn scan_plugins_root(root: &Path) -> Vec<LoadedPlugin> {
+    scan_plugins_root_filtered(root, &[])
+}
+
+/// [`scan_plugins_root`] restricted to enabled plugins: names in the
+/// process-wide disabled filter are omitted entirely (REQ-AP-008).
+#[must_use]
+pub fn scan_enabled_plugins(root: &Path) -> Vec<LoadedPlugin> {
+    let disabled: Vec<String> = filter::disabled_set().into_iter().collect();
+    scan_plugins_root_filtered(root, &disabled)
+}
+
+/// The scan core: `disabled` names plugin roots omitted entirely.
+#[must_use]
+pub fn scan_plugins_root_filtered(root: &Path, disabled: &[String]) -> Vec<LoadedPlugin> {
     let mut plugins: Vec<LoadedPlugin> = Vec::new();
     let mut seen_names: Vec<String> = Vec::new();
 
@@ -96,6 +112,16 @@ pub fn scan_plugins_root(root: &Path) -> Vec<LoadedPlugin> {
         // `data` holds PLUGIN_DATA directories, not plugins.
         if candidate.file_name().is_some_and(|n| n == "data") {
             continue;
+        }
+        if let Some(name) = plugin_name_if_valid(&candidate) {
+            if disabled.iter().any(|d| d == &name) {
+                tracing::debug!(
+                    plugin = %name,
+                    path = %candidate.display(),
+                    "plugin disabled; contributing nothing"
+                );
+                continue;
+            }
         }
         match load_plugin(&candidate) {
             Ok(plugin) => {
@@ -120,6 +146,12 @@ pub fn scan_plugins_root(root: &Path) -> Vec<LoadedPlugin> {
         }
     }
     plugins
+}
+
+/// The manifest name of a candidate root, when its manifest is valid.
+fn plugin_name_if_valid(root: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(root.join("plugin.json")).ok()?;
+    Manifest::parse(&content).ok().map(|m| m.name)
 }
 
 /// Load one plugin root: validate the manifest, then load both component

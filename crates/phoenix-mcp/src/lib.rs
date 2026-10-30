@@ -2943,9 +2943,12 @@ impl McpClientManager {
     }
 
     /// Replace the disabled plugin set (called at startup with persisted
-    /// state; absent names are enabled — specs/plugins/ REQ-AP-008).
+    /// state; absent names are enabled — specs/plugins/ REQ-AP-008). The
+    /// process-wide plugin filter is the single authority shared with skill
+    /// discovery, so both surfaces observe the same set.
     pub async fn set_disabled_plugins(&self, disabled: std::collections::HashSet<String>) {
-        *self.disabled_plugins.write().await = disabled;
+        *self.disabled_plugins.write().await = disabled.clone();
+        phoenix_plugins::filter::set_disabled(disabled);
     }
 
     /// Disable a plugin: on the next reconciliation its servers are removed
@@ -2953,11 +2956,17 @@ impl McpClientManager {
     /// (specs/plugins/ REQ-AP-008).
     pub async fn disable_plugin(&self, name: &str) {
         self.disabled_plugins.write().await.insert(name.to_string());
+        let mut global = phoenix_plugins::filter::disabled_set();
+        global.insert(name.to_string());
+        phoenix_plugins::filter::set_disabled(global);
     }
 
     /// Re-enable a plugin.
     pub async fn enable_plugin(&self, name: &str) {
         self.disabled_plugins.write().await.remove(name);
+        let mut global = phoenix_plugins::filter::disabled_set();
+        global.remove(name);
+        phoenix_plugins::filter::set_disabled(global);
     }
 
     /// Read user configuration files, then append enabled plugins' MCP
@@ -5323,10 +5332,10 @@ fn plugin_server_configs(
     let home = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
         .home()
         .to_path_buf();
-    plugin_server_configs_under(
-        &phoenix_plugins::default_plugins_root(&home),
-        disabled_plugins,
-    )
+    let mut disabled = disabled_plugins.clone();
+    disabled.extend(phoenix_plugins::filter::disabled_set());
+    let root = phoenix_plugins::default_plugins_root(&home);
+    plugin_server_configs_under(&root, &disabled)
 }
 
 /// The testable core of [`plugin_server_configs`]: scan an explicit plugins

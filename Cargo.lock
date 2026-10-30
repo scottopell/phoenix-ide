@@ -3112,6 +3112,7 @@ name = "phoenix-skills"
 version = "0.1.0"
 dependencies = [
  "phoenix-core",
+ "phoenix-plugins",
  "rust-embed",
  "tempfile",
  "tracing",
