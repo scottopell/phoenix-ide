@@ -57,6 +57,10 @@ phoenix-tools = { path = "../phoenix-tools" }
 # SQLite persistence (conversations, messages, steering queues, migrations).
 # Extracted so the persistence layer is a leaf depending only on phoenix-core.
 phoenix-db = { path = "../phoenix-db" }
+
+# Agent Plugins 1.1.0 loading core: plugin scan, lifecycle, and the shared
+# enabled-plugin filter (specs/plugins/).
+phoenix-plugins = { path = "../phoenix-plugins" }
 phoenix-svg = { path = "../phoenix-svg" }
 
 # Pure conversation reducer (Elm-architecture state machine). Extracted so the

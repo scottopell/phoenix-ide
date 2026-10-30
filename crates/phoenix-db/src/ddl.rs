@@ -303,6 +303,17 @@ CREATE TABLE IF NOT EXISTS mcp_disabled_servers (
 );
 ";
 
+/// Migration SQL to create `plugins` table: the user-level plugin registry
+/// (specs/plugins/ REQ-AP-008, REQ-AP-009). Absent row = unmanaged + enabled.
+pub(crate) const MIGRATION_CREATE_PLUGINS: &str = r"
+CREATE TABLE IF NOT EXISTS plugins (
+    name TEXT PRIMARY KEY,
+    provenance TEXT NOT NULL CHECK(provenance IN ('managed','unmanaged')),
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    installed_at TEXT NOT NULL
+);
+";
+
 /// Migration SQL to create `share_tokens` table (REQ-AUTH-008).
 pub(crate) const MIGRATION_CREATE_SHARE_TOKENS: &str = r"
 CREATE TABLE IF NOT EXISTS share_tokens (

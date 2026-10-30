@@ -3255,6 +3255,7 @@ dependencies = [
  "phoenix-core",
  "phoenix-db",
  "phoenix-llm",
+ "phoenix-plugins",
  "phoenix-skills",
  "phoenix-state-machine",
  "phoenix-svg",

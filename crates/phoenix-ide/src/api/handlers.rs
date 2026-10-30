@@ -530,6 +530,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
         .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
         .route("/api/mcp/oauth/callback", get(mcp_oauth_callback))
+        // User-level agent plugins (specs/plugins/): list/status, add,
+        // remove, enable/disable, and the separate data purge
+        .route("/api/plugins", get(plugins_list))
+        .route("/api/plugins/add", post(plugin_add))
+        .route("/api/plugins/:name/disable", post(plugin_disable))
+        .route("/api/plugins/:name/enable", post(plugin_enable))
+        .route("/api/plugins/:name/remove", post(plugin_remove))
+        .route("/api/plugins/:name/purge-data", post(plugin_purge_data))
         // Notification settings (REQ-NOTIF-006, REQ-NOTIF-009)
         .route(
             "/api/settings/notifications",
@@ -9440,6 +9448,324 @@ async fn enable_mcp_server(
     state.mcp_manager.enable_server(&name).await;
     tracing::info!(server = %name, "MCP server enabled");
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+// ============================================================
+// User-level agent plugins (specs/plugins/)
+// ============================================================
+
+/// The plugins root for this server, derived from the user's home.
+fn plugins_root() -> std::path::PathBuf {
+    use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
+    let home = PhoenixRuntimeEnvironment::detect().home().to_path_buf();
+    phoenix_plugins::default_plugins_root(&home)
+}
+
+/// List installed plugins with per-component load outcomes and lifecycle
+/// state (REQ-AP-002, REQ-AP-010): every plugin in the shared root (enabled
+/// or disabled) plus registered-but-missing roots, joined with the persisted
+/// registry rows for provenance.
+async fn plugins_list(State(state): State<AppState>) -> impl IntoResponse {
+    let root = plugins_root();
+    let registry: std::collections::HashMap<String, phoenix_db::PluginRecord> = state
+        .db
+        .get_plugins()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.name.clone(), r))
+        .collect();
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+
+    // Unfiltered scan: disabled plugins still appear in the list (they are
+    // installed, just not contributing).
+    for plugin in phoenix_plugins::scan_plugins_root(&root) {
+        seen.insert(plugin.manifest.name.clone());
+        let record = registry.get(&plugin.manifest.name);
+        let managed = record.is_some_and(|r| {
+            r.provenance == phoenix_db::PluginProvenance::Managed
+        });
+        let enabled = record.map_or(true, |r| r.enabled);
+        entries.push(serde_json::json!({
+            "name": plugin.manifest.name,
+            "version": plugin.manifest.version,
+            "description": plugin.manifest.description,
+            "root": plugin.root,
+            "enabled": enabled,
+            "provenance": if managed { "managed" } else { "unmanaged" },
+            "missing": false,
+            "skills": plugin.skills.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            "mcp_servers": plugin.servers.iter().map(|s| s.server().to_string()).collect::<Vec<_>>(),
+            "mcp_disabled_reason": plugin.mcp_disabled_reason,
+        }));
+    }
+
+    // Registered-but-absent roots: another harness sharing the root may have
+    // removed the directory (REQ-AP-009).
+    for record in registry.values() {
+        if !seen.contains(&record.name) {
+            entries.push(serde_json::json!({
+                "name": record.name,
+                "enabled": record.enabled,
+                "provenance": if record.provenance == phoenix_db::PluginProvenance::Managed { "managed" } else { "unmanaged" },
+                "missing": true,
+            }));
+        }
+    }
+
+    Json(serde_json::json!({ "plugins": entries, "root": root }))
+}
+
+/// Add a plugin from a local path or a git URL (REQ-AP-009): validate the
+/// source's manifest, refuse a name collision with an already-loaded
+/// plugin, install under the shared root as `<manifest-name>`, and register
+/// managed provenance.
+#[derive(serde::Deserialize)]
+struct PluginAddParams {
+    /// A local plugin directory or a git URL.
+    source: String,
+}
+
+async fn plugin_add(
+    State(state): State<AppState>,
+    Json(params): Json<PluginAddParams>,
+) -> Response {
+    let root = plugins_root();
+    let source = std::path::Path::new(&params.source);
+
+    // Resolve the source to a local directory first: a git URL is cloned
+    // shallowly into a tempdir, a local path is validated in place.
+    let staging = tempfile::tempdir().map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    });
+    let staging = match staging {
+        Ok(s) => s,
+        Err((code, message)) => {
+            return (code, Json(serde_json::json!({"error": message}))).into_response()
+        }
+    };
+    let source_dir: std::path::PathBuf = if source.is_dir() {
+        source.to_path_buf()
+    } else if params.source.starts_with("http://")
+        || params.source.starts_with("https://")
+        || params.source.ends_with(".git")
+    {
+        let target = staging.path().join("clone");
+        let output = tokio::process::Command::new("git")
+            .args(["clone", "--depth", "1", &params.source])
+            .arg(&target)
+            .output()
+            .await;
+        match output {
+            Ok(out) if out.status.success() => target,
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("git clone failed: {stderr}")})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("git clone failed: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "source must be a local directory or a git URL"})),
+        )
+            .into_response();
+    };
+
+    // Validate the source manifest before installing anything.
+    let plugin = match phoenix_plugins::load_plugin(&source_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid plugin source: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let name = plugin.manifest.name;
+
+    // Collision: an already-loaded plugin with the same manifest name wins
+    // (REQ-AP-009).
+    let existing = phoenix_plugins::scan_plugins_root(&root)
+        .into_iter()
+        .any(|p| p.manifest.name == name);
+    if existing {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("plugin '{name}' is already installed")})),
+        )
+            .into_response();
+    }
+
+    // Install: copy the source directory under the plugins root as
+    // `<manifest-name>` (the spec's own layout convention).
+    let destination = root.join(&name);
+    let output = tokio::process::Command::new("cp")
+        .arg("-a")
+        .arg(&source_dir)
+        .arg(&destination)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("copy failed: {stderr}")})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("copy failed: {e}")})),
+            )
+                .into_response();
+        }
+    }
+
+    if let Err(e) = state.db.register_plugin(&name).await {
+        tracing::warn!(plugin = %name, error = %e, "Failed to persist plugin registration");
+    }
+    tracing::info!(plugin = %name, "Plugin added");
+
+    // Reload so its MCP servers connect (skills refresh next turn).
+    let _ = state.mcp_manager.reload().await;
+    Json(serde_json::json!({"ok": true, "name": name})).into_response()
+}
+
+/// The installed plugin directory for a registry name, when its manifest
+/// name matches (identity is the manifest name, not the path).
+fn plugin_dir_for(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    phoenix_plugins::scan_plugins_root(root)
+        .into_iter()
+        .find(|p| p.manifest.name == name)
+        .map(|p| p.root)
+}
+
+/// Shared tail for the lifecycle mutations: persist the registry change,
+/// update the process-wide filter, reconcile MCP, respond.
+async fn plugin_lifecycle_response(
+    state: &AppState,
+    name: &str,
+    outcome: Result<(), String>,
+    action: &str,
+) -> Response {
+    match outcome {
+        Ok(()) => {
+            // Refresh the shared filter from the persisted registry so skill
+            // discovery and the MCP merge observe the same set (REQ-AP-008).
+            let disabled: std::collections::HashSet<String> = state
+                .db
+                .get_plugins()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| !r.enabled)
+                .map(|r| r.name)
+                .collect();
+            phoenix_plugins::filter::set_disabled(disabled.clone());
+            state.mcp_manager.set_disabled_plugins(disabled).await;
+            let _ = state.mcp_manager.reload().await;
+            tracing::info!(plugin = %name, "Plugin {action}");
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// Disable a plugin: none of its components load; its MCP connections are
+/// removed on reconciliation (REQ-AP-008).
+async fn plugin_disable(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Response {
+    let outcome = match state.db.set_plugin_enabled(&name, false).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    };
+    plugin_lifecycle_response(&state, &name, outcome, "disabled").await
+}
+
+/// Enable a plugin (REQ-AP-008).
+async fn plugin_enable(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Response {
+    let outcome = match state.db.set_plugin_enabled(&name, true).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    };
+    plugin_lifecycle_response(&state, &name, outcome, "enabled").await
+}
+
+/// Remove a plugin: delete its directory, drop its registry row, retain its
+/// data directory (purge is separate) (REQ-AP-009).
+async fn plugin_remove(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Response {
+    let root = plugins_root();
+    let outcome = async {
+        let dir = plugin_dir_for(&root, &name)
+            .ok_or_else(|| format!("plugin '{name}' is not installed"))?;
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(|e| format!("remove failed: {e}"))?;
+        state
+            .db
+            .unregister_plugin(&name)
+            .await
+            .map_err(|e| format!("registry update failed: {e}"))?;
+        Ok(())
+    }
+    .await;
+    plugin_lifecycle_response(&state, &name, outcome, "removed").await
+}
+
+/// Purge a removed (or missing) plugin's data directory — the separate
+/// explicit action that destroys plugin state (REQ-AP-009).
+async fn plugin_purge_data(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Response {
+    let root = plugins_root();
+    let outcome = async {
+        // Purge is available only when the plugin no longer contributes:
+        // its root is absent (removed or already missing).
+        if plugin_dir_for(&root, &name).is_some() {
+            return Err(format!(
+                "plugin '{name}' is still installed; remove it before purging data"
+            ));
+        }
+        let data_dir = phoenix_plugins::data_dir_for(&root, &name);
+        if data_dir.is_dir() {
+            tokio::fs::remove_dir_all(&data_dir)
+                .await
+                .map_err(|e| format!("purge failed: {e}"))?;
+        }
+        Ok(())
+    }
+    .await;
+    plugin_lifecycle_response(&state, &name, outcome, "purged").await
 }
 
 // ============================================================

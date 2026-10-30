@@ -1832,6 +1832,25 @@ const PROMPT_TAIL_AFTER_SQL: &str =
      WHERE conversation_id = ?1 AND sequence_id > ?2
      ORDER BY sequence_id ASC";
 
+/// One persisted plugin registry row (specs/plugins/). An absent row means
+/// the plugin is unmanaged (another harness installed it) and enabled
+/// (REQ-AP-008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRecord {
+    pub name: String,
+    pub provenance: PluginProvenance,
+    pub enabled: bool,
+}
+
+/// How a plugin directory came to exist (REQ-AP-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginProvenance {
+    /// Phoenix installed it through the add path.
+    Managed,
+    /// Another harness installed it; Phoenix merely loads it.
+    Unmanaged,
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -3633,6 +3652,11 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+        // Create plugins table (specs/plugins/, idempotent via IF NOT EXISTS)
+        let _ = sqlx::raw_sql(ddl::MIGRATION_CREATE_PLUGINS)
+            .execute(&self.pool)
+            .await;
+
         // Create share_tokens table (REQ-AUTH-008, idempotent via IF NOT EXISTS)
         let _ = sqlx::raw_sql(ddl::MIGRATION_CREATE_SHARE_TOKENS)
             .execute(&self.pool)
@@ -3868,6 +3892,86 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn enable_mcp_server(&self, name: &str) -> DbResult<()> {
         sqlx::query("DELETE FROM mcp_disabled_servers WHERE server_name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Plugin registry (specs/plugins/) ====================
+
+    /// All persisted plugin registry rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_plugins(&self) -> DbResult<Vec<PluginRecord>> {
+        let rows: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT name, provenance, enabled FROM plugins")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, provenance, enabled)| PluginRecord {
+                name,
+                provenance: if provenance == "managed" {
+                    PluginProvenance::Managed
+                } else {
+                    PluginProvenance::Unmanaged
+                },
+                enabled: enabled != 0,
+            })
+            .collect())
+    }
+
+    /// Set a plugin's enabled state, upserting its registry row. A row that
+    /// does not exist yet is created as unmanaged (the plugin was discovered
+    /// in the shared root, not installed by Phoenix); disabling an
+    /// unmanaged plugin records user intent without claiming install
+    /// ownership (REQ-AP-008, REQ-AP-009).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn set_plugin_enabled(&self, name: &str, enabled: bool) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO plugins (name, provenance, enabled, installed_at) \
+             VALUES (?1, 'unmanaged', ?2, datetime('now')) \
+             ON CONFLICT(name) DO UPDATE SET enabled = ?2",
+        )
+        .bind(name)
+        .bind(i64::from(enabled))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Register a plugin Phoenix installed through the add path: managed
+    /// provenance, enabled (REQ-AP-009).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn register_plugin(&self, name: &str) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO plugins (name, provenance, enabled, installed_at) \
+             VALUES (?1, 'managed', 1, datetime('now')) \
+             ON CONFLICT(name) DO UPDATE SET provenance = 'managed', enabled = 1",
+        )
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a plugin's registry row (its data directory survives; purge
+    /// is a separate explicit action) (REQ-AP-009).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn unregister_plugin(&self, name: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM plugins WHERE name = ?1")
             .bind(name)
             .execute(&self.pool)
             .await?;
