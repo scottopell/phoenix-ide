@@ -20365,26 +20365,66 @@ with tempfile.TemporaryDirectory() as directory:
         );
     }
 
-    /// Migration 35: creates the durable async conversation-creation job table.
     #[tokio::test]
-    async fn migration_035_creates_conversation_creation_jobs_table() {
+    async fn creation_job_migrations_install_schema_and_claim_constraints() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
-
+        for parent in ["claim-valid-parent", "claim-invalid-parent"] {
+            sqlx::query(
+                "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated,
+                     state_updated_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '/tmp',
+                         1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(parent)
+            .bind(r#"{"mode":"Explore"}"#)
+            .bind(r#"{"type":"idle"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         run_pending_migrations(&pool).await.unwrap();
 
-        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<String, _>("name"))
-            .collect();
-        assert!(
-            columns.iter().any(|c| c == "conversation_id"),
-            "Expected conversation_creation_jobs table to exist after migration 35; got {columns:?}"
-        );
-
+        for (table, expected) in [
+            (
+                "conversation_creation_jobs",
+                &[
+                    "conversation_id",
+                    "status",
+                    "stage",
+                    "attempt",
+                    "generation",
+                    "claim_worker_id",
+                    "claim_token",
+                    "lease_until",
+                    "next_attempt_at",
+                ][..],
+            ),
+            ("conversation_creation_job_files", &["stored_path"][..]),
+            ("conversation_creation_job_images", &["data"][..]),
+            (
+                "conversation_creation_resource_reservations",
+                &[
+                    "job_id",
+                    "generation",
+                    "repository_identity",
+                    "resource_identity",
+                    "status",
+                ][..],
+            ),
+        ] {
+            let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?1)")
+                .bind(table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            for column in expected {
+                assert!(
+                    columns.iter().any(|actual| actual == column),
+                    "{table} missing {column}: {columns:?}"
+                );
+            }
+        }
         let due_index: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_creation_jobs_due'",
         )
@@ -20392,114 +20432,40 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(due_index, vec!["idx_creation_jobs_due".to_string()]);
-    }
 
-    #[tokio::test]
-    async fn migration_036_creates_creation_job_files_table() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_job_files)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        assert!(
-            columns.iter().any(|c| c == "stored_path"),
-            "Expected conversation_creation_job_files table to exist after migration 36; got {columns:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_037_creates_creation_job_images_table() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_job_images)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        assert!(
-            columns.iter().any(|c| c == "data"),
-            "Expected conversation_creation_job_images table to exist after migration 37; got {columns:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_035_adds_fenced_creation_protocol_constraints() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<String, _>("name"))
-            .collect();
-        for expected in [
-            "status",
-            "stage",
-            "attempt",
-            "generation",
-            "claim_worker_id",
-            "claim_token",
-            "lease_until",
-            "next_attempt_at",
-        ] {
-            assert!(columns.iter().any(|column| column == expected));
-        }
-
-        let invalid = sqlx::query(
+        sqlx::query(
             "INSERT INTO conversation_creation_jobs (
-                id, conversation_id, status, stage, attempt, generation,
-                intent_json, accepted_at, created_at, updated_at
-             ) VALUES ('job-invalid', 'missing-conversation', 'claimed',
-                       'validate_intent', 1, 1, '{}', 'now', 'now', 'now')",
+                 id, conversation_id, status, stage, attempt, generation,
+                 claim_worker_id, claim_token, lease_until, intent_json,
+                 accepted_at, created_at, updated_at)
+             VALUES ('job-valid', 'claim-valid-parent', 'claimed', 'validate_intent', 1, 1,
+                     'worker', 'token', 'now', '{}', 'now', 'now', 'now')",
         )
         .execute(&pool)
-        .await;
-        assert!(
-            invalid.is_err(),
-            "claimed row without authority must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_036_adds_creation_resource_reservations() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-        run_pending_migrations(&pool).await.unwrap();
-
-        let columns: Vec<String> =
-            sqlx::query("PRAGMA table_info(conversation_creation_resource_reservations)")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect();
-        for expected in [
-            "job_id",
-            "generation",
-            "repository_identity",
-            "resource_identity",
-            "status",
-        ] {
-            assert!(columns.iter().any(|column| column == expected));
-        }
+        .await
+        .expect("a claimed job with complete authority must be accepted");
+        let error = sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, status, stage, attempt, generation,
+                 intent_json, accepted_at, created_at, updated_at)
+             VALUES ('job-invalid', 'claim-invalid-parent', 'claimed', 'validate_intent',
+                     1, 1, '{}', 'now', 'now', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("claimed row without authority must be rejected");
+        let sqlx::Error::Database(error) = error else {
+            panic!("expected a SQLite CHECK failure, got {error:?}");
+        };
+        assert!(error.is_check_violation(), "{error}");
+        assert!(error.message().contains("claim_worker_id"), "{error}");
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_creation_jobs WHERE id = 'job-invalid'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, 0);
     }
 
     /// Migration 003 (REQ-BED-030): adds a nullable `continued_in_conv_id`

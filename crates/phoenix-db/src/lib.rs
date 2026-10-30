@@ -19222,18 +19222,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_llm_language_unset_returns_phoenix_native() {
+    async fn default_llm_language_defaults_roundtrips_and_falls_back_for_unknown_values() {
         let db = Database::open_in_memory().await.unwrap();
         assert_eq!(
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::PhoenixNative
         );
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_set_persists_and_reads_back() {
-        let db = Database::open_in_memory().await.unwrap();
-
         db.set_default_llm_language(LlmLanguage::Caveman)
             .await
             .unwrap();
@@ -19242,7 +19236,6 @@ mod tests {
             LlmLanguage::Caveman
         );
 
-        // Switch back.
         db.set_default_llm_language(LlmLanguage::PhoenixNative)
             .await
             .unwrap();
@@ -19250,14 +19243,6 @@ mod tests {
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::PhoenixNative
         );
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_falls_back_when_value_unknown() {
-        let db = Database::open_in_memory().await.unwrap();
-        // Forge a value this build doesn't recognize (forward-compat: an
-        // older binary reading a DB written by a newer one). Should fall
-        // back to the default rather than poison startup.
         db.set_app_setting("default_llm_language", "klingon")
             .await
             .unwrap();
@@ -19356,16 +19341,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_initializers_commit_one_instance_identity() {
+    async fn migration_contention_then_serial_retry_preserves_any_committed_identity() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("concurrent-instance-identity.sqlite");
         let db_path = db_path.to_string_lossy().into_owned();
         let first = Database::open(&db_path).await.unwrap();
         let second = Database::open(&db_path).await.unwrap();
 
-        let _concurrent_results = tokio::join!(
+        let (first_attempt, second_attempt) = tokio::join!(
             migrations::run_pending_migrations(first.pool()),
             migrations::run_pending_migrations(second.pool()),
+        );
+
+        let identity_table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'instance_identity')",
+        )
+        .fetch_one(first.pool())
+        .await
+        .unwrap();
+        let identity_before_retry = if identity_table_exists {
+            Some(
+                first
+                    .instance_id()
+                    .await
+                    .expect("committed identity table must contain a valid identity"),
+            )
+        } else {
+            None
+        };
+        assert!(
+            (first_attempt.is_err() && second_attempt.is_err()) || identity_before_retry.is_some(),
+            "a successful migrator must commit an identity: {first_attempt:?}, {second_attempt:?}"
         );
 
         migrations::run_pending_migrations(first.pool())
@@ -19375,6 +19381,12 @@ mod tests {
             .await
             .unwrap();
         let first_id = first.instance_id().await.unwrap();
+        if let Some(committed_identity) = identity_before_retry {
+            assert_eq!(
+                first_id, committed_identity,
+                "serial completion replaced a committed identity"
+            );
+        }
         assert_eq!(second.instance_id().await.unwrap(), first_id);
         let identities: Vec<String> =
             sqlx::query_scalar("SELECT instance_id FROM instance_identity")
@@ -23978,27 +23990,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steady_state_prompt_tail_has_constant_statement_shape_and_no_full_history_read() {
-        async fn measure(
-            user_count: usize,
-        ) -> (
-            Vec<crate::sqlite_workload::NativeStatementShape>,
-            Vec<crate::sqlite_workload::NativeStatementShape>,
+    #[allow(clippy::too_many_lines)]
+    async fn prompt_reads_batch_attachments_and_bound_tail_work() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        async fn append_rows(
+            db: &Database,
+            conversation: &str,
+            sequences: std::ops::Range<i64>,
+            prefix: &str,
         ) {
-            let db = Database::open_in_memory().await.unwrap();
-            let conversation_id = format!("projection-shape-{user_count}");
-            db.create_conversation(&conversation_id, &conversation_id, "/tmp", true, None, None)
-                .await
-                .unwrap();
-            for index in 0..user_count {
+            for sequence in sequences {
+                let id = format!("{prefix}-{sequence}");
                 db.add_message_with_seq(
-                    &format!("history-{index}"),
-                    &conversation_id,
-                    i64::try_from(index + 1).unwrap(),
+                    &id,
+                    conversation,
+                    sequence,
                     &MessageContent::user_with_attachments(
-                        format!("history {index}"),
-                        vec![image_attachment(&format!("image-{index}"))],
-                        vec![file_attachment(&format!("file-{index}"))],
+                        &id,
+                        vec![image_attachment(&format!("image-{id}"))],
+                        vec![file_attachment(&format!("file-{id}"))],
                     ),
                     None,
                     None,
@@ -24006,68 +24020,129 @@ mod tests {
                 .await
                 .unwrap();
             }
-            db.sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            let snapshot = db
-                .load_hydrated_prompt_snapshot(&conversation_id)
-                .await
-                .unwrap();
-            let snapshot_statements = db
-                .sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            db.add_message_with_seq(
-                "new-tail-row",
-                &conversation_id,
-                i64::try_from(user_count + 1).unwrap(),
-                &MessageContent::user_with_attachments(
-                    "new tail row",
-                    vec![image_attachment("tail-image")],
-                    vec![file_attachment("tail-file")],
-                ),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-            db.sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            let tail = db
-                .load_hydrated_prompt_tail(&conversation_id, snapshot.fenced_position())
-                .await
-                .unwrap();
+        }
+
+        fn assert_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
+            use crate::sqlite_workload::NativeStatementShape;
+            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
+            assert_eq!(statements[0], NativeStatementShape::Begin);
+            assert!(statements[1..5]
+                .iter()
+                .all(|statement| *statement == NativeStatementShape::OrdinaryRead));
+        }
+
+        fn assert_tail(tail: &HydratedPromptTail, expected_ids: &[String]) {
             let HydratedPromptTail::Current(rows) = tail else {
                 panic!("append must return a current tail");
             };
-            assert_eq!(rows.messages().len(), 1);
-            assert_eq!(rows.messages()[0].message_id, "new-tail-row");
-            let (images, files) = rows.messages()[0].content.attachments();
-            assert_eq!((images.len(), files.len()), (1, 1));
-            let tail_statements = db
-                .sqlite_workload_collector
-                .take_native_statement_shapes_for_test();
-            (snapshot_statements, tail_statements)
-        }
-
-        fn assert_prompt_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
-            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
             assert_eq!(
-                statements[0],
-                crate::sqlite_workload::NativeStatementShape::Begin,
-                "prompt statements: {statements:#?}"
+                rows.messages()
+                    .iter()
+                    .map(|message| &message.message_id)
+                    .collect::<Vec<_>>(),
+                expected_ids.iter().collect::<Vec<_>>()
             );
-            assert!(statements[1..5].iter().all(|statement| *statement
-                == crate::sqlite_workload::NativeStatementShape::OrdinaryRead));
-            // The final statement is the transaction boundary. Native metadata may
-            // conservatively classify it as an ordinary read after a cache collision;
-            // its bracket position, not that degraded category, excludes it.
+            for message in rows.messages() {
+                let (images, files) = message.content.attachments();
+                assert_eq!((images.len(), files.len()), (1, 1));
+            }
         }
 
-        for _ in 0..3 {
-            let (zero, eight, twenty_seven) = tokio::join!(measure(0), measure(8), measure(27));
-            for (snapshot_statements, tail_statements) in [zero, eight, twenty_seven] {
-                assert_prompt_read_shape(&snapshot_statements);
-                assert_prompt_read_shape(&tail_statements);
+        for history_count in [0_i64, 2] {
+            let db = Database::open_in_memory().await.unwrap();
+            let conversation = "prompt-read-contract";
+            db.create_conversation(conversation, conversation, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            append_rows(&db, conversation, 1..history_count + 1, "history").await;
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let snapshot = db
+                .load_hydrated_prompt_snapshot(conversation)
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.messages().len(),
+                usize::try_from(history_count).unwrap()
+            );
+            assert_read_shape(
+                &db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test(),
+            );
+
+            let first = history_count + 1;
+            append_rows(&db, conversation, first..first + 2, "tail").await;
+            let steps = Arc::new(AtomicU64::new(0));
+            {
+                let mut connection = db.pool().acquire().await.unwrap();
+                let mut handle = connection.lock_handle().await.unwrap();
+                let observed = Arc::clone(&steps);
+                handle.set_progress_handler(1, move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    true
+                });
             }
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let tail = db
+                .load_hydrated_prompt_tail(conversation, snapshot.fenced_position())
+                .await
+                .unwrap();
+            let small_tail_steps = steps.load(Ordering::Relaxed);
+            assert_tail(
+                &tail,
+                &[format!("tail-{first}"), format!("tail-{}", first + 1)],
+            );
+            assert_read_shape(
+                &db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test(),
+            );
+
+            if history_count > 0 {
+                append_rows(&db, conversation, first + 2..first + 66, "older-prefix").await;
+                db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test();
+                let later_snapshot = db
+                    .load_hydrated_prompt_snapshot(conversation)
+                    .await
+                    .unwrap();
+                assert_read_shape(
+                    &db.sqlite_workload_collector
+                        .take_native_statement_shapes_for_test(),
+                );
+                append_rows(&db, conversation, first + 66..first + 68, "later-tail").await;
+                db.sqlite_workload_collector
+                    .take_native_statement_shapes_for_test();
+                steps.store(0, Ordering::Relaxed);
+                let later_tail = db
+                    .load_hydrated_prompt_tail(conversation, later_snapshot.fenced_position())
+                    .await
+                    .unwrap();
+                let large_tail_steps = steps.load(Ordering::Relaxed);
+                assert_tail(
+                    &later_tail,
+                    &[
+                        format!("later-tail-{}", first + 66),
+                        format!("later-tail-{}", first + 67),
+                    ],
+                );
+                assert_read_shape(
+                    &db.sqlite_workload_collector
+                        .take_native_statement_shapes_for_test(),
+                );
+                assert!(small_tail_steps > 0);
+                assert!(large_tail_steps <= small_tail_steps + 32,
+                    "tail work grew with 64 older parents: {small_tail_steps} -> {large_tail_steps} VM steps");
+            }
+            db.pool()
+                .acquire()
+                .await
+                .unwrap()
+                .lock_handle()
+                .await
+                .unwrap()
+                .remove_progress_handler();
+            db.pool().close().await;
         }
     }
 
