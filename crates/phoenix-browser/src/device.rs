@@ -61,6 +61,9 @@ impl Default for DeviceConfig {
 }
 
 impl DeviceConfig {
+    /// # Errors
+    /// Returns an error if touch is disabled or start/move coordinates are not
+    /// finite, nonnegative CSS pixels strictly within the configured viewport.
     pub fn validate_touch(self, action: crate::touch::TouchAction) -> Result<(), String> {
         if !self.touch {
             return Err("Touch steps require device.touch=true".into());
@@ -109,16 +112,11 @@ impl DeviceConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) enum DeviceState {
     Known(DeviceConfig),
+    #[default]
     Unknown,
-}
-
-impl Default for DeviceState {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl DeviceState {

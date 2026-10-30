@@ -21,6 +21,9 @@ pub struct ScenarioOwner {
 }
 
 impl ScenarioOwner {
+    /// # Errors
+    /// Returns an error if this owner is closing or a previous scenario task,
+    /// including its cleanup, has not finished.
     pub fn start<F, Fut>(&self, operation: F) -> Result<(), String>
     where
         F: FnOnce(watch::Receiver<bool>) -> Fut + Send + 'static,

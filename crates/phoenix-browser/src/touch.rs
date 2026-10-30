@@ -89,7 +89,7 @@ impl TouchState {
                 (DispatchTouchEventType::TouchEnd, None, Self::Idle)
             }
             TouchAction::Cancel => (DispatchTouchEventType::TouchCancel, None, Self::Idle),
-            _ => {
+            TouchAction::Start { .. } | TouchAction::Move { .. } | TouchAction::End => {
                 return Err(
                     "Invalid touch transition; start once, move while active, then end".into(),
                 );

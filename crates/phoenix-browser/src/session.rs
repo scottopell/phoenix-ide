@@ -3047,12 +3047,19 @@ impl BrowserSessionManager {
 }
 
 impl BrowserSession {
+    /// # Errors
+    /// Returns an error if the session's weak scenario-owner reference cannot
+    /// be upgraded because no managed owner remains alive.
     pub fn scenario_owner(&self) -> Result<Arc<crate::scenario::ScenarioOwner>, String> {
         self.scenario_owner
             .upgrade()
             .ok_or_else(|| "Scenario requires a managed browser session".into())
     }
 
+    /// # Errors
+    /// Returns an error if the device configuration is unknown, touch is disabled,
+    /// coordinates are nonfinite or outside the valid viewport bounds, the
+    /// contact transition is invalid, or CDP touch dispatch fails.
     pub async fn dispatch_touch(
         &mut self,
         action: crate::touch::TouchAction,
@@ -3061,16 +3068,26 @@ impl BrowserSession {
         self.touch.dispatch(&self.page, action).await
     }
 
+    /// # Errors
+    /// Returns an error if the touch contact is active or its state is unknown.
     pub fn ensure_touch_idle(&self) -> Result<(), String> {
         self.touch.idle()
     }
+    /// # Errors
+    /// Returns an error if a required CDP touch cancellation fails.
     pub async fn cancel_touch(&mut self) -> Result<(), String> {
         self.touch.cancel_on(&self.page).await
     }
+    /// # Errors
+    /// Returns an error if no device configuration has been acknowledged or a
+    /// device configuration operation left the state unknown.
     pub fn device_config(&self) -> Result<crate::device::DeviceConfig, String> {
         self.device.known()
     }
 
+    /// # Errors
+    /// Returns an error if the touch contact is not idle or CDP fails to apply
+    /// touch emulation or device metrics.
     pub async fn configure_device(
         &mut self,
         config: crate::device::DeviceConfig,
@@ -3079,6 +3096,10 @@ impl BrowserSession {
         self.device.configure(&self.page, config).await
     }
 
+    /// # Errors
+    /// Returns an error if the touch contact is not idle, the device configuration
+    /// is unknown, either dimension is outside 1..=16384, or CDP fails to apply
+    /// the resized device metrics.
     pub async fn resize_viewport(&mut self, width: u32, height: u32) -> Result<(), String> {
         self.touch.idle()?;
         let config = self.device.known()?.resized(width, height)?;
