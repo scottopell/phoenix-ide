@@ -3721,13 +3721,13 @@ mod previous_transcripts_tests {
 mod tests {
     use super::{
         conversation_page_end, exact_conversation_href, format_global_search_hits,
-        message_id_fragment, render_full_message_text, render_global_message_line,
-        resolve_conversation_read_target, resolve_reference_impl, resolve_work_scope,
-        split_fragment, BoundedReadError, ConversationReadTarget, CoordinatorWorkScopeTargetError,
-        GlobalMessageTarget, GlobalMessageTargetError, GlobalReadService, ResolvedEnvironmentKind,
-        ResolvedWorkScope, ServerPathSemantics, WorkScopeUnavailableReason,
-        FEDERATED_READ_MAX_DB_READS, FEDERATED_READ_SCAN_LIMIT, MAX_CONVERSATION_READ_CURSOR,
-        READ_PAGE_CHARS,
+        message_id_fragment, render_bounded_message_line_with_cache, render_full_message_text,
+        render_global_message_line, resolve_conversation_read_target, resolve_reference_impl,
+        resolve_work_scope, split_fragment, BoundedReadError, ConversationReadTarget,
+        CoordinatorWorkScopeTargetError, GlobalMessageTarget, GlobalMessageTargetError,
+        GlobalReadService, ResolvedEnvironmentKind, ResolvedWorkScope, ServerPathSemantics,
+        WorkScopeUnavailableReason, FEDERATED_READ_MAX_DB_READS, FEDERATED_READ_SCAN_LIMIT,
+        FEDERATED_READ_TEST_CONTENT_LIMIT, MAX_CONVERSATION_READ_CURSOR, READ_PAGE_CHARS,
     };
     use std::sync::Arc;
 
