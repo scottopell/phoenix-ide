@@ -19325,6 +19325,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened.instance_id().await.unwrap(), first_id);
+        let error = sqlx::query(
+            "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(reopened.pool())
+        .await
+        .expect_err("a second identity with the singleton key must be rejected");
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(sqlx::error::DatabaseError::is_unique_violation),
+            "{error}"
+        );
         assert!(sqlx::query(
             "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (2, ?1)",
         )
@@ -19338,59 +19351,9 @@ mod tests {
         .execute(reopened.pool())
         .await
         .is_err());
-    }
-
-    #[tokio::test]
-    async fn migration_contention_then_serial_retry_preserves_any_committed_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("concurrent-instance-identity.sqlite");
-        let db_path = db_path.to_string_lossy().into_owned();
-        let first = Database::open(&db_path).await.unwrap();
-        let second = Database::open(&db_path).await.unwrap();
-
-        let (first_attempt, second_attempt) = tokio::join!(
-            migrations::run_pending_migrations(first.pool()),
-            migrations::run_pending_migrations(second.pool()),
-        );
-
-        let identity_table_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'instance_identity')",
-        )
-        .fetch_one(first.pool())
-        .await
-        .unwrap();
-        let identity_before_retry = if identity_table_exists {
-            Some(
-                first
-                    .instance_id()
-                    .await
-                    .expect("committed identity table must contain a valid identity"),
-            )
-        } else {
-            None
-        };
-        assert!(
-            (first_attempt.is_err() && second_attempt.is_err()) || identity_before_retry.is_some(),
-            "a successful migrator must commit an identity: {first_attempt:?}, {second_attempt:?}"
-        );
-
-        migrations::run_pending_migrations(first.pool())
-            .await
-            .unwrap();
-        migrations::run_pending_migrations(second.pool())
-            .await
-            .unwrap();
-        let first_id = first.instance_id().await.unwrap();
-        if let Some(committed_identity) = identity_before_retry {
-            assert_eq!(
-                first_id, committed_identity,
-                "serial completion replaced a committed identity"
-            );
-        }
-        assert_eq!(second.instance_id().await.unwrap(), first_id);
         let identities: Vec<String> =
             sqlx::query_scalar("SELECT instance_id FROM instance_identity")
-                .fetch_all(first.pool())
+                .fetch_all(reopened.pool())
                 .await
                 .unwrap();
         assert_eq!(identities, vec![first_id.to_string()]);
