@@ -611,7 +611,7 @@ mod tests {
                     );
                 }
                 ProductCreationAcceptOutcome::Conflict(_) => {
-                    assert!(!replay, "{label}: expected replay")
+                    assert!(!replay, "{label}: expected replay");
                 }
             }
         }
