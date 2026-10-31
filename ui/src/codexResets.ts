@@ -57,6 +57,28 @@ export function resetCountLabel(count: number): string {
   return `${count} ${count === 1 ? 'reset' : 'resets'} available`;
 }
 
+/**
+ * A redemption whose answer was lost. Survives closing the flow so a reopened
+ * flow can only retry it with the same key (REQ-CRR-007); cleared by any answer.
+ * Held in page memory only.
+ */
+export interface PendingRedemption {
+  options: ResetOption[];
+  account: string | null;
+  option: ResetOption;
+  key: string;
+}
+
+let pendingRedemption: PendingRedemption | null = null;
+
+export function getPendingRedemption(): PendingRedemption | null {
+  return pendingRedemption;
+}
+
+export function setPendingRedemption(next: PendingRedemption | null): void {
+  pendingRedemption = next;
+}
+
 /** Refresh the shared quota store after a redemption (REQ-CRR-007). */
 export async function refreshCodexQuota(): Promise<void> {
   const startedAt = getCodexQuotaGeneration();

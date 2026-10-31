@@ -5,8 +5,8 @@
 
 use chrono::DateTime;
 use phoenix_core::domain::codex_reset_credits::{
-    CodexResetCredit, CodexResetCreditStatus, CodexResetCredits, CodexResetRedeemOutcome,
-    CodexResetRedeemResponse, CodexResetType,
+    CodexResetCredit, CodexResetCreditId, CodexResetCreditStatus, CodexResetCredits,
+    CodexResetRedeemOutcome, CodexResetRedeemResponse, CodexResetType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +111,8 @@ pub fn reset_credits_from_upstream(
                 expires_at,
                 title: credit.title,
                 description: credit.description,
-                id: credit.id,
+                id: CodexResetCreditId::try_from(credit.id)
+                    .map_err(|error| format!("reset credit listing: {error}"))?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -183,7 +184,7 @@ mod tests {
                 available_count: 2,
                 credits: vec![
                     CodexResetCredit {
-                        id: "credit-1".into(),
+                        id: CodexResetCreditId::try_from("credit-1".to_string()).unwrap(),
                         reset_type: CodexResetType::CodexRateLimits,
                         status: CodexResetCreditStatus::Available,
                         granted_at: 1_781_654_400,
@@ -192,7 +193,7 @@ mod tests {
                         description: Some("Ready to redeem".into()),
                     },
                     CodexResetCredit {
-                        id: "credit-2".into(),
+                        id: CodexResetCreditId::try_from("credit-2".to_string()).unwrap(),
                         reset_type: CodexResetType::Unknown,
                         status: CodexResetCreditStatus::Unknown,
                         granted_at: 1_781_733_600,
@@ -219,6 +220,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("granted_at"), "{error}");
+    }
+
+    #[test]
+    fn listing_rejects_empty_credit_id() {
+        let error = reset_credits_from_upstream(
+            json!({
+                "credits": [{
+                    "id": " ", "reset_type": "codex_rate_limits", "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z", "expires_at": null
+                }],
+                "available_count": 1
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("credit_id"), "{error}");
     }
 
     #[test]

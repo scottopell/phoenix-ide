@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { resetCountLabel, resetOptions } from './codexResets';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { api } from './api';
+import { clearCodexQuota, getCodexQuotaSnapshot, setCodexQuota } from './codexQuota';
+import { refreshCodexQuota, resetCountLabel, resetOptions } from './codexResets';
+import type { QuotaDetails } from './sseSchemas';
 import type { CodexResetCredit } from './generated/CodexResetCredit';
 
 function credit(overrides: Partial<CodexResetCredit>): CodexResetCredit {
@@ -81,5 +84,31 @@ describe('resetCountLabel', () => {
   it('pluralizes', () => {
     expect(resetCountLabel(1)).toBe('1 reset available');
     expect(resetCountLabel(3)).toBe('3 resets available');
+  });
+});
+
+describe('refreshCodexQuota (REQ-CRR-010)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    clearCodexQuota();
+  });
+
+  const quota = { plan_type: 'plus' } as unknown as QuotaDetails;
+
+  it('stores a refreshed quota', async () => {
+    vi.spyOn(api, 'codexQuota').mockResolvedValue(quota);
+    await refreshCodexQuota();
+    expect(getCodexQuotaSnapshot()).toBe(quota);
+  });
+
+  it('discards a refresh that started before a sign-out clear', async () => {
+    let resolve: (value: QuotaDetails | null) => void = () => undefined;
+    vi.spyOn(api, 'codexQuota').mockImplementation(() => new Promise((r) => { resolve = r; }));
+    setCodexQuota(quota);
+    const pending = refreshCodexQuota();
+    clearCodexQuota();
+    resolve(quota);
+    await pending;
+    expect(getCodexQuotaSnapshot()).toBeNull();
   });
 });

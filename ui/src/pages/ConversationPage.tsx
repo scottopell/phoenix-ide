@@ -397,6 +397,8 @@ function ConversationPageContent({
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
   const [deletingConversation, setDeletingConversation] = useState(false);
+  // Bumped by every user send or dismissal; see ErrorBanner `userActionSeq`.
+  const userActionSeqRef = useRef(0);
   const historyGenerationRef = useRef(0);
   const historyRequestTokenRef = useRef(0);
   const historyCommandTokenRef = useRef(0);
@@ -1405,6 +1407,7 @@ function ConversationPageContent({
 
   const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
     if (!conversationId || isArchived) return;
+    userActionSeqRef.current += 1;
 
     const msg = enqueue(text, attachedImages, attachedFiles);
 
@@ -2518,10 +2521,13 @@ function ConversationPageContent({
         <>
         <ErrorBanner
           key={conversation.id}
+          conversationId={conversation.id}
+          userActionSeq={userActionSeqRef}
           message={convStateForChildren.message}
           error={convStateForChildren.error}
           onRetry={readOnly || isArchived ? undefined : () => handleSend('continue', [])}
           onDismiss={readOnly || isArchived ? undefined : () => {
+            userActionSeqRef.current += 1;
             // No optimistic idle: `dismissError` resolves on enqueue, not on
             // persist, so faking idle could diverge if the executor races/
             // rejects. The server-broadcast state_change SSE drives idle.

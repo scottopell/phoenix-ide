@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
-import { refreshCodexQuota, resetOptions, type ResetOption } from '../codexResets';
+import {
+  getPendingRedemption,
+  refreshCodexQuota,
+  resetOptions,
+  setPendingRedemption,
+  type PendingRedemption,
+  type ResetOption,
+} from '../codexResets';
 import type { CodexResetCredits } from '../generated/CodexResetCredits';
 import type { CodexResetRedeemResponse } from '../generated/CodexResetRedeemResponse';
 import { generateUUID } from '../utils/uuid';
 import './CodexResetFlow.css';
 
-// `account` is the listing's account_id; the server refuses a redemption whose
-// account no longer matches the signed-in credential.
+// `account` is the listing's account_id.
 interface Choices {
   options: ResetOption[];
   account: string | null;
@@ -22,6 +28,15 @@ type FlowState =
   | { type: 'failed'; choices: Choices; option: ResetOption; key: string }
   | { type: 'done'; text: string; succeeded: boolean };
 
+function failedFromPending(pending: PendingRedemption): FlowState {
+  return {
+    type: 'failed',
+    choices: { options: pending.options, account: pending.account },
+    option: pending.option,
+    key: pending.key,
+  };
+}
+
 interface CodexResetFlowProps {
   /** Called once per successful redemption, only while this flow is mounted. */
   onSucceeded?: ((response: CodexResetRedeemResponse) => void) | undefined;
@@ -31,7 +46,10 @@ interface CodexResetFlowProps {
 }
 
 export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFlowProps) {
-  const [state, setState] = useState<FlowState>({ type: 'loading' });
+  const [state, setState] = useState<FlowState>(() => {
+    const pending = getPendingRedemption();
+    return pending ? failedFromPending(pending) : { type: 'loading' };
+  });
   const mountedRef = useRef(true);
   const onSucceededRef = useRef(onSucceeded);
   const onListingRef = useRef(onListing);
@@ -47,6 +65,10 @@ export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFl
     setState({ type: 'loading' });
     const result = await api.codexResetCredits();
     if (!mountedRef.current) return;
+    if (result.type === 'signed_out') {
+      setState({ type: 'done', text: 'Sign in to ChatGPT to use usage limit resets.', succeeded: false });
+      return;
+    }
     if (result.type !== 'ok') {
       setState({ type: 'unavailable', notice });
       return;
@@ -60,18 +82,20 @@ export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFl
     setState({ type: 'choosing', choices: { options, account: result.credits.account_id }, notice });
   }, []);
 
-  useEffect(() => { void loadChoices(null); }, [loadChoices]);
+  useEffect(() => {
+    if (getPendingRedemption() === null) void loadChoices(null);
+  }, [loadChoices]);
 
   const redeem = useCallback(async (choices: Choices, option: ResetOption, key: string) => {
     setState({ type: 'in_flight', choices, option, key });
+    setPendingRedemption({ options: choices.options, account: choices.account, option, key });
     const result = await api.codexRedeemReset({
       idempotency_key: key,
       credit_id: option.creditId,
       account_id: choices.account,
     });
-    if (result.type === 'ok' && result.response.outcome !== 'nothing_to_reset') {
-      void refreshCodexQuota();
-    }
+    if (result.type !== 'failed') setPendingRedemption(null);
+    if (result.type === 'ok') void refreshCodexQuota();
     if (!mountedRef.current) return;
     switch (result.type) {
       case 'failed':

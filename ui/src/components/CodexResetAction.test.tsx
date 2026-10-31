@@ -5,6 +5,7 @@ import { CodexResetAction } from './CodexResetAction';
 import { ErrorBanner } from './ErrorBanner';
 import { getErrorPresentation } from '../errorPresentation';
 import type { CodexResetCredits } from '../generated/CodexResetCredits';
+import { setPendingRedemption } from '../codexResets';
 
 vi.mock('../codexResets', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../codexResets')>()),
@@ -21,6 +22,7 @@ const twoResets: CodexResetCredits = {
 };
 
 afterEach(() => {
+  setPendingRedemption(null);
   vi.restoreAllMocks();
 });
 
@@ -132,5 +134,72 @@ describe('ErrorBanner reset integration (REQ-CRR-008)', () => {
     await act(async () => { resolve({ type: 'ok', response: { outcome: 'reset', windows_reset: 2 } }); });
     expect(retryA).not.toHaveBeenCalled();
     expect(retryB).not.toHaveBeenCalled();
+  });
+
+  it('resumes at most once when the user also clicks Retry during the redemption', async () => {
+    vi.spyOn(api, 'codexResetCredits').mockResolvedValue({ type: 'ok', credits: twoResets });
+    let resolve: (value: CodexRedeemResult) => void = () => undefined;
+    vi.spyOn(api, 'codexRedeemReset').mockImplementation(() => new Promise((r) => { resolve = r; }));
+    const onRetry = vi.fn();
+    render(
+      <ErrorBanner
+        message="You've hit your usage limit."
+        error={getErrorPresentation('usage_limit_reached')}
+        onRetry={onRetry}
+        onDismiss={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: /use reset/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /full reset.*expires/i }));
+    fireEvent.click(screen.getByRole('button', { name: /yes, use reset/i }));
+    fireEvent.click(screen.getByRole('button', { name: /retry.*continue/i }));
+    await act(async () => { resolve({ type: 'ok', response: { outcome: 'reset', windows_reset: 2 } }); });
+    expect(onRetry).toHaveBeenCalledOnce();
+  });
+
+  it('does not resume when the user sent a message since the banner appeared', async () => {
+    vi.spyOn(api, 'codexResetCredits').mockResolvedValue({ type: 'ok', credits: twoResets });
+    vi.spyOn(api, 'codexRedeemReset').mockResolvedValue({ type: 'ok', response: { outcome: 'reset', windows_reset: 2 } });
+    const onRetry = vi.fn();
+    const userActionSeq = { current: 3 };
+    render(
+      <ErrorBanner
+        message="You've hit your usage limit."
+        error={getErrorPresentation('usage_limit_reached')}
+        onRetry={onRetry}
+        onDismiss={vi.fn()}
+        conversationId="conv-a"
+        userActionSeq={userActionSeq}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: /use reset/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /full reset.*expires/i }));
+    userActionSeq.current = 4;
+    fireEvent.click(screen.getByRole('button', { name: /yes, use reset/i }));
+    expect(await screen.findByText(/usage reset/i)).toBeInTheDocument();
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it('drops an in-flight redemption when the banner switches conversation (local key)', async () => {
+    vi.spyOn(api, 'codexResetCredits').mockResolvedValue({ type: 'ok', credits: twoResets });
+    let resolve: (value: CodexRedeemResult) => void = () => undefined;
+    vi.spyOn(api, 'codexRedeemReset').mockImplementation(() => new Promise((r) => { resolve = r; }));
+    const onRetry = vi.fn();
+    const banner = (conversationId: string) => (
+      <ErrorBanner
+        message="You've hit your usage limit."
+        error={getErrorPresentation('usage_limit_reached')}
+        onRetry={onRetry}
+        onDismiss={vi.fn()}
+        conversationId={conversationId}
+      />
+    );
+    const { rerender } = render(banner('conv-a'));
+    fireEvent.click(await screen.findByRole('button', { name: /use reset/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /full reset.*expires/i }));
+    fireEvent.click(screen.getByRole('button', { name: /yes, use reset/i }));
+    rerender(banner('conv-b'));
+    await act(async () => { resolve({ type: 'ok', response: { outcome: 'reset', windows_reset: 2 } }); });
+    expect(onRetry).not.toHaveBeenCalled();
   });
 });

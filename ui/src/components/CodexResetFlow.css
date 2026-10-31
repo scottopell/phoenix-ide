@@ -21,13 +21,16 @@
   color: var(--text-muted);
 }
 
-.codex-reset-flow__notice,
+.codex-reset-flow__notice {
+  color: var(--accent-yellow);
+}
+
 .codex-reset-flow__error {
-  color: var(--accent-amber, #d80);
+  color: var(--accent-red);
 }
 
 .codex-reset-flow__success {
-  color: var(--accent-green, #2a9);
+  color: var(--accent-green);
 }
 
 .codex-reset-flow__options {
@@ -87,13 +90,13 @@
 }
 
 .codex-reset-flow__btn--primary {
-  background: var(--accent-color, #3b82f6);
-  border-color: var(--accent-color, #3b82f6);
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
   color: white;
 }
 
 .codex-reset-flow__btn--primary:hover:not(:disabled) {
-  background: var(--accent-hover, #2563eb);
+  filter: brightness(1.1);
   color: white;
 }
 
@@ -110,7 +113,7 @@
 .codex-reset-availability__use {
   padding: 2px 8px;
   background: transparent;
-  color: var(--accent-color, #3b82f6);
+  color: var(--accent-blue);
   border: 1px solid currentcolor;
   border-radius: 4px;
   font: inherit;

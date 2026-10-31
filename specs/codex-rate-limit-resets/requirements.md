@@ -67,9 +67,10 @@ value rather than failing the whole listing
 AND SHALL report a negative upstream available count as zero
 AND SHALL report the account identifier the listing was read for
 
-WHEN a listed credit carries a grant or expiry time that is not valid RFC3339
+WHEN a listed credit carries a grant or expiry time that is not valid RFC3339,
+or an empty identifier
 THE SYSTEM SHALL fail the listing as an upstream failure rather than invent a
-time
+time or offer a credit that cannot be redeemed
 
 WHEN no ChatGPT credential is loaded
 THE SYSTEM SHALL answer the listing with a signed-out response distinct from an
@@ -205,9 +206,13 @@ spend gated behind a deliberate second step.
 
 ### REQ-CRR-007: Redemption Outcome Handling
 
+WHEN the upstream answers a redemption with any outcome
+THE SYSTEM SHALL refresh the account quota, even if the view that started the
+redemption has closed
+
 WHEN a redemption answers `reset` or `already_redeemed`
 THE SYSTEM SHALL treat the redemption as successful
-AND SHALL refresh the displayed account quota and reset listing
+AND SHALL refresh the reset listing
 
 WHEN a redemption answers `nothing_to_reset`
 THE SYSTEM SHALL tell the user that their usage does not need a reset right
@@ -226,12 +231,12 @@ WHEN a redemption fails without an outcome (transport failure, upstream
 failure, or timeout)
 THE SYSTEM SHALL tell the user the reset could not be applied
 AND SHALL offer only to try again with the same idempotency key and credit
-choice, or to close, so a redemption whose response was lost cannot be followed
-by a fresh key for a different choice in the same flow
-AND SHALL refresh the account quota whenever a redemption answers, even if the
-view that started it has closed
+choice, or to close
+AND SHALL keep that unanswered redemption pending until a redemption attempt
+for it answers, so that reopening the choose-and-confirm flow from either
+surface offers only that same retry rather than a fresh choice and key
 
-WHEN a redemption answers that no ChatGPT credential is loaded
+WHEN a redemption or a listing answers that no ChatGPT credential is loaded
 THE SYSTEM SHALL tell the user to sign in and SHALL NOT offer a retry
 
 WHEN a redemption answers that the account changed
@@ -240,7 +245,9 @@ account
 
 **Rationale:** The four outcome codes and their user-facing meanings are the
 upstream contract. Reusing the key on retry turns a lost success into
-`already_redeemed` instead of a second spend.
+`already_redeemed` instead of a second spend; holding the unanswered
+redemption pending closes the same gap for a user who closes and reopens the
+flow. The pending redemption lives in the page and does not survive a reload.
 
 ---
 
@@ -256,7 +263,10 @@ the error's Retry action, without a further user action
 WHEN that conversation has left the error state before the redemption
 succeeds (for example the window elapsed and the error cleared, or the user
 retried or dismissed it)
+OR the user has sent a message, retried, or dismissed the error since that
+error display appeared, even if the displayed state has not yet changed
 THE SYSTEM SHALL NOT resume the conversation on the redemption's behalf
+AND SHALL resume a conversation at most once per error display
 
 WHEN a redemption started from a conversation's error does not succeed
 THE SYSTEM SHALL leave the conversation in its error state with its existing
@@ -302,8 +312,10 @@ AND SHALL refuse a redemption whose named account differs from the account of
 the token it would be sent with
 
 WHEN the credential is signed out or replaced while a request is in flight
-THE SYSTEM SHALL let the in-flight request finish or fail against the
-credential it started with, and SHALL NOT retry it against the replacement
+THE SYSTEM SHALL NOT send that request's redemption for any account other than
+the one it names
+AND SHALL report a request that loses its credential mid-flight as an upstream
+failure
 
 **Rationale:** Reset credits belong to an account. Pairing the token and
 account identifier from one credential is what prevents a cross-account

@@ -26,7 +26,7 @@ pub enum CodexResetCreditStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct CodexResetCredit {
-    pub id: String,
+    pub id: CodexResetCreditId,
     pub reset_type: CodexResetType,
     pub status: CodexResetCreditStatus,
     /// Unix seconds.

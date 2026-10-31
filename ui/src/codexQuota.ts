@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import type { QuotaDetails } from './sseSchemas';
 
 let snapshot: QuotaDetails | null = null;
-// Bumped on clear (sign-out / account switch) so a late refresh is discarded.
+// Bumped by every clear so a refresh started before the clear is discarded.
 let generation = 0;
 const listeners = new Set<() => void>();
 

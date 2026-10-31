@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api, type CodexRedeemResult } from '../api';
 import { CodexResetFlow } from './CodexResetFlow';
+import { setPendingRedemption } from '../codexResets';
 import type { CodexResetCredits } from '../generated/CodexResetCredits';
 
 vi.mock('../codexResets', async (importOriginal) => ({
@@ -28,6 +29,7 @@ describe('CodexResetFlow', () => {
     vi.spyOn(api, 'codexResetCredits').mockResolvedValue({ type: 'ok', credits: listing });
   });
   afterEach(() => {
+    setPendingRedemption(null);
     vi.restoreAllMocks();
   });
 
@@ -191,5 +193,35 @@ describe('CodexResetFlow', () => {
     fireEvent.click(screen.getByRole('button', { name: /yes, use reset/i }));
     expect(await screen.findByText(/sign in to chatgpt/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /try again/i })).not.toBeInTheDocument();
+  });
+
+  it('reopening after a lost answer offers only the same redemption (no second spend)', async () => {
+    const listingSpy = vi.spyOn(api, 'codexResetCredits');
+    const redeem = vi.spyOn(api, 'codexRedeemReset')
+      .mockResolvedValueOnce({ type: 'failed' })
+      .mockResolvedValueOnce({ type: 'ok', response: { outcome: 'already_redeemed', windows_reset: 0 } });
+    const first = render(<CodexResetFlow onClose={vi.fn()} />);
+    await chooseAndConfirmView();
+    fireEvent.click(screen.getByRole('button', { name: /yes, use reset/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /close/i }));
+    first.unmount();
+
+    render(<CodexResetFlow onClose={vi.fn()} />);
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /full reset \(weekly/i })).not.toBeInTheDocument();
+    expect(listingSpy).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: /try again/i }));
+    await screen.findByText(/usage reset/i);
+    expect(redeem.mock.calls[1]?.[0]).toEqual(redeem.mock.calls[0]?.[0]);
+
+    // Answered: the next flow starts from a fresh listing.
+    render(<CodexResetFlow onClose={vi.fn()} />);
+    await waitFor(() => expect(listingSpy).toHaveBeenCalledTimes(2));
+  });
+
+  it('shows a sign-in message when the listing reports signed out', async () => {
+    vi.spyOn(api, 'codexResetCredits').mockResolvedValue({ type: 'signed_out' });
+    render(<CodexResetFlow onClose={vi.fn()} />);
+    expect(await screen.findByText(/sign in to chatgpt/i)).toBeInTheDocument();
   });
 });
