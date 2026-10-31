@@ -16270,6 +16270,41 @@ fn cleared_creation_intent_json() -> String {
     .to_string()
 }
 
+fn initial_steering_execution_outcome(state: &ConvState) -> Option<phoenix_workflow::TurnTerminal> {
+    match state {
+        ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
+            Some(phoenix_workflow::TurnTerminal::Completed)
+        }
+        ConvState::CreationCancelled { .. } => Some(phoenix_workflow::TurnTerminal::Cancelled),
+        ConvState::Error { message, .. } => Some(phoenix_workflow::TurnTerminal::Failed {
+            reason: message.clone(),
+        }),
+        ConvState::ContextExhausted { .. } => Some(phoenix_workflow::TurnTerminal::Failed {
+            reason: "context exhausted".into(),
+        }),
+        ConvState::RecoverableContinuationFailure { .. } => {
+            Some(phoenix_workflow::TurnTerminal::Failed {
+                reason: "continuation failed".into(),
+            })
+        }
+        ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ServerOverloadRetrying { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Failed { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::HandedOff { .. } => None,
+    }
+}
+
 pub(crate) async fn record_initial_execution_outcome_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
@@ -16288,38 +16323,7 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     if let Some((message_id, source_kind)) = steering {
         let source_kind =
             crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
-        let outcome = match state {
-            ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
-                Some(phoenix_workflow::TurnTerminal::Completed)
-            }
-            ConvState::CreationCancelled { .. } => Some(phoenix_workflow::TurnTerminal::Cancelled),
-            ConvState::Error { message, .. } => Some(phoenix_workflow::TurnTerminal::Failed {
-                reason: message.clone(),
-            }),
-            ConvState::ContextExhausted { .. } => Some(phoenix_workflow::TurnTerminal::Failed {
-                reason: "context exhausted".into(),
-            }),
-            ConvState::RecoverableContinuationFailure { .. } => {
-                Some(phoenix_workflow::TurnTerminal::Failed {
-                    reason: "continuation failed".into(),
-                })
-            }
-            ConvState::LlmRequesting { .. }
-            | ConvState::SeededLlmRequesting { .. }
-            | ConvState::ServerOverloadRetrying { .. }
-            | ConvState::Provisioning { .. }
-            | ConvState::ToolExecuting { .. }
-            | ConvState::CancellingTool { .. }
-            | ConvState::AwaitingSubAgents { .. }
-            | ConvState::CancellingSubAgents { .. }
-            | ConvState::Failed { .. }
-            | ConvState::AwaitingRecovery { .. }
-            | ConvState::AwaitingContinuation { .. }
-            | ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. }
-            | ConvState::CreationFailed { .. }
-            | ConvState::HandedOff { .. } => None,
-        };
+        let outcome = initial_steering_execution_outcome(state);
         if let Some(terminal) = outcome {
             let terminal = crate::coordinator_watches::consume_execution_cancel_tx(
                 tx,
