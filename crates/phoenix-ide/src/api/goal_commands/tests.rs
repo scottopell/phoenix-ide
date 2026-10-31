@@ -473,6 +473,99 @@ async fn nonsettled_runtime_refuses_commands_and_unknown_product_targets_do_not_
 }
 
 #[tokio::test]
+async fn synthetic_unclassified_preparation_closes_authority_before_releasing_admission() {
+    let fixture = Fixture::new().await;
+    let authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+        fixture
+            .state
+            .runtime
+            .acquire_local_authority_pass()
+            .unwrap(),
+    );
+
+    assert!(authority
+        .complete::<()>(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
+        .is_err());
+    assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .fatal_authority_owners_at_first_close(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn synthetic_abandoned_preparation_closes_authority_before_releasing_admission() {
+    let fixture = Fixture::new().await;
+    let authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+        fixture
+            .state
+            .runtime
+            .acquire_local_authority_pass()
+            .unwrap(),
+    );
+
+    drop(authority);
+    assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .fatal_authority_owners_at_first_close(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn synthetic_panicked_preparation_closes_authority_before_releasing_admission() {
+    let fixture = Fixture::new().await;
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+            fixture
+                .state
+                .runtime
+                .acquire_local_authority_pass()
+                .unwrap(),
+        );
+        panic!("synthetic preparation panic");
+    }));
+
+    assert!(panicked.is_err());
+    assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .fatal_authority_owners_at_first_close(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn established_preparation_rejection_disarms_without_closing_authority() {
+    let fixture = Fixture::new().await;
+    let authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+        fixture
+            .state
+            .runtime
+            .acquire_local_authority_pass()
+            .unwrap(),
+    );
+
+    assert!(authority
+        .complete::<()>(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                phoenix_db::conversation_goals::GoalDbError::RetryConflict,
+            )),
+        )
+        .is_err());
+    assert!(!fixture.state.runtime.fatal_local_authority_is_latched());
+    assert!(fixture.state.runtime.acquire_local_authority_pass().is_ok());
+}
+
+#[tokio::test]
 async fn unclassified_goal_write_latches_fatal_and_blocks_next_admission() {
     let fixture = Fixture::new().await;
     let before = fixture.snapshot().await;

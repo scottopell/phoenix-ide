@@ -595,9 +595,12 @@ async fn native_goal_target_rollover_follows_live_owner_and_replays_old_referenc
 }
 
 #[tokio::test]
-async fn native_goal_tools_refuse_suspended_reactivation_and_stop_expansion() {
-    use phoenix_core::domain::conversation_goal::{GoalDisposition, GoalText};
+#[allow(clippy::too_many_lines)]
+async fn native_suspended_goal_replacement_uses_auto_continue_admission_and_preserves_history() {
+    use phoenix_core::domain::conversation_goal::{GoalDisposition, GoalState, GoalText};
+    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion as Preference;
     use phoenix_db::conversation_goals::user_commands::{GoalUserChange, GoalUserCommand};
+
     let f = Fixture::new().await;
     let prepared = f
         .prepare(json!({"operation":"create","objective":"suspension boundary"}))
@@ -630,28 +633,92 @@ async fn native_goal_tools_refuse_suspended_reactivation_and_stop_expansion() {
     .established()
     .unwrap()
     .unwrap();
-    let before = f.work_counts().await;
+    let work_before = f.work_counts().await;
+    let suspended = f.db.conversation_goal(&f.owner).await.unwrap().unwrap();
+    let old_goal_id = suspended.goal_id().clone();
+    assert!(matches!(suspended.state(), GoalState::Suspended(_)));
+
+    let underway = f
+        .invoke(
+            "prepare_goal",
+            json!({
+                "target": f.target(),
+                "action": {"operation":"state","disposition":{"state":"underway"}}
+            }),
+        )
+        .await;
+    assert!(!underway.is_success());
+    assert!(underway.output().contains("explicit Start"));
+    assert!(!f
+        .invoke("prepare_goal", json!({"target":f.target(),"action":{"operation":"state","disposition":{"state":"suspended","reason":"not a Stop tool"}}}))
+        .await
+        .is_success());
+    assert_eq!(
+        f.db.conversation_goal(&f.owner).await.unwrap(),
+        Some(suspended.clone())
+    );
+
+    f.db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Disabled)
+        .await
+        .unwrap();
     let history_before =
         f.db.conversation_goal_history(&f.owner, GoalVersion::INITIAL)
             .await
             .unwrap();
-    for action in [
-        json!({"operation":"replace","objective":"must not bypass Start"}),
-        json!({"operation":"state","disposition":{"state":"underway"}}),
-        json!({"operation":"state","disposition":{"state":"suspended","reason":"not a Stop tool"}}),
-    ] {
-        assert!(!f
-            .invoke("prepare_goal", json!({"target":f.target(),"action":action}))
-            .await
-            .is_success());
-    }
+    let disabled = f
+        .prepare(json!({"operation":"replace","objective":"replacement"}))
+        .await;
+    let refused = f.apply(&disabled).await;
+    assert!(!refused.is_success());
+    assert!(refused.output().contains("enable automatic continuation"));
+    assert_eq!(
+        f.db.conversation_goal(&f.owner).await.unwrap(),
+        Some(suspended.clone())
+    );
     assert_eq!(
         f.db.conversation_goal_history(&f.owner, GoalVersion::INITIAL)
             .await
             .unwrap(),
         history_before
     );
-    assert_eq!(f.work_counts().await, before);
+
+    f.db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Enabled)
+        .await
+        .unwrap();
+    let enabled = f
+        .prepare(json!({"operation":"replace","objective":"replacement"}))
+        .await;
+    let accepted = f.apply(&enabled).await;
+    assert!(accepted.is_success(), "{}", accepted.output());
+    let replacement = f.db.conversation_goal(&f.owner).await.unwrap().unwrap();
+    assert_ne!(replacement.goal_id(), &old_goal_id);
+    assert_eq!(replacement.objective().as_str(), "replacement");
+    let history_after =
+        f.db.conversation_goal_history(&f.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap();
+    assert_eq!(history_after.len(), history_before.len() + 1);
+    assert_eq!(
+        &history_after[..history_before.len()],
+        history_before.as_slice()
+    );
+    assert!(history_after.iter().any(|entry| {
+        entry.goal_id() == &old_goal_id && matches!(entry.state(), GoalState::Suspended(_))
+    }));
+
+    f.db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Disabled)
+        .await
+        .unwrap();
+    let replay = f.apply(&enabled).await;
+    assert!(replay.is_success());
+    assert_eq!(replay.output(), accepted.output());
+    assert_eq!(
+        f.db.conversation_goal_history(&f.owner, GoalVersion::INITIAL)
+            .await
+            .unwrap(),
+        history_after
+    );
+    assert_eq!(f.work_counts().await, work_before);
 }
 
 #[tokio::test]

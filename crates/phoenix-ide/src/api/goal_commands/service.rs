@@ -12,7 +12,40 @@ use phoenix_db::conversation_goals::user_commands::{
 
 use super::goal_error;
 use crate::api::{auth::OwnerAuthenticated, handlers::AppError};
-use crate::runtime::RuntimeManager;
+use crate::runtime::{AdmittedOperation, RuntimeManager};
+
+pub(super) struct CoordinatorGoalPreparationAuthorityPass {
+    owner: Option<AdmittedOperation>,
+}
+
+impl CoordinatorGoalPreparationAuthorityPass {
+    pub(super) fn new(owner: AdmittedOperation) -> Self {
+        Self { owner: Some(owner) }
+    }
+
+    pub(super) fn complete<T>(
+        mut self,
+        result: LocalAuthorityResult<Result<T, phoenix_db::conversation_goals::GoalDbError>>,
+    ) -> Result<T, AppError> {
+        match result {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                self.owner.take();
+                result.map_err(goal_error)
+            }
+            LocalAuthorityResult::DurableFactUnclassified => Err(AppError::Internal(
+                "Goal preparation durability is unclassified; local authority closed".into(),
+            )),
+        }
+    }
+}
+
+impl Drop for CoordinatorGoalPreparationAuthorityPass {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.close("coordinator_goal_preparation");
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct GoalCommandService {
@@ -81,16 +114,17 @@ impl GoalCommandService {
         intent: GoalPreparationIntent,
         turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId,
     ) -> Result<PreparedGoalAction, AppError> {
-        let _authority = self
-            .runtime
-            .acquire_local_authority_pass()
-            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
-        let result = self
+        let authority = CoordinatorGoalPreparationAuthorityPass::new(
+            self.runtime
+                .acquire_local_authority_pass()
+                .map_err(|()| AppError::Internal("local authority is closed".into()))?,
+        );
+        let classified = self
             .runtime
             .db()
             .prepare_coordinator_goal_action(caller, owner, source_tool_call, turn_id, intent)
-            .await
-            .map_err(goal_error)?;
+            .await;
+        let result = authority.complete(classified)?;
         self.runtime
             .db()
             .require_current_coordinator(caller)

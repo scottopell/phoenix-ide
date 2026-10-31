@@ -140,6 +140,8 @@ async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatchin
             create_intent("first objective"),
         )
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     assert_eq!(action.owner, owner);
     assert_eq!(action.expected_version, GoalVersion::INITIAL);
@@ -192,6 +194,8 @@ async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatchin
             create_intent("first objective"),
         )
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     assert_eq!(retry.reference, action.reference);
     assert_eq!(retry.expected_version, action.expected_version);
@@ -212,10 +216,101 @@ async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatchin
             turn,
             create_intent("changed objective")
         )
-        .await,
+        .await
+        .established()
+        .expect("preparation authority classified"),
         Err(GoalDbError::RetryConflict)
     ));
     assert_eq!(preparation_count(&db).await, 1);
+}
+
+#[tokio::test]
+async fn preparation_acknowledged_rollback_is_established_and_preserves_retained_action() {
+    let db = fixture().await;
+    let (caller, _, source_call, turn) = coordinator_source(&db, "prep-rollback").await;
+    let (_, owner) = ordinary(&db, "prep-rollback-owner").await;
+    let retained = db
+        .prepare_coordinator_goal_action(
+            &caller,
+            &owner,
+            &source_call,
+            turn,
+            create_intent("original"),
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let before = counts(&db).await;
+    let conflict = db
+        .prepare_coordinator_goal_action(
+            &caller,
+            &owner,
+            &source_call,
+            turn,
+            create_intent("changed"),
+        )
+        .await;
+    assert!(matches!(
+        conflict,
+        crate::workflow::LocalAuthorityResult::Established(Err(GoalDbError::RetryConflict))
+    ));
+    assert_eq!(preparation_count(&db).await, 1);
+    assert_eq!(counts(&db).await, before);
+    assert_eq!(
+        db.prepared_goal_action(&retained.reference)
+            .await
+            .unwrap()
+            .unwrap(),
+        retained
+    );
+}
+
+#[tokio::test]
+async fn preparation_lost_commit_ack_is_unclassified_and_source_retry_recovers_one_action() {
+    let db = fixture().await;
+    let before = counts(&db).await;
+    let (caller, _, source_call, turn) = coordinator_source(&db, "prep-lost-ack").await;
+    let (_, owner) = ordinary(&db, "prep-lost-ack-owner").await;
+    let intent = create_intent("retained after lost commit acknowledgment");
+
+    let result = db
+        .prepare_coordinator_goal_action_with_commit(
+            &caller,
+            &owner,
+            &source_call,
+            turn,
+            intent.clone(),
+            PreparationCommit::LoseAcknowledgement,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+    ));
+    assert_eq!(preparation_count(&db).await, 1);
+    assert_eq!(counts(&db).await, before);
+    let retained_row = sqlx::query("SELECT * FROM conversation_goal_preparations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let retained = decode(&retained_row).unwrap();
+
+    let recovered = db
+        .prepare_coordinator_goal_action(&caller, &owner, &source_call, turn, intent)
+        .await
+        .established()
+        .expect("source retry commit was acknowledged")
+        .unwrap();
+    assert_eq!(recovered, retained);
+    assert_eq!(preparation_count(&db).await, 1);
+    assert_eq!(counts(&db).await, before);
+    assert_eq!(
+        db.read_coordinator_goal_preparation(&caller, recovered.reference)
+            .await
+            .unwrap(),
+        recovered
+    );
 }
 
 #[tokio::test]
@@ -232,6 +327,8 @@ async fn prepared_command_observes_version_cas_and_replays_retained_refusal() {
             create_intent("stale objective"),
         )
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     let command = action.command(Uuid::new_v4()).unwrap();
     let intervention = crate::conversation_goals::user_commands::GoalUserCommand {
@@ -316,6 +413,8 @@ async fn prepared_command_accepts_real_coordinator_source_and_replays_without_mu
             create_intent("coordinator objective"),
         )
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     let command = action.command(Uuid::new_v4()).unwrap();
     assert_eq!(command.request_id, action.reference);
@@ -373,7 +472,9 @@ async fn preparation_requires_exact_server_turn_and_current_coordinator() {
             DirectTurnTurnId(0),
             create_intent("wrong execution"),
         )
-        .await,
+        .await
+        .established()
+        .expect("preparation authority classified"),
         Err(GoalDbError::TargetChanged)
     ));
     assert!(matches!(
@@ -384,13 +485,17 @@ async fn preparation_requires_exact_server_turn_and_current_coordinator() {
             turn,
             create_intent("wrong role"),
         )
-        .await,
+        .await
+        .established()
+        .expect("preparation authority classified"),
         Err(GoalDbError::TargetChanged)
     ));
     assert_eq!(preparation_count(&db).await, 0);
     let prepared = db
         .prepare_coordinator_goal_action(&caller, &owner, &call, turn, create_intent("retained"))
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     assert!(matches!(
         db.prepare_coordinator_goal_action(
@@ -400,7 +505,9 @@ async fn preparation_requires_exact_server_turn_and_current_coordinator() {
             DirectTurnTurnId(0),
             create_intent("retained"),
         )
-        .await,
+        .await
+        .established()
+        .expect("preparation authority classified"),
         Err(GoalDbError::RetryConflict)
     ));
     assert_eq!(
@@ -426,6 +533,8 @@ async fn coordinator_payload_and_source_are_checked_before_busy_and_receipt_repl
             create_intent("authorized objective"),
         )
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     let command = action.command(Uuid::new_v4()).unwrap();
 
@@ -532,6 +641,8 @@ async fn preparation_schema_rejects_update_delete_replace_and_malformed_shape() 
             create_intent("immutable action"),
         )
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     assert!(sqlx::query(
         "UPDATE conversation_goal_preparations SET objective='overwrite' WHERE reference=?"
@@ -569,6 +680,8 @@ async fn preparation_retains_source_locators_after_message_deletion_and_owner_ca
             create_intent("retained source"),
         )
         .await
+        .established()
+        .expect("preparation authority classified")
         .unwrap();
     let command = prepared.command(Uuid::new_v4()).unwrap();
     db.apply_coordinator_goal_command(

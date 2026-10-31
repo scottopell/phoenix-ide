@@ -243,81 +243,123 @@ impl Database {
         source_call: &SourceToolCall,
         turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId,
         intent: GoalPreparationIntent,
-    ) -> Result<PreparedGoalAction> {
-        let turn_id = i64::try_from(turn_id.0)
-            .map_err(|_| GoalDbError::Invalid("durable turn ID is out of range"))?;
-        let mut connection = self.pool().acquire().await?;
-        let mut tx = sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await?;
-        require_coordinator(&mut tx, caller).await?;
-        if let Some(row) = sqlx::query("SELECT * FROM conversation_goal_preparations WHERE caller_conversation_id=? AND message_id=? AND tool_use_id=?")
-            .bind(caller).bind(&source_call.message_id).bind(&source_call.tool_use_id).fetch_optional(&mut *tx).await? {
-            let previous = decode(&row)?;
-            if previous.owner != *owner || previous.intent != intent || previous.source.execution.turn_id() != turn_id { return Err(GoalDbError::RetryConflict); }
-            tx.rollback().await?;
-            return Ok(previous);
-        }
-        let source_row = sqlx::query("SELECT c.product_conversation_id,t.workflow_id,t.turn_id FROM conversations c JOIN durable_turns t ON t.conversation_id=c.id WHERE c.id=? AND t.turn_id=? AND t.disposition='Runtime' AND t.terminal_kind IS NULL AND t.owns_conversation=1")
-            .bind(caller).bind(turn_id).fetch_optional(&mut *tx).await?.ok_or(GoalDbError::TargetChanged)?;
-        let source = GoalAgentSource {
-            product_conversation_id: ProductConversationId::parse(
-                source_row.try_get::<String, _>("product_conversation_id")?,
-            )
-            .map_err(|_| GoalDbError::Integrity("source product"))?,
-            transcript_id: GoalText::parse(caller)?,
-            execution: GoalExecution::parse(
-                source_row.try_get("workflow_id")?,
-                source_row.try_get("turn_id")?,
-            )?,
-            message_id: GoalText::parse(source_call.message_id.clone())?,
-            tool_use_id: GoalText::parse(source_call.tool_use_id.clone())?,
-        };
-        let message: Option<String> = sqlx::query_scalar("SELECT content FROM messages WHERE conversation_id=? AND message_id=? AND message_type='agent'")
-            .bind(caller).bind(&source_call.message_id).fetch_optional(&mut *tx).await?;
-        let blocks: Vec<phoenix_core::domain::llm_types::ContentBlock> =
-            serde_json::from_str(&message.ok_or(GoalDbError::TargetChanged)?)
-                .map_err(|_| GoalDbError::Integrity("source tool message content"))?;
-        if !blocks.iter().any(|block| matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. } if id == &source_call.tool_use_id)) { return Err(GoalDbError::TargetChanged); }
-        let live = Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
-        super::admission::require_target_tx(&mut tx, owner, &live.latest_transcript_row_id).await?;
-        let current = current_tx(&mut tx, owner).await?;
-        let (expected_version, observed_goal_id) = match (&intent, current.as_ref()) {
-            (GoalPreparationIntent::Create { .. }, None) => (GoalVersion::INITIAL, None),
-            (GoalPreparationIntent::Replace { .. }, Some(current)) => {
-                if matches!(current.state(), GoalState::Suspended(_)) {
-                    return Err(GoalDbError::Invalid("Suspended Goal requires explicit Start; replacement tools cannot reactivate it"));
-                }
-                (current.version(), Some(current.goal_id().clone()))
-            }
-            (GoalPreparationIntent::State { disposition }, Some(current)) => {
-                if matches!(disposition, GoalCommandDisposition::Underway)
-                    && matches!(current.state(), GoalState::Suspended(_))
-                {
-                    return Err(GoalDbError::Invalid("Suspended Goal requires explicit Start; disposition tools cannot reactivate it"));
-                }
-                (current.version(), Some(current.goal_id().clone()))
-            }
-            (GoalPreparationIntent::Create { .. }, Some(_)) => {
-                return Err(GoalDbError::Invalid(
-                    "Goal exists; use explicit replace after reading current Goal/history",
-                ))
-            }
-            _ => return Err(GoalDbError::Invalid("No saved Goal; use create first")),
-        };
-        let reference = Uuid::new_v4();
-        let (operation, objective, disposition, reason) = columns(&intent);
-        sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(reference.as_bytes().as_slice()).bind(owner.as_str()).bind(caller).bind(source.product_conversation_id.as_str())
-            .bind(source.execution.workflow_id()).bind(source.execution.turn_id()).bind(source.message_id.as_str()).bind(source.tool_use_id.as_str())
-            .bind(operation).bind(expected_version.get()).bind(observed_goal_id.as_ref().map(GoalId::as_str)).bind(objective).bind(disposition).bind(reason).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(PreparedGoalAction {
-            reference,
-            owner: owner.clone(),
-            source,
-            expected_version,
-            observed_goal_id,
+    ) -> crate::workflow::LocalAuthorityResult<Result<PreparedGoalAction>> {
+        self.prepare_coordinator_goal_action_with_commit(
+            caller,
+            owner,
+            source_call,
+            turn_id,
             intent,
-        })
+            PreparationCommit::Normal,
+        )
+        .await
+    }
+
+    async fn prepare_coordinator_goal_action_with_commit(
+        &self,
+        caller: &str,
+        owner: &ProductConversationId,
+        source_call: &SourceToolCall,
+        turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId,
+        intent: GoalPreparationIntent,
+        commit: PreparationCommit,
+    ) -> crate::workflow::LocalAuthorityResult<Result<PreparedGoalAction>> {
+        use crate::workflow::LocalAuthorityResult;
+
+        let turn_id = match i64::try_from(turn_id.0) {
+            Ok(turn_id) => turn_id,
+            Err(_) => {
+                return LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::Invalid(
+                    "durable turn ID is out of range",
+                )))
+            }
+        };
+        let mut connection = match self.pool().acquire().await {
+            Ok(connection) => connection,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let mut tx = match sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            require_coordinator(&mut tx, caller).await?;
+            if let Some(row) = sqlx::query("SELECT * FROM conversation_goal_preparations WHERE caller_conversation_id=? AND message_id=? AND tool_use_id=?")
+                .bind(caller).bind(&source_call.message_id).bind(&source_call.tool_use_id).fetch_optional(&mut *tx).await? {
+                let previous = decode(&row)?;
+                if previous.owner != *owner || previous.intent != intent || previous.source.execution.turn_id() != turn_id { return Err(GoalDbError::RetryConflict); }
+                return Ok(previous);
+            }
+            let source_row = sqlx::query("SELECT c.product_conversation_id,t.workflow_id,t.turn_id FROM conversations c JOIN durable_turns t ON t.conversation_id=c.id WHERE c.id=? AND t.turn_id=? AND t.disposition='Runtime' AND t.terminal_kind IS NULL AND t.owns_conversation=1")
+                .bind(caller).bind(turn_id).fetch_optional(&mut *tx).await?.ok_or(GoalDbError::TargetChanged)?;
+            let source = GoalAgentSource {
+                product_conversation_id: ProductConversationId::parse(
+                    source_row.try_get::<String, _>("product_conversation_id")?,
+                )
+                .map_err(|_| GoalDbError::Integrity("source product"))?,
+                transcript_id: GoalText::parse(caller)?,
+                execution: GoalExecution::parse(
+                    source_row.try_get("workflow_id")?,
+                    source_row.try_get("turn_id")?,
+                )?,
+                message_id: GoalText::parse(source_call.message_id.clone())?,
+                tool_use_id: GoalText::parse(source_call.tool_use_id.clone())?,
+            };
+            let message: Option<String> = sqlx::query_scalar("SELECT content FROM messages WHERE conversation_id=? AND message_id=? AND message_type='agent'")
+                .bind(caller).bind(&source_call.message_id).fetch_optional(&mut *tx).await?;
+            let blocks: Vec<phoenix_core::domain::llm_types::ContentBlock> =
+                serde_json::from_str(&message.ok_or(GoalDbError::TargetChanged)?)
+                    .map_err(|_| GoalDbError::Integrity("source tool message content"))?;
+            if !blocks.iter().any(|block| matches!(block, phoenix_core::domain::llm_types::ContentBlock::ToolUse { id, .. } if id == &source_call.tool_use_id)) { return Err(GoalDbError::TargetChanged); }
+            let live = Self::get_ordinary_product_conversation_on(&mut tx, owner).await?;
+            super::admission::require_target_tx(&mut tx, owner, &live.latest_transcript_row_id).await?;
+            let current = current_tx(&mut tx, owner).await?;
+            let (expected_version, observed_goal_id) = match (&intent, current.as_ref()) {
+                (GoalPreparationIntent::Create { .. }, None) => (GoalVersion::INITIAL, None),
+                (GoalPreparationIntent::Replace { .. }, Some(current)) => {
+                    (current.version(), Some(current.goal_id().clone()))
+                }
+                (GoalPreparationIntent::State { disposition }, Some(current)) => {
+                    if matches!(disposition, GoalCommandDisposition::Underway)
+                        && matches!(current.state(), GoalState::Suspended(_))
+                    {
+                        return Err(GoalDbError::Invalid("Suspended Goal requires explicit Start; disposition tools cannot reactivate it"));
+                    }
+                    (current.version(), Some(current.goal_id().clone()))
+                }
+                (GoalPreparationIntent::Create { .. }, Some(_)) => {
+                    return Err(GoalDbError::Invalid(
+                        "Goal exists; use explicit replace after reading current Goal/history",
+                    ))
+                }
+                _ => return Err(GoalDbError::Invalid("No saved Goal; use create first")),
+            };
+            let reference = Uuid::new_v4();
+            let (operation, objective, disposition, reason) = columns(&intent);
+            sqlx::query("INSERT INTO conversation_goal_preparations(reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(reference.as_bytes().as_slice()).bind(owner.as_str()).bind(caller).bind(source.product_conversation_id.as_str())
+                .bind(source.execution.workflow_id()).bind(source.execution.turn_id()).bind(source.message_id.as_str()).bind(source.tool_use_id.as_str())
+                .bind(operation).bind(expected_version.get()).bind(observed_goal_id.as_ref().map(GoalId::as_str)).bind(objective).bind(disposition).bind(reason).execute(&mut *tx).await?;
+            Ok(PreparedGoalAction {
+                reference,
+                owner: owner.clone(),
+                source,
+                expected_version,
+                observed_goal_id,
+                intent,
+            })
+        }
+        .await;
+        match result {
+            Ok(action) => match commit.execute(tx).await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(action)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
     }
 
     /// Read a retained action by its preparation reference.
@@ -342,6 +384,23 @@ impl Database {
         let result = decode(&row)?;
         tx.rollback().await?;
         Ok(result)
+    }
+}
+
+enum PreparationCommit {
+    Normal,
+    #[cfg(test)]
+    LoseAcknowledgement,
+}
+
+impl PreparationCommit {
+    async fn execute(self, tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+        tx.commit().await?;
+        match self {
+            Self::Normal => Ok(()),
+            #[cfg(test)]
+            Self::LoseAcknowledgement => Err(sqlx::Error::WorkerCrashed.into()),
+        }
     }
 }
 
