@@ -517,8 +517,8 @@ impl Database {
         let resolved = self
             .resolve_ordinary_product_conversation(reference)
             .await?;
-        let revision: i64 = sqlx::query_scalar(
-            "SELECT root.name_revision FROM conversations root
+        let row = sqlx::query(
+            "SELECT root.id, root.name_revision FROM conversations root
              WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user'
                AND root.user_initiated = 1 AND root.parent_conversation_id IS NULL
                AND NOT EXISTS (SELECT 1 FROM conversations predecessor
@@ -527,11 +527,13 @@ impl Database {
              ORDER BY root.id LIMIT 1",
         )
         .bind(resolved.product_conversation_id.as_str())
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
+        let row = row.ok_or_else(|| DbError::ConversationNotFound(reference.to_string()))?;
         Ok(crate::ConversationNameBaseline {
             owner: resolved.product_conversation_id,
-            revision,
+            root_transcript_id: row.try_get("id")?,
+            revision: row.try_get("name_revision")?,
         })
     }
 
@@ -573,6 +575,7 @@ impl Database {
         title: &str,
         baseline: Option<&crate::ConversationNameBaseline>,
     ) -> DbResult<Option<ProductConversationId>> {
+        let title = crate::NormalizedConversationTitle::parse(title)?;
         let mut connection = self.pool.acquire().await?;
         let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
         let now = chrono::Utc::now();
@@ -613,33 +616,24 @@ impl Database {
                         .fetch_one(&mut *transaction)
                         .await?;
                 if baseline.owner != resolved.product_conversation_id
+                    || baseline.root_transcript_id != root_id
                     || baseline.revision != revision
                 {
                     return Ok(None);
                 }
             }
-            let title = title.trim();
-            if title.is_empty() {
-                return Err(DbError::Serialization(
-                    "conversation name must not be empty".into(),
-                ));
-            }
-            let slug =
-                crate::conversation_name::allocate_slug_tx(&mut transaction, title, &root_id)
-                    .await?;
-            let result = sqlx::query(
-                "UPDATE conversations
-                 SET title = ?1, slug = ?4, updated_at = ?2, name_revision = name_revision + 1
-                 WHERE id = ?3",
+            let expected_revision = baseline.map(|baseline| baseline.revision);
+            let applied = crate::product_conversation_rename::apply_conversation_name_tx(
+                &mut transaction,
+                &resolved.product_conversation_id,
+                &root_id,
+                expected_revision,
+                title.as_str(),
+                &now.to_rfc3339(),
             )
-            .bind(title)
-            .bind(now.to_rfc3339())
-            .bind(&root_id)
-            .bind(&slug)
-            .execute(&mut *transaction)
             .await?;
-            if result.rows_affected() == 0 {
-                return Err(DbError::ConversationNotFound(reference.to_string()));
+            if applied.is_none() {
+                return Ok(None);
             }
             Ok::<Option<ProductConversationId>, DbError>(Some(resolved.product_conversation_id))
         }
@@ -1136,7 +1130,7 @@ impl Database {
         result
     }
 
-    async fn resolve_ordinary_product_conversation_on(
+    pub(crate) async fn resolve_ordinary_product_conversation_on(
         connection: &mut SqliteConnection,
         reference: &str,
     ) -> DbResult<ResolvedProductConversation> {

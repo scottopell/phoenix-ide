@@ -47,7 +47,7 @@ class QualificationOutputTests(unittest.TestCase):
         step = next(node for node in check.body if isinstance(node, ast.FunctionDef)
                     and node.name == "run_step")
         namespace = dict(vars(self.dev), CHECK_TIMEOUT=600, compiler_cache_env=None,
-                         worker_budget=1, profile_work=False,
+                         worker_budget=1, profile_work=False, interrupted=threading.Event(),
                          reporter=self.reporter, results=self.results, results_lock=threading.Lock(),
                          _begin_dev_span=mock.Mock(return_value=None),
                          _finish_check_step_span=mock.Mock(),
@@ -56,16 +56,27 @@ class QualificationOutputTests(unittest.TestCase):
         self.namespace = namespace
         self.run_step = namespace["run_step"]
 
-    def execute(self, diagnostic, returncode=0, *, timeout=False):
+    def execute(self, diagnostic, returncode=0, *, timeout=False, name="cargo clippy"):
         stream = (io.BytesIO(diagnostic.encode()) if bool(os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"))
                   else io.StringIO(diagnostic))
         process = mock.Mock(pid=12345, stdout=stream, returncode=returncode)
-        process.wait.side_effect = ([subprocess.TimeoutExpired(["fixture"], 7), returncode]
-                                    if timeout else [returncode])
+        if timeout:
+            def wait(*, timeout):
+                if timeout in (3, 5):
+                    return returncode
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired(["fixture"], timeout)
+            process.wait.side_effect = wait
+        else:
+            process.wait.return_value = returncode
         with mock.patch.object(self.dev.subprocess, "Popen", return_value=process) as launch, \
              mock.patch.object(self.dev.os, "killpg") as kill, \
              mock.patch.object(self.dev.select, "select", side_effect=lambda streams, *_: (streams, [], [])):
-            result = self.run_step("cargo clippy", ["fixture"], timeout=7)
+            result = self.run_step(name, ["fixture"], timeout=0.01 if timeout else 7)
+        launch.assert_called_once()
+        if not timeout:
+            self.assertEqual(process.wait.call_count, 1)
+            self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 0.1)
         self.assertEqual(launch.call_args.kwargs["stderr"], subprocess.STDOUT)
         self.assertTrue(launch.call_args.kwargs["start_new_session"])
         qualification = bool(os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"))
@@ -104,6 +115,56 @@ class QualificationOutputTests(unittest.TestCase):
         self.assertEqual(list(diagnostic_dir.iterdir()), [diagnostic_dir / "cargo-clippy.full.log"])
         self.assertFalse((self.directory / "cargo-clippy.full.log").exists())
 
+    def test_unittest_command_is_once_and_verbose_only_with_diagnostics(self):
+        source = ast.parse((ROOT / "dev.py").read_text())
+        check = next(node for node in source.body
+                     if isinstance(node, ast.FunctionDef) and node.name == "cmd_check")
+        block = next(node for node in ast.walk(check) if isinstance(node, ast.If)
+                     and any(isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                             and isinstance(stmt.value.func, ast.Name)
+                             and stmt.value.func.id == "run_step" and stmt.value.args
+                             and isinstance(stmt.value.args[0], ast.Constant)
+                             and stmt.value.args[0].value == "dev.py unit tests"
+                             for stmt in node.orelse))
+        start = next(index for index, stmt in enumerate(block.orelse)
+                     if isinstance(stmt, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == "unittest_cmd"
+                             for target in stmt.targets))
+        code = compile(ast.Module(body=block.orelse[start:], type_ignores=[]),
+                       str(ROOT / "dev.py"), "exec")
+        for diagnostic in (None, "", str(self.directory)):
+            for profile in (None, self.directory / "profile"):
+                with self.subTest(diagnostic=diagnostic, profile=profile):
+                    env = {} if diagnostic is None else {"PHOENIX_CHECK_DIAGNOSTIC_DIR": diagnostic}
+                    run_step = mock.Mock()
+                    namespace = dict(os=os, sys=sys, ROOT=ROOT, profile_work=profile is not None,
+                                     _CHECK_PROFILE=profile, run_step=run_step)
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        exec(code, namespace)
+                    prefix = ([sys.executable, "-m", "unittest"] if profile is None else
+                              [sys.executable, str(ROOT / "scripts" / "python_unittest_profile.py")])
+                    expected = prefix + ["discover", "tests/devpy"] + (["-v"] if diagnostic else [])
+                    run_step.assert_called_once_with("dev.py unit tests", expected)
+
+    def test_unittest_capture_retains_verbose_summary_skips_and_completion(self):
+        for returncode, ending in ((0, "OK (skipped=1)"),
+                                  (1, "FAILED (failures=1, skipped=1)")):
+            with self.subTest(returncode=returncode):
+                log_path = self.directory / "devpy-unit-tests.full.log"
+                payload = ("test_one (suite.Case.test_one) ... ok\n" * 240
+                           + "test_skip (suite.Case.test_skip) ... skipped 'platform reason'\n"
+                           + "Ran 241 tests in 0.123s\n\n" + ending + "\n")
+                result, _ = self.execute(payload, returncode, name="dev.py unit tests")
+                raw = log_path.read_bytes()
+                self.assertEqual(result, returncode)
+                self.assertTrue(raw.startswith(payload.encode()))
+                self.assertIn(b"platform reason", raw)
+                self.assertIn(b"Ran 241 tests", raw)
+                self.assertIn(b"payload COMPLETE", raw)
+                self.assertIn(f"process_returncode={returncode}".encode(), raw)
+                self.assertFalse((self.directory / "cargo-clippy.full.log").exists())
+                log_path.unlink()
+
     def test_clippy_capture_cap_keeps_failure_and_marks_truncation(self):
         os.environ.pop("PHOENIX_CHECK_DIAGNOSTIC_DIR", None)
         diagnostic_dir = self.directory / "capped-diagnostics"
@@ -127,6 +188,9 @@ class QualificationOutputTests(unittest.TestCase):
         diagnostic = {"PHOENIX_CHECK_DIAGNOSTIC_DIR": str(self.directory)}
         self.assertEqual(self.dev._check_diagnostic_log_path("cargo clippy", diagnostic),
                          self.directory / "cargo-clippy.full.log")
+        self.assertEqual(self.dev._check_diagnostic_log_path("dev.py unit tests", diagnostic),
+                         self.directory / "devpy-unit-tests.full.log")
+        self.assertIsNone(self.dev._check_diagnostic_log_path("dev.py unit tests", {}))
         self.assertIsNone(self.dev._check_diagnostic_log_path("cargo test", diagnostic))
         self.assertIsNone(self.dev._check_diagnostic_log_path("cargo clippy", {"PHOENIX_GOAL_REUSE_DIR": str(self.directory)}))
 
@@ -175,13 +239,20 @@ class QualificationOutputTests(unittest.TestCase):
         stream = os.fdopen(read_fd, "rb", buffering=0)
         os.write(write_fd, b"early assertion from a test-owned pipe\n")
         process = mock.Mock(pid=12345, stdout=stream, returncode=returncode)
-        process.wait.side_effect = ([subprocess.TimeoutExpired(["fixture"], 7), returncode]
-                                    if timeout else [returncode])
+        if timeout:
+            def wait(*, timeout):
+                if timeout in (3, 5):
+                    return returncode
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired(["fixture"], timeout)
+            process.wait.side_effect = wait
+        else:
+            process.wait.return_value = returncode
         try:
             with mock.patch.object(self.dev.subprocess, "Popen", return_value=process), \
                  mock.patch.object(self.dev.os, "killpg") as kill, \
                  mock.patch.object(self.dev._QualificationOutputLog, "DRAIN_SECONDS", 0.01):
-                result = self.run_step("cargo clippy", ["fixture"], timeout=7)
+                result = self.run_step("cargo clippy", ["fixture"], timeout=0.01)
             self.assertTrue(stream.closed, "select/stop reader must close its own stream")
             raw = (self.directory / "cargo-clippy.full.log").read_bytes()
             self.assertIn(b"reader_complete=True", raw)
@@ -288,21 +359,150 @@ class QualificationOutputTests(unittest.TestCase):
         self.assertIn("output reader failed: broken reader; payload INCOMPLETE", raw)
         self.assertIn("reader_complete=True", raw)
 
-    def test_interrupted_wait_retains_incomplete_status_without_signaling(self):
-        process = mock.Mock(pid=12345, stdout=io.BytesIO(b"before interrupt\n"), returncode=None)
-        process.wait.side_effect = KeyboardInterrupt
-        with mock.patch.object(self.dev.subprocess, "Popen", return_value=process), \
+    def test_main_thread_handler_interrupts_worker_step_after_registration(self):
+        process = mock.Mock(pid=12345, stdout=io.BytesIO(b"before interrupt\n"), returncode=0)
+        process.wait.side_effect = lambda *, timeout: (
+            0 if timeout == 3 else (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(["fixture"], timeout)
+            )
+        )
+        event = self.namespace["interrupted"]
+        launched = threading.Event()
+        results = []
+        original_term = signal.getsignal(signal.SIGTERM)
+
+        def launch(*args, **kwargs):
+            launched.set()
+            return process
+
+        with self.dev._check_interrupt_handlers(event), \
+             mock.patch.object(self.dev.subprocess, "Popen", side_effect=launch) as popen, \
              mock.patch.object(self.dev.os, "killpg") as kill, \
              mock.patch.object(self.dev.select, "select", side_effect=lambda streams, *_: (streams, [], [])):
-            with self.assertRaises(KeyboardInterrupt):
+            worker = threading.Thread(target=lambda: results.append(
                 self.run_step("cargo clippy", ["fixture"])
-        kill.assert_not_called()
-        self.assertTrue(process.stdout.closed)
-        raw = (self.directory / "cargo-clippy.full.log").read_text()
-        self.assertIn("process_returncode=None", raw)
-        self.assertIn("payload INCOMPLETE; process ownership unresolved", raw)
-        self.assertNotIn("payload COMPLETE", raw)
-        self.assertEqual(self.results, [])
+            ))
+            worker.start()
+            self.assertTrue(launched.wait(2), "worker must register its fresh child before TERM")
+            signal.raise_signal(signal.SIGTERM)
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(event.is_set())
+        self.assertEqual(results, [1])
+        popen.assert_called_once()
+        kill.assert_called_once_with(process.pid, signal.SIGTERM)
+        self.assertIn("INTERRUPTED", self.results[-1][3])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), original_term)
+
+    def test_interrupt_handler_restores_handlers_on_exception(self):
+        event = threading.Event()
+        previous = {sig: signal.getsignal(sig) for sig in
+                    (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+        with self.assertRaisesRegex(RuntimeError, "sentinel"):
+            with self.dev._check_interrupt_handlers(event):
+                raise RuntimeError("sentinel")
+        self.assertEqual({sig: signal.getsignal(sig) for sig in previous}, previous)
+
+    def test_canceled_thread_sequence_does_not_admit_next_lane(self):
+        event = threading.Event()
+        started = []
+        first = threading.Thread(target=lambda: (started.append("first"), event.set()))
+        second = threading.Thread(target=lambda: started.append("second"))
+        self.dev._run_check_threads_sequentially([first, second], 1, event)
+        self.assertEqual(started, ["first"])
+        self.assertFalse(second.ident)
+
+    def test_interrupt_before_launch_does_not_start_process_and_fails(self):
+        self.namespace["interrupted"].set()
+        with mock.patch.object(self.dev.subprocess, "Popen") as launch:
+            result = self.run_step("cargo clippy", ["fixture"])
+        self.assertEqual(result, 1)
+        launch.assert_not_called()
+        self.assertIn("INTERRUPTED before launch", self.results[-1][3])
+
+    def test_cancellation_during_launch_is_not_lost(self):
+        process = mock.Mock(pid=12345, stdout=io.BytesIO(b"ready\n"))
+        process.wait.return_value = 0
+
+        def launch(*args, **kwargs):
+            self.namespace["interrupted"].set()
+            return process
+
+        with mock.patch.object(self.dev.subprocess, "Popen", side_effect=launch), \
+             mock.patch.object(self.dev.os, "killpg") as kill:
+            result = self.run_step("cargo clippy", ["mock"], timeout=7)
+
+        self.assertNotEqual(result, 0)
+        kill.assert_called_once_with(process.pid, signal.SIGTERM)
+        self.assertIn("INTERRUPTED", self.results[-1][3])
+
+    def test_actual_main_signal_drains_owned_step_and_stops_next_lane(self):
+        ready = threading.Event()
+        roots = []
+        sent = []
+        original_popen = subprocess.Popen
+        original_killpg = os.killpg
+        original_append = self.dev._QualificationOutputLog.append
+        next_lane = mock.Mock()
+
+        def launch(*args, **kwargs):
+            root = original_popen(*args, **kwargs)
+            roots.append(root)
+            return root
+
+        def append(log, data):
+            original_append(log, data)
+            if b"READY" in data:
+                ready.set()
+
+        def signal_owned(group, sig):
+            self.assertEqual(group, roots[0].pid)
+            self.assertIsNone(roots[0].returncode)
+            sent.append(sig)
+            original_killpg(group, sig)
+
+        def interrupt_ready_step():
+            if ready.wait(5):
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        worker = threading.Thread(target=lambda: self.run_step(
+            "cargo clippy", [sys.executable, "-c",
+            "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('READY', flush=True); signal.pause()"], timeout=15))
+        sender = threading.Thread(target=interrupt_ready_step)
+        try:
+            with self.dev._check_interrupt_handlers(self.namespace["interrupted"]), \
+                 mock.patch.object(self.dev.subprocess, "Popen", side_effect=launch), \
+                 mock.patch.object(self.dev.os, "killpg", side_effect=signal_owned), \
+                 mock.patch.object(self.dev._QualificationOutputLog, "append", append):
+                sender.start()
+                stuck = self.dev._run_check_threads_sequentially(
+                    [worker, next_lane], 15, self.namespace["interrupted"])
+                sender.join(timeout=6)
+            self.assertTrue(ready.is_set(), "child must establish signal disposition before interrupt")
+            self.assertFalse(sender.is_alive())
+            self.assertEqual(stuck, [])
+            next_lane.start.assert_not_called()
+            self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+            self.assertEqual(roots[0].returncode, -signal.SIGKILL)
+            self.assertTrue(roots[0].stdout.closed)
+            self.assertEqual(self.results[-1][1], -signal.SIGKILL)
+            self.assertIn("INTERRUPTED", self.results[-1][3])
+            raw = (self.directory / "cargo-clippy.full.log").read_text()
+            self.assertIn("process_returncode=-9", raw)
+            self.assertIn("payload COMPLETE", raw)
+        finally:
+            for root in roots:
+                try:
+                    root.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    root.kill()
+                    root.wait(timeout=2)
+                root.stdout.close()
+            if worker.ident is not None:
+                worker.join(timeout=2)
+            if sender.ident is not None:
+                sender.join(timeout=6)
 
     def test_actual_timeout_signals_while_root_is_unreaped_only(self):
         original_popen = subprocess.Popen
@@ -366,11 +566,12 @@ class QualificationOutputTests(unittest.TestCase):
         diagnostic = "assertion failed before timeout\n" + "later output\n" * 400
         result, process = self.execute(diagnostic, -15, timeout=True)
         self.assertEqual(result, -15)
-        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=7), mock.call(timeout=3)])
+        self.assertGreaterEqual(process.wait.call_count, 2)
+        self.assertEqual(process.wait.call_args_list[-1], mock.call(timeout=3))
         raw = (self.directory / "cargo-clippy.full.log").read_text()
         self.assertTrue(raw.startswith(diagnostic))
         self.assertIn("process_returncode=-15 timed_out=True reader_complete=True", raw)
-        self.assertIn("TIMEOUT after 7s", self.results[0][3])
+        self.assertIn("TIMEOUT after 0.01s", self.results[0][3])
         self.assertIn("earlier lines dropped", self.results[0][3])
 
     def test_overflow_is_bounded_and_fails_a_successful_process(self):
@@ -424,7 +625,7 @@ class QualificationOutputTests(unittest.TestCase):
 
         def wait(*, timeout):
             custody_order.append(("wait", timeout))
-            if timeout in (7, 3):
+            if timeout == 3 or timeout <= 0.1:
                 raise subprocess.TimeoutExpired(["fixture"], timeout)
             self.assertEqual(timeout, 5)
             process.returncode = -9
@@ -442,8 +643,10 @@ class QualificationOutputTests(unittest.TestCase):
         self.assertEqual(result, -9)
         self.assertEqual(kill.call_args_list, [mock.call(12345, self.dev.signal.SIGTERM),
                                                mock.call(12345, self.dev.signal.SIGKILL)])
-        self.assertEqual(process.wait.call_args_list,
-                         [mock.call(timeout=7), mock.call(timeout=3), mock.call(timeout=5)])
-        self.assertEqual(custody_order, [("wait", 7), ("signal", signal.SIGTERM),
-                                         ("wait", 3), ("signal", signal.SIGKILL), ("wait", 5)])
+        calls = process.wait.call_args_list
+        self.assertTrue(all(call.kwargs["timeout"] <= 0.1 for call in calls[:-2]))
+        self.assertEqual(calls[-2:], [mock.call(timeout=3), mock.call(timeout=5)])
+        self.assertEqual(custody_order[0][0], "wait")
+        self.assertEqual(custody_order[-4:], [("signal", signal.SIGTERM), ("wait", 3),
+                                              ("signal", signal.SIGKILL), ("wait", 5)])
         self.assertIn("process_returncode=-9 timed_out=True", (self.directory / "cargo-clippy.full.log").read_text())

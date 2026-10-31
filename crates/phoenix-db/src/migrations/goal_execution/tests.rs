@@ -45,7 +45,6 @@ async fn migration_138_backfills_materialized_without_breaking_ordinary_message_
 
     run_through_for_test(db.pool(), 140).await.unwrap();
     assert_eq!(run_through_for_test(db.pool(), 140).await.unwrap(), 0);
-    assert_eq!(MIGRATIONS.last().unwrap().version, 142);
     assert_eq!(run_through_for_test(db.pool(), 141).await.unwrap(), 1);
     let receipt_table: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='canonical_tool_round_receipts'",

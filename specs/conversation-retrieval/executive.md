@@ -46,6 +46,10 @@ Hosted review corrections to benchmark setup and behavioral specifications
 require their own final-head checks. Hosted CI and review are tracked on
 PR #896; earlier local passes are not final-head or production-recovery proof.
 
+## Benchmark fixture interpreter qualification
+
+Exact-source full devpy qualification at `61a4791e19ec` exposed the snapshot-help fixture launching a literal `python` executable that was absent from the managed runtime's PATH. The fixture now launches `sys.executable`, preserving the admitted interpreter and the existing assertion that snapshot has no custom-output option. No benchmark or retrieval behavior changes. Focused fixture/module and full-lane successor qualification remain pending; earlier benchmark evidence does not qualify this correction.
+
 ## Technical Summary
 
 The index stores searchable text in an SQLite FTS5 virtual table,

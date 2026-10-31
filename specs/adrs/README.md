@@ -15,6 +15,8 @@ Complete exported span capacity is governed by [ADR-118](118_preserve-complete-s
 
 Controlled-functional build isolation is governed by [ADR-119](119_separate-controlled-functional-telemetry-build.md), affecting REQ-CVT-001/005/006.
 
+Creation terminal evidence and image delivery lifetime are governed by [ADR-207](207_creation-receipt-evidence-and-image-payload-lifetime.md), affecting REQ-CCR-013–015.
+
 ## Numbering and validation
 
 ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
@@ -32,6 +34,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [207](207_creation-receipt-evidence-and-image-payload-lifetime.md) | Retain creation evidence and replay identity, retire delivery images at product deletion | Accepted | REQ-CCR-013, REQ-CCR-014, REQ-CCR-015 |
 | [000](000_adopt-spears-v2.md) | Phoenix adopts spEARS v2 for new specification work | Accepted | methodology-level |
 | [001](001_bash-first-class-handles.md) | Bash handles are first-class process-local entities with wait windows | Accepted | REQ-BASH-001, REQ-BASH-002, REQ-BASH-003, REQ-BASH-005, REQ-BASH-009, REQ-BASH-014, REQ-BASH-WS-001, REQ-BASH-WS-002 |
 | [002](002_bash-watch-backed-handle-state.md) | Bash handle state uses watch-backed exit notifications and snapshot shaping | Accepted | REQ-BASH-001, REQ-BASH-003, REQ-BASH-004, REQ-BASH-005, REQ-BASH-006, REQ-BASH-014, REQ-BASH-WS-002 |
@@ -180,6 +183,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [143](143_bounded-owned-child-settlement-after-launch.md) | Bound owned-child settlement after Bash launch | Proposed | REQ-BASH-017 |
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
 | [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
+| [191](191_native-create-and-rename-use-shared-application-actions.md) | Native create and rename use shared application actions | Accepted | REQ-GR-007, REQ-CCR-013, REQ-CID-007 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |

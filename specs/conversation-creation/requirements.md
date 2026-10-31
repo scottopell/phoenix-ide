@@ -212,6 +212,11 @@ THE SYSTEM SHALL expose the exact durable request's progress and recovery outcom
 AND the client SHALL remain on a creation or recovery surface until that exact request publishes atomically, fails, or is cancelled
 AND SHALL navigate to the conversation route only after observing atomic publication
 
+WHEN public exact-request status observes a retained creation whose published product or original transcript is absent
+THE SYSTEM SHALL report the original request identity, reserved product identity, and original transcript identity as a historical publication without a live route or mutating recovery action
+AND SHALL distinguish this retained outcome from a request identity that was never accepted
+AND the client SHALL stop polling without navigating, reposting, or retrying that request, while allowing explicit local release of the observation without deleting the server record.
+
 WHEN the same request is retried with the same request identifier and the same creation intent
 THE SYSTEM SHALL replay the original acceptance result rather than creating a second job
 
@@ -368,3 +373,77 @@ AND SHALL retain claim-fenced reconciliation and sequential advancement when wor
 AND SHALL NOT infer additional completed phases from repository state, error text, or elapsed time
 
 This forward transformation grants no downgrade, mixed-version writer, or live database replacement guarantee beyond [the compatibility requirements](../compatibility/requirements.md).
+
+### REQ-CCR-013: Coordinator Creation Preserves Intent and Provenance
+
+WHEN the current Global Coordinator requests an ordinary conversation through its dedicated creation capability
+THE SYSTEM SHALL use the shared durable creation acceptance and reconciliation path with one canonical request identity and an explicit submit-objective start intent
+AND SHALL accept only nonblank objective text, an existing absolute directory, and validated supported model, effort, and language choices
+AND SHALL NOT accept attachments, caller-authored origin metadata, filesystem references, or skill expansion as part of this capability.
+
+WHEN the Coordinator discovers project directory options
+THE SYSTEM SHALL return only existing, normalized directories satisfying creation's directory floor
+AND SHALL apply its result bound and truncation indicator to usable options rather than stale persisted candidates.
+
+THE SYSTEM SHALL persist the executing product, transcript, assistant message, and tool-use identities as internal-conversation provenance
+AND SHALL deliver Coordinator objective text literally as agent-authored input rather than user-authored input
+AND SHALL retain the first accepted provenance on an identical retry while allowing a fresh source-call locator from the same authorized source
+AND SHALL reject reuse of a request identity for a different intent rather than reserve another conversation.
+
+Creation intent SHALL identify the accepted effective model and language choices, not whether those request fields were explicit or omitted.
+On first acceptance, omitted model and language SHALL resolve to the acceptance-time defaults.
+On retry, omitted model and language SHALL reconcile to the accepted choices, an explicit matching choice SHALL replay, and an explicit different choice SHALL conflict.
+Omitted effort SHALL remain a native execution selection distinct from every explicit effort level, including when the native default has that same level.
+Retries SHALL NOT reevaluate the accepted choices against changed defaults.
+
+WHEN the Coordinator reconciles an uncertain creation result
+THE SYSTEM SHALL return the original durable request and product identities and observed creation status
+AND SHALL distinguish acceptance from publication, objective delivery, runtime execution, and completion
+AND SHALL derive the complete native readback, including publication identity, route, and execution evidence, from one persistence snapshot that also validates the current Coordinator's authority
+AND SHALL NOT implicitly cancel, restart, or repeat an intentional creation under a new identity.
+
+WHEN the published product or its original transcript is deleted
+THE SYSTEM SHALL retain the accepted request identity, immutable intent identity, first source provenance, reserved product identity, and original publication identity
+AND SHALL reconcile an identical retry to that historical acceptance rather than create another product or repeat work
+AND SHALL reject changed-intent reuse of that request identity
+AND SHALL expose the original publication as historical without a live route, even when the product survives through a successor transcript
+AND SHALL NOT claim, renew, deliver, complete, retry, recover, or schedule reconciliation deadlines for delivery to the missing original transcript, including through an already-held claim
+AND SHALL report only exact retained terminal execution evidence, or unavailable execution when that evidence is absent, without retargeting the original objective to a successor.
+
+THE SYSTEM SHALL preserve public user API, historical, and Slack gateway origin decoding and objective-delivery behavior independently of the Coordinator's literal-input policy.
+
+
+### REQ-CCR-014: Operation-Owned Initial Execution Evidence
+
+WHEN the exact accepted initial objective settles as completed, failed, or cancelled
+THE SYSTEM SHALL atomically retain its first terminal outcome with consumption of that objective's execution occurrence, independently of watch registration and notification delivery
+AND SHALL bind the receipt to the accepted request and its original published transcript, preserve an actual failure reason, and retain it across process restart and target deletion
+AND SHALL carry that exact objective failure reason through native status readback, separately from provisioning failure, before and after target deletion
+AND SHALL represent native initial execution as a status-tagged outcome whose failed variant requires the retained reason, rather than construct a failed read model that omits it
+AND SHALL apply the same contract to captured initial objectives settled by a direct turn.
+
+WHEN operation-specific evidence is absent
+THE SYSTEM SHALL report initial execution as unavailable rather than infer a terminal outcome from publication, an unrelated later turn, the transcript's latest state, or a successor
+AND SHALL NOT treat retained evidence as authority for execution, recovery, or retargeting.
+
+### REQ-CCR-015: Creation Image Payload Lifetime
+
+WHILE any transcript of the published product exists
+THE SYSTEM SHALL retain the accepted creation-request image delivery payloads without changing their bytes.
+
+WHEN the product's last transcript is hard-deleted
+THE SYSTEM SHALL atomically retire those delivery payloads while retaining historical creation status, original identities, provenance, and bounded ordered image replay identity
+AND SHALL NOT retire payloads when only the original transcript is deleted with a surviving continuation.
+
+WHERE delivery payloads are retired
+THE SYSTEM SHALL reconcile identical request retry to the retained original receipt and conflict on a changed image count, order, media type, or exact accepted data
+AND SHALL retain each image's ordinal, media type, and SHA-256 digest of the exact accepted UTF-8 data string, not its payload
+AND SHALL structurally distinguish retired payloads from an originally empty image list and from missing or partially corrupted live delivery data
+AND SHALL fail on live payload corruption rather than silently substitute empty intent
+AND SHALL NOT bootstrap, reserve resources, enqueue an objective, or retarget a successor during replay.
+
+WHEN upgrading stored creation receipts
+THE SYSTEM SHALL atomically derive replay identity from retained payloads before retiring payloads whose published product no longer exists
+AND SHALL NOT fabricate erased execution outcomes.
+
+This payload lifetime concerns creation-request delivery copies only, not independent transcript attachments.

@@ -263,7 +263,11 @@ pub(crate) async fn preflight(
         Some(_) => return Err(conflict("migration ledger is not a table")),
     }
     let highest = recorded.keys().next_back().copied().unwrap_or(0);
-    if highest >= 130 && !(129..=highest).all(|v| recorded.contains_key(&v)) {
+    if highest >= 130
+        && !canonical
+            .range(129..=highest)
+            .all(|(version, _)| recorded.contains_key(version))
+    {
         return Err(conflict(
             "partial post-129 ledger has a missing canonical predecessor",
         ));
@@ -592,13 +596,19 @@ mod tests {
         pool
     }
 
+    mod goal_tools_tests {
+        include!("lineage/goal_tools_tests.rs");
+    }
+
     #[tokio::test]
     async fn fresh_and_each_real_canonical_prefix_are_admitted() {
         let fresh = pool().await;
         preflight(&fresh, crate::migrations::migration_identities())
             .await
             .unwrap();
-        for through in 129..=140 {
+        for (through, _) in
+            crate::migrations::migration_identities().filter(|(version, _)| *version >= 129)
+        {
             let pool = real_prefix(through).await;
             let start_tables: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name IN ('conversation_goal_starts', 'conversation_goal_start_canonical_inputs')",
@@ -620,6 +630,39 @@ mod tests {
                 .unwrap_or_else(|error| panic!("canonical prefix {through}: {error}"));
             assert_eq!(snapshot(&pool).await, before);
         }
+    }
+
+    #[tokio::test]
+    async fn registered_tail_requires_canonical_predecessors_and_exact_identities() {
+        for missing in [129, 144] {
+            let pool = real_prefix(146).await;
+            sqlx::query("DELETE FROM _migrations WHERE version = ?1")
+                .bind(missing)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let error = preflight(&pool, crate::migrations::migration_identities())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("missing canonical predecessor"));
+            refuses_without_mutation(&pool).await;
+        }
+
+        let pool = real_prefix(146).await;
+        sqlx::query("UPDATE _migrations SET name = 'wrong-tail-identity' WHERE version = 146")
+            .execute(&pool)
+            .await
+            .unwrap();
+        refuses_without_mutation(&pool).await;
+
+        let pool = real_prefix(146).await;
+        let unknown = crate::migrations::migration_identities()
+            .map(|(version, _)| version)
+            .max()
+            .unwrap()
+            + 1;
+        row(&pool, unknown, "unregistered-tail").await;
+        refuses_without_mutation(&pool).await;
     }
 
     #[tokio::test]

@@ -12,6 +12,8 @@ mod api;
 mod chain_qa;
 mod chain_runtime;
 mod continuation_service;
+mod conversation_action_tools;
+mod conversation_actions;
 mod conversation_cwd;
 mod coordinator_home;
 mod coordinator_tools;

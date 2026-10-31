@@ -25449,6 +25449,247 @@ mod goal_report_cancellation_checkpoint_tests {
     };
     use phoenix_core::domain::db_schema::FinalizedToolResult;
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn accepted_user_cancel_retains_unwatched_initial_receipt_through_idle_and_replay() {
+        use phoenix_core::domain::db_schema::{ConvMode, Conversation, Message, UserContent};
+        use phoenix_core::llm_language::LlmLanguage;
+        use phoenix_core::work_scope::{
+            AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId,
+        };
+        use phoenix_db::{
+            ClaimedProductCreationJob, ProductCreationInitialExecution, ProductCreationIntent,
+            ProductCreationOrigin, ProductCreationProvisioningStage as Stage,
+            ProductCreationPublishInput, SteeringAcceptanceFingerprint,
+        };
+        use phoenix_llm::{ModelEffort, ServiceTier};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let request_id = "initial-cancel-request";
+        let id = "initial-cancel-conversation";
+        let cwd = "/tmp";
+        let intent = ProductCreationIntent {
+            origin: ProductCreationOrigin::UserApi,
+            cwd: cwd.into(),
+            objective: "inspect repository".into(),
+            model: Some("test-model".into()),
+            effort: None,
+            images: vec![],
+            llm_language: LlmLanguage::Caveman,
+        };
+        db.accept_product_creation(request_id, &intent)
+            .await
+            .unwrap();
+        let provisioning = db
+            .claim_product_creation(
+                request_id,
+                "worker",
+                "token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for stage in [
+            Stage::ResolveRepository,
+            Stage::ResolveStartingPin,
+            Stage::MaterializeWorktree,
+            Stage::FinalizeAttachments,
+            Stage::CommitMetadata,
+        ] {
+            assert!(
+                db.advance_product_creation_provisioning_stage(
+                    request_id,
+                    &provisioning.claim,
+                    stage,
+                )
+                .await
+                .unwrap()
+            );
+        }
+        let product_id = provisioning.job.product_conversation_id.clone();
+        let scope = WorkScopeId::new();
+        let conversation = Conversation {
+            id: id.to_string(),
+            product_conversation_id: product_id,
+            slug: Some(id.to_string()),
+            title: Some(id.to_string()),
+            cwd: cwd.to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            archived: false,
+            model: Some("gpt-5".to_string()),
+            effort: Some(ModelEffort::High),
+            service_tier: ServiceTier::Standard,
+            project_id: None,
+            conv_mode: ConvMode::Direct,
+            runtime_role: RuntimeRole::User,
+            attached_work_scope_id: Some(scope),
+            desired_base_branch: None,
+            message_count: 0,
+            transcript_generation: 1,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+
+            llm_language: LlmLanguage::Caveman,
+            spawned_from_conversation_id: None,
+        };
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: request_id.into(),
+                claim: provisioning.claim.clone(),
+                conversation,
+                authority_kind: AuthorityKind::Direct,
+                environment: EnvironmentContext::UnownedCwd { cwd: cwd.into() },
+                git_publication: None,
+            })
+            .await
+            .unwrap());
+        let delivery = ClaimedProductCreationJob {
+            claim: provisioning.claim,
+            job: db
+                .get_product_creation_job(request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        let fingerprint = format!("product-create:{request_id}");
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            origin: intent.origin.input_origin(),
+            text: intent.objective.clone(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: request_id.into(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        db.append_product_creation_steering_entry(&delivery, &entry, &fingerprint)
+            .await
+            .unwrap();
+        assert!(db
+            .complete_product_creation_delivery(
+                request_id,
+                &delivery.claim,
+                &SteeringAcceptanceFingerprint::Exact(fingerprint),
+                &intent,
+            )
+            .await
+            .unwrap());
+        let initial_content = MessageContent::User(UserContent::new(intent.objective));
+        let initial = Message {
+            message_id: request_id.into(),
+            conversation_id: id.into(),
+            sequence_id: 1,
+            origin: entry.origin,
+            message_type: initial_content.message_type(),
+            content: initial_content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let state = ConvState::LlmRequesting { attempt: 1 };
+        db.commit_steering_drain(id, &[initial], &state, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(request_id)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Running
+        );
+        let context = ConvContext::new(
+            id,
+            Path::new(cwd).to_path_buf(),
+            "test-model",
+            200_000,
+            16_384,
+        );
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            state.clone(),
+            DatabaseStorage::new(db.clone()),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(32, 0),
+        );
+        assert!(runtime.active_direct_turn.is_none());
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime.state, ConvState::Idle);
+        assert_eq!(
+            db.get_conversation(id).await.unwrap().state,
+            ConvState::Idle
+        );
+        let receipt: (String, Option<String>) = sqlx::query_as(
+            "SELECT terminal_kind, failure_reason FROM product_creation_initial_execution_receipts WHERE request_id = ?1",
+        )
+        .bind(request_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt, ("Cancelled".into(), None));
+        let remaining: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM steering_execution_occurrences WHERE conversation_id = ?1),
+                    (SELECT COUNT(*) FROM execution_cancel_observations WHERE conversation_id = ?1),
+                    (SELECT COUNT(*) FROM coordinator_watches),
+                    (SELECT COUNT(*) FROM coordinator_watch_events)",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining, (0, 0, 0, 0));
+        runtime
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            })
+            .await
+            .unwrap();
+        let markers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_cancel_observations WHERE conversation_id = ?1",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(markers, 0, "a late idle Stop creates no marker");
+        assert_eq!(
+            db.product_creation_initial_execution(request_id)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Cancelled
+        );
+        drop(runtime);
+        db.delete_conversation(id).await.unwrap();
+        assert_eq!(
+            db.product_creation_initial_execution(request_id)
+                .await
+                .unwrap(),
+            ProductCreationInitialExecution::Cancelled
+        );
+    }
+
     async fn goal_and_watch_counts(db: &Database) -> (i64, i64, i64, i64, i64) {
         sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM conversation_goal_ids),

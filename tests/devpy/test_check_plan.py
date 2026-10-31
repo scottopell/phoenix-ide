@@ -258,7 +258,9 @@ class CheckPlanTests(unittest.TestCase):
         stuck = self.dev._run_check_threads_sequentially([first, second], 0.01)
 
         first.start.assert_called_once_with()
-        first.join.assert_called_once_with(timeout=0.01)
+        first.join.assert_called_once()
+        self.assertTrue(all(call.kwargs["timeout"] <= 0.1
+                            for call in first.join.call_args_list))
         second.start.assert_not_called()
         self.assertEqual([first], stuck)
 

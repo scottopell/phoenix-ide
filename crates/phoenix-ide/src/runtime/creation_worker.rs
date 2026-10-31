@@ -462,7 +462,18 @@ async fn expand_product_creation_objective(
     manager: &RuntimeManager,
     conversation_id: &str,
     objective: &str,
+    origin: &crate::db::ProductCreationOrigin,
 ) -> Result<crate::send_chat_service::ExpandedDispatchMessage, String> {
+    let policy = match origin {
+        crate::db::ProductCreationOrigin::UnknownHistorical
+        | crate::db::ProductCreationOrigin::UserApi
+        | crate::db::ProductCreationOrigin::SlackGateway { .. } => {
+            crate::send_chat_service::MessageExpansionPolicy::ExpandReferences
+        }
+        crate::db::ProductCreationOrigin::InternalConversation { .. } => {
+            crate::send_chat_service::MessageExpansionPolicy::LiteralText
+        }
+    };
     let conversation = manager
         .db()
         .get_conversation(conversation_id)
@@ -473,7 +484,7 @@ async fn expand_product_creation_objective(
         conversation_id,
         &conversation.cwd,
         objective,
-        crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
+        policy,
     )
     .await
     .map_err(|error| error.to_string())
@@ -540,7 +551,7 @@ async fn complete_already_accepted_product_creation_delivery(
             .product_creation_objective_already_durably_accepted(
                 &job.request_id,
                 Some(exact_fingerprint),
-                &job.intent,
+                &job.intent.live_intent().map_err(str::to_string)?,
             )
             .await
             .map_err(|error| error.to_string())?
@@ -551,7 +562,7 @@ async fn complete_already_accepted_product_creation_delivery(
                     &job.request_id,
                     &claimed.claim,
                     exact_fingerprint,
-                    &job.intent,
+                    &job.intent.live_intent().map_err(str::to_string)?,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -603,8 +614,8 @@ async fn deliver_product_creation_objective_inner(
     {
         return Ok(());
     }
-    let images = job
-        .intent
+    let live_intent = job.intent.live_intent().map_err(str::to_string)?;
+    let images = live_intent
         .images
         .iter()
         .map(|image| crate::db::ImageData {
@@ -612,15 +623,19 @@ async fn deliver_product_creation_objective_inner(
             media_type: image.media_type.clone(),
         })
         .collect();
-    let expanded =
-        match expand_product_creation_objective(manager, &conversation_id, &job.intent.objective)
-            .await
-        {
-            Ok(expanded) => expanded,
-            Err(error) => {
-                return Err(persist_retryable_delivery_failure(manager, claimed, &error).await?);
-            }
-        };
+    let expanded = match expand_product_creation_objective(
+        manager,
+        &conversation_id,
+        &job.intent.objective,
+        &job.intent.origin,
+    )
+    .await
+    {
+        Ok(expanded) => expanded,
+        Err(error) => {
+            return Err(persist_retryable_delivery_failure(manager, claimed, &error).await?);
+        }
+    };
     checkpoint_product_creation_stage(
         manager,
         claimed,
@@ -667,7 +682,7 @@ async fn deliver_product_creation_objective_inner(
                 "product-create:{}",
                 job.request_id
             )),
-            &job.intent,
+            &job.intent.live_intent().map_err(str::to_string)?,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -4344,6 +4359,45 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
+    async fn internal_creation_objective_is_literal_agent_content() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "literal-objective",
+            "literal-objective",
+            root.path().to_str().unwrap(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let manager = test_runtime_manager(db);
+        let origin = crate::db::ProductCreationOrigin::InternalConversation {
+            product_conversation_id: "coordinator-product".parse().unwrap(),
+            transcript_id: "coordinator-source".into(),
+            source_call: phoenix_core::domain::db_schema::SourceToolCall {
+                message_id: "assistant-source".into(),
+                tool_use_id: "create-call".into(),
+            },
+        };
+        // Neither a missing @file nor an unknown /skill may be expanded for agent input.
+        for objective in ["Read @missing.md", "/missing-skill @missing.md"] {
+            let expanded = expand_product_creation_objective(
+                &manager,
+                "literal-objective",
+                objective,
+                &origin,
+            )
+            .await
+            .unwrap();
+            assert_eq!(expanded.display_text, objective);
+            assert!(expanded.llm_text.is_none());
+            assert!(expanded.skill_invocation.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn initial_objective_expands_against_published_conversation_root() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("notes.md"), "published root contents").unwrap();
@@ -4368,18 +4422,27 @@ mod product_creation_delivery_replay_tests {
             None,
         );
 
-        let expanded = expand_product_creation_objective(
-            &manager,
-            "expanded-product-objective",
-            "Read @notes.md",
-        )
-        .await
-        .unwrap();
-        assert_eq!(expanded.display_text, "Read @notes.md");
-        assert!(expanded
-            .llm_text
-            .as_deref()
-            .is_some_and(|text| text.contains("published root contents")));
+        for origin in [
+            crate::db::ProductCreationOrigin::UnknownHistorical,
+            crate::db::ProductCreationOrigin::UserApi,
+            crate::db::ProductCreationOrigin::SlackGateway {
+                request_id: "slack-request".into(),
+            },
+        ] {
+            let expanded = expand_product_creation_objective(
+                &manager,
+                "expanded-product-objective",
+                "Read @notes.md",
+                &origin,
+            )
+            .await
+            .unwrap();
+            assert_eq!(expanded.display_text, "Read @notes.md");
+            assert!(expanded
+                .llm_text
+                .as_deref()
+                .is_some_and(|text| text.contains("published root contents")));
+        }
     }
 
     #[tokio::test]

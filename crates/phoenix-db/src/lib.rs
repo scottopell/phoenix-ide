@@ -43,6 +43,12 @@ pub use prompt_projection::{
 };
 pub mod conversation_goals;
 mod conversation_name;
+mod product_conversation_rename;
+pub use product_conversation_rename::{
+    NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,
+    ProductConversationRenameReceipt, ProductConversationRenameResult,
+    ProductConversationRenameSource,
+};
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -346,6 +352,12 @@ pub enum DbError {
     Sqlx(#[from] sqlx::Error),
     #[error("Conversation not found: {0}")]
     ConversationNotFound(String),
+    #[error("conversation title must be nonblank and at most 200 Unicode scalar values")]
+    ConversationTitleInvalid,
+    #[error("the current persisted Global Coordinator transcript is required")]
+    CurrentCoordinatorRequired,
+    #[error("Invalid product creation intent: {0}")]
+    ProductCreationIntentInvalid(String),
     #[error("Conversation already exists: {0}")]
     ConversationAlreadyExists(String),
     #[error("Message not found: {0}")]
@@ -806,6 +818,7 @@ pub struct ConversationCreationMetadataUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationNameBaseline {
     owner: phoenix_core::domain::product_conversation::ProductConversationId,
+    root_transcript_id: String,
     revision: i64,
 }
 
@@ -16257,6 +16270,41 @@ fn cleared_creation_intent_json() -> String {
     .to_string()
 }
 
+fn initial_steering_execution_outcome(state: &ConvState) -> Option<phoenix_workflow::TurnTerminal> {
+    match state {
+        ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
+            Some(phoenix_workflow::TurnTerminal::Completed)
+        }
+        ConvState::CreationCancelled { .. } => Some(phoenix_workflow::TurnTerminal::Cancelled),
+        ConvState::Error { message, .. } => Some(phoenix_workflow::TurnTerminal::Failed {
+            reason: message.clone(),
+        }),
+        ConvState::ContextExhausted { .. } => Some(phoenix_workflow::TurnTerminal::Failed {
+            reason: "context exhausted".into(),
+        }),
+        ConvState::RecoverableContinuationFailure { .. } => {
+            Some(phoenix_workflow::TurnTerminal::Failed {
+                reason: "continuation failed".into(),
+            })
+        }
+        ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ServerOverloadRetrying { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Failed { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::HandedOff { .. } => None,
+    }
+}
+
 pub(crate) async fn record_initial_execution_outcome_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
@@ -16275,33 +16323,33 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     if let Some((message_id, source_kind)) = steering {
         let source_kind =
             crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
-        let outcome = match state {
-            ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
-                Some(("Completed", None))
+        let outcome = initial_steering_execution_outcome(state);
+        if let Some(terminal) = outcome {
+            let terminal = crate::coordinator_watches::consume_execution_cancel_tx(
+                tx,
+                conversation_id,
+                terminal,
+            )
+            .await?;
+            if matches!(
+                &source_kind,
+                crate::coordinator_watches::MessageExecutionSource::Steering
+            ) {
+                crate::product_creation::record_initial_execution_receipt_tx(
+                    tx,
+                    conversation_id,
+                    &message_id,
+                    &terminal,
+                )
+                .await?;
             }
-            ConvState::CreationCancelled { .. } => Some(("Cancelled", None)),
-            ConvState::Error { message, .. } => Some(("Failed", Some(message.as_str()))),
-            ConvState::ContextExhausted { .. } => Some(("Failed", Some("context exhausted"))),
-            ConvState::RecoverableContinuationFailure { .. } => {
-                Some(("Failed", Some("continuation failed")))
-            }
-            ConvState::LlmRequesting { .. }
-            | ConvState::SeededLlmRequesting { .. }
-            | ConvState::ServerOverloadRetrying { .. }
-            | ConvState::Provisioning { .. }
-            | ConvState::ToolExecuting { .. }
-            | ConvState::CancellingTool { .. }
-            | ConvState::AwaitingSubAgents { .. }
-            | ConvState::CancellingSubAgents { .. }
-            | ConvState::Failed { .. }
-            | ConvState::AwaitingRecovery { .. }
-            | ConvState::AwaitingContinuation { .. }
-            | ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. }
-            | ConvState::CreationFailed { .. }
-            | ConvState::HandedOff { .. } => None,
-        };
-        if let Some((kind, reason)) = outcome {
+            let (kind, reason) = match &terminal {
+                phoenix_workflow::TurnTerminal::Completed => ("Completed", None),
+                phoenix_workflow::TurnTerminal::Cancelled => ("Cancelled", None),
+                phoenix_workflow::TurnTerminal::Failed { reason } => {
+                    ("Failed", Some(reason.as_str()))
+                }
+            };
             crate::coordinator_watches::record_steering_event_tx(
                 tx,
                 source_kind,

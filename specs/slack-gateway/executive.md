@@ -53,6 +53,8 @@ before mutation. Upstream migration history through 141 is unchanged.
 
 ## Validation
 
+Creation-receipt retention migration147 changes the deletion expectation in `request_status_links_require_native_publication`: deleting the predecessor retains its published creation receipt and original identities. The test still requires ordinary native routing and Slack product links to resolve a remaining live successor, then requires both request/return links to become unavailable after last-transcript deletion while the same receipt remains. Coordinator creation history remains tied to the original transcript and does not inherit that successor route. Hosted qualification at head `4e0857e662203` (synthetic merge `d7e4e2dd282a6`) exposed the obsolete cascade-deletion assertion; the corrected test and whole owning Slack DB module await new exact-source qualification. Earlier validation below is historical, not PASS for the retention successor.
+
 All 292 Rust migration, lineage, gateway, Goal and replay tests pass on the
 reconciled schema.
 Coverage includes fresh installation, prototype refusal before mutation, native

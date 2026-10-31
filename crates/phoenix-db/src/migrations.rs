@@ -17,6 +17,9 @@ mod local_goal_watch;
 mod retire_commission_review;
 mod settle_historical_continuation;
 
+#[cfg(test)]
+mod conversation_tools_tests;
+
 struct Migration {
     version: u32,
     name: &'static str,
@@ -744,7 +747,41 @@ const MIGRATIONS: &[Migration] = &[
         name: "slack_gateway_v1",
         sql: include_str!("migrations/slack_gateway.sql"),
     },
-
+    Migration {
+        version: 143,
+        name: "agent_creation_provenance",
+        sql: include_str!("migrations/agent_creation_provenance.sql"),
+    },
+    Migration {
+        version: 144,
+        name: "product_conversation_rename_receipts",
+        sql: include_str!("migrations/product_conversation_rename_receipts.sql"),
+    },
+    Migration {
+        version: 145,
+        name: "coordinator_goal_preparations",
+        sql: include_str!("conversation_goals/prepared.sql"),
+    },
+    Migration {
+        version: 146,
+        name: "retain_product_conversation_rename_receipts",
+        sql: include_str!("migrations/retain_product_conversation_rename_receipts.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "retain_product_creation_receipts",
+        sql: include_str!("migrations/retain_product_creation_receipts.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "product_creation_initial_execution_receipts",
+        sql: include_str!("migrations/product_creation_initial_execution_receipts.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "product_creation_image_retirement",
+        sql: include_str!("migrations/product_creation_image_retirement.sql"),
+    },
 ];
 
 const MIGRATION_138: &str = concat!(
@@ -12049,6 +12086,48 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
     restore
 }
 
+async fn migration_149_backfill_image_replay_identity(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<()> {
+    let mut cursor = 0_i64;
+    loop {
+        let row: Option<(i64, String, i64, String, String)> = sqlx::query_as(
+            "SELECT rowid, request_id, ordinal, media_type, data FROM product_creation_job_images
+             WHERE rowid > ?1 ORDER BY rowid LIMIT 1",
+        )
+        .bind(cursor)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((rowid, request_id, ordinal, media_type, data)) = row else {
+            break;
+        };
+        cursor = rowid;
+        sqlx::query("INSERT INTO product_creation_image_replay_identity (request_id, ordinal, media_type, data_sha256) VALUES (?1, ?2, ?3, ?4)")
+            .bind(request_id)
+            .bind(ordinal)
+            .bind(media_type)
+            .bind(crate::product_creation::creation_image_data_sha256(&data))
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO product_creation_retired_images (request_id)
+         SELECT j.request_id FROM product_creation_jobs j
+         WHERE j.published_product_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM product_creation_image_replay_identity i WHERE i.request_id = j.request_id)
+           AND NOT EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = j.published_product_id)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM product_creation_job_images WHERE request_id IN
+         (SELECT request_id FROM product_creation_retired_images)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn apply_migration_body(
     tx: &mut Transaction<'_, Sqlite>,
     migration: &Migration,
@@ -12062,7 +12141,18 @@ async fn apply_migration_body(
     if migration.version == 113 {
         settle_historical_continuation::run(tx).await?;
     } else {
+        #[cfg(test)]
+        {
+            let sql = conversation_tools_tests::body_sql(tx, migration.sql).await?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_ref()))
+                .execute(&mut **tx)
+                .await?;
+        }
+        #[cfg(not(test))]
         sqlx::raw_sql(migration.sql).execute(&mut **tx).await?;
+        if migration.version == 149 {
+            migration_149_backfill_image_replay_identity(tx).await?;
+        }
         if migration.version == 114 {
             sqlx::query(
                 "INSERT INTO instance_identity (singleton_key, instance_id) VALUES (1, ?1)",
@@ -12143,6 +12233,20 @@ pub(crate) fn migration_identities() -> impl Iterator<Item = (u32, &'static str)
     MIGRATIONS
         .iter()
         .map(|migration| (migration.version, migration.name))
+}
+
+#[cfg(test)]
+pub(crate) async fn run_unpublished_tools_d3_for_test(pool: &SqlitePool) -> DbResult<u32> {
+    let unpublished: Vec<_> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 149 && migration.version != 145)
+        .map(|migration| Migration {
+            version: migration.version,
+            name: migration.name,
+            sql: migration.sql,
+        })
+        .collect();
+    run_migration_list(pool, &unpublished).await
 }
 
 #[cfg(test)]
@@ -15041,6 +15145,13 @@ with tempfile.TemporaryDirectory() as directory:
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (149, "product_creation_image_retirement"),
+            (148, "product_creation_initial_execution_receipts"),
+            (147, "retain_product_creation_receipts"),
+            (146, "retain_product_conversation_rename_receipts"),
+            (145, "coordinator_goal_preparations"),
+            (144, "product_conversation_rename_receipts"),
+            (143, "agent_creation_provenance"),
             (142, "slack_gateway_v1"),
             (141, "canonical_tool_round_receipts"),
             (140, "federation_local_stop_acceptance"),
@@ -19266,6 +19377,140 @@ with tempfile.TemporaryDirectory() as directory:
         .await
         .unwrap();
         assert_eq!(column, ("INTEGER".to_string(), 1));
+    }
+
+    #[test]
+    fn goal_tools_registry_contains_real_145_before_retention_tail() {
+        let tail: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= 143)
+            .map(|migration| (migration.version, migration.name))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                (143, "agent_creation_provenance"),
+                (144, "product_conversation_rename_receipts"),
+                (145, "coordinator_goal_preparations"),
+                (146, "retain_product_conversation_rename_receipts"),
+                (147, "retain_product_creation_receipts"),
+                (148, "product_creation_initial_execution_receipts"),
+                (149, "product_creation_image_retirement"),
+            ]
+        );
+        let goal = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 145)
+            .unwrap();
+        assert_eq!(goal.sql, include_str!("conversation_goals/prepared.sql"));
+        assert!(goal
+            .sql
+            .contains("CREATE TABLE conversation_goal_preparations"));
+        assert!(goal
+            .sql
+            .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
+        assert_eq!(MIGRATIONS.len(), 148);
+    }
+
+    #[tokio::test]
+    async fn image_retirement_migration_backfills_live_and_orphan_receipts_from_148() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_through_for_test(&pool, 148).await.unwrap();
+        for request in ["live-image", "orphan-image"] {
+            sqlx::query("INSERT INTO product_creation_jobs (request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros) VALUES (?1, ?1, '/tmp', 'objective', 'caveman', 'accepted', 1, 1)")
+                .bind(request).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO product_creation_job_images (request_id, ordinal, media_type, data) VALUES (?1, 0, 'image/png', 'exact UTF8 é')")
+                .bind(request).execute(&pool).await.unwrap();
+        }
+        sqlx::query("UPDATE product_creation_jobs SET status = 'published', published_product_id = 'deleted-product', published_conversation_id = 'deleted-transcript' WHERE request_id = 'orphan-image'")
+            .execute(&pool).await.unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let identity: Vec<(String, String)> = sqlx::query_as(
+            "SELECT request_id, data_sha256 FROM product_creation_image_replay_identity ORDER BY request_id",
+        ).fetch_all(&pool).await.unwrap();
+        let expected = "763DAB0258E0A3A46C75E194A4414076B85FB08CF3366C59849282EA89FA78C2";
+        assert_eq!(
+            identity,
+            vec![
+                ("live-image".into(), expected.into()),
+                ("orphan-image".into(), expected.into())
+            ]
+        );
+        let orphan_payloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'orphan-image'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphan_payloads, 0);
+        let live_payloads: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'live-image'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live_payloads, 1);
+        let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id = 'orphan-image'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(retired, 1);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn image_retirement_migration_preserves_text_only_orphan_receipt_from_148() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_through_for_test(&pool, 148).await.unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_jobs
+             (request_id, product_conversation_id, cwd, objective, llm_language, status,
+              accepted_at_unix_micros, updated_at_unix_micros,
+              published_product_id, published_conversation_id)
+             VALUES ('orphan-text', 'orphan-text', '/tmp', 'objective', 'caveman', 'published',
+                     1, 1, 'deleted-product', 'deleted-transcript')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let retained: (String, String, String) = sqlx::query_as(
+            "SELECT status, published_product_id, published_conversation_id
+             FROM product_creation_jobs WHERE request_id = 'orphan-text'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "published".into(),
+                "deleted-product".into(),
+                "deleted-transcript".into()
+            )
+        );
+        let image_rows: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+             (SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id = 'orphan-text'),
+             (SELECT COUNT(*) FROM product_creation_image_replay_identity WHERE request_id = 'orphan-text'),
+             (SELECT COUNT(*) FROM product_creation_job_images WHERE request_id = 'orphan-text')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(image_rows, (0, 0, 0));
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

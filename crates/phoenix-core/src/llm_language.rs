@@ -236,8 +236,9 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 links and grounded status—not a fixed template. Mention material \
                 delivery/evidence limits. Check-ins are bounded, not polling. Only mutate \
                 selected WorkScope via unsandboxed Bash with its explicit active work_scope_id. \
-                No dedicated project/task/workspace/approval/lifecycle mutation tools. Act on \
-                user turns and factual events from explicit watches; ordinary watches follow \
+                No dedicated project/task/workspace/approval/lifecycle mutation tools except \
+                installed create_conversation/rename_conversation. Act on user turns and factual \
+                events from explicit watches; ordinary watches follow \
                 continuations until removed/closed."
         }
         LlmLanguage::Caveman => {
@@ -285,9 +286,10 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 first; problem, actual work, outcome/why and next step. Plain English, links, \
                 grounded status; not a fixed template. Note material delivery/evidence limits. \
                 Bounded check-in, no polling. Change selected WorkScope only with unsandboxed \
-                Bash and explicit active work_scope_id. No \
-                project/task/workspace/approval/lifecycle mutation tools. Act on user turns and \
-                factual events from explicit watches; ordinary watches follow continuations until \
+                Bash and explicit active work_scope_id. No dedicated \
+                project/task/workspace/approval/lifecycle mutation tools except installed \
+                create_conversation/rename_conversation. Act on user turns and factual events from \
+                explicit watches; ordinary watches follow continuations until \
                 removed/closed."
         }
     }
@@ -774,7 +776,7 @@ mod tests {
     fn coordinator_prompts_fit_baselines_and_teach_clear_recovery() {
         const BASELINES: [(LlmLanguage, usize, usize); 2] = [
             (LlmLanguage::PhoenixNative, 626, 4742),
-            (LlmLanguage::Caveman, 509, 3649),
+            (LlmLanguage::Caveman, 509, 3716),
         ];
         for (language, baseline_words, baseline_chars) in BASELINES {
             let prompt = coordinator_prompt(language);
