@@ -390,6 +390,12 @@ AND SHALL deliver Coordinator objective text literally as agent-authored input r
 AND SHALL retain the first accepted provenance on an identical retry while allowing a fresh source-call locator from the same authorized source
 AND SHALL reject reuse of a request identity for a different intent rather than reserve another conversation.
 
+Creation intent SHALL identify the accepted effective model and language choices, not whether those request fields were explicit or omitted.
+On first acceptance, omitted model and language SHALL resolve to the acceptance-time defaults.
+On retry, omitted model and language SHALL reconcile to the accepted choices, an explicit matching choice SHALL replay, and an explicit different choice SHALL conflict.
+Omitted effort SHALL remain a native execution selection distinct from every explicit effort level, including when the native default has that same level.
+Retries SHALL NOT reevaluate the accepted choices against changed defaults.
+
 WHEN the Coordinator reconciles an uncertain creation result
 THE SYSTEM SHALL return the original durable request and product identities and observed creation status
 AND SHALL distinguish acceptance from publication, objective delivery, runtime execution, and completion

@@ -521,6 +521,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_reconciles_frozen_model_and_language_but_conflicts_changed_choices() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, LlmLanguage::PhoenixNative)
+            .await
+            .unwrap();
+        let source = CreateSource::CurrentCoordinator {
+            product_conversation_id: coordinator.product_conversation_id.clone(),
+            transcript_id: coordinator.id.clone(),
+            source_call: SourceToolCall {
+                message_id: "frozen-choice-message".into(),
+                tool_use_id: "frozen-choice-call".into(),
+            },
+        };
+        let [initial, changed_defaults] = ["gpt-5.6-sol", "gpt-6.1-sol"].map(|model| {
+            runtime(
+                db.clone(),
+                ModelRegistry::new(&LlmConfig {
+                    openai_api_key: Some("test-never-dispatched".into()),
+                    default_model: Some(model.into()),
+                    ..LlmConfig::default()
+                }),
+            )
+        });
+        assert_eq!(
+            changed_defaults.model_registry().default_model_id(),
+            "gpt-6.1-sol"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut req = request(cwd.to_str().unwrap());
+        req.model = Some("gpt-5.6-sol".into());
+        req.llm_language = Some(LlmLanguage::PhoenixNative);
+        let ProductCreationAcceptOutcome::Accepted(accepted) = db
+            .accept_product_creation_resolved(&req.request_id, Some(&coordinator.id), |r| {
+                resolve_test_intent(&initial, &req, &source, r)
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("first request must be accepted");
+        };
+        db.set_default_llm_language(LlmLanguage::Caveman)
+            .await
+            .unwrap();
+
+        let cases = [
+            ("omitted", None, None, true),
+            (
+                "explicit_same",
+                Some("gpt-5.6-sol"),
+                Some(LlmLanguage::PhoenixNative),
+                true,
+            ),
+            ("changed_model", Some("gpt-6.1-sol"), None, false),
+            ("changed_language", None, Some(LlmLanguage::Caveman), false),
+        ];
+        for (label, model, language, replay) in cases {
+            let expected_model = model.unwrap_or("gpt-5.6-sol");
+            let expected_language = language.unwrap_or(LlmLanguage::PhoenixNative);
+            req.model = model.map(str::to_owned);
+            req.llm_language = language;
+            let candidate = resolve_test_intent(
+                &changed_defaults,
+                &req,
+                &source,
+                ProductCreationResolution::Existing(&accepted),
+            )
+            .unwrap();
+            assert_eq!(candidate.model.as_deref(), Some(expected_model), "{label}");
+            assert_eq!(candidate.llm_language, expected_language, "{label}");
+            assert!(candidate.effort.is_none(), "{label}");
+            match db
+                .accept_product_creation_resolved(&req.request_id, Some(&coordinator.id), |r| {
+                    resolve_test_intent(&changed_defaults, &req, &source, r)
+                })
+                .await
+                .unwrap()
+            {
+                ProductCreationAcceptOutcome::Accepted(_) => panic!("{label}: retry accepted"),
+                ProductCreationAcceptOutcome::Replayed(result) => {
+                    assert!(replay, "{label}: changed choice replayed");
+                    assert_eq!(result.intent, accepted.intent, "{label}");
+                    assert_eq!(
+                        result.product_conversation_id, accepted.product_conversation_id,
+                        "{label}"
+                    );
+                }
+                ProductCreationAcceptOutcome::Conflict(_) => {
+                    assert!(!replay, "{label}: expected replay")
+                }
+            }
+        }
+        let stored = db
+            .get_product_creation_job(&req.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.intent, accepted.intent);
+    }
+
+    #[tokio::test]
     async fn replay_uses_frozen_defaults_and_preserves_first_source_attribution() {
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
