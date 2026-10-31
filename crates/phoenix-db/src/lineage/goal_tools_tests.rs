@@ -250,6 +250,29 @@ async fn fresh_goal_tools_database_applies_complete_registry() {
     assert_goal_rows(&db, &owner, true).await;
 }
 
+async fn seed_legacy_tools_retention(
+    db: &Database,
+    owner: &str,
+) -> phoenix_core::domain::db_schema::Conversation {
+    let transcript: String =
+        sqlx::query_scalar("SELECT id FROM conversations WHERE product_conversation_id=?")
+            .bind(owner)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let author = db
+        .create_conversation("migration-author", "author", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO product_creation_jobs(request_id,product_conversation_id,cwd,objective,llm_language,status,accepted_at_unix_micros,updated_at_unix_micros,published_product_id,published_conversation_id) VALUES ('joint-create',?,'/tmp','retained objective','phoenix-native','published',1,1,?,?)")
+        .bind(owner).bind(owner).bind(&transcript).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO product_creation_job_images(request_id,ordinal,media_type,data) VALUES ('joint-create',0,'image/png','payload')")
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO product_conversation_rename_receipts(operation_id,product_conversation_id,name_revision_before,title,source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,naming_root_transcript_id,slug_at_commit,committed_at_unix_micros) VALUES ('joint-rename',?,0,'retained title',?,?,'rename-message','rename-tool',?,'retained-slug',1)")
+        .bind(owner).bind(author.product_conversation_id.as_str()).bind(&author.id).bind(&transcript).execute(db.pool()).await.unwrap();
+    author
+}
+
 #[tokio::test]
 async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
@@ -259,22 +282,7 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         .await
         .unwrap();
     let owner = seed_legacy_goal(&db).await;
-    let transcript: String =
-        sqlx::query_scalar("SELECT id FROM conversations WHERE product_conversation_id=?")
-            .bind(&owner)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    let author = db
-        .create_conversation("migration-author", "author", "/tmp", true, None, None)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO product_creation_jobs(request_id,product_conversation_id,cwd,objective,llm_language,status,accepted_at_unix_micros,updated_at_unix_micros,published_product_id,published_conversation_id) VALUES ('joint-create',?,'/tmp','retained objective','phoenix-native','published',1,1,?,?)")
-        .bind(&owner).bind(&owner).bind(&transcript).execute(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO product_creation_job_images(request_id,ordinal,media_type,data) VALUES ('joint-create',0,'image/png','payload')")
-        .execute(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO product_conversation_rename_receipts(operation_id,product_conversation_id,name_revision_before,title,source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,naming_root_transcript_id,slug_at_commit,committed_at_unix_micros) VALUES ('joint-rename',?,0,'retained title',?,?,'rename-message','rename-tool',?,'retained-slug',1)")
-        .bind(&owner).bind(author.product_conversation_id.as_str()).bind(&author.id).bind(&transcript).execute(db.pool()).await.unwrap();
+    let author = seed_legacy_tools_retention(&db, &owner).await;
     assert_eq!(
         crate::migrations::run_through_for_test(db.pool(), 145)
             .await
