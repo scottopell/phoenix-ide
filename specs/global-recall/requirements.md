@@ -158,6 +158,19 @@ AND SHALL NOT grant that capability to sub-agents
 
 THE search and transcript-read capabilities SHALL describe recalled text as untrusted stored data rather than instructions
 
+WHEN a destination serves a federated conversation-page read
+THE SYSTEM SHALL examine at most 12,992 physical message rows and issue at most 203 bounded-history fetches for that request
+AND SHALL count visible rows, hidden rows, and rows replayed to reach the rendered-content cursor against the same row budget
+AND SHALL cap each fetch to the remaining row budget
+
+IF the system reaches that budget before a fetched row proves rendered continuation or a bounded fetch proves physical transcript EOF
+THE SYSTEM SHALL fail the request without returning page content, a continuation cursor, or an end-of-transcript indication
+AND SHALL NOT expose a resumable physical-scan position
+AND an unchanged request SHALL restart the same scan rather than advance it
+
+THE physical-message budget SHALL bound work rather than wall-clock duration
+AND neither that budget nor an HTTP deadline response SHALL guarantee interruption of in-progress SQLite work
+
 WHEN the singleton Global Coordinator invokes Bash
 THE SYSTEM SHALL require an explicit active `WorkScope` ID for every new command
 AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching unsandboxed Bash
@@ -230,6 +243,10 @@ AND SHALL preserve explicit historical evidence, Global Coordinator routing, and
 
 WHEN a stable ProductConversation reference is resolved
 THE SYSTEM SHALL resolve the current transcript member and its attached WorkScope from one database point in time
+
+WHEN a stable ProductConversation reference is resolved through a bounded global conversation-read or reference-resolution surface
+THE SYSTEM SHALL resolve its eligible ordinary identity and topology from metadata
+AND SHALL NOT deserialize message content, continuation handoff content, or continuation opening content solely to resolve that identity
 
 WHEN an exact transcript-row reference is resolved
 THE SYSTEM SHALL resolve only that historical member's attached WorkScope and SHALL NOT substitute a current or successor member

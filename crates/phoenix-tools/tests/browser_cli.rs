@@ -1322,6 +1322,237 @@ fn live_session_input_errors_and_close_ignore_startup_only_idle_config() {
     assert_resources_removed(&resources);
 }
 
+struct HeldScenarioFixture {
+    address: SocketAddr,
+    received: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+    shutdown: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldScenarioFixture {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (shutdown, stopping) = std::sync::mpsc::channel();
+        let (arrived, received) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let released = Mutex::new(Some(released));
+            std::thread::scope(|connections| {
+                while stopping.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty) {
+                    let (stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            // test-timing-allow: poll socket readiness; shutdown wakes this wait, and elapsed time never establishes request readiness.
+                            if stopping.recv_timeout(Duration::from_millis(20))
+                                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(error) => panic!("scenario fixture accept failed: {error}"),
+                    };
+                    let arrived = &arrived;
+                    let released = &released;
+                    connections.spawn(move || {
+                        Self::serve(stream, arrived, released).unwrap();
+                    });
+                }
+            });
+        });
+        Self {
+            address,
+            received,
+            release,
+            shutdown,
+            worker: Some(worker),
+        }
+    }
+
+    fn serve(
+        mut stream: TcpStream,
+        arrived: &std::sync::mpsc::Sender<()>,
+        released: &Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    ) -> std::io::Result<()> {
+        stream.set_nonblocking(false)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            if headers.len() >= 16 * 1024 {
+                return Err(std::io::Error::other("fixture headers exceed 16 KiB"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            stream.set_read_timeout(Some(remaining))?;
+            let mut byte = [0];
+            match stream.read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(_) => headers.push(byte[0]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let headers = std::str::from_utf8(&headers)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let mut request = headers
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace();
+        let method = request.next();
+        let path = request.next();
+        let version = request.next();
+        if method != Some("GET") || version != Some("HTTP/1.1") || request.next().is_some() {
+            return Err(std::io::Error::other("unexpected fixture request line"));
+        }
+        let (status, content_type, body) = match path {
+            Some("/") => (
+                "200 OK",
+                "text/html",
+                "<!doctype html><title>Held scenario</title>",
+            ),
+            Some("/hold") => {
+                let released = released.lock().unwrap().take().expect("duplicate /hold");
+                arrived.send(()).unwrap();
+                released
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(std::io::Error::other)?;
+                ("200 OK", "text/plain", "released")
+            }
+            _ => ("404 Not Found", "text/plain", ""),
+        };
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+}
+
+impl Drop for HeldScenarioFixture {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        let _ = self.shutdown.send(());
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_socket_scenarios_reject_before_fixture_release_without_replaying() {
+    // REQ-BCLI-006, REQ-BT-019.22. These requests cross the real daemon socket.
+    if !chrome_enabled() {
+        return;
+    }
+    for disconnect_first in [false, true] {
+        let cli = BrowserCli::new();
+        let fixture = HeldScenarioFixture::new();
+        let opened = cli.ok(&["open", &format!("http://{}/", fixture.address)]);
+        let resources = live_resources(&cli);
+        let scenario = json!({
+            "action":"run_scenario", "runs":1, "warmup":0,
+            "reset":"none", "throttle_rate":1, "gc_per_run":false,
+            "steps":[
+                {"kind":"wait_eval", "expression":"true"},
+                {"kind":"eval", "expression":"fetch('/hold').then(response => response.text()).then(body => { if (body !== 'released') throw new Error('unexpected hold response'); window.firstRuns = (window.firstRuns || 0) + 1; return true; })"}
+            ]
+        });
+        let mut first = UnixStream::connect(cli.socket()).unwrap();
+        serde_json::to_writer(&mut first, &json!({"command":"profile", "input":scenario})).unwrap();
+        first.write_all(b"\n").unwrap();
+        fixture
+            .received
+            .recv_timeout(Duration::from_secs(20))
+            .expect("first scenario never sent complete /hold request headers");
+        let mut first = if disconnect_first {
+            drop(first);
+            None
+        } else {
+            Some(first)
+        };
+        let second_input = json!({
+            "action":"run_scenario", "runs":1, "warmup":0,
+            "reset":"none", "throttle_rate":1, "gc_per_run":false,
+            "steps":[
+                {"kind":"wait_eval", "expression":"true"},
+                {"kind":"eval", "expression":"window.secondRuns = (window.secondRuns || 0) + 1"}
+            ]
+        })
+        .to_string();
+        // The deadline detects queueing; fixture release is strictly downstream
+        // of the busy response, so elapsed time never establishes readiness.
+        std::thread::scope(|scope| {
+            let (sent, reply) = std::sync::mpsc::channel();
+            let cli = &cli;
+            let second_input = &second_input;
+            scope.spawn(move || {
+                let response = std::panic::catch_unwind(|| {
+                    cli.invoke(
+                        &["profile", "run_scenario", "--input", second_input],
+                        None,
+                        false,
+                    )
+                });
+                sent.send(response).unwrap();
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let response = reply
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("second scenario queued behind the held first scenario")
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                assert_eq!(response["status"], "error");
+                assert_eq!(response["error"]["code"], "busy");
+                assert_eq!(response["lifetime"], opened["lifetime"]);
+            }));
+            // Release on assertion failure too, before the competitor thread is joined.
+            fixture.release.send(()).unwrap();
+            if let Err(panic) = outcome {
+                std::panic::resume_unwind(panic);
+            }
+        });
+        if let Some(first) = first.as_mut() {
+            first
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut response = String::new();
+            first.read_to_string(&mut response).unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["status"], "success", "{response}");
+            assert_eq!(response["browser_lifetime"], opened["browser_lifetime"]);
+        }
+        // Ordinary eval stays serialized and is a fence after the first operation,
+        // including when its caller disconnected; it must observe exactly one run.
+        assert_eq!(
+            cli.eval("[window.firstRuns || 0, window.secondRuns || 0]"),
+            json!([1, 0])
+        );
+        cli.invoke(
+            &["profile", "run_scenario", "--input", &second_input],
+            None,
+            true,
+        );
+        assert_eq!(
+            cli.eval("[window.firstRuns, window.secondRuns]"),
+            json!([1, 1])
+        );
+        cli.ok(&["close"]);
+        assert_resources_removed(&resources);
+    }
+}
+
 #[test]
 fn close_interrupts_an_active_evaluation_and_cleans_up() {
     if !chrome_enabled() {

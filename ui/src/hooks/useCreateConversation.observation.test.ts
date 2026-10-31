@@ -64,6 +64,10 @@ const cancelled: ProductConversationCreationObservation = {
   kind: 'cancelled', request_id: 'request-1',
   error: null, allowed_actions: ['start_over', 'delete'],
 };
+const historical: ProductConversationCreationObservation = {
+  kind: 'historical_published', request_id: 'request-1', product_conversation_id: 'product-1',
+  transcript_row_id: 'transcript-1',
+};
 const published: ProductConversationCreationObservation = {
   kind: 'published', request_id: 'request-1', product_conversation_id: 'product-1',
   transcript_row_id: 'transcript-1', canonical_route: '/c/canonical-product-1',
@@ -180,6 +184,27 @@ describe('exact-request creation observation', () => {
     expect(apiMock.createProductConversation).toHaveBeenCalledTimes(1);
     expect(generateUUIDMock).toHaveBeenCalledTimes(1);
     expect(storedCreation()).not.toBeNull();
+  });
+
+  it.each(['accepted', 'uncertain'] as const)('keeps %s historical publication terminal until explicit local forget', async (source) => {
+    if (source === 'uncertain') apiMock.createProductConversation.mockRejectedValueOnce(new TypeError('Lost response'));
+    apiMock.getProductConversationCreation.mockResolvedValue(historical);
+    const hook = mountCreation();
+    await prepareCreation(hook);
+    await act(async () => { await hook.result.current.handleSend(); });
+    expect(hook.result.current.creationObservation).toEqual(historical);
+    expect(hook.result.current.creating).toBe(false);
+    expect(hook.result.current.canSend).toBe(false);
+    expect(hook.navigate).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(apiMock.getProductConversationCreation).toHaveBeenCalledTimes(1);
+    expect(apiMock.createProductConversation).toHaveBeenCalledTimes(1);
+    expect(storedCreation()).not.toBeNull();
+    act(() => hook.result.current.forgetCreationObservation('request-1'));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(storedCreation()).toBeNull();
+    expect(hook.result.current.canSend).toBe(true);
+    expect(hook.navigate).not.toHaveBeenCalled();
   });
 
   it('resumes the persisted exact request after reload without another POST', async () => {
@@ -592,7 +617,7 @@ describe('exact-request creation observation', () => {
     expect(hook.result.current.error).toContain('removed from the server');
   });
 
-  it.each([pending, failed, cancelled, published])('fences a mismatched product ID on $kind', async (observation) => {
+  it.each([pending, failed, cancelled, published, historical])('fences a mismatched product ID on $kind', async (observation) => {
     apiMock.getProductConversationCreation.mockResolvedValue({ ...observation, product_conversation_id: 'wrong-product' });
     const hook = mountCreation();
     await prepareCreation(hook);

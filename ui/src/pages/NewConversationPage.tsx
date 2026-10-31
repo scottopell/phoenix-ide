@@ -437,9 +437,12 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const exactError = exactObservation && recoveryActionErrors[exactObservation.request_id];
   const exactRecovery = exactObservation && (
     <section className="product-creation-recovery" aria-label="Current creation result">
-      <strong>{exactObservation.kind === 'cancelled'
-        ? 'Cancelled'
-        : recoveryStatusLabel(exactObservation.status)}</strong>
+      <strong>{exactObservation.kind === 'historical_published'
+        ? 'Published conversation removed'
+        : exactObservation.kind === 'cancelled' ? 'Cancelled' : recoveryStatusLabel(exactObservation.status)}</strong>
+      {exactObservation.kind === 'historical_published' && (
+        <div>This creation was published, but its original conversation is no longer available. No live conversation can be opened from this result.</div>
+      )}
       {'error' in exactObservation && exactObservation.error && (
         <div className="product-creation-recovery__error">{exactObservation.error}</div>
       )}
@@ -447,7 +450,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         <div className="product-creation-recovery__error" role="alert">{exactError.message}</div>
       )}
       <div className="product-creation-recovery__actions">
-        {exactObservation.allowed_actions.map((action) => (
+        {exactObservation.kind !== 'historical_published' && exactObservation.allowed_actions.map((action) => (
           <button
             key={action}
             type="button"
@@ -459,8 +462,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             {recoveryActionLabel(action)}
           </button>
         ))}
-        {(exactObservation.kind === 'failed' || exactObservation.kind === 'cancelled')
-          && (exactObservation.allowed_actions.length === 0
+        {(exactObservation.kind === 'failed' || exactObservation.kind === 'cancelled' || exactObservation.kind === 'historical_published')
+          && (exactObservation.kind === 'historical_published' || exactObservation.allowed_actions.length === 0
             || (exactObservation.kind === 'failed' && exactObservation.status === 'cleanup_ambiguous')) && (
           <button
             type="button"

@@ -5,7 +5,7 @@ use phoenix_core::domain::llm_types::ModelEffort;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_core::llm_language::LlmLanguage;
 use phoenix_tools::{Tool, ToolContext, ToolOutput};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::CreateProductConversationRequest;
@@ -164,7 +164,8 @@ fn rename_detail_response(detail: &crate::db::ProductConversationRenameDetail) -
         detail.slug.as_deref(),
         detail.product_conversation_id.as_str(),
     );
-    json!({"status":"detail", "canonical_route":route, "detail":detail})
+    json!({"status":"detail", "canonical_route":route, "detail":detail,
+        "allowed_actions": if detail.can_rename { vec!["detail", "read", "rename"] } else { vec!["detail", "read"] }})
 }
 
 impl RenameConversation {
@@ -250,7 +251,7 @@ impl Tool for CreateConversation {
         "create_conversation"
     }
     fn description(&self) -> String {
-        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id for canonical pending/ready/failure status. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
+        "Current Global Coordinator only. Explicitly create AND submit a nonblank text objective using start=submit_objective via the durable creation pipeline; dormant create is unsupported. Options discovers bounded project paths, normalized cwd, and available model/effort choices. Submit only an exact normalized absolute cwd. Objective text is literal agent content, never a user commission or slash command. Omit model/language to freeze current defaults on first acceptance; retry omission reuses those choices, while explicit different choices conflict. Omitted effort means native execution semantics, distinct from an explicit level. Choose a caller-owned request UUID before submission; read/retry that UUID after uncertainty (no duplicate or changed-intent retry). Accepted is not ready: read request_id for canonical pending/ready/failure status. No WorkScope attachment, artifact reference, cancellation, or retry-delivery operation is offered.".into()
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object", "additionalProperties":false,"required":["op"],"properties":{
@@ -267,7 +268,138 @@ impl Tool for CreateConversation {
     }
 }
 
+fn validated_creation_directory(cwd: &str, home: &std::path::Path) -> Result<String, String> {
+    let cwd = cwd.trim();
+    let path = if cwd == "~" {
+        home.to_path_buf()
+    } else if let Some(relative) = cwd.strip_prefix("~/") {
+        home.join(relative)
+    } else {
+        std::path::PathBuf::from(cwd)
+    };
+    if cwd.is_empty() || !path.is_dir() {
+        return Err("cwd must name an existing directory, not a file".into());
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    crate::conversation_cwd::validate_conversation_cwd(canonical.to_string_lossy())
+        .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NativeCreationPublication {
+    Available {
+        conversation_id: String,
+        canonical_route: String,
+    },
+    Historical {
+        conversation_id: String,
+    },
+}
+
+#[derive(Serialize)]
+struct NativeCreationStatus {
+    request_id: String,
+    product_conversation_id: ProductConversationId,
+    status: String,
+    provisioning_stage: phoenix_db::ProductCreationProvisioningStage,
+    provisioning_stage_updated_at: chrono::DateTime<chrono::Utc>,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+    publication: Option<NativeCreationPublication>,
+    initial_objective_execution: phoenix_db::ProductCreationInitialExecution,
+    execution_interpretation: &'static str,
+    allowed_actions: [&'static str; 1],
+}
+
+fn native_creation_status(status: phoenix_db::ProductCreationStatusRead) -> NativeCreationStatus {
+    NativeCreationStatus {
+        request_id: status.request_id,
+        product_conversation_id: status.product_conversation_id,
+        status: status.status,
+        provisioning_stage: status.provisioning_stage,
+        provisioning_stage_updated_at: status.stage_updated_at,
+        retry_at: status.retry_at,
+        error: status.error,
+        publication: status.publication.map(|publication| match publication {
+            phoenix_db::ProductCreationPublicationRead::Available {
+                conversation_id,
+                aggregate,
+            } => NativeCreationPublication::Available {
+                conversation_id,
+                canonical_route: crate::api::product_conversations::canonical_route(&aggregate),
+            },
+            phoenix_db::ProductCreationPublicationRead::Historical { conversation_id } => {
+                NativeCreationPublication::Historical { conversation_id }
+            }
+        }),
+        initial_objective_execution: status.initial_objective_execution,
+        execution_interpretation: "Publication means initial input accepted, not objective completed. Unavailable means no attributable outcome is retained; never infer success from later turns.",
+        allowed_actions: ["read"],
+    }
+}
+
+async fn read_native_creation_status(
+    runtime: &RuntimeManager,
+    transcript_id: &str,
+    request_id: &str,
+) -> Result<Option<NativeCreationStatus>, String> {
+    runtime
+        .db()
+        .read_product_creation_status_as_coordinator(transcript_id, request_id)
+        .await
+        .map(|status| status.map(native_creation_status))
+        .map_err(|error| error.to_string())
+}
+
+async fn native_creation_acceptance_receipt(
+    runtime: &RuntimeManager,
+    transcript_id: &str,
+    request_id: &str,
+) -> Result<Value, String> {
+    let accepted = read_native_creation_status(runtime, transcript_id, request_id)
+        .await?
+        .ok_or("Accepted creation request is no longer available; reconcile request_id")?;
+    Ok(
+        json!({"status":"accepted", "request_id":accepted.request_id,"product_conversation_id":accepted.product_conversation_id,"next":"read request_id; accepted does not imply ready"}),
+    )
+}
+
 impl CreateConversation {
+    async fn project_options(&self, transcript_id: &str) -> Result<(Vec<Value>, bool), String> {
+        let mut projects = Vec::new();
+        let mut after_id = None::<String>;
+        while projects.len() < 51 {
+            let candidates = self
+                .0
+                .db()
+                .product_creation_project_options_as_coordinator(transcript_id, after_id.as_deref())
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some((last_id, _)) = candidates.last() else {
+                break;
+            };
+            after_id = Some(last_id.clone());
+            let home = self.0.runtime_home().to_path_buf();
+            let usable = tokio::task::spawn_blocking(move || {
+                candidates.into_iter().filter_map(|(id, cwd)| {
+                    match validated_creation_directory(&cwd, &home) {
+                        Ok(cwd) => Some(json!({"project_id":id,"cwd":cwd})),
+                        Err(error) => {
+                            tracing::debug!(project_id = %id, cwd = %cwd, %error, "omitting unusable creation project option");
+                            None
+                        }
+                    }
+                }).collect::<Vec<_>>()
+            }).await.map_err(|error| error.to_string())?;
+            projects.extend(usable.into_iter().take(51 - projects.len()));
+        }
+        let truncated = projects.len() > 50;
+        projects.truncate(50);
+        Ok((projects, truncated))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_inner(&self, input: Value, ctx: ToolContext) -> Result<Value, String> {
         self.0
@@ -278,27 +410,18 @@ impl CreateConversation {
         let request: CreateRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
         match request {
             CreateRequest::Options { cwd } => {
-                let cwd = cwd
-                    .map(|cwd| {
-                        crate::conversation_cwd::normalize_product_creation_cwd_intent(
-                            &cwd,
-                            self.0.runtime_home(),
-                        )
-                    })
-                    .transpose()
-                    .map_err(|e| e.to_string())?;
-                let mut projects = self
-                    .0
-                    .db()
-                    .product_creation_project_options_as_coordinator(&ctx.conversation_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let truncated = projects.len() > 50;
-                projects.truncate(50);
-                let projects: Vec<_> = projects
-                    .into_iter()
-                    .map(|(id, cwd)| json!({"project_id":id,"cwd":cwd}))
-                    .collect();
+                let cwd = match cwd {
+                    Some(cwd) => Some({
+                        let home = self.0.runtime_home().to_path_buf();
+                        tokio::task::spawn_blocking(move || {
+                            validated_creation_directory(&cwd, &home)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())??
+                    }),
+                    None => None,
+                };
+                let (projects, truncated) = self.project_options(&ctx.conversation_id).await?;
                 let registry = self.0.model_registry();
                 let routes = registry.available_execution_routes();
                 let models: Vec<_> = routes.into_iter().map(|route| json!({"model":route.model,"supported_efforts":route.supported_efforts})).collect();
@@ -307,41 +430,13 @@ impl CreateConversation {
                 )
             }
             CreateRequest::Read { request_id } => {
-                let job = self
-                    .0
-                    .db()
-                    .get_product_creation_job_as_coordinator(&ctx.conversation_id, &request_id.0)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let Some(job) = job else {
+                let status =
+                    read_native_creation_status(&self.0, &ctx.conversation_id, &request_id.0)
+                        .await?;
+                let Some(status) = status else {
                     return Ok(json!({"status":"unknown", "request_id":request_id.0}));
                 };
-                let route = if job.status == "published" {
-                    let aggregate = self
-                        .0
-                        .db()
-                        .get_ordinary_product_conversation(&job.product_conversation_id)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Some(crate::api::product_conversations::canonical_route(
-                        &aggregate,
-                    ))
-                } else {
-                    None
-                };
-                let delivery_retryable = self
-                    .0
-                    .db()
-                    .product_creation_delivery_retryable(&job.request_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let status = crate::api::handlers::product_creation_status_response(
-                    job,
-                    delivery_retryable,
-                    route,
-                )
-                .map_err(|e| e.to_string())?;
-                serde_json::to_value(status).map_err(|e| e.to_string())
+                serde_json::to_value(status).map_err(|error| error.to_string())
             }
             CreateRequest::Create {
                 request_id,
@@ -375,9 +470,12 @@ impl CreateConversation {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                Ok(
-                    json!({"status":"accepted", "request_id":accepted.request_id,"product_conversation_id":accepted.product_conversation_id,"next":"read request_id; accepted does not imply ready"}),
+                native_creation_acceptance_receipt(
+                    &self.0,
+                    &ctx.conversation_id,
+                    &accepted.request_id,
                 )
+                .await
             }
         }
     }

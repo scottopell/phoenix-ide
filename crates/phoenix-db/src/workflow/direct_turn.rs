@@ -3181,6 +3181,18 @@ async fn settle_captured_execution_occurrence_tx(
     };
     let source_kind =
         crate::coordinator_watches::MessageExecutionSource::from_db(&occurrence.source_kind)?;
+    if matches!(
+        &source_kind,
+        crate::coordinator_watches::MessageExecutionSource::Steering
+    ) {
+        crate::product_creation::record_initial_execution_receipt_tx(
+            tx,
+            &occurrence.conversation_id,
+            &occurrence.message_id,
+            terminal,
+        )
+        .await?;
+    }
     crate::coordinator_watches::record_steering_event_tx(
         tx,
         source_kind,

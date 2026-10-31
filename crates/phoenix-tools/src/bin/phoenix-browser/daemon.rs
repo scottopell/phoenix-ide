@@ -5,6 +5,7 @@ use base64::Engine;
 use fs2::FileExt;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_tools::browser::profile::{BrowserProfileTool, ReservedScenario};
 use phoenix_tools::browser::{
     BrowserAccess, BrowserEvalTool, BrowserEvaluation, BrowserEvaluationError, BrowserOperation,
     BrowserSession, BrowserSessionManager,
@@ -106,17 +107,34 @@ impl Drop for Owner {
     }
 }
 
-struct Existing(Arc<RwLock<BrowserSession>>);
+struct Existing {
+    session: Arc<RwLock<BrowserSession>>,
+    manager: Arc<BrowserSessionManager>,
+}
 #[async_trait]
 impl BrowserAccess for Existing {
     async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String> {
-        Ok(self.0.clone())
+        Ok(self.session.clone())
+    }
+
+    async fn scenario_owner(
+        &self,
+        session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String> {
+        self.manager.scenario_owner_for_session(session).await
     }
 }
 struct Unavailable;
 #[async_trait]
 impl BrowserAccess for Unavailable {
     async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, String> {
+        Err("browser state is gone; use open URL".into())
+    }
+
+    async fn scenario_owner(
+        &self,
+        _session: &Arc<RwLock<BrowserSession>>,
+    ) -> Result<Arc<phoenix_browser::scenario::ScenarioOwner>, String> {
         Err("browser state is gone; use open URL".into())
     }
 }
@@ -451,6 +469,54 @@ impl State {
         }
     }
 
+    async fn reserve_scenario(
+        &self,
+        request: &Request,
+    ) -> Result<Option<QueuedScenario>, Response> {
+        if request.command != "profile"
+            || request.input.get("action").and_then(Value::as_str) != Some("run_scenario")
+        {
+            return Ok(None);
+        }
+        let rejection = |code, message: String| {
+            Response::error(&self.session, Some(&self.lifetime), code, message)
+        };
+        let Some(validated) = BrowserProfileTool::prepare_scenario(request.input.clone())
+            .map_err(|error| rejection(ErrorCode::InvalidInput, error.output().to_owned()))?
+        else {
+            return Ok(None);
+        };
+        let browser = match self.manager.lookup_existing(&self.scope).await {
+            phoenix_browser::session::BrowserSessionLookup::Ready(browser) => browser,
+            phoenix_browser::session::BrowserSessionLookup::Absent => {
+                return Err(rejection(
+                    ErrorCode::StateLost,
+                    "browser state is gone; use open URL to start fresh".into(),
+                ));
+            }
+            phoenix_browser::session::BrowserSessionLookup::Retained(retained) => {
+                return Err(cleanup_failure(
+                    self,
+                    &format!(
+                        "retained browser initialization at {}: {}",
+                        retained.profile_path.display(),
+                        retained.reason
+                    ),
+                    Some(retained.browser_lifetime),
+                ));
+            }
+        };
+        let owner = self
+            .manager
+            .scenario_owner_for_session(&browser)
+            .await
+            .map_err(|error| rejection(ErrorCode::BrowserStateUnavailable, error))?;
+        let scenario = validated
+            .reserve(&owner)
+            .map_err(|error| rejection(ErrorCode::Busy, error))?;
+        Ok(Some(QueuedScenario { browser, scenario }))
+    }
+
     async fn admit(&self, request: &Request) -> Admission {
         let existing = match self.live_browser().await {
             Ok(browser) => browser,
@@ -536,7 +602,10 @@ impl State {
             operation,
             browser_lifetime,
         } = ready;
-        let access = Existing(browser.clone());
+        let access = Existing {
+            session: browser.clone(),
+            manager: self.manager.clone(),
+        };
         if *operation == BrowserOperation::Eval {
             let response = match BrowserEvalTool::evaluate(request.input.clone(), &access).await {
                 Ok(value) => {
@@ -740,9 +809,15 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = ()> + Send, Str
     })
 }
 
+struct QueuedScenario {
+    browser: Arc<RwLock<BrowserSession>>,
+    scenario: ReservedScenario,
+}
+
 struct Job {
     request: Request,
     stream: UnixStream,
+    scenario: Option<QueuedScenario>,
 }
 
 fn collect_artifacts(value: &Value, artifacts: &mut Vec<String>) {
@@ -834,10 +909,83 @@ async fn run_job(state: &State, job: &mut Job, shutdown: &mut watch::Receiver<bo
     if *shutdown.borrow() {
         return JobResult::Reply(cancelled(state, Some(ready.browser_lifetime)));
     }
+    if let Some(queued) = job.scenario.take() {
+        if !Arc::ptr_eq(&queued.browser, &ready.browser) {
+            return JobResult::Reply(
+                Response::error(
+                    &state.session,
+                    Some(&state.lifetime),
+                    ErrorCode::StateLost,
+                    "reserved browser lifetime ended; scenario was not executed",
+                )
+                .with_browser_lifetime(Some(ready.browser_lifetime.clone())),
+            );
+        }
+        let cancellation = queued.scenario.cancellation();
+        let output = match settle_scenario_on_shutdown(
+            queued.scenario.execute(&queued.browser),
+            cancellation,
+            shutdown,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(output) => {
+                return JobResult::Reply(scenario_shutdown_reply(
+                    state,
+                    Some(ready.browser_lifetime),
+                    &output,
+                ));
+            }
+        };
+        return JobResult::Reply(
+            adapt(
+                &state.session,
+                Some(&state.lifetime),
+                &output,
+                &state.image_directory,
+            )
+            .await
+            .with_browser_lifetime(Some(ready.browser_lifetime.clone())),
+        );
+    }
     JobResult::Reply(tokio::select! {
         response = state.execute(&job.request, &ready) => response,
         _ = shutdown.changed() => cancelled(state, Some(ready.browser_lifetime.clone())),
     })
+}
+
+fn scenario_shutdown_reply(
+    state: &State,
+    browser_lifetime: Option<String>,
+    output: &ToolOutput,
+) -> Response {
+    let mut response = cancelled(state, browser_lifetime);
+    if let Outcome::Error { error } = &mut response.outcome {
+        error.message.push_str(" Scenario terminal result: ");
+        error.message.push_str(output.output());
+        error.details = Some(json!({
+            "tool_text": output.output(),
+            "data": output.display_data(),
+        }));
+    }
+    response
+}
+
+async fn settle_scenario_on_shutdown(
+    operation: impl std::future::Future<Output = ToolOutput>,
+    cancellation: phoenix_browser::scenario::ScenarioCancellation,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<ToolOutput, ToolOutput> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = phoenix_browser::scenario::cancelled(shutdown) => {
+            cancellation.cancel();
+            Err(operation.await)
+        }
+        output = &mut operation => Ok(output),
+    }
 }
 
 async fn worker(
@@ -871,7 +1019,17 @@ async fn worker(
 
 async fn read_job(mut stream: UnixStream, state: &State) -> Option<Job> {
     match tokio::time::timeout(Duration::from_secs(10), protocol::read_message(&mut stream)).await {
-        Ok(Ok(request)) => Some(Job { request, stream }),
+        Ok(Ok(request)) => match state.reserve_scenario(&request).await {
+            Ok(scenario) => Some(Job {
+                request,
+                stream,
+                scenario,
+            }),
+            Err(response) => {
+                send_response(&mut stream, &response).await;
+                None
+            }
+        },
         failure => {
             let message = match failure {
                 Ok(Err(error)) => error,
@@ -902,6 +1060,7 @@ fn receive_client(clients: &mut JoinSet<Option<Job>>, stream: UnixStream, state:
 }
 
 fn reject_busy(clients: &mut JoinSet<Option<Job>>, mut job: Job, state: Arc<State>) {
+    drop(job.scenario.take());
     clients.spawn(async move {
         send_response(
             &mut job.stream,
@@ -1172,6 +1331,246 @@ pub async fn run_from_args(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn scenario_shutdown_waits_for_owned_cleanup_before_reply() {
+        let owner = Arc::new(phoenix_browser::scenario::ScenarioOwner::default());
+        let permit = owner.reserve().unwrap();
+        let cancellation = permit.cancellation();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (cleaning, cleanup_started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (result, terminal) = tokio::sync::oneshot::channel();
+        permit
+            .start(move |mut cancelled| async move {
+                entered.send(()).unwrap();
+                phoenix_browser::scenario::cancelled(&mut cancelled).await;
+                cleaning.send(()).unwrap();
+                released.await.unwrap();
+                result
+                    .send(ToolOutput::error("cancelled after cleanup"))
+                    .unwrap();
+            })
+            .unwrap();
+        started.await.unwrap();
+        let (stop, mut shutdown) = watch::channel(false);
+        let mut response = Box::pin(settle_scenario_on_shutdown(
+            async { terminal.await.unwrap() },
+            cancellation,
+            &mut shutdown,
+        ));
+        stop.send(true).unwrap();
+        assert!(futures::poll!(&mut response).is_pending());
+        cleanup_started.await.unwrap();
+        assert!(owner.reserve().is_err());
+        assert!(
+            futures::poll!(&mut response).is_pending(),
+            "cancellation escaped while cleanup was held"
+        );
+        release.send(()).unwrap();
+        let output = response
+            .await
+            .expect_err("shutdown must retain terminal output");
+        assert_eq!(output.output(), "cancelled after cleanup");
+    }
+
+    #[tokio::test]
+    async fn scenario_shutdown_reply_preserves_terminal_cleanup_results() {
+        let state = reader_state();
+        let terminal_data = json!({
+            "outcome":"blocked", "raw_samples":[{"duration":42}],
+            "methodology_warnings":["retained terminal details"]
+        });
+        for text in [
+            "Browser scenario cancelled by session termination",
+            "Browser scenario cancelled by session termination\nScenario cleanup failed: Touch cancellation failed: lost acknowledgement; throttle restoration failed",
+        ] {
+            let owner = Arc::new(phoenix_browser::scenario::ScenarioOwner::default());
+            let permit = owner.reserve().unwrap();
+            let cancellation = permit.cancellation();
+            let (_stop, mut shutdown) = watch::channel(true);
+            let terminal = ToolOutput::error(text).with_display(terminal_data.clone());
+            let terminal = settle_scenario_on_shutdown(
+                std::future::ready(terminal),
+                cancellation,
+                &mut shutdown,
+            )
+            .await
+            .expect_err("shutdown must retain terminal output");
+            let response = scenario_shutdown_reply(&state, Some("browser-id".into()), &terminal);
+            assert_eq!(response.browser_lifetime.as_deref(), Some("browser-id"));
+            let Outcome::Error { error } = response.outcome else {
+                panic!("shutdown must return operation_cancelled");
+            };
+            assert_eq!(error.code, ErrorCode::OperationCancelled);
+            assert!(error.message.contains("effects may have partially executed"));
+            assert!(error.message.contains(text));
+            assert_eq!(error.details, Some(json!({"tool_text":text,"data":terminal_data})));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn worker_scenario_shutdown_reply_has_restored_contact_throttle_and_custody() {
+        use tokio::io::AsyncReadExt;
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/held", fixture.local_addr().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let manager = BrowserSessionManager::new();
+        manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
+        let state = Arc::new(State {
+            manager: manager.clone(),
+            scope: ResourceScopeKey::Unattached(format!("cancel-test:{}", uuid::Uuid::new_v4())),
+            session: "named:cancel-test".into(),
+            lifetime: uuid::Uuid::new_v4().to_string(),
+            idle: Duration::from_secs(300),
+            image_directory: directory.path().join("images"),
+        });
+        let browser = manager.get_session(&state.scope).await.unwrap();
+        {
+            let mut guard = browser.write().await;
+            guard
+                .configure_device(
+                    serde_json::from_value(json!({
+                        "width": 800, "height": 600, "device_scale_factor": 1,
+                        "mobile": true, "touch": true,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            guard.set_throttle_rate(1.5).await.unwrap();
+        }
+        let request = Request {
+            command: "profile".into(),
+            input: json!({
+                "action":"run_scenario", "runs":1, "warmup":0,
+                "device": {
+                    "width":800, "height":600, "device_scale_factor":1,
+                    "mobile":true, "touch":true
+                },
+                "reset":{"kind":"navigate", "url":url}, "throttle_rate":2, "gc_per_run":false,
+                "steps":[
+                    {"kind":"wait_eval", "expression":"true"},
+                    {"kind":"touch_start", "x":10, "y":10},
+                    {"kind":"eval", "expression":"fetch('/cleanup-gate'); true"},
+                    {"kind":"wait_eval", "expression":"false", "timeout":"60s"},
+                    {"kind":"touch_end"}
+                ]
+            }),
+        };
+        // Serve the initial navigation, then hold the fetch reached with active contact.
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let scenario = state.reserve_scenario(&request).await.unwrap();
+        assert!(scenario.is_some());
+        let (jobs, queued) = mpsc::channel(1);
+        let (stop, shutdown) = watch::channel(false);
+        let (completed, _events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(worker(state.clone(), queued, shutdown, completed));
+        jobs.send(Job {
+            request,
+            stream: server,
+            scenario,
+        })
+        .await
+        .unwrap();
+        let fixture_task = tokio::spawn(async move {
+            for held in [false, true] {
+                let (mut stream, _) = fixture.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(stream.read_u8().await.unwrap());
+                }
+                if held {
+                    assert!(headers.starts_with(b"GET /cleanup-gate "));
+                    return stream;
+                }
+                let body = "<html><head><link rel='icon' href='data:,'></head><body style='height:600px'></body></html>";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            unreachable!()
+        });
+        let held = tokio::time::timeout(Duration::from_secs(15), fixture_task)
+            .await
+            .expect("scenario never reached active-contact fetch")
+            .unwrap();
+        stop.send(true).unwrap();
+        let response: Response =
+            tokio::time::timeout(Duration::from_secs(10), protocol::read_message(&mut client))
+                .await
+                .expect("scenario shutdown failed to settle")
+                .unwrap();
+        assert!(
+            matches!(response.outcome, Outcome::Error { error } if error.code == ErrorCode::OperationCancelled)
+        );
+        let guard = browser
+            .try_write()
+            .expect("reply preceded cleanup lock release");
+        guard
+            .ensure_touch_idle()
+            .expect("reply left contact active or unknown");
+        assert_eq!(guard.throttle_rate().unwrap().to_bits(), 1.5_f64.to_bits());
+        drop(guard);
+        drop(held);
+        drop(jobs);
+        assert!(task.await.unwrap().is_none());
+        manager.kill_session(&state.scope).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_access_rejects_competing_scenario_while_worker_holds_session_lock() {
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let manager = BrowserSessionManager::new();
+        let scope =
+            ResourceScopeKey::Unattached(format!("existing-owner-{}", uuid::Uuid::new_v4()));
+        let session = manager.get_session(&scope).await.unwrap();
+        let owner = manager.scenario_owner_for_session(&session).await.unwrap();
+        let (entered, worker_entered) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker_session = session.clone();
+        owner
+            .start(move |_| async move {
+                let _guard = worker_session.write().await;
+                entered.send(()).unwrap();
+                released.await.unwrap();
+            })
+            .unwrap();
+        worker_entered.await.unwrap();
+        let access = Existing {
+            session,
+            manager: manager.clone(),
+        };
+        let mut admission = Box::pin(BrowserOperation::Profile.execute(
+            json!({
+                "action":"run_scenario", "runs":1, "warmup":0,
+                "steps":[{"kind":"eval", "expression":"true"}]
+            }),
+            &access,
+        ));
+        let std::task::Poll::Ready(output) = futures::poll!(&mut admission) else {
+            panic!("existing-session scenario admission waited for the worker's lock");
+        };
+        assert!(!output.is_success());
+        assert!(
+            output.output().contains("Another browser scenario"),
+            "{}",
+            output.output()
+        );
+        drop(admission);
+        release.send(()).unwrap();
+        manager.shutdown_all().await.expect("browser shutdown");
+    }
+
     #[test]
     fn evaluation_error_values_remain_data_instead_of_artifact_handles() {
         let details = serde_json::from_value(json!({
@@ -1214,7 +1613,13 @@ mod tests {
         browser.read().await.page.goto("about:blank").await.unwrap();
         browser.read().await.page.evaluate("document.body.innerHTML = Array.from({length:100}, (_,i) => `<button>${i} ${'accessible action '.repeat(5)}</button>`).join('')").await.unwrap();
         let output = BrowserOperation::Snapshot
-            .execute(json!({"interactive":true}), &Existing(browser.clone()))
+            .execute(
+                json!({"interactive":true}),
+                &Existing {
+                    session: browser.clone(),
+                    manager: state.manager.clone(),
+                },
+            )
             .await;
         assert!(output.is_success(), "{}", output.output());
         let checkpoint = browser.read().await.snapshot_checkpoint().unwrap();
@@ -1609,6 +2014,114 @@ mod tests {
         assert!(matches!(closed.outcome, Outcome::Success { result } if result["closed"] == true));
         task.await.unwrap().unwrap();
         assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn socket_scenario_registration_rejects_competitor_before_serial_dispatch() {
+        async fn receive(
+            listener: &UnixListener,
+            socket: &Path,
+            input: Value,
+            state: &State,
+        ) -> (UnixStream, Option<Job>) {
+            let mut client = UnixStream::connect(socket).await.unwrap();
+            protocol::encode_message(&Request {
+                command: "profile".into(),
+                input,
+            })
+            .unwrap()
+            .write_to(&mut client)
+            .await
+            .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let job = tokio::time::timeout(Duration::from_secs(5), read_job(server, state))
+                .await
+                .expect("scenario admission waited for serial dispatch");
+            (client, job)
+        }
+        if matches!(
+            std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
+            Ok("1" | "true")
+        ) {
+            return;
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("pb-admit-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = directory.path().join("session.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let manager = BrowserSessionManager::new();
+        manager.set_scope_liveness_hook(Arc::new(|_, _| Box::pin(async { true })));
+        let state = State {
+            manager: manager.clone(),
+            scope: ResourceScopeKey::Unattached(format!("admit-test:{}", uuid::Uuid::new_v4())),
+            session: "named:admit-test".into(),
+            lifetime: uuid::Uuid::new_v4().to_string(),
+            idle: Duration::from_secs(300),
+            image_directory: directory.path().join("images"),
+        };
+        manager.get_session(&state.scope).await.unwrap();
+        let input = json!({
+            "action":"run_scenario", "runs":1, "warmup":0,
+            "reset":"none", "throttle_rate":1, "gc_per_run":false,
+            "steps":[
+                {"kind":"wait_eval", "expression":"true"},
+                {"kind":"eval", "expression":"window.queuedRuns = (window.queuedRuns || 0) + 1"}
+            ]
+        });
+        let mut invalid = input.clone();
+        invalid["steps"] = json!([]);
+        let (mut client, job) = receive(&listener, &socket, invalid.clone(), &state).await;
+        assert!(job.is_none());
+        let response: Response = protocol::read_message(&mut client).await.unwrap();
+        assert!(
+            matches!(response.outcome, Outcome::Error { error } if error.code == ErrorCode::InvalidInput)
+        );
+
+        let (_first_client, mut first) = receive(&listener, &socket, input.clone(), &state).await;
+        assert!(first.as_ref().unwrap().scenario.is_some());
+        // No worker has polled run_job: custody must already exclude competitors.
+        let (mut client, second) = receive(&listener, &socket, input.clone(), &state).await;
+        assert!(second.is_none());
+        let response: Response = protocol::read_message(&mut client).await.unwrap();
+        assert_eq!(response.lifetime.as_deref(), Some(state.lifetime.as_str()));
+        assert!(
+            matches!(response.outcome, Outcome::Error { error } if error.code == ErrorCode::Busy)
+        );
+        let (mut client, invalid_job) = receive(&listener, &socket, invalid, &state).await;
+        assert!(invalid_job.is_none());
+        let response: Response = protocol::read_message(&mut client).await.unwrap();
+        assert!(
+            matches!(response.outcome, Outcome::Error { error } if error.code == ErrorCode::InvalidInput)
+        );
+
+        let (_stop, mut shutdown) = watch::channel(false);
+        let JobResult::Reply(response) =
+            run_job(&state, &mut first.take().unwrap(), &mut shutdown).await
+        else {
+            panic!("queued scenario unexpectedly requested cleanup");
+        };
+        assert!(matches!(response.outcome, Outcome::Success { .. }));
+        let (_client, next) = receive(&listener, &socket, input, &state).await;
+        let JobResult::Reply(response) = run_job(&state, &mut next.unwrap(), &mut shutdown).await
+        else {
+            panic!("recovery scenario unexpectedly requested cleanup");
+        };
+        assert!(matches!(response.outcome, Outcome::Success { .. }));
+        let request = Request {
+            command: "eval".into(),
+            input: json!({"expression":"window.queuedRuns"}),
+        };
+        let Admission::Ready(ready) = state.admit(&request).await else {
+            panic!("eval admission failed")
+        };
+        let response = state.execute(&request, &ready).await;
+        assert!(
+            matches!(response.outcome, Outcome::Success { result } if result["data"]["value"] == 2)
+        );
+        manager.kill_session(&state.scope).await.unwrap();
     }
 
     #[tokio::test]

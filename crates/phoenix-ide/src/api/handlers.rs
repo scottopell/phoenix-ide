@@ -673,6 +673,16 @@ pub fn create_router(state: AppState) -> Router {
             post(super::federation::query_database)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
+        .route(
+            "/api/federation/peer/read-conversation",
+            post(super::federation::read_conversation)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/resolve-reference",
+            post(super::federation::resolve_reference)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             super::auth::peer_auth_middleware,
@@ -2083,12 +2093,30 @@ async fn get_product_conversation_creation(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
 ) -> Result<Json<super::types::ProductConversationCreationStatusResponse>, AppError> {
-    let job = state
+    let read = state
         .db
-        .get_product_creation_job(&request_id)
+        .read_public_product_creation_status(&request_id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
         .ok_or_else(|| AppError::NotFound("product creation request not found".to_string()))?;
+    let job = read.job;
+    let route = match read.publication {
+        Some(crate::db::ProductCreationPublicationRead::Historical { conversation_id }) => {
+            return Ok(Json(
+                super::types::ProductConversationCreationStatusResponse::HistoricalPublished {
+                    request_id: job.request_id,
+                    product_conversation_id: job.product_conversation_id.to_string(),
+                    transcript_row_id: conversation_id,
+                },
+            ));
+        }
+        Some(crate::db::ProductCreationPublicationRead::Available { aggregate, .. })
+            if job.status == "published" =>
+        {
+            Some(super::product_conversations::canonical_route(&aggregate))
+        }
+        _ => None,
+    };
     let delivery_retryable = if job.status == "delivery_failed" {
         state
             .db
@@ -2097,17 +2125,6 @@ async fn get_product_conversation_creation(
             .map_err(|error| AppError::Internal(error.to_string()))?
     } else {
         false
-    };
-    let route = if job.status == "published" {
-        Some(super::product_conversations::canonical_route(
-            &state
-                .db
-                .get_ordinary_product_conversation(&job.product_conversation_id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-        ))
-    } else {
-        None
     };
     product_creation_status_response(job, delivery_retryable, route).map(Json)
 }
@@ -2564,6 +2581,229 @@ mod product_creation_acceptance_tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    mod product_conversation_create_tests {
+        use super::*;
+        use crate::db::{ContinueOutcome, ProductCreationProvisioningStage as Stage};
+        use phoenix_core::domain::db_schema::ConvMode;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_core::work_scope::{
+            AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId,
+        };
+
+        async fn get_creation(app: &Router, request_id: &str) -> axum::response::Response {
+            app.clone()
+                .oneshot(
+                    Request::get(format!("/api/product-conversations/creation/{request_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn publish_accepted(state: &AppState, request_id: &str) -> String {
+            let job = state
+                .db
+                .get_product_creation_job(request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let claimed = state
+                .db
+                .claim_product_creation(
+                    request_id,
+                    "public-history-fixture",
+                    "public-history-claim",
+                    chrono::Utc::now(),
+                    chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            for stage in [
+                Stage::ResolveRepository,
+                Stage::ResolveStartingPin,
+                Stage::MaterializeWorktree,
+                Stage::FinalizeAttachments,
+                Stage::CommitMetadata,
+            ] {
+                assert!(state
+                    .db
+                    .advance_product_creation_provisioning_stage(request_id, &claimed.claim, stage)
+                    .await
+                    .unwrap());
+            }
+            let original = format!("published-{request_id}");
+            let template = format!("template-{request_id}");
+            let mut conversation = state
+                .db
+                .create_conversation(&template, &template, &job.intent.cwd, true, None, None)
+                .await
+                .unwrap();
+            state.db.delete_conversation(&template).await.unwrap();
+            conversation.id = original.clone();
+            conversation.slug = Some(original.clone());
+            conversation.product_conversation_id = job.product_conversation_id;
+            conversation.cwd = job.intent.cwd.clone();
+            conversation.model = job.intent.model.clone();
+            conversation.effort = job.intent.effort;
+            conversation.llm_language = job.intent.llm_language;
+            conversation.conv_mode = ConvMode::Direct;
+            conversation.runtime_role = RuntimeRole::User;
+            conversation.attached_work_scope_id = Some(WorkScopeId::new());
+            assert!(state
+                .db
+                .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
+                    request_id: request_id.to_string(),
+                    claim: claimed.claim.clone(),
+                    conversation,
+                    authority_kind: AuthorityKind::Work,
+                    environment: EnvironmentContext::UnownedCwd {
+                        cwd: job.intent.cwd,
+                    },
+                    git_publication: None,
+                })
+                .await
+                .unwrap());
+            complete_delivery(state, request_id, claimed.claim).await;
+            original
+        }
+
+        async fn complete_delivery(
+            state: &AppState,
+            request_id: &str,
+            claim: crate::db::ProductCreationClaim,
+        ) {
+            let delivery = crate::db::ClaimedProductCreationJob {
+                claim,
+                job: state
+                    .db
+                    .get_product_creation_job(request_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            };
+            let fingerprint = format!("product-create:{request_id}");
+            let entry = phoenix_core::domain::sm_event::SteerEntry {
+                text: delivery.job.intent.objective.clone(),
+                origin: delivery.job.intent.origin.input_origin(),
+                message_id: request_id.to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            };
+            state
+                .db
+                .append_product_creation_steering_entry(&delivery, &entry, &fingerprint)
+                .await
+                .unwrap();
+            assert!(state
+                .db
+                .complete_product_creation_delivery(
+                    request_id,
+                    &delivery.claim,
+                    &crate::db::SteeringAcceptanceFingerprint::Exact(fingerprint),
+                    &delivery.job.intent.live_intent().unwrap(),
+                )
+                .await
+                .unwrap());
+        }
+
+        async fn assert_historical(
+            app: &Router,
+            request_id: &str,
+            product_id: &Value,
+            original: &str,
+        ) {
+            let response = get_creation(app, request_id).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let status = json_body(response).await;
+            assert_eq!(status["kind"], "historical_published", "{status}");
+            assert_eq!(status["request_id"], request_id);
+            assert_eq!(&status["product_conversation_id"], product_id);
+            assert_eq!(status["transcript_row_id"], original);
+            assert!(status.get("canonical_route").is_none(), "{status}");
+            assert!(status.get("allowed_actions").is_none(), "{status}");
+            assert!(status.get("status").is_none(), "{status}");
+            assert_eq!(status.as_object().unwrap().len(), 4, "{status}");
+        }
+
+        #[tokio::test]
+        async fn public_get_retains_original_historical_creation_with_successor_and_after_last_deletion(
+        ) {
+            let state = hard_delete_cascade_tests::make_test_state().await;
+            let directory = tempfile::tempdir().unwrap();
+            let app = create_router(state.clone());
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let accepted = post_creation(
+                &app,
+                &request_body(&request_id, directory.path().to_str().unwrap()),
+            )
+            .await;
+            assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+            let receipt = json_body(accepted).await;
+            let original = publish_accepted(&state, &request_id).await;
+            let live_response = get_creation(&app, &request_id).await;
+            assert_eq!(live_response.status(), StatusCode::OK);
+            let live = json_body(live_response).await;
+            assert_eq!(live["kind"], "published", "{live}");
+            assert_eq!(live["request_id"], request_id);
+            assert_eq!(
+                live["product_conversation_id"],
+                receipt["product_conversation_id"]
+            );
+            assert_eq!(live["transcript_row_id"], original);
+            assert!(live["canonical_route"].as_str().is_some());
+            assert!(live.get("allowed_actions").is_none());
+
+            state
+                .db
+                .update_conversation_state(
+                    &original,
+                    &ConvState::ContextExhausted {
+                        summary: "exhausted".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            let successor = match state.db.continue_conversation(&original).await.unwrap() {
+                ContinueOutcome::Created(successor) => successor,
+                other => panic!("expected successor, got {other:?}"),
+            };
+            assert_eq!(
+                successor.product_conversation_id.to_string(),
+                receipt["product_conversation_id"]
+            );
+            state.db.delete_conversation(&original).await.unwrap();
+            assert_eq!(
+                state.db.get_conversation(&successor.id).await.unwrap().id,
+                successor.id
+            );
+            assert_historical(
+                &app,
+                &request_id,
+                &receipt["product_conversation_id"],
+                &original,
+            )
+            .await;
+
+            state.db.delete_conversation(&successor.id).await.unwrap();
+            assert_historical(
+                &app,
+                &request_id,
+                &receipt["product_conversation_id"],
+                &original,
+            )
+            .await;
+            assert_eq!(
+                get_creation(&app, "never-accepted").await.status(),
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 }
 

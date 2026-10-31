@@ -343,6 +343,10 @@ rule CascadeTearsDownWhenNoInheritor {
         -- The kill awaits explicit Chrome termination before removing the
         -- user data dir and manager entry. Teardown completion therefore
         -- means the process and its SingletonLock have been released.
+        -- Before awaiting the session lock, signal the broker-owned scenario
+        -- worker to cancel. It retains serialization through bounded contact and
+        -- throttle cleanup (requirements.md REQ-BT-019.22). Browser destruction
+        -- may supersede that cleanup but is not a CDP cancellation acknowledgement.
 }
 
 -- REQ-BROWSER-WS-003: cleanup-cascade preservation when a live conversation

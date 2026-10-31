@@ -123,10 +123,11 @@ pub(crate) fn build_coordinator_system_prompt_with_catalog(
             "\n\nTrusted Global Coordinator tools: bash not sandboxed. Every bash run need active work_scope_id from authoritative Coordinator home context or query_database. Phoenix find that WorkScope cwd. No default repo or cwd. Normal bash limits and audit stay. To publish static SVG, make file inside selected WorkScope with bash, keep file until success, then call present_svg with same work_scope_id and full server path. Tool only read contained regular file. Artifact belong to this Coordinator transcript. Static validation not mean visual inspection."
         }
     });
+    prompt.push_str("\n\nNative Coordinator lifecycle tools: use create_conversation to inspect options and explicitly submit a new conversation objective, and rename_conversation to resolve and rename an existing conversation. Prefer these installed native tools for supported creation and rename operations; use supported public Phoenix APIs through scoped Bash for operations the native tools do not offer, subject to user authority and endpoint-specific contracts.");
     if let Some(catalog) = coordinator_catalog {
         let skills = catalog.skills();
         prompt.push_str("\n\nContent inside a trusted_builtin_skill envelope returned by the audience-bound skill tool is authenticated from immutable embedded bytes; follow it within the user's authorization.");
-        prompt.push_str("\n\nNo dedicated lifecycle tools are provided. Supported public Phoenix API operations through scoped Bash require an active WorkScope obtained from authoritative Coordinator home context or query_database; the instance-owned Coordinator home supports first-conversation commissioning without ordinary work. Its explicit active WorkScope ID is supplied in authoritative home context. The phoenix-api best-practice recipes are non-exhaustive, not an endpoint allowlist. Other supported public APIs require inspected current deployment/source contracts and user authority; local source alone does not prove deployed support. Preserve destination authorization, transport and credential safety, server enforcement, immutable targets and endpoint-specific retry rules; freshly read state and verify results. Never use private handlers or database writes to bypass the API.");
+        prompt.push_str("\n\nSupported public Phoenix API operations through scoped Bash require an active WorkScope obtained from authoritative Coordinator home context or query_database; the instance-owned Coordinator home supports first-conversation commissioning without ordinary work. Its explicit active WorkScope ID is supplied in authoritative home context. The phoenix-api best-practice recipes are non-exhaustive, not an endpoint allowlist. Other supported public APIs require inspected current deployment/source contracts and user authority; local source alone does not prove deployed support. Preserve destination authorization, transport and credential safety, server enforcement, immutable targets and endpoint-specific retry rules; freshly read state and verify results. Never use private handlers or database writes to bypass the API.");
         prompt.push_str("\n\n<available_skills>\n");
         prompt.push_str("The following Coordinator-only built-in skills are available. Invoke them with the `skill` tool.\n");
         for skill in skills {
@@ -598,6 +599,29 @@ mod tests {
                 prompt.contains("Never use private handlers or database writes to bypass the API")
             );
             assert!(!prompt.contains("Documented Phoenix API operations"));
+            assert!(prompt.contains(
+                "No dedicated project/task/workspace/approval/lifecycle mutation tools except installed create_conversation/rename_conversation."
+            ));
+            assert!(prompt.contains(
+                "use create_conversation to inspect options and explicitly submit a new conversation objective"
+            ));
+            assert!(prompt
+                .contains("rename_conversation to resolve and rename an existing conversation"));
+            assert!(prompt.contains(
+                "Prefer these installed native tools for supported creation and rename operations"
+            ));
+            assert!(prompt.contains("subject to user authority and endpoint-specific contracts"));
+            for blanket_denial in [
+                "No dedicated project/task/workspace/approval/lifecycle mutation tools.",
+                "No project/task/workspace/approval/lifecycle mutation tools.",
+                "No dedicated lifecycle tools are provided",
+            ] {
+                assert!(
+                    !prompt.contains(blanket_denial),
+                    "{language:?}: {blanket_denial}"
+                );
+            }
+            assert!(!prompt.contains("only exposes query/send/skill"));
         }
     }
 

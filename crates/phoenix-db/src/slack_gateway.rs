@@ -2717,14 +2717,21 @@ mod tests {
             panic!("expected native successor");
         };
         db.delete_conversation(&product.id).await.unwrap();
-        let creation_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM product_creation_jobs WHERE request_id=?1)",
-        )
-        .bind(&request.creation_id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert!(!creation_exists);
+        let retained = db
+            .get_product_creation_job(&request.creation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, "published");
+        assert_eq!(
+            retained.product_conversation_id,
+            product.product_conversation_id
+        );
+        assert_eq!(
+            retained.published_product_id,
+            Some(product.product_conversation_id.clone())
+        );
+        assert_eq!(retained.published_conversation_id, Some(product.id.clone()));
         assert!(db
             .resolve_ordinary_product_conversation(product.product_conversation_id.as_str())
             .await
@@ -2752,6 +2759,18 @@ mod tests {
             Some(product.product_conversation_id.to_string())
         );
         assert!(!deleted.conversation_available);
+        assert!(
+            !db.slack_returns(&source.workspace, &source.owner)
+                .await
+                .unwrap()[0]
+                .published
+        );
+        let after_last_deletion = db
+            .get_product_creation_job(&request.creation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_last_deletion, retained);
     }
 
     #[tokio::test]

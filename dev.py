@@ -2309,11 +2309,12 @@ def _title_from_slug(slug: str) -> str:
 def _migrate_seed_database(*, build: bool, release: bool) -> None:
     if build:
         build_rust(release=release)
-    binary = ROOT / "target" / ("release" if release else "debug") / "phoenix_ide"
+    env = os.environ.copy()
+    binary = _cargo_target_dir(ROOT, env) / ("release" if release else "debug") / "phoenix_ide"
     if not binary.exists():
         raise RuntimeError(f"Phoenix binary not found after build: {binary}")
-    env = os.environ.copy()
     env["PHOENIX_DB_PATH"] = str(get_db_path())
+
     if not env.get("PHOENIX_DATA_DIR"):
         env["PHOENIX_DATA_DIR"] = str(get_db_path().with_suffix(".data"))
     subprocess.run(
@@ -4061,27 +4062,6 @@ def _fetcher_download_reachable() -> bool:
     return resp.status == 200
 
 
-def _outbound_https_reachable() -> bool:
-    """Probe whether outbound HTTPS to public hosts works.
-
-    Some browser tests (currently `test_browser_navigate_remote`)
-    actually navigate to real websites; they need real internet, not
-    just a working Chromium. Sandbox networks often block this. We
-    probe `https://example.com` itself — that's the exact host the
-    test hits, so a green probe means the test will work and a red
-    probe means it would fail for environmental reasons (signal we
-    skip via `PHOENIX_SKIP_NETWORK_TESTS=1`).
-    """
-    import urllib.request as ureq
-    import urllib.error as uerr
-    req = ureq.Request("https://example.com/", method="HEAD")
-    try:
-        resp = ureq.urlopen(req, timeout=1.5)
-    except (uerr.HTTPError, uerr.URLError, OSError):
-        return False
-    return 200 <= resp.status < 400
-
-
 def _classify_browser_env() -> None:
     """Pick a Chromium binary or auto-skip browser tests.
 
@@ -4110,26 +4090,6 @@ def _classify_browser_env() -> None:
         return
     os.environ["PHOENIX_SKIP_BROWSER_TESTS"] = "1"
     print("  i  Chromium unavailable — skipping browser tests")
-
-
-def _classify_network_env() -> None:
-    """Auto-skip tests that need outbound HTTPS when the env can't make
-    those requests. The probe targets the same host the affected tests
-    hit (currently example.com) so a green probe means the test will
-    work and a red probe means it would fail for environmental reasons.
-
-    Sets `PHOENIX_SKIP_NETWORK_TESTS=1` on probe failure; the Rust
-    `require_network!()` macro reads this and short-circuits each
-    network-dependent test.
-
-    Per the cmd_check probe rule: silent on the green path; prints
-    only when skipping the network-dependent test class.
-    """
-    if "PHOENIX_SKIP_NETWORK_TESTS" in os.environ:
-        return
-    if not _outbound_https_reachable():
-        os.environ["PHOENIX_SKIP_NETWORK_TESTS"] = "1"
-        print("  i  outbound HTTPS: unavailable — skipping remote-network tests")
 
 
 # ===========================================================================
@@ -5405,16 +5365,51 @@ def _run_check_lane(
             results.append((f"{name} lane", 1, time.monotonic() - started, detail))
 
 
+@contextlib.contextmanager
+def _check_interrupt_handlers(interrupted: threading.Event):
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("check interrupt handlers must be installed on the main thread")
+    previous = {}
+
+    def request_interrupt(signum, _frame):
+        interrupted.set()
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            previous[signum] = signal.signal(signum, request_interrupt)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def _run_check_threads_sequentially(
     threads: list[threading.Thread],
     timeout: float,
+    interrupted: threading.Event | None = None,
 ) -> list[threading.Thread]:
     for thread in threads:
+        if interrupted is not None and interrupted.is_set():
+            break
         thread.daemon = True
         thread.start()
-        thread.join(timeout=timeout)
-        if thread.is_alive():
-            return [thread]
+        if interrupted is None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return [thread]
+            continue
+        deadline = time.monotonic() + timeout
+        cancellation_deadline = None
+        while True:
+            if interrupted is not None and interrupted.is_set() and cancellation_deadline is None:
+                cancellation_deadline = time.monotonic() + 60
+                deadline = min(deadline, cancellation_deadline)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return [thread]
+            thread.join(timeout=min(0.1, remaining))
+            if not thread.is_alive():
+                break
     return []
 
 
@@ -5560,8 +5555,12 @@ class _QualificationOutputLog:
 
 
 def _check_diagnostic_log_path(name: str, env: dict[str, str]) -> Path | None:
-    if name == "cargo clippy" and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
-        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / "cargo-clippy.full.log"
+    filenames = {
+        "cargo clippy": "cargo-clippy.full.log",
+        "dev.py unit tests": "devpy-unit-tests.full.log",
+    }
+    if name in filenames and env.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+        return Path(env["PHOENIX_CHECK_DIAGNOSTIC_DIR"]) / filenames[name]
     return None
 
 
@@ -5589,6 +5588,7 @@ def cmd_check(
     output.
     """
     worker_budget = _check_cpu_budget()
+    interrupted = threading.Event()
     failed_lanes: set[str] = set()
 
     class _CheckResults(list):
@@ -5733,6 +5733,17 @@ def cmd_check(
         if diagnostic_path := _check_diagnostic_log_path(name, env):
             diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
             output_log = _QualificationOutputLog(diagnostic_path)
+        if interrupted.is_set():
+            output = "INTERRUPTED before launch; process was not started\n"
+            if output_log is not None:
+                output_log.finish(None, False, False)
+                output += f"Full qualification diagnostics: {output_log.path}\n"
+            with results_lock:
+                results.append((name, 1, time.monotonic() - t0, output))
+            reporter.step_done(lane, name, 1, time.monotonic() - t0)
+            _finish_check_step_span(span, elapsed=time.monotonic() - t0, timed_out=False,
+                                    lock_wait=0.0, returncode=1)
+            return 1
         try:
             proc = subprocess.Popen(
                 launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -5785,23 +5796,37 @@ def cmd_check(
         rt.start()
 
         timed_out = False
+        was_interrupted = False
+        deadline = time.monotonic() + timeout
         try:
-            rc = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                rc = proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+            while True:
+                if interrupted.is_set():
+                    was_interrupted = True
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    rc = proc.wait(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            if timed_out or was_interrupted:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                rc = proc.wait(timeout=5)
+                try:
+                    rc = proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    rc = proc.wait(timeout=5)
         finally:
+            was_interrupted = was_interrupted or interrupted.is_set()
             capture_error = ""
             if output_log is not None:
                 output_log.settle_reader(rt, stop_reader)
@@ -5821,7 +5846,14 @@ def cmd_check(
         tail = "\n".join(buf).strip()
         if output_log is not None:
             tail, truncated = output_log.console_tail()
-        if timed_out:
+        if was_interrupted:
+            retained = "200 lines / 128 KiB of output" if output_log is not None else f"{len(buf)} lines of output"
+            header = f"INTERRUPTED — process group shutdown requested; last {retained}"
+            if truncated:
+                header += " (earlier lines dropped)"
+            output = header + ("\n" + tail if tail else "\n(no output captured before interruption)")
+            rc = rc if rc != 0 else 1
+        elif timed_out:
             retained = "200 lines / 128 KiB of output" if output_log is not None else f"{len(buf)} lines of output"
             header = f"TIMEOUT after {timeout}s \u2014 last {retained}"
             if truncated:
@@ -6400,6 +6432,8 @@ def cmd_check(
                     "discover",
                     "tests/devpy",
                 ]
+            if os.environ.get("PHOENIX_CHECK_DIAGNOSTIC_DIR"):
+                unittest_cmd.append("-v")
             run_step("dev.py unit tests", unittest_cmd)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
@@ -6441,21 +6475,19 @@ def cmd_check(
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
     if cargo_active:
-        # Classify the environment up front so the Rust suite skips the
-        # classes of tests that would otherwise produce env-noise failures.
+        # Classify browser availability before running the Rust suite.
         #
         # Contract for `./dev.py check`:
         #   - Red == broken code. Never "your network is broken" or
         #     "you don't have Chrome installed".
         #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
-        #     PHOENIX_SKIP_BROWSER_TESTS, PHOENIX_SKIP_NETWORK_TESTS,
+        #     PHOENIX_SKIP_BROWSER_TESTS,
         #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
         #   - Probes print iff classification CHANGES test behavior:
         #     auto-skipping a class, overriding a config, etc. Happy paths
         #     (Chromium found, fetcher reachable, signing works, deps
         #     present) stay silent so a normal-env run is clean.
         _classify_browser_env()
-        _classify_network_env()
 
         # Tests create temporary commits and must never consult an interactive
         # signing agent. Add a process-only override without probing the signer
@@ -6720,19 +6752,30 @@ def cmd_check(
     # The rust lane runs compile and codegen (CHECK_TIMEOUT each) before the
     # cargo-test step, so a raised cargo-test budget must raise the join too.
     LANE_JOIN_TIMEOUT = max(CHECK_TIMEOUT * 6, CHECK_TIMEOUT * 2 + CARGO_TEST_TIMEOUT) + 30
-    stuck = _run_check_threads_sequentially(threads, LANE_JOIN_TIMEOUT)
+    with _check_interrupt_handlers(interrupted):
+        stuck = _run_check_threads_sequentially(
+            threads, LANE_JOIN_TIMEOUT, interrupted=interrupted
+        )
+    with results_lock:
+        if interrupted.is_set() and not any(rc != 0 for _, rc, _, _ in results):
+            results.append(("check interrupted", 1, 0.0,
+                            "INTERRUPTED after lane execution; check is not successful"))
     # Stop the live renderer before any direct printing below (hung-lane
     # lines, failure dumps, summary) — plain mode's close() is a no-op.
     reporter.close()
     for t in stuck:
         with results_lock:
             label = f"hung: {t.name}"
-            results.append((
-                label, 1, LANE_JOIN_TIMEOUT,
+            detail = (
+                f"INTERRUPTED; lane teardown did not finish within 60s; "
+                "output and child cleanup are incomplete"
+                if interrupted.is_set() else
                 f"lane did not finish within {LANE_JOIN_TIMEOUT}s — "
-                "a subprocess may be orphaned; investigate before retrying",
-            ))
-            print(f"  ✗ {label:<18s} ({LANE_JOIN_TIMEOUT}s)")
+                "a subprocess may be orphaned; investigate before retrying"
+            )
+            join_budget = 60 if interrupted.is_set() else LANE_JOIN_TIMEOUT
+            results.append((label, 1, join_budget, detail))
+            print(f"  ✗ {label:<18s} ({join_budget}s)")
 
     profile_messages = []
     if profile_work and _CHECK_PROFILE is not None and sys.platform == "darwin":

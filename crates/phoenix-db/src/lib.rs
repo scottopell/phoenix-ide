@@ -2,9 +2,10 @@
 //!
 //! Provides persistence for conversations and messages.
 
-use phoenix_core::domain::tool_result_identity::{
-    latest_tool_result_message_id, tool_result_message_id,
-};
+use phoenix_core::domain::tool_result_identity::latest_tool_result_message_id;
+#[cfg(test)]
+use phoenix_core::domain::tool_result_identity::tool_result_message_id;
+use phoenix_core::domain::tool_round::{tool_result_message, ToolRoundAssembly, ToolRoundError};
 
 mod slack_gateway;
 pub use slack_gateway::*;
@@ -25,6 +26,8 @@ pub use request_capacity::CapacityDiagnosticRow;
 mod git_repository_reconciliation;
 mod message_attachments;
 mod svg_artifacts;
+#[cfg(test)]
+mod tool_round_materialization_tests;
 pub use svg_artifacts::SvgArtifact;
 mod lineage;
 mod migrations;
@@ -208,6 +211,25 @@ pub struct ContinuationHandoffCandidate {
 /// Maximum pending steering entries permitted per conversation.
 pub const MAX_STEERING_QUEUE_DEPTH: usize = 5;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundedReadMessageContent {
+    Materialized(MessageContent),
+    Oversized,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedReadMessage {
+    pub message_id: String,
+    pub sequence_id: i64,
+    pub message_type: MessageType,
+    pub content: BoundedReadMessageContent,
+    pub created_at: DateTime<Utc>,
+    pub origin: InputOrigin,
+    pub hidden: bool,
+    pub file_count: usize,
+    pub image_count: usize,
+}
+
 /// Resolved spawn settings written in the child's creation transaction.
 pub struct SubAgentExecution<'a> {
     pub connection: &'a str,
@@ -231,6 +253,7 @@ use sqlx::sqlite::{
 use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
 use sqlx_core::transaction::TransactionManager;
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -12539,7 +12562,7 @@ impl Database {
                     unfinished.push(tool_id);
                 }
             }
-            let (agent_msg, tool_msgs) = build_materialized_tool_round(
+            let round = build_materialized_tool_round(
                 &conv_id,
                 start_seq,
                 &materialized_at,
@@ -12550,19 +12573,19 @@ impl Database {
                 &sub_agent_outcomes,
             );
 
-            // Pairing invariant: every `tool_use` in the assistant message gets
-            // exactly one result. Refuse to persist a mis-paired chain.
-            let tool_use_count = assistant_message.tool_uses().len();
-            if tool_use_count != tool_msgs.len() {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    tool_uses = tool_use_count,
-                    results = tool_msgs.len(),
-                    "in-flight tool round has mismatched tool_use/result counts; \
-                     skipping materialization, leaving to orphan repair",
-                );
-                continue;
-            }
+            let (agent_msg, tool_msgs) = match round {
+                Ok(messages) => messages,
+                Err(ToolRoundError::ResultCountMismatch { tool_uses, results }) => {
+                    tracing::warn!(
+                        conv_id = %conv_id,
+                        tool_uses,
+                        results,
+                        "in-flight tool round has mismatched tool_use/result counts; \
+                         skipping materialization, leaving to orphan repair",
+                    );
+                    continue;
+                }
+            };
 
             let interrupted = ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
@@ -12649,7 +12672,7 @@ impl Database {
             tracing::info!(
                 conv_id = %conv_id,
                 completed = completed_results.len(),
-                interrupted = tool_use_count - completed_results.len(),
+                interrupted = tool_msgs.len() - completed_results.len(),
                 "materialized in-flight tool round on restart",
             );
         }
@@ -14145,6 +14168,50 @@ impl Database {
         .await
     }
 
+    /// Get message metadata and a bounded content prefix for remote-read rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bounded query or content decoding fails.
+    pub async fn get_bounded_read_messages_after_limited(
+        &self,
+        conversation_id: &str,
+        after_sequence: i64,
+        limit: NonZeroUsize,
+        content_limit: NonZeroUsize,
+    ) -> DbResult<Vec<BoundedReadMessage>> {
+        let row_limit = i64::try_from(limit.get())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let prefix_limit = bounded_read_prefix_limit(content_limit)?;
+        self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
+            sqlx::query(
+                "SELECT m.message_id, m.sequence_id, m.message_type, \
+                        substr(CAST(m.content AS BLOB), 1, ?4) AS content_prefix, \
+                        m.created_at, m.origin_kind, m.origin_product_conversation_id, \
+                        m.origin_transcript_id, m.origin_subscription_event_id, \
+                        m.origin_source_message_id, m.origin_source_tool_use_id, \
+                        m.origin_slack_request_id, \
+                        CASE WHEN json_valid(m.display_data) \
+                                  AND json_type(m.display_data, '$.hidden') = 'true' \
+                             THEN 1 ELSE 0 END AS hidden, \
+                        (SELECT COUNT(*) FROM message_files mf WHERE mf.message_id = m.message_id) AS file_count, \
+                        (SELECT COUNT(*) FROM message_images mi WHERE mi.message_id = m.message_id) AS image_count \
+                 FROM messages m \
+                 WHERE m.conversation_id = ?1 AND m.sequence_id > ?2 \
+                 ORDER BY m.sequence_id ASC LIMIT ?3",
+            )
+            .bind(conversation_id)
+            .bind(after_sequence)
+            .bind(row_limit)
+            .bind(prefix_limit)
+            .try_map(move |row| parse_bounded_read_message_row(row, content_limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(DbError::Sqlx)
+        })
+        .await
+    }
+
     /// Get the inclusive message range `[start_sequence, end_sequence]`.
     ///
     /// # Errors
@@ -14250,6 +14317,42 @@ impl Database {
     ) -> DbResult<Message> {
         self.get_message_by_id_for_conversation(Some(conversation_id), message_id)
             .await
+    }
+
+    /// Get one conversation-scoped message with a bounded content prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::MessageNotFound`] when the scoped identity is absent,
+    /// or a database/decoding error when retrieval fails.
+    pub async fn get_bounded_read_message_by_id_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        content_limit: NonZeroUsize,
+    ) -> DbResult<BoundedReadMessage> {
+        let prefix_limit = bounded_read_prefix_limit(content_limit)?;
+        sqlx::query(
+            "SELECT m.message_id, m.sequence_id, m.message_type, \
+                    substr(CAST(m.content AS BLOB), 1, ?3) AS content_prefix, \
+                    m.created_at, m.origin_kind, m.origin_product_conversation_id, \
+                    m.origin_transcript_id, m.origin_subscription_event_id, \
+                    m.origin_source_message_id, m.origin_source_tool_use_id, \
+                    m.origin_slack_request_id, \
+                    CASE WHEN json_valid(m.display_data) \
+                              AND json_type(m.display_data, '$.hidden') = 'true' \
+                         THEN 1 ELSE 0 END AS hidden, \
+                    (SELECT COUNT(*) FROM message_files mf WHERE mf.message_id = m.message_id) AS file_count, \
+                    (SELECT COUNT(*) FROM message_images mi WHERE mi.message_id = m.message_id) AS image_count \
+             FROM messages m WHERE m.conversation_id = ?1 AND m.message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(prefix_limit)
+        .try_map(move |row| parse_bounded_read_message_row(row, content_limit))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::MessageNotFound(message_id.to_string()))
     }
 
     async fn get_message_by_id_for_conversation(
@@ -15936,7 +16039,18 @@ fn build_materialized_tool_round(
         String,
         phoenix_core::domain::sm_state::SubAgentOutcome,
     >,
-) -> (Message, Vec<Message>) {
+) -> Result<(Message, Vec<Message>), ToolRoundError> {
+    let round = ToolRoundAssembly::new(
+        assistant_message.clone(),
+        completed_results.to_vec(),
+        interrupted_tool_ids.iter().map(|tool_id| {
+            ToolResult::error(
+                tool_id.clone(),
+                "[Tool execution interrupted by server restart]".to_string(),
+            )
+        }),
+    )?;
+    let assistant_message = round.assistant_message();
     let mut next_seq = start_seq;
 
     let agent_content = MessageContent::agent(assistant_message.content.clone());
@@ -15963,64 +16077,34 @@ fn build_materialized_tool_round(
         sub_agent_outcomes,
     );
 
-    let mut tool_msgs: Vec<Message> = Vec::new();
-
-    // Completed tools keep their real output — except a `spawn_agents`
-    // placeholder whose sub-agents were still pending, which is rewritten into
-    // the interrupted fan-in (content + display) computed above.
-    for result in completed_results {
-        let (output, is_error, display): (String, bool, Option<serde_json::Value>) =
+    let mut tool_msgs = Vec::with_capacity(round.results().len());
+    for (ordinal, result) in round.results().iter().enumerate() {
+        let mut content = tool_result_transcript_content(result);
+        let display = if ordinal < completed_results.len() {
             match spawn_fan_ins.get(&result.tool_use_id) {
-                Some((content, display)) => (content.clone(), false, Some(display.clone())),
-                None => (
-                    result.output().to_string(),
-                    result.is_error(),
-                    merge_duration_into_display(result.display_data(), result.duration_ms),
-                ),
-            };
-        let content = MessageContent::tool_with_images(
-            &result.tool_use_id,
-            output,
-            is_error,
-            result.images().to_vec(),
-        );
-        tool_msgs.push(Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-            message_id: tool_result_message_id(&assistant_message.message_id, &result.tool_use_id),
-            conversation_id: conv_id.to_string(),
-            sequence_id: next_seq,
-            message_type: content.message_type(),
+                Some((output, display)) => {
+                    content.content.clone_from(output);
+                    content.is_error = false;
+                    Some(display.clone())
+                }
+                None => merge_duration_into_display(result.display_data(), result.duration_ms),
+            }
+        } else {
+            content.is_error = true;
+            None
+        };
+        tool_msgs.push(tool_result_message(
+            &assistant_message.message_id,
+            conv_id,
+            next_seq,
+            *now,
             content,
-            display_data: display,
-            usage_data: None,
-            created_at: *now,
-        });
+            display,
+        ));
         next_seq += 1;
     }
 
-    // The in-flight/cancelling tool and every queued-but-unstarted tool were
-    // interrupted.
-    for tool_id in interrupted_tool_ids {
-        let content = MessageContent::tool(
-            tool_id,
-            "[Tool execution interrupted by server restart]",
-            true,
-        );
-        tool_msgs.push(Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-            message_id: tool_result_message_id(&assistant_message.message_id, tool_id),
-            conversation_id: conv_id.to_string(),
-            sequence_id: next_seq,
-            message_type: content.message_type(),
-            content,
-            display_data: None,
-            usage_data: None,
-            created_at: *now,
-        });
-        next_seq += 1;
-    }
-
-    (agent_msg, tool_msgs)
+    Ok((agent_msg, tool_msgs))
 }
 
 async fn insert_message_tx(
@@ -16186,6 +16270,41 @@ fn cleared_creation_intent_json() -> String {
     .to_string()
 }
 
+fn initial_steering_execution_outcome(state: &ConvState) -> Option<phoenix_workflow::TurnTerminal> {
+    match state {
+        ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
+            Some(phoenix_workflow::TurnTerminal::Completed)
+        }
+        ConvState::CreationCancelled { .. } => Some(phoenix_workflow::TurnTerminal::Cancelled),
+        ConvState::Error { message, .. } => Some(phoenix_workflow::TurnTerminal::Failed {
+            reason: message.clone(),
+        }),
+        ConvState::ContextExhausted { .. } => Some(phoenix_workflow::TurnTerminal::Failed {
+            reason: "context exhausted".into(),
+        }),
+        ConvState::RecoverableContinuationFailure { .. } => {
+            Some(phoenix_workflow::TurnTerminal::Failed {
+                reason: "continuation failed".into(),
+            })
+        }
+        ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ServerOverloadRetrying { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Failed { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::HandedOff { .. } => None,
+    }
+}
+
 pub(crate) async fn record_initial_execution_outcome_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
@@ -16204,33 +16323,33 @@ pub(crate) async fn record_initial_execution_outcome_tx(
     if let Some((message_id, source_kind)) = steering {
         let source_kind =
             crate::coordinator_watches::MessageExecutionSource::from_db(&source_kind)?;
-        let outcome = match state {
-            ConvState::Idle | ConvState::Terminal | ConvState::Completed { .. } => {
-                Some(("Completed", None))
+        let outcome = initial_steering_execution_outcome(state);
+        if let Some(terminal) = outcome {
+            let terminal = crate::coordinator_watches::consume_execution_cancel_tx(
+                tx,
+                conversation_id,
+                terminal,
+            )
+            .await?;
+            if matches!(
+                &source_kind,
+                crate::coordinator_watches::MessageExecutionSource::Steering
+            ) {
+                crate::product_creation::record_initial_execution_receipt_tx(
+                    tx,
+                    conversation_id,
+                    &message_id,
+                    &terminal,
+                )
+                .await?;
             }
-            ConvState::CreationCancelled { .. } => Some(("Cancelled", None)),
-            ConvState::Error { message, .. } => Some(("Failed", Some(message.as_str()))),
-            ConvState::ContextExhausted { .. } => Some(("Failed", Some("context exhausted"))),
-            ConvState::RecoverableContinuationFailure { .. } => {
-                Some(("Failed", Some("continuation failed")))
-            }
-            ConvState::LlmRequesting { .. }
-            | ConvState::SeededLlmRequesting { .. }
-            | ConvState::ServerOverloadRetrying { .. }
-            | ConvState::Provisioning { .. }
-            | ConvState::ToolExecuting { .. }
-            | ConvState::CancellingTool { .. }
-            | ConvState::AwaitingSubAgents { .. }
-            | ConvState::CancellingSubAgents { .. }
-            | ConvState::Failed { .. }
-            | ConvState::AwaitingRecovery { .. }
-            | ConvState::AwaitingContinuation { .. }
-            | ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. }
-            | ConvState::CreationFailed { .. }
-            | ConvState::HandedOff { .. } => None,
-        };
-        if let Some((kind, reason)) = outcome {
+            let (kind, reason) = match &terminal {
+                phoenix_workflow::TurnTerminal::Completed => ("Completed", None),
+                phoenix_workflow::TurnTerminal::Cancelled => ("Cancelled", None),
+                phoenix_workflow::TurnTerminal::Failed { reason } => {
+                    ("Failed", Some(reason.as_str()))
+                }
+            };
             crate::coordinator_watches::record_steering_event_tx(
                 tx,
                 source_kind,
@@ -16507,6 +16626,52 @@ fn parse_prompt_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
         display_data,
         usage_data,
         created_at,
+    })
+}
+
+fn bounded_read_prefix_limit(content_limit: NonZeroUsize) -> DbResult<i64> {
+    let prefix_limit = content_limit
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| DbError::Serialization("bounded read content limit overflow".to_string()))?;
+    i64::try_from(prefix_limit).map_err(|error| DbError::Serialization(error.to_string()))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn parse_bounded_read_message_row(
+    row: SqliteRow,
+    content_limit: NonZeroUsize,
+) -> Result<BoundedReadMessage, sqlx::Error> {
+    let message_type = parse_message_type(&row.try_get::<String, _>("message_type")?);
+    let content_prefix: Vec<u8> = row.try_get("content_prefix")?;
+    let content = if content_prefix.len() > content_limit.get() {
+        BoundedReadMessageContent::Oversized
+    } else {
+        let content_text = String::from_utf8(content_prefix).map_err(|error| {
+            prompt_decode_error(format!("invalid message content UTF-8: {error}"))
+        })?;
+        let content_value = serde_json::from_str(&content_text).unwrap_or_default();
+        let content =
+            MessageContent::from_stored_json(message_type, content_value).unwrap_or_else(|_| {
+                MessageContent::error(format!("Failed to parse {message_type} message"))
+            });
+        BoundedReadMessageContent::Materialized(content)
+    };
+    let file_count = usize::try_from(row.try_get::<i64, _>("file_count")?)
+        .map_err(|error| prompt_decode_error(format!("invalid file count: {error}")))?;
+    let image_count = usize::try_from(row.try_get::<i64, _>("image_count")?)
+        .map_err(|error| prompt_decode_error(format!("invalid image count: {error}")))?;
+
+    Ok(BoundedReadMessage {
+        message_id: row.try_get("message_id")?,
+        sequence_id: row.try_get("sequence_id")?,
+        message_type,
+        content,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        origin: decode_origin(&row)?,
+        hidden: row.try_get::<i64, _>("hidden")? != 0,
+        file_count,
+        image_count,
     })
 }
 
@@ -22764,6 +22929,177 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![4, 5]
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_projection_enforces_content_bytes_and_preserves_metadata() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("bounded", "bounded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO slack_gateway_requests (
+                 request_id, workspace, owner, channel, message_ts, thread_ts, kind,
+                 instruction, context, source_url, accepted_at_unix_micros, input_id,
+                 observed_at_unix_micros, trigger_kind
+             ) VALUES (
+                 'slack-request-bounded', 'workspace', 'owner', 'channel', 'message-ts',
+                 'thread-ts', 'baseline', '', '', 'https://example.invalid/slack', 0,
+                 'slack-input-bounded', 0, 'prefix'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.add_message_with_seq_and_origin(
+            "bounded-message",
+            "bounded",
+            1,
+            &MessageContent::user_with_attachments(
+                "bounded body",
+                vec![ImageData {
+                    data: "large-image-payload".to_string(),
+                    media_type: "image/png".to_string(),
+                }],
+                vec![FileAttachment {
+                    original_name: "notes.txt".to_string(),
+                    media_type: "text/plain".to_string(),
+                    size_bytes: 20,
+                    stored_path: "/store/notes.txt".to_string(),
+                }],
+            ),
+            Some(&serde_json::json!({"hidden": true})),
+            None,
+            &phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                request_id: "slack-request-bounded".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let raw: Vec<u8> =
+            sqlx::query_scalar("SELECT CAST(content AS BLOB) FROM messages WHERE message_id = ?1")
+                .bind("bounded-message")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+
+        let exact = db
+            .get_bounded_read_messages_after_limited(
+                "bounded",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(raw.len()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        let BoundedReadMessageContent::Materialized(content) = &exact[0].content else {
+            panic!("content at its exact byte bound must materialize");
+        };
+        assert!(matches!(content, MessageContent::User(_)));
+        let (images, files) = content.attachments();
+        assert!(images.is_empty());
+        assert!(files.is_empty());
+        assert!(!raw
+            .windows("large-image-payload".len())
+            .any(|window| window == b"large-image-payload"));
+        assert!(!raw
+            .windows("/store/notes.txt".len())
+            .any(|window| window == b"/store/notes.txt"));
+        assert!(exact[0].hidden);
+        assert_eq!(exact[0].file_count, 1);
+        assert_eq!(exact[0].image_count, 1);
+        assert_eq!(
+            exact[0].origin,
+            phoenix_core::domain::db_schema::InputOrigin::SlackGateway {
+                request_id: "slack-request-bounded".to_string(),
+            }
+        );
+
+        let oversized = db
+            .get_bounded_read_messages_after_limited(
+                "bounded",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(raw.len() - 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            oversized[0].content,
+            BoundedReadMessageContent::Oversized
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_classifies_a_split_multibyte_prefix_before_utf8_decode() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("unicode", "unicode", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "unicode-message",
+            "unicode",
+            &MessageContent::user("prefix é suffix"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let raw: Vec<u8> =
+            sqlx::query_scalar("SELECT CAST(content AS BLOB) FROM messages WHERE message_id = ?1")
+                .bind("unicode-message")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let first_multibyte_byte = raw.iter().position(|byte| *byte == 0xc3).unwrap();
+        assert_eq!(
+            &raw[first_multibyte_byte..first_multibyte_byte + 2],
+            &[0xc3, 0xa9]
+        );
+        assert!(std::str::from_utf8(&raw[..=first_multibyte_byte]).is_err());
+
+        let bounded = db
+            .get_bounded_read_message_by_id_in_conversation(
+                "unicode",
+                "unicode-message",
+                NonZeroUsize::new(first_multibyte_byte).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            bounded.content,
+            BoundedReadMessageContent::Oversized
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_exact_message_lookup_is_scoped_to_its_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        for conversation in ["scope-a", "scope-b"] {
+            db.create_conversation(conversation, conversation, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.add_message(
+            "scoped-message",
+            "scope-a",
+            &MessageContent::user("body"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let error = db
+            .get_bounded_read_message_by_id_in_conversation(
+                "scope-b",
+                "scoped-message",
+                NonZeroUsize::new(1024).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::MessageNotFound(id) if id == "scoped-message"));
     }
 
     /// A freshly-migrated DB (base SCHEMA + all versioned migrations, the path

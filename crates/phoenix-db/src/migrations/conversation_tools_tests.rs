@@ -7,6 +7,8 @@ use crate::{Database, DbError, DbResult};
 
 const PROVENANCE: &str = include_str!("agent_creation_provenance.sql");
 const RECEIPTS: &str = include_str!("product_conversation_rename_receipts.sql");
+const RETAIN_RECEIPTS: &str = include_str!("retain_product_conversation_rename_receipts.sql");
+const RETAIN_CREATION: &str = include_str!("retain_product_creation_receipts.sql");
 const FAULTS: &[&str] = &[
     "DROP TABLE product_creation_jobs;\n",
     "INSERT INTO product_creation_job_images (request_id, ordinal, media_type, data) SELECT request_id, ordinal, media_type, data FROM _phase1_images_before;\n",
@@ -253,6 +255,10 @@ fn registered_identity_order_and_exact_bodies() {
         (143, "agent_creation_provenance"),
         (144, "product_conversation_rename_receipts"),
         (145, "coordinator_goal_preparations"),
+        (146, "retain_product_conversation_rename_receipts"),
+        (147, "retain_product_creation_receipts"),
+        (148, "product_creation_initial_execution_receipts"),
+        (149, "product_creation_image_retirement"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -266,6 +272,13 @@ fn registered_identity_order_and_exact_bodies() {
         (PROVENANCE, 143),
         (RECEIPTS, 144),
         (include_str!("../conversation_goals/prepared.sql"), 145),
+        (RETAIN_RECEIPTS, 146),
+        (RETAIN_CREATION, 147),
+        (
+            include_str!("product_creation_initial_execution_receipts.sql"),
+            148,
+        ),
+        (include_str!("product_creation_image_retirement.sql"), 149),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -288,12 +301,94 @@ fn registered_identity_order_and_exact_bodies() {
 }
 
 #[tokio::test]
+async fn rename_receipt_retention_migration_preserves_rows_and_rolls_back_atomically() {
+    const SELECT_RECEIPT: &str = "SELECT operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros FROM product_conversation_rename_receipts";
+    type ReceiptRow = (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+    );
+    let pool = fixture(145, false).await;
+    let db = Database::from_pool_for_tests(pool.clone(), String::new());
+    let root = db
+        .create_conversation("retention-root", "retention-root", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let title = crate::NormalizedConversationTitle::parse("\0Historical title").unwrap();
+    sqlx::query("INSERT INTO product_conversation_rename_receipts (operation_id, product_conversation_id, name_revision_before, title, source_product_conversation_id, source_transcript_id, source_message_id, source_tool_use_id, naming_root_transcript_id, slug_at_commit, committed_at_unix_micros) VALUES ('retained-operation', ?1, 7, ?3, 'source-product', 'source-transcript', 'source-message', 'source-call', ?2, 'historical-slug', 123456)")
+        .bind(root.product_conversation_id.as_str()).bind(&root.id).bind(title.as_str())
+        .execute(&pool).await.unwrap();
+    let before: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TRIGGER retention_ledger_fault BEFORE INSERT ON _migrations WHEN NEW.version=146 BEGIN SELECT RAISE(ABORT,'retention ledger fault'); END;").execute(&pool).await.unwrap();
+    let before_schema = snapshot(&mut pool.acquire().await.unwrap()).await;
+    let error = run_pending_migrations(&pool).await.unwrap_err();
+    assert!(
+        error.to_string().contains("retention ledger fault"),
+        "{error}"
+    );
+    assert_eq!(
+        snapshot(&mut pool.acquire().await.unwrap()).await,
+        before_schema
+    );
+    let after_rollback: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after_rollback);
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(foreign_keys, 1);
+    sqlx::raw_sql("DROP TRIGGER retention_ledger_fault")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('product_conversation_rename_receipts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(foreign_keys, 0);
+    let after: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    db.delete_conversation(&root.id).await.unwrap();
+    let historical: ReceiptRow = sqlx::query_as(SELECT_RECEIPT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, historical);
+    let mut conn = pool.acquire().await.unwrap();
+    clean(&mut conn).await;
+    drop(conn);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
     use crate::{ProductCreationAcceptOutcome, ProductCreationOrigin};
 
     let pool = fixture(142, true).await;
     let db = Database::from_pool_for_tests(pool.clone(), String::new());
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
     let retained = db
         .get_product_creation_job("old-slack")
         .await
@@ -306,7 +401,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
         }
     );
     assert!(matches!(
-        db.accept_product_creation("old-slack", &retained.intent)
+        db.accept_product_creation("old-slack", &retained.intent.live_intent().unwrap())
             .await
             .unwrap(),
         ProductCreationAcceptOutcome::Replayed(_)
@@ -314,7 +409,7 @@ async fn registered_slack_origin_decodes_and_replays_after_upgrade() {
     sqlx::raw_sql("INSERT INTO slack_gateway_bindings(binding_id, workspace, owner, channel, thread_ts, kind, creation_id) VALUES('new-binding', 'ws', 'owner', 'channel', '2', 'explicit', 'new-slack');
         INSERT INTO slack_gateway_requests(request_id, workspace, owner, channel, message_ts, thread_ts, kind, instruction, context, source_url, binding_id, accepted_at_unix_micros, input_id, observed_at_unix_micros, trigger_kind) VALUES('new-slack-source', 'ws', 'owner', 'channel', '2', '2', 'explicit', 'literal', 'context', 'https://example.invalid', 'new-binding', 5, 'new-input', 5, 'prefix');")
         .execute(&pool).await.unwrap();
-    let mut intent = retained.intent;
+    let mut intent = retained.intent.live_intent().unwrap();
     intent.images.clear();
     intent.origin = ProductCreationOrigin::SlackGateway {
         request_id: "new-slack-source".into(),
@@ -354,9 +449,26 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let pool = fixture(prefix, populated).await;
             run_through_for_test(&pool, 142).await.unwrap();
             let before = snapshot(&mut pool.acquire().await.unwrap()).await;
-            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+            assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
+            let live_images: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_job_images")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            let replay_identities: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_image_replay_identity")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(replay_identities, live_images);
+            let retired: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_retired_images")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(retired, 0);
             clean(&mut conn).await;
             let ledger = snapshot(&mut conn).await.ledger;
             assert_eq!(
@@ -368,7 +480,11 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
                 [
                     (143, "agent_creation_provenance"),
                     (144, "product_conversation_rename_receipts"),
-                    (145, "coordinator_goal_preparations")
+                    (145, "coordinator_goal_preparations"),
+                    (146, "retain_product_conversation_rename_receipts"),
+                    (147, "retain_product_creation_receipts"),
+                    (148, "product_creation_initial_execution_receipts"),
+                    (149, "product_creation_image_retirement")
                 ]
             );
             drop(conn);
@@ -408,7 +524,7 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
             .await
             .unwrap();
         drop(conn);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         clean(&mut conn).await;
@@ -430,7 +546,92 @@ async fn registered_ledger_failure_rolls_back_body_then_reenters() {
         .await
         .unwrap();
     drop(conn);
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 7);
+}
+
+#[tokio::test]
+async fn image_retirement_ledger_failure_restores_payload_schema_and_retries() {
+    let pool = fixture(148, true).await;
+    sqlx::query("UPDATE product_creation_jobs SET status='published', published_product_id='deleted-product', published_conversation_id='deleted-transcript' WHERE request_id='old-history'")
+        .execute(&pool).await.unwrap();
+    let before: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!before.is_empty());
+    sqlx::raw_sql("CREATE TRIGGER image_retirement_ledger_fault BEFORE INSERT ON _migrations WHEN NEW.version=149 BEGIN SELECT RAISE(ABORT,'image retirement ledger fault'); END;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = run_pending_migrations(&pool).await.unwrap_err();
+    assert!(
+        error.to_string().contains("image retirement ledger fault"),
+        "{error}"
+    );
+    let after_rollback: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after_rollback, before,
+        "migration rollback restores image bytes"
+    );
+    for object in [
+        "product_creation_image_replay_identity",
+        "product_creation_retired_images",
+        "product_creation_retire_images_after_product_delete",
+        "product_creation_identity_no_update",
+        "product_creation_identity_no_delete",
+    ] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)")
+                .bind(object)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!exists, "{object} must roll back");
+    }
+    let ledger_entry: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version=149")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger_entry, 0);
+    sqlx::raw_sql("DROP TRIGGER image_retirement_ledger_fault")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+    let restored: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT request_id, ordinal, media_type, data FROM product_creation_job_images ORDER BY request_id, ordinal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected_live: Vec<_> = before
+        .iter()
+        .filter(|row| row.0 != "old-history")
+        .cloned()
+        .collect();
+    assert_eq!(restored, expected_live);
+    let retired: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM product_creation_retired_images WHERE request_id='old-history'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retired, 1);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_image_replay_identity")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(usize::try_from(identity_count).unwrap(), before.len());
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -445,4 +646,185 @@ async fn unsupported_lineage_refuses_before_schema_or_row_mutation() {
     let mut conn = pool.acquire().await.unwrap();
     assert_eq!(snapshot(&mut conn).await, before);
     clean(&mut conn).await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Checks schema, child data and rollback in one registered migration journey"
+)]
+async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomically() {
+    let pool = fixture(146, true).await;
+    let db = Database::from_pool_for_tests(pool.clone(), String::new());
+    let target = db
+        .create_conversation("receipt-target", "receipt-target", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE product_creation_jobs SET status='published', published_product_id=?1, published_conversation_id=?2, objective_origin='internal_conversation', objective_source_product_conversation_id='source-product', objective_source_transcript_id='source-transcript', objective_source_message_id='source-message', objective_source_tool_use_id='source-call' WHERE request_id='old-user'")
+        .bind(target.product_conversation_id.as_str())
+        .bind(target.id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO product_creation_jobs(request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros, objective_origin) VALUES('old-unpinned', 'pc_old_unpinned', '/fixture', 'unpinned objective', 'phoenix-native', 'accepted', 5, 6, 'unknown_historical')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO product_creation_job_images(request_id, ordinal, media_type, data) VALUES('old-user', 2, 'image/jpeg', 'ordinal-two')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let initial_fk_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(initial_fk_count, 3);
+    let mut conn = pool.acquire().await.unwrap();
+    let before = snapshot(&mut conn).await;
+    drop(conn);
+    sqlx::raw_sql("CREATE TRIGGER creation_receipt_ledger_fault BEFORE INSERT ON _migrations WHEN NEW.version=147 BEGIN SELECT RAISE(ABORT,'creation receipt ledger fault'); END;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before_rollback = snapshot(&mut pool.acquire().await.unwrap()).await;
+    let error = run_pending_migrations(&pool).await.unwrap_err();
+    assert!(
+        error.to_string().contains("creation receipt ledger fault"),
+        "{error}"
+    );
+    assert_eq!(
+        snapshot(&mut pool.acquire().await.unwrap()).await,
+        before_rollback
+    );
+
+    sqlx::raw_sql("DROP TRIGGER creation_receipt_ledger_fault")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+    let ledger_entry: (i64, String) =
+        sqlx::query_as("SELECT version, name FROM _migrations WHERE version=147")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        ledger_entry,
+        (147, "retain_product_creation_receipts".into())
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    let after = snapshot(&mut conn).await;
+    assert_eq!(
+        after.columns, before.columns,
+        "table shape remains unchanged"
+    );
+    assert_eq!(
+        after.data, before.data,
+        "all typed parent and child row bytes survive"
+    );
+    for (kind, name, table, old_sql) in &before.schema {
+        if [
+            "product_creation_job_images",
+            "product_creation_resource_reservations",
+        ]
+        .contains(&table.as_str())
+            || (table == "product_creation_jobs" && kind != "table")
+        {
+            let actual: Option<String> =
+                sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type=?1 AND name=?2")
+                    .bind(kind)
+                    .bind(name)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            assert_eq!(&actual, old_sql, "unchanged schema object {name}");
+        }
+    }
+    let outgoing_fk_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs')")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        outgoing_fk_count, 1,
+        "exactly the Slack provenance FK remains"
+    );
+    let removed_receipt_fks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs') WHERE \"from\" IN ('published_product_id', 'published_conversation_id')")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(removed_receipt_fks, 0);
+    let slack_fk: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('product_creation_jobs') WHERE \"from\"='objective_slack_request_id' AND \"table\"='slack_gateway_requests'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(slack_fk, 1);
+    let job_guards: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('creation_slack_origin_insert', 'product_creation_checkout_pin_immutable')")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(job_guards, 2);
+    let job_indexes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN ('product_creation_jobs_claim_order', 'product_creation_jobs_retry_order', 'product_creation_jobs_cleanup_order', 'product_creation_jobs_delivery_order', 'product_creation_jobs_published_cwd')")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(job_indexes, 5);
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .is_empty());
+    let provenance: (String, String, String, String) = sqlx::query_as("SELECT objective_source_product_conversation_id, objective_source_transcript_id, objective_source_message_id, objective_source_tool_use_id FROM product_creation_jobs WHERE request_id='old-user'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        provenance,
+        (
+            "source-product".into(),
+            "source-transcript".into(),
+            "source-message".into(),
+            "source-call".into()
+        )
+    );
+    let nonnull_pin: (Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT pin_exact_checkout_oid, pin_logical_base, pin_freshness FROM product_creation_jobs WHERE request_id='old-user'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        nonnull_pin,
+        (
+            Some("frozen-oid".into()),
+            Some("main".into()),
+            Some("fresh".into())
+        )
+    );
+    let null_pin: (Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT pin_exact_checkout_oid, pin_logical_base, pin_freshness FROM product_creation_jobs WHERE request_id='old-unpinned'")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(null_pin, (None, None, None));
+    let reservation_token: Option<String> = sqlx::query_scalar(
+        "SELECT ownership_token FROM product_creation_resource_reservations WHERE id='old-user-2'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(reservation_token.as_deref(), Some("token東京"));
+    drop(conn);
+
+    db.delete_conversation(&target.id).await.unwrap();
+    let retained_ids: (String, String) = sqlx::query_as("SELECT published_product_id, published_conversation_id FROM product_creation_jobs WHERE request_id='old-user'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_ids,
+        (
+            target.product_conversation_id.to_string(),
+            target.id.clone()
+        )
+    );
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
 }
