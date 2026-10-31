@@ -758,6 +758,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/product_conversation_rename_receipts.sql"),
     },
     Migration {
+        version: 145,
+        name: "coordinator_goal_preparations",
+        sql: include_str!("conversation_goals/prepared.sql"),
+    },
+    Migration {
         version: 146,
         name: "retain_product_conversation_rename_receipts",
         sql: include_str!("migrations/retain_product_conversation_rename_receipts.sql"),
@@ -12231,6 +12236,20 @@ pub(crate) fn migration_identities() -> impl Iterator<Item = (u32, &'static str)
 }
 
 #[cfg(test)]
+pub(crate) async fn run_unpublished_tools_d3_for_test(pool: &SqlitePool) -> DbResult<u32> {
+    let unpublished: Vec<_> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 149 && migration.version != 145)
+        .map(|migration| Migration {
+            version: migration.version,
+            name: migration.name,
+            sql: migration.sql,
+        })
+        .collect();
+    run_migration_list(pool, &unpublished).await
+}
+
+#[cfg(test)]
 pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbResult<u32> {
     let end = MIGRATIONS.partition_point(|migration| migration.version <= version);
     run_migration_list(pool, &MIGRATIONS[..end]).await
@@ -15130,6 +15149,7 @@ with tempfile.TemporaryDirectory() as directory:
             (148, "product_creation_initial_execution_receipts"),
             (147, "retain_product_creation_receipts"),
             (146, "retain_product_conversation_rename_receipts"),
+            (145, "coordinator_goal_preparations"),
             (144, "product_conversation_rename_receipts"),
             (143, "agent_creation_provenance"),
             (142, "slack_gateway_v1"),
@@ -19360,10 +19380,36 @@ with tempfile.TemporaryDirectory() as directory:
     }
 
     #[test]
-    fn initial_execution_receipt_registry_retains_sparse_reserved_slot() {
-        assert_eq!(MIGRATIONS.last().unwrap().version, 149);
-        assert!(!MIGRATIONS.iter().any(|migration| migration.version == 145));
-        assert_eq!(MIGRATIONS.len(), 147);
+    fn goal_tools_registry_contains_real_145_before_retention_tail() {
+        let tail: Vec<_> = MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= 143)
+            .map(|migration| (migration.version, migration.name))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                (143, "agent_creation_provenance"),
+                (144, "product_conversation_rename_receipts"),
+                (145, "coordinator_goal_preparations"),
+                (146, "retain_product_conversation_rename_receipts"),
+                (147, "retain_product_creation_receipts"),
+                (148, "product_creation_initial_execution_receipts"),
+                (149, "product_creation_image_retirement"),
+            ]
+        );
+        let goal = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 145)
+            .unwrap();
+        assert_eq!(goal.sql, include_str!("conversation_goals/prepared.sql"));
+        assert!(goal
+            .sql
+            .contains("CREATE TABLE conversation_goal_preparations"));
+        assert!(goal
+            .sql
+            .contains("CREATE TABLE conversation_goal_coordinator_receipts"));
+        assert_eq!(MIGRATIONS.len(), 148);
     }
 
     #[tokio::test]

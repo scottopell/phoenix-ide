@@ -596,6 +596,10 @@ mod tests {
         pool
     }
 
+    mod goal_tools_tests {
+        include!("lineage/goal_tools_tests.rs");
+    }
+
     #[tokio::test]
     async fn fresh_and_each_real_canonical_prefix_are_admitted() {
         let fresh = pool().await;
