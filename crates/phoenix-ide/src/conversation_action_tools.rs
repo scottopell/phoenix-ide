@@ -18,6 +18,8 @@ use crate::db::{
 };
 use crate::runtime::{AdmittedOperation, RuntimeManager};
 
+mod continuation;
+
 struct RenameAuthorityPass {
     owner: Option<AdmittedOperation>,
 }
@@ -64,7 +66,8 @@ pub(crate) async fn tools(
     {
         Ok(()) => Ok(vec![
             Arc::new(RenameConversation(runtime.clone())),
-            Arc::new(CreateConversation(runtime)),
+            Arc::new(CreateConversation(runtime.clone())),
+            Arc::new(continuation::ContinueConversation(runtime)),
         ]),
         Err(crate::db::DbError::CurrentCoordinatorRequired) => Ok(Vec::new()),
         Err(error) => Err(error),

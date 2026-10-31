@@ -816,7 +816,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
-            vec!["rename_conversation", "create_conversation"]
+            vec!["rename_conversation", "create_conversation", "continue_conversation"]
         );
         assert!(crate::conversation_action_tools::tools(manager, "missing")
             .await

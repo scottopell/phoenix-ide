@@ -191,7 +191,7 @@ THE SYSTEM SHALL additionally provide explicit subscription management only to t
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
-AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation and naming capabilities defined below to the Coordinator
+AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation, naming and generated-continuation capabilities defined below to the Coordinator
 
 WHILE the persisted singleton Global Coordinator is the executing current transcript
 THE SYSTEM MAY provide dedicated conversation creation and naming tools through the same application actions used by public conversation operations
@@ -203,6 +203,10 @@ AND SHALL NOT thereby grant continuation, structured-answer, review, task approv
 
 THE creation capability SHALL follow `../conversation-creation/requirements.md` REQ-CCR-013
 AND THE naming capability SHALL follow `../conversation-identity/requirements.md` REQ-CID-007
+
+WHILE the persisted singleton Global Coordinator is the executing current transcript
+THE SYSTEM MAY provide `continue_conversation` solely for the generated ordinary-conversation continuation defined by REQ-GR-019
+AND SHALL NOT thereby grant self-rotation, literal opening instructions, automatic-continuation preference changes, failed-work recovery, task approval, structured-answer or review authority.
 
 ---
 
@@ -512,3 +516,29 @@ WHEN retained home files are intentionally cleaned
 THE supported procedure SHALL require deliberate owner action identifying the files to remove, preserve the binding and directory, and never be an ordinary Close/Delete side effect.
 WHEN the entire instance is intentionally decommissioned
 THE operator SHALL stop the runtime and explicitly remove its database and retained data as an instance-wide action, not a WorkScope retirement command.
+
+
+### REQ-GR-019: Continue an Exact Generated Ordinary Handoff
+
+WHEN the current authenticated Global Coordinator invokes native `continue_conversation`
+THE SYSTEM SHALL require an exact ordinary ProductConversation ID, exact exhausted predecessor transcript ID and exact persisted system-generated summary message ID
+AND SHALL derive source transcript and tool-call identity from trusted execution context rather than agent input
+AND SHALL recheck current Coordinator authority in the reservation transaction, including completed-opening replay
+AND SHALL refuse self-rotation, ordinary-conversation sources, predecessor Coordinator sources and sub-agents.
+
+THE SYSTEM SHALL require the predecessor to be a published user-initiated member of that ordinary conversation in ContextExhausted with the referenced current generated summary
+AND SHALL preserve the shared continuation environment, lifecycle, single-successor and useful-capacity rules in `../bedrock/requirements.md` REQ-BED-020, REQ-BED-021, REQ-BED-020b and REQ-BED-030
+AND SHALL open the successor only with that retained summary as generated predecessor context, never as fresh user authority
+AND SHALL create the first-message identity on the server rather than accept literal text, user-agent metadata, source overrides or client opening keys from the agent.
+
+WHEN a durable continuation reservation already exists for that exact handoff
+THE SYSTEM SHALL reuse its successor and winning opening identity
+AND SHALL review a pending opening against that exact successor's current capacity without replacing its retained intent on refusal
+AND SHALL return a completed opening's retained acceptance without requiring provider capacity or dispatching another opening.
+
+WHEN local persistence authority becomes unclassified during reservation or opening acceptance
+THE SYSTEM SHALL close local runtime authority before releasing its admitted operation
+AND SHALL NOT publish the native invocation as ordinary success or refusal after that closure
+AND SHALL follow `../compatibility/requirements.md` without promising cross-process leases, recovery or cancellation of already-admitted effects.
+
+THE native capability SHALL NOT enable automatic continuation, retry or rearm failed work, reopen a closed conversation, schedule work, mutate Goals or bypass stop/pause/approval gates.

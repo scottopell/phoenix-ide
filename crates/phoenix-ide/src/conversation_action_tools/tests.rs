@@ -154,6 +154,63 @@ async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) 
     (runtime, db, coordinator.id)
 }
 
+fn native_context_without_source_identity(transcript: &str) -> ToolContext {
+    struct Offline;
+    impl phoenix_core::llm_service::LlmSelector for Offline {
+        fn get(&self, _: &str) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+        fn default_service(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+    }
+    ToolContext::new_without_filesystem(
+        tokio_util::sync::CancellationToken::new(),
+        transcript.into(),
+        Arc::new(phoenix_tools::BrowserSessionManager::default()),
+        Arc::new(phoenix_tools::BashHandleRegistry::new()),
+        Arc::new(Offline),
+        phoenix_terminal::ActiveTerminals::new(),
+        Arc::new(phoenix_tools::TmuxRegistry::new()),
+    )
+}
+
+fn native_continue_input(product: &ProductConversationId, predecessor: &str) -> Value {
+    json!({
+        "product_conversation_id": product,
+        "predecessor_transcript_id": predecessor,
+        "summary_message_id": "native-summary"
+    })
+}
+
+async fn native_continue_predecessor(
+    db: &crate::db::Database,
+    id: &str,
+    summary: &str,
+) -> ProductConversationId {
+    use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+    db.update_conversation_state(
+        id,
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
+            summary: summary.into(),
+        },
+    )
+    .await
+    .unwrap();
+    db.add_message_with_seq_and_origin(
+        "native-summary",
+        id,
+        1,
+        &MessageContent::continuation(summary),
+        None,
+        None,
+        &InputOrigin::SystemGenerated,
+    )
+    .await
+    .unwrap();
+    db.get_conversation(id).await.unwrap().product_conversation_id
+}
+
 fn assert_immutable_creation_conflict(changed: &ToolOutput) {
     assert!(matches!(changed, ToolOutput::Error { .. }));
     assert_eq!(
@@ -738,6 +795,118 @@ async fn native_registered_creation_read_replays_historical_publication_after_ta
     assert!(matches!(revoked, ToolOutput::Error { .. }));
     let revoked_replay = create.run(request, native_context(&gc)).await;
     assert!(matches!(revoked_replay, ToolOutput::Error { .. }));
+}
+
+#[tokio::test]
+async fn native_continue_requires_tool_call_identity_and_refuses_non_coordinator_sources() {
+    let (runtime, db, gc) = native_runtime().await;
+    let predecessor = db
+        .create_conversation("native-continue", "native-continue", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let product = native_continue_predecessor(&db, &predecessor.id, "retained summary").await;
+    let tool = continuation::ContinueConversation(runtime.clone());
+    let input = native_continue_input(&product, &predecessor.id);
+    let missing_identity = tool
+        .run(input.clone(), native_context_without_source_identity(&gc))
+        .await;
+    assert!(matches!(missing_identity, ToolOutput::Error { .. }));
+    assert!(db.get_conversation(&predecessor.id).await.unwrap().continued_in_conv_id.is_none());
+
+    let ordinary = db
+        .create_conversation("ordinary-source", "ordinary-source", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let refused = tool.run(input, native_context(&ordinary.id)).await;
+    assert!(matches!(refused, ToolOutput::Error { .. }));
+    assert!(db.get_conversation(&predecessor.id).await.unwrap().continued_in_conv_id.is_none());
+    assert!(!runtime.local_authority_is_closed());
+}
+
+#[tokio::test]
+async fn native_continue_adapter_is_a_pending_sink_after_local_authority_closes() {
+    use futures::FutureExt;
+
+    let (runtime, _, gc) = native_runtime().await;
+    runtime.fence_fatal_local_authority().await;
+    let tool = continuation::ContinueConversation(runtime);
+    let future = tool.run(
+        json!({"unexpected":"input"}),
+        native_context(&gc),
+    );
+    assert!(future.now_or_never().is_none());
+}
+
+#[tokio::test]
+async fn native_continue_replays_completed_opening_without_replacing_its_message_identity() {
+    use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
+    use phoenix_db::{CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest};
+    use phoenix_workflow::ClientTurnKey;
+
+    let (runtime, db, gc) = native_runtime().await;
+    let predecessor = db
+        .create_conversation("native-replay", "native-replay", "/tmp", true, None, None)
+        .await
+        .unwrap();
+    let product = native_continue_predecessor(&db, &predecessor.id, "retained summary").await;
+    let opening_key = ClientTurnKey::try_from("already-opened-message").unwrap();
+    let (outcome, opening) = db.continue_from_current_coordinator(CurrentCoordinatorContinuationRequest {
+        source_transcript_id: &gc,
+        product_conversation_id: &product,
+        predecessor_transcript_id: &predecessor.id,
+        summary_message_id: "native-summary",
+        first_message_id: opening_key,
+    }).await.established().expect("reservation classified").unwrap();
+    let phoenix_db::ContinueOutcome::Created(successor) = outcome else {
+        panic!("expected first continuation reservation");
+    };
+    let CoordinatorContinuationOpening::Pending(intent) = opening else {
+        panic!("expected a new opening reservation");
+    };
+    assert_eq!(intent.message_id.as_str(), "already-opened-message");
+    db.add_message_with_seq_and_origin(
+        "already-opened-message",
+        &successor.id,
+        1,
+        &MessageContent::continuation("retained summary"),
+        None,
+        None,
+        &InputOrigin::SystemGenerated,
+    ).await.unwrap();
+    assert!(db.continuation_dispatch_intent(&predecessor.id).await.unwrap().is_none());
+
+    let tool = continuation::ContinueConversation(runtime.clone());
+    let replay = tool
+        .run(native_continue_input(&product, &predecessor.id), native_context(&gc))
+        .await;
+    assert!(!matches!(replay, ToolOutput::Error { .. }), "{}", replay.output());
+    let replay: Value = serde_json::from_str(replay.output()).unwrap();
+    assert_eq!(replay["conversation_id"], successor.id);
+    assert_eq!(replay["status"], "already_exists");
+    let messages = db.get_messages(&successor.id).await.unwrap();
+    let openings: Vec<_> = messages.iter().filter(|message| {
+        matches!(message.content, phoenix_core::domain::db_schema::MessageContent::Continuation { .. })
+    }).collect();
+    assert_eq!(openings.len(), 1);
+    assert_eq!(openings[0].message_id, "already-opened-message");
+    assert!(matches!(openings[0].origin, InputOrigin::SystemGenerated));
+
+    db.update_conversation_state(
+        &gc,
+        &phoenix_core::sm_state::ConvState::ContextExhausted {
+            summary: "Coordinator rotation".into(),
+        },
+    ).await.unwrap();
+    assert!(matches!(
+        db.continue_conversation(&gc).await.unwrap(),
+        phoenix_db::ContinueOutcome::Created(_)
+    ));
+    let stale_replay = tool
+        .run(native_continue_input(&product, &predecessor.id), native_context(&gc))
+        .await;
+    assert!(matches!(stale_replay, ToolOutput::Error { .. }));
+    assert_eq!(db.get_messages(&successor.id).await.unwrap().len(), 1);
+    assert!(!runtime.local_authority_is_closed());
 }
 
 async fn insert_project_option(db: &crate::db::Database, id: &str, path: &std::path::Path) {
