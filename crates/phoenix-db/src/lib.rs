@@ -4833,13 +4833,23 @@ impl Database {
         &self,
         parent_id: &str,
     ) -> DbResult<Option<ContinuationDispatchIntent>> {
+        Self::continuation_dispatch_intent_on(&self.pool, parent_id).await
+    }
+
+    async fn continuation_dispatch_intent_on<'e, E>(
+        executor: E,
+        parent_id: &str,
+    ) -> DbResult<Option<ContinuationDispatchIntent>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let row = sqlx::query(
             "SELECT parent_conversation_id, successor_conversation_id, message_id,
                     handoff, user_agent, opening_authority
              FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
         )
         .bind(parent_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
         row.map(|row| {
             Ok(ContinuationDispatchIntent {
@@ -4902,7 +4912,15 @@ impl Database {
         let observation = self
             .sqlite_workload_collector
             .start_read_family(SqliteReadFamily::ConversationGet);
-        let result = sqlx::query(
+        let result = Self::get_conversation_on(&self.pool, id).await;
+        observation.complete(result)
+    }
+
+    async fn get_conversation_on<'e, E>(executor: E, id: &str) -> DbResult<Conversation>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        sqlx::query(
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
@@ -4914,7 +4932,7 @@ impl Database {
         )
         .bind(id)
         .try_map(parse_conversation_row)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await
         .map_err(|e| {
             if matches!(e, sqlx::Error::RowNotFound) {
@@ -4922,8 +4940,7 @@ impl Database {
             } else {
                 DbError::Sqlx(e)
             }
-        });
-        observation.complete(result)
+        })
     }
 
     /// Get conversation by slug
@@ -9842,6 +9859,13 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_members_forward(&self, root_id: &str) -> DbResult<Vec<String>> {
+        Self::chain_members_forward_on(&self.pool, root_id).await
+    }
+
+    async fn chain_members_forward_on<'e, E>(executor: E, root_id: &str) -> DbResult<Vec<String>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let rows = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, next_id, depth) AS (
                 SELECT id, continued_in_conv_id, 0
@@ -9855,7 +9879,7 @@ impl Database {
             SELECT id FROM chain ORDER BY depth",
         )
         .bind(root_id)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows)
     }
@@ -9999,6 +10023,13 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_root_of(&self, conv_id: &str) -> DbResult<Option<String>> {
+        Self::chain_root_of_on(&self.pool, conv_id).await
+    }
+
+    async fn chain_root_of_on<'e, E>(executor: E, conv_id: &str) -> DbResult<Option<String>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let row = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, depth) AS (
                 SELECT id, 0
@@ -10012,7 +10043,7 @@ impl Database {
             SELECT id FROM chain ORDER BY depth DESC LIMIT 1",
         )
         .bind(conv_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row)
     }
