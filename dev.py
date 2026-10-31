@@ -2309,11 +2309,12 @@ def _title_from_slug(slug: str) -> str:
 def _migrate_seed_database(*, build: bool, release: bool) -> None:
     if build:
         build_rust(release=release)
-    binary = ROOT / "target" / ("release" if release else "debug") / "phoenix_ide"
+    env = os.environ.copy()
+    binary = _cargo_target_dir(ROOT, env) / ("release" if release else "debug") / "phoenix_ide"
     if not binary.exists():
         raise RuntimeError(f"Phoenix binary not found after build: {binary}")
-    env = os.environ.copy()
     env["PHOENIX_DB_PATH"] = str(get_db_path())
+
     if not env.get("PHOENIX_DATA_DIR"):
         env["PHOENIX_DATA_DIR"] = str(get_db_path().with_suffix(".data"))
     subprocess.run(
