@@ -191,7 +191,7 @@ THE SYSTEM SHALL additionally provide explicit subscription management only to t
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
-AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation, naming and generated-continuation capabilities defined below to the Coordinator
+AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation, naming, generated-continuation and automatic-continuation preference capabilities defined below to the Coordinator
 
 WHILE the persisted singleton Global Coordinator is the executing current transcript
 THE SYSTEM MAY provide dedicated conversation creation and naming tools through the same application actions used by public conversation operations
@@ -207,6 +207,10 @@ AND THE naming capability SHALL follow `../conversation-identity/requirements.md
 WHILE the persisted singleton Global Coordinator is the executing current transcript
 THE SYSTEM MAY provide `continue_conversation` solely for the generated ordinary-conversation continuation defined by REQ-GR-019
 AND SHALL NOT thereby grant self-rotation, literal opening instructions, automatic-continuation preference changes, failed-work recovery, task approval, structured-answer or review authority.
+
+WHILE the persisted singleton Global Coordinator is the executing current transcript
+THE SYSTEM MAY provide `read_automatic_continuation` and `set_automatic_continuation` solely for the preference operations defined by REQ-GR-020
+AND SHALL NOT thereby grant scheduling, admission, failed-work recovery, retry/rearm, Goal mutation, task approval, structured-answer or review authority.
 
 ---
 
@@ -542,3 +546,16 @@ AND SHALL NOT publish the native invocation as ordinary success or refusal after
 AND SHALL follow `../compatibility/requirements.md` without promising cross-process leases, recovery or cancellation of already-admitted effects.
 
 THE native capability SHALL NOT enable automatic continuation, retry or rearm failed work, reopen a closed conversation, schedule work, mutate Goals or bypass stop/pause/approval gates.
+
+
+### REQ-GR-020: Read and Set Automatic-Continuation Preferences Without Scheduling Work
+
+WHEN the current Coordinator inspects or changes automatic continuation
+THE SYSTEM SHALL expose native `read_automatic_continuation` and `set_automatic_continuation` tools that share the persisted preference with supported public settings surfaces without implicitly continuing or admitting work.
+
+1. Both tools require trusted source tool-call context and transactionally revalidate that the source transcript is the current Coordinator. Ordinary conversations, sub-agents and predecessor Coordinator transcripts receive no such capability; retaining an earlier tool handle does not preserve source authority after rotation.
+2. Each request has a closed `target` tagged by `kind`: `ordinary` requires one nonblank `product_conversation_id`; `coordinator` carries no caller-supplied identity and resolves the singleton Coordinator aggregate. An ordinary target must name an exact published ordinary ProductConversation. Transcript aliases, subordinate or unpublished conversations and a Coordinator disguised as an ordinary target are rejected.
+3. Read accepts only `target`. Set additionally requires the strict Boolean `auto_continue_on_context_exhaustion`; omitted, string and numeric values are rejected. Unknown fields, source-identity overrides and recovery controls are rejected. The persisted default is false.
+4. Successful results contain only the resolved `aggregate` and Boolean `auto_continue_on_context_exhaustion`, not a claim about scheduler state, admission or dispatch. The aggregate identifies its `ordinary` or `coordinator` kind and resolved ProductConversation ID. Read is side-effect-free. Set changes only the preference and establishes its returned value within the committing transaction; a later status-projection failure cannot misrepresent that write as an acknowledged rollback.
+5. Preference changes are prospective under [Bedrock REQ-BED-020](../bedrock/requirements.md). Enabling after exhaustion does not wake or retroactively admit continuation. Disabling does not revoke already-admitted continuation. Neither operation creates or removes a dispatch intent, retries/rearms failed work, alters a Goal or bypasses stop, pause, closed-work or approval gates.
+6. Requester cancellation does not cancel an owned write before its durability outcome is classified. An acknowledged rollback is an ordinary refusal. An unclassified commit or rollback closes local runtime authority before its write owner is released; neither ordinary success nor ordinary error is published after that closure. A read failure is not classified as an uncertain write. These rules add no cross-process recovery, idempotency receipt or eventual-completion guarantee.

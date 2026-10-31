@@ -18,6 +18,7 @@ use crate::db::{
 };
 use crate::runtime::{AdmittedOperation, RuntimeManager};
 
+mod automatic_continuation;
 mod continuation;
 
 struct RenameAuthorityPass {
@@ -67,7 +68,11 @@ pub(crate) async fn tools(
         Ok(()) => Ok(vec![
             Arc::new(RenameConversation(runtime.clone())),
             Arc::new(CreateConversation(runtime.clone())),
-            Arc::new(continuation::ContinueConversation(runtime)),
+            Arc::new(continuation::ContinueConversation(runtime.clone())),
+            Arc::new(automatic_continuation::AutomaticContinuationTool::read(
+                runtime.clone(),
+            )),
+            Arc::new(automatic_continuation::AutomaticContinuationTool::set(runtime)),
         ]),
         Err(crate::db::DbError::CurrentCoordinatorRequired) => Ok(Vec::new()),
         Err(error) => Err(error),

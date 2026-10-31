@@ -185,6 +185,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
 | [191](191_native-create-and-rename-use-shared-application-actions.md) | Native create and rename use shared application actions | Accepted | REQ-GR-007, REQ-CCR-013, REQ-CID-007 |
 | [208](208_native-continue-reuses-generated-handoff-admission.md) | Native Continue reuses generated handoff admission | Accepted | REQ-GR-007/019, REQ-BED-020/021/020b/030 |
+| [209](209_native-automatic-continuation-is-preference-only.md) | Native automatic continuation is preference-only | Accepted | REQ-GR-007/020, REQ-BED-020, REQ-API-029 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |
 | [150](150_concrete-coordinator-reporting-and-blocker-recovery.md) | Concrete Coordinator reporting and blocked-work recovery | Accepted | REQ-GR-011 |
 | [148](148_qualify-exact-ordinary-launchd-source129-to-target131.md) | Qualify exact ordinary launchd source 129 to target 131 | Accepted | REQ-COMP-019, REQ-LDD-023/028 |

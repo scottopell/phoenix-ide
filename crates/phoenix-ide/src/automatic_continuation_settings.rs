@@ -11,6 +11,8 @@ use phoenix_core::domain::product_conversation::{
     AutoContinueOnContextExhaustion, AutomaticContinuationPhase, ProductConversationId,
 };
 
+pub(crate) mod native;
+
 #[derive(Debug)]
 pub(crate) enum Target {
     Ordinary(ProductConversationId),

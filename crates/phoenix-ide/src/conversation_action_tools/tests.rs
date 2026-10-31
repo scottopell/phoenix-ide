@@ -109,7 +109,7 @@ fn rename_detail_uses_shared_encoded_canonical_route_with_stable_id_fallback() {
     );
 }
 
-fn native_context(transcript: &str) -> ToolContext {
+pub(super) fn native_context(transcript: &str) -> ToolContext {
     struct Offline;
     impl phoenix_core::llm_service::LlmSelector for Offline {
         fn get(&self, _: &str) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
@@ -132,7 +132,7 @@ fn native_context(transcript: &str) -> ToolContext {
     .with_tool_use_id("native-call")
 }
 
-async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) {
+pub(super) async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) {
     let db = crate::db::Database::open_in_memory().await.unwrap();
     let coordinator = db
         .get_or_create_coordinator(None, LlmLanguage::default())
@@ -154,7 +154,7 @@ async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) 
     (runtime, db, coordinator.id)
 }
 
-fn native_context_without_source_identity(transcript: &str) -> ToolContext {
+pub(super) fn native_context_without_source_identity(transcript: &str) -> ToolContext {
     struct Offline;
     impl phoenix_core::llm_service::LlmSelector for Offline {
         fn get(&self, _: &str) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {

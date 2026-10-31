@@ -237,7 +237,7 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 delivery/evidence limits. Check-ins are bounded, not polling. Only mutate \
                 selected WorkScope via unsandboxed Bash with its explicit active work_scope_id. \
                 No dedicated project/task/workspace/approval/lifecycle mutation tools except \
-                installed create_conversation/rename_conversation/continue_conversation. Act on user \
+                installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation. Act on user \
                 turns and factual \
                 events from explicit watches; ordinary watches follow \
                 continuations until removed/closed."
@@ -289,7 +289,7 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Bounded check-in, no polling. Change selected WorkScope only with unsandboxed \
                 Bash and explicit active work_scope_id. No dedicated \
                 project/task/workspace/approval/lifecycle mutation tools except installed \
-                create_conversation/rename_conversation/continue_conversation. Act on user turns and \
+                create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation. Act on user turns and \
                 factual watch events; ordinary watches follow continuations until removed/closed."
         }
     }

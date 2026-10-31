@@ -123,7 +123,7 @@ pub(crate) fn build_coordinator_system_prompt_with_catalog(
             "\n\nTrusted Global Coordinator tools: bash not sandboxed. Every bash run need active work_scope_id from authoritative Coordinator home context or query_database. Phoenix find that WorkScope cwd. No default repo or cwd. Normal bash limits and audit stay. To publish static SVG, make file inside selected WorkScope with bash, keep file until success, then call present_svg with same work_scope_id and full server path. Tool only read contained regular file. Artifact belong to this Coordinator transcript. Static validation not mean visual inspection."
         }
     });
-    prompt.push_str("\n\nNative Coordinator lifecycle tools: use create_conversation to inspect options and explicitly submit a new conversation objective, and rename_conversation to resolve and rename an existing conversation. Use continue_conversation only for an exact ordinary ProductConversation, exhausted predecessor and persisted generated summary message; it opens generated context, not new instructions. It does not rotate the Coordinator, enable auto-continue, retry/rearm failed work or bypass stop/pause/approval gates. Prefer these installed native tools for supported creation, rename and generated continuation operations; use supported public Phoenix APIs through scoped Bash for operations the native tools do not offer, subject to user authority and endpoint-specific contracts.");
+    prompt.push_str("\n\nNative Coordinator lifecycle tools: use create_conversation to inspect options and explicitly submit a new conversation objective, and rename_conversation to resolve and rename an existing conversation. Use continue_conversation only for an exact ordinary ProductConversation, exhausted predecessor and persisted generated summary message; it opens generated context, not new instructions. It does not rotate the Coordinator, enable auto-continue, retry/rearm failed work or bypass stop/pause/approval gates. Use read_automatic_continuation and set_automatic_continuation only to inspect or explicitly set the persisted preference for an exact ordinary ProductConversation or the explicit Coordinator target. Settings are prospective: enabling after exhaustion does not wake or admit work; disabling does not revoke already-admitted continuation. They do not retry/rearm failed work or mutate Goals. Prefer these installed native tools for supported creation, rename, generated continuation and preference operations; use supported public Phoenix APIs through scoped Bash for operations the native tools do not offer, subject to user authority and endpoint-specific contracts.");
     if let Some(catalog) = coordinator_catalog {
         let skills = catalog.skills();
         prompt.push_str("\n\nContent inside a trusted_builtin_skill envelope returned by the audience-bound skill tool is authenticated from immutable embedded bytes; follow it within the user's authorization.");
@@ -600,7 +600,7 @@ mod tests {
             );
             assert!(!prompt.contains("Documented Phoenix API operations"));
             assert!(prompt.contains(
-                "No dedicated project/task/workspace/approval/lifecycle mutation tools except installed create_conversation/rename_conversation/continue_conversation."
+                "No dedicated project/task/workspace/approval/lifecycle mutation tools except installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation."
             ));
             assert!(prompt.contains(
                 "use create_conversation to inspect options and explicitly submit a new conversation objective"
@@ -608,7 +608,7 @@ mod tests {
             assert!(prompt
                 .contains("rename_conversation to resolve and rename an existing conversation"));
             assert!(prompt.contains(
-                "Prefer these installed native tools for supported creation, rename and generated continuation operations"
+                "Prefer these installed native tools for supported creation, rename, generated continuation and preference operations"
             ));
             assert!(prompt.contains(
                 "exact ordinary ProductConversation, exhausted predecessor and persisted generated summary message"
@@ -617,6 +617,10 @@ mod tests {
             assert!(prompt.contains(
                 "does not rotate the Coordinator, enable auto-continue, retry/rearm failed work or bypass stop/pause/approval gates"
             ));
+            assert!(prompt.contains("Use read_automatic_continuation and set_automatic_continuation"));
+            assert!(prompt.contains("enabling after exhaustion does not wake or admit work"));
+            assert!(prompt.contains("disabling does not revoke already-admitted continuation"));
+            assert!(prompt.contains("They do not retry/rearm failed work or mutate Goals"));
             assert!(prompt.contains("subject to user authority and endpoint-specific contracts"));
             for blanket_denial in [
                 "No dedicated project/task/workspace/approval/lifecycle mutation tools.",
