@@ -1264,7 +1264,7 @@ impl Database {
         for row in rows {
             let id: String = row.try_get("id")?;
             transcript_rows.push(ProductConversationTranscriptRow {
-                conversation: Self::get_conversation_on(connection, &id).await?,
+                conversation: Self::get_conversation_on(&mut *connection, &id).await?,
                 segment_ordinal: row.try_get("ordinal")?,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
@@ -1313,22 +1313,6 @@ impl Database {
             updated_at,
             segments,
             source,
-        })
-    }
-
-    async fn get_conversation_on(
-        connection: &mut SqliteConnection,
-        id: &str,
-    ) -> DbResult<crate::Conversation> {
-        sqlx::query(
-            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier, c.project_id, c.desired_base_branch,
-                    c.runtime_role, c.work_scope_id, c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.llm_language, c.spawned_from_conversation_id,
-                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-             FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.id = ?1",
-        ).bind(id).try_map(super::parse_conversation_row).fetch_one(&mut *connection).await.map_err(|error| {
-            if matches!(error, sqlx::Error::RowNotFound) { DbError::ConversationNotFound(id.to_string()) } else { DbError::Sqlx(error) }
         })
     }
 
