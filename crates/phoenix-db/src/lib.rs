@@ -43,6 +43,10 @@ pub use prompt_projection::{
 };
 pub mod conversation_goals;
 mod conversation_name;
+mod native_continuation;
+pub use native_continuation::{
+    CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
+};
 mod product_conversation_rename;
 pub use product_conversation_rename::{
     NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,

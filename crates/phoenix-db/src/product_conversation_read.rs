@@ -1466,7 +1466,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn read_continuation_opening_on(
+    pub(super) async fn read_continuation_opening_on(
         connection: &mut SqliteConnection,
         successor: &str,
     ) -> DbResult<ContinuationOpeningRead> {
