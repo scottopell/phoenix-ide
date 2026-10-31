@@ -13450,7 +13450,7 @@ mod scope_liveness_tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
-            .await
+            .await.established().expect("acceptance durability is established")
             .expect("accept direct turn");
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected newly accepted turn")
@@ -13712,7 +13712,7 @@ mod scope_liveness_tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
-            .await
+            .await.established().expect("acceptance durability is established")
             .expect("accept direct turn");
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected newly accepted turn")

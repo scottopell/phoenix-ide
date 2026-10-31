@@ -360,7 +360,7 @@ async fn accept_execution(
     repo: &crate::workflow::WorkflowRepository,
     input: &crate::workflow::AcceptAuthoritativeTurn,
 ) -> GoalExecution {
-    let accepted = repo.accept_authoritative_turn(input).await.unwrap();
+    let accepted = repo.accept_authoritative_turn(input).await.established().expect("acceptance durability is established").unwrap();
     let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
         panic!("expected fresh Runtime admission");
     };
@@ -704,7 +704,7 @@ async fn fresh_runtime_turn_captures_goal_and_control_once_before_replay() {
     .established()
     .expect("classified control")
     .unwrap();
-    let replay = repo.accept_authoritative_turn(&input).await.unwrap();
+    let replay = repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
     assert!(matches!(
         replay.outcome,
         phoenix_workflow::TurnOutcome::ExactReplay { .. }

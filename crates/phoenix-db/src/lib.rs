@@ -30775,7 +30775,7 @@ mod tests {
                 disposition: phoenix_workflow::AcceptedDisposition::Runtime,
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
-            .await
+            .await.established().expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")
@@ -30822,7 +30822,7 @@ mod tests {
                 disposition: phoenix_workflow::AcceptedDisposition::Runtime,
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
-            .await
+            .await.established().expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")

@@ -13825,7 +13825,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     accepted_at: Timestamp(1),
                 },
             )
-            .await
+            .await.established().expect("acceptance durability is established")
             .expect("accept direct turn");
     }
 
@@ -18568,7 +18568,7 @@ mod attachment_storage_tests {
                     accepted_at: Timestamp(1),
                 },
             )
-            .await
+            .await.established().expect("acceptance durability is established")
             .expect("accept direct turn");
 
         let referenced = referenced_attachment_paths(&db).await.expect("references");

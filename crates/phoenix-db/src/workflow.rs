@@ -3356,7 +3356,7 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at,
             })
-            .await
+            .await.established().expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -3402,7 +3402,7 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at,
             })
-            .await
+            .await.established().expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
