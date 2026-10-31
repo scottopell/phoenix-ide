@@ -3667,7 +3667,9 @@ mod product_creation_tests {
                 .unwrap();
             db.delete_conversation(&conversation).await.unwrap();
             assert_eq!(
-                db.product_creation_initial_execution(&request).await.unwrap(),
+                db.product_creation_initial_execution(&request)
+                    .await
+                    .unwrap(),
                 ProductCreationInitialExecution::Cancelled
             );
         }
@@ -4262,7 +4264,10 @@ mod product_creation_tests {
         else {
             panic!("expected historical text-only replay");
         };
-        assert_eq!(replayed.product_conversation_id, job.product_conversation_id);
+        assert_eq!(
+            replayed.product_conversation_id,
+            job.product_conversation_id
+        );
         assert_eq!(replayed.published_product_id, job.published_product_id);
         assert_eq!(
             replayed.published_conversation_id.as_deref(),
