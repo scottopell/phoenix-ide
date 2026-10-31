@@ -4,8 +4,9 @@ use super::*;
 use crate::runtime::deny_gate::CheckedToolCall;
 use crate::runtime::testing::MockLlmClient;
 use crate::runtime::traits::{DatabaseStorage, ToolRegistryExecutor};
+use crate::runtime::FatalLocalAuthorityFence;
 use crate::state_machine::AssistantMessage;
-use phoenix_core::domain::tool_input::ToolInput;
+use phoenix_core::domain::sm_state::ToolInput;
 use phoenix_llm::ToolDefinition;
 use phoenix_tools::{ToolOutput, ToolRegistry};
 use std::future::Future;
@@ -60,9 +61,9 @@ async fn assert_native_fatal_sink_is_disposed_without_result(name: &str, input: 
             .unwrap(),
         None,
     );
-    assert!(registry.tool_definitions().any(|tool| tool.name == name));
+    assert!(registry.definitions().iter().any(|tool| tool.name == name));
     let executor = Arc::new(ObserveNativeFatalSink {
-        inner: ToolRegistryExecutor::new(registry),
+        inner: ToolRegistryExecutor::builtin_only(registry, Arc::from([])),
         fence: manager.fatal_local_authority_fence.clone(),
         pending: Arc::new(Notify::new()),
         dropped: Arc::new(Notify::new()),

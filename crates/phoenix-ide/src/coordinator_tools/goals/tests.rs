@@ -56,6 +56,8 @@ impl Fixture {
             .workflow_repository()
             .accept_authoritative_turn(&runtime_input(&caller, "native-goal-source"))
             .await
+            .established()
+            .expect("native Goal fixture turn admission must have an established durable fact")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("fresh runtime turn");

@@ -942,7 +942,7 @@ async fn native_continue_replays_completed_opening_without_replacing_its_message
 
     db.update_conversation_state(
         &gc,
-        &phoenix_core::sm_state::ConvState::ContextExhausted {
+        &phoenix_core::domain::sm_state::ConvState::ContextExhausted {
             summary: "Coordinator rotation".into(),
         },
     )
