@@ -2,6 +2,7 @@ import { AlertCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { ErrorKind } from '../generated/ErrorKind';
 import type { ErrorPresentation } from '../errorPresentation';
+import { CodexResetAction } from './CodexResetAction';
 
 interface ErrorBannerProps {
   message: string;
@@ -142,6 +143,11 @@ export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerP
         <div className="error-body-content">
           <div className="error-body-title">{displayTitle}</div>
           {details && <div className="error-body-details">{linkify(details)}</div>}
+          {/* REQ-CRR-005/008: a successful redemption resumes through the same
+              Retry path, and only while this banner is still mounted. */}
+          {canUserResume && errorKind === 'usage_limit_reached' && (
+            <CodexResetAction surface="error" onRedeemed={onRetry} />
+          )}
         </div>
       </div>
 
