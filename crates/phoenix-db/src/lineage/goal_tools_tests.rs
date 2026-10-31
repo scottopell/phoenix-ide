@@ -90,6 +90,46 @@ async fn assert_goal_rows(db: &Database, owner: &str, has_prepared: bool) {
         .is_empty());
 }
 
+async fn table_data(pool: &SqlitePool) -> Vec<(String, Vec<Vec<String>>)> {
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let mut data = Vec::new();
+    for table in tables {
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(&table)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        let projection = columns
+            .iter()
+            .map(|column| format!("quote(\"{}\")", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {projection} FROM \"{}\"",
+            table.replace('"', "\"\"")
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut values: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| {
+                (0..columns.len())
+                    .map(|index| row.get::<String, _>(index))
+                    .collect()
+            })
+            .collect();
+        values.sort();
+        data.push((table, values));
+    }
+    data
+}
+
 #[tokio::test]
 async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
     for through in 142..=149 {
@@ -143,11 +183,21 @@ async fn canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent() {
         );
         assert_goal_rows(&db, &owner, source.is_some()).await;
         if let Some(source) = source {
-            sqlx::query("DELETE FROM product_conversations WHERE id=?")
-                .bind(source)
+            let before_delete = snapshot(db.pool()).await;
+            let data_before_delete = table_data(db.pool()).await;
+            let error = sqlx::query("DELETE FROM product_conversations WHERE id=?")
+                .bind(&source)
                 .execute(db.pool())
                 .await
-                .unwrap();
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Coordinator transcript is outside ordinary Delete"),
+                "{error}"
+            );
+            assert_eq!(snapshot(db.pool()).await, before_delete);
+            assert_eq!(table_data(db.pool()).await, data_before_delete);
             assert_goal_rows(&db, &owner, true).await;
         }
         sqlx::query("DELETE FROM product_conversations WHERE id=?")
@@ -215,12 +265,16 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
             .fetch_one(db.pool())
             .await
             .unwrap();
+    let author = db
+        .create_conversation("migration-author", "author", "/tmp", true, None, None)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO product_creation_jobs(request_id,product_conversation_id,cwd,objective,llm_language,status,accepted_at_unix_micros,updated_at_unix_micros,published_product_id,published_conversation_id) VALUES ('joint-create',?,'/tmp','retained objective','phoenix-native','published',1,1,?,?)")
         .bind(&owner).bind(&owner).bind(&transcript).execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO product_creation_job_images(request_id,ordinal,media_type,data) VALUES ('joint-create',0,'image/png','payload')")
         .execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO product_conversation_rename_receipts(operation_id,product_conversation_id,name_revision_before,title,source_product_conversation_id,source_transcript_id,source_message_id,source_tool_use_id,naming_root_transcript_id,slug_at_commit,committed_at_unix_micros) VALUES ('joint-rename',?,0,'retained title',?,?,'rename-message','rename-tool',?,'retained-slug',1)")
-        .bind(&owner).bind(&owner).bind(&transcript).bind(&transcript).execute(db.pool()).await.unwrap();
+        .bind(&owner).bind(author.product_conversation_id.as_str()).bind(&author.id).bind(&transcript).execute(db.pool()).await.unwrap();
     assert_eq!(
         crate::migrations::run_through_for_test(db.pool(), 145)
             .await
@@ -248,6 +302,32 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
             .unwrap(),
         0
     );
+    assert_goal_rows(&db, &owner, true).await;
+    assert_tools_retention(&db, false).await;
+    let attribution_before: (String, String) = sqlx::query_as("SELECT source_product_conversation_id,source_transcript_id FROM product_conversation_rename_receipts WHERE operation_id='joint-rename'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        attribution_before,
+        (
+            author.product_conversation_id.to_string(),
+            author.id.clone()
+        )
+    );
+    sqlx::query("DELETE FROM product_conversations WHERE id=?")
+        .bind(author.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let author_transcripts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id=?")
+            .bind(&author.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(author_transcripts, 0);
+    let attribution_after: (String, String) = sqlx::query_as("SELECT source_product_conversation_id,source_transcript_id FROM product_conversation_rename_receipts WHERE operation_id='joint-rename'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(attribution_after, attribution_before);
     assert_goal_rows(&db, &owner, true).await;
     assert_tools_retention(&db, false).await;
     sqlx::query("DELETE FROM product_conversations WHERE id=?")
@@ -280,6 +360,9 @@ async fn real_145_provenance_and_tools_retention_survive_upgrade_delete_and_reop
         0
     );
     assert_tools_retention(&db, true).await;
+    let attribution_reopened: (String, String) = sqlx::query_as("SELECT source_product_conversation_id,source_transcript_id FROM product_conversation_rename_receipts WHERE operation_id='joint-rename'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(attribution_reopened, attribution_before);
     assert!(sqlx::query("PRAGMA foreign_key_check")
         .fetch_all(db.pool())
         .await
