@@ -153,15 +153,39 @@ impl Database {
 
     /// Atomically performs a root-identity/revision-fenced rename and records its durable receipt.
     /// # Errors
-    /// Returns an error if command validation, Coordinator authority, or database access fails.
+    /// Returns established typed errors or an unclassified durable outcome.
     pub async fn rename_product_conversation(
         &self,
         current_gc_transcript_id: &str,
         command: &ProductConversationRenameCommand,
-    ) -> DbResult<ProductConversationRenameResult> {
-        validate_command(command)?;
-        let mut conn = self.pool.acquire().await?;
-        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductConversationRenameResult>> {
+        self.rename_product_conversation_with_commit(
+            current_gc_transcript_id,
+            command,
+            RenameCommit::Normal,
+        )
+        .await
+    }
+
+    async fn rename_product_conversation_with_commit(
+        &self,
+        current_gc_transcript_id: &str,
+        command: &ProductConversationRenameCommand,
+        commit: RenameCommit,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<ProductConversationRenameResult>> {
+        use crate::workflow::LocalAuthorityResult;
+
+        if let Err(error) = validate_command(command) {
+            return LocalAuthorityResult::DurableFactEstablished(Err(error));
+        }
+        let mut conn = match self.pool.acquire().await {
+            Ok(conn) => conn,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let mut tx = match conn.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
         let result = async {
             require_current_gc_tx(&mut tx, current_gc_transcript_id).await?;
             if command.source.transcript_id != current_gc_transcript_id {
@@ -211,14 +235,31 @@ impl Database {
             Ok(ProductConversationRenameResult::Applied(ProductConversationRenameReceipt { operation_id: command.operation_id.clone(), product_conversation_id: command.product_conversation_id.clone(), title: command.title.as_str().into(), slug_at_commit: slug, naming_root_transcript_id: root_id, name_revision_before: revision, committed_at_unix_micros: now, source: command.source.clone() }))
         }.await;
         match result {
-            Ok(value) => {
-                tx.commit().await?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
-            }
+            Ok(value) => match commit.execute(tx).await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(value)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+}
+
+enum RenameCommit {
+    Normal,
+    #[cfg(test)]
+    LoseAcknowledgement,
+}
+
+impl RenameCommit {
+    async fn execute(self, tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> DbResult<()> {
+        tx.commit().await?;
+        match self {
+            Self::Normal => Ok(()),
+            #[cfg(test)]
+            Self::LoseAcknowledgement => Err(sqlx::Error::WorkerCrashed.into()),
         }
     }
 }
@@ -351,6 +392,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_rename_with_lost_acknowledgement_is_not_an_ordinary_failure() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("lost-ack-root", "lost-ack-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let gc = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let mut command = test_command(uuid::Uuid::new_v4().to_string(), 0);
+        command.product_conversation_id = root.product_conversation_id.clone();
+        command.expected_root_transcript_id = root.id.clone();
+        command.source.product_conversation_id = gc.product_conversation_id;
+        command.source.transcript_id = gc.id.clone();
+        let outcome = db
+            .rename_product_conversation_with_commit(&gc.id, &command, RenameCommit::LoseAcknowledgement)
+            .await;
+        assert!(matches!(
+            outcome,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+        ));
+        let receipt = db
+            .read_product_conversation_rename_receipt(&gc.id, &command.operation_id)
+            .await
+            .unwrap()
+            .expect("the injected acknowledgement loss follows a real commit");
+        assert_eq!(receipt.title, command.title.as_str());
+        assert_eq!(receipt.name_revision_before, 0);
+        assert_eq!(
+            db.read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str())
+                .await
+                .unwrap()
+                .name_revision,
+            1
+        );
+        assert_eq!(
+            db.rename_product_conversation(&gc.id, &command)
+                .await
+                .established()
+                .expect("successful acknowledgement establishes replay")
+                .unwrap(),
+            ProductConversationRenameResult::Replayed(receipt)
+        );
+        assert_eq!(
+            db.read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str())
+                .await
+                .unwrap()
+                .name_revision,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_rename_with_acknowledged_rollback_is_established_and_unwritten() {
+        let db = Database::open_in_memory().await.unwrap();
+        let command = test_command(uuid::Uuid::new_v4().to_string(), 0);
+        assert!(matches!(
+            db.rename_product_conversation("not-a-coordinator", &command)
+                .await
+                .established()
+                .expect("acknowledged rollback establishes rejection"),
+            Err(DbError::CurrentCoordinatorRequired)
+        ));
+        let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM product_conversation_rename_receipts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0);
+    }
+
+    #[tokio::test]
     async fn unauthorized_read_does_not_require_receipt_table() {
         let db = Database::open_in_memory().await.unwrap();
         let result = db
@@ -384,6 +497,8 @@ mod tests {
         let ProductConversationRenameResult::Applied(first) = db
             .rename_product_conversation(&gc.id, &command)
             .await
+            .established()
+            .expect("rename classification")
             .unwrap()
         else {
             panic!()
@@ -414,6 +529,8 @@ mod tests {
         assert_eq!(
             db.rename_product_conversation(&gc.id, &stale)
                 .await
+                .established()
+                .expect("rename classification")
                 .unwrap(),
             ProductConversationRenameResult::Stale
         );
@@ -422,6 +539,8 @@ mod tests {
         assert_eq!(
             db.rename_product_conversation(&gc.id, &command)
                 .await
+                .established()
+                .expect("rename classification")
                 .unwrap(),
             ProductConversationRenameResult::Replayed(first.clone())
         );
@@ -477,6 +596,8 @@ mod tests {
         assert_eq!(
             db.rename_product_conversation(&gc.id, &command)
                 .await
+                .established()
+                .expect("rename classification")
                 .unwrap(),
             ProductConversationRenameResult::Unavailable
         );
@@ -520,6 +641,8 @@ mod tests {
         let ProductConversationRenameResult::Applied(receipt) = db
             .rename_product_conversation(&gc.id, &command)
             .await
+            .established()
+            .expect("rename classification")
             .unwrap()
         else {
             panic!("expected applied rename");
@@ -541,6 +664,8 @@ mod tests {
         assert_eq!(
             db.rename_product_conversation(&gc.id, &command)
                 .await
+                .established()
+                .expect("rename classification")
                 .unwrap(),
             ProductConversationRenameResult::Replayed(receipt.clone())
         );
@@ -552,19 +677,28 @@ mod tests {
         changed.product_conversation_id = replacement.product_conversation_id;
         changed.expected_root_transcript_id = replacement.id;
         assert!(matches!(
-            db.rename_product_conversation(&gc.id, &changed).await,
+            db.rename_product_conversation(&gc.id, &changed)
+                .await
+                .established()
+                .expect("rename classification"),
             Ok(ProductConversationRenameResult::Conflict)
         ));
         changed = command.clone();
         changed.title = NormalizedConversationTitle::parse("changed intent").unwrap();
         assert!(matches!(
-            db.rename_product_conversation(&gc.id, &changed).await,
+            db.rename_product_conversation(&gc.id, &changed)
+                .await
+                .established()
+                .expect("rename classification"),
             Ok(ProductConversationRenameResult::Conflict)
         ));
         changed = command.clone();
         changed.source.product_conversation_id = command.product_conversation_id.clone();
         assert!(matches!(
-            db.rename_product_conversation(&gc.id, &changed).await,
+            db.rename_product_conversation(&gc.id, &changed)
+                .await
+                .established()
+                .expect("rename classification"),
             Ok(ProductConversationRenameResult::Conflict)
         ));
         assert_eq!(
