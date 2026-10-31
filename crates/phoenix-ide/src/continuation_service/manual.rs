@@ -40,7 +40,7 @@ pub(crate) fn automatic_retry_phase_for_turn_state(
     }
 }
 
-async fn dispatch_continuation_handoff(
+pub(super) async fn dispatch_continuation_handoff(
     service: &ContinuationApplicationService,
     intent: crate::db::ContinuationDispatchIntent,
 ) -> (ContinueConversationStatus, Option<String>) {

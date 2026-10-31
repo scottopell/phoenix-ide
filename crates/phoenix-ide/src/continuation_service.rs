@@ -13,6 +13,8 @@ use crate::send_chat_service::{
 };
 
 mod manual;
+mod native;
+pub(crate) use native::NativeContinueRequest;
 
 #[cfg(test)]
 pub(crate) use manual::{

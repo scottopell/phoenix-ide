@@ -3005,7 +3005,7 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    let result = self.review_handoff_with_authority(review.handoff, review.shorten, review.source_candidate_id, review.opening_authority).await;
+                    let result = self.review_handoff_input(review.input).await;
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
                         return RuntimeExitDisposition::CoordinatedShutdown;
@@ -9789,7 +9789,7 @@ where
         self.review_handoff_with_authority(handoff, shorten, source_candidate_id, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     async fn review_handoff_with_authority(
         &mut self,
         handoff: String,
@@ -9797,7 +9797,38 @@ where
         source_candidate_id: Option<String>,
         opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
     ) -> Result<super::HandoffReviewResponse, String> {
-        if !matches!(
+        self.review_handoff_input(super::HandoffReviewInput::ProspectiveSuccessor {
+            handoff,
+            shorten,
+            source_candidate_id,
+            opening_authority,
+        }).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn review_handoff_input(
+        &mut self,
+        input: super::HandoffReviewInput,
+    ) -> Result<super::HandoffReviewResponse, String> {
+        use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
+
+        let reserved_opening = matches!(&input, super::HandoffReviewInput::ReservedGeneratedOpening(_));
+        let (handoff, shorten, source_candidate_id, opening_authority) = match input {
+            super::HandoffReviewInput::ProspectiveSuccessor {
+                handoff, shorten, source_candidate_id, opening_authority,
+            } => (handoff, shorten, source_candidate_id, opening_authority),
+            super::HandoffReviewInput::ReservedGeneratedOpening(intent) => {
+                if intent.successor_conversation_id != self.context.conversation_id
+                    || intent.opening_authority != ContinuationOpeningAuthority::GeneratedPredecessorContext
+                    || intent.user_agent.is_some()
+                    || !matches!(self.state, ConvState::Idle)
+                {
+                    return Err("Generated opening review requires its idle reserved successor".to_string());
+                }
+                (intent.handoff, false, None, intent.opening_authority)
+            }
+        };
+        if !reserved_opening && !matches!(
             self.state,
             ConvState::ContextExhausted { .. } | ConvState::RecoverableContinuationFailure { .. }
         ) {
@@ -9805,16 +9836,17 @@ where
         }
         let source_revision = match &self.state {
             ConvState::RecoverableContinuationFailure { failure } => {
-                crate::db::ContinuationSourceRevision::Operation {
+                Some(crate::db::ContinuationSourceRevision::Operation {
                     operation_id: failure.request.operation_id.clone(),
                     attempt: failure.request.attempt,
-                }
+                })
             }
             ConvState::ContextExhausted { .. } => {
-                crate::db::ContinuationSourceRevision::ExhaustedState {
+                Some(crate::db::ContinuationSourceRevision::ExhaustedState {
                     state_updated_at: self.state_updated_at,
-                }
+                })
             }
+            _ if reserved_opening => None,
             _ => unreachable!("review state guarded above"),
         };
         let retained_source = if shorten && !handoff.trim().is_empty() {
@@ -9849,7 +9881,7 @@ where
                         id: id.clone(),
                         conversation_id: self.context.conversation_id.clone(),
                         origin: crate::db::ContinuationCandidateOrigin::ReviewInput {
-                            revision: source_revision.clone(),
+                            revision: source_revision.clone().ok_or("shortening requires a predecessor revision")?,
                         },
                         source,
                         text: handoff.clone(),
@@ -9862,7 +9894,11 @@ where
         } else {
             crate::db::ContinuationCandidateSource::UnattributedInput
         };
-        let (system, tools) = self.prepare_successor_overhead().await?;
+        let (system, tools) = if reserved_opening {
+            self.prepare_ordinary_overhead().await?
+        } else {
+            self.prepare_successor_overhead().await?
+        };
         let client = self
             .llm_client
             .clone()
@@ -10086,7 +10122,7 @@ where
                                 id: candidate_id.clone(),
                                 conversation_id: self.context.conversation_id.clone(),
                                 origin: crate::db::ContinuationCandidateOrigin::AiShortening {
-                                    revision: source_revision,
+                                    revision: source_revision.ok_or("shortening requires a predecessor revision")?,
                                 },
                                 source: retained_source,
                                 text: candidate.clone(),

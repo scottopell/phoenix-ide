@@ -312,11 +312,18 @@ pub struct HandoffReviewResponse {
     pub shortening: HandoffShorteningResult,
 }
 
+pub(crate) enum HandoffReviewInput {
+    ProspectiveSuccessor {
+        handoff: String,
+        shorten: bool,
+        source_candidate_id: Option<String>,
+        opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    },
+    ReservedGeneratedOpening(phoenix_db::ContinuationDispatchIntent),
+}
+
 pub(crate) struct HandoffReviewRequest {
-    pub handoff: String,
-    pub shorten: bool,
-    pub source_candidate_id: Option<String>,
-    pub opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
+    pub input: HandoffReviewInput,
     pub response: oneshot::Sender<Result<HandoffReviewResponse, String>>,
 }
 
@@ -6829,6 +6836,46 @@ impl RuntimeManager {
         Ok(outcome)
     }
 
+    pub(crate) async fn review_reserved_continuation_opening(
+        self: &Arc<Self>,
+        intent: phoenix_db::ContinuationDispatchIntent,
+    ) -> Result<HandoffReviewResponse, String> {
+        let _owner = self.acquire_local_authority_pass().map_err(|()| {
+            "runtime admission closed after fatal local authority loss".to_string()
+        })?;
+        let persisted = self.db()
+            .continuation_dispatch_intent(&intent.parent_conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("reserved opening is no longer pending")?;
+        if persisted.successor_conversation_id != intent.successor_conversation_id
+            || persisted.message_id != intent.message_id
+            || persisted.handoff != intent.handoff
+            || persisted.opening_authority != intent.opening_authority
+            || persisted.user_agent != intent.user_agent
+        {
+            return Err("reserved opening changed before capacity review".to_string());
+        }
+        let handle = self
+            .get_or_create_continuation_maintenance(&intent.successor_conversation_id)
+            .await?;
+        let sender = handle
+            .handoff_review_tx
+            .as_ref()
+            .ok_or("handoff review unavailable")?;
+        let (response, receipt) = oneshot::channel();
+        sender
+            .send(HandoffReviewRequest {
+                input: HandoffReviewInput::ReservedGeneratedOpening(intent),
+                response,
+            })
+            .await
+            .map_err(|_| "handoff review runtime stopped".to_string())?;
+        receipt
+            .await
+            .map_err(|_| "handoff review runtime stopped".to_string())?
+    }
+
     /// Evaluate a continuation with the current ordinary successor projection.
     ///
     /// # Errors
@@ -6899,10 +6946,12 @@ impl RuntimeManager {
         let (response, receipt) = oneshot::channel();
         sender
             .send(HandoffReviewRequest {
-                handoff,
-                shorten,
-                source_candidate_id,
-                opening_authority,
+                input: HandoffReviewInput::ProspectiveSuccessor {
+                    handoff,
+                    shorten,
+                    source_candidate_id,
+                    opening_authority,
+                },
                 response,
             })
             .await
