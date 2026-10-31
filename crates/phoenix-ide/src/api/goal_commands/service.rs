@@ -124,13 +124,22 @@ impl GoalCommandService {
             .db()
             .prepare_coordinator_goal_action(caller, owner, source_tool_call, turn_id, intent)
             .await;
-        let result = authority.complete(classified)?;
-        self.runtime
-            .db()
-            .require_current_coordinator(caller)
-            .await
-            .map_err(goal_error)?;
-        self.publication_result(Ok(result))
+        let result = match authority.complete(classified) {
+            Ok(result) => self
+                .runtime
+                .db()
+                .require_current_coordinator(caller)
+                .await
+                .map(|()| result)
+                .map_err(goal_error),
+            Err(error) => Err(error),
+        };
+        #[cfg(test)]
+        if let Some(barrier) = &self.command_publication_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        self.publication_result(result)
     }
 
     pub(crate) async fn prepared_snapshot(

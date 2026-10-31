@@ -473,6 +473,45 @@ async fn nonsettled_runtime_refuses_commands_and_unknown_product_targets_do_not_
 }
 
 #[tokio::test]
+async fn preparation_refusal_rechecks_authority_at_publication() {
+    let fixture = Fixture::new().await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone())
+        .with_command_publication_barrier(barrier.clone());
+    let caller = fixture.transcript.clone();
+    let owner = fixture.owner.clone();
+    let pending = tokio::spawn(async move {
+        service
+            .prepare_coordinator(
+                &caller,
+                &phoenix_core::domain::db_schema::SourceToolCall {
+                    message_id: "unused-ordinary-caller-message".into(),
+                    tool_use_id: "unused-ordinary-caller-tool".into(),
+                },
+                &owner,
+                phoenix_db::conversation_goals::GoalPreparationIntent::Create {
+                    objective: phoenix_core::domain::conversation_goal::GoalText::parse(
+                        "refused ordinary caller",
+                    )
+                    .unwrap(),
+                },
+                phoenix_core::domain::sm_event::DirectTurnTurnId(0),
+            )
+            .await
+    });
+    barrier.wait().await;
+    assert!(!fixture.state.runtime.fatal_local_authority_is_latched());
+    fixture
+        .state
+        .runtime
+        .signal_fatal_local_authority("preparation_publication_race_test");
+    barrier.wait().await;
+    assert!(
+        matches!(pending.await.unwrap(), Err(AppError::Internal(message)) if message == "local authority is closed")
+    );
+}
+
+#[tokio::test]
 async fn synthetic_unclassified_preparation_closes_authority_before_releasing_admission() {
     let fixture = Fixture::new().await;
     let authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(

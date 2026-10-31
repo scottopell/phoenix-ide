@@ -253,14 +253,15 @@ async fn preparation_acknowledged_rollback_is_established_and_preserves_retained
         .await;
     assert!(matches!(
         conflict,
-        crate::workflow::LocalAuthorityResult::Established(Err(GoalDbError::RetryConflict))
+        crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+            GoalDbError::RetryConflict
+        ))
     ));
     assert_eq!(preparation_count(&db).await, 1);
     assert_eq!(counts(&db).await, before);
     assert_eq!(
-        db.prepared_goal_action(&retained.reference)
+        db.read_coordinator_goal_preparation(&caller, retained.reference)
             .await
-            .unwrap()
             .unwrap(),
         retained
     );
