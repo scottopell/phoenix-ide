@@ -25582,14 +25582,14 @@ mod goal_report_cancellation_checkpoint_tests {
             )
             .await
             .unwrap());
-        let content = MessageContent::User(UserContent::new(intent.objective));
+        let initial_content = MessageContent::User(UserContent::new(intent.objective));
         let initial = Message {
             message_id: request_id.into(),
             conversation_id: id.into(),
             sequence_id: 1,
             origin: entry.origin,
-            message_type: content.message_type(),
-            content,
+            message_type: initial_content.message_type(),
+            content: initial_content,
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
