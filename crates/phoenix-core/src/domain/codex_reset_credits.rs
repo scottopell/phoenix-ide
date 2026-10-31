@@ -64,6 +64,7 @@ pub enum CodexResetRedeemOutcome {
 }
 
 impl CodexResetRedeemOutcome {
+    #[must_use]
     pub fn is_success(self) -> bool {
         matches!(self, Self::Reset | Self::AlreadyRedeemed)
     }

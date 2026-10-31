@@ -76,14 +76,14 @@
   transition: color 0.15s ease, border-color 0.15s ease;
 }
 
-.codex-reset-flow__btn:hover:not(:disabled) {
-  color: var(--text-primary);
-  border-color: var(--text-muted);
-}
-
 .codex-reset-flow__btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.codex-reset-flow__btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
 }
 
 .codex-reset-flow__btn--primary {
@@ -111,7 +111,7 @@
   padding: 2px 8px;
   background: transparent;
   color: var(--accent-color, #3b82f6);
-  border: 1px solid currentColor;
+  border: 1px solid currentcolor;
   border-radius: 4px;
   font: inherit;
   cursor: pointer;

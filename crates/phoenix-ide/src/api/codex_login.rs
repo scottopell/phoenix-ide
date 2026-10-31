@@ -945,7 +945,7 @@ pub struct LoginPreflight {
     pub account_email: Option<String>,
 }
 
-/// Failure of one authenticated request to the ChatGPT Codex backend.
+/// Failure of one authenticated request to the `ChatGPT` Codex backend.
 #[derive(Debug)]
 enum CodexBackendError {
     /// The credential could not produce an access token (signed out or revoked
@@ -967,7 +967,7 @@ impl std::fmt::Display for CodexBackendError {
     }
 }
 
-/// Send one authenticated request to the ChatGPT backend and decode its JSON.
+/// Send one authenticated request to the `ChatGPT` backend and decode its JSON.
 ///
 /// Token and account id come from the one `credential` passed in, so the
 /// request never pairs one account's token with another's id. A 401 refreshes

@@ -49,6 +49,7 @@ pub struct UpstreamRedeemRequest<'a> {
 }
 
 impl<'a> UpstreamRedeemRequest<'a> {
+    #[must_use]
     pub fn new(idempotency_key: uuid::Uuid, credit_id: Option<&'a str>) -> Self {
         Self {
             redeem_request_id: idempotency_key.to_string(),
@@ -83,6 +84,10 @@ fn credit_status(value: &str) -> CodexResetCreditStatus {
 
 /// Decode the upstream listing. Any malformed credit fails the whole listing
 /// (REQ-CRR-001): a fabricated time would be worse than no listing.
+///
+/// # Errors
+///
+/// Returns a description when the body does not decode or a time is not RFC3339.
 pub fn reset_credits_from_upstream(value: serde_json::Value) -> Result<CodexResetCredits, String> {
     let upstream: UpstreamResetCredits =
         serde_json::from_value(value).map_err(|error| format!("reset credit listing: {error}"))?;
@@ -115,6 +120,10 @@ pub fn reset_credits_from_upstream(value: serde_json::Value) -> Result<CodexRese
 
 /// Decode the upstream consume answer. An unknown `code` is an error, never a
 /// success (REQ-CRR-002).
+///
+/// # Errors
+///
+/// Returns a description when the body does not decode or the code is unknown.
 pub fn redeem_response_from_upstream(
     value: serde_json::Value,
 ) -> Result<CodexResetRedeemResponse, String> {

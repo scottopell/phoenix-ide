@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { api } from '../api';
+import { api, type CodexResetCreditsResult } from '../api';
 import { CodexResetAction } from './CodexResetAction';
 import { ErrorBanner } from './ErrorBanner';
 import { getErrorPresentation } from '../errorPresentation';
@@ -31,11 +31,11 @@ describe('CodexResetAction on the error surface (REQ-CRR-005)', () => {
     expect(screen.getByRole('button', { name: /use reset/i })).toBeInTheDocument();
   });
 
-  it.each([
+  it.each<[string, CodexResetCreditsResult]>([
     ['zero', { type: 'ok', credits: { available_count: 0, credits: [] } }],
     ['signed out', { type: 'signed_out' }],
     ['unavailable', { type: 'unavailable' }],
-  ] as const)('shows nothing when %s', async (_label, result) => {
+  ])('shows nothing when %s', async (_label, result) => {
     const listing = vi.spyOn(api, 'codexResetCredits').mockResolvedValue(result);
     const { container } = render(<CodexResetAction surface="error" />);
     await waitFor(() => expect(listing).toHaveBeenCalled());
