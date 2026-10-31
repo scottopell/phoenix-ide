@@ -596,7 +596,7 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
         .filter(|m| matches!(m.content, MessageContent::Continuation(_)))
         .collect();
     assert_eq!(openings.len(), 1);
-    assert_eq!(openings[0].id, accepted_message_id);
+    assert_eq!(openings[0].message_id, accepted_message_id);
     assert!(matches!(openings[0].origin, InputOrigin::SystemGenerated));
     let MessageContent::Continuation(content) = &openings[0].content else {
         unreachable!();
@@ -604,7 +604,7 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
     assert_eq!(content.summary, SUMMARY);
     let workflow = f.db.workflow_repository();
     let turn = workflow
-        .owning_turn_for_conversation(&phoenix_workflow::ConversationAuthority(
+        .load_owning_authoritative_turn(&phoenix_workflow::ConversationAuthority(
             successor_id.clone(),
         ))
         .await
@@ -693,7 +693,7 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
     assert!(matches!(final_conversation.state, ConvState::Idle));
     assert_eq!(final_conversation.state_updated_at, settled_at);
     assert!(workflow
-        .owning_turn_for_conversation(&phoenix_workflow::ConversationAuthority(
+        .load_owning_authoritative_turn(&phoenix_workflow::ConversationAuthority(
             successor_id.clone()
         ))
         .await
@@ -705,7 +705,7 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
         .filter(|m| matches!(m.content, MessageContent::Continuation(_)))
         .collect();
     assert_eq!(final_openings.len(), 1);
-    assert_eq!(final_openings[0].id, accepted_message_id);
+    assert_eq!(final_openings[0].message_id, accepted_message_id);
     assert!(matches!(
         entered.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
