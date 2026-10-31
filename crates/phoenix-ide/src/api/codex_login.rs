@@ -945,48 +945,84 @@ pub struct LoginPreflight {
     pub account_email: Option<String>,
 }
 
-async fn fetch_codex_quota(
+/// Failure of one authenticated request to the ChatGPT Codex backend.
+#[derive(Debug)]
+enum CodexBackendError {
+    /// The credential could not produce an access token (signed out or revoked
+    /// while the request was being prepared).
+    NoToken,
+    Transport(reqwest::Error),
+    Status(reqwest::StatusCode),
+    Decode(reqwest::Error),
+}
+
+impl std::fmt::Display for CodexBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoToken => f.write_str("no Codex access token available"),
+            Self::Transport(error) => write!(f, "request failed: {error}"),
+            Self::Status(status) => write!(f, "upstream rejected request: {status}"),
+            Self::Decode(error) => write!(f, "response did not decode: {error}"),
+        }
+    }
+}
+
+/// Send one authenticated request to the ChatGPT backend and decode its JSON.
+///
+/// Token and account id come from the one `credential` passed in, so the
+/// request never pairs one account's token with another's id. A 401 refreshes
+/// the token and retries once; `build` must therefore be replay-safe.
+async fn codex_backend_json(
     credential: &codex_credential::CodexCredential,
-) -> Option<(Option<String>, phoenix_llm::QuotaDetails)> {
+    build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+) -> Result<(Option<String>, serde_json::Value), CodexBackendError> {
     use phoenix_llm::CredentialSource;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .ok()?;
-    let mut attempts = 0;
-    let (response, account_id) = loop {
-        let (token, account_id) = credential.get_with_account_id().await?;
-        let mut request = client
-            .get(phoenix_llm::CODEX_USAGE_URL)
+        .map_err(CodexBackendError::Transport)?;
+    let mut refreshed = false;
+    loop {
+        let (token, account_id) = credential
+            .get_with_account_id()
+            .await
+            .ok_or(CodexBackendError::NoToken)?;
+        let mut request = build(&client)
             .bearer_auth(token)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::USER_AGENT, "phoenix-ide");
         if let Some(account_id) = account_id.as_ref() {
             request = request.header("chatgpt-account-id", account_id);
         }
-        let response = match request.send().await {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::debug!(%error, "failed to fetch Codex quota");
-                return None;
-            }
-        };
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempts == 0 {
-            attempts += 1;
+        let response = request.send().await.map_err(CodexBackendError::Transport)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+            refreshed = true;
             credential.invalidate().await;
             continue;
         }
-        break (response, account_id);
-    };
-    if !response.status().is_success() {
-        tracing::debug!(status = %response.status(), "Codex quota endpoint rejected request");
-        return None;
+        if !response.status().is_success() {
+            return Err(CodexBackendError::Status(response.status()));
+        }
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(CodexBackendError::Decode)?;
+        return Ok((account_id, payload));
     }
-    let payload = match response.json::<serde_json::Value>().await {
-        Ok(payload) => payload,
+}
+
+async fn fetch_codex_quota(
+    credential: &codex_credential::CodexCredential,
+) -> Option<(Option<String>, phoenix_llm::QuotaDetails)> {
+    let (account_id, payload) = match codex_backend_json(credential, |client| {
+        client.get(phoenix_llm::CODEX_USAGE_URL)
+    })
+    .await
+    {
+        Ok(result) => result,
         Err(error) => {
-            tracing::debug!(%error, "failed to decode Codex quota");
+            tracing::debug!(%error, "failed to fetch Codex quota");
             return None;
         }
     };
@@ -1003,6 +1039,109 @@ pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_l
         None => None,
     };
     Json(quota)
+}
+
+fn codex_signed_out_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::CONFLICT,
+        Json(super::types::ErrorResponse::typed(
+            "Not signed in to ChatGPT",
+            "codex_signed_out",
+        )),
+    )
+        .into_response()
+}
+
+fn codex_upstream_unavailable_response(message: impl Into<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(super::types::ErrorResponse::typed(
+            message,
+            "codex_upstream_unavailable",
+        )),
+    )
+        .into_response()
+}
+
+/// `GET /api/codex/rate-limit-resets` — REQ-CRR-001.
+pub async fn codex_rate_limit_resets(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use phoenix_llm::codex_reset_credits::{reset_credits_from_upstream, CODEX_RESET_CREDITS_URL};
+
+    let _publication = state.codex_login.lock_publication().await;
+    let Some(credential) = state.llm_registry.current_codex_credential() else {
+        return codex_signed_out_response();
+    };
+    let payload = match codex_backend_json(credential.as_ref(), |client| {
+        client.get(CODEX_RESET_CREDITS_URL)
+    })
+    .await
+    {
+        Ok((_, payload)) => payload,
+        Err(CodexBackendError::NoToken) => return codex_signed_out_response(),
+        Err(error) => {
+            tracing::debug!(%error, "failed to list Codex reset credits");
+            return codex_upstream_unavailable_response("Could not load usage limit resets");
+        }
+    };
+    match reset_credits_from_upstream(payload) {
+        Ok(credits) => Json(credits).into_response(),
+        Err(error) => {
+            tracing::debug!(%error, "failed to decode Codex reset credits");
+            codex_upstream_unavailable_response("Could not load usage limit resets")
+        }
+    }
+}
+
+/// `POST /api/codex/rate-limit-resets/consume` — REQ-CRR-002. Only ever called
+/// from the UI's confirmation step (REQ-CRR-004).
+pub async fn codex_rate_limit_reset_consume(
+    State(state): State<AppState>,
+    Json(request): Json<phoenix_core::domain::codex_reset_credits::CodexResetRedeemRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use phoenix_llm::codex_reset_credits::{
+        redeem_response_from_upstream, UpstreamRedeemRequest, CODEX_RESET_CREDITS_CONSUME_URL,
+    };
+
+    let _publication = state.codex_login.lock_publication().await;
+    let Some(credential) = state.llm_registry.current_codex_credential() else {
+        return codex_signed_out_response();
+    };
+    let body = UpstreamRedeemRequest::new(request.idempotency_key, request.credit_id.as_deref());
+    let payload = match codex_backend_json(credential.as_ref(), |client| {
+        client.post(CODEX_RESET_CREDITS_CONSUME_URL).json(&body)
+    })
+    .await
+    {
+        Ok((_, payload)) => payload,
+        Err(CodexBackendError::NoToken) => return codex_signed_out_response(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to redeem Codex reset credit");
+            return codex_upstream_unavailable_response("Could not apply the usage limit reset");
+        }
+    };
+    match redeem_response_from_upstream(payload) {
+        Ok(response) => {
+            if response.outcome.is_success() {
+                tracing::info!(
+                    outcome = ?response.outcome,
+                    windows_reset = response.windows_reset,
+                    chosen_credit = request.credit_id.is_some(),
+                    "redeemed Codex reset credit"
+                );
+            } else {
+                tracing::info!(outcome = ?response.outcome, "Codex reset credit not redeemed");
+            }
+            Json(response).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Codex reset redeem answered with an unknown outcome");
+            codex_upstream_unavailable_response("Could not apply the usage limit reset")
+        }
+    }
 }
 
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
