@@ -6,8 +6,10 @@ use phoenix_core::domain::product_conversation::{
 };
 use phoenix_core::domain::sm_state::ConvState;
 use phoenix_db::workflow::LocalAuthorityResult;
+use phoenix_db::{
+    ContinueOutcome, CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
+};
 use phoenix_workflow::ClientTurnKey;
-use phoenix_db::{ContinueOutcome, CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest};
 
 pub(crate) struct NativeContinueRequest {
     pub source_transcript_id: String,
@@ -67,7 +69,9 @@ impl ContinuationApplicationService {
     ) -> NativeContinueCompletion {
         let runtime = self.runtime.clone();
         let result = tokio::spawn(async move {
-            Self::new(runtime).continue_from_coordinator_owned(request).await
+            Self::new(runtime)
+                .continue_from_coordinator_owned(request)
+                .await
         })
         .await
         .unwrap_or_else(|error| Err(error.to_string()));
@@ -89,7 +93,8 @@ impl ContinuationApplicationService {
         db.require_current_coordinator_transcript(&request.source_transcript_id)
             .await
             .map_err(|error| error.to_string())?;
-        let source = db.get_conversation(&request.source_transcript_id)
+        let source = db
+            .get_conversation(&request.source_transcript_id)
             .await
             .map_err(|error| error.to_string())?;
         if source.product_conversation_id == request.product_conversation_id {
@@ -99,20 +104,25 @@ impl ContinuationApplicationService {
         if let Some(waiting) = request.source_gate_wait {
             let _ = waiting.send(());
         }
-        let _source_gate = self.runtime
+        let _source_gate = self
+            .runtime
             .lock_product_message_admission(source.product_conversation_id.as_str())
             .await;
         db.require_current_coordinator_transcript(&request.source_transcript_id)
             .await
             .map_err(|error| error.to_string())?;
-        let _target_gate = self.runtime
+        let _target_gate = self
+            .runtime
             .lock_product_message_admission(request.product_conversation_id.as_str())
             .await;
-        let target_mutation = self.runtime.mutation_admission(&request.predecessor_transcript_id)
+        let target_mutation = self
+            .runtime
+            .mutation_admission(&request.predecessor_transcript_id)
             .await
             .map_err(|error| error.to_string())?;
         let _target_mutation = target_mutation.lock().await;
-        let predecessor = db.get_conversation(&request.predecessor_transcript_id)
+        let predecessor = db
+            .get_conversation(&request.predecessor_transcript_id)
             .await
             .map_err(|error| error.to_string())?;
         if predecessor.product_conversation_id != request.product_conversation_id {
@@ -122,44 +132,62 @@ impl ContinuationApplicationService {
             let ConvState::ContextExhausted { summary, .. } = &predecessor.state else {
                 return Err("predecessor is not context-exhausted".to_string());
             };
-            let review = self.runtime.review_continuation_admission(
-                &request.predecessor_transcript_id,
-                summary.clone(),
-                ContinuationOpeningAuthority::GeneratedPredecessorContext,
-            ).await?;
+            let review = self
+                .runtime
+                .review_continuation_admission(
+                    &request.predecessor_transcript_id,
+                    summary.clone(),
+                    ContinuationOpeningAuthority::GeneratedPredecessorContext,
+                )
+                .await?;
             if !review.source.fits() {
-                return Err(format!("generated handoff exceeds successor capacity: {:?}", review.source));
+                return Err(format!(
+                    "generated handoff exceeds successor capacity: {:?}",
+                    review.source
+                ));
             }
         }
-        let pass = ReservationPass { owner: Some(owner.reborrow()) };
-        let (outcome, opening) = pass.classify(db.continue_from_current_coordinator(
-            CurrentCoordinatorContinuationRequest {
-                source_transcript_id: &request.source_transcript_id,
-                product_conversation_id: &request.product_conversation_id,
-                predecessor_transcript_id: &request.predecessor_transcript_id,
-                summary_message_id: &request.summary_message_id,
-                first_message_id: request.first_message_id,
-            },
-        ).await)?.map_err(|error| error.to_string())?;
+        let pass = ReservationPass {
+            owner: Some(owner.reborrow()),
+        };
+        let (outcome, opening) = pass
+            .classify(
+                db.continue_from_current_coordinator(CurrentCoordinatorContinuationRequest {
+                    source_transcript_id: &request.source_transcript_id,
+                    product_conversation_id: &request.product_conversation_id,
+                    predecessor_transcript_id: &request.predecessor_transcript_id,
+                    summary_message_id: &request.summary_message_id,
+                    first_message_id: request.first_message_id,
+                })
+                .await,
+            )?
+            .map_err(|error| error.to_string())?;
         let (successor, existed) = match outcome {
             ContinueOutcome::Created(successor) => (successor, false),
             ContinueOutcome::AlreadyContinued(successor) => (successor, true),
             ContinueOutcome::ParentNotContextExhausted { state_variant } => {
-                return Err(format!("predecessor is not context-exhausted: {state_variant}"));
+                return Err(format!(
+                    "predecessor is not context-exhausted: {state_variant}"
+                ));
             }
         };
         let (status, error) = match opening {
-            CoordinatorContinuationOpening::Accepted { accepted_message_id: _ } => {
-                (ContinueConversationStatus::AlreadyExists, None)
-            }
+            CoordinatorContinuationOpening::Accepted {
+                accepted_message_id: _,
+            } => (ContinueConversationStatus::AlreadyExists, None),
             CoordinatorContinuationOpening::Pending(intent) => {
-                let review = self.runtime
+                let review = self
+                    .runtime
                     .review_reserved_continuation_opening(intent.clone())
                     .await?;
                 if !review.source.fits() {
-                    return Err(format!("generated handoff exceeds reserved successor capacity: {:?}", review.source));
+                    return Err(format!(
+                        "generated handoff exceeds reserved successor capacity: {:?}",
+                        review.source
+                    ));
                 }
-                let (status, error) = super::manual::dispatch_continuation_handoff(self, intent).await;
+                let (status, error) =
+                    super::manual::dispatch_continuation_handoff(self, intent).await;
                 let status = if existed {
                     super::manual::existing_continuation_status(status)
                 } else {

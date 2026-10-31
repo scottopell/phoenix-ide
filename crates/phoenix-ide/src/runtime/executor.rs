@@ -9812,7 +9812,8 @@ where
             shorten,
             source_candidate_id,
             opening_authority,
-        }).await
+        })
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9822,26 +9823,38 @@ where
     ) -> Result<super::HandoffReviewResponse, String> {
         use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
 
-        let reserved_opening = matches!(&input, super::HandoffReviewInput::ReservedGeneratedOpening(_));
+        let reserved_opening = matches!(
+            &input,
+            super::HandoffReviewInput::ReservedGeneratedOpening(_)
+        );
         let (handoff, shorten, source_candidate_id, opening_authority) = match input {
             super::HandoffReviewInput::ProspectiveSuccessor {
-                handoff, shorten, source_candidate_id, opening_authority,
+                handoff,
+                shorten,
+                source_candidate_id,
+                opening_authority,
             } => (handoff, shorten, source_candidate_id, opening_authority),
             super::HandoffReviewInput::ReservedGeneratedOpening(intent) => {
                 if intent.successor_conversation_id != self.context.conversation_id
-                    || intent.opening_authority != ContinuationOpeningAuthority::GeneratedPredecessorContext
+                    || intent.opening_authority
+                        != ContinuationOpeningAuthority::GeneratedPredecessorContext
                     || intent.user_agent.is_some()
                     || !matches!(self.state, ConvState::Idle)
                 {
-                    return Err("Generated opening review requires its idle reserved successor".to_string());
+                    return Err(
+                        "Generated opening review requires its idle reserved successor".to_string(),
+                    );
                 }
                 (intent.handoff, false, None, intent.opening_authority)
             }
         };
-        if !reserved_opening && !matches!(
-            self.state,
-            ConvState::ContextExhausted { .. } | ConvState::RecoverableContinuationFailure { .. }
-        ) {
+        if !reserved_opening
+            && !matches!(
+                self.state,
+                ConvState::ContextExhausted { .. }
+                    | ConvState::RecoverableContinuationFailure { .. }
+            )
+        {
             return Err("Handoff review requires an exhausted conversation or retained continuation failure".to_string());
         }
         let source_revision = match &self.state {
@@ -9891,7 +9904,9 @@ where
                         id: id.clone(),
                         conversation_id: self.context.conversation_id.clone(),
                         origin: crate::db::ContinuationCandidateOrigin::ReviewInput {
-                            revision: source_revision.clone().ok_or("shortening requires a predecessor revision")?,
+                            revision: source_revision
+                                .clone()
+                                .ok_or("shortening requires a predecessor revision")?,
                         },
                         source,
                         text: handoff.clone(),
@@ -10132,7 +10147,8 @@ where
                                 id: candidate_id.clone(),
                                 conversation_id: self.context.conversation_id.clone(),
                                 origin: crate::db::ContinuationCandidateOrigin::AiShortening {
-                                    revision: source_revision.ok_or("shortening requires a predecessor revision")?,
+                                    revision: source_revision
+                                        .ok_or("shortening requires a predecessor revision")?,
                                 },
                                 source: retained_source,
                                 text: candidate.clone(),
@@ -29602,10 +29618,7 @@ mod tool_generation_guard_tests {
         // These current-generation outcomes are already queued when fatal authority closes.
         for outcome in [
             ToolExecOutcome::Completed(ToolResult::success("X".to_string(), "ok".to_string())),
-            ToolExecOutcome::Completed(ToolResult::error(
-                "X".to_string(),
-                "refused".to_string(),
-            )),
+            ToolExecOutcome::Completed(ToolResult::error("X".to_string(), "refused".to_string())),
         ] {
             rt.tool_outcome_tx
                 .send((generation, outcome))
@@ -29642,8 +29655,14 @@ mod tool_generation_guard_tests {
             broadcast_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
-        assert_eq!(rt.handoff_completion_authority.is_some(), retain_handoff_owner);
-        assert_eq!(fence.owners_at_first_close(), Some(usize::from(retain_handoff_owner)));
+        assert_eq!(
+            rt.handoff_completion_authority.is_some(),
+            retain_handoff_owner
+        );
+        assert_eq!(
+            fence.owners_at_first_close(),
+            Some(usize::from(retain_handoff_owner))
+        );
     }
 
     #[tokio::test]

@@ -24,27 +24,54 @@ impl Fixture {
 
     async fn with_registry(registry: Arc<phoenix_llm::ModelRegistry>) -> Self {
         let db = Database::open_in_memory().await.unwrap();
-        let source = db.get_or_create_coordinator(None, LlmLanguage::default())
-            .await.unwrap();
-        let predecessor = db.create_conversation(
-            "native-continue-target", "native-continue-target", "/tmp", true, None, None,
-        ).await.unwrap();
-        db.update_conversation_state(&predecessor.id, &ConvState::ContextExhausted {
-            summary: SUMMARY.to_string(),
-        }).await.unwrap();
+        let source = db
+            .get_or_create_coordinator(None, LlmLanguage::default())
+            .await
+            .unwrap();
+        let predecessor = db
+            .create_conversation(
+                "native-continue-target",
+                "native-continue-target",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &predecessor.id,
+            &ConvState::ContextExhausted {
+                summary: SUMMARY.to_string(),
+            },
+        )
+        .await
+        .unwrap();
         db.add_message_with_seq_and_origin(
-            SUMMARY_ID, &predecessor.id, 1, &MessageContent::continuation(SUMMARY),
-            None, None, &InputOrigin::SystemGenerated,
-        ).await.unwrap();
+            SUMMARY_ID,
+            &predecessor.id,
+            1,
+            &MessageContent::continuation(SUMMARY),
+            None,
+            None,
+            &InputOrigin::SystemGenerated,
+        )
+        .await
+        .unwrap();
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             registry,
-            crate::platform::PlatformCapability::None { details: "native continuation tests".into() },
+            crate::platform::PlatformCapability::None {
+                details: "native continuation tests".into(),
+            },
             Arc::new(crate::tools::mcp::McpClientManager::new()),
             None,
         ));
         Self {
-            db, runtime, source: source.id, predecessor: predecessor.id,
+            db,
+            runtime,
+            source: source.id,
+            predecessor: predecessor.id,
             product: predecessor.product_conversation_id,
         }
     }
@@ -65,13 +92,19 @@ impl Fixture {
     }
 
     async fn reserve(&self) -> ContinuationDispatchIntent {
-        let result = self.db.continue_from_current_coordinator(CurrentCoordinatorContinuationRequest {
-            source_transcript_id: &self.source,
-            product_conversation_id: &self.product,
-            predecessor_transcript_id: &self.predecessor,
-            summary_message_id: SUMMARY_ID,
-            first_message_id: ClientTurnKey::try_from(WINNER).unwrap(),
-        }).await.established().expect("reservation classified").unwrap();
+        let result = self
+            .db
+            .continue_from_current_coordinator(CurrentCoordinatorContinuationRequest {
+                source_transcript_id: &self.source,
+                product_conversation_id: &self.product,
+                predecessor_transcript_id: &self.predecessor,
+                summary_message_id: SUMMARY_ID,
+                first_message_id: ClientTurnKey::try_from(WINNER).unwrap(),
+            })
+            .await
+            .established()
+            .expect("reservation classified")
+            .unwrap();
         assert!(matches!(result.0, ContinueOutcome::Created(_)));
         match result.1 {
             CoordinatorContinuationOpening::Pending(intent) => intent,
@@ -80,21 +113,39 @@ impl Fixture {
     }
 
     async fn complete(&self, intent: &ContinuationDispatchIntent) {
-        self.db.add_message_with_seq_and_origin(
-            WINNER, &intent.successor_conversation_id, 1,
-            &MessageContent::continuation(SUMMARY), None, None, &InputOrigin::SystemGenerated,
-        ).await.unwrap();
-        assert!(self.db.continuation_dispatch_intent(&self.predecessor).await.unwrap().is_none());
+        self.db
+            .add_message_with_seq_and_origin(
+                WINNER,
+                &intent.successor_conversation_id,
+                1,
+                &MessageContent::continuation(SUMMARY),
+                None,
+                None,
+                &InputOrigin::SystemGenerated,
+            )
+            .await
+            .unwrap();
+        assert!(self
+            .db
+            .continuation_dispatch_intent(&self.predecessor)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     fn pass(&self) -> ReservationPass {
-        ReservationPass { owner: Some(self.runtime.acquire_local_authority_pass().unwrap()) }
+        ReservationPass {
+            owner: Some(self.runtime.acquire_local_authority_pass().unwrap()),
+        }
     }
 
     fn assert_closed_with_owner(&self) {
         assert!(self.runtime.fatal_local_authority_is_latched());
         assert!(self.runtime.acquire_local_authority_pass().is_err());
-        assert_eq!(self.runtime.fatal_authority_owners_at_first_close(), Some(1));
+        assert_eq!(
+            self.runtime.fatal_authority_owners_at_first_close(),
+            Some(1)
+        );
     }
 }
 
@@ -102,7 +153,12 @@ impl Fixture {
 async fn established_reservation_success_and_rejection_release_without_closing() {
     let f = Fixture::new().await;
     for value in [Ok::<_, &str>(17), Err("acknowledged rejection")] {
-        assert_eq!(f.pass().classify(LocalAuthorityResult::DurableFactEstablished(value)).unwrap(), value);
+        assert_eq!(
+            f.pass()
+                .classify(LocalAuthorityResult::DurableFactEstablished(value))
+                .unwrap(),
+            value
+        );
         assert!(!f.runtime.fatal_local_authority_is_latched());
     }
     f.runtime.fence_fatal_local_authority().await;
@@ -112,7 +168,10 @@ async fn established_reservation_success_and_rejection_release_without_closing()
 #[tokio::test]
 async fn unclassified_reservation_closes_before_owner_release() {
     let f = Fixture::new().await;
-    assert!(f.pass().classify::<()>(LocalAuthorityResult::DurableFactUnclassified).is_err());
+    assert!(f
+        .pass()
+        .classify::<()>(LocalAuthorityResult::DurableFactUnclassified)
+        .is_err());
     f.assert_closed_with_owner();
 }
 
@@ -131,7 +190,9 @@ async fn detached_reservation_worker_still_classifies_after_requester_is_gone() 
     let (settled, completion) = tokio::sync::oneshot::channel();
     let worker = tokio::spawn(async move {
         proceed.await.unwrap();
-        let refused = pass.classify::<()>(LocalAuthorityResult::DurableFactUnclassified).is_err();
+        let refused = pass
+            .classify::<()>(LocalAuthorityResult::DurableFactUnclassified)
+            .is_err();
         settled.send(refused).unwrap();
     });
     drop(worker);
@@ -178,10 +239,27 @@ async fn cancelling_an_armed_reservation_task_closes_before_release() {
 async fn closed_authority_returns_terminal_completion_without_reserving_a_successor() {
     let f = Fixture::new().await;
     drop(f.pass());
-    let completion = f.service().continue_from_coordinator(f.request("closed-retry")).await;
-    assert!(matches!(completion, NativeContinueCompletion::LocalAuthorityClosed));
-    assert!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.is_none());
-    assert!(f.db.continuation_dispatch_intent(&f.predecessor).await.unwrap().is_none());
+    let completion = f
+        .service()
+        .continue_from_coordinator(f.request("closed-retry"))
+        .await;
+    assert!(matches!(
+        completion,
+        NativeContinueCompletion::LocalAuthorityClosed
+    ));
+    assert!(f
+        .db
+        .get_conversation(&f.predecessor)
+        .await
+        .unwrap()
+        .continued_in_conv_id
+        .is_none());
+    assert!(f
+        .db
+        .continuation_dispatch_intent(&f.predecessor)
+        .await
+        .unwrap()
+        .is_none());
     f.assert_closed_with_owner();
 }
 
@@ -191,12 +269,28 @@ async fn completed_opening_replay_after_authority_close_has_no_ordinary_reply() 
     let intent = f.reserve().await;
     f.complete(&intent).await;
     drop(f.pass());
-    let completion = f.service().continue_from_coordinator(f.request("closed-replay")).await;
-    assert!(matches!(completion, NativeContinueCompletion::LocalAuthorityClosed));
-    let messages = f.db.get_messages(&intent.successor_conversation_id).await.unwrap();
+    let completion = f
+        .service()
+        .continue_from_coordinator(f.request("closed-replay"))
+        .await;
+    assert!(matches!(
+        completion,
+        NativeContinueCompletion::LocalAuthorityClosed
+    ));
+    let messages =
+        f.db.get_messages(&intent.successor_conversation_id)
+            .await
+            .unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].message_id, WINNER);
-    assert_eq!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.as_deref(), Some(intent.successor_conversation_id.as_str()));
+    assert_eq!(
+        f.db.get_conversation(&f.predecessor)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .as_deref(),
+        Some(intent.successor_conversation_id.as_str())
+    );
     f.assert_closed_with_owner();
 }
 
@@ -205,11 +299,26 @@ async fn completed_generated_opening_replays_without_a_provider_or_new_successor
     let f = Fixture::new().await;
     let intent = f.reserve().await;
     f.complete(&intent).await;
-    let result = f.service().continue_from_coordinator(f.request("losing-retry-key")).await.established().unwrap();
+    let result = f
+        .service()
+        .continue_from_coordinator(f.request("losing-retry-key"))
+        .await
+        .established()
+        .unwrap();
     assert_eq!(result.conversation_id, intent.successor_conversation_id);
-    assert!(matches!(result.status, ContinueConversationStatus::AlreadyExists));
+    assert!(matches!(
+        result.status,
+        ContinueConversationStatus::AlreadyExists
+    ));
     assert!(result.error.is_none());
-    assert_eq!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.as_deref(), Some(result.conversation_id.as_str()));
+    assert_eq!(
+        f.db.get_conversation(&f.predecessor)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .as_deref(),
+        Some(result.conversation_id.as_str())
+    );
     let messages = f.db.get_messages(&result.conversation_id).await.unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].message_id, WINNER);
@@ -220,19 +329,50 @@ async fn completed_generated_opening_replays_without_a_provider_or_new_successor
 async fn pending_replay_requires_current_successor_capacity_and_retains_winning_intent() {
     let f = Fixture::new().await;
     let intent = f.reserve().await;
-    let error = tokio::time::timeout(std::time::Duration::from_secs(30),
-        f.service().continue_from_coordinator(f.request("losing-retry-key")))
-        .await.expect("pending capacity review completes without a recursive mutation lock")
-        .established().err().expect("empty registry has no provider for capacity review");
-    assert!(error.contains("unavailable through its selected connection"), "{error}");
-    let pending = f.db.continuation_dispatch_intent(&f.predecessor).await.unwrap().unwrap();
-    assert_eq!(pending.successor_conversation_id, intent.successor_conversation_id);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.service()
+            .continue_from_coordinator(f.request("losing-retry-key")),
+    )
+    .await
+    .expect("pending capacity review completes without a recursive mutation lock")
+    .established()
+    .err()
+    .expect("empty registry has no provider for capacity review");
+    assert!(
+        error.contains("unavailable through its selected connection"),
+        "{error}"
+    );
+    let pending =
+        f.db.continuation_dispatch_intent(&f.predecessor)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        pending.successor_conversation_id,
+        intent.successor_conversation_id
+    );
     assert_eq!(pending.message_id, intent.message_id);
     assert_eq!(pending.handoff, intent.handoff);
-    assert_eq!(pending.opening_authority, ContinuationOpeningAuthority::GeneratedPredecessorContext);
+    assert_eq!(
+        pending.opening_authority,
+        ContinuationOpeningAuthority::GeneratedPredecessorContext
+    );
     assert!(pending.user_agent.is_none());
-    assert!(f.db.get_messages(&intent.successor_conversation_id).await.unwrap().is_empty());
-    assert_eq!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.as_deref(), Some(intent.successor_conversation_id.as_str()));
+    assert!(f
+        .db
+        .get_messages(&intent.successor_conversation_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.db.get_conversation(&f.predecessor)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .as_deref(),
+        Some(intent.successor_conversation_id.as_str())
+    );
     assert!(!f.runtime.fatal_local_authority_is_latched());
 }
 
@@ -264,34 +404,69 @@ impl phoenix_llm::LlmService for OpeningProvider {
 
 #[tokio::test]
 async fn pending_replay_uses_winning_generated_opening_and_dispatches_it_once() {
-    let provider = Arc::new(OpeningProvider { entered: tokio::sync::Notify::new() });
-    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(provider.clone()));
+    let provider = Arc::new(OpeningProvider {
+        entered: tokio::sync::Notify::new(),
+    });
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(
+        provider.clone(),
+    ));
     let f = Fixture::with_registry(registry).await;
     let intent = f.reserve().await;
     let predecessor_mutation = f.runtime.mutation_admission(&f.predecessor).await.unwrap();
-    let successor_mutation = f.runtime.mutation_admission(&intent.successor_conversation_id).await.unwrap();
+    let successor_mutation = f
+        .runtime
+        .mutation_admission(&intent.successor_conversation_id)
+        .await
+        .unwrap();
     assert!(Arc::ptr_eq(&predecessor_mutation, &successor_mutation));
     let mutation = predecessor_mutation.lock().await;
     assert!(successor_mutation.try_lock().is_err());
     drop(mutation);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30),
-        f.service().continue_from_coordinator(f.request("losing-retry-key")))
-        .await.expect("shared product mutation gate must not be reacquired").established().unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.service()
+            .continue_from_coordinator(f.request("losing-retry-key")),
+    )
+    .await
+    .expect("shared product mutation gate must not be reacquired")
+    .established()
+    .unwrap();
     assert_eq!(result.conversation_id, intent.successor_conversation_id);
-    assert!(matches!(result.status, ContinueConversationStatus::AlreadyExists));
+    assert!(matches!(
+        result.status,
+        ContinueConversationStatus::AlreadyExists
+    ));
     assert!(result.error.is_none());
-    tokio::time::timeout(std::time::Duration::from_secs(30), provider.entered.notified())
-        .await.expect("provider entry follows durable opening materialization");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        provider.entered.notified(),
+    )
+    .await
+    .expect("provider entry follows durable opening materialization");
     let messages = f.db.get_messages(&result.conversation_id).await.unwrap();
-    let openings: Vec<_> = messages.iter().filter(|message| {
-        matches!(message.content, MessageContent::Continuation(_))
-    }).collect();
+    let openings: Vec<_> = messages
+        .iter()
+        .filter(|message| matches!(message.content, MessageContent::Continuation(_)))
+        .collect();
     assert_eq!(openings.len(), 1);
     assert!(matches!(openings[0].origin, InputOrigin::SystemGenerated));
-    assert!(f.db.continuation_dispatch_intent(&f.predecessor).await.unwrap().is_none());
-    let second = f.service().continue_from_coordinator(f.request("second-losing-retry")).await.established().unwrap();
+    assert!(f
+        .db
+        .continuation_dispatch_intent(&f.predecessor)
+        .await
+        .unwrap()
+        .is_none());
+    let second = f
+        .service()
+        .continue_from_coordinator(f.request("second-losing-retry"))
+        .await
+        .established()
+        .unwrap();
     assert_eq!(second.conversation_id, result.conversation_id);
-    assert!(matches!(second.status, ContinueConversationStatus::AlreadyExists));
+    assert!(matches!(
+        second.status,
+        ContinueConversationStatus::AlreadyExists
+    ));
     assert!(!f.runtime.fatal_local_authority_is_latched());
 }
 
@@ -300,13 +475,36 @@ async fn stale_coordinator_is_refused_even_for_a_completed_opening() {
     let f = Fixture::new().await;
     let intent = f.reserve().await;
     f.complete(&intent).await;
-    f.db.update_conversation_state(&f.source, &ConvState::ContextExhausted {
-        summary: "Coordinator rotation".into(),
-    }).await.unwrap();
-    assert!(matches!(f.db.continue_conversation(&f.source).await.unwrap(), ContinueOutcome::Created(_)));
-    let error = f.service().continue_from_coordinator(f.request("stale-retry")).await.established().err().unwrap();
-    assert_eq!(error, phoenix_db::DbError::CurrentCoordinatorRequired.to_string());
-    assert_eq!(f.db.get_messages(&intent.successor_conversation_id).await.unwrap().len(), 1);
+    f.db.update_conversation_state(
+        &f.source,
+        &ConvState::ContextExhausted {
+            summary: "Coordinator rotation".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        f.db.continue_conversation(&f.source).await.unwrap(),
+        ContinueOutcome::Created(_)
+    ));
+    let error = f
+        .service()
+        .continue_from_coordinator(f.request("stale-retry"))
+        .await
+        .established()
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        phoenix_db::DbError::CurrentCoordinatorRequired.to_string()
+    );
+    assert_eq!(
+        f.db.get_messages(&intent.successor_conversation_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(!f.runtime.fatal_local_authority_is_latched());
 }
 
@@ -315,22 +513,48 @@ async fn source_rotation_while_waiting_for_source_gate_rejects_completed_replay(
     let f = Fixture::new().await;
     let intent = f.reserve().await;
     f.complete(&intent).await;
-    let source_product = f.db.get_conversation(&f.source).await.unwrap().product_conversation_id;
-    let source_gate = f.runtime.lock_product_message_admission(source_product.as_str()).await;
+    let source_product =
+        f.db.get_conversation(&f.source)
+            .await
+            .unwrap()
+            .product_conversation_id;
+    let source_gate = f
+        .runtime
+        .lock_product_message_admission(source_product.as_str())
+        .await;
     let (observed, waiting) = tokio::sync::oneshot::channel();
     let mut request = f.request("rotation-race-retry");
     request.source_gate_wait = Some(observed);
     let service = f.service();
     let worker = tokio::spawn(async move { service.continue_from_coordinator(request).await });
-    waiting.await.expect("initial current-source validation completed before waiting on gate");
-    f.db.update_conversation_state(&f.source, &ConvState::ContextExhausted {
-        summary: "rotation before gate acquisition".into(),
-    }).await.unwrap();
-    assert!(matches!(f.db.continue_conversation(&f.source).await.unwrap(), ContinueOutcome::Created(_)));
+    waiting
+        .await
+        .expect("initial current-source validation completed before waiting on gate");
+    f.db.update_conversation_state(
+        &f.source,
+        &ConvState::ContextExhausted {
+            summary: "rotation before gate acquisition".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        f.db.continue_conversation(&f.source).await.unwrap(),
+        ContinueOutcome::Created(_)
+    ));
     drop(source_gate);
     let error = worker.await.unwrap().established().err().unwrap();
-    assert_eq!(error, phoenix_db::DbError::CurrentCoordinatorRequired.to_string());
-    assert_eq!(f.db.get_messages(&intent.successor_conversation_id).await.unwrap().len(), 1);
+    assert_eq!(
+        error,
+        phoenix_db::DbError::CurrentCoordinatorRequired.to_string()
+    );
+    assert_eq!(
+        f.db.get_messages(&intent.successor_conversation_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(!f.runtime.fatal_local_authority_is_latched());
 }
 
@@ -338,11 +562,36 @@ async fn source_rotation_while_waiting_for_source_gate_rejects_completed_replay(
 async fn coordinator_self_rotation_is_a_nonfatal_preflight_refusal() {
     let f = Fixture::new().await;
     let mut request = f.request("self-rotation");
-    request.product_conversation_id = f.db.get_conversation(&f.source).await.unwrap().product_conversation_id;
+    request.product_conversation_id =
+        f.db.get_conversation(&f.source)
+            .await
+            .unwrap()
+            .product_conversation_id;
     request.predecessor_transcript_id = f.source.clone();
-    let error = f.service().continue_from_coordinator(request).await.established().err().unwrap();
-    assert_eq!(error, "native Continue cannot rotate its Coordinator source");
-    assert!(f.db.get_conversation(&f.source).await.unwrap().continued_in_conv_id.is_none());
-    assert!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.is_none());
+    let error = f
+        .service()
+        .continue_from_coordinator(request)
+        .await
+        .established()
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        "native Continue cannot rotate its Coordinator source"
+    );
+    assert!(f
+        .db
+        .get_conversation(&f.source)
+        .await
+        .unwrap()
+        .continued_in_conv_id
+        .is_none());
+    assert!(f
+        .db
+        .get_conversation(&f.predecessor)
+        .await
+        .unwrap()
+        .continued_in_conv_id
+        .is_none());
     assert!(!f.runtime.fatal_local_authority_is_latched());
 }

@@ -17,9 +17,7 @@ mod native;
 pub(crate) use native::{NativeContinueCompletion, NativeContinueRequest};
 
 #[cfg(test)]
-pub(crate) use manual::{
-    automatic_retry_phase_for_turn_state, continuation_message_id,
-};
+pub(crate) use manual::{automatic_retry_phase_for_turn_state, continuation_message_id};
 
 fn winning_intent_is_automatic(
     admission: &AutomaticContinuationAdmission,

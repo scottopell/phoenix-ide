@@ -72,7 +72,9 @@ pub(crate) async fn tools(
             Arc::new(automatic_continuation::AutomaticContinuationTool::read(
                 runtime.clone(),
             )),
-            Arc::new(automatic_continuation::AutomaticContinuationTool::set(runtime)),
+            Arc::new(automatic_continuation::AutomaticContinuationTool::set(
+                runtime,
+            )),
         ]),
         Err(crate::db::DbError::CurrentCoordinatorRequired) => Ok(Vec::new()),
         Err(error) => Err(error),

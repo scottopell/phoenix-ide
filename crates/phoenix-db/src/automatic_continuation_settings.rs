@@ -96,7 +96,10 @@ impl Database {
         let (committed, observed) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let mut pause = self.native_settings_commit_test_pause.lock().unwrap();
-        assert!(pause.is_none(), "native settings commit pause already armed");
+        assert!(
+            pause.is_none(),
+            "native settings commit pause already armed"
+        );
         *pause = Some(SettingsCommitTestPause {
             committed,
             release: released,
@@ -139,7 +142,11 @@ impl Database {
     ) -> LocalAuthorityResult<DbResult<AutomaticContinuationSettings>> {
         #[cfg(any(test, feature = "test-support"))]
         {
-            let pause = self.native_settings_commit_test_pause.lock().unwrap().take();
+            let pause = self
+                .native_settings_commit_test_pause
+                .lock()
+                .unwrap()
+                .take();
             if let Some(pause) = pause {
                 let result = self
                     .set_native_automatic_continuation_settings_with_commit(
@@ -149,7 +156,10 @@ impl Database {
                         SettingsCommit::LoseAcknowledgement,
                     )
                     .await;
-                assert!(matches!(result, LocalAuthorityResult::DurableFactUnclassified));
+                assert!(matches!(
+                    result,
+                    LocalAuthorityResult::DurableFactUnclassified
+                ));
                 let _ = pause.committed.send(());
                 pause
                     .release
@@ -186,11 +196,15 @@ impl Database {
             Err(error) => return Established(Err(error.into())),
         };
         let result = async {
-            crate::product_conversation_rename::require_current_gc_tx(&mut tx, source_transcript_id)
-                .await?;
+            crate::product_conversation_rename::require_current_gc_tx(
+                &mut tx,
+                source_transcript_id,
+            )
+            .await?;
             let aggregate = Self::resolve_settings_target(&mut tx, target).await?;
             write_preference_on(&mut tx, aggregate.product_conversation_id(), preference).await?;
-            let preference = read_preference_on(&mut tx, aggregate.product_conversation_id()).await?;
+            let preference =
+                read_preference_on(&mut tx, aggregate.product_conversation_id()).await?;
             Ok(AutomaticContinuationSettings {
                 aggregate,
                 preference,
@@ -220,7 +234,8 @@ impl Database {
     ) -> DbResult<ResolvedAutomaticContinuationAggregate> {
         match target {
             AutomaticContinuationTarget::Ordinary(id) => {
-                let resolved = Self::resolve_ordinary_product_conversation_on(tx, id.as_str()).await?;
+                let resolved =
+                    Self::resolve_ordinary_product_conversation_on(tx, id.as_str()).await?;
                 if resolved.product_conversation_id != *id {
                     return Err(DbError::ContinuationPrecondition(
                         "target did not resolve to the exact ordinary product conversation".into(),

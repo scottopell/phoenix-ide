@@ -64,9 +64,7 @@ impl ContinueConversation {
                 let response = result?;
                 serde_json::to_value(response).map_err(|error| error.to_string())
             }
-            NativeContinueCompletion::LocalAuthorityClosed => {
-                std::future::pending().await
-            }
+            NativeContinueCompletion::LocalAuthorityClosed => std::future::pending().await,
         }
     }
 }
@@ -117,25 +115,47 @@ mod tests {
         });
         assert!(serde_json::from_value::<ContinueRequest>(valid.clone()).is_ok());
         for key in [
-            "handoff", "first_message_id", "user_message", "agent", "retry",
-            "recovery", "control", "source_transcript_id", "tool_use_id",
+            "handoff",
+            "first_message_id",
+            "user_message",
+            "agent",
+            "retry",
+            "recovery",
+            "control",
+            "source_transcript_id",
+            "tool_use_id",
         ] {
             let mut value = valid.clone();
             value[key] = json!("unexpected");
-            assert!(serde_json::from_value::<ContinueRequest>(value).is_err(), "{key}");
+            assert!(
+                serde_json::from_value::<ContinueRequest>(value).is_err(),
+                "{key}"
+            );
         }
         for field in [
-            "product_conversation_id", "predecessor_transcript_id", "summary_message_id",
+            "product_conversation_id",
+            "predecessor_transcript_id",
+            "summary_message_id",
         ] {
             let mut value = valid.clone();
             value.as_object_mut().unwrap().remove(field);
-            assert!(serde_json::from_value::<ContinueRequest>(value).is_err(), "{field}");
+            assert!(
+                serde_json::from_value::<ContinueRequest>(value).is_err(),
+                "{field}"
+            );
         }
-        for field in ["product_conversation_id", "predecessor_transcript_id", "summary_message_id"] {
+        for field in [
+            "product_conversation_id",
+            "predecessor_transcript_id",
+            "summary_message_id",
+        ] {
             for blank in ["", "  \t\n"] {
                 let mut value = valid.clone();
                 value[field] = json!(blank);
-                assert!(serde_json::from_value::<ContinueRequest>(value).is_err(), "{field}");
+                assert!(
+                    serde_json::from_value::<ContinueRequest>(value).is_err(),
+                    "{field}"
+                );
             }
         }
     }

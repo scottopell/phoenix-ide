@@ -618,7 +618,9 @@ mod tests {
             assert!(prompt.contains(
                 "does not rotate the Coordinator, enable auto-continue, retry/rearm failed work or bypass stop/pause/approval gates"
             ));
-            assert!(prompt.contains("Use read_automatic_continuation and set_automatic_continuation"));
+            assert!(
+                prompt.contains("Use read_automatic_continuation and set_automatic_continuation")
+            );
             assert!(prompt.contains("enabling after exhaustion does not wake or admit work"));
             assert!(prompt.contains("disabling does not revoke already-admitted continuation"));
             assert!(prompt.contains("They do not retry/rearm failed work or mutate Goals"));

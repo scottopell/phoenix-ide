@@ -1,7 +1,5 @@
-use crate::api::handlers::{AppError, map_admission_db_error};
-use crate::api::{
-    ConflictErrorResponse, ContinueConversationResponse, ContinueConversationStatus,
-};
+use crate::api::handlers::{map_admission_db_error, AppError};
+use crate::api::{ConflictErrorResponse, ContinueConversationResponse, ContinueConversationStatus};
 use crate::continuation_service::ContinuationApplicationService;
 use crate::send_chat_service::{SendChatApplicationService, SendChatOutcome, SendChatRequest};
 use crate::state_machine::ConvState;
@@ -47,21 +45,19 @@ pub(super) async fn dispatch_continuation_handoff(
     let parent_id = intent.parent_conversation_id.clone();
     let conversation_id = intent.successor_conversation_id.clone();
     let expansion_policy = continuation_expansion_policy(intent.opening_authority);
-    let dispatch = SendChatApplicationService::new(
-        service.runtime.db().clone(),
-        service.runtime.clone(),
-    )
-    .send(SendChatRequest {
-        conversation_id: conversation_id.clone(),
-        origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-        text: intent.handoff,
-        message_id: intent.message_id.as_str().to_string(),
-        images: Vec::new(),
-        files: Vec::new(),
-        user_agent: intent.user_agent,
-        expansion_policy,
-    })
-    .await;
+    let dispatch =
+        SendChatApplicationService::new(service.runtime.db().clone(), service.runtime.clone())
+            .send(SendChatRequest {
+                conversation_id: conversation_id.clone(),
+                origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
+                text: intent.handoff,
+                message_id: intent.message_id.as_str().to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: intent.user_agent,
+                expansion_policy,
+            })
+            .await;
     match dispatch {
         Ok(SendChatOutcome::Delivered) => {
             // Channel delivery is not durable acceptance. The outbox intent stays
@@ -151,7 +147,8 @@ pub(super) async fn continue_manual(
         match &req.source {
             crate::api::ContinueHandoffSource::Manual => false,
             crate::api::ContinueHandoffSource::Candidate { candidate_id } => {
-                let candidates = service.runtime
+                let candidates = service
+                    .runtime
                     .db()
                     .continuation_handoff_candidates(id)
                     .await
@@ -167,7 +164,8 @@ pub(super) async fn continue_manual(
                 true
             }
             crate::api::ContinueHandoffSource::Summary { message_id } => {
-                let message = service.runtime
+                let message = service
+                    .runtime
                     .db()
                     .get_message_by_id_in_conversation(id, message_id)
                     .await

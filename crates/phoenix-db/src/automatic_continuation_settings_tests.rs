@@ -13,23 +13,57 @@ async fn native_settings_use_current_coordinator_source_and_exact_ordinary_targe
         .unwrap();
     let target = AutomaticContinuationTarget::Ordinary(&ordinary.product_conversation_id);
 
-    let initial = db.read_native_automatic_continuation_settings(&coordinator.id, target).await.unwrap();
-    assert_eq!(initial.aggregate, ResolvedAutomaticContinuationAggregate::Ordinary(ordinary.product_conversation_id.clone()));
-    assert_eq!(initial.preference, AutoContinueOnContextExhaustion::Disabled);
+    let initial = db
+        .read_native_automatic_continuation_settings(&coordinator.id, target)
+        .await
+        .unwrap();
+    assert_eq!(
+        initial.aggregate,
+        ResolvedAutomaticContinuationAggregate::Ordinary(ordinary.product_conversation_id.clone())
+    );
+    assert_eq!(
+        initial.preference,
+        AutoContinueOnContextExhaustion::Disabled
+    );
 
-    let set = db.set_native_automatic_continuation_settings(
-        &coordinator.id, target, AutoContinueOnContextExhaustion::Enabled,
-    ).await.established().expect("setting transaction is acknowledged").unwrap();
+    let set = db
+        .set_native_automatic_continuation_settings(
+            &coordinator.id,
+            target,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .established()
+        .expect("setting transaction is acknowledged")
+        .unwrap();
     assert_eq!(set.preference, AutoContinueOnContextExhaustion::Enabled);
-    assert_eq!(db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id).await.unwrap(), AutoContinueOnContextExhaustion::Enabled);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Enabled
+    );
 
-    let stale = db.read_native_automatic_continuation_settings("not-current-coordinator", target).await;
+    let stale = db
+        .read_native_automatic_continuation_settings("not-current-coordinator", target)
+        .await;
     assert!(matches!(stale, Err(DbError::CurrentCoordinatorRequired)));
-    let refused = db.set_native_automatic_continuation_settings(
-        &ordinary.id, target, AutoContinueOnContextExhaustion::Disabled,
-    ).await.established().expect("validation rollback is acknowledged");
+    let refused = db
+        .set_native_automatic_continuation_settings(
+            &ordinary.id,
+            target,
+            AutoContinueOnContextExhaustion::Disabled,
+        )
+        .await
+        .established()
+        .expect("validation rollback is acknowledged");
     assert!(matches!(refused, Err(DbError::CurrentCoordinatorRequired)));
-    assert_eq!(db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id).await.unwrap(), AutoContinueOnContextExhaustion::Enabled);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&ordinary.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Enabled
+    );
 }
 
 #[tokio::test]
@@ -39,19 +73,50 @@ async fn native_coordinator_target_is_explicit_and_typed() {
         .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
         .await
         .unwrap();
-    let settings = db.read_native_automatic_continuation_settings(
-        &coordinator.id, AutomaticContinuationTarget::Coordinator,
-    ).await.unwrap();
-    assert_eq!(settings.aggregate, ResolvedAutomaticContinuationAggregate::Coordinator(coordinator.product_conversation_id.clone()));
-    assert_eq!(settings.aggregate.product_conversation_id(), &coordinator.product_conversation_id);
-    assert_eq!(settings.preference, AutoContinueOnContextExhaustion::Disabled);
-    let updated = db.set_native_automatic_continuation_settings(
-        &coordinator.id, AutomaticContinuationTarget::Coordinator,
-        AutoContinueOnContextExhaustion::Enabled,
-    ).await.established().expect("setting transaction is acknowledged").unwrap();
-    assert_eq!(updated.aggregate, ResolvedAutomaticContinuationAggregate::Coordinator(coordinator.product_conversation_id.clone()));
+    let settings = db
+        .read_native_automatic_continuation_settings(
+            &coordinator.id,
+            AutomaticContinuationTarget::Coordinator,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        settings.aggregate,
+        ResolvedAutomaticContinuationAggregate::Coordinator(
+            coordinator.product_conversation_id.clone()
+        )
+    );
+    assert_eq!(
+        settings.aggregate.product_conversation_id(),
+        &coordinator.product_conversation_id
+    );
+    assert_eq!(
+        settings.preference,
+        AutoContinueOnContextExhaustion::Disabled
+    );
+    let updated = db
+        .set_native_automatic_continuation_settings(
+            &coordinator.id,
+            AutomaticContinuationTarget::Coordinator,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .established()
+        .expect("setting transaction is acknowledged")
+        .unwrap();
+    assert_eq!(
+        updated.aggregate,
+        ResolvedAutomaticContinuationAggregate::Coordinator(
+            coordinator.product_conversation_id.clone()
+        )
+    );
     assert_eq!(updated.preference, AutoContinueOnContextExhaustion::Enabled);
-    assert_eq!(db.auto_continue_on_context_exhaustion(&coordinator.product_conversation_id).await.unwrap(), AutoContinueOnContextExhaustion::Enabled);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&coordinator.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Enabled
+    );
 }
 
 #[tokio::test]
@@ -158,7 +223,8 @@ async fn ordinary_target_rejects_transcript_and_coordinator_id_targets() {
     let source = &coordinator.id;
 
     let coordinator_product_id = coordinator.product_conversation_id.as_str().to_string();
-    let missing_product_id = ProductConversationId::parse(uuid::Uuid::new_v4().to_string()).unwrap();
+    let missing_product_id =
+        ProductConversationId::parse(uuid::Uuid::new_v4().to_string()).unwrap();
     for id in [&ordinary.id, &coordinator_product_id] {
         let parsed = ProductConversationId::parse(id.clone()).unwrap();
         let result = db
@@ -224,7 +290,14 @@ async fn native_setting_changes_are_prospective_at_summary_commit() {
             .await
             .unwrap();
         let parent = db
-            .create_conversation("prospective-setting", "prospective-setting", "/tmp", true, None, None)
+            .create_conversation(
+                "prospective-setting",
+                "prospective-setting",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let target = AutomaticContinuationTarget::Ordinary(&parent.product_conversation_id);
@@ -277,7 +350,10 @@ async fn native_setting_changes_are_prospective_at_summary_commit() {
             .unwrap(),
             crate::ContinuationCommitOutcome::Applied,
         );
-        let admission_before = db.automatic_continuation_admission(&parent.id).await.unwrap();
+        let admission_before = db
+            .automatic_continuation_admission(&parent.id)
+            .await
+            .unwrap();
         assert_eq!(admission_before.is_some(), initially_enabled);
         let intent_before = db.continuation_dispatch_intent(&parent.id).await.unwrap();
         let messages_before = db.get_messages(&parent.id).await.unwrap();
@@ -294,7 +370,9 @@ async fn native_setting_changes_are_prospective_at_summary_commit() {
             .unwrap();
         assert_eq!(bool::from(changed.preference), !initially_enabled);
         assert_eq!(
-            db.automatic_continuation_admission(&parent.id).await.unwrap(),
+            db.automatic_continuation_admission(&parent.id)
+                .await
+                .unwrap(),
             admission_before,
         );
         assert_eq!(
@@ -313,38 +391,82 @@ async fn native_setting_changes_are_prospective_at_summary_commit() {
 #[tokio::test]
 async fn native_settings_reject_subagent_sources_targets_and_unpublished_products() {
     let db = Database::open_in_memory().await.unwrap();
-    let coordinator = db.get_or_create_coordinator(
-        None, phoenix_core::llm_language::LlmLanguage::default(),
-    ).await.unwrap();
-    let root = db.create_conversation(
-        "settings-unpublished", "settings-unpublished", "/tmp", true, None, None,
-    ).await.unwrap();
-    let child = db.create_subagent_conversation(
-        "settings-subagent", "settings-subagent", "/tmp", &root.id,
-        "offline-model", &root.conv_mode,
-        phoenix_core::llm_language::LlmLanguage::default(),
-        root.attached_work_scope_id.as_ref(),
-        crate::SubAgentExecution { connection: "mock", effort: None, persona: None },
-    ).await.unwrap();
+    let coordinator = db
+        .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+        .await
+        .unwrap();
+    let root = db
+        .create_conversation(
+            "settings-unpublished",
+            "settings-unpublished",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let child = db
+        .create_subagent_conversation(
+            "settings-subagent",
+            "settings-subagent",
+            "/tmp",
+            &root.id,
+            "offline-model",
+            &root.conv_mode,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            root.attached_work_scope_id.as_ref(),
+            crate::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
+        )
+        .await
+        .unwrap();
     assert!(matches!(
-        db.read_native_automatic_continuation_settings(&child.id, AutomaticContinuationTarget::Coordinator).await,
+        db.read_native_automatic_continuation_settings(
+            &child.id,
+            AutomaticContinuationTarget::Coordinator
+        )
+        .await,
         Err(DbError::CurrentCoordinatorRequired),
     ));
     assert!(matches!(
         db.set_native_automatic_continuation_settings(
-            &child.id, AutomaticContinuationTarget::Coordinator, AutoContinueOnContextExhaustion::Enabled,
-        ).await.established().unwrap(),
+            &child.id,
+            AutomaticContinuationTarget::Coordinator,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .established()
+        .unwrap(),
         Err(DbError::CurrentCoordinatorRequired),
     ));
     let child_reference: phoenix_core::domain::product_conversation::ProductConversationId =
         child.id.parse().unwrap();
     let child_target = AutomaticContinuationTarget::Ordinary(&child_reference);
-    assert!(db.read_native_automatic_continuation_settings(&coordinator.id, child_target).await.is_err());
-    assert!(db.set_native_automatic_continuation_settings(
-        &coordinator.id, child_target, AutoContinueOnContextExhaustion::Enabled,
-    ).await.established().unwrap().is_err());
+    assert!(db
+        .read_native_automatic_continuation_settings(&coordinator.id, child_target)
+        .await
+        .is_err());
+    assert!(db
+        .set_native_automatic_continuation_settings(
+            &coordinator.id,
+            child_target,
+            AutoContinueOnContextExhaustion::Enabled,
+        )
+        .await
+        .established()
+        .unwrap()
+        .is_err());
     assert_eq!(child.product_conversation_id, root.product_conversation_id);
-    assert_eq!(db.auto_continue_on_context_exhaustion(&root.product_conversation_id).await.unwrap(), AutoContinueOnContextExhaustion::Disabled);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&root.product_conversation_id)
+            .await
+            .unwrap(),
+        AutoContinueOnContextExhaustion::Disabled
+    );
     sqlx::query("INSERT INTO product_creation_jobs(request_id, product_conversation_id, cwd, objective, llm_language, status, accepted_at_unix_micros, updated_at_unix_micros, published_product_id, published_conversation_id, provisioning_stage, stage_updated_at_unix_micros, objective_origin) VALUES ('metadata-staged-job', ?1, '/tmp', '', 'phoenix-native', 'delivery_pending', 1, 1, ?1, ?2, 'bootstrap_initial_turn', 1, 'user_api')")
         .bind(root.product_conversation_id.as_str())
         .bind(&root.id)
@@ -367,7 +489,9 @@ async fn native_settings_reject_subagent_sources_targets_and_unpublished_product
         .expect("invalid-target rollback acknowledged")
         .is_err());
     assert_eq!(
-        db.auto_continue_on_context_exhaustion(&root.product_conversation_id).await.unwrap(),
+        db.auto_continue_on_context_exhaustion(&root.product_conversation_id)
+            .await
+            .unwrap(),
         AutoContinueOnContextExhaustion::Disabled,
     );
 }

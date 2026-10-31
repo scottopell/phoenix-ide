@@ -46,7 +46,9 @@ async fn resolve(db: &Database, target: Target) -> Result<ResolvedTarget, AppErr
                 .coordinator_conversation_id()
                 .await
                 .map_err(db_to_app)?
-                .ok_or_else(|| AppError::NotFound("Coordinator has not been created".to_string()))?;
+                .ok_or_else(|| {
+                    AppError::NotFound("Coordinator has not been created".to_string())
+                })?;
             let coordinator = db
                 .get_conversation(&coordinator_id)
                 .await
@@ -145,11 +147,9 @@ async fn automatic_continuation_view(
     let id = product_conversation_id.to_string();
     Ok(AutomaticContinuationView {
         aggregate: match target {
-            ResolvedTarget::Coordinator(_) => {
-                AutomaticContinuationAggregateView::Coordinator {
-                    product_conversation_id: id,
-                }
-            }
+            ResolvedTarget::Coordinator(_) => AutomaticContinuationAggregateView::Coordinator {
+                product_conversation_id: id,
+            },
             ResolvedTarget::Ordinary(_) => AutomaticContinuationAggregateView::Ordinary {
                 product_conversation_id: id,
             },

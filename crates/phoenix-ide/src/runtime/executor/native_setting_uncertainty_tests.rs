@@ -12,7 +12,7 @@ use phoenix_tools::{ToolOutput, ToolRegistry};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{broadcast, Notify};
 
 struct ObserveUncertainSettingsAdapter {
     inner: ToolRegistryExecutor,
@@ -72,7 +72,9 @@ async fn uncertain_registered_setting_closes_authority_and_stops_https_superviso
         AutoContinueOnContextExhaustion::Disabled,
     );
     let registry = ToolRegistry::coordinator(
-        crate::conversation_action_tools::tools(manager.clone(), &source).await.unwrap(),
+        crate::conversation_action_tools::tools(manager.clone(), &source)
+            .await
+            .unwrap(),
         None,
     );
     let name = "set_automatic_continuation";
@@ -130,11 +132,7 @@ async fn uncertain_registered_setting_closes_authority_and_stops_https_superviso
     .unwrap();
     let before_messages = db.get_messages(&source).await.unwrap();
     let before_state = serde_json::to_value(&state).unwrap();
-    let before_updated_at = db
-        .get_conversation(&source)
-        .await
-        .unwrap()
-        .state_updated_at;
+    let before_updated_at = db.get_conversation(&source).await.unwrap().state_updated_at;
     let storage = Arc::new(DatabaseStorage::new(db.clone()));
     let llm = Arc::new(MockLlmClient::new("test-model"));
     let broadcaster = SseBroadcaster::new(32, 0)

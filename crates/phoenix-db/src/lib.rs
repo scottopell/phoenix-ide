@@ -41,11 +41,12 @@ pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
     PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
+mod automatic_continuation_settings;
 pub mod conversation_goals;
 mod conversation_name;
-mod automatic_continuation_settings;
 pub use automatic_continuation_settings::{
-    AutomaticContinuationSettings, AutomaticContinuationTarget, ResolvedAutomaticContinuationAggregate,
+    AutomaticContinuationSettings, AutomaticContinuationTarget,
+    ResolvedAutomaticContinuationAggregate,
 };
 mod native_continuation;
 pub use native_continuation::{
@@ -7033,8 +7034,11 @@ impl Database {
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<AutoContinueOnContextExhaustion> {
         let mut connection = self.pool.acquire().await?;
-        automatic_continuation_settings::read_preference_on(&mut connection, product_conversation_id)
-            .await
+        automatic_continuation_settings::read_preference_on(
+            &mut connection,
+            product_conversation_id,
+        )
+        .await
     }
 
     /// Persist the aggregate-scoped automatic-continuation preference.
@@ -9609,7 +9613,9 @@ impl Database {
             .await?
             .unwrap_or_else(|| parent_id.to_string());
         let root = Self::get_conversation_on(&mut **tx, &root_id).await?;
-        let chain_len = Self::chain_members_forward_on(&mut **tx, &root_id).await?.len();
+        let chain_len = Self::chain_members_forward_on(&mut **tx, &root_id)
+            .await?
+            .len();
         let root_slug = root.slug.as_deref().unwrap_or("conversation");
         let base_n = chain_len + 1;
         let mut candidate_slug = format!("{root_slug}-{base_n}");
@@ -30772,7 +30778,9 @@ mod tests {
                 disposition: phoenix_workflow::AcceptedDisposition::Runtime,
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")
@@ -30819,7 +30827,9 @@ mod tests {
                 disposition: phoenix_workflow::AcceptedDisposition::Runtime,
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")

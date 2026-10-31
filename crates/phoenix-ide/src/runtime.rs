@@ -6856,7 +6856,8 @@ impl RuntimeManager {
         let _owner = self.acquire_local_authority_pass().map_err(|()| {
             "runtime admission closed after fatal local authority loss".to_string()
         })?;
-        let persisted = self.db()
+        let persisted = self
+            .db()
             .continuation_dispatch_intent(&intent.parent_conversation_id)
             .await
             .map_err(|error| error.to_string())?
@@ -13512,7 +13513,9 @@ mod scope_liveness_tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .expect("accept direct turn");
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected newly accepted turn")
@@ -13774,7 +13777,9 @@ mod scope_liveness_tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .expect("accept direct turn");
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected newly accepted turn")

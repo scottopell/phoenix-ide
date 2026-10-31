@@ -6324,7 +6324,6 @@ async fn cancel_steering_message(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-
 #[cfg(test)]
 use crate::continuation_service::{
     automatic_retry_phase_for_turn_state, continuation_expansion_policy, continuation_message_id,
@@ -13825,7 +13824,9 @@ pub(crate) mod hard_delete_cascade_tests {
                     accepted_at: Timestamp(1),
                 },
             )
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .expect("accept direct turn");
     }
 
@@ -18568,7 +18569,9 @@ mod attachment_storage_tests {
                     accepted_at: Timestamp(1),
                 },
             )
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .expect("accept direct turn");
 
         let referenced = referenced_attachment_paths(&db).await.expect("references");

@@ -1477,6 +1477,7 @@ fn transition_code(err: &TransitionError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::DirectTurnAcceptancePass;
     use super::{
         accepts_user_message_direct_or_steering, active_turn_fences_direct_acceptance,
         close_admission_fenced_outcome, expand_message, generated_predecessor_context_projection,
@@ -1488,6 +1489,7 @@ mod tests {
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use crate::db::SteeringAcceptanceFingerprint;
+    use crate::runtime::RuntimeManager;
     use phoenix_core::domain::db_schema::SkillContent;
     use phoenix_core::domain::sm_event::{
         PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
@@ -1500,8 +1502,6 @@ mod tests {
         AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
         ProcessIncarnation, Timestamp, TurnAuthorityId, TurnConflict, TurnOutcome,
     };
-    use super::DirectTurnAcceptancePass;
-    use crate::runtime::RuntimeManager;
     use std::sync::Arc;
 
     async fn acceptance_pass_runtime() -> Arc<RuntimeManager> {
@@ -1522,7 +1522,9 @@ mod tests {
     async fn direct_turn_acceptance_pass_established_success_and_error_release_owner() {
         for result in [
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok::<_, &str>(42)),
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err::<i32, _>("known")),
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err::<i32, _>(
+                "known",
+            )),
         ] {
             let runtime = acceptance_pass_runtime().await;
             let pass = DirectTurnAcceptancePass::new(&runtime).unwrap();
@@ -1542,9 +1544,7 @@ mod tests {
         let runtime = acceptance_pass_runtime().await;
         let pass = DirectTurnAcceptancePass::new(&runtime).unwrap();
         let error = pass
-            .complete::<()>(
-                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,
-            )
+            .complete::<()>(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
             .unwrap_err();
 
         assert!(matches!(error, SendChatServiceError::Internal(_)));
@@ -1564,7 +1564,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_acceptance_worker_closes_after_requester_drops_handle_and_holds_mutex_until_classified() {
+    async fn detached_acceptance_worker_closes_after_requester_drops_handle_and_holds_mutex_until_classified(
+    ) {
         let runtime = acceptance_pass_runtime().await;
         let conversation_id = "acceptance-pass-test-conversation";
         let acceptance_guard = runtime.lock_message_acceptance(conversation_id).await;
@@ -1594,7 +1595,10 @@ mod tests {
             .is_none());
         classify_tx.send(()).unwrap();
         assert!(classified_rx.await.unwrap());
-        fatal_rx.changed().await.expect("fatal fence watch is latched");
+        fatal_rx
+            .changed()
+            .await
+            .expect("fatal fence watch is latched");
         assert!(runtime.fatal_local_authority_is_latched());
         assert!(runtime.acquire_local_authority_pass().is_err());
         assert!(runtime
@@ -1637,7 +1641,9 @@ mod tests {
         fatal_rx.changed().await.expect("drain closes fatal fence");
         assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
         drop(pass);
-        drained_rx.await.expect("owner drain completes after pass drop");
+        drained_rx
+            .await
+            .expect("owner drain completes after pass drop");
         drain.await.unwrap();
         assert!(runtime.fatal_local_authority_is_latched());
         assert!(runtime.acquire_local_authority_pass().is_err());
@@ -2148,7 +2154,9 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = turn.outcome else {
             panic!("expected created turn")
@@ -2221,7 +2229,9 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = turn.outcome else {
             panic!("expected created turn")
@@ -2257,7 +2267,9 @@ mod tests {
             disposition: AcceptedDisposition::Runtime,
             accepted_at: Timestamp(1),
         })
-        .await.established().expect("acceptance durability is established")
+        .await
+        .established()
+        .expect("acceptance durability is established")
         .unwrap();
         db.set_legacy_conversation_archived(&req.conversation_id)
             .await

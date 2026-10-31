@@ -150,9 +150,9 @@ async fn apply_owned(
     operation: Operation,
     #[cfg(test)] source_gate_wait: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<PreferenceView, String> {
-    let _operation_owner = runtime.acquire_local_authority_pass().map_err(|()| {
-        "runtime admission closed after fatal local authority loss".to_string()
-    })?;
+    let _operation_owner = runtime
+        .acquire_local_authority_pass()
+        .map_err(|()| "runtime admission closed after fatal local authority loss".to_string())?;
     let db = runtime.db();
     db.require_current_coordinator_transcript(&source_transcript_id)
         .await

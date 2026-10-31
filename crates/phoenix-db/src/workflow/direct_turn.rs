@@ -340,7 +340,9 @@ impl WorkflowRepository {
             Ok(step) => step,
             Err(error) => {
                 return match tx.rollback().await {
-                    Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                    Ok(()) => {
+                        crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error))
+                    }
                     Err(rollback_error) => {
                         tracing::warn!(%error, %rollback_error,
                             "direct-turn acceptance rejection rollback acknowledgement failed");
@@ -351,7 +353,9 @@ impl WorkflowRepository {
         };
         if cut == TransactionCut::BeforeCommit {
             return match tx.rollback().await {
-                Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(injected_cut(cut))),
+                Ok(()) => crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                    injected_cut(cut),
+                )),
                 Err(_) => crate::workflow::LocalAuthorityResult::DurableFactUnclassified,
             };
         }
@@ -4618,7 +4622,9 @@ mod tests {
             .unwrap();
         let repo = WorkflowRepository::new(db.pool().clone());
         repo.accept_authoritative_turn(&input("conv-fenced", "admitted", 1))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
 
         let product_conversation_id = db
@@ -4636,7 +4642,9 @@ mod tests {
 
         let error = repo
             .accept_authoritative_turn(&input("conv-fenced", "refused", 2))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap_err();
         assert!(matches!(error, DbError::CloseAdmissionFenced(_)));
         assert_eq!(
@@ -4763,7 +4771,9 @@ mod tests {
     ) -> (TurnAuthorityId, WorkflowId) {
         let created = repo
             .accept_authoritative_turn(&input("conv-a", key, seed))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -4935,12 +4945,8 @@ mod tests {
             TurnOutcome::ExactReplay { turn_id: replay_id, .. } if replay_id == turn_id
         ));
 
-        let invalid_retry = input_with_disposition(
-            "conv-a",
-            "classified",
-            2,
-            AcceptedDisposition::Steering,
-        );
+        let invalid_retry =
+            input_with_disposition("conv-a", "classified", 2, AcceptedDisposition::Steering);
         assert!(matches!(
             repo.accept_authoritative_turn(&invalid_retry).await,
             crate::workflow::LocalAuthorityResult::DurableFactEstablished(Err(_))
@@ -4968,7 +4974,11 @@ mod tests {
             .established()
             .expect("acceptance durability is established")
             .unwrap();
-        let TurnOutcome::ExactReplay { turn_id: committed_id, .. } = recovered.outcome else {
+        let TurnOutcome::ExactReplay {
+            turn_id: committed_id,
+            ..
+        } = recovered.outcome
+        else {
             panic!("lost commit acknowledgement must replay the committed winner");
         };
         let count: i64 = sqlx::query_scalar(
@@ -4996,7 +5006,9 @@ mod tests {
         assert!(matches!(
             before_repo
                 .accept_authoritative_turn(&before_input)
-                .await.established().expect("acceptance durability is established")
+                .await
+                .established()
+                .expect("acceptance durability is established")
                 .unwrap()
                 .outcome,
             TurnOutcome::Created { .. }
@@ -5013,7 +5025,9 @@ mod tests {
         assert!(matches!(
             after_repo
                 .accept_authoritative_turn(&after_input)
-                .await.established().expect("acceptance durability is established")
+                .await
+                .established()
+                .expect("acceptance durability is established")
                 .unwrap()
                 .outcome,
             TurnOutcome::ExactReplay { .. }
@@ -5150,7 +5164,9 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(29),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5214,7 +5230,9 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(29),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5384,7 +5402,9 @@ mod tests {
         let before_repo = repo().await;
         let created = before_repo
             .accept_authoritative_turn(&input("conv-a", "materialize-before", 3))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5436,7 +5456,9 @@ mod tests {
         let after_repo = repo().await;
         let created = after_repo
             .accept_authoritative_turn(&input("conv-a", "materialize-after", 4))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5495,7 +5517,9 @@ mod tests {
         let before_repo = repo().await;
         let created = before_repo
             .accept_authoritative_turn(&input("conv-a", "terminal-before", 5))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5516,7 +5540,9 @@ mod tests {
         let after_repo = repo().await;
         let created = after_repo
             .accept_authoritative_turn(&input("conv-a", "terminal-after", 6))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5551,7 +5577,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "terminal-projection", 7))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5720,7 +5748,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "occurrence-absence-fence", 17))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5800,7 +5830,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "occurrence-fence", 18))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5881,7 +5913,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "resumable-error", 8))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -5947,7 +5981,9 @@ mod tests {
         .unwrap();
         let original_parent = repo
             .accept_authoritative_turn(&input("conv-b", "original-parent-turn", 6))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: original_parent_turn_id,
@@ -5992,7 +6028,9 @@ mod tests {
         .unwrap();
         let later_parent = repo
             .accept_authoritative_turn(&input("conv-b", "later-parent-turn", 7))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: later_parent_turn_id,
@@ -6005,7 +6043,9 @@ mod tests {
 
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "child-terminal-action", 8))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -6051,7 +6091,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "terminal-probe-old", 9))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -6084,7 +6126,9 @@ mod tests {
         );
 
         repo.accept_authoritative_turn(&input("conv-a", "terminal-probe-new", 10))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         assert_eq!(
             repo.probe_terminal_projection(&expected).await.unwrap(),
@@ -6099,7 +6143,9 @@ mod tests {
         sqlx::query("INSERT INTO coordinator_watches(source_product_conversation_id,enrolled_at_us) SELECT product_conversation_id,0 FROM conversations WHERE id = 'conv-a'").execute(&repo.pool).await.unwrap();
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "continuation-terminal", 8))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -6216,7 +6262,9 @@ mod tests {
             let repo = repo().await;
             let created = repo
                 .accept_authoritative_turn(&input("conv-a", key, 11))
-                .await.established().expect("acceptance durability is established")
+                .await
+                .established()
+                .expect("acceptance durability is established")
                 .unwrap();
             let TurnOutcome::Created { turn_id, .. } = created.outcome else {
                 panic!("expected created turn")
@@ -6361,7 +6409,9 @@ mod tests {
         let (directory, setup_repo, _) = open_workflow_repo_pair().await;
         let created = setup_repo
             .accept_authoritative_turn(&input("conv-a", "continuation-contention", 9))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -6475,7 +6525,9 @@ mod tests {
         let (directory, setup_repo, _) = open_workflow_repo_pair().await;
         let created = setup_repo
             .accept_authoritative_turn(&input("conv-a", "continuation-start-contention", 10))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -6848,7 +6900,9 @@ mod tests {
 
         let materialized = repo
             .accept_authoritative_turn(&input("conv-b", "rearm-materialized", 2))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: materialized_id,
@@ -6904,7 +6958,9 @@ mod tests {
         .unwrap();
         let competitor = repo
             .accept_authoritative_turn(&input("conv-a", "rearm-competitor", 3))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: competitor_id,
@@ -6937,7 +6993,9 @@ mod tests {
 
         let steering = repo
             .accept_authoritative_turn(&input("conv-d", "rearm-steering", 4))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: steering_id,
@@ -7045,7 +7103,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "same", 1))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7059,18 +7119,24 @@ mod tests {
         );
         assert!(matches!(
             repo.accept_authoritative_turn(&input("conv-a", "same", 1))
-                .await.established().expect("acceptance durability is established")
+                .await
+                .established()
+                .expect("acceptance durability is established")
                 .unwrap()
                 .outcome,
             TurnOutcome::ExactReplay { .. }
         ));
         assert!(repo
             .accept_authoritative_turn(&input("conv-a", "other", 2))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .is_err());
         assert!(repo
             .accept_authoritative_turn(&input("conv-b", "same", 1))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .is_ok());
         repo.terminate_authoritative_turn(TurnCommand::Cancel {
             turn_id,
@@ -7093,7 +7159,9 @@ mod tests {
         assert_eq!(effect_status, "Invalidated");
         assert!(repo
             .accept_authoritative_turn(&input("conv-a", "other", 2))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .is_ok());
     }
 
@@ -7102,7 +7170,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "terminal-replay", 10))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7327,7 +7397,9 @@ mod tests {
 
         let step = repo
             .accept_authoritative_turn(&input("conv-a", "cross-conversation", 11))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         assert!(matches!(step.outcome, TurnOutcome::Created { .. }));
         assert_eq!(
@@ -7344,7 +7416,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "schema", 11))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7373,7 +7447,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "delete", 4))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7398,7 +7474,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "runtime", 9))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7427,7 +7505,9 @@ mod tests {
         let repo = repo().await;
         let first = repo
             .accept_authoritative_turn(&input("conv-a", "first", 21))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: first_id, ..
@@ -7438,7 +7518,9 @@ mod tests {
         let first_workflow = repo.workflow_id_for_turn(first_id).await.unwrap().unwrap();
         let second = repo
             .accept_authoritative_turn(&input("conv-b", "second", 22))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: second_id, ..
@@ -7449,7 +7531,9 @@ mod tests {
         let second_workflow = repo.workflow_id_for_turn(second_id).await.unwrap().unwrap();
         let materialized = repo
             .accept_authoritative_turn(&input("conv-c", "materialized", 23))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: materialized_id,
@@ -7541,11 +7625,15 @@ mod tests {
             .unwrap();
         let predecessor = repo
             .accept_authoritative_turn(&input("conv-a", "old", 31))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let leaf = repo
             .accept_authoritative_turn(&input(&leaf.id, "live", 32))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created {
             turn_id: predecessor_id,
@@ -7606,7 +7694,9 @@ mod tests {
         let accepted = db
             .workflow_repository()
             .accept_authoritative_turn(&input("conv-a-subordinate", "subordinate", 33))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("created subordinate turn")
@@ -7639,8 +7729,12 @@ mod tests {
             async { first.accept_authoritative_turn(&left_input).await },
             async { second.accept_authoritative_turn(&right_input).await }
         );
-        let left = left.established().expect("acceptance durability is established");
-        let right = right.established().expect("acceptance durability is established");
+        let left = left
+            .established()
+            .expect("acceptance durability is established");
+        let right = right
+            .established()
+            .expect("acceptance durability is established");
         let TurnOutcome::Created {
             turn_id: left_id, ..
         } = left.unwrap().outcome
@@ -7668,8 +7762,12 @@ mod tests {
             async { first.accept_authoritative_turn(&direct_input).await },
             async { second.accept_authoritative_turn(&direct_input).await }
         );
-        let left = left.established().expect("acceptance durability is established");
-        let right = right.established().expect("acceptance durability is established");
+        let left = left
+            .established()
+            .expect("acceptance durability is established");
+        let right = right
+            .established()
+            .expect("acceptance durability is established");
         let left = left.unwrap().outcome;
         let right = right.unwrap().outcome;
         let created = [left.clone(), right.clone()]
@@ -7690,7 +7788,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "claim-cuts", 7))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7729,7 +7829,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "claim", 7))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7772,7 +7874,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "release", 8))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7813,7 +7917,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "preflight", 31))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7929,7 +8035,9 @@ mod tests {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "materialize-phase3", 9))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -7994,7 +8102,9 @@ mod tests {
 
         let terminal_created = repo
             .accept_authoritative_turn(&input("conv-d", "steering-terminal", 12))
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = terminal_created.outcome else {
             panic!("expected created turn")
@@ -8033,8 +8143,18 @@ mod tests {
         let repo = repo().await;
         let input_a = input("conv-a-scope", "same-key", 33);
         let input_b = input("conv-b-scope", "same-key", 34);
-        let step_a = repo.accept_authoritative_turn(&input_a).await.established().expect("acceptance durability is established").unwrap();
-        let step_b = repo.accept_authoritative_turn(&input_b).await.established().expect("acceptance durability is established").unwrap();
+        let step_a = repo
+            .accept_authoritative_turn(&input_a)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
+        let step_b = repo
+            .accept_authoritative_turn(&input_b)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let TurnOutcome::Created {
             turn_id: turn_a, ..
         } = step_a.outcome
@@ -8138,7 +8258,12 @@ mod tests {
             client_key: ClientTurnKey::new("historical-source").unwrap(),
             accepted_at: Timestamp(77),
         };
-        let created = repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
+        let created = repo
+            .accept_authoritative_turn(&input)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected accepted")
         };
@@ -8222,7 +8347,12 @@ mod tests {
             disposition: AcceptedDisposition::Runtime,
             accepted_at: Timestamp(77),
         };
-        let created = repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
+        let created = repo
+            .accept_authoritative_turn(&input)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
@@ -8341,7 +8471,9 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(78),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -8397,7 +8529,9 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(80),
             })
-            .await.established().expect("acceptance durability is established")
+            .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
@@ -8443,7 +8577,11 @@ mod tests {
             disposition: AcceptedDisposition::Runtime,
             accepted_at: Timestamp(90),
         };
-        repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
+        repo.accept_authoritative_turn(&input)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let replay = repo
             .lookup_scoped_direct_turn_replay(&conversation, &input.client_key, &payload.submitted)
             .await
@@ -8458,7 +8596,11 @@ mod tests {
     async fn steering_accept_rehydrates_active_owner_before_commit() {
         let repo = repo().await;
         let runtime = input("conv-a", "runtime-owner", 80);
-        repo.accept_authoritative_turn(&runtime).await.established().expect("acceptance durability is established").unwrap();
+        repo.accept_authoritative_turn(&runtime)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         sqlx::query(
             "UPDATE durable_turns SET prepared_fingerprint = 'corrupt-owner' WHERE conversation_id = ?1 AND client_turn_key = ?2",
         )
@@ -8474,7 +8616,12 @@ mod tests {
             81,
             AcceptedDisposition::Steering,
         );
-        let err = repo.accept_authoritative_turn(&steering).await.established().expect("acceptance durability is established").unwrap_err();
+        let err = repo
+            .accept_authoritative_turn(&steering)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap_err();
         assert!(matches!(
             err,
             DbError::DirectTurnConflict(TurnConflict::CorruptAggregate(_))
@@ -8494,7 +8641,11 @@ mod tests {
     async fn scoped_replay_returns_exact_before_expansion_changes() {
         let repo = repo().await;
         let input = input("conv-replay", "client", 31);
-        repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
+        repo.accept_authoritative_turn(&input)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let mut changed_delivery =
             PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload()).unwrap();
         changed_delivery.delivery.llm_text = Some("changed expansion".to_string());
@@ -8515,7 +8666,11 @@ mod tests {
         use phoenix_core::domain::db_schema::InputOrigin;
         let repo = repo().await;
         let input = input("conv-replay", "legacy-client", 31);
-        repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
+        repo.accept_authoritative_turn(&input)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
             .unwrap()
             .submitted;
@@ -8540,7 +8695,11 @@ mod tests {
     async fn scoped_replay_reports_submitted_identity_changed() {
         let repo = repo().await;
         let input = input("conv-replay", "conflict", 32);
-        repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
+        repo.accept_authoritative_turn(&input)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
             .unwrap()
             .submitted;
@@ -8560,8 +8719,16 @@ mod tests {
         let repo = repo().await;
         let input_a = input("conv-a-scope", "same-key", 33);
         let input_b = input("conv-b-scope", "same-key", 34);
-        repo.accept_authoritative_turn(&input_a).await.established().expect("acceptance durability is established").unwrap();
-        repo.accept_authoritative_turn(&input_b).await.established().expect("acceptance durability is established").unwrap();
+        repo.accept_authoritative_turn(&input_a)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
+        repo.accept_authoritative_turn(&input_b)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         let submitted_a = PreparedDirectTurnPayload::from_exact_bytes(input_a.prepared.payload())
             .unwrap()
             .submitted;
@@ -8604,7 +8771,11 @@ mod tests {
     async fn scoped_replay_rejects_corrupt_persisted_fingerprint() {
         let repo = repo().await;
         let input = input("conv-replay", "corrupt", 35);
-        repo.accept_authoritative_turn(&input).await.established().expect("acceptance durability is established").unwrap();
+        repo.accept_authoritative_turn(&input)
+            .await
+            .established()
+            .expect("acceptance durability is established")
+            .unwrap();
         sqlx::query("UPDATE durable_turns SET prepared_fingerprint = 'not-the-exact-fingerprint' WHERE conversation_id = ?1 AND client_turn_key = ?2")
             .bind(&input.conversation().0)
             .bind(input.client_key.as_str())

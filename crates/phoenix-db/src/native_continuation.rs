@@ -6,7 +6,7 @@ use phoenix_workflow::ClientTurnKey;
 use sqlx::{Connection, Row};
 
 use crate::{
-    workflow::LocalAuthorityResult, ContinueOutcome, ContinuationDispatchIntent, Database, DbError,
+    workflow::LocalAuthorityResult, ContinuationDispatchIntent, ContinueOutcome, Database, DbError,
     DbResult, MessageContent, MessageType, NewContinuationDispatchIntent,
 };
 
@@ -50,7 +50,9 @@ impl Database {
         request: CurrentCoordinatorContinuationRequest<'_>,
         commit: ContinuationCommit,
     ) -> LocalAuthorityResult<DbResult<(ContinueOutcome, CoordinatorContinuationOpening)>> {
-        use LocalAuthorityResult::{DurableFactEstablished as Established, DurableFactUnclassified as Unclassified};
+        use LocalAuthorityResult::{
+            DurableFactEstablished as Established, DurableFactUnclassified as Unclassified,
+        };
 
         let mut connection = match self.pool.acquire().await {
             Ok(connection) => connection,

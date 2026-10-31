@@ -11,7 +11,7 @@ use phoenix_tools::{ToolOutput, ToolRegistry};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{broadcast, Notify};
 
 struct ObserveNativeFatalSink {
     inner: ToolRegistryExecutor,
@@ -110,11 +110,7 @@ async fn assert_native_fatal_sink_is_disposed_without_result(name: &str, input: 
     .unwrap();
     let before_messages = db.get_messages(&source).await.unwrap();
     let before_state = serde_json::to_value(&state).unwrap();
-    let before_updated_at = db
-        .get_conversation(&source)
-        .await
-        .unwrap()
-        .state_updated_at;
+    let before_updated_at = db.get_conversation(&source).await.unwrap().state_updated_at;
     let storage = Arc::new(DatabaseStorage::new(db.clone()));
     let llm = Arc::new(MockLlmClient::new("test-model"));
     let broadcaster = SseBroadcaster::new(32, 0)
