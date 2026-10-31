@@ -34,20 +34,20 @@ use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
     CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
     CodeSearchResponse, ConflictErrorResponse, ContinueConversationRequest,
-    ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
-    ConversationMessageRangeResponse, ConversationMessageSliceResponse,
-    ConversationMessagesAroundResponse, ConversationResponse, ConversationRouteResponse,
-    ConversationSearchQuery, ConversationSearchResponse, ConversationWithMessagesResponse,
-    CreateConversationRequest, CreateProductConversationRequest, CredentialStatusApi,
-    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
-    FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
-    ModelsResponse, NotificationSettingsRequest, ProductConversationCreateAcceptedResponse,
-    ProductConversationRouteResponse, ProjectFileSearchQuery, ProjectSkillsQuery,
-    ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
-    RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
-    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
-    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ContinueConversationResponse, ConversationListResponse, ConversationMessageRangeResponse,
+    ConversationMessageSliceResponse, ConversationMessagesAroundResponse, ConversationResponse,
+    ConversationRouteResponse, ConversationSearchQuery, ConversationSearchResponse,
+    ConversationWithMessagesResponse, CreateConversationRequest, CreateProductConversationRequest,
+    CredentialStatusApi, DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry,
+    FileSearchEntry, FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse,
+    ListFilesResponse, ModelsResponse, NotificationSettingsRequest,
+    ProductConversationCreateAcceptedResponse, ProductConversationRouteResponse,
+    ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse,
+    RecentManagementRootSuggestion, RecentManagementRootSuggestionsResponse,
+    ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse, SkillEntry,
+    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
+    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -21292,6 +21292,94 @@ mod handoff_capacity_api_tests {
             .unwrap()
             .continued_in_conv_id
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn continuation_admission_preserves_close_and_history_conflict_types() {
+        for (id, close, error_type, error) in [
+            (
+                "continue-closing",
+                true,
+                "close_admission_fenced",
+                "Close admission fence rejects continuation admission",
+            ),
+            (
+                "continue-history",
+                false,
+                "target_unavailable",
+                "Conversation is unavailable for continuation admission",
+            ),
+        ] {
+            let state = make_test_state().await;
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            state
+                .db
+                .update_conversation_state(
+                    id,
+                    &ConvState::ContextExhausted {
+                        summary: "retained boundary".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            let conversation = state.db.get_conversation(id).await.unwrap();
+            if close {
+                state
+                    .db
+                    .begin_close_foundation(
+                        &conversation.product_conversation_id,
+                        &phoenix_core::domain::close::TranscriptConversationId::parse(id).unwrap(),
+                        "literal-close-attempt",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query(
+                    "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+                )
+                .bind(conversation.product_conversation_id.as_str())
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            }
+            let before = state.db.get_conversation(id).await.unwrap();
+            let messages = serde_json::to_value(state.db.get_messages(id).await.unwrap()).unwrap();
+            let (status, body) = post(
+                &state,
+                id,
+                "continue",
+                serde_json::json!({
+                    "handoff": "explicit manual handoff",
+                    "message_id": "opening",
+                    "source": { "kind": "manual" },
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error_type"], error_type);
+            assert_eq!(body["error"], error);
+            let after = state.db.get_conversation(id).await.unwrap();
+            assert!(after.continued_in_conv_id.is_none());
+            assert_eq!(
+                serde_json::to_value(after.state).unwrap(),
+                serde_json::to_value(before.state).unwrap(),
+            );
+            assert_eq!(after.state_updated_at, before.state_updated_at);
+            assert_eq!(
+                serde_json::to_value(state.db.get_messages(id).await.unwrap()).unwrap(),
+                messages,
+            );
+            assert!(state
+                .db
+                .continuation_dispatch_intent(id)
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]

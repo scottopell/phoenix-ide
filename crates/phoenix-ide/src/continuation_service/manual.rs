@@ -1,4 +1,4 @@
-use crate::api::handlers::{map_admission_db_error, AppError};
+use crate::api::handlers::{map_admission_db_error, map_ordinary_mutation_admission, AppError};
 use crate::api::{ConflictErrorResponse, ContinueConversationResponse, ContinueConversationStatus};
 use crate::continuation_service::ContinuationApplicationService;
 use crate::send_chat_service::{SendChatApplicationService, SendChatOutcome, SendChatRequest};
@@ -283,12 +283,13 @@ pub(super) async fn continue_manual(
     };
 
     if parent.continued_in_conv_id.is_none() {
-        service
+        let admission = service
             .runtime
             .db()
-            .ensure_conversation_admission_open(id, "continuation admission")
+            .message_target_admission(id)
             .await
             .map_err(map_admission_db_error)?;
+        map_ordinary_mutation_admission(&admission, "continuation admission")?;
         let review = service
             .runtime
             .review_continuation_admission(id, handoff.clone(), opening_authority)
