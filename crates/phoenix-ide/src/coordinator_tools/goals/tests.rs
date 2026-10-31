@@ -703,7 +703,8 @@ async fn native_suspended_goal_replacement_uses_auto_continue_admission_and_pres
         history_before.as_slice()
     );
     assert!(history_after.iter().any(|entry| {
-        entry.goal_id() == &old_goal_id && matches!(entry.state(), GoalState::Suspended(_))
+        entry.snapshot().goal_id() == &old_goal_id
+            && matches!(entry.snapshot().state(), GoalState::Suspended(_))
     }));
 
     f.db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Disabled)

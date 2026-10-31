@@ -489,7 +489,7 @@ async fn preparation_refusal_rechecks_authority_at_publication() {
                     tool_use_id: "unused-ordinary-caller-tool".into(),
                 },
                 &owner,
-                phoenix_db::conversation_goals::GoalPreparationIntent::Create {
+                phoenix_db::conversation_goals::prepared::GoalPreparationIntent::Create {
                     objective: phoenix_core::domain::conversation_goal::GoalText::parse(
                         "refused ordinary caller",
                     )
