@@ -1,0 +1,200 @@
+-- allium: 3
+-- codex-rate-limit-resets.allium
+--
+-- Scope: one logical reset-credit redemption, from the user's choice through
+-- the upstream outcome, plus the conditional resume of the conversation whose
+-- quota-exhaustion error started it. Listing is a plain read and is not
+-- modelled beyond the snapshot the choice is built from.
+--
+-- Requirement traceability:
+--   REQ-CRR-002/003/007  RedemptionConfirmed, RedemptionAnswered*, RedemptionFailed,
+--                        RedemptionRetried, KeyStableAcrossRetries
+--   REQ-CRR-004          RedemptionRequiresConfirmation
+--   REQ-CRR-006          RedemptionConfirmed, OneSubmissionInFlight
+--   REQ-CRR-008          ResumeAfterSuccess, NoResumeAfterErrorLeft,
+--                        SettingsNeverResumes
+--   REQ-CRR-001/005/009/010 are read paths and surface gating, covered by
+--   requirements.md and tests rather than state here.
+
+enum RedemptionOrigin {
+    conversation_error
+    | settings
+}
+
+enum RedeemOutcome {
+    reset
+    | nothing_to_reset
+    | no_credit
+    | already_redeemed
+}
+
+entity Conversation {
+    -- True while the conversation is displayed in a user-resumable
+    -- usage_limit_reached error state.
+    in_usage_limit_error: Boolean
+    resumed_by_redemption: Boolean
+}
+
+entity Redemption {
+    origin: RedemptionOrigin
+    -- Present iff origin = conversation_error.
+    conversation: Conversation?
+    -- Absent when the backend chooses the credit.
+    credit_id: String?
+    idempotency_key: String
+    -- Set at confirmation; reused unchanged by every retry.
+    confirmed_key: String?
+    state: choosing | confirming | in_flight | succeeded | declined | failed | cancelled
+    outcome: RedeemOutcome?
+}
+
+rule ResetChosen {
+    when: UserChose(redemption, credit)
+    requires: redemption.state = choosing
+    ensures:
+        redemption.credit_id = credit
+        redemption.state = confirming
+    @guidance
+        -- credit is null for the backend-chooses option offered when the
+        -- listing reports a positive count but no available credit details.
+}
+
+rule ChoiceReopened {
+    when: UserWentBack(redemption)
+    requires: redemption.state = confirming
+    ensures:
+        redemption.state = choosing
+}
+
+rule RedemptionConfirmed {
+    when: UserConfirmed(redemption, key)
+    requires: redemption.state = confirming
+    ensures:
+        redemption.idempotency_key = key
+        redemption.confirmed_key = key
+        redemption.state = in_flight
+    @guidance
+        -- Create a fresh UUID key when the confirmation is shown, submit one
+        -- upstream consume request with it and the chosen credit_id, and
+        -- disable the confirm action until an answer arrives.
+}
+
+rule RedemptionCancelled {
+    when: UserCancelled(redemption)
+    requires: redemption.state = choosing or redemption.state = confirming
+    ensures:
+        redemption.state = cancelled
+}
+
+rule RedemptionAnsweredSuccess {
+    when: UpstreamAnswered(redemption, outcome)
+    requires: redemption.state = in_flight
+    requires: outcome = reset or outcome = already_redeemed
+    ensures:
+        redemption.outcome = outcome
+        redemption.state = succeeded
+    @guidance
+        -- Refresh the account quota and reset listing.
+}
+
+rule RedemptionAnsweredDeclined {
+    when: UpstreamAnswered(redemption, outcome)
+    requires: redemption.state = in_flight
+    requires: outcome = nothing_to_reset or outcome = no_credit
+    ensures:
+        redemption.outcome = outcome
+        redemption.state = declined
+    @guidance
+        -- nothing_to_reset: "Your usage does not need a reset right now."
+        -- no_credit with credit_id: "That reset is no longer available."
+        --   and refresh the listing.
+        -- no_credit without credit_id: "No usage limit resets are available."
+}
+
+rule RedemptionFailed {
+    when: UpstreamFailed(redemption)
+    requires: redemption.state = in_flight
+    ensures:
+        redemption.state = failed
+}
+
+rule RedemptionRetried {
+    when: UserRetried(redemption)
+    requires: redemption.state = failed
+    ensures:
+        redemption.state = in_flight
+    @guidance
+        -- Resubmit with the same idempotency_key and credit_id. A lost success
+        -- answers already_redeemed instead of spending a second credit.
+}
+
+rule ResumeAfterSuccess {
+    when: RedemptionSucceeded(redemption, conversation)
+    requires: redemption.state = succeeded
+    requires: redemption.origin = conversation_error
+    requires: redemption.conversation = conversation
+    requires: conversation.in_usage_limit_error
+    ensures:
+        conversation.resumed_by_redemption = true
+    @guidance
+        -- Resume through the error's existing Retry path (send "continue").
+}
+
+rule NoResumeAfterErrorLeft {
+    when: RedemptionSucceeded(redemption, conversation)
+    requires: redemption.state = succeeded
+    requires: not conversation.in_usage_limit_error
+    ensures:
+        conversation.resumed_by_redemption = false
+}
+
+invariant RedemptionRequiresConfirmation {
+    for r in Redemption:
+        (r.state = in_flight or r.state = succeeded or r.state = declined or r.state = failed)
+            implies r.confirmed_key != null
+}
+
+invariant KeyStableAcrossRetries {
+    for r in Redemption:
+        r.confirmed_key != null implies r.idempotency_key = r.confirmed_key
+}
+
+invariant SettingsNeverResumes {
+    for r in Redemption:
+        r.origin = settings implies r.conversation = null
+}
+
+invariant OneSubmissionInFlight {
+    for r in Redemption:
+        r.state = in_flight implies r.outcome = null
+}
+
+invariant ConversationOriginHasConversation {
+    for r in Redemption:
+        r.origin = conversation_error implies r.conversation != null
+}
+
+surface ResetRedemption {
+    facing user: Redemption
+    provides:
+        UserChose(user, credit)
+        UserWentBack(user)
+        UserConfirmed(user, key)
+        UserCancelled(user)
+        UserRetried(user)
+    @guarantee ManualOnly
+        -- No rule creates or confirms a Redemption from quota exhaustion,
+        -- retry, restart, resume, or any background process (REQ-CRR-004).
+}
+
+surface CodexBackendRedeem {
+    facing redemption: Redemption
+    context conversation: Conversation
+    provides:
+        UpstreamAnswered(redemption, outcome)
+        UpstreamFailed(redemption)
+        RedemptionSucceeded(redemption, conversation)
+    @guarantee IdempotentKey
+        -- A replay of a key that already redeemed answers already_redeemed and
+        -- spends nothing; nothing_to_reset spends nothing.
+}
