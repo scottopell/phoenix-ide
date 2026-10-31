@@ -12,6 +12,13 @@ use crate::send_chat_service::{
     MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
 };
 
+mod manual;
+
+#[cfg(test)]
+pub(crate) use manual::{
+    automatic_retry_phase_for_turn_state, continuation_message_id,
+};
+
 fn winning_intent_is_automatic(
     admission: &AutomaticContinuationAdmission,
     intent: &crate::db::ContinuationDispatchIntent,
@@ -19,7 +26,7 @@ fn winning_intent_is_automatic(
     intent.message_id == admission.first_message_id
 }
 
-fn continuation_expansion_policy(
+pub(crate) fn continuation_expansion_policy(
     authority: ContinuationOpeningAuthority,
 ) -> MessageExpansionPolicy {
     match authority {
@@ -71,6 +78,14 @@ pub(crate) struct ContinuationApplicationService {
 }
 
 impl ContinuationApplicationService {
+    pub(crate) async fn continue_manual(
+        &self,
+        parent_id: &str,
+        req: crate::api::ContinueConversationRequest,
+    ) -> Result<crate::api::ContinueConversationResponse, crate::api::handlers::AppError> {
+        manual::continue_manual(self, parent_id, req).await
+    }
+
     #[must_use]
     pub(crate) fn new(runtime: Arc<RuntimeManager>) -> Self {
         Self { runtime }
