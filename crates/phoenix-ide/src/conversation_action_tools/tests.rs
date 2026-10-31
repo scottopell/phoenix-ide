@@ -132,7 +132,7 @@ pub(super) fn native_context(transcript: &str) -> ToolContext {
     .with_tool_use_id("native-call")
 }
 
-pub(super) async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) {
+pub(crate) async fn native_runtime() -> (Arc<RuntimeManager>, crate::db::Database, String) {
     let db = crate::db::Database::open_in_memory().await.unwrap();
     let coordinator = db
         .get_or_create_coordinator(None, LlmLanguage::default())

@@ -1734,6 +1734,10 @@ pub struct Database {
     #[cfg(test)]
     steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
     #[cfg(any(test, feature = "test-support"))]
+    native_settings_commit_test_pause: std::sync::Arc<
+        std::sync::Mutex<Option<automatic_continuation_settings::SettingsCommitTestPause>>,
+    >,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) steering_capacity_test_control: SteeringCapacityTestControl,
 }
 
@@ -1760,6 +1764,8 @@ impl Clone for Database {
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
             #[cfg(test)]
             steering_drain_test_latch: self.steering_drain_test_latch.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            native_settings_commit_test_pause: self.native_settings_commit_test_pause.clone(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: self.steering_capacity_test_control.clone(),
         }
@@ -1997,6 +2003,8 @@ impl Database {
             steering_begin_test_latch: None,
             #[cfg(test)]
             steering_drain_test_latch: None,
+            #[cfg(any(test, feature = "test-support"))]
+            native_settings_commit_test_pause: std::sync::Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: SteeringCapacityTestControl::default(),
         }

@@ -29474,6 +29474,12 @@ mod overload_startup_tests {
     }
 }
 
+#[cfg(test)]
+mod native_action_fatal_tests;
+
+#[cfg(test)]
+mod native_setting_uncertainty_tests;
+
 /// The tool path's generation guard mirrors the LLM path's. An intentional
 /// `Effect::AbortTool` / `CancellingTool` backstop teardown drops the aborted
 /// tool task's outcome sender; the forwarder maps that drop to a synthetic

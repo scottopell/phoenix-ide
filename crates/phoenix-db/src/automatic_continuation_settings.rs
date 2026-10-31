@@ -68,11 +68,42 @@ pub(crate) async fn write_preference_on(
 #[derive(Clone, Copy)]
 enum SettingsCommit {
     Acknowledge,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     LoseAcknowledgement,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct SettingsCommitTestPause {
+    committed: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 impl Database {
+    /// Arms one native settings write to lose its commit acknowledgement, pausing
+    /// before returning the unclassified outcome until the release sender is used.
+    /// The control is shared only by clones of this DB.
+    ///
+    /// # Panics
+    /// Panics if another native settings acknowledgement pause is already armed.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn pause_next_native_settings_commit_ack_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (committed, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut pause = self.native_settings_commit_test_pause.lock().unwrap();
+        assert!(pause.is_none(), "native settings commit pause already armed");
+        *pause = Some(SettingsCommitTestPause {
+            committed,
+            release: released,
+        });
+        (observed, release)
+    }
+
     /// Reads the current preference for a verified transcript and target.
     ///
     /// # Errors
@@ -106,6 +137,27 @@ impl Database {
         target: AutomaticContinuationTarget<'_>,
         preference: AutoContinueOnContextExhaustion,
     ) -> LocalAuthorityResult<DbResult<AutomaticContinuationSettings>> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let pause = self.native_settings_commit_test_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let result = self
+                    .set_native_automatic_continuation_settings_with_commit(
+                        source_transcript_id,
+                        target,
+                        preference,
+                        SettingsCommit::LoseAcknowledgement,
+                    )
+                    .await;
+                assert!(matches!(result, LocalAuthorityResult::DurableFactUnclassified));
+                let _ = pause.committed.send(());
+                pause
+                    .release
+                    .await
+                    .expect("native settings commit pause controller dropped");
+                return result;
+            }
+        }
         self.set_native_automatic_continuation_settings_with_commit(
             source_transcript_id,
             target,
