@@ -403,6 +403,316 @@ impl phoenix_llm::LlmService for OpeningProvider {
 }
 
 #[tokio::test]
+async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settlement() {
+    use crate::runtime::SseEvent;
+    use phoenix_db::ContinuationOpeningRead;
+    use phoenix_workflow::{AcceptedDisposition, Materialization, TurnLifecycle, TurnTerminal};
+    use tokio::sync::{broadcast, mpsc, oneshot, Barrier, Semaphore};
+
+    struct CountedProvider {
+        entries: mpsc::UnboundedSender<String>,
+        release: Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for CountedProvider {
+        async fn complete(
+            &self,
+            request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            self.entries
+                .send(request.telemetry.as_ref().unwrap().conversation_id.clone())
+                .expect("count every provider entry");
+            self.release
+                .acquire()
+                .await
+                .expect("provider release gate stays open")
+                .forget();
+            Ok(phoenix_llm::LlmResponse {
+                provider_replay: None,
+                content: Vec::new(),
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                usage_observation: phoenix_core::domain::llm_types::UsageObservation::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "claude-sonnet-5"
+        }
+    }
+
+    let (entries, mut entered) = mpsc::unbounded_channel();
+    let provider = Arc::new(CountedProvider {
+        entries,
+        release: Semaphore::new(0),
+    });
+    let registry = Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(
+        provider.clone(),
+    ));
+    let f = Fixture::with_registry(registry).await;
+    f.runtime
+        .start_direct_turn_worker()
+        .await
+        .expect("fresh concurrent fixture direct-turn worker startup");
+    let predecessor = f.db.get_conversation(&f.predecessor).await.unwrap();
+    assert!(matches!(
+        predecessor.state,
+        ConvState::ContextExhausted { .. }
+    ));
+    assert!(predecessor.continued_in_conv_id.is_none());
+    let scope_id = predecessor.attached_work_scope_id.as_ref().unwrap();
+    let scopes_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert!(f
+        .db
+        .continuation_dispatch_intent(&f.predecessor)
+        .await
+        .unwrap()
+        .is_none());
+    let source = f.db.get_conversation(&f.source).await.unwrap();
+    let source_gate = f
+        .runtime
+        .lock_product_message_admission(source.product_conversation_id.as_str())
+        .await;
+    let (left_waiting, left_wait) = oneshot::channel();
+    let (right_waiting, right_wait) = oneshot::channel();
+    let mut left_request = f.request("fresh-concurrent-left");
+    left_request.source_gate_wait = Some(left_waiting);
+    let mut right_request = f.request("fresh-concurrent-right");
+    right_request.source_gate_wait = Some(right_waiting);
+    let start = Barrier::new(2);
+    let left_service = f.service();
+    let right_service = f.service();
+    let (left, right, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(
+            async {
+                start.wait().await;
+                left_service.continue_from_coordinator(left_request).await
+            },
+            async {
+                start.wait().await;
+                right_service.continue_from_coordinator(right_request).await
+            },
+            async {
+                left_wait.await.expect("left request reached source gate");
+                right_wait.await.expect("right request reached source gate");
+                drop(source_gate);
+            },
+        )
+    })
+    .await
+    .expect("both concurrent requests finish after source admission");
+    let left = left.established().unwrap();
+    let right = right.established().unwrap();
+    let (created, replayed, winning_key) = match (&left.status, &right.status) {
+        (ContinueConversationStatus::Accepted, ContinueConversationStatus::AlreadyExists) => {
+            (&left, &right, "fresh-concurrent-left")
+        }
+        (ContinueConversationStatus::AlreadyExists, ContinueConversationStatus::Accepted) => {
+            (&right, &left, "fresh-concurrent-right")
+        }
+        statuses => panic!("one fresh acceptance and one replay required: {statuses:?}"),
+    };
+    assert_eq!(created.conversation_id, replayed.conversation_id);
+    assert_ne!(created.conversation_id, f.predecessor);
+    assert!(created.error.is_none());
+    assert!(replayed.error.is_none());
+    let successor_id = &created.conversation_id;
+    let provider_conversation =
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered.recv())
+            .await
+            .expect("fresh opening reaches provider")
+            .expect("provider entry channel stays open");
+    assert_eq!(provider_conversation, *successor_id);
+    let mut events = f.runtime.subscribe(successor_id).await.unwrap();
+    let successor = f.db.get_conversation(successor_id).await.unwrap();
+    assert!(matches!(successor.state, ConvState::LlmRequesting { .. }));
+    assert_eq!(successor.product_conversation_id, f.product);
+    assert_eq!(
+        successor.attached_work_scope_id,
+        predecessor.attached_work_scope_id
+    );
+    assert_eq!(successor.conv_mode, predecessor.conv_mode);
+    assert_eq!(successor.runtime_role, predecessor.runtime_role);
+    assert_eq!(
+        f.db.get_conversation(&f.predecessor)
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .as_deref(),
+        Some(successor_id.as_str())
+    );
+    let members: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1")
+            .bind(f.product.as_str())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(members, 2);
+    let scopes_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(scopes_after, scopes_before);
+    let owned_scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
+    )
+    .bind(f.product.as_str())
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(owned_scopes, vec![scope_id.as_str().to_string()]);
+    let ContinuationOpeningRead::Accepted {
+        edge,
+        accepted_message_id,
+        opening_authority,
+        ..
+    } = f.db.read_continuation_opening(successor_id).await.unwrap()
+    else {
+        panic!("fresh opening must be durably accepted before provider entry");
+    };
+    assert_eq!(edge.product_conversation_id, f.product);
+    assert_eq!(edge.predecessor_transcript_row_id, f.predecessor);
+    assert_eq!(edge.successor_transcript_row_id, *successor_id);
+    assert_eq!(edge.continuation_message_id, SUMMARY_ID);
+    assert_eq!(
+        opening_authority,
+        ContinuationOpeningAuthority::GeneratedPredecessorContext
+    );
+    assert_eq!(accepted_message_id, format!("{successor_id}:{winning_key}"));
+    assert!(f
+        .db
+        .continuation_dispatch_intent(&f.predecessor)
+        .await
+        .unwrap()
+        .is_none());
+    let opening = f.db.get_messages(successor_id).await.unwrap();
+    let openings: Vec<_> = opening
+        .iter()
+        .filter(|m| matches!(m.content, MessageContent::Continuation(_)))
+        .collect();
+    assert_eq!(openings.len(), 1);
+    assert_eq!(openings[0].id, accepted_message_id);
+    assert!(matches!(openings[0].origin, InputOrigin::SystemGenerated));
+    let MessageContent::Continuation(content) = &openings[0].content else {
+        unreachable!();
+    };
+    assert_eq!(content.summary, SUMMARY);
+    let workflow = f.db.workflow_repository();
+    let turn = workflow
+        .owning_turn_for_conversation(&phoenix_workflow::ConversationAuthority(
+            successor_id.clone(),
+        ))
+        .await
+        .unwrap()
+        .expect("blocked provider belongs to one admitted turn");
+    assert_eq!(turn.conversation.0, *successor_id);
+    assert_eq!(turn.client_key.as_str(), winning_key);
+    assert_eq!(
+        turn.lifecycle,
+        TurnLifecycle::Accepted {
+            disposition: AcceptedDisposition::Runtime
+        }
+    );
+    assert_eq!(
+        turn.materialization,
+        Materialization::Materialized {
+            message_id: phoenix_workflow::CanonicalMessageId(accepted_message_id.clone())
+        }
+    );
+    let turns: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM durable_turns WHERE conversation_id = ?1")
+            .bind(successor_id)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(turns, 1);
+    loop {
+        match events.try_recv() {
+            Ok(SseEvent::StateChange {
+                state: ConvState::Idle | ConvState::Error { .. },
+                ..
+            }) => {
+                panic!("terminal/error state before provider release");
+            }
+            Ok(SseEvent::Error { .. }) => panic!("error before provider release"),
+            Ok(_) => {}
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("pre-release successor event stream failed: {error}"),
+        }
+    }
+    assert!(matches!(
+        entered.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    provider.release.add_permits(1);
+    let settled_at = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match events
+                .recv()
+                .await
+                .expect("successor event stream must not lag or close")
+            {
+                SseEvent::StateChange {
+                    state: ConvState::Idle,
+                    state_updated_at,
+                    ..
+                } => break state_updated_at,
+                SseEvent::StateChange {
+                    state: ConvState::Error { .. },
+                    ..
+                }
+                | SseEvent::Error { .. } => panic!("fresh turn failed instead of settling"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("released fresh turn publishes terminal settlement");
+    let settled = workflow
+        .load_authoritative_turn(turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.id, turn.id);
+    assert_eq!(settled.conversation, turn.conversation);
+    assert_eq!(settled.client_key, turn.client_key);
+    assert_eq!(settled.materialization, turn.materialization);
+    assert_eq!(
+        settled.lifecycle,
+        TurnLifecycle::Terminal {
+            terminal: TurnTerminal::Completed,
+            disposition: AcceptedDisposition::Runtime
+        }
+    );
+    let final_conversation = f.db.get_conversation(successor_id).await.unwrap();
+    assert!(matches!(final_conversation.state, ConvState::Idle));
+    assert_eq!(final_conversation.state_updated_at, settled_at);
+    assert!(workflow
+        .owning_turn_for_conversation(&phoenix_workflow::ConversationAuthority(
+            successor_id.clone()
+        ))
+        .await
+        .unwrap()
+        .is_none());
+    let final_messages = f.db.get_messages(successor_id).await.unwrap();
+    let final_openings: Vec<_> = final_messages
+        .iter()
+        .filter(|m| matches!(m.content, MessageContent::Continuation(_)))
+        .collect();
+    assert_eq!(final_openings.len(), 1);
+    assert_eq!(final_openings[0].id, accepted_message_id);
+    assert!(matches!(
+        entered.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
 async fn pending_replay_uses_winning_generated_opening_and_dispatches_it_once() {
     let provider = Arc::new(OpeningProvider {
         entered: tokio::sync::Notify::new(),
