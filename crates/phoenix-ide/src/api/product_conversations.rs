@@ -8,18 +8,14 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use phoenix_core::domain::close::TranscriptConversationId;
-use phoenix_core::domain::db_schema::MessageContent;
 use phoenix_core::domain::product_conversation::{
-    AutoContinueOnContextExhaustion, AutomaticContinuationPhase,
-    OrdinaryProductConversationLifecycle, ProductConversationId,
+    AutoContinueOnContextExhaustion, OrdinaryProductConversationLifecycle, ProductConversationId,
 };
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use super::handlers::AppError;
 use super::types::{
-    AutomaticContinuationAdmissionPhaseView, AutomaticContinuationAdmissionView,
-    AutomaticContinuationAggregateView, AutomaticContinuationFailureView,
     AutomaticContinuationView, ConversationHistoryBoundaryView, ConversationHistorySegmentView,
     CoordinatorConversationSnapshotView, OrdinaryProductConversationLifecycleView,
     ProductConversationChainQaCompatibilityView, ProductConversationCloseActionView,
@@ -288,14 +284,12 @@ pub async fn get_product_conversation_automatic_continuation(
     let product_conversation_id = reference
         .parse::<ProductConversationId>()
         .map_err(|_| AppError::NotFound("ProductConversation not found".to_string()))?;
-    state
-        .db
-        .get_ordinary_product_conversation(&product_conversation_id)
-        .await
-        .map_err(db_to_app)?;
-    automatic_continuation_view(&state, product_conversation_id, false)
-        .await
-        .map(Json)
+    crate::automatic_continuation_settings::read(
+        &state.db,
+        crate::automatic_continuation_settings::Target::Ordinary(product_conversation_id),
+    )
+    .await
+    .map(Json)
 }
 
 pub async fn put_product_conversation_automatic_continuation(
@@ -306,182 +300,37 @@ pub async fn put_product_conversation_automatic_continuation(
     let product_conversation_id = reference
         .parse::<ProductConversationId>()
         .map_err(|_| AppError::NotFound("ProductConversation not found".to_string()))?;
-    state
-        .db
-        .get_ordinary_product_conversation(&product_conversation_id)
-        .await
-        .map_err(db_to_app)?;
-    state
-        .db
-        .set_auto_continue_on_context_exhaustion(
-            &product_conversation_id,
-            AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
-        )
-        .await
-        .map_err(db_to_app)?;
-    automatic_continuation_view(&state, product_conversation_id, false)
-        .await
-        .map(Json)
+    crate::automatic_continuation_settings::set(
+        &state.db,
+        crate::automatic_continuation_settings::Target::Ordinary(product_conversation_id),
+        AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
+    )
+    .await
+    .map(Json)
 }
 
 pub async fn get_coordinator_automatic_continuation(
     State(state): State<AppState>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
-    coordinator_automatic_continuation_view(&state)
-        .await
-        .map(Json)
+    crate::automatic_continuation_settings::read(
+        &state.db,
+        crate::automatic_continuation_settings::Target::Coordinator,
+    )
+    .await
+    .map(Json)
 }
 
 pub async fn put_coordinator_automatic_continuation(
     State(state): State<AppState>,
     Json(request): Json<UpdateAutomaticContinuationRequest>,
 ) -> Result<Json<AutomaticContinuationView>, AppError> {
-    let coordinator_id = coordinator_conversation_id(&state).await?;
-    let coordinator = state
-        .db
-        .get_conversation(&coordinator_id)
-        .await
-        .map_err(db_to_app)?;
-    state
-        .db
-        .set_auto_continue_on_context_exhaustion(
-            &coordinator.product_conversation_id,
-            AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
-        )
-        .await
-        .map_err(db_to_app)?;
-    automatic_continuation_view(&state, coordinator.product_conversation_id, true)
-        .await
-        .map(Json)
-}
-
-async fn coordinator_automatic_continuation_view(
-    state: &AppState,
-) -> Result<AutomaticContinuationView, AppError> {
-    let coordinator_id = coordinator_conversation_id(state).await?;
-    let coordinator = state
-        .db
-        .get_conversation(&coordinator_id)
-        .await
-        .map_err(db_to_app)?;
-    automatic_continuation_view(state, coordinator.product_conversation_id, true).await
-}
-
-async fn coordinator_conversation_id(state: &AppState) -> Result<String, AppError> {
-    state
-        .db
-        .coordinator_conversation_id()
-        .await
-        .map_err(db_to_app)?
-        .ok_or_else(|| AppError::NotFound("Coordinator has not been created".to_string()))
-}
-
-async fn automatic_continuation_view(
-    state: &AppState,
-    product_conversation_id: ProductConversationId,
-    coordinator: bool,
-) -> Result<AutomaticContinuationView, AppError> {
-    let preference = state
-        .db
-        .auto_continue_on_context_exhaustion(&product_conversation_id)
-        .await
-        .map_err(db_to_app)?;
-    let admission = state
-        .db
-        .latest_automatic_continuation_admission(&product_conversation_id)
-        .await
-        .map_err(db_to_app)?;
-    let admission = if let Some(admission) = admission {
-        let actionable_failure = if let Some(message) = admission.last_error {
-            let summary = state
-                .db
-                .get_message_by_id_in_conversation(
-                    &admission.predecessor_conversation_id,
-                    &admission.summary_message_id,
-                )
-                .await
-                .map_err(db_to_app)?;
-            let MessageContent::Continuation(summary) = summary.content else {
-                return Err(AppError::Internal(
-                    "automatic continuation summary has the wrong message type".to_string(),
-                ));
-            };
-            let persisted_winner = state
-                .db
-                .continuation_dispatch_intent(&admission.predecessor_conversation_id)
-                .await
-                .map_err(db_to_app)?;
-            let (first_message_id, accepted_handoff, opening_authority) = persisted_winner
-                .map(|intent| {
-                    (
-                        intent.message_id.as_str().to_string(),
-                        intent.handoff,
-                        intent.opening_authority,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        admission.first_message_id.as_str().to_string(),
-                        summary.summary,
-                        admission.opening_authority,
-                    )
-                });
-            Some(AutomaticContinuationFailureView {
-                message,
-                first_message_id,
-                accepted_handoff,
-                opening_authority,
-            })
-        } else {
-            None
-        };
-        Some(AutomaticContinuationAdmissionView {
-            predecessor_transcript_row_id: admission.predecessor_conversation_id,
-            phase: admission_phase_view(admission.phase),
-            no_progress_attempts: admission.no_progress_attempts,
-            actionable_failure,
-        })
-    } else {
-        None
-    };
-    let id = product_conversation_id.to_string();
-    Ok(AutomaticContinuationView {
-        aggregate: if coordinator {
-            AutomaticContinuationAggregateView::Coordinator {
-                product_conversation_id: id,
-            }
-        } else {
-            AutomaticContinuationAggregateView::Ordinary {
-                product_conversation_id: id,
-            }
-        },
-        auto_continue_on_context_exhaustion: preference.is_enabled(),
-        admission,
-    })
-}
-
-fn admission_phase_view(
-    phase: AutomaticContinuationPhase,
-) -> AutomaticContinuationAdmissionPhaseView {
-    match phase {
-        AutomaticContinuationPhase::Admitted => AutomaticContinuationAdmissionPhaseView::Admitted,
-        AutomaticContinuationPhase::SuccessorReserved => {
-            AutomaticContinuationAdmissionPhaseView::SuccessorReserved
-        }
-        AutomaticContinuationPhase::OwnershipTransferred => {
-            AutomaticContinuationAdmissionPhaseView::OwnershipTransferred
-        }
-        AutomaticContinuationPhase::DispatchAccepted => {
-            AutomaticContinuationAdmissionPhaseView::DispatchAccepted
-        }
-        AutomaticContinuationPhase::MessageSettled => {
-            AutomaticContinuationAdmissionPhaseView::MessageSettled
-        }
-        AutomaticContinuationPhase::Superseded => {
-            AutomaticContinuationAdmissionPhaseView::Superseded
-        }
-        AutomaticContinuationPhase::Failed => AutomaticContinuationAdmissionPhaseView::Failed,
-    }
+    crate::automatic_continuation_settings::set(
+        &state.db,
+        crate::automatic_continuation_settings::Target::Coordinator,
+        AutoContinueOnContextExhaustion::from(request.auto_continue_on_context_exhaustion),
+    )
+    .await
+    .map(Json)
 }
 
 pub async fn list_product_conversations(
