@@ -25452,15 +25452,15 @@ mod goal_report_cancellation_checkpoint_tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn accepted_user_cancel_retains_unwatched_initial_receipt_through_idle_and_replay() {
-        use phoenix_core::domain::db_schema::{
-            ConvMode, Conversation, Message, SteeringAcceptanceFingerprint, UserContent,
-        };
+        use phoenix_core::domain::db_schema::{ConvMode, Conversation, Message, UserContent};
         use phoenix_core::llm_language::LlmLanguage;
-        use phoenix_core::work_scope::{AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId};
+        use phoenix_core::work_scope::{
+            AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId,
+        };
         use phoenix_db::{
             ClaimedProductCreationJob, ProductCreationInitialExecution, ProductCreationIntent,
             ProductCreationOrigin, ProductCreationProvisioningStage as Stage,
-            ProductCreationPublishInput,
+            ProductCreationPublishInput, SteeringAcceptanceFingerprint,
         };
         use phoenix_llm::{ModelEffort, ServiceTier};
 
@@ -25540,8 +25540,8 @@ mod goal_report_cancellation_checkpoint_tests {
             llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
         };
-        assert!(
-            db.publish_product_creation_atomically(&ProductCreationPublishInput {
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: request_id.into(),
                 claim: provisioning.claim.clone(),
                 conversation,
@@ -25550,11 +25550,14 @@ mod goal_report_cancellation_checkpoint_tests {
                 git_publication: None,
             })
             .await
-            .unwrap()
-        );
+            .unwrap());
         let delivery = ClaimedProductCreationJob {
             claim: provisioning.claim,
-            job: db.get_product_creation_job(request_id).await.unwrap().unwrap(),
+            job: db
+                .get_product_creation_job(request_id)
+                .await
+                .unwrap()
+                .unwrap(),
         };
         let fingerprint = format!("product-create:{request_id}");
         let entry = phoenix_core::domain::sm_event::SteerEntry {
@@ -25570,16 +25573,15 @@ mod goal_report_cancellation_checkpoint_tests {
         db.append_product_creation_steering_entry(&delivery, &entry, &fingerprint)
             .await
             .unwrap();
-        assert!(
-            db.complete_product_creation_delivery(
+        assert!(db
+            .complete_product_creation_delivery(
                 request_id,
                 &delivery.claim,
                 &SteeringAcceptanceFingerprint::Exact(fingerprint),
                 &intent,
             )
             .await
-            .unwrap()
-        );
+            .unwrap());
         let content = MessageContent::User(UserContent::new(intent.objective));
         let initial = Message {
             message_id: request_id.into(),
