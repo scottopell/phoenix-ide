@@ -43,6 +43,10 @@ pub use prompt_projection::{
 };
 pub mod conversation_goals;
 mod conversation_name;
+mod automatic_continuation_settings;
+pub use automatic_continuation_settings::{
+    AutomaticContinuationSettings, AutomaticContinuationTarget, ResolvedAutomaticContinuationAggregate,
+};
 mod native_continuation;
 pub use native_continuation::{
     CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
@@ -7020,16 +7024,9 @@ impl Database {
         &self,
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<AutoContinueOnContextExhaustion> {
-        let enabled: Option<i64> = sqlx::query_scalar(
-            "SELECT auto_continue_on_context_exhaustion
-             FROM product_conversations WHERE id = ?1",
-        )
-        .bind(product_conversation_id.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-        enabled
-            .map(|value| AutoContinueOnContextExhaustion::from(value != 0))
-            .ok_or_else(|| DbError::ProductConversationUnavailable(product_conversation_id.clone()))
+        let mut connection = self.pool.acquire().await?;
+        automatic_continuation_settings::read_preference_on(&mut connection, product_conversation_id)
+            .await
     }
 
     /// Persist the aggregate-scoped automatic-continuation preference.
@@ -7043,21 +7040,13 @@ impl Database {
         product_conversation_id: &ProductConversationId,
         preference: AutoContinueOnContextExhaustion,
     ) -> DbResult<()> {
-        let updated = sqlx::query(
-            "UPDATE product_conversations
-             SET auto_continue_on_context_exhaustion = ?1
-             WHERE id = ?2",
+        let mut connection = self.pool.acquire().await?;
+        automatic_continuation_settings::write_preference_on(
+            &mut connection,
+            product_conversation_id,
+            preference,
         )
-        .bind(i64::from(bool::from(preference)))
-        .bind(product_conversation_id.as_str())
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(DbError::ProductConversationUnavailable(
-                product_conversation_id.clone(),
-            ));
-        }
-        Ok(())
+        .await
     }
 
     /// Return the automatic continuation admitted for this predecessor, if any.
