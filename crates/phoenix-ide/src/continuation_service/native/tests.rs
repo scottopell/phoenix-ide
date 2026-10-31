@@ -175,11 +175,37 @@ async fn cancelling_an_armed_reservation_task_closes_before_release() {
 }
 
 #[tokio::test]
+async fn closed_authority_returns_terminal_completion_without_reserving_a_successor() {
+    let f = Fixture::new().await;
+    drop(f.pass());
+    let completion = f.service().continue_from_coordinator(f.request("closed-retry")).await;
+    assert!(matches!(completion, NativeContinueCompletion::LocalAuthorityClosed));
+    assert!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.is_none());
+    assert!(f.db.continuation_dispatch_intent(&f.predecessor).await.unwrap().is_none());
+    f.assert_closed_with_owner();
+}
+
+#[tokio::test]
+async fn completed_opening_replay_after_authority_close_has_no_ordinary_reply() {
+    let f = Fixture::new().await;
+    let intent = f.reserve().await;
+    f.complete(&intent).await;
+    drop(f.pass());
+    let completion = f.service().continue_from_coordinator(f.request("closed-replay")).await;
+    assert!(matches!(completion, NativeContinueCompletion::LocalAuthorityClosed));
+    let messages = f.db.get_messages(&intent.successor_conversation_id).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message_id, WINNER);
+    assert_eq!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.as_deref(), Some(intent.successor_conversation_id.as_str()));
+    f.assert_closed_with_owner();
+}
+
+#[tokio::test]
 async fn completed_generated_opening_replays_without_a_provider_or_new_successor() {
     let f = Fixture::new().await;
     let intent = f.reserve().await;
     f.complete(&intent).await;
-    let result = f.service().continue_from_coordinator(f.request("losing-retry-key")).await.unwrap();
+    let result = f.service().continue_from_coordinator(f.request("losing-retry-key")).await.established().unwrap();
     assert_eq!(result.conversation_id, intent.successor_conversation_id);
     assert!(matches!(result.status, ContinueConversationStatus::AlreadyExists));
     assert!(result.error.is_none());
@@ -197,7 +223,7 @@ async fn pending_replay_requires_current_successor_capacity_and_retains_winning_
     let error = tokio::time::timeout(std::time::Duration::from_secs(30),
         f.service().continue_from_coordinator(f.request("losing-retry-key")))
         .await.expect("pending capacity review completes without a recursive mutation lock")
-        .err().expect("empty registry has no provider for capacity review");
+        .established().err().expect("empty registry has no provider for capacity review");
     assert!(error.contains("unavailable through its selected connection"), "{error}");
     let pending = f.db.continuation_dispatch_intent(&f.predecessor).await.unwrap().unwrap();
     assert_eq!(pending.successor_conversation_id, intent.successor_conversation_id);
@@ -250,7 +276,7 @@ async fn pending_replay_uses_winning_generated_opening_and_dispatches_it_once() 
     drop(mutation);
     let result = tokio::time::timeout(std::time::Duration::from_secs(30),
         f.service().continue_from_coordinator(f.request("losing-retry-key")))
-        .await.expect("shared product mutation gate must not be reacquired").unwrap();
+        .await.expect("shared product mutation gate must not be reacquired").established().unwrap();
     assert_eq!(result.conversation_id, intent.successor_conversation_id);
     assert!(matches!(result.status, ContinueConversationStatus::AlreadyExists));
     assert!(result.error.is_none());
@@ -263,7 +289,7 @@ async fn pending_replay_uses_winning_generated_opening_and_dispatches_it_once() 
     assert_eq!(openings.len(), 1);
     assert!(matches!(openings[0].origin, InputOrigin::SystemGenerated));
     assert!(f.db.continuation_dispatch_intent(&f.predecessor).await.unwrap().is_none());
-    let second = f.service().continue_from_coordinator(f.request("second-losing-retry")).await.unwrap();
+    let second = f.service().continue_from_coordinator(f.request("second-losing-retry")).await.established().unwrap();
     assert_eq!(second.conversation_id, result.conversation_id);
     assert!(matches!(second.status, ContinueConversationStatus::AlreadyExists));
     assert!(!f.runtime.fatal_local_authority_is_latched());
@@ -278,7 +304,7 @@ async fn stale_coordinator_is_refused_even_for_a_completed_opening() {
         summary: "Coordinator rotation".into(),
     }).await.unwrap();
     assert!(matches!(f.db.continue_conversation(&f.source).await.unwrap(), ContinueOutcome::Created(_)));
-    let error = f.service().continue_from_coordinator(f.request("stale-retry")).await.err().unwrap();
+    let error = f.service().continue_from_coordinator(f.request("stale-retry")).await.established().err().unwrap();
     assert_eq!(error, phoenix_db::DbError::CurrentCoordinatorRequired.to_string());
     assert_eq!(f.db.get_messages(&intent.successor_conversation_id).await.unwrap().len(), 1);
     assert!(!f.runtime.fatal_local_authority_is_latched());
@@ -302,7 +328,7 @@ async fn source_rotation_while_waiting_for_source_gate_rejects_completed_replay(
     }).await.unwrap();
     assert!(matches!(f.db.continue_conversation(&f.source).await.unwrap(), ContinueOutcome::Created(_)));
     drop(source_gate);
-    let error = worker.await.unwrap().err().unwrap();
+    let error = worker.await.unwrap().established().err().unwrap();
     assert_eq!(error, phoenix_db::DbError::CurrentCoordinatorRequired.to_string());
     assert_eq!(f.db.get_messages(&intent.successor_conversation_id).await.unwrap().len(), 1);
     assert!(!f.runtime.fatal_local_authority_is_latched());
@@ -314,7 +340,7 @@ async fn coordinator_self_rotation_is_a_nonfatal_preflight_refusal() {
     let mut request = f.request("self-rotation");
     request.product_conversation_id = f.db.get_conversation(&f.source).await.unwrap().product_conversation_id;
     request.predecessor_transcript_id = f.source.clone();
-    let error = f.service().continue_from_coordinator(request).await.err().unwrap();
+    let error = f.service().continue_from_coordinator(request).await.established().err().unwrap();
     assert_eq!(error, "native Continue cannot rotate its Coordinator source");
     assert!(f.db.get_conversation(&f.source).await.unwrap().continued_in_conv_id.is_none());
     assert!(f.db.get_conversation(&f.predecessor).await.unwrap().continued_in_conv_id.is_none());

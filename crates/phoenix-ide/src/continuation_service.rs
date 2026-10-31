@@ -14,7 +14,7 @@ use crate::send_chat_service::{
 
 mod manual;
 mod native;
-pub(crate) use native::NativeContinueRequest;
+pub(crate) use native::{NativeContinueCompletion, NativeContinueRequest};
 
 #[cfg(test)]
 pub(crate) use manual::{

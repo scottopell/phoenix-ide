@@ -19,6 +19,21 @@ pub(crate) struct NativeContinueRequest {
     pub source_gate_wait: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+pub(crate) enum NativeContinueCompletion {
+    Established(Result<ContinueConversationResponse, String>),
+    LocalAuthorityClosed,
+}
+
+#[cfg(test)]
+impl NativeContinueCompletion {
+    fn established(self) -> Result<ContinueConversationResponse, String> {
+        match self {
+            Self::Established(result) => result,
+            Self::LocalAuthorityClosed => panic!("ordinary reply requires open local authority"),
+        }
+    }
+}
+
 struct ReservationPass {
     owner: Option<AdmittedOperation>,
 }
@@ -49,13 +64,18 @@ impl ContinuationApplicationService {
     pub(crate) async fn continue_from_coordinator(
         &self,
         request: NativeContinueRequest,
-    ) -> Result<ContinueConversationResponse, String> {
+    ) -> NativeContinueCompletion {
         let runtime = self.runtime.clone();
-        tokio::spawn(async move {
+        let result = tokio::spawn(async move {
             Self::new(runtime).continue_from_coordinator_owned(request).await
         })
         .await
-        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|error| Err(error.to_string()));
+        if self.runtime.local_authority_is_closed() {
+            NativeContinueCompletion::LocalAuthorityClosed
+        } else {
+            NativeContinueCompletion::Established(result)
+        }
     }
 
     async fn continue_from_coordinator_owned(
