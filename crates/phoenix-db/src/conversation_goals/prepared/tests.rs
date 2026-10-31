@@ -112,7 +112,11 @@ async fn goal_preparation_migration_follows_conversation_tool_migrations() {
         vec![
             (143, "agent_creation_provenance".into()),
             (144, "product_conversation_rename_receipts".into()),
-            (145, "coordinator_goal_preparations".into())
+            (145, "coordinator_goal_preparations".into()),
+            (146, "retain_product_conversation_rename_receipts".into()),
+            (147, "retain_product_creation_receipts".into()),
+            (148, "product_creation_initial_execution_receipts".into()),
+            (149, "product_creation_image_retirement".into())
         ]
     );
 }

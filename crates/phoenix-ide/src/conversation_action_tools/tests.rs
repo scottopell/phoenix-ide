@@ -268,9 +268,8 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
 async fn rename_unclassified_result_closes_fence_before_releasing_owner() {
     let (runtime, _, _) = native_runtime().await;
     let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
-    let result = authority.complete(
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,
-    );
+    let result =
+        authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified);
     assert!(result.is_err());
     assert!(runtime.local_authority_is_closed());
     assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
@@ -282,17 +281,21 @@ async fn rename_established_rejection_and_stale_result_keep_admission_open() {
     let (runtime, _, _) = native_runtime().await;
     let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
     assert!(authority
-        .complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
-            Err(crate::db::DbError::CurrentCoordinatorRequired),
-        ))
+        .complete(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                crate::db::DbError::CurrentCoordinatorRequired
+            ),)
+        )
         .is_err());
     assert!(!runtime.local_authority_is_closed());
     let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
     assert_eq!(
         authority
-            .complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
-                Ok(ProductConversationRenameResult::Stale),
-            ))
+            .complete(
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+                    ProductConversationRenameResult::Stale
+                ),)
+            )
             .unwrap(),
         ProductConversationRenameResult::Stale
     );
@@ -309,9 +312,7 @@ async fn cancelled_rename_authority_closes_fence_before_releasing_owner() {
         let authority = RenameAuthorityPass::new(owner);
         entered_tx.send(()).unwrap();
         std::future::pending::<()>().await;
-        authority.complete(
-            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified,
-        )
+        authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
     });
     entered_rx.await.unwrap();
     task.abort();
