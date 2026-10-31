@@ -411,6 +411,10 @@ async fn pending_replay_uses_winning_generated_opening_and_dispatches_it_once() 
         provider.clone(),
     ));
     let f = Fixture::with_registry(registry).await;
+    f.runtime
+        .start_direct_turn_worker()
+        .await
+        .expect("pending replay fixture direct-turn worker startup");
     let intent = f.reserve().await;
     let predecessor_mutation = f.runtime.mutation_admission(&f.predecessor).await.unwrap();
     let successor_mutation = f
