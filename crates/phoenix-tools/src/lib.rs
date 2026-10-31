@@ -342,6 +342,7 @@ pub struct ToolContext {
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
     tool_use_id: Option<String>,
+    direct_turn_id: Option<phoenix_core::domain::sm_event::DirectTurnTurnId>,
     svg_assistant_message_id: Option<String>,
     svg_artifact_store: Option<Arc<dyn present_svg::SvgArtifactStore>>,
 }
@@ -435,6 +436,7 @@ impl ToolContext {
             work_scope: ResourceScopeKey::Coordinator,
             bash_progress_sink: None,
             tool_use_id: None,
+            direct_turn_id: None,
             svg_assistant_message_id: None,
             svg_artifact_store: None,
             llm_metrics_tx: None,
@@ -492,6 +494,7 @@ impl ToolContext {
             work_scope,
             bash_progress_sink: None,
             tool_use_id: None,
+            direct_turn_id: None,
             svg_assistant_message_id: None,
             svg_artifact_store: None,
         }
@@ -619,6 +622,20 @@ impl ToolContext {
     #[must_use]
     pub fn llm_selector(&self) -> &Arc<dyn LlmSelector> {
         &self.llm_selector
+    }
+
+    #[must_use]
+    pub fn direct_turn_id(&self) -> Option<phoenix_core::domain::sm_event::DirectTurnTurnId> {
+        self.direct_turn_id
+    }
+
+    #[must_use]
+    pub fn with_direct_turn_id(
+        mut self,
+        turn_id: phoenix_core::domain::sm_event::DirectTurnTurnId,
+    ) -> Self {
+        self.direct_turn_id = Some(turn_id);
+        self
     }
 
     #[must_use]

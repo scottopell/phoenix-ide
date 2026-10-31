@@ -5073,6 +5073,38 @@ impl RuntimeManager {
         }
     }
 
+    pub(crate) async fn coordinator_tool_registry(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        catalog: Option<crate::skills::AuthenticatedCoordinatorSkillCatalog>,
+    ) -> Result<ToolRegistry, String> {
+        self.db
+            .require_current_coordinator_transcript(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let service = crate::api::global_read::GlobalReadService::new(
+            self.db.clone(),
+            self.message_retriever.clone(),
+        );
+        let send_chat = Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+            self.db.clone(),
+            self.clone(),
+        ));
+        let mut coordinator_tools = crate::coordinator_tools::tools(
+            service,
+            send_chat,
+            self.work_scope_load.clone(),
+            self.db.clone(),
+        );
+        coordinator_tools.extend(
+            crate::conversation_action_tools::tools(self.clone(), conversation_id)
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        coordinator_tools.extend(crate::coordinator_tools::goal_tools(self.clone()));
+        Ok(ToolRegistry::coordinator(coordinator_tools, catalog))
+    }
+
     /// Get or materialize the in-memory runtime for a durable conversation.
     ///
     /// Materialization is single-flight per conversation. Unrelated conversations
@@ -6043,32 +6075,13 @@ impl RuntimeManager {
         } else {
             use crate::db::ConvMode;
             if is_coordinator {
-                let service = crate::api::global_read::GlobalReadService::new(
-                    self.db.clone(),
-                    self.message_retriever.clone(),
-                );
-                let send_chat =
-                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                        self.db.clone(),
-                        self.clone(),
-                    ));
                 let coordinator_catalog =
                     crate::skills::AuthenticatedCoordinatorSkillCatalog::discover(
                         crate::skills::builtin::default_extract_dir().as_deref(),
                     );
-                let mut coordinator_tools = crate::coordinator_tools::tools(
-                    service,
-                    send_chat,
-                    self.work_scope_load.clone(),
-                    self.db.clone(),
-                );
-                coordinator_tools.extend(
-                    crate::conversation_action_tools::tools(self.clone(), conversation_id)
-                        .await
-                        .map_err(|error| error.to_string())?,
-                );
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(coordinator_tools, coordinator_catalog.clone()),
+                    self.coordinator_tool_registry(conversation_id, coordinator_catalog.clone())
+                        .await?,
                     agent_catalog.clone(),
                 )
                 .with_coordinator_skill_catalog(coordinator_catalog)

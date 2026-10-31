@@ -236,8 +236,8 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 links and grounded status—not a fixed template. Mention material \
                 delivery/evidence limits. Check-ins are bounded, not polling. Only mutate \
                 selected WorkScope via unsandboxed Bash with its explicit active work_scope_id. \
-                No dedicated project/task/workspace/approval/lifecycle mutation tools except \
-                installed create_conversation/rename_conversation. Act on user turns and factual \
+                No project/task/workspace/approval/lifecycle tools except \
+                create_conversation/rename_conversation and prepare_goal/apply_goal metadata. Act on user turns and factual \
                 events from explicit watches; ordinary watches follow \
                 continuations until removed/closed."
         }
@@ -286,9 +286,9 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 first; problem, actual work, outcome/why and next step. Plain English, links, \
                 grounded status; not a fixed template. Note material delivery/evidence limits. \
                 Bounded check-in, no polling. Change selected WorkScope only with unsandboxed \
-                Bash and explicit active work_scope_id. No dedicated \
-                project/task/workspace/approval/lifecycle mutation tools except installed \
-                create_conversation/rename_conversation. Act on user turns and factual events from \
+                Bash and explicit active work_scope_id. No project/task/workspace/approval/lifecycle \
+                tools except create_conversation/rename_conversation and prepare_goal/apply_goal metadata. \
+                Act on user turns and factual events from \
                 explicit watches; ordinary watches follow continuations until \
                 removed/closed."
         }

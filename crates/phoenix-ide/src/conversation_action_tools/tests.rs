@@ -265,6 +265,76 @@ async fn native_creation_read_and_submit_receipt_require_current_snapshot_author
 }
 
 #[tokio::test]
+async fn rename_unclassified_result_closes_fence_before_releasing_owner() {
+    let (runtime, _, _) = native_runtime().await;
+    let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
+    let result =
+        authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified);
+    assert!(result.is_err());
+    assert!(runtime.local_authority_is_closed());
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+    assert!(runtime.acquire_local_authority_pass().is_err());
+}
+
+#[tokio::test]
+async fn rename_established_rejection_and_stale_result_keep_admission_open() {
+    let (runtime, _, _) = native_runtime().await;
+    let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
+    assert!(authority
+        .complete(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                crate::db::DbError::CurrentCoordinatorRequired
+            ),)
+        )
+        .is_err());
+    assert!(!runtime.local_authority_is_closed());
+    let authority = RenameAuthorityPass::new(runtime.acquire_local_authority_pass().unwrap());
+    assert_eq!(
+        authority
+            .complete(
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(
+                    ProductConversationRenameResult::Stale
+                ),)
+            )
+            .unwrap(),
+        ProductConversationRenameResult::Stale
+    );
+    assert!(!runtime.local_authority_is_closed());
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), None);
+}
+
+#[tokio::test]
+async fn cancelled_rename_authority_closes_fence_before_releasing_owner() {
+    let (runtime, _, _) = native_runtime().await;
+    let owner = runtime.acquire_local_authority_pass().unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let authority = RenameAuthorityPass::new(owner);
+        entered_tx.send(()).unwrap();
+        std::future::pending::<()>().await;
+        authority.complete(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
+    });
+    entered_rx.await.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(runtime.local_authority_is_closed());
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+}
+
+#[tokio::test]
+async fn panicked_rename_authority_closes_fence_before_releasing_owner() {
+    let (runtime, _, _) = native_runtime().await;
+    let owner = runtime.acquire_local_authority_pass().unwrap();
+    let task = tokio::spawn(async move {
+        let _authority = RenameAuthorityPass::new(owner);
+        panic!("injected rename boundary panic");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(runtime.local_authority_is_closed());
+    assert_eq!(runtime.fatal_authority_owners_at_first_close(), Some(1));
+}
+
+#[tokio::test]
 async fn native_registered_rename_is_guarded_replayable_and_revision_checked() {
     let (runtime, db, gc) = native_runtime().await;
     let root = db

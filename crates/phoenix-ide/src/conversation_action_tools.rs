@@ -16,7 +16,42 @@ use crate::db::{
     NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameResult,
     ProductConversationRenameSource,
 };
-use crate::runtime::RuntimeManager;
+use crate::runtime::{AdmittedOperation, RuntimeManager};
+
+struct RenameAuthorityPass {
+    owner: Option<AdmittedOperation>,
+}
+
+impl RenameAuthorityPass {
+    fn new(owner: AdmittedOperation) -> Self {
+        Self { owner: Some(owner) }
+    }
+
+    fn complete(
+        mut self,
+        result: phoenix_db::workflow::LocalAuthorityResult<
+            crate::db::DbResult<ProductConversationRenameResult>,
+        >,
+    ) -> Result<ProductConversationRenameResult, String> {
+        match result {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                self.owner.take();
+                result.map_err(|error| error.to_string())
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err("local authority is unclassified; process admission closed".into())
+            }
+        }
+    }
+}
+
+impl Drop for RenameAuthorityPass {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.close("product_conversation_rename");
+        }
+    }
+}
 
 pub(crate) async fn tools(
     runtime: Arc<RuntimeManager>,
@@ -216,16 +251,17 @@ impl RenameConversation {
                     title: NormalizedConversationTitle::parse(&title).map_err(|e| e.to_string())?,
                     source,
                 };
-                let _authority = self
+                let owner = self
                     .0
                     .acquire_local_authority_pass()
                     .map_err(|()| "local authority is closed")?;
-                let result = self
+                let authority = RenameAuthorityPass::new(owner);
+                let classified = self
                     .0
                     .db()
                     .rename_product_conversation(&ctx.conversation_id, &command)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    .await;
+                let result = authority.complete(classified)?;
                 Ok(match result {
                     ProductConversationRenameResult::Applied(receipt) => {
                         json!({"status":"applied", "receipt":receipt})
