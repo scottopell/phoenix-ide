@@ -30,9 +30,11 @@ upstream contract, as exercised by the open-source Codex client
 - `code` is one of `reset`, `nothing_to_reset`, `no_credit`,
   `already_redeemed`. `windows_reset` counts restored windows and is absent on
   some responses (absent means zero).
-- `redeem_request_id` is an idempotency key for one logical redemption. The
-  backend answers a replay of a key that already redeemed with
-  `already_redeemed` and does not spend a second credit.
+- `redeem_request_id` identifies one logical redemption. The upstream client
+  protocol directs callers to reuse the same value when retrying that
+  redemption, and treats `already_redeemed` as success. Phoenix relies on a
+  replayed key not spending a second credit; this is the documented intent of
+  the key, not behavior Phoenix can verify.
 - An omitted `credit_id` lets the backend choose the credit.
 - The backend answers `nothing_to_reset` without spending a credit when the
   account has no exhausted window to restore.
@@ -63,6 +65,7 @@ non-expiring credit represented by an absent expiry
 AND SHALL map unrecognised reset types and statuses to an explicit unknown
 value rather than failing the whole listing
 AND SHALL report a negative upstream available count as zero
+AND SHALL report the account identifier the listing was read for
 
 WHEN a listed credit carries a grant or expiry time that is not valid RFC3339
 THE SYSTEM SHALL fail the listing as an upstream failure rather than invent a
@@ -72,8 +75,9 @@ WHEN no ChatGPT credential is loaded
 THE SYSTEM SHALL answer the listing with a signed-out response distinct from an
 upstream failure, without contacting the upstream
 
-WHEN the upstream request fails, times out, is rejected, or returns a body that
-does not decode
+WHEN a ChatGPT credential is loaded but the upstream request fails, times out,
+is rejected, or returns a body that does not decode, or the credential cannot
+produce an access token
 THE SYSTEM SHALL answer with an upstream-failure response
 AND SHALL log the failure cause at debug level or above
 
@@ -86,14 +90,16 @@ find out"; a client must not render either as "zero resets".
 
 ### REQ-CRR-002: Explicit Reset Redemption
 
-WHEN the user interface submits a redemption with an idempotency key and an
-optional credit identifier
+WHEN the user interface submits a redemption with an idempotency key, an
+optional credit identifier, and the account identifier of the listing the user
+chose from
 THE SYSTEM SHALL send one upstream redeem request carrying that key as
 `redeem_request_id` and the credit identifier when one was supplied
 AND SHALL return the upstream outcome (`reset`, `nothing_to_reset`,
 `no_credit`, `already_redeemed`) and the number of windows reset
-AND SHALL require the idempotency key to be a UUID, rejecting any other value
-as an invalid request before contacting the upstream
+AND SHALL require the idempotency key to be a UUID and any credit identifier to
+be non-empty, rejecting any other value as an invalid request before contacting
+the upstream
 
 WHEN the upstream answers with an outcome code outside the four known codes
 THE SYSTEM SHALL answer with an upstream-failure response and SHALL NOT
@@ -102,6 +108,11 @@ report the redemption as successful
 WHEN no ChatGPT credential is loaded
 THE SYSTEM SHALL answer with the signed-out response without contacting the
 upstream
+
+WHEN the loaded credential's account differs from the account identifier the
+redemption names
+THE SYSTEM SHALL answer with an account-changed response without contacting
+the upstream
 
 WHEN the redemption completes with outcome `reset` or `already_redeemed`
 THE SYSTEM SHALL log the redemption at info level with the outcome and the
@@ -179,8 +190,12 @@ AND SHALL allow the user to go back to the choice or cancel without redeeming
 
 WHEN the user confirms
 THE SYSTEM SHALL submit exactly one redemption for the chosen option under an
-idempotency key created for that confirmation
+idempotency key created for that confirmation, naming the account of the
+listing the option came from
 AND SHALL disable further confirmation while the redemption is in flight
+
+THE SYSTEM SHALL let the user cancel while the listing loads, while choosing,
+and while confirming
 
 **Rationale:** Mirrors the upstream Codex client's list, choose, confirm flow so
 users see the same choices and wording across Codex surfaces, while keeping the
@@ -200,8 +215,9 @@ now, SHALL report that no reset was spent, and SHALL NOT resume any
 conversation
 
 WHEN a redemption of a chosen credit answers `no_credit`
-THE SYSTEM SHALL tell the user that the reset is no longer available and
-SHALL refresh the reset listing
+THE SYSTEM SHALL tell the user that the reset is no longer available, keeping
+that message even if the refreshed listing fails,
+AND SHALL refresh the reset listing
 
 WHEN a redemption without a chosen credit answers `no_credit`
 THE SYSTEM SHALL tell the user that no usage limit resets are available
@@ -209,8 +225,18 @@ THE SYSTEM SHALL tell the user that no usage limit resets are available
 WHEN a redemption fails without an outcome (transport failure, upstream
 failure, or timeout)
 THE SYSTEM SHALL tell the user the reset could not be applied
-AND SHALL offer to try again with the same idempotency key and credit choice,
-so a redemption whose response was lost cannot spend a second credit
+AND SHALL offer only to try again with the same idempotency key and credit
+choice, or to close, so a redemption whose response was lost cannot be followed
+by a fresh key for a different choice in the same flow
+AND SHALL refresh the account quota whenever a redemption answers, even if the
+view that started it has closed
+
+WHEN a redemption answers that no ChatGPT credential is loaded
+THE SYSTEM SHALL tell the user to sign in and SHALL NOT offer a retry
+
+WHEN a redemption answers that the account changed
+THE SYSTEM SHALL tell the user and present a fresh choice for the current
+account
 
 **Rationale:** The four outcome codes and their user-facing meanings are the
 upstream contract. Reusing the key on retry turns a lost success into
@@ -221,8 +247,9 @@ upstream contract. Reusing the key on retry turns a lost success into
 ### REQ-CRR-008: Resume After Redemption From the Error
 
 WHEN a redemption started from a conversation's quota-exhaustion error succeeds
-AND the error display that started it is still shown, meaning the conversation
-has not left that `usage_limit_reached` error state since the redemption began
+AND the error display that started it is still shown, meaning the same
+conversation has not left that `usage_limit_reached` error state since the
+redemption began and the user has not navigated to another conversation
 THE SYSTEM SHALL resume the conversation through the same user-resume path as
 the error's Retry action, without a further user action
 
@@ -271,6 +298,8 @@ request from that single credential, so a request never pairs one account's
 token with another account's identifier
 AND SHALL order list and redeem requests against the publication of a newly
 signed-in credential, as the authenticated usage read does
+AND SHALL refuse a redemption whose named account differs from the account of
+the token it would be sent with
 
 WHEN the credential is signed out or replaced while a request is in flight
 THE SYSTEM SHALL let the in-flight request finish or fail against the
@@ -280,4 +309,5 @@ credential it started with, and SHALL NOT retry it against the replacement
 account identifier from one credential is what prevents a cross-account
 request. Ordering against sign-in publication matches the usage read. A
 replacement credential must not inherit a redemption the user confirmed for
-the previous account.
+the previous account; naming the account in the redemption makes that
+structural rather than dependent on which view is still open.

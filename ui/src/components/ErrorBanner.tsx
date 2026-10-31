@@ -143,8 +143,8 @@ export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerP
         <div className="error-body-content">
           <div className="error-body-title">{displayTitle}</div>
           {details && <div className="error-body-details">{linkify(details)}</div>}
-          {/* REQ-CRR-005/008: a successful redemption resumes through the same
-              Retry path, and only while this banner is still mounted. */}
+          {/* REQ-CRR-008: resumes via onRetry; ConversationPage keys this
+              banner by conversation so the callback cannot cross conversations. */}
           {canUserResume && errorKind === 'usage_limit_reached' && (
             <CodexResetAction surface="error" onRedeemed={onRetry} />
           )}

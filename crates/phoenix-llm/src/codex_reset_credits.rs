@@ -82,13 +82,16 @@ fn credit_status(value: &str) -> CodexResetCreditStatus {
     }
 }
 
-/// Decode the upstream listing. Any malformed credit fails the whole listing
+/// Decode the upstream listing read for `account_id`. Any malformed credit fails the whole listing
 /// (REQ-CRR-001): a fabricated time would be worse than no listing.
 ///
 /// # Errors
 ///
 /// Returns a description when the body does not decode or a time is not RFC3339.
-pub fn reset_credits_from_upstream(value: serde_json::Value) -> Result<CodexResetCredits, String> {
+pub fn reset_credits_from_upstream(
+    value: serde_json::Value,
+    account_id: Option<String>,
+) -> Result<CodexResetCredits, String> {
     let upstream: UpstreamResetCredits =
         serde_json::from_value(value).map_err(|error| format!("reset credit listing: {error}"))?;
     let credits = upstream
@@ -113,7 +116,8 @@ pub fn reset_credits_from_upstream(value: serde_json::Value) -> Result<CodexRese
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(CodexResetCredits {
-        available_count: upstream.available_count.max(0),
+        account_id,
+        available_count: u32::try_from(upstream.available_count.max(0)).unwrap_or(u32::MAX),
         credits,
     })
 }
@@ -143,35 +147,39 @@ mod tests {
     #[test]
     fn listing_decodes_upstream_fixture() {
         // Same payload shape as codex-rs rate_limit_reset_contract tests.
-        let listing = reset_credits_from_upstream(json!({
-            "credits": [
-                {
-                    "id": "credit-1",
-                    "reset_type": "codex_rate_limits",
-                    "status": "available",
-                    "granted_at": "2026-06-17T00:00:00Z",
-                    "expires_at": "2026-07-17T00:00:00Z",
-                    "redeem_started_at": null,
-                    "redeemed_at": null,
-                    "profile_user_id": "@friend",
-                    "title": "Full reset (Weekly + 5 hr)",
-                    "description": "Ready to redeem"
-                },
-                {
-                    "id": "credit-2",
-                    "reset_type": "something_new",
-                    "status": "frozen",
-                    "granted_at": "2026-06-18T00:00:00+02:00",
-                    "expires_at": null
-                }
-            ],
-            "available_count": 2,
-            "total_earned_count": 4
-        }))
+        let listing = reset_credits_from_upstream(
+            json!({
+                "credits": [
+                    {
+                        "id": "credit-1",
+                        "reset_type": "codex_rate_limits",
+                        "status": "available",
+                        "granted_at": "2026-06-17T00:00:00Z",
+                        "expires_at": "2026-07-17T00:00:00Z",
+                        "redeem_started_at": null,
+                        "redeemed_at": null,
+                        "profile_user_id": "@friend",
+                        "title": "Full reset (Weekly + 5 hr)",
+                        "description": "Ready to redeem"
+                    },
+                    {
+                        "id": "credit-2",
+                        "reset_type": "something_new",
+                        "status": "frozen",
+                        "granted_at": "2026-06-18T00:00:00+02:00",
+                        "expires_at": null
+                    }
+                ],
+                "available_count": 2,
+                "total_earned_count": 4
+            }),
+            Some("acct".into()),
+        )
         .unwrap();
         assert_eq!(
             listing,
             CodexResetCredits {
+                account_id: Some("acct".into()),
                 available_count: 2,
                 credits: vec![
                     CodexResetCredit {
@@ -199,27 +207,31 @@ mod tests {
 
     #[test]
     fn listing_rejects_malformed_time() {
-        let error = reset_credits_from_upstream(json!({
-            "credits": [{
-                "id": "c", "reset_type": "codex_rate_limits", "status": "available",
-                "granted_at": "yesterday", "expires_at": null
-            }],
-            "available_count": 1
-        }))
+        let error = reset_credits_from_upstream(
+            json!({
+                "credits": [{
+                    "id": "c", "reset_type": "codex_rate_limits", "status": "available",
+                    "granted_at": "yesterday", "expires_at": null
+                }],
+                "available_count": 1
+            }),
+            None,
+        )
         .unwrap_err();
         assert!(error.contains("granted_at"), "{error}");
     }
 
     #[test]
     fn listing_requires_credits_and_count() {
-        assert!(reset_credits_from_upstream(json!({ "available_count": 1 })).is_err());
-        assert!(reset_credits_from_upstream(json!({ "credits": [] })).is_err());
+        assert!(reset_credits_from_upstream(json!({ "available_count": 1 }), None).is_err());
+        assert!(reset_credits_from_upstream(json!({ "credits": [] }), None).is_err());
     }
 
     #[test]
     fn listing_clamps_negative_count() {
         let listing =
-            reset_credits_from_upstream(json!({ "credits": [], "available_count": -3 })).unwrap();
+            reset_credits_from_upstream(json!({ "credits": [], "available_count": -3 }), None)
+                .unwrap();
         assert_eq!(listing.available_count, 0);
     }
 

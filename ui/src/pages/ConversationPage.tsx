@@ -2517,6 +2517,7 @@ function ConversationPageContent({
       ) : convStateForChildren.type === 'error' ? (
         <>
         <ErrorBanner
+          key={conversation.id}
           message={convStateForChildren.message}
           error={convStateForChildren.error}
           onRetry={readOnly || isArchived ? undefined : () => handleSend('continue', [])}

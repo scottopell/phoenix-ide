@@ -948,9 +948,11 @@ pub struct LoginPreflight {
 /// Failure of one authenticated request to the `ChatGPT` Codex backend.
 #[derive(Debug)]
 enum CodexBackendError {
-    /// The credential could not produce an access token (signed out or revoked
-    /// while the request was being prepared).
+    /// The loaded credential could not produce an access token (refresh failed,
+    /// or it was revoked while the request was being prepared).
     NoToken,
+    /// The credential's account differs from the one the caller required.
+    AccountMismatch,
     Transport(reqwest::Error),
     Status(reqwest::StatusCode),
     Decode(reqwest::Error),
@@ -960,6 +962,7 @@ impl std::fmt::Display for CodexBackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoToken => f.write_str("no Codex access token available"),
+            Self::AccountMismatch => f.write_str("Codex account changed"),
             Self::Transport(error) => write!(f, "request failed: {error}"),
             Self::Status(status) => write!(f, "upstream rejected request: {status}"),
             Self::Decode(error) => write!(f, "response did not decode: {error}"),
@@ -971,9 +974,11 @@ impl std::fmt::Display for CodexBackendError {
 ///
 /// Token and account id come from the one `credential` passed in, so the
 /// request never pairs one account's token with another's id. A 401 refreshes
-/// the token and retries once; `build` must therefore be replay-safe.
+/// the token and retries once; `build` must therefore be replay-safe. With
+/// `required_account`, nothing is sent unless the token's account matches it.
 async fn codex_backend_json(
     credential: &codex_credential::CodexCredential,
+    required_account: Option<&Option<String>>,
     build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
 ) -> Result<(Option<String>, serde_json::Value), CodexBackendError> {
     use phoenix_llm::CredentialSource;
@@ -988,6 +993,9 @@ async fn codex_backend_json(
             .get_with_account_id()
             .await
             .ok_or(CodexBackendError::NoToken)?;
+        if required_account.is_some_and(|required| *required != account_id) {
+            return Err(CodexBackendError::AccountMismatch);
+        }
         let mut request = build(&client)
             .bearer_auth(token)
             .header(reqwest::header::ACCEPT, "application/json")
@@ -1015,7 +1023,7 @@ async fn codex_backend_json(
 async fn fetch_codex_quota(
     credential: &codex_credential::CodexCredential,
 ) -> Option<(Option<String>, phoenix_llm::QuotaDetails)> {
-    let (account_id, payload) = match codex_backend_json(credential, |client| {
+    let (account_id, payload) = match codex_backend_json(credential, None, |client| {
         client.get(phoenix_llm::CODEX_USAGE_URL)
     })
     .await
@@ -1053,6 +1061,18 @@ fn codex_signed_out_response() -> axum::response::Response {
         .into_response()
 }
 
+fn codex_account_changed_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::CONFLICT,
+        Json(super::types::ErrorResponse::typed(
+            "The signed-in ChatGPT account changed",
+            "codex_account_changed",
+        )),
+    )
+        .into_response()
+}
+
 fn codex_upstream_unavailable_response(message: impl Into<String>) -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -1074,19 +1094,18 @@ pub async fn codex_rate_limit_resets(State(state): State<AppState>) -> axum::res
     let Some(credential) = state.llm_registry.current_codex_credential() else {
         return codex_signed_out_response();
     };
-    let payload = match codex_backend_json(credential.as_ref(), |client| {
+    let (account_id, payload) = match codex_backend_json(credential.as_ref(), None, |client| {
         client.get(CODEX_RESET_CREDITS_URL)
     })
     .await
     {
-        Ok((_, payload)) => payload,
-        Err(CodexBackendError::NoToken) => return codex_signed_out_response(),
+        Ok(result) => result,
         Err(error) => {
             tracing::debug!(%error, "failed to list Codex reset credits");
             return codex_upstream_unavailable_response("Could not load usage limit resets");
         }
     };
-    match reset_credits_from_upstream(payload) {
+    match reset_credits_from_upstream(payload, account_id) {
         Ok(credits) => Json(credits).into_response(),
         Err(error) => {
             tracing::debug!(%error, "failed to decode Codex reset credits");
@@ -1095,8 +1114,7 @@ pub async fn codex_rate_limit_resets(State(state): State<AppState>) -> axum::res
     }
 }
 
-/// `POST /api/codex/rate-limit-resets/consume` — REQ-CRR-002. Only ever called
-/// from the UI's confirmation step (REQ-CRR-004).
+/// `POST /api/codex/rate-limit-resets/consume` — REQ-CRR-002, REQ-CRR-010.
 pub async fn codex_rate_limit_reset_consume(
     State(state): State<AppState>,
     Json(request): Json<phoenix_core::domain::codex_reset_credits::CodexResetRedeemRequest>,
@@ -1110,19 +1128,31 @@ pub async fn codex_rate_limit_reset_consume(
     let Some(credential) = state.llm_registry.current_codex_credential() else {
         return codex_signed_out_response();
     };
-    let body = UpstreamRedeemRequest::new(request.idempotency_key, request.credit_id.as_deref());
-    let payload = match codex_backend_json(credential.as_ref(), |client| {
-        client.post(CODEX_RESET_CREDITS_CONSUME_URL).json(&body)
-    })
-    .await
-    {
-        Ok((_, payload)) => payload,
-        Err(CodexBackendError::NoToken) => return codex_signed_out_response(),
-        Err(error) => {
-            tracing::warn!(%error, "failed to redeem Codex reset credit");
-            return codex_upstream_unavailable_response("Could not apply the usage limit reset");
-        }
-    };
+    let body = UpstreamRedeemRequest::new(
+        request.idempotency_key,
+        request
+            .credit_id
+            .as_ref()
+            .map(phoenix_core::domain::codex_reset_credits::CodexResetCreditId::as_str),
+    );
+    let payload =
+        match codex_backend_json(credential.as_ref(), Some(&request.account_id), |client| {
+            client.post(CODEX_RESET_CREDITS_CONSUME_URL).json(&body)
+        })
+        .await
+        {
+            Ok((_, payload)) => payload,
+            Err(CodexBackendError::AccountMismatch) => {
+                tracing::info!("refused Codex reset redemption: account changed since listing");
+                return codex_account_changed_response();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to redeem Codex reset credit");
+                return codex_upstream_unavailable_response(
+                    "Could not apply the usage limit reset",
+                );
+            }
+        };
     match redeem_response_from_upstream(payload) {
         Ok(response) => {
             if response.outcome.is_success() {
@@ -1220,6 +1250,43 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn credential_for_account(
+        dir: &std::path::Path,
+        account: &str,
+    ) -> Arc<codex_credential::CodexCredential> {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let jwt = format!(
+            "{}.{}.",
+            encode(br#"{"alg":"none"}"#),
+            encode(format!(r#"{{"exp":{exp}}}"#).as_bytes())
+        );
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","refresh_token":"r","account_id":"{account}"}}}}"#
+            ),
+        )
+        .unwrap();
+        codex_credential::CodexCredential::load(path).unwrap().0
+    }
+
+    #[tokio::test]
+    async fn reset_redemption_for_another_account_is_refused_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential = credential_for_account(dir.path(), "acct-b");
+        let built = std::sync::atomic::AtomicBool::new(false);
+        let result = codex_backend_json(&credential, Some(&Some("acct-a".to_string())), |client| {
+            built.store(true, std::sync::atomic::Ordering::SeqCst);
+            client.post("http://127.0.0.1:9/never")
+        })
+        .await;
+        assert!(matches!(result, Err(CodexBackendError::AccountMismatch)));
+        assert!(!built.load(std::sync::atomic::Ordering::SeqCst));
+    }
     use phoenix_llm::codex_login::{finalize_login, DeviceCode, LoginError, TokenResponse};
     use std::time::Instant;
 

@@ -81,7 +81,7 @@ rule RedemptionConfirmed {
 
 rule RedemptionCancelled {
     when: UserCancelled(redemption)
-    requires: redemption.state = choosing or redemption.state = confirming
+    requires: redemption.state = choosing or redemption.state = confirming or redemption.state = failed
     ensures:
         redemption.state = cancelled
 }
@@ -118,6 +118,8 @@ rule RedemptionFailed {
         redemption.state = failed
 }
 
+-- No rule moves failed -> choosing: a new choice would mint a new key while
+-- the first redemption's outcome is unknown.
 rule RedemptionRetried {
     when: UserRetried(redemption)
     requires: redemption.state = failed

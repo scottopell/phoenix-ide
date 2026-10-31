@@ -6,17 +6,20 @@ import type { CodexResetRedeemResponse } from '../generated/CodexResetRedeemResp
 import { generateUUID } from '../utils/uuid';
 import './CodexResetFlow.css';
 
-// Choose → confirm → redeem (specs/codex-rate-limit-resets REQ-CRR-006/007).
-// The idempotency key is minted when confirmation opens and reused by
-// "Try again", so a lost success answers already_redeemed instead of spending
-// a second credit.
+// `account` is the listing's account_id; the server refuses a redemption whose
+// account no longer matches the signed-in credential.
+interface Choices {
+  options: ResetOption[];
+  account: string | null;
+}
+
 type FlowState =
   | { type: 'loading' }
-  | { type: 'unavailable' }
-  | { type: 'choosing'; options: ResetOption[]; notice: string | null }
-  | { type: 'confirming'; options: ResetOption[]; option: ResetOption; key: string }
-  | { type: 'in_flight'; options: ResetOption[]; option: ResetOption; key: string }
-  | { type: 'failed'; options: ResetOption[]; option: ResetOption; key: string }
+  | { type: 'unavailable'; notice: string | null }
+  | { type: 'choosing'; choices: Choices; notice: string | null }
+  | { type: 'confirming'; choices: Choices; option: ResetOption; key: string }
+  | { type: 'in_flight'; choices: Choices; option: ResetOption; key: string }
+  | { type: 'failed'; choices: Choices; option: ResetOption; key: string }
   | { type: 'done'; text: string; succeeded: boolean };
 
 interface CodexResetFlowProps {
@@ -45,7 +48,7 @@ export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFl
     const result = await api.codexResetCredits();
     if (!mountedRef.current) return;
     if (result.type !== 'ok') {
-      setState({ type: 'unavailable' });
+      setState({ type: 'unavailable', notice });
       return;
     }
     onListingRef.current?.(result.credits);
@@ -54,26 +57,43 @@ export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFl
       setState({ type: 'done', text: notice ?? 'No usage limit resets are available.', succeeded: false });
       return;
     }
-    setState({ type: 'choosing', options, notice });
+    setState({ type: 'choosing', choices: { options, account: result.credits.account_id }, notice });
   }, []);
 
   useEffect(() => { void loadChoices(null); }, [loadChoices]);
 
-  const redeem = useCallback(async (options: ResetOption[], option: ResetOption, key: string) => {
-    setState({ type: 'in_flight', options, option, key });
-    let response: CodexResetRedeemResponse;
-    try {
-      response = await api.codexRedeemReset({ idempotency_key: key, credit_id: option.creditId });
-    } catch {
-      if (mountedRef.current) setState({ type: 'failed', options, option, key });
-      return;
+  const redeem = useCallback(async (choices: Choices, option: ResetOption, key: string) => {
+    setState({ type: 'in_flight', choices, option, key });
+    const result = await api.codexRedeemReset({
+      idempotency_key: key,
+      credit_id: option.creditId,
+      account_id: choices.account,
+    });
+    if (result.type === 'ok' && result.response.outcome !== 'nothing_to_reset') {
+      void refreshCodexQuota();
     }
     if (!mountedRef.current) return;
+    switch (result.type) {
+      case 'failed':
+        setState({ type: 'failed', choices, option, key });
+        return;
+      case 'signed_out':
+        setState({ type: 'done', text: 'Sign in to ChatGPT to use usage limit resets.', succeeded: false });
+        return;
+      case 'account_changed':
+        void loadChoices('Your ChatGPT account changed. Choose a reset for the current account.');
+        return;
+      case 'ok':
+        break;
+      default:
+        result satisfies never;
+        return;
+    }
+    const response = result.response;
     switch (response.outcome) {
       case 'reset':
       case 'already_redeemed':
         setState({ type: 'done', text: 'Usage reset.', succeeded: true });
-        void refreshCodexQuota();
         onSucceededRef.current?.(response);
         return;
       case 'nothing_to_reset':
@@ -97,13 +117,21 @@ export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFl
 
   return (
     <div className="codex-reset-flow" role="group" aria-label="Usage limit resets">
-      {state.type === 'loading' && <div className="codex-reset-flow__muted">Checking your resets…</div>}
+      {state.type === 'loading' && (
+        <>
+          <div className="codex-reset-flow__muted" role="status">Checking your resets…</div>
+          <div className="codex-reset-flow__actions">
+            <button type="button" className="codex-reset-flow__btn" onClick={onClose}>Cancel</button>
+          </div>
+        </>
+      )}
 
       {state.type === 'unavailable' && (
         <>
-          <div className="codex-reset-flow__muted">Couldn&apos;t load your resets.</div>
+          {state.notice && <div className="codex-reset-flow__notice" role="status">{state.notice}</div>}
+          <div className="codex-reset-flow__muted" role="status">Couldn&apos;t load your resets.</div>
           <div className="codex-reset-flow__actions">
-            <button type="button" className="codex-reset-flow__btn" onClick={() => { void loadChoices(null); }}>Try again</button>
+            <button type="button" className="codex-reset-flow__btn" onClick={() => { void loadChoices(state.notice); }}>Try again</button>
             <button type="button" className="codex-reset-flow__btn" onClick={onClose}>Close</button>
           </div>
         </>
@@ -111,14 +139,14 @@ export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFl
 
       {state.type === 'choosing' && (
         <>
-          {state.notice && <div className="codex-reset-flow__notice">{state.notice}</div>}
+          {state.notice && <div className="codex-reset-flow__notice" role="status">{state.notice}</div>}
           <ul className="codex-reset-flow__options">
-            {state.options.map((option, index) => (
+            {state.choices.options.map((option, index) => (
               <li key={option.creditId ?? `backend-choice-${index}`}>
                 <button
                   type="button"
                   className="codex-reset-flow__option"
-                  onClick={() => setState({ type: 'confirming', options: state.options, option, key: generateUUID() })}
+                  onClick={() => setState({ type: 'confirming', choices: state.choices, option, key: generateUUID() })}
                 >
                   <span className="codex-reset-flow__option-name">{option.name}</span>
                   <span className="codex-reset-flow__muted">{option.detail ?? option.description}</span>
@@ -141,32 +169,38 @@ export function CodexResetFlow({ onSucceeded, onListing, onClose }: CodexResetFl
           </div>
           <div className="codex-reset-flow__muted">{state.option.description}</div>
           {state.type === 'failed' && (
-            <div className="codex-reset-flow__error">Couldn&apos;t reset usage. Please try again.</div>
+            <div className="codex-reset-flow__error" role="status">Couldn&apos;t reset usage. Please try again.</div>
           )}
           <div className="codex-reset-flow__actions">
             <button
               type="button"
               className="codex-reset-flow__btn codex-reset-flow__btn--primary"
               disabled={state.type === 'in_flight'}
-              onClick={() => { void redeem(state.options, state.option, state.key); }}
+              onClick={() => { void redeem(state.choices, state.option, state.key); }}
             >
               {state.type === 'in_flight' ? 'Resetting…' : state.type === 'failed' ? 'Try again' : 'Yes, use reset'}
             </button>
-            <button
-              type="button"
-              className="codex-reset-flow__btn"
-              disabled={state.type === 'in_flight'}
-              onClick={() => setState({ type: 'choosing', options: state.options, notice: null })}
-            >
-              No, go back
-            </button>
+            {state.type === 'confirming' && (
+              <button
+                type="button"
+                className="codex-reset-flow__btn"
+                onClick={() => setState({ type: 'choosing', choices: state.choices, notice: null })}
+              >
+                No, go back
+              </button>
+            )}
+            {state.type !== 'in_flight' && (
+              <button type="button" className="codex-reset-flow__btn" onClick={onClose}>
+                {state.type === 'failed' ? 'Close' : 'Cancel'}
+              </button>
+            )}
           </div>
         </>
       )}
 
       {state.type === 'done' && (
         <>
-          <div className={state.succeeded ? 'codex-reset-flow__success' : 'codex-reset-flow__muted'}>
+          <div className={state.succeeded ? 'codex-reset-flow__success' : 'codex-reset-flow__muted'} role="status">
             {state.succeeded ? '✓ ' : ''}{state.text}
           </div>
           <div className="codex-reset-flow__actions">

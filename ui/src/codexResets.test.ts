@@ -18,6 +18,7 @@ function credit(overrides: Partial<CodexResetCredit>): CodexResetCredit {
 describe('resetOptions (REQ-CRR-006)', () => {
   it('lists available credits by soonest expiry, non-expiring last, capped at the count', () => {
     const options = resetOptions({
+      account_id: null,
       available_count: 2,
       credits: [
         credit({ id: 'never', expires_at: null }),
@@ -31,6 +32,7 @@ describe('resetOptions (REQ-CRR-006)', () => {
 
   it('puts non-expiring credits after expiring ones', () => {
     const options = resetOptions({
+      account_id: null,
       available_count: 3,
       credits: [credit({ id: 'never' }), credit({ id: 'soon', expires_at: 1_750_000_000 })],
     });
@@ -41,6 +43,7 @@ describe('resetOptions (REQ-CRR-006)', () => {
 
   it('falls back to default title and description for blank values', () => {
     const [option] = resetOptions({
+      account_id: null,
       available_count: 1,
       credits: [credit({ title: '  ', description: null })],
     });
@@ -50,6 +53,7 @@ describe('resetOptions (REQ-CRR-006)', () => {
 
   it('keeps upstream title and description', () => {
     const [option] = resetOptions({
+      account_id: null,
       available_count: 1,
       credits: [credit({ title: 'Full reset (Weekly + 5 hr)', description: 'Ready to redeem' })],
     });
@@ -59,6 +63,7 @@ describe('resetOptions (REQ-CRR-006)', () => {
 
   it('offers one backend-chooses option when the count is positive but no details are available', () => {
     const options = resetOptions({
+      account_id: null,
       available_count: 1,
       credits: [credit({ status: 'redeeming' })],
     });
@@ -68,7 +73,7 @@ describe('resetOptions (REQ-CRR-006)', () => {
   });
 
   it('offers nothing when the count is zero', () => {
-    expect(resetOptions({ available_count: 0, credits: [credit({})] })).toEqual([]);
+    expect(resetOptions({ account_id: null, available_count: 0, credits: [credit({})] })).toEqual([]);
   });
 });
 

@@ -94,10 +94,9 @@ conversation remains in a resumable error with Retry available.
   error until the user retries them or the sweep clears them. The upstream
   endpoints are not a published OpenAI API, so they can change without notice,
   and Phoenix tracks them by following `codex-rs`.
-- **Neutral:** If the account changes between the error and the redemption,
-  the redemption applies to the newly loaded account. In the common case that
-  account is not exhausted, so the outcome is `nothing_to_reset` and no credit
-  is spent.
+- **Neutral:** If the account changes between the listing and the
+  redemption, the server refuses the redemption, because it names the
+  listing's account. The user then chooses again for the current account.
 
 ## References
 

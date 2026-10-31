@@ -1,5 +1,5 @@
 import { api } from './api';
-import { setCodexQuota } from './codexQuota';
+import { getCodexQuotaGeneration, setCodexQuota } from './codexQuota';
 import type { CodexResetCredits } from './generated/CodexResetCredits';
 
 /** One choosable reset (REQ-CRR-006). `creditId: null` lets the backend choose. */
@@ -59,9 +59,10 @@ export function resetCountLabel(count: number): string {
 
 /** Refresh the shared quota store after a redemption (REQ-CRR-007). */
 export async function refreshCodexQuota(): Promise<void> {
+  const startedAt = getCodexQuotaGeneration();
   try {
     const quota = await api.codexQuota();
-    if (quota) setCodexQuota(quota);
+    if (quota && getCodexQuotaGeneration() === startedAt) setCodexQuota(quota);
   } catch {
     // The quota display keeps its last snapshot; the next read refreshes it.
   }

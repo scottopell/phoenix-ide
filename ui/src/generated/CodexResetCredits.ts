@@ -3,6 +3,6 @@ import type { CodexResetCredit } from "./CodexResetCredit";
 
 export type CodexResetCredits = { 
 /**
- * Never negative.
+ * `ChatGPT` account the listing was read for; a redemption must name it.
  */
-available_count: number, credits: Array<CodexResetCredit>, };
+account_id: string | null, available_count: number, credits: Array<CodexResetCredit>, };
