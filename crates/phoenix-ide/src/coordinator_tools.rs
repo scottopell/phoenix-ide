@@ -3,6 +3,12 @@ use crate::api::global_read::{
     PreviousTranscriptsRequest,
 };
 
+mod goals;
+
+pub(crate) fn goal_tools(runtime: Arc<crate::runtime::RuntimeManager>) -> Vec<Arc<dyn Tool>> {
+    goals::tools(runtime)
+}
+
 pub(crate) fn previous_transcripts_tool(
     service: GlobalReadService,
     product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
@@ -1188,7 +1194,7 @@ mod tests {
         }
     }
 
-    fn context(conversation_id: &str) -> ToolContext {
+    pub(super) fn context(conversation_id: &str) -> ToolContext {
         ToolContext::new_without_filesystem(
             CancellationToken::new(),
             conversation_id.to_string(),

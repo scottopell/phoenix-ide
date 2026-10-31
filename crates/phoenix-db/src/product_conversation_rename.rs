@@ -408,7 +408,11 @@ mod tests {
         command.source.product_conversation_id = gc.product_conversation_id;
         command.source.transcript_id = gc.id.clone();
         let outcome = db
-            .rename_product_conversation_with_commit(&gc.id, &command, RenameCommit::LoseAcknowledgement)
+            .rename_product_conversation_with_commit(
+                &gc.id,
+                &command,
+                RenameCommit::LoseAcknowledgement,
+            )
             .await;
         assert!(matches!(
             outcome,
@@ -422,10 +426,13 @@ mod tests {
         assert_eq!(receipt.title, command.title.as_str());
         assert_eq!(receipt.name_revision_before, 0);
         assert_eq!(
-            db.read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str())
-                .await
-                .unwrap()
-                .name_revision,
+            db.read_product_conversation_rename_detail(
+                &gc.id,
+                root.product_conversation_id.as_str()
+            )
+            .await
+            .unwrap()
+            .name_revision,
             1
         );
         assert_eq!(
@@ -437,10 +444,13 @@ mod tests {
             ProductConversationRenameResult::Replayed(receipt)
         );
         assert_eq!(
-            db.read_product_conversation_rename_detail(&gc.id, root.product_conversation_id.as_str())
-                .await
-                .unwrap()
-                .name_revision,
+            db.read_product_conversation_rename_detail(
+                &gc.id,
+                root.product_conversation_id.as_str()
+            )
+            .await
+            .unwrap()
+            .name_revision,
             1
         );
     }
@@ -456,10 +466,11 @@ mod tests {
                 .expect("acknowledged rollback establishes rejection"),
             Err(DbError::CurrentCoordinatorRequired)
         ));
-        let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM product_conversation_rename_receipts")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM product_conversation_rename_receipts")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(receipts, 0);
     }
 

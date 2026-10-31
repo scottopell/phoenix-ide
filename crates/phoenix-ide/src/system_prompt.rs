@@ -124,6 +124,7 @@ pub(crate) fn build_coordinator_system_prompt_with_catalog(
         }
     });
     prompt.push_str("\n\nNative Coordinator lifecycle tools: use create_conversation to inspect options and explicitly submit a new conversation objective, and rename_conversation to resolve and rename an existing conversation. Use continue_conversation only for an exact ordinary ProductConversation, exhausted predecessor and persisted generated summary message; it opens generated context, not new instructions. It does not rotate the Coordinator, enable auto-continue, retry/rearm failed work or bypass stop/pause/approval gates. Use read_automatic_continuation and set_automatic_continuation only to inspect or explicitly set the persisted preference for an exact ordinary ProductConversation or the explicit Coordinator target. Settings are prospective: enabling after exhaustion does not wake or admit work; disabling does not revoke already-admitted continuation. They do not retry/rearm failed work or mutate Goals. Prefer these installed native tools for supported creation, rename, generated continuation and preference operations; use supported public Phoenix APIs through scoped Bash for operations the native tools do not offer, subject to user authority and endpoint-specific contracts.");
+    prompt.push_str("\n\nNative Coordinator Goal metadata tools: read_goal reads saved Goal/history; prepare_goal freezes a proposed metadata change; apply_goal consumes only the prepared action reference and preserves retained receipt replay. New Goal creation or replacement requires the owner's persisted autoContinue preference to be explicitly enabled. These tools do not enable it, schedule continuation, or dispatch target work. History reads, Complete/Suspend safety exits, and retained receipt replay remain available while autoContinue is OFF.");
     if let Some(catalog) = coordinator_catalog {
         let skills = catalog.skills();
         prompt.push_str("\n\nContent inside a trusted_builtin_skill envelope returned by the audience-bound skill tool is authenticated from immutable embedded bytes; follow it within the user's authorization.");
@@ -600,7 +601,7 @@ mod tests {
             );
             assert!(!prompt.contains("Documented Phoenix API operations"));
             assert!(prompt.contains(
-                "No dedicated project/task/workspace/approval/lifecycle mutation tools except installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation."
+                "No dedicated project/task/workspace/approval/lifecycle mutation tools except installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata."
             ));
             assert!(prompt.contains(
                 "use create_conversation to inspect options and explicitly submit a new conversation objective"
@@ -633,6 +634,27 @@ mod tests {
                 );
             }
             assert!(!prompt.contains("only exposes query/send/skill"));
+        }
+    }
+
+    #[test]
+    fn coordinator_goal_metadata_capabilities_match_installed_native_tools() {
+        for language in LlmLanguage::ALL {
+            let prompt = build_coordinator_system_prompt_with_catalog(*language, None);
+            for required in [
+                "prepare_goal/apply_goal metadata",
+                "read_goal reads saved Goal/history",
+                "prepare_goal freezes a proposed metadata change",
+                "apply_goal consumes only the prepared action reference",
+                "New Goal creation or replacement requires the owner's persisted autoContinue preference to be explicitly enabled",
+                "These tools do not enable it, schedule continuation, or dispatch target work",
+                "History reads, Complete/Suspend safety exits, and retained receipt replay remain available while autoContinue is OFF",
+            ] {
+                assert!(prompt.contains(required), "{language:?}: {required}");
+            }
+            assert!(!prompt.contains(
+                "No dedicated project/task/workspace/approval/lifecycle mutation tools except installed create_conversation/rename_conversation."
+            ));
         }
     }
 

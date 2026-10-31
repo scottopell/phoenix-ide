@@ -16,7 +16,7 @@ use phoenix_db::conversation_goals::{
 use serde::Deserialize;
 
 use super::{auth::OwnerAuthenticated, handlers::AppError, types::ConflictErrorResponse, AppState};
-use service::GoalCommandService;
+pub(crate) use service::GoalCommandService;
 
 mod service;
 #[cfg(test)]
@@ -142,7 +142,11 @@ fn receipt_response(receipt: GoalUserReceipt) -> Response {
 
 fn goal_error(error: GoalDbError) -> AppError {
     match error {
+        GoalDbError::Invalid(message) => AppError::BadRequest(message.into()),
         GoalDbError::Admission(error) => super::product_conversations::db_to_app(error),
+        error @ GoalDbError::AutoContinueDisabled => AppError::Conflict(Box::new(
+            ConflictErrorResponse::new(error.to_string(), "goal_requires_auto_continue"),
+        )),
         error @ (GoalDbError::RetryConflict | GoalDbError::TargetChanged | GoalDbError::Busy) => {
             AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 error.to_string(),

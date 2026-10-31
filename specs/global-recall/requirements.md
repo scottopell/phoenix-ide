@@ -191,7 +191,7 @@ THE SYSTEM SHALL additionally provide explicit subscription management only to t
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
 THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
-AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation, naming, generated-continuation and automatic-continuation preference capabilities defined below to the Coordinator
+AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, source-scoped retrieval for another conversation's private follow-up surface, or dedicated lifecycle mutation tools other than the bounded creation, naming, generated-continuation, automatic-continuation preference, and Goal metadata capabilities defined below to the Coordinator
 
 WHILE the persisted singleton Global Coordinator is the executing current transcript
 THE SYSTEM MAY provide dedicated conversation creation and naming tools through the same application actions used by public conversation operations
@@ -211,6 +211,14 @@ AND SHALL NOT thereby grant self-rotation, literal opening instructions, automat
 WHILE the persisted singleton Global Coordinator is the executing current transcript
 THE SYSTEM MAY provide `read_automatic_continuation` and `set_automatic_continuation` solely for the preference operations defined by REQ-GR-020
 AND SHALL NOT thereby grant scheduling, admission, failed-work recovery, retry/rearm, Goal mutation, task approval, structured-answer or review authority.
+
+WHEN the current authenticated Coordinator uses native Goal metadata tools
+THE SYSTEM MAY provide `read_goal`, `prepare_goal`, and reference-only `apply_goal` through the shared Goal command service
+AND SHALL enforce the same admission, provenance, retained-receipt, and history rules as owner Goal commands
+AND SHALL follow the admission, retained-state, safety-control, and no-implicit-execution requirements in [`goal-continuation/requirements.md`](../goal-continuation/requirements.md) REQ-GOAL-AC-001 through REQ-GOAL-AC-004
+AND SHALL require explicit persisted owner autoContinue enablement for new Goal creation or replacement without enabling that preference
+AND SHALL preserve Goal/history reads, Complete/Suspend safety exits, and retained receipt replay while that preference is OFF
+AND SHALL NOT expose these tools to ordinary conversations, predecessor transcripts, or sub-agents, schedule continuation, or dispatch target work through them
 
 ---
 

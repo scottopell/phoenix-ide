@@ -1,3 +1,4 @@
+use phoenix_core::domain::conversation_goal::GoalAgentSource;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -27,6 +28,7 @@ pub struct GoalUserCommand {
     pub change: GoalUserChange,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoalUserChange {
     Create {
         objective: GoalText,
@@ -136,13 +138,34 @@ pub struct GoalUserReceipt {
     pub result: GoalUserResult,
 }
 
+#[derive(Clone, Copy)]
+enum GoalReceiptStore {
+    Owner,
+    Coordinator,
+}
+
+impl GoalControlAuthority<'_> {
+    fn receipts(self) -> GoalReceiptStore {
+        match self {
+            Self::Owner => GoalReceiptStore::Owner,
+            Self::Coordinator { .. } => GoalReceiptStore::Coordinator,
+        }
+    }
+}
+
 async fn retained_tx(
     tx: &mut GoalTx<'_>,
     input: &GoalUserCommand,
+    store: GoalReceiptStore,
 ) -> Result<Option<GoalUserReceipt>> {
-    let row = sqlx::query("SELECT command,expected_version,goal_id,outcome,result_version,rejected_objective,rejected_state,rejected_reason,recorded_at_us FROM conversation_goal_user_requests WHERE owner_id=? AND principal_id=? AND request_id=?")
-        .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
-        .bind(input.request_id.as_bytes().as_slice()).fetch_optional(&mut **tx).await?;
+    let row = match store {
+        GoalReceiptStore::Owner => sqlx::query("SELECT command,expected_version,goal_id,outcome,result_version,rejected_objective,rejected_state,rejected_reason,recorded_at_us FROM conversation_goal_user_requests WHERE owner_id=? AND principal_id=? AND request_id=?")
+            .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
+            .bind(input.request_id.as_bytes().as_slice()).fetch_optional(&mut **tx).await?,
+        GoalReceiptStore::Coordinator => sqlx::query("SELECT CASE p.operation WHEN 'state' THEN 'state' ELSE 'create' END AS command,p.expected_version,p.observed_goal_id AS goal_id,r.outcome,r.result_version,p.objective AS rejected_objective,COALESCE(p.disposition,'underway') AS rejected_state,p.reason AS rejected_reason,r.recorded_at_us FROM conversation_goal_coordinator_receipts r JOIN conversation_goal_preparations p ON p.reference=r.preparation_reference WHERE r.owner_id=? AND r.preparation_reference=?")
+            .bind(input.owner.as_str()).bind(input.request_id.as_bytes().as_slice())
+            .fetch_optional(&mut **tx).await?,
+    };
     let Some(row) = row else { return Ok(None) };
     if row.try_get::<String, _>("command")? != input.change.command().0
         || row.try_get::<i64, _>("expected_version")? != input.expected_version.get()
@@ -205,6 +228,7 @@ async fn retained_tx(
 async fn reject_tx(
     tx: &mut GoalTx<'_>,
     input: &GoalUserCommand,
+    authority: GoalControlAuthority<'_>,
     reason: GoalUserRefusal,
     observed_version: GoalVersion,
     at: GoalTimestampUs,
@@ -215,11 +239,16 @@ async fn reject_tx(
         GoalUserRefusal::Transition => "rejected_transition",
     };
     let (goal_id, objective, state, reason_text) = input.change.rejected_fields();
-    sqlx::query("INSERT INTO conversation_goal_user_requests (owner_id,principal_id,request_id,command,expected_version,goal_id,rejected_objective,rejected_state,rejected_reason,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
-        .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
-        .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
-        .bind(goal_id).bind(objective).bind(state).bind(reason_text).bind(outcome).bind(observed_version.get()).bind(at.get())
-        .execute(&mut **tx).await?;
+    match authority {
+        GoalControlAuthority::Owner => sqlx::query("INSERT INTO conversation_goal_user_requests (owner_id,principal_id,request_id,command,expected_version,goal_id,rejected_objective,rejected_state,rejected_reason,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
+            .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
+            .bind(goal_id).bind(objective).bind(state).bind(reason_text).bind(outcome)
+            .bind(observed_version.get()).bind(at.get()).execute(&mut **tx).await?,
+        GoalControlAuthority::Coordinator { .. } => sqlx::query("INSERT INTO conversation_goal_coordinator_receipts (preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?)")
+            .bind(input.request_id.as_bytes().as_slice()).bind(input.owner.as_str()).bind(outcome)
+            .bind(observed_version.get()).bind(at.get()).execute(&mut **tx).await?,
+    };
     Ok(GoalUserReceipt {
         request_id: input.request_id,
         result: GoalUserResult::Rejected {
@@ -230,7 +259,78 @@ async fn reject_tx(
     })
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum GoalControlAuthority<'a> {
+    Owner,
+    Coordinator {
+        caller: &'a str,
+        source: &'a GoalAgentSource,
+    },
+}
+
+impl GoalControlAuthority<'_> {
+    async fn require(self, tx: &mut GoalTx<'_>) -> Result<()> {
+        if let Self::Coordinator { caller, .. } = self {
+            super::prepared::require_coordinator(tx, caller).await?;
+        }
+        Ok(())
+    }
+
+    fn actor(self, input: &GoalUserCommand) -> GoalActor {
+        match self {
+            Self::Owner => GoalActor::UserControl {
+                principal_id: input.principal_id,
+                request_id: input.request_id,
+                command: input.change.command().1,
+            },
+            Self::Coordinator { source, .. } => GoalActor::Coordinator(source.clone()),
+        }
+    }
+}
+
 impl Database {
+    /// Read an exact Coordinator receipt for a retained preparation.
+    ///
+    /// # Errors
+    /// Rejects a non-current Coordinator, a missing or changed preparation,
+    /// conflicting receipt identity, malformed data, or a storage failure.
+    pub async fn retained_coordinator_goal_command(
+        &self,
+        caller: &str,
+        input: &GoalUserCommand,
+    ) -> Result<Option<GoalUserReceipt>> {
+        let mut tx = self.pool().begin().await?;
+        super::prepared::require_coordinator(&mut tx, caller).await?;
+        super::prepared::require_retained_preparation(&mut tx, caller, input).await?;
+        let result = retained_tx(&mut tx, input, GoalReceiptStore::Coordinator).await?;
+        tx.rollback().await?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_coordinator_goal_command<F: FnOnce()>(
+        &self,
+        caller: &str,
+        source: &GoalAgentSource,
+        input: &GoalUserCommand,
+        expected_transcript: &str,
+        host_gate_busy: bool,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        on_authority_lost: F,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        self.control_goal_command(
+            input,
+            expected_transcript,
+            GoalControlAuthority::Coordinator { caller, source },
+            clock,
+            host_gate_busy,
+            on_authority_lost,
+            #[cfg(test)]
+            UserCommitCut::None,
+        )
+        .await
+    }
+
     /// Read an exact receipt for an ordinary owner before checking admission for a new write.
     ///
     /// The transcript argument is a prior caller sample; this read resolves the live target itself.
@@ -244,7 +344,7 @@ impl Database {
     ) -> Result<Option<GoalUserReceipt>> {
         let mut tx = self.pool().begin().await?;
         let live = Self::get_ordinary_product_conversation_on(&mut tx, &input.owner).await?;
-        let retained = retained_tx(&mut tx, input).await?;
+        let retained = retained_tx(&mut tx, input, GoalReceiptStore::Owner).await?;
         if retained.is_none() {
             admission::require_target_tx(&mut tx, &input.owner, &live.latest_transcript_row_id)
                 .await?;
@@ -299,16 +399,22 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn user_goal_command_tx(
         &self,
         tx: &mut GoalTx<'_>,
         input: &GoalUserCommand,
         expected_transcript: &str,
+        requester: GoalControlAuthority<'_>,
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         host_gate_busy: bool,
     ) -> Result<GoalUserReceipt> {
+        requester.require(tx).await?;
         let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
-        if let Some(retained) = retained_tx(tx, input).await? {
+        if let GoalControlAuthority::Coordinator { caller, source } = requester {
+            super::prepared::require_exact_preparation(tx, caller, source, input).await?;
+        }
+        if let Some(retained) = retained_tx(tx, input, requester.receipts()).await? {
             return Ok(retained);
         }
         let target = if host_gate_busy {
@@ -328,14 +434,10 @@ impl Database {
             } else {
                 GoalUserRefusal::Version
             };
-            let receipt = reject_tx(tx, input, reason, observed, at).await?;
+            let receipt = reject_tx(tx, input, requester, reason, observed, at).await?;
             return Ok(receipt);
         }
-        let actor = GoalActor::UserControl {
-            principal_id: input.principal_id,
-            request_id: input.request_id,
-            command: input.change.command().1,
-        };
+        let actor = requester.actor(input);
         let mutation = GoalMutation {
             owner: input.owner.clone(),
             expected_version: input.expected_version,
@@ -352,7 +454,8 @@ impl Database {
         match admission::require_settled_tx(tx, &mutation, expected_transcript).await {
             Ok(()) => {}
             Err(GoalDbError::Busy) => {
-                let receipt = reject_tx(tx, input, GoalUserRefusal::Busy, observed, at).await?;
+                let receipt =
+                    reject_tx(tx, input, requester, GoalUserRefusal::Busy, observed, at).await?;
                 return Ok(receipt);
             }
             Err(error) => return Err(error),
@@ -362,17 +465,29 @@ impl Database {
             Err(GoalError::Inapplicable | GoalError::Conflict)
                 if matches!(&input.change, GoalUserChange::State { .. }) =>
             {
-                let receipt =
-                    reject_tx(tx, input, GoalUserRefusal::Transition, observed, at).await?;
+                let receipt = reject_tx(
+                    tx,
+                    input,
+                    requester,
+                    GoalUserRefusal::Transition,
+                    observed,
+                    at,
+                )
+                .await?;
                 return Ok(receipt);
             }
             Err(error) => return Err(error.into()),
         };
-        sqlx::query("INSERT INTO conversation_goal_user_requests (owner_id,principal_id,request_id,command,expected_version,goal_id,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?,?,'accepted',?,?)")
-            .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
-            .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
-            .bind(next.goal_id().as_str()).bind(next.version().get()).bind(at.get())
-            .execute(&mut **tx).await?;
+        match requester {
+            GoalControlAuthority::Owner => sqlx::query("INSERT INTO conversation_goal_user_requests (owner_id,principal_id,request_id,command,expected_version,goal_id,outcome,result_version,recorded_at_us) VALUES (?,?,?,?,?,?,'accepted',?,?)")
+                .bind(input.owner.as_str()).bind(input.principal_id.as_bytes().as_slice())
+                .bind(input.request_id.as_bytes().as_slice()).bind(input.change.command().0).bind(input.expected_version.get())
+                .bind(next.goal_id().as_str()).bind(next.version().get()).bind(at.get())
+                .execute(&mut **tx).await?,
+            GoalControlAuthority::Coordinator { .. } => sqlx::query("INSERT INTO conversation_goal_coordinator_receipts (preparation_reference,owner_id,outcome,result_version,recorded_at_us) VALUES (?,?,'accepted',?,?)")
+                .bind(input.request_id.as_bytes().as_slice()).bind(input.owner.as_str())
+                .bind(next.version().get()).bind(at.get()).execute(&mut **tx).await?,
+        };
         let entry = apply_goal_tx(
             tx,
             &mutation,
@@ -406,6 +521,31 @@ impl Database {
         on_authority_lost: F,
         #[cfg(test)] cut: UserCommitCut,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        self.control_goal_command(
+            input,
+            expected_transcript,
+            GoalControlAuthority::Owner,
+            clock,
+            host_gate_busy,
+            on_authority_lost,
+            #[cfg(test)]
+            cut,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[cfg_attr(test, allow(clippy::too_many_arguments))]
+    async fn control_goal_command<F: FnOnce()>(
+        &self,
+        input: &GoalUserCommand,
+        expected_transcript: &str,
+        requester: GoalControlAuthority<'_>,
+        clock: impl FnOnce() -> Result<GoalTimestampUs>,
+        host_gate_busy: bool,
+        on_authority_lost: F,
+        #[cfg(test)] cut: UserCommitCut,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
         let mut connection = match self.pool().acquire().await {
             Ok(connection) => connection,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
@@ -416,7 +556,14 @@ impl Database {
         };
         let mut authority = super::control::ControlCommitAuthority::new(on_authority_lost);
         let result = self
-            .user_goal_command_tx(&mut tx, input, expected_transcript, clock, host_gate_busy)
+            .user_goal_command_tx(
+                &mut tx,
+                input,
+                expected_transcript,
+                requester,
+                clock,
+                host_gate_busy,
+            )
             .await;
         let attempted = match result {
             Ok(receipt) => {
@@ -470,7 +617,14 @@ impl Database {
         else {
             return LocalAuthorityResult::DurableFactUnclassified;
         };
-        let retained = retained_tx(&mut lookup, input).await;
+        let retained = async {
+            if let GoalControlAuthority::Coordinator { caller, source } = requester {
+                super::prepared::require_exact_preparation(&mut lookup, caller, source, input)
+                    .await?;
+            }
+            retained_tx(&mut lookup, input, requester.receipts()).await
+        }
+        .await;
         #[cfg(test)]
         let retained = if matches!(cut, UserCommitCut::LostClassification) {
             Err(GoalDbError::Sqlx(sqlx::Error::Protocol(

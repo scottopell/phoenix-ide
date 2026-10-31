@@ -43,6 +43,10 @@ impl Fixture {
             .await
             .unwrap();
         let owner = conversation.product_conversation_id.clone();
+        state.runtime.db().set_auto_continue_on_context_exhaustion(
+            &owner,
+            phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion::Enabled,
+        ).await.unwrap();
         Self {
             router: create_router(state.clone()),
             state,
@@ -165,6 +169,68 @@ async fn goal_routes_require_owner_authentication_and_do_not_mount_peer_routes()
     let (status, _) = request(isolated, "GET", "/api/federation/goals", Value::Null, true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(fixture.snapshot().await, before);
+}
+
+#[tokio::test]
+async fn owner_goal_create_and_replace_require_explicit_auto_continue_without_partial_receipts() {
+    use phoenix_core::domain::product_conversation::AutoContinueOnContextExhaustion as Preference;
+
+    let f = Fixture::new().await;
+    let db = f.state.runtime.db();
+    db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Disabled)
+        .await
+        .unwrap();
+    let before = f.snapshot().await;
+    let (status, refusal) = f
+        .call("POST", "", create_request(0, "disabled create"))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["error_type"], "goal_requires_auto_continue");
+    assert!(refusal["error"]
+        .as_str()
+        .unwrap()
+        .contains("enable automatic continuation"));
+    assert_eq!(f.snapshot().await, before);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_user_requests")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipts, 0);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&f.owner)
+            .await
+            .unwrap(),
+        Preference::Disabled
+    );
+
+    db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Enabled)
+        .await
+        .unwrap();
+    let command = create_request(0, "enabled create");
+    let accepted = f.call("POST", "", command.clone()).await;
+    assert_eq!(accepted.0, StatusCode::OK, "{}", accepted.1);
+    db.set_auto_continue_on_context_exhaustion(&f.owner, Preference::Disabled)
+        .await
+        .unwrap();
+    let before_replacement = f.snapshot().await;
+    assert_eq!(f.call("POST", "", command).await, accepted);
+    let (status, refusal) = f
+        .call("POST", "", create_request(1, "disabled replacement"))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["error_type"], "goal_requires_auto_continue");
+    assert_eq!(f.snapshot().await, before_replacement);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_goal_user_requests")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipts, 1);
+    assert_eq!(
+        db.auto_continue_on_context_exhaustion(&f.owner)
+            .await
+            .unwrap(),
+        Preference::Disabled
+    );
 }
 
 #[tokio::test]
@@ -404,6 +470,138 @@ async fn nonsettled_runtime_refuses_commands_and_unknown_product_targets_do_not_
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(fixture.snapshot().await, before);
+}
+
+#[tokio::test]
+async fn preparation_refusal_rechecks_authority_at_publication() {
+    let fixture = Fixture::new().await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let service = super::service::GoalCommandService::new(fixture.state.runtime.clone())
+        .with_command_publication_barrier(barrier.clone());
+    let caller = fixture.transcript.clone();
+    let owner = fixture.owner.clone();
+    let pending = tokio::spawn(async move {
+        service
+            .prepare_coordinator(
+                &caller,
+                &phoenix_core::domain::db_schema::SourceToolCall {
+                    message_id: "unused-ordinary-caller-message".into(),
+                    tool_use_id: "unused-ordinary-caller-tool".into(),
+                },
+                &owner,
+                phoenix_db::conversation_goals::prepared::GoalPreparationIntent::Create {
+                    objective: phoenix_core::domain::conversation_goal::GoalText::parse(
+                        "refused ordinary caller",
+                    )
+                    .unwrap(),
+                },
+                phoenix_core::domain::sm_event::DirectTurnTurnId(0),
+            )
+            .await
+    });
+    barrier.wait().await;
+    assert!(!fixture.state.runtime.fatal_local_authority_is_latched());
+    fixture
+        .state
+        .runtime
+        .signal_fatal_local_authority("preparation_publication_race_test");
+    barrier.wait().await;
+    assert!(
+        matches!(pending.await.unwrap(), Err(AppError::Internal(message)) if message == "local authority is closed")
+    );
+}
+
+#[tokio::test]
+async fn synthetic_unclassified_preparation_closes_authority_before_releasing_admission() {
+    let fixture = Fixture::new().await;
+    let authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+        fixture
+            .state
+            .runtime
+            .acquire_local_authority_pass()
+            .unwrap(),
+    );
+
+    assert!(authority
+        .complete::<()>(phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified)
+        .is_err());
+    assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .fatal_authority_owners_at_first_close(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn synthetic_abandoned_preparation_closes_authority_before_releasing_admission() {
+    let fixture = Fixture::new().await;
+    let authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+        fixture
+            .state
+            .runtime
+            .acquire_local_authority_pass()
+            .unwrap(),
+    );
+
+    drop(authority);
+    assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .fatal_authority_owners_at_first_close(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn synthetic_panicked_preparation_closes_authority_before_releasing_admission() {
+    let fixture = Fixture::new().await;
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+            fixture
+                .state
+                .runtime
+                .acquire_local_authority_pass()
+                .unwrap(),
+        );
+        panic!("synthetic preparation panic");
+    }));
+
+    assert!(panicked.is_err());
+    assert!(fixture.state.runtime.fatal_local_authority_is_latched());
+    assert_eq!(
+        fixture
+            .state
+            .runtime
+            .fatal_authority_owners_at_first_close(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn established_preparation_rejection_disarms_without_closing_authority() {
+    let fixture = Fixture::new().await;
+    let authority = super::service::CoordinatorGoalPreparationAuthorityPass::new(
+        fixture
+            .state
+            .runtime
+            .acquire_local_authority_pass()
+            .unwrap(),
+    );
+
+    assert!(authority
+        .complete::<()>(
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(
+                phoenix_db::conversation_goals::GoalDbError::RetryConflict,
+            )),
+        )
+        .is_err());
+    assert!(!fixture.state.runtime.fatal_local_authority_is_latched());
+    assert!(fixture.state.runtime.acquire_local_authority_pass().is_ok());
 }
 
 #[tokio::test]
