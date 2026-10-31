@@ -521,6 +521,7 @@ async fn preparation_requires_exact_server_turn_and_current_coordinator() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn coordinator_payload_and_source_are_checked_before_busy_and_receipt_replay() {
     let db = fixture().await;
     let (caller, _, source_call, turn) = coordinator_source(&db, "prep-poison").await;

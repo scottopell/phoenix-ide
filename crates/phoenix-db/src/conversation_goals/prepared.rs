@@ -266,13 +266,10 @@ impl Database {
     ) -> crate::workflow::LocalAuthorityResult<Result<PreparedGoalAction>> {
         use crate::workflow::LocalAuthorityResult;
 
-        let turn_id = match i64::try_from(turn_id.0) {
-            Ok(turn_id) => turn_id,
-            Err(_) => {
-                return LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::Invalid(
-                    "durable turn ID is out of range",
-                )))
-            }
+        let Ok(turn_id) = i64::try_from(turn_id.0) else {
+            return LocalAuthorityResult::DurableFactEstablished(Err(GoalDbError::Invalid(
+                "durable turn ID is out of range",
+            )));
         };
         let mut connection = match self.pool().acquire().await {
             Ok(connection) => connection,
