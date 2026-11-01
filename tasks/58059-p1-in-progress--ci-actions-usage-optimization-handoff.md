@@ -59,6 +59,26 @@ Inside `check (rust)` on a normal runner (run 41230192024):
 
 `cargo test` runs nextest capped at **3 threads** on a 4-CPU runner (`cpus=4, mem_cap=10`).
 
+## Progress (branch `ci/actions-usage-optimization`)
+
+Findings from job logs (the agent proxy blocks the caches API, so `gh cache list` is still unverified):
+
+- **P1-2 root cause (likely):** `ci-${{ github.ref }}` with `cancel-in-progress: true` also applied to `main`. The next merge cancelled the 50-min rust job before its post step, so the `check-rust` rust-cache was rarely saved (main push runs: 3 success, 5 cancelled, 1 failure in the window). The clippy job finishes in ~3 min and *does* get a full hit (`v1-rust-check-clippy-…`, ~405 MB, run 41260754169).
+- **sccache "0 compile requests"** is a stats artifact: the server idles out (default 600 s) during the 30-min test step, and `--show-stats` then starts a fresh server. It does not show that sccache was unused.
+- Run 41260754169 shows P2-1 directly: `ui/specs` failed after 9 s, while `rust` ran another 35 min and failed too.
+- The `bash-launch.yml` Ubuntu job overlaps `check (rust)`, which builds the same native launcher and sets `PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1`. That makes it a candidate for removal (product-owner call).
+
+Done:
+
+- [x] P1-1 stopgap: cargo-test budget 4800 s; step/job timeouts recomputed.
+- [x] P1-2: main CI runs are no longer cancelled; `cache-on-failure` for the rust lane on main; `SCCACHE_IDLE_TIMEOUT=0` so stats become meaningful; macOS app saves rust-cache only on main.
+- [x] Native fixture builds with default jobs instead of `-j 1`.
+- [x] Bash launch settlement cancels superseded PR runs.
+- [x] P3-2: the shallow-clone test fetches pinned commits on demand.
+- [x] P3-3: Node 20 actions bumped (tag-referenced ones only; SHA pins untouched).
+
+Next, once a few main runs have saved caches: compare PR rust-job `Cache Cargo` hits and sccache hit rates. Then decide P1-1 sharding, P2-1 gating and P2-2 macOS scope (open questions below).
+
 ## Prioritised issues
 
 ### P1-1: `check (rust)` times out on slow runners
