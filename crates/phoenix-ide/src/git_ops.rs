@@ -308,6 +308,7 @@ pub(crate) fn run_git_test_command(
         wait_for_child_with(
             || child.try_wait(),
             || started.elapsed() >= timeout,
+            // test-timing-allow: back off real subprocess polling; try_wait proves exit, elapsed time only bounds liveness.
             || std::thread::sleep(std::time::Duration::from_millis(20)),
         )
     })
