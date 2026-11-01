@@ -14,6 +14,7 @@ import {
   type TranscriptLayout,
   type TranscriptRange,
 } from '../conversation/virtualTranscriptLayout';
+import { flushSync } from 'react-dom';
 import './VirtualTranscript.css';
 
 export interface VirtualTranscriptRange {
@@ -670,8 +671,10 @@ function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: 
 
   if (revealed) physicalChanged = measureMountedExtents(store) || physicalChanged;
   if (physicalChanged) {
+    const previousDrift = store.drift;
     applyPhysicalChange(store, anchor, wasPinned);
-    publish();
+    if (store.drift !== previousDrift) flushSync(publish);
+    else publish();
     return;
   }
 
