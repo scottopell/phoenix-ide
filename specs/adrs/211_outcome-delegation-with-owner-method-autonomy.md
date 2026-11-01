@@ -11,7 +11,7 @@ The user reported that ordinary scroll-regression debugging had become a sequenc
 ## Options considered
 
 1. Keep generic follow-through guidance alone: shortest, but it did not clearly distinguish routine method repair from approval-gated actions in the reported case.
-2. Add the outcome rule and three role-consistent examples: concrete boundaries and repair latitude, at the cost of a larger prompt. This is the proposed option, not an approved size-budget exception.
+2. Add the outcome rule and three role-consistent examples: concrete boundaries and repair latitude, at the cost of a larger prompt. The user accepted the size-budget exception after reviewing the draft.
 3. Compress existing guidance to fund the examples: retains the size limit but risks losing previously reviewed reporting, authority and recovery distinctions; no such rewrite is proposed here.
 
 ## Decision
@@ -26,7 +26,7 @@ The proposed wording makes routine method repair independent of Coordinator appr
 
 ### Size tradeoff
 
-The literal paragraph and all three requested examples add 185 words / 1,224 Unicode characters plus a separator to each variant. Preserve the old base prompt and its historical ceilings; test the bounded addition separately. This explicitly proposes an increase rather than claiming the earlier same-size budget was met. This draft does not cut security guidance or the earlier silence examples to conceal growth; accepting the larger overall budget remains a review decision.
+The literal paragraph and all three requested examples add 185 words / 1,224 Unicode characters plus a separator to each variant. Preserve the old base prompt and its historical ceilings; test the bounded addition separately. This explicitly proposes an increase rather than claiming the earlier same-size budget was met. This draft does not cut security guidance or the earlier silence examples to conceal growth; the user subsequently accepted the larger overall budget: “Prompt increase reasonable, my prior rule aside”.
 
 ## Verification
 
