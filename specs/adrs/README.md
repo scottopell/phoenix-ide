@@ -205,6 +205,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [188](188_slack-gateway-supports-only-its-final-public-schema.md) | Slack gateway supports only its final public schema | Accepted | REQ-SG-005/011/012/015/017; REQ-COMP-002/020 |
 | [210](210_original-target-touch-routing-follows-contact-ownership.md) | Original-target touch routing follows contact ownership | Accepted | REQ-MLRU-014, REQ-MLRU-017 |
 | [212](212_outcome-delegation-with-owner-method-autonomy.md) | Outcome delegation with owner method autonomy | Proposed | REQ-GR-011 |
+| [213](213_macos-bash-launch-qualification-is-the-only-hosted-launch-ci.md) | macOS Bash launch qualification is the only separate hosted launch CI | Accepted | REQ-BASH-017 |
 
 ## For agents: which decisions bind your task
 
