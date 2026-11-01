@@ -11,9 +11,10 @@ on:
       - main
 
 concurrency:
-  group: ci-${{ github.ref }}
-  # main runs must finish: they alone save the shared caches and drive the
-  # main-failure issue jobs.
+  # One group per main commit so no main run is cancelled or replaced while
+  # pending: main runs alone save the shared caches and drive the
+  # main-failure issue jobs. Other refs keep only their newest run.
+  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
