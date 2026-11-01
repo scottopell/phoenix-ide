@@ -21,6 +21,25 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def historical_registry_bytes(test, commit):
+    """Read migrations.rs at a pinned historical commit, fetching it into shallow clones."""
+    spec = f"{commit}:crates/phoenix-db/src/migrations.rs"
+    present = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=ROOT, capture_output=True,
+    ).returncode == 0
+    if not present:
+        fetched = subprocess.run(
+            ["git", "fetch", "--quiet", "--no-tags", "--depth=1", "origin", commit],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if fetched.returncode != 0:
+            reason = f"git object {commit} unavailable and fetch failed: {fetched.stderr.strip()}"
+            if os.environ.get("CI"):
+                raise AssertionError(reason)
+            test.skipTest(reason)
+    return subprocess.check_output(["git", "show", spec], cwd=ROOT)
+
+
 def load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -6517,9 +6536,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
 
     def test_prepared114_receipt_candidate_gets_typed_evidence_from_exact_git_object(self):
         commit = self.dev.PREPARED_SOURCE114_COMMIT
-        registry_bytes = subprocess.check_output(
-            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
-        )
+        registry_bytes = historical_registry_bytes(self, commit)
         with self.deployment(current=True, candidate_commit=commit, registry_bytes=registry_bytes) as (staging, controller, events), \
              mock.patch.object(self.dev, "ROOT", staging / "different-controller-checkout"):
             self.dev.launchd_prod_deploy(controller=controller)
@@ -6542,9 +6559,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
 
     def test_prepared128_controller_manifest_round_trips_through_helper_exact_qualification(self):
         commit = self.dev.PREPARED_SOURCE128_COMMIT
-        registry_bytes = subprocess.check_output(
-            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
-        )
+        registry_bytes = historical_registry_bytes(self, commit)
         identity = self.dev.RuntimeIdentity(self.dev.PREPARED_SOURCE128_VERSION, commit)
         with self.deployment(current=True, candidate_commit=commit, registry_bytes=registry_bytes) as (staging, controller, events), \
              mock.patch.object(self.dev.sys, "platform", "darwin"), \
@@ -6579,9 +6594,7 @@ class LaunchdControllerDurabilityTests(unittest.TestCase):
 
     def test_prepared128_requires_exact_version_registry_and_separate_controller(self):
         commit = self.dev.PREPARED_SOURCE128_COMMIT
-        registry_bytes = subprocess.check_output(
-            ["git", "show", f"{commit}:crates/phoenix-db/src/migrations.rs"], cwd=ROOT,
-        )
+        registry_bytes = historical_registry_bytes(self, commit)
         for version, content, controller_commit, error in (
             ("2.0.0", registry_bytes, "d" * 40, "receipt-bound version/commit"),
             (self.dev.PREPARED_SOURCE128_VERSION, b"substituted registry\n", "d" * 40, "registry SHA-256 mismatch"),

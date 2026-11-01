@@ -5330,6 +5330,119 @@ def _rust_check_commands(
     return compile_cmd, test_cmd, codegen_cmd
 
 
+class RustPhase(enum.Enum):
+    """One slice of the rust lane when CI splits it across runners.
+
+    BUILD compiles the test binaries into a nextest archive; CODEGEN and TEST
+    run from that archive on other runners. Together they cover exactly the
+    unsplit lane: compile, codegen + staleness diff, and cargo test.
+    """
+    BUILD = "build"
+    CODEGEN = "codegen"
+    TEST = "test"
+
+
+@dataclasses.dataclass(frozen=True)
+class RustPartition:
+    index: int
+    total: int
+
+    def __post_init__(self):
+        if not 1 <= self.index <= self.total:
+            raise ValueError(f"rust partition {self.index}/{self.total} is out of range")
+
+    @classmethod
+    def parse(cls, raw: str) -> "RustPartition":
+        match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", raw)
+        if match is None:
+            raise ValueError(f"rust partition must look like K/N, got {raw!r}")
+        return cls(int(match.group(1)), int(match.group(2)))
+
+    def nextest_arg(self) -> str:
+        # count: deals each test binary's tests round-robin, spreading a
+        # binary's expensive tests across shards; hash: clustered them.
+        return f"count:{self.index}/{self.total}"
+
+
+@dataclasses.dataclass(frozen=True)
+class RustSplit:
+    phase: RustPhase
+    partition: RustPartition | None = None
+
+    def __post_init__(self):
+        if self.partition is not None and self.phase is not RustPhase.TEST:
+            raise ValueError("--rust-partition applies only to --rust-phase test")
+
+
+RUST_SPLIT_DIR = ROOT / "target" / "rust-split"
+RUST_SPLIT_ARCHIVE = RUST_SPLIT_DIR / "tests.tar.zst"
+RUST_SPLIT_SCOPE = RUST_SPLIT_DIR / "scope.json"
+# Archive members are rooted at `target/`; extracting into ROOT restores the
+# exact paths baked into test binaries (env!("CARGO_BIN_EXE_*")).
+RUST_SPLIT_METADATA_DIR = ROOT / "target" / "nextest"
+
+
+def _write_rust_split_scope(scope: list[str] | None, path: Path = RUST_SPLIT_SCOPE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"rust_scope": scope}) + "\n")
+
+
+def _read_rust_split_scope(path: Path = RUST_SPLIT_SCOPE) -> list[str] | None:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise SystemExit(
+            f"{path} is missing: --rust-phase codegen/test needs the build phase's artifact"
+        ) from None
+    scope = data["rust_scope"]
+    if scope is not None and not (
+        isinstance(scope, list) and scope and all(isinstance(c, str) and c for c in scope)
+    ):
+        raise SystemExit(f"{path} holds an invalid rust_scope: {scope!r}")
+    return scope
+
+
+def _rust_split_commands(
+    split: RustSplit,
+    compile_p: list[str],
+    scope: list[str] | None,
+    test_threads: int,
+    nextest_profile_args: list[str],
+) -> dict[str, list[str]]:
+    """Commands for one split rust-lane phase, keyed by step name."""
+    if split.phase is RustPhase.BUILD:
+        return {"cargo test compile": [
+            "cargo", "nextest", "archive", *compile_p,
+            "--archive-file", str(RUST_SPLIT_ARCHIVE),
+        ]}
+    reuse = [
+        "--binaries-metadata", str(RUST_SPLIT_METADATA_DIR / "binaries-metadata.json"),
+        "--cargo-metadata", str(RUST_SPLIT_METADATA_DIR / "cargo-metadata.json"),
+    ]
+    extract = ["tar", "--zstd", "-xf", str(RUST_SPLIT_ARCHIVE), "-C", str(ROOT)]
+    threads = ["--test-threads", str(test_threads)]
+    if split.phase is RustPhase.CODEGEN:
+        return {
+            "extract test archive": extract,
+            "codegen": ["cargo", "nextest", *nextest_profile_args, "run", *reuse,
+                        "-E", "test(/export_bindings/)", *threads],
+        }
+    # The archive also holds export-crate harnesses compiled only for codegen;
+    # select the unsplit lane's test scope with a filterset instead of -p.
+    expr = "not test(/export_bindings/)"
+    if scope:
+        expr = f"({expr}) and ({' or '.join(f'package(={c})' for c in scope)})"
+    partition = []
+    if split.partition is not None:
+        # A small scoped change can leave a hash partition empty.
+        partition = ["--partition", split.partition.nextest_arg(), "--no-tests=warn"]
+    return {
+        "extract test archive": extract,
+        "cargo test": ["cargo", "nextest", *nextest_profile_args, "run", *reuse,
+                       "-E", expr, *threads, *partition],
+    }
+
+
 def _clippy_check_env(root: Path = ROOT) -> dict[str, str]:
     return {
         "CARGO_INCREMENTAL": "0",
@@ -5579,6 +5692,7 @@ def cmd_check(
     compiler_cache: str | None = None,
     profile_work: bool = False,
     compiler_cache_setup: tuple[str, dict[str, str]] | None = None,
+    rust_split: RustSplit | None = None,
 ):
     """Run lint, format checks, tests, and task validation within one worker budget.
 
@@ -5662,6 +5776,19 @@ def cmd_check(
             rust_scope = sorted(_scope)
             reporter.info(f"rust scope: -p {' -p '.join(rust_scope)} "
                           f"(changed crate(s) + reverse-deps)")
+    if rust_split is not None and "rust" in active:
+        if _CHECK_PROFILE is not None:
+            _CHECK_PROFILE.metadata["rust_split"] = {
+                "phase": rust_split.phase.value,
+                "partition": rust_split.partition.nextest_arg() if rust_split.partition else None,
+            }
+        if rust_split.phase is RustPhase.BUILD:
+            _write_rust_split_scope(rust_scope)
+        else:
+            # The archive was compiled for the build phase's scope; reuse it
+            # verbatim so every phase selects the same crates.
+            rust_scope = _read_rust_split_scope()
+            reporter.info(f"rust scope from build phase: {rust_scope or 'full workspace'}")
 
     def _pflags():
         """`-p crate` flags for the current rust scope, or [] for full workspace."""
@@ -5951,12 +6078,32 @@ def cmd_check(
         # target dir, so its RUSTC_WORKSPACE_WRAPPER=clippy-driver fingerprint
         # churn can never invalidate this dir's build (and the two builds
         # don't contend on the shared target lock).
+        if rust_split is not None:
+            lane_rust_split()
+            return
         rc = run_step("codegen", codegen_cmd,
                       env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
         if rc == 0:
             codegen_stale_step()
         run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
+
+    def lane_rust_split():
+        phase = rust_split.phase
+        if phase is RustPhase.BUILD:
+            # Archiving compresses every test binary after the compile.
+            run_step("cargo test compile", split_cmds["cargo test compile"],
+                     timeout=CHECK_TIMEOUT + 300)
+            return
+        if run_step("extract test archive", split_cmds["extract test archive"]) != 0:
+            return
+        if phase is RustPhase.CODEGEN:
+            rc = run_step("codegen", split_cmds["codegen"],
+                          env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+            if rc == 0:
+                codegen_stale_step()
+        else:
+            run_step("cargo test", split_cmds["cargo test"], timeout=CARGO_TEST_TIMEOUT)
 
     def lane_clippy():
         """Clippy in a bounded, non-incremental target directory.
@@ -6590,6 +6737,13 @@ def cmd_check(
             has_nextest, compile_p, _pflags(), codegen_p, test_threads,
             nextest_profile_args,
         )
+        split_cmds: dict[str, list[str]] = {}
+        if rust_split is not None:
+            if not has_nextest:
+                raise SystemExit("--rust-phase requires cargo-nextest")
+            split_cmds = _rust_split_commands(
+                rust_split, compile_p, rust_scope, test_threads, nextest_profile_args,
+            )
 
         # Scratch base for the ts-rs export. Every `#[ts(export_to)]` in the
         # workspace uses a `../../../ui/src/generated/` path relative to the
@@ -14762,6 +14916,15 @@ def main():
         "--profile-work-dir", type=Path, default=None,
         help="Use this empty artifact directory for a correlated profiling run",
     )
+    check_parser.add_argument(
+        "--rust-phase", choices=[phase.value for phase in RustPhase], default=None,
+        help="Run one slice of the rust lane (CI): build a nextest archive, or "
+             "run codegen/tests from it",
+    )
+    check_parser.add_argument(
+        "--rust-partition", default=None, metavar="K/N",
+        help="With --rust-phase test, run nextest hash partition K of N",
+    )
 
     check_plan_parser = sub.add_parser(
         "check-plan",
@@ -15050,12 +15213,22 @@ def main():
         if not cmd_doctor():
             sys.exit(1)
     elif args.command == "check":
+        try:
+            rust_split = None if args.rust_phase is None else RustSplit(
+                RustPhase(args.rust_phase),
+                None if args.rust_partition is None else RustPartition.parse(args.rust_partition),
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if args.rust_partition is not None and rust_split is None:
+            parser.error("--rust-partition requires --rust-phase test")
         cmd_check(
             gate=not args.check_all,
             lanes=args.lanes,
             pretty=pretty,
             compiler_cache=args.compiler_cache,
             profile_work=args.profile_work,
+            rust_split=rust_split,
         )
     elif args.command == "check-plan":
         cmd_check_plan(gate=not args.check_all, lanes=args.lanes, fmt=args.format)
