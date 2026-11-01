@@ -1,4 +1,4 @@
-# ADR-212: macOS Bash launch qualification is the only separate hosted launch CI
+# ADR-213: macOS Bash launch qualification is the only separate hosted launch CI
 
 - **Status:** Accepted
 - **Date:** 2026-11-01

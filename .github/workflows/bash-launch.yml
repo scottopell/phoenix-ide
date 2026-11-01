@@ -2,7 +2,7 @@ name: Bash launch settlement
 
 # macOS-only: CI's rust lane runs these tests on Linux with the native launcher
 # required. This job is the only CI that compiles the macOS process-identity
-# and launcher paths (ADR-212).
+# and launcher paths (ADR-213).
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
