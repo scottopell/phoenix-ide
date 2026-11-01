@@ -176,11 +176,7 @@ impl Database {
             }
 
             match tokio::time::timeout_at(deadline, notifications.recv()).await {
-                Ok(Ok(notification))
-                    if notification.owner() == owner
-                        && notification.version() >= request.minimum_version() => {}
-                Ok(Ok(_)) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     return Err(GoalDbError::Integrity("goal notification channel closed"));
                 }
