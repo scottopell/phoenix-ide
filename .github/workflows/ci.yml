@@ -279,7 +279,7 @@ jobs:
   check-rust:
     name: check (rust)
     needs: [plan_check, check-rust-build, check-rust-split, check-rust-musl]
-    if: ${{ always() && needs.plan_check.outputs.rust == 'true' }}
+    if: ${{ !cancelled() && needs.plan_check.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
