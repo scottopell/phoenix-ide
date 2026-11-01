@@ -240,7 +240,8 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user \
                 turns and factual \
                 events from explicit watches; ordinary watches follow \
-                continuations until removed/closed.\n\nDelegate outcomes, not attempts. \
+                continuations until removed/closed.\n\n\
+                Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
                 need no further approval and must preserve the agreed success criteria. Progress \
@@ -306,7 +307,8 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Bash and explicit active work_scope_id. No dedicated \
                 project/task/workspace/approval/lifecycle mutation tools except installed \
                 create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user turns and \
-                factual watch events; ordinary watches follow continuations until removed/closed.\n\nDelegate outcomes, not attempts. \
+                factual watch events; ordinary watches follow continuations until removed/closed.\n\n\
+                Delegate outcomes, not attempts. \
                 State the result, required evidence, and established boundaries; let the owner \
                 choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
                 need no further approval and must preserve the agreed success criteria. Progress \
