@@ -1,4 +1,4 @@
-# ADR-211: Outcome delegation with owner method autonomy
+# ADR-212: Outcome delegation with owner method autonomy
 
 - **Status:** Proposed
 - **Date:** 2026-11-01
