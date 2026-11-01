@@ -184,7 +184,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [144](144_output-budget-is-declared-model-maximum-and-exhaustion-is-terminal.md) | Output budget is the declared model maximum, and output exhaustion is a distinct terminal error | Accepted | REQ-LLM-003, REQ-LLM-004f, REQ-LLM-006c |
 | [190](190_generic-ordinary-forward-proof-begins-after-quiescence.md) | Generic ordinary forward proof begins after quiescence | Accepted | REQ-COMP-013/019, REQ-LDD-023/028 |
 | [191](191_native-create-and-rename-use-shared-application-actions.md) | Native create and rename use shared application actions | Accepted | REQ-GR-007, REQ-CCR-013, REQ-CID-007 |
-| [208](208_native-continue-reuses-generated-handoff-admission.md) | Native Continue reuses generated handoff admission | Accepted | REQ-GR-007/019, REQ-BED-020/021/020b/030 |
+| [211](211_native-continue-reuses-generated-handoff-admission.md) | Native Continue reuses generated handoff admission | Accepted | REQ-GR-007/019, REQ-BED-020/021/020b/030 |
 | [209](209_native-automatic-continuation-is-preference-only.md) | Native automatic continuation is preference-only | Accepted | REQ-GR-007/020, REQ-BED-020, REQ-API-029 |
 | [192](192_goal-admission-requires-explicit-auto-continue.md) | Goal admission requires explicit automatic continuation | Accepted | REQ-GOAL-AC-001–004 |
 | [149](149_selective-coordinator-checkins.md) | Selective coordinator check-ins and attention-first briefings | Accepted | REQ-GR-011 |

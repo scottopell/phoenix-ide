@@ -1,4 +1,4 @@
-# ADR-208: Native Continue reuses generated handoff admission
+# ADR-211: Native Continue reuses generated handoff admission
 
 - **Status:** Accepted
 - **Date:** 2026-10-31

@@ -6,7 +6,7 @@
 
 ## Context
 
-The user requests agent-facing automatic-continuation controls alongside native Continue. The public settings routes expose the same aggregate-owned Boolean plus a richer projection of admission and failure history. Their setter can commit a preference before that projection fails. Calling that setter directly from a native mutation adapter would turn a post-write projection error into an ambiguous ordinary refusal. ADR-208 grants generated Continue, not preference mutation or scheduler authority.
+The user requests agent-facing automatic-continuation controls alongside native Continue. The public settings routes expose the same aggregate-owned Boolean plus a richer projection of admission and failure history. Their setter can commit a preference before that projection fails. Calling that setter directly from a native mutation adapter would turn a post-write projection error into an ambiguous ordinary refusal. ADR-211 grants generated Continue, not preference mutation or scheduler authority.
 
 ## Options considered
 
@@ -22,7 +22,7 @@ Public and native operations use the same on-connection preference primitives. T
 
 An owned application worker survives requester cancellation through write classification. Acknowledged commit or rollback can release its write owner. Unclassified commit or rollback, or loss of an armed write-classification guard, closes local runtime authority before that owner is released. Closed completion is not an ordinary success/refusal. The adapter withholds ordinary output on closure and relies on the existing fatal-cancellation supervisor for teardown; application and adapter checks alone do not prove executor disposal or final result-persistence exclusion.
 
-Preferences remain prospective. Enabling after exhaustion neither admits nor wakes work; disabling does not revoke an existing admission. Neither tool changes dispatch intents, Goal metadata, stop/pause/closed state, recovery, retry/rearm or approval policy. This decision supplements ADR-191 and ADR-208 rather than expanding their individual capabilities. Goal admission policy remains separately owned.
+Preferences remain prospective. Enabling after exhaustion neither admits nor wakes work; disabling does not revoke an existing admission. Neither tool changes dispatch intents, Goal metadata, stop/pause/closed state, recovery, retry/rearm or approval policy. This decision supplements ADR-191 and ADR-211 rather than expanding their individual capabilities. Goal admission policy remains separately owned.
 
 ## Consequences
 
@@ -38,5 +38,5 @@ Preferences remain prospective. Enabling after exhaustion neither admits nor wak
 - [Bedrock requirements](../bedrock/requirements.md), REQ-BED-020.
 - [API requirements](../api/requirements.md), REQ-API-029.
 - [Compatibility requirements](../compatibility/requirements.md).
-- [ADR-036](036_local-sqlite-authority-loss-fails-stop.md), [ADR-191](191_native-create-and-rename-use-shared-application-actions.md), and [ADR-208](208_native-continue-reuses-generated-handoff-admission.md).
+- [ADR-036](036_local-sqlite-authority-loss-fails-stop.md), [ADR-191](191_native-create-and-rename-use-shared-application-actions.md), and [ADR-211](211_native-continue-reuses-generated-handoff-admission.md).
 - `Database::read_native_automatic_continuation_settings`, `Database::set_native_automatic_continuation_settings`, `PreferenceWritePass`, and `AutomaticContinuationTool::run`.
