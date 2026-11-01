@@ -145,6 +145,43 @@ pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
     command
 }
 
+/// Construct a noninteractive Git subprocess isolated from inherited repository
+/// routing and Git configuration environment variables.
+///
+/// Explicit environment entries added to the returned command take precedence
+/// over these removals, so callers can configure a deliberate test repository.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn test_command(config: &[(&str, &str)]) -> std::process::Command {
+    const REPOSITORY_ENV: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_PREFIX",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_QUARANTINE_PATH",
+    ];
+
+    let mut command = command_with_config(config);
+    for name in REPOSITORY_ENV {
+        command.env_remove(name);
+    }
+    command.env_remove("GIT_CONFIG");
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_CONFIG_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 fn inherited_config_count() -> Option<usize> {
     let Some(raw_count) = std::env::var_os("GIT_CONFIG_COUNT") else {
         return Some(0);
@@ -377,6 +414,50 @@ mod command_tests {
         command
             .get_envs()
             .any(|(key, env_value)| key == name && env_value == Some(std::ffi::OsStr::new(value)))
+    }
+
+    #[test]
+    fn test_command_removes_repository_selectors_and_keeps_explicit_overrides() {
+        let mut command = test_command(&[("diff.noprefix", "false")]);
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_NAMESPACE",
+            "GIT_SHALLOW_FILE",
+            "GIT_PREFIX",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_QUARANTINE_PATH",
+            "GIT_CONFIG",
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == name && value.is_none()),
+                "{name}"
+            );
+        }
+        for &(name, value) in NONINTERACTIVE_GIT_ENV {
+            assert!(command_sets_env(&command, name, value));
+        }
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-c".into(), "diff.noprefix=false".into(),]
+                .into_iter()
+                .chain(noninteractive_config_args())
+                .collect::<Vec<std::ffi::OsString>>()
+        );
+        command.env("GIT_INDEX_FILE", "explicit-fixture-index");
+        assert!(command_sets_env(
+            &command,
+            "GIT_INDEX_FILE",
+            "explicit-fixture-index"
+        ));
     }
 
     #[test]

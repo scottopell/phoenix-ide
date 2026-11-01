@@ -281,12 +281,36 @@ fn run_git_command_bounded_with(
 ///   `diff.mnemonicPrefix=true` otherwise gets `c/`/`w/` on `git diff HEAD`,
 ///   which the UI diff parser rejects (it only recognises `a/`/`b/`).
 pub(crate) fn git_command() -> std::process::Command {
-    phoenix_core::git::command_with_config(&[
-        ("diff.noprefix", "false"),
-        ("diff.mnemonicPrefix", "false"),
-        ("diff.srcPrefix", "a/"),
-        ("diff.dstPrefix", "b/"),
-    ])
+    phoenix_core::git::command_with_config(DIFF_PREFIX_GIT_CONFIG)
+}
+
+const DIFF_PREFIX_GIT_CONFIG: &[(&str, &str)] = &[
+    ("diff.noprefix", "false"),
+    ("diff.mnemonicPrefix", "false"),
+    ("diff.srcPrefix", "a/"),
+    ("diff.dstPrefix", "b/"),
+];
+
+#[cfg(test)]
+pub(crate) fn run_git_for_test(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = phoenix_core::git::test_command(DIFF_PREFIX_GIT_CONFIG);
+    command.args(args).current_dir(cwd);
+    run_git_test_command(command, args, std::time::Duration::from_secs(30))
+}
+
+#[cfg(test)]
+pub(crate) fn run_git_test_command(
+    command: std::process::Command,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    run_git_command_bounded_with(command, args, timeout, |child, started, timeout| {
+        wait_for_child_with(
+            || child.try_wait(),
+            || started.elapsed() >= timeout,
+            || std::thread::sleep(std::time::Duration::from_millis(20)),
+        )
+    })
 }
 
 /// Like [`run_git`], but returns raw stdout bytes — no trimming, no UTF-8
@@ -1183,20 +1207,20 @@ mod tests {
 
     /// Initialize an empty repo with a single commit on `main`.
     fn init_repo(dir: &Path) {
-        run_git(dir, &["init", "--quiet", "--initial-branch=main"]).unwrap();
-        run_git(dir, &["config", "user.email", "probe@test"]).unwrap();
-        run_git(dir, &["config", "user.name", "probe"]).unwrap();
-        run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
+        run_git_for_test(dir, &["init", "--quiet", "--initial-branch=main"]).unwrap();
+        run_git_for_test(dir, &["config", "user.email", "probe@test"]).unwrap();
+        run_git_for_test(dir, &["config", "user.name", "probe"]).unwrap();
+        run_git_for_test(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
     }
 
     fn commit_file(dir: &Path, name: &str, content: &str, message: &str) {
         std::fs::write(dir.join(name), content).unwrap();
-        run_git(dir, &["add", name]).unwrap();
-        run_git(dir, &["commit", "-q", "-m", message]).unwrap();
+        run_git_for_test(dir, &["add", name]).unwrap();
+        run_git_for_test(dir, &["commit", "-q", "-m", message]).unwrap();
     }
 
     fn clone_repo(source: &Path, dest: &Path) {
-        run_git(
+        run_git_for_test(
             std::env::current_dir().unwrap().as_path(),
             &[
                 "clone",
@@ -1206,8 +1230,8 @@ mod tests {
             ],
         )
         .unwrap();
-        run_git(dest, &["config", "user.email", "probe@test"]).unwrap();
-        run_git(dest, &["config", "user.name", "probe"]).unwrap();
+        run_git_for_test(dest, &["config", "user.email", "probe@test"]).unwrap();
+        run_git_for_test(dest, &["config", "user.name", "probe"]).unwrap();
     }
 
     #[test]

@@ -2314,6 +2314,8 @@ fn truncated_kib(stdout: &str, total_bytes: u64, saturated: bool) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_ops::run_git_for_test as run_git;
+    use std::path::Path;
 
     #[test]
     fn successful_root_status_clears_stale_cache_independent_of_feedback_coverage() {
@@ -2510,6 +2512,196 @@ mod tests {
         run_git(dir, &["config", "user.email", "probe@test"]).unwrap();
         run_git(dir, &["config", "user.name", "probe"]).unwrap();
         run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
+    }
+
+    #[test]
+    fn repository_fixtures_ignore_inherited_git_environment() {
+        const CHILD: &str = "PHOENIX_API_GIT_FIXTURE_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+            let command = phoenix_core::git::test_command(&[]);
+            assert_eq!(environment, std::env::vars_os().collect());
+            for name in environment
+                .keys()
+                .filter(|name| name.as_encoded_bytes().starts_with(b"GIT_CONFIG_"))
+            {
+                assert!(
+                    command
+                        .get_envs()
+                        .any(|(key, value)| key == name && value.is_none()),
+                    "inherited configuration selector survived: {name:?}"
+                );
+            }
+            let repo = std::path::PathBuf::from(path);
+            init_repo(&repo);
+            commit_file(&repo, "fixture.txt", "fixture\n", "fixture");
+            assert_eq!(
+                std::fs::canonicalize(run_git(&repo, &["rev-parse", "--show-toplevel"]).unwrap())
+                    .unwrap(),
+                std::fs::canonicalize(&repo).unwrap()
+            );
+            assert_eq!(
+                run_git(&repo, &["rev-list", "--count", "HEAD"]).unwrap(),
+                "2"
+            );
+            let clone = tempfile::tempdir().unwrap();
+            clone_repo(&repo, clone.path());
+            assert_eq!(
+                run_git(clone.path(), &["show", "HEAD:fixture.txt"]).unwrap(),
+                "fixture"
+            );
+            return;
+        }
+
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn visit(
+                root: &Path,
+                dir: &Path,
+                files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+            ) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        visit(root, &path, files);
+                    } else {
+                        files.insert(
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            std::fs::read(&path).unwrap(),
+                        );
+                    }
+                }
+            }
+            let mut files = std::collections::BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let linked = temp.path().join("linked");
+        std::fs::create_dir(&parent).unwrap();
+        init_repo(&parent);
+        commit_file(&parent, "sentinel.txt", "parent\n", "sentinel");
+        run_git(&parent, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        run_git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "sentinel-linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let git_dir = std::path::PathBuf::from(
+            run_git(&linked, &["rev-parse", "--absolute-git-dir"]).unwrap(),
+        );
+        let common = std::fs::canonicalize(parent.join(".git")).unwrap();
+        let parent_before = snapshot(&parent);
+        let linked_before = snapshot(&linked);
+
+        for case in [
+            "routing",
+            "indexed-config",
+            "malformed-config",
+            "config-files",
+        ] {
+            let fixture = temp.path().join(case);
+            std::fs::create_dir(&fixture).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "api::git_handlers::tests::repository_fixtures_ignore_inherited_git_environment",
+                "--nocapture",
+            ]);
+            child.env(CHILD, &fixture);
+            match case {
+                "routing" => {
+                    child
+                        .env("GIT_DIR", &git_dir)
+                        .env("GIT_WORK_TREE", &linked)
+                        .env("GIT_COMMON_DIR", &common)
+                        .env("GIT_INDEX_FILE", git_dir.join("index"))
+                        .env("GIT_OBJECT_DIRECTORY", common.join("objects"));
+                }
+                "indexed-config" | "malformed-config" => {
+                    child
+                        .env(
+                            "GIT_CONFIG_COUNT",
+                            if case == "indexed-config" {
+                                "1"
+                            } else {
+                                "invalid"
+                            },
+                        )
+                        .env("GIT_CONFIG_KEY_0", "core.worktree")
+                        .env("GIT_CONFIG_VALUE_0", &linked)
+                        .env("GIT_CONFIG_KEY_999", "core.worktree")
+                        .env("GIT_CONFIG_VALUE_999", &linked)
+                        .env(
+                            "GIT_CONFIG_PARAMETERS",
+                            format!("'core.worktree={}'", linked.display()),
+                        );
+                }
+                "config-files" => {
+                    child
+                        .env("GIT_CONFIG", common.join("config"))
+                        .env("GIT_CONFIG_GLOBAL", common.join("config"))
+                        .env("GIT_CONFIG_SYSTEM", common.join("config"));
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::ffi::OsStringExt;
+                        child.env(
+                            std::ffi::OsString::from_vec(b"GIT_CONFIG_\xff".to_vec()),
+                            "poison",
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let output = crate::git_ops::run_git_test_command(
+                child,
+                &[case],
+                std::time::Duration::from_secs(120),
+            )
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert!(output.contains("1 passed"), "child filter selected no test");
+            assert!(
+                fixture.join(".git").is_dir(),
+                "fixture did not get an independent repository"
+            );
+            assert_eq!(parent_before, snapshot(&parent), "parent changed in {case}");
+            assert_eq!(
+                linked_before,
+                snapshot(&linked),
+                "linked worktree changed in {case}"
+            );
+        }
+
+        let negative = temp.path().join("negative-control");
+        std::fs::create_dir(&negative).unwrap();
+        let mut command = phoenix_core::git::test_command(&[]);
+        command
+            .args(["init", "--quiet"])
+            .current_dir(&negative)
+            .env("GIT_DIR", &git_dir)
+            .env("GIT_WORK_TREE", &negative);
+        crate::git_ops::run_git_test_command(
+            command,
+            &["init", "--quiet"],
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_ne!(
+            parent_before.get(Path::new(".git/config")),
+            snapshot(&parent).get(Path::new(".git/config")),
+            "negative control did not reproduce shared config mutation"
+        );
+        assert!(
+            !negative.join(".git").exists(),
+            "negative control unexpectedly created an independent repo"
+        );
     }
 
     fn commit_file(dir: &std::path::Path, name: &str, content: &str, message: &str) {
