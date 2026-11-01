@@ -175,19 +175,29 @@ impl Database {
                 return Ok(read.with_status(CoordinatorGoalWaitStatus::Satisfied));
             }
 
-            match tokio::time::timeout_at(deadline, notifications.recv()).await {
-                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    return Err(GoalDbError::Integrity("goal notification channel closed"));
-                }
-                Err(_) => {
-                    let final_read = self.read_goal_wait_result(&authority, owner, after).await?;
-                    let status = if final_read.current_version() >= request.minimum_version() {
-                        CoordinatorGoalWaitStatus::Satisfied
-                    } else {
-                        CoordinatorGoalWaitStatus::TimedOut
-                    };
-                    return Ok(final_read.with_status(status));
+            loop {
+                match tokio::time::timeout_at(deadline, notifications.recv()).await {
+                    Ok(Ok(notification)) => {
+                        if notification.owner() == owner
+                            && notification.version() >= request.minimum_version()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => break,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                        return Err(GoalDbError::Integrity("goal notification channel closed"));
+                    }
+                    Err(_) => {
+                        let final_read =
+                            self.read_goal_wait_result(&authority, owner, after).await?;
+                        let status = if final_read.current_version() >= request.minimum_version() {
+                            CoordinatorGoalWaitStatus::Satisfied
+                        } else {
+                            CoordinatorGoalWaitStatus::TimedOut
+                        };
+                        return Ok(final_read.with_status(status));
+                    }
                 }
             }
         }
