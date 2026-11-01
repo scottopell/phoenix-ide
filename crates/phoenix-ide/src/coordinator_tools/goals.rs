@@ -35,7 +35,7 @@ pub(super) fn tools(runtime: &Arc<RuntimeManager>) -> Vec<Arc<dyn Tool>> {
             Arc::new(GoalTool {
                 service: service.clone(),
                 operation,
-                runtime: Arc::clone(&runtime),
+                runtime: Arc::clone(runtime),
             }) as Arc<dyn Tool>
         })
         .collect()
@@ -137,7 +137,7 @@ impl Tool for GoalTool {
 }
 
 impl GoalTool {
-    fn bad_input(&self, error: serde_json::Error) -> String {
+    fn bad_input(&self, error: &serde_json::Error) -> String {
         format!(
             "Invalid {} input: {error}. Read the tool schema; authority and versions are server-derived.",
             self.name()
@@ -162,7 +162,7 @@ impl GoalTool {
 
     async fn read(&self, input: Value, ctx: &ToolContext) -> Result<Value, String> {
         let args: ReadInput =
-            serde_json::from_value(input).map_err(|error| self.bad_input(error))?;
+            serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
         let owner = target(&args.target)?;
         let after = GoalVersion::parse(args.after_version.unwrap_or(0))
             .map_err(|error| error.to_string())?;
@@ -213,7 +213,7 @@ impl GoalTool {
             Operation::Read => self.read(input, ctx).await?,
             Operation::Prepare => {
                 let args: PrepareInput =
-                    serde_json::from_value(input).map_err(|error| self.bad_input(error))?;
+                    serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
                 let owner = target(&args.target)?;
                 let source = ctx.source_tool_call().ok_or(
                     "Missing server-bound assistant/tool invocation; cannot prepare a Goal action",
@@ -234,7 +234,7 @@ impl GoalTool {
             }
             Operation::Apply => {
                 let args: ApplyInput =
-                    serde_json::from_value(input).map_err(|error| self.bad_input(error))?;
+                    serde_json::from_value(input).map_err(|error| self.bad_input(&error))?;
                 let receipt = self
                     .service
                     .apply_prepared(&ctx.conversation_id, args.action_reference)
