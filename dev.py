@@ -5920,7 +5920,7 @@ def cmd_check(
         return rc
 
     def lane_rust():
-        """Rust lane: test compile → codegen export → staleness diff → test run.
+        """Rust lane: codegen export → staleness diff → test compile → test run.
 
         This lane does not generate a Linux-musl cross-target artifact tree.
 
@@ -5951,14 +5951,11 @@ def cmd_check(
         # target dir, so its RUSTC_WORKSPACE_WRAPPER=clippy-driver fingerprint
         # churn can never invalidate this dir's build (and the two builds
         # don't contend on the shared target lock).
-        compile_rc = run_step("cargo test compile", compile_cmd)
-        if compile_rc == 0:
-            # TS_RS_EXPORT_DIR is read at test runtime (not macro expansion),
-            # so this run reuses the harnesses compiled above verbatim.
-            rc = run_step("codegen", codegen_cmd,
-                          env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
-            if rc == 0:
-                codegen_stale_step()
+        rc = run_step("codegen", codegen_cmd,
+                      env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+        if rc == 0:
+            codegen_stale_step()
+        run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd, timeout=CARGO_TEST_TIMEOUT)
 
     def lane_clippy():
@@ -7556,7 +7553,7 @@ def _build_pipeline_model(with_timings: bool = False):
 # Per-lane step lists mirror the lane_* / check_* functions in cmd_check; shown
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
-    "rust": ["cargo test (compile)", "codegen export", "codegen-stale diff",
+    "rust": ["codegen export", "codegen-stale diff", "cargo test (compile)",
              "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
     "tsc": ["tsc -b --noEmit"],
