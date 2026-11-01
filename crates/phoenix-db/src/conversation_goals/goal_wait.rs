@@ -179,7 +179,7 @@ impl Database {
                 Ok(Ok(notification))
                     if notification.owner() == owner
                         && notification.version() >= request.minimum_version() => {}
-                Ok(Ok(_)) => continue,
+                Ok(Ok(_)) => {}
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     return Err(GoalDbError::Integrity("goal notification channel closed"));
@@ -197,7 +197,7 @@ impl Database {
         }
     }
 
-    /// Wait for an ordinary ProductConversation's Goal to reach `minimum_version`.
+    /// Wait for an ordinary `ProductConversation`'s Goal to reach `minimum_version`.
     ///
     /// The returned current Goal, history page, and destination transcript identity
     /// come from the same authoritative database snapshot.

@@ -45,10 +45,10 @@ async fn canonical_goal_report_wakes_federated_waiter_after_commit() {
 
     let committed = round.commit(&db).await.unwrap();
     assert!(!committed.replayed);
-    let waited = waiter.await.unwrap().unwrap();
-    assert_eq!(waited.status(), CoordinatorGoalWaitStatus::Satisfied);
+    let result = waiter.await.unwrap().unwrap();
+    assert_eq!(result.status(), CoordinatorGoalWaitStatus::Satisfied);
     assert_eq!(
-        waited.current().unwrap().snapshot().version(),
+        result.current().unwrap().snapshot().version(),
         GoalVersion::parse(2).unwrap()
     );
 }
