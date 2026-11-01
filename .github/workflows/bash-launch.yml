@@ -1,17 +1,28 @@
 name: Bash launch settlement
 
+# macOS-only: CI's rust lane runs these tests on Linux with the native launcher
+# required. This job is the only CI that compiles the macOS process-identity
+# and launcher paths (ADR-212).
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - 'crates/phoenix-tools/src/bash/**'
       - 'crates/phoenix-core/src/process_identity.rs'
-      - 'crates/phoenix-core/src/domain/tool_wire.rs'
-      - 'crates/phoenix-ide/src/main.rs'
+      - 'crates/phoenix-core/src/platform.rs'
       - 'crates/phoenix-tools/src/bash.rs'
-      - 'crates/phoenix-ide/src/runtime.rs'
-      - 'crates/phoenix-ide/src/runtime/**'
-      - 'crates/phoenix-ide/src/coordinator_tools.rs'
+      - 'crates/phoenix-tools/src/bash/**'
+      - 'crates/phoenix-ide/src/main.rs'
+      - 'crates/phoenix-ide/src/runtime/close_retirement.rs'
+      - '.github/workflows/bash-launch.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/phoenix-core/src/process_identity.rs'
+      - 'crates/phoenix-core/src/platform.rs'
+      - 'crates/phoenix-tools/src/bash.rs'
+      - 'crates/phoenix-tools/src/bash/**'
+      - 'crates/phoenix-ide/src/main.rs'
+      - 'crates/phoenix-ide/src/runtime/close_retirement.rs'
       - '.github/workflows/bash-launch.yml'
   workflow_dispatch:
 
@@ -19,53 +30,52 @@ permissions:
   contents: read
 
 concurrency:
-  group: bash-launch-${{ github.ref }}
-  cancel-in-progress: true
+  group: bash-launch-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   fault-tests:
-    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
-    name: Bash launch faults (${{ matrix.os }}, exact head)
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    # Cold macOS builds compile/link the native binary and large IDE test harness.
-    timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 30 }}
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: Bash launch faults (macos-latest, exact head)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
+      PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v7
-      - name: Generate wire contracts
-        run: ./dev.py codegen
-      - name: Build native launcher executable
-        run: cargo build -p phoenix_ide --bin phoenix_ide
-      - name: Fault-injected launch and identity regressions
-        env:
-          PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
-          PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
-        run: |
-          test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
-          cargo test -p phoenix-core process_identity::tests -- --show-output
-          cargo test -p phoenix-core domain::tool_wire::bash_tmux_wire_tests -- --show-output
-          cargo test -p phoenix-tools bash::operations::tests -- --show-output
-          cargo test -p phoenix-tools bash::launch_protocol::tests -- --show-output
-          cargo test -p phoenix-tools bash::ring::tests -- --show-output
-          cargo test -p phoenix-tools bash::registry::tests -- --show-output
-          cargo test -p phoenix-tools bash::reaper::tests -- --show-output
-          # One libtest invocation preserves all filters without recompiling the
-          # large IDE test harness for each filter. Keep its cases serial.
-          cargo test -p phoenix_ide --lib -- --show-output --test-threads=1 \
-            browser_retirement \
-            coordinator_bash_executes_owned_home_with_zero_ordinary_conversations \
-            real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay \
-            conversation_runtime_dispatches_real_zero_and_normal_bash_waits
-      - uses: actions/upload-artifact@v6
-        if: always()
         with:
-          name: bash-wire-${{ matrix.os }}
-          path: ui/src/generated/
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bash-launch-macos
+          prefix-key: v1-rust
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Build native launcher executable
+        run: |
+          cargo build -p phoenix_ide --bin phoenix_ide
+          test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
+      # Both runs select the same packages and targets, so the second reuses
+      # the first's build.
+      - name: Launch and identity fault regressions
+        run: |
+          cargo nextest run -p phoenix-core -p phoenix-tools -p phoenix_ide --lib \
+            --success-output final -E '
+              (package(phoenix-core) and (test(process_identity::tests) or test(domain::tool_wire::bash_tmux_wire_tests)))
+              or (package(phoenix-tools) and (test(bash::operations::tests) or test(bash::launch_protocol::tests)
+                or test(bash::ring::tests) or test(bash::registry::tests) or test(bash::reaper::tests)))'
+      - name: Runtime launch regressions (serial)
+        run: |
+          cargo nextest run -p phoenix-core -p phoenix-tools -p phoenix_ide --lib \
+            --success-output final --test-threads 1 -E '
+              package(phoenix_ide) and (test(browser_retirement)
+                or test(coordinator_bash_executes_owned_home_with_zero_ordinary_conversations)
+                or test(real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay)
+                or test(conversation_runtime_dispatches_real_zero_and_normal_bash_waits))'
