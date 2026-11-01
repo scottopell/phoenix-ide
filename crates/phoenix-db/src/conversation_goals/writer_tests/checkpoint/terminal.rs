@@ -1,6 +1,9 @@
 use super::*;
+use std::time::Duration as StdDuration;
+
 use crate::conversation_goals::round::CommittedGoalTerminalRound;
 use crate::workflow::{DirectTurnTerminalObligationInput, PersistedConversationProjection};
+use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
 
 pub(super) async fn obligation(
     db: &Database,
@@ -48,6 +51,50 @@ async fn terminal_commit(
         Some(&round.replay()),
     )
     .await
+}
+
+#[tokio::test]
+async fn terminal_goal_report_wakes_federated_waiter_after_commit() {
+    let (db, owner, round) = report_fixture().await;
+    let obligation = obligation(&db, &round).await;
+    let caller = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(b"terminal-goal-waiter");
+    db.replace_federation_enrollment(caller, "terminal goal waiter", &verifier)
+        .await
+        .unwrap();
+    let authority = crate::FederationSendAuthority::new(caller, verifier);
+    let waiter_db = db.clone();
+    let waiter_owner = owner.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_db
+            .wait_for_federated_goals(
+                &authority,
+                &waiter_owner,
+                GoalVersion::INITIAL,
+                CoordinatorGoalWaitRequest::new(
+                    GoalVersion::parse(2).unwrap(),
+                    StdDuration::from_secs(2),
+                )
+                .unwrap(),
+            )
+            .await
+    });
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while db.goal_version_waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("waiter subscribed");
+
+    let committed = terminal_commit(&db, &round, &obligation).await.unwrap();
+    assert!(!committed.replayed);
+    let result = waiter.await.unwrap().unwrap();
+    assert_eq!(result.status(), CoordinatorGoalWaitStatus::Satisfied);
+    assert_eq!(
+        result.current().unwrap().snapshot().version(),
+        GoalVersion::parse(2).unwrap()
+    );
 }
 
 #[tokio::test]

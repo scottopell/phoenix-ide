@@ -5,7 +5,7 @@ use crate::api::global_read::{
 
 mod goals;
 
-pub(crate) fn goal_tools(runtime: Arc<crate::runtime::RuntimeManager>) -> Vec<Arc<dyn Tool>> {
+pub(crate) fn goal_tools(runtime: &Arc<crate::runtime::RuntimeManager>) -> Vec<Arc<dyn Tool>> {
     goals::tools(runtime)
 }
 
@@ -700,12 +700,21 @@ struct SendConversationMessage {
     send_chat: Arc<SendChatApplicationService>,
 }
 
+fn present_instance_selector<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(Some(value))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendConversationMessageInput {
     target: String,
     message: String,
     message_id: String,
+    #[serde(default, deserialize_with = "present_instance_selector")]
+    instance: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -905,7 +914,7 @@ impl Tool for SendConversationMessage {
     }
 
     fn description(&self) -> String {
-        "Send one conversation-authored message by typed target: @conv:<product_conversation_id> routes to the current writable transcript at authoritative admission; @transcript:<conversation_id> targets that exact runtime member. Never target this conversation, a sub-agent, or the Coordinator chain. Delivered or queued outcomes report acceptance only; they do not imply recipient understanding, acknowledgement, execution, or completion.".to_string()
+        "Send one conversation-authored message by typed target: @conv:<product_conversation_id> routes to the current writable transcript at authoritative admission; @transcript:<conversation_id> targets that exact runtime member. Omit instance for local routing; an explicit instance selects exactly one enrolled peer, with no local fallback. Remote messages are limited to 32768 UTF-8 bytes. Never target this conversation, a sub-agent, or the Coordinator chain. Delivered or queued outcomes report acceptance only; they do not imply recipient understanding, acknowledgement, execution, or completion.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -914,7 +923,8 @@ impl Tool for SendConversationMessage {
             "properties": {
                 "target": { "type": "string", "pattern": "^@(?:conv|transcript):[^\\s#]+$", "description": "@conv:<product_conversation_id> for stable current-writable routing, or @transcript:<conversation_id> for an exact runtime member" },
                 "message": { "type": "string", "minLength": 1 },
-                "message_id": { "type": "string", "format": "uuid" }
+                "message_id": { "type": "string", "format": "uuid" },
+                "instance": { "type": "string", "minLength": 1, "description": "Optional enrolled instance UUID or unambiguous saved-peer display name; no local fallback." }
             },
             "required": ["target", "message", "message_id"],
             "additionalProperties": false
@@ -931,6 +941,9 @@ impl Tool for SendConversationMessage {
             return ToolOutput::error(
                 "message must be non-empty and message_id must be a UUID".to_string(),
             );
+        }
+        if let Some(instance) = &parsed.instance {
+            return self.send_remote(&parsed, instance, &ctx).await;
         }
         let target = match self.service.resolve_message_target(&parsed.target).await {
             Ok(value) => value,
@@ -1074,6 +1087,88 @@ impl Tool for SendConversationMessage {
     }
 }
 
+impl SendConversationMessage {
+    async fn send_remote(
+        &self,
+        input: &SendConversationMessageInput,
+        instance: &str,
+        ctx: &ToolContext,
+    ) -> ToolOutput {
+        use crate::api::federation::{
+            RemoteMessageText, RemoteSendMessageRequest, RemoteSendTarget, RemoteSenderAttestation,
+        };
+        let peer_id = match crate::api::federation::resolve_saved_peer_id(
+            self.send_chat.db(),
+            instance,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => return ToolOutput::error(error.to_string()),
+        };
+        let peer = match self
+            .send_chat
+            .db()
+            .federation_peer_connection(peer_id)
+            .await
+        {
+            Ok(Some(peer)) => peer,
+            Ok(None) => return ToolOutput::error("peer connection not found; no local fallback"),
+            Err(error) => return ToolOutput::error(error.to_string()),
+        };
+        let target = match RemoteSendTarget::parse_tool_target(&input.target) {
+            Ok(target) => target,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let message = match RemoteMessageText::parse(input.message.clone()) {
+            Ok(message) => message,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let source = match self
+            .send_chat
+            .source_conversation(&ctx.conversation_id)
+            .await
+        {
+            Ok(source) => source,
+            Err(error) => {
+                return ToolOutput::error(format!("sender membership unavailable: {error}"))
+            }
+        };
+        let Some(call) = ctx.source_tool_call() else {
+            return ToolOutput::error("Trusted source tool-call identity unavailable");
+        };
+        let sender = match RemoteSenderAttestation::from_conversation(source, call) {
+            Ok(sender) => sender,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let request = RemoteSendMessageRequest {
+            destination_instance_id: peer.peer_instance_id,
+            target,
+            message_id: uuid::Uuid::parse_str(&input.message_id)
+                .expect("tool input UUID validated"),
+            message,
+            sender,
+        };
+        match crate::api::federation::send_remote_conversation_message(
+            self.send_chat.db(),
+            &peer,
+            &request,
+        )
+        .await
+        {
+            Ok(receipt) => match serde_json::to_string(&receipt) {
+                Ok(body) => ToolOutput::success(body),
+                Err(error) => {
+                    ToolOutput::error(format!("failed to encode remote receipt: {error}"))
+                }
+            },
+            Err(error) => ToolOutput::error(format!(
+                "remote send failed (delivery may be uncertain; no local fallback): {error}"
+            )),
+        }
+    }
+}
+
 impl SendConversationMessageOutput {
     fn conversation_id(&self) -> Option<&str> {
         match self {
@@ -1113,6 +1208,7 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::Internal(_) => "internal_error",
         SendChatServiceError::Dispatch(_) => "dispatch_failed",
         SendChatServiceError::IdempotencyConflict => "idempotency_conflict",
+        SendChatServiceError::FederationSendAuthorityInactive => "authority_inactive",
         SendChatServiceError::Busy => "conversation_busy",
         SendChatServiceError::CloseAdmissionFenced => "close_admission_fenced",
         SendChatServiceError::HistoryUnavailable => "target_unavailable",
@@ -2175,6 +2271,452 @@ mod tests {
                 })),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn send_conversation_message_omitted_instance_preserves_local_routing() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let source = state
+            .db
+            .create_conversation("source", "source", "/tmp/source", true, None, None)
+            .await
+            .unwrap();
+        let target = state
+            .db
+            .create_conversation("target", "target", "/tmp/target", true, None, None)
+            .await
+            .unwrap();
+
+        state
+            .runtime
+            .inject_handle_for_test(
+                &target.id,
+                phoenix_core::domain::sm_state::ConvState::LlmRequesting { attempt: 1 },
+            )
+            .await;
+
+        let tool = SendConversationMessage {
+            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+            send_chat: Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                state.db.clone(),
+                state.runtime.clone(),
+            )),
+        };
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let output = tool
+            .run(
+                json!({
+                    "target": format!("@transcript:{}", target.id),
+                    "message": "local message",
+                    "message_id": message_id,
+                }),
+                context(&source.id)
+                    .with_svg_assistant_message_id("assistant-source")
+                    .with_tool_use_id("send-source"),
+            )
+            .await;
+
+        assert!(output.is_success());
+        let parsed: serde_json::Value = serde_json::from_str(output.output()).unwrap();
+        assert_eq!(parsed["outcome"], "queued_as_steering");
+        assert_eq!(parsed["conversation_id"], target.id);
+        assert_eq!(parsed["message_id"], message_id);
+        let queue = state.db.get_steering_queue(&target.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].text, "local message");
+        assert!(matches!(
+            &queue[0].origin,
+            phoenix_core::domain::db_schema::InputOrigin::InternalConversation {
+                transcript_id,
+                source_call: Some(source_call),
+                ..
+            } if transcript_id == &source.id
+                && source_call.tool_use_id == "send-source"
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_conversation_message_explicit_unknown_or_self_instance_never_falls_back_locally()
+    {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .create_conversation("source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_conversation("local-target", "target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let tool = SendConversationMessage {
+            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+            send_chat: Arc::new(SendChatApplicationService::new(
+                state.db.clone(),
+                state.runtime,
+            )),
+        };
+        let own_instance = state.db.instance_id().await.unwrap().to_string();
+        for instance in ["missing-peer".to_string(), own_instance] {
+            let output = tool
+                .run(
+                    json!({
+                        "target": "@transcript:local-target",
+                        "message": "must not deliver locally",
+                        "message_id": uuid::Uuid::new_v4().to_string(),
+                        "instance": instance,
+                    }),
+                    context("source"),
+                )
+                .await;
+            assert!(
+                !output.is_success(),
+                "unexpected local fallback: {output:?}"
+            );
+            assert!(output.output().contains("peer connection not found"));
+            assert!(state
+                .db
+                .get_messages("local-target")
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(state
+                .db
+                .get_steering_queue("local-target")
+                .await
+                .unwrap()
+                .is_empty());
+            let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM durable_turns")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+            let effects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_effects")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+            assert_eq!((turns, effects), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_conversation_message_ambiguous_peer_never_falls_back_locally() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .create_conversation("source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_conversation("local-target", "target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+            dir: temp.path().to_path_buf(),
+            hosts: vec!["localhost".to_string()],
+        })
+        .unwrap();
+        let trust = phoenix_core::domain::instance_identity::PeerTlsTrust::PrivateCa {
+            certificate_pem: phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+                std::fs::read_to_string(tls.ca_cert_path.unwrap()).unwrap(),
+            )
+            .unwrap(),
+        };
+        for marker in ["a", "b"] {
+            state
+                .db
+                .save_federation_peer_connection(
+                    phoenix_core::domain::instance_identity::InstanceId::new(),
+                    "ambiguous-peer",
+                    &format!("https://localhost:31{}01", u8::from(marker != "a"))
+                        .parse()
+                        .unwrap(),
+                    &phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
+                        "phx_peer_{}",
+                        marker.repeat(43)
+                    ))
+                    .unwrap(),
+                    &trust,
+                )
+                .await
+                .unwrap();
+        }
+        let tool = SendConversationMessage {
+            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+            send_chat: Arc::new(SendChatApplicationService::new(
+                state.db.clone(),
+                state.runtime,
+            )),
+        };
+
+        let output = tool
+            .run(
+                json!({
+                    "target": "@transcript:local-target",
+                    "message": "must not deliver locally",
+                    "message_id": uuid::Uuid::new_v4().to_string(),
+                    "instance": "ambiguous-peer",
+                }),
+                context("source"),
+            )
+            .await;
+        assert!(
+            !output.is_success(),
+            "unexpected local fallback: {output:?}"
+        );
+        assert!(output.output().contains("peer display name is ambiguous"));
+        assert!(state
+            .db
+            .get_messages("local-target")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .get_steering_queue("local-target")
+            .await
+            .unwrap()
+            .is_empty());
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM durable_turns")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        let effects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_effects")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!((turns, effects), (0, 0));
+    }
+
+    async fn assert_remote_rejection_did_not_mutate_target(db: &crate::db::Database) {
+        assert!(db.get_messages("local-target").await.unwrap().is_empty());
+        assert!(db
+            .get_steering_queue("local-target")
+            .await
+            .unwrap()
+            .is_empty());
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM durable_turns")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let effects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_effects")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!((turns, effects), (0, 0));
+    }
+
+    struct ExpectedAuthenticatedRequest {
+        bearer: phoenix_core::domain::instance_identity::PeerBearerCredential,
+        destination: phoenix_core::domain::instance_identity::InstanceId,
+        caller: phoenix_core::domain::instance_identity::InstanceId,
+        target: crate::api::federation::RemoteSendTarget,
+        message_id: uuid::Uuid,
+        source_product_conversation_id: String,
+        source_transcript_id: String,
+    }
+
+    impl ExpectedAuthenticatedRequest {
+        fn from_source(
+            bearer: phoenix_core::domain::instance_identity::PeerBearerCredential,
+            destination: phoenix_core::domain::instance_identity::InstanceId,
+            caller: phoenix_core::domain::instance_identity::InstanceId,
+            target: crate::api::federation::RemoteSendTarget,
+            message_id: uuid::Uuid,
+            source: &crate::db::Conversation,
+        ) -> Self {
+            Self {
+                bearer,
+                destination,
+                caller,
+                target,
+                message_id,
+                source_product_conversation_id: source.product_conversation_id.as_str().to_string(),
+                source_transcript_id: source.id.clone(),
+            }
+        }
+    }
+
+    async fn serve_authenticated_attested_request(
+        listener: tokio::net::TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+        expected: ExpectedAuthenticatedRequest,
+    ) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+        let ExpectedAuthenticatedRequest {
+            bearer,
+            destination,
+            caller,
+            target,
+            message_id,
+            source_product_conversation_id,
+            source_transcript_id,
+        } = expected;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let stream = acceptor.accept(stream).await.unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_until(b'\n', &mut headers).await.unwrap();
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        assert!(headers.starts_with("POST /api/federation/peer/send-conversation-message HTTP/1.1"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {}", bearer.expose())));
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).await.unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["destination_instance_id"], destination.to_string());
+        assert_eq!(request["target"], serde_json::to_value(&target).unwrap());
+        assert_eq!(request["message_id"], message_id.to_string());
+        assert_eq!(request["message"], "explicit remote text");
+        assert_eq!(request["sender"]["kind"], "conversation");
+        assert_eq!(
+            request["sender"]["product_conversation_id"],
+            source_product_conversation_id
+        );
+        assert_eq!(request["sender"]["transcript_id"], source_transcript_id);
+        assert_eq!(
+            request["sender"]["source_call"],
+            json!({"message_id": "assistant-send", "tool_use_id": "call-send"})
+        );
+
+        let response = crate::api::federation::RemoteSendMessageResponse {
+            destination_instance_id: destination,
+            caller_instance_id: caller,
+            target,
+            operation_id: message_id,
+            receipt: crate::api::federation::RemoteSendReceipt::Rejected {
+                code: crate::api::federation::RemoteSendRejectionCode::TargetNotFound,
+                message: "remote target unavailable".to_string(),
+            },
+        };
+        let body = serde_json::to_vec(&response).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(&body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_conversation_message_explicit_peer_sends_authenticated_attested_request() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let source = state
+            .db
+            .create_conversation("source", "source", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_conversation("local-target", "target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let caller = state.db.instance_id().await.unwrap();
+        let destination = phoenix_core::domain::instance_identity::InstanceId::new();
+        let bearer = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
+            "phx_peer_{}",
+            "d".repeat(43)
+        ))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut tls = crate::tls::load_config(&crate::tls::ConfigSource::Auto {
+            dir: temp.path().to_path_buf(),
+            hosts: vec!["localhost".to_string()],
+        })
+        .unwrap();
+        tls.server.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let trust = phoenix_core::domain::instance_identity::PeerTlsTrust::PrivateCa {
+            certificate_pem: phoenix_core::domain::instance_identity::PeerCaCertificatePem::parse(
+                std::fs::read_to_string(tls.ca_cert_path.unwrap()).unwrap(),
+            )
+            .unwrap(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        state
+            .db
+            .save_federation_peer_connection(
+                destination,
+                "saved-peer",
+                &format!("https://localhost:{port}").parse().unwrap(),
+                &bearer,
+                &trust,
+            )
+            .await
+            .unwrap();
+
+        let message_id = uuid::Uuid::new_v4();
+        let target =
+            crate::api::federation::RemoteSendTarget::parse_tool_target("@transcript:local-target")
+                .unwrap();
+        let expected_target = target.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls.server));
+        let server = tokio::spawn(serve_authenticated_attested_request(
+            listener,
+            acceptor,
+            ExpectedAuthenticatedRequest::from_source(
+                bearer,
+                destination,
+                caller,
+                target,
+                message_id,
+                &source,
+            ),
+        ));
+
+        let tool = SendConversationMessage {
+            service: GlobalReadService::new(state.db.clone(), state.message_retriever.clone()),
+            send_chat: Arc::new(SendChatApplicationService::new(
+                state.db.clone(),
+                state.runtime,
+            )),
+        };
+        let output = tool
+            .run(
+                json!({
+                    "target": "@transcript:local-target",
+                    "message": "explicit remote text",
+                    "message_id": message_id.to_string(),
+                    "instance": "saved-peer"
+                }),
+                context("source")
+                    .with_svg_assistant_message_id("assistant-send")
+                    .with_tool_use_id("call-send"),
+            )
+            .await;
+        server.await.unwrap();
+
+        assert!(output.is_success(), "{output:?}");
+        let receipt: Value = serde_json::from_str(output.output()).unwrap();
+        assert_eq!(receipt["destination_instance_id"], destination.to_string());
+        assert_eq!(receipt["caller_instance_id"], caller.to_string());
+        assert_eq!(
+            receipt["target"],
+            serde_json::to_value(expected_target).unwrap()
+        );
+        assert_eq!(receipt["operation_id"], message_id.to_string());
+        assert_eq!(receipt["receipt"]["outcome"], "rejected");
+
+        assert_remote_rejection_did_not_mutate_target(&state.db).await;
     }
 
     #[tokio::test]

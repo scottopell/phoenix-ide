@@ -126,6 +126,21 @@ export const InputOriginSchema: v.GenericSchema<unknown, InputOrigin> = v.varian
     transcript_id: v.string(),
     source_call: v.optional(v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })), null),
   }),
+  v.looseObject({ kind: v.literal('remote_api'), instance_id: v.string() }),
+  v.looseObject({
+    kind: v.literal('remote_conversation'),
+    instance_id: v.string(),
+    product_conversation_id: v.string(),
+    transcript_id: v.string(),
+    source_call: v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })),
+  }),
+  v.looseObject({
+    kind: v.literal('remote_coordinator'),
+    instance_id: v.string(),
+    product_conversation_id: v.string(),
+    transcript_id: v.string(),
+    source_call: v.nullable(v.object({ message_id: v.string(), tool_use_id: v.string() })),
+  }),
 ]);
 
 export const EventPresentationSchema: v.GenericSchema<unknown, EventPresentation> = v.variant('status', [

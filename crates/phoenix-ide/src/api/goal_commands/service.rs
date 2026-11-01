@@ -9,6 +9,7 @@ use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::conversation_goals::user_commands::{
     GoalUserChange, GoalUserCommand, GoalUserReceipt,
 };
+use phoenix_db::conversation_goals::{CoordinatorGoalWaitRequest, CoordinatorGoalWaitResult};
 
 use super::goal_error;
 use crate::api::{auth::OwnerAuthenticated, handlers::AppError};
@@ -182,6 +183,31 @@ impl GoalCommandService {
             .runtime
             .db()
             .read_coordinator_goals(caller, owner, after)
+            .await
+            .map_err(goal_error);
+        self.runtime
+            .db()
+            .require_current_coordinator(caller)
+            .await
+            .map_err(goal_error)?;
+        self.publication_result(result)
+    }
+
+    pub(crate) async fn wait_coordinator(
+        &self,
+        caller: &str,
+        owner: &ProductConversationId,
+        after: GoalVersion,
+        request: CoordinatorGoalWaitRequest,
+    ) -> Result<CoordinatorGoalWaitResult, AppError> {
+        let _authority = self
+            .runtime
+            .acquire_local_authority_pass()
+            .map_err(|()| AppError::Internal("local authority is closed".into()))?;
+        let result = self
+            .runtime
+            .db()
+            .wait_for_coordinator_goals(caller, owner, after, request)
             .await
             .map_err(goal_error);
         self.runtime

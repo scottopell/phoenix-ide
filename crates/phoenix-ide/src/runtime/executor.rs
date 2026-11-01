@@ -80,7 +80,7 @@ enum AuthoritativeEffect {
         origin: phoenix_core::domain::db_schema::InputOrigin,
     },
     PersistAuthoritativeUserMessage {
-        payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        payload: Box<phoenix_core::domain::sm_event::PreparedDirectTurnPayload>,
         authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
         idempotent: bool,
     },
@@ -1580,6 +1580,18 @@ fn render_messages<'a>(
                         "[Message from conversation {product_conversation_id}, transcript {transcript_id}]\n{}",
                         user_content.llm_text()
                     ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!(
+                        "[API-channel input from authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!(
+                        "[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!(
+                        "[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]\n{}",
+                        user_content.llm_text()
+                    ),
                     phoenix_core::domain::db_schema::InputOrigin::SubscriptionEvent { event_id } => {
                         format!("[Conversation event {event_id}]\n{}", user_content.llm_text())
                     }
@@ -1666,6 +1678,9 @@ fn render_messages<'a>(
             MessageContent::Skill(skill_content) => {
                 let source = match &msg.origin {
                     phoenix_core::domain::db_schema::InputOrigin::UserApi => "[User-facing API input]".to_string(),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteApi { instance_id } => format!("[API-channel input from authenticated instance {instance_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
+                    phoenix_core::domain::db_schema::InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!("[Message from remote Coordinator {product_conversation_id}, transcript {transcript_id}, authenticated instance {instance_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::InternalConversation { product_conversation_id, transcript_id, .. } => format!("[Message from conversation {product_conversation_id}, transcript {transcript_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::SlackGateway { request_id } => format!("[Slack gateway request {request_id}]"),
                     phoenix_core::domain::db_schema::InputOrigin::SystemGenerated => "[System-generated input]".to_string(),
@@ -6315,7 +6330,7 @@ where
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
                     authority,
-                    payload,
+                    payload: *payload,
                     sequence_id: reserved_seqs[0],
                     created_at: phoenix_workflow::Timestamp(now),
                     accepted_state: self
@@ -14486,6 +14501,43 @@ mod dispatch_context_budget_tests {
         );
     }
 
+    #[test]
+    fn provider_context_preserves_authenticated_remote_origin_for_user_and_skill() {
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, SkillContent},
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let instance_id = InstanceId::new();
+        let product_conversation_id = ProductConversationId::parse("same-local-product").unwrap();
+        for (origin, expected) in [
+            (InputOrigin::RemoteApi { instance_id }, format!("[API-channel input from authenticated instance {instance_id}]")),
+            (InputOrigin::RemoteConversation {
+                instance_id, product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "same-local-transcript".into(), source_call: None,
+            }, format!("[Message from conversation {product_conversation_id}, transcript same-local-transcript, authenticated instance {instance_id}]")),
+            (InputOrigin::RemoteCoordinator {
+                instance_id, product_conversation_id: product_conversation_id.clone(),
+                transcript_id: "same-local-transcript".into(), source_call: None,
+            }, format!("[Message from remote Coordinator {product_conversation_id}, transcript same-local-transcript, authenticated instance {instance_id}]")),
+        ] {
+            let mut user = message("recipient", 1, "body");
+            user.origin = origin.clone();
+            let mut skill = message("recipient", 2, "body");
+            skill.origin = origin;
+            skill.message_type = crate::db::MessageType::Skill;
+            skill.content = MessageContent::Skill(SkillContent {
+                name: "inspect".into(), body: "body".into(), trigger: "/inspect".into(), files: vec![],
+            });
+            let rendered = render_messages(&[user, skill], &std::collections::HashSet::new());
+            assert_eq!(rendered.len(), 2);
+            for rendered in rendered {
+                assert_eq!(rendered.role, phoenix_llm::MessageRole::User);
+                assert!(matches!(&rendered.content[0], ContentBlock::Text { text } if text == &format!("{expected}\nbody")));
+            }
+        }
+    }
+
     fn message(conv_id: &str, sequence_id: i64, text: &str) -> crate::db::Message {
         crate::db::Message {
             origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
@@ -15632,7 +15684,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -15657,7 +15709,7 @@ mod authoritative_user_message_effect_tests {
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -15692,7 +15744,7 @@ mod authoritative_user_message_effect_tests {
             updated_at: Utc::now(),
         });
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
+            payload: Box::new(payload("msg-direct")),
             authority: authority(),
             idempotent: true,
         })
@@ -18308,7 +18360,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18343,7 +18395,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18394,7 +18446,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18450,7 +18502,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18486,7 +18538,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18522,7 +18574,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             })
@@ -18555,7 +18607,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -18584,7 +18636,7 @@ mod authoritative_user_message_effect_tests {
                 attempt: 1,
             })
             .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: false,
             });
@@ -19180,7 +19232,7 @@ mod authoritative_user_message_effect_tests {
                     attempt: 1,
                 })
                 .with_effect(Effect::PersistAuthoritativeUserMessage {
-                    payload: payload("msg-direct"),
+                    payload: Box::new(payload("msg-direct")),
                     authority: authority(),
                     idempotent: false,
                 })
@@ -19216,7 +19268,7 @@ mod authoritative_user_message_effect_tests {
                 updated_at: Utc::now(),
             });
             rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
+                payload: Box::new(payload("msg-direct")),
                 authority: authority(),
                 idempotent: true,
             })

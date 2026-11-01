@@ -634,6 +634,12 @@ pub enum SteeringAdmissionError {
     CloseAdmissionFenced,
     #[error("conversation is permanently unavailable in History")]
     HistoryUnavailable,
+    #[error("federation send authority is no longer active")]
+    FederationSendAuthorityInactive,
+    #[error("federation send identity conflicts with a prior admission")]
+    FederationSendIdentityConflict,
+    #[error("federation steering send exactly replays a prior admission")]
+    FederationSteeringDuplicate,
     #[error("steering queue is full")]
     QueueFull,
     #[error("{0}")]
@@ -648,6 +654,7 @@ impl From<String> for SteeringAdmissionError {
 
 enum SteeringAppendAuthority<'a> {
     Ordinary,
+    Federation(&'a crate::db::FederationSendAuthority),
     ProductCreation(&'a crate::db::ClaimedProductCreationJob),
 }
 
@@ -5109,7 +5116,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|error| error.to_string())?,
         );
-        coordinator_tools.extend(crate::coordinator_tools::goal_tools(self.clone()));
+        coordinator_tools.extend(crate::coordinator_tools::goal_tools(self));
         Ok(ToolRegistry::coordinator(coordinator_tools, catalog))
     }
 
@@ -7065,6 +7072,22 @@ impl RuntimeManager {
         .await
     }
 
+    pub async fn enqueue_federated_steer_message(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+        request_fingerprint: &str,
+        authority: &crate::db::FederationSendAuthority,
+    ) -> Result<(), SteeringAdmissionError> {
+        self.enqueue_steer_message_with_authority(
+            conversation_id,
+            event,
+            request_fingerprint,
+            SteeringAppendAuthority::Federation(authority),
+        )
+        .await
+    }
+
     pub async fn enqueue_product_creation_steer_message(
         self: &Arc<Self>,
         delivery: &crate::db::ClaimedProductCreationJob,
@@ -7163,6 +7186,16 @@ impl RuntimeManager {
                         .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
                         .await
                 }
+                SteeringAppendAuthority::Federation(authority) => {
+                    self.db()
+                        .append_federated_steering_entry(
+                            conversation_id,
+                            &new_entry,
+                            request_fingerprint,
+                            authority,
+                        )
+                        .await
+                }
                 SteeringAppendAuthority::ProductCreation(delivery) => {
                     self.db()
                         .append_product_creation_steering_entry(
@@ -7182,6 +7215,15 @@ impl RuntimeManager {
                 }
                 crate::db::DbError::ProductConversationUnavailable(_) => {
                     SteeringAdmissionError::HistoryUnavailable
+                }
+                crate::db::DbError::FederationSendAuthorityInactive => {
+                    SteeringAdmissionError::FederationSendAuthorityInactive
+                }
+                crate::db::DbError::FederationSendIdentityConflict => {
+                    SteeringAdmissionError::FederationSendIdentityConflict
+                }
+                crate::db::DbError::FederationSteeringDuplicate => {
+                    SteeringAdmissionError::FederationSteeringDuplicate
                 }
                 crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
                 error => SteeringAdmissionError::Internal(format!(
@@ -11495,6 +11537,79 @@ mod scope_liveness_tests {
                 .expect("conversation")
                 .state,
             ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_steering_exact_persisted_replay_maps_to_duplicate_without_new_effect() {
+        use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "federated-steering-replay";
+        manager
+            .db()
+            .create_conversation(conversation_id, "replay", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .inject_handle_for_test(conversation_id, ConvState::Idle)
+            .await;
+
+        let caller = InstanceId::new();
+        let verifier = FederationCredentialVerifier::from_bearer(b"steering-replay-token");
+        manager
+            .db()
+            .replace_federation_enrollment(caller, "peer", &verifier)
+            .await
+            .expect("enroll caller");
+        let authority = crate::db::FederationSendAuthority::new(caller, verifier);
+        let event = Event::SteerMessage {
+            origin: phoenix_core::domain::db_schema::InputOrigin::RemoteApi {
+                instance_id: caller,
+            },
+            text: "steer once".into(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "federated-replay-message".into(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let fingerprint = "federated-replay-fingerprint";
+        manager
+            .enqueue_federated_steer_message(
+                conversation_id,
+                event.clone(),
+                fingerprint,
+                &authority,
+            )
+            .await
+            .expect("first steering admission");
+        assert!(matches!(
+            manager
+                .enqueue_federated_steer_message(conversation_id, event, fingerprint, &authority)
+                .await,
+            Err(SteeringAdmissionError::FederationSteeringDuplicate)
+        ));
+
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_acceptance_fingerprint(conversation_id, "federated-replay-message",)
+                .await
+                .expect("read durable receipt"),
+            Some(phoenix_db::SteeringAcceptanceFingerprint::Exact(
+                fingerprint.to_string()
+            ))
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("read durable steering effects")
+                .len(),
+            1
         );
     }
 

@@ -151,10 +151,17 @@ async fn goal_routes_require_owner_authentication_and_do_not_mount_peer_routes()
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
+    let caller_instance_id = phoenix_core::domain::instance_identity::InstanceId::new();
     let isolated = routes()
         .with_state(fixture.state.clone())
         .layer(axum::Extension(crate::api::auth::PeerAuthenticated {
-            caller_instance_id: phoenix_core::domain::instance_identity::InstanceId::new(),
+            caller_instance_id,
+            send_authority: phoenix_db::FederationSendAuthority::new(
+                caller_instance_id,
+                phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(
+                    b"authenticated-peer-not-owner",
+                ),
+            ),
             caller_display_name: "authenticated peer, not owner".into(),
         }));
     let (status, _) = request(

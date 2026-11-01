@@ -360,6 +360,9 @@ pub(super) async fn continue_manual(
             | DbError::CloseFoundationNotFound(_)
             | DbError::SubAgentLifecycleConflict(_)
             | DbError::DirectTurnConflict(_)
+            | DbError::FederationSendAuthorityInactive
+            | DbError::FederationSendIdentityConflict
+            | DbError::FederationSteeringDuplicate
             | DbError::ForkProposalConflict(_)
             | DbError::GitRepositoryWorkScopeProjectConflict { .. }
             | DbError::DormantGitRepositoryCatchupPermitTargetMismatch

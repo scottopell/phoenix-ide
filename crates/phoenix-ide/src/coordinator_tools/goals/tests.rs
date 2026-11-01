@@ -379,7 +379,7 @@ async fn native_goal_tools_refuse_raw_ids_authority_override_and_missing_turn() 
         )
         .await
         .is_success());
-    let prepare = tools(f.runtime.clone())
+    let prepare = tools(&f.runtime)
         .into_iter()
         .find(|t| t.name() == "prepare_goal")
         .unwrap();
@@ -422,7 +422,7 @@ async fn native_goal_tools_recheck_coordinator_role_on_every_operation() {
     let f = Fixture::new().await;
     let ordinary = "goal-native-target";
     for name in ["read_goal", "prepare_goal", "apply_goal"] {
-        let tool = tools(f.runtime.clone())
+        let tool = tools(&f.runtime)
             .into_iter()
             .find(|t| t.name() == name)
             .unwrap();

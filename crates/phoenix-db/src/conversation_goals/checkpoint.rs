@@ -200,6 +200,11 @@ pub(super) async fn retained_result_tx(
     Ok(Some(result))
 }
 
+pub(crate) struct FinalizedGoalReport {
+    pub(crate) result: ToolResult,
+    pub(crate) committed_goal: Option<super::GoalVersionCommittedNotification>,
+}
+
 pub(crate) async fn finalize_report_tx(
     tx: &mut GoalTx<'_>,
     assistant: &Message,
@@ -208,12 +213,15 @@ pub(crate) async fn finalize_report_tx(
     duration_ms: u64,
     at: GoalTimestampUs,
     policies: super::execution::GoalWritePolicies,
-) -> Result<ToolResult> {
+) -> Result<FinalizedGoalReport> {
     verify_source_tx(tx, assistant, execution, report).await?;
     let result_message_id =
         tool_result_message_id(&assistant.message_id, report.call().tool_use_id.as_str());
     if let Some(retained) = retained_result_tx(tx, report, &result_message_id).await? {
-        return Ok(retained);
+        return Ok(FinalizedGoalReport {
+            result: retained,
+            committed_goal: None,
+        });
     }
     let mut report_tx = tx.begin().await?;
     let mutation = report.mutation();
@@ -225,23 +233,36 @@ pub(crate) async fn finalize_report_tx(
         policies,
     )
     .await;
-    let mut result = match outcome {
+    let (mut result, committed_goal) = match outcome {
         Ok(entry) => {
             let output = accepted_output(&entry)?;
+            let committed_goal = super::GoalVersionCommittedNotification::new(
+                mutation.owner.clone(),
+                entry.snapshot().version(),
+            );
             report_tx.commit().await?;
-            ToolResult::success(report.call().tool_use_id.as_str().into(), output)
+            (
+                ToolResult::success(report.call().tool_use_id.as_str().into(), output),
+                Some(committed_goal),
+            )
         }
         Err(error) if semantic_refusal(&error) => {
             report_tx.rollback().await?;
-            ToolResult::error(
-                report.call().tool_use_id.as_str().into(),
-                format!("Goal report rejected: {error}"),
+            (
+                ToolResult::error(
+                    report.call().tool_use_id.as_str().into(),
+                    format!("Goal report rejected: {error}"),
+                ),
+                None,
             )
         }
         Err(error) => return Err(error),
     };
     result.duration_ms = Some(duration_ms);
-    Ok(result)
+    Ok(FinalizedGoalReport {
+        result,
+        committed_goal,
+    })
 }
 
 #[cfg(test)]

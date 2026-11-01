@@ -31,6 +31,7 @@ use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, Inst
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAuthenticated {
     pub caller_instance_id: InstanceId,
+    pub send_authority: phoenix_db::FederationSendAuthority,
     pub caller_display_name: String,
 }
 
@@ -506,7 +507,7 @@ pub async fn peer_auth_middleware(
         .map(|token| FederationCredentialVerifier::from_bearer(token.as_bytes()));
     let enrollment = match authenticated {
         Some(verifier) => match state.db.authenticate_federation_verifier(&verifier).await {
-            Ok(enrollment) => enrollment,
+            Ok(enrollment) => enrollment.map(|enrollment| (enrollment, verifier)),
             Err(error) => {
                 tracing::warn!(%error, "federation credential lookup failed closed");
                 None
@@ -515,8 +516,12 @@ pub async fn peer_auth_middleware(
         None => None,
     };
 
-    if let Some(enrollment) = enrollment {
+    if let Some((enrollment, verifier)) = enrollment {
         req.extensions_mut().insert(PeerAuthenticated {
+            send_authority: phoenix_db::FederationSendAuthority::new(
+                enrollment.caller_instance_id,
+                verifier,
+            ),
             caller_instance_id: enrollment.caller_instance_id,
             caller_display_name: enrollment.caller_display_name,
         });

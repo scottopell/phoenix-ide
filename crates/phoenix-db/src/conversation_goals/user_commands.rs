@@ -288,6 +288,11 @@ impl GoalControlAuthority<'_> {
     }
 }
 
+struct GoalUserCommandOutcome {
+    receipt: GoalUserReceipt,
+    committed_goal: Option<super::GoalVersionCommittedNotification>,
+}
+
 impl Database {
     /// Read an exact Coordinator receipt for a retained preparation.
     ///
@@ -318,17 +323,20 @@ impl Database {
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         on_authority_lost: F,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
-        self.control_goal_command(
-            input,
-            expected_transcript,
-            GoalControlAuthority::Coordinator { caller, source },
-            clock,
-            host_gate_busy,
-            on_authority_lost,
-            #[cfg(test)]
-            UserCommitCut::None,
-        )
-        .await
+        let result = self
+            .control_goal_command_with_notification(
+                input,
+                expected_transcript,
+                GoalControlAuthority::Coordinator { caller, source },
+                clock,
+                host_gate_busy,
+                on_authority_lost,
+                #[cfg(test)]
+                UserCommitCut::None,
+            )
+            .await;
+        self.notify_goal_command_outcome(&result);
+        Self::without_goal_notification(result)
     }
 
     /// Read an exact receipt for an ordinary owner before checking admission for a new write.
@@ -364,16 +372,20 @@ impl Database {
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         on_authority_lost: F,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
-        self.user_goal_command(
-            input,
-            expected_transcript,
-            clock,
-            false,
-            on_authority_lost,
-            #[cfg(test)]
-            UserCommitCut::None,
-        )
-        .await
+        let result = self
+            .control_goal_command_with_notification(
+                input,
+                expected_transcript,
+                GoalControlAuthority::Owner,
+                clock,
+                false,
+                on_authority_lost,
+                #[cfg(test)]
+                UserCommitCut::None,
+            )
+            .await;
+        self.notify_goal_command_outcome(&result);
+        Self::without_goal_notification(result)
     }
 
     /// Retain a busy refusal when the host could not acquire its existing admission gates.
@@ -408,14 +420,17 @@ impl Database {
         requester: GoalControlAuthority<'_>,
         clock: impl FnOnce() -> Result<GoalTimestampUs>,
         host_gate_busy: bool,
-    ) -> Result<GoalUserReceipt> {
+    ) -> Result<GoalUserCommandOutcome> {
         requester.require(tx).await?;
         let live = Self::get_ordinary_product_conversation_on(tx, &input.owner).await?;
         if let GoalControlAuthority::Coordinator { caller, source } = requester {
             super::prepared::require_exact_preparation(tx, caller, source, input).await?;
         }
         if let Some(retained) = retained_tx(tx, input, requester.receipts()).await? {
-            return Ok(retained);
+            return Ok(GoalUserCommandOutcome {
+                receipt: retained,
+                committed_goal: None,
+            });
         }
         let target = if host_gate_busy {
             &live.latest_transcript_row_id
@@ -435,7 +450,10 @@ impl Database {
                 GoalUserRefusal::Version
             };
             let receipt = reject_tx(tx, input, requester, reason, observed, at).await?;
-            return Ok(receipt);
+            return Ok(GoalUserCommandOutcome {
+                receipt,
+                committed_goal: None,
+            });
         }
         let actor = requester.actor(input);
         let mutation = GoalMutation {
@@ -456,7 +474,10 @@ impl Database {
             Err(GoalDbError::Busy) => {
                 let receipt =
                     reject_tx(tx, input, requester, GoalUserRefusal::Busy, observed, at).await?;
-                return Ok(receipt);
+                return Ok(GoalUserCommandOutcome {
+                    receipt,
+                    committed_goal: None,
+                });
             }
             Err(error) => return Err(error),
         }
@@ -474,7 +495,10 @@ impl Database {
                     at,
                 )
                 .await?;
-                return Ok(receipt);
+                return Ok(GoalUserCommandOutcome {
+                    receipt,
+                    committed_goal: None,
+                });
             }
             Err(error) => return Err(error.into()),
         };
@@ -504,11 +528,18 @@ impl Database {
         )
         .await
         .map_err(GoalDbError::from)?;
-        Ok(GoalUserReceipt {
-            request_id: input.request_id,
-            result: GoalUserResult::Accepted {
-                entry: Box::new(entry),
+        let committed_goal = super::GoalVersionCommittedNotification::new(
+            input.owner.clone(),
+            entry.snapshot().version(),
+        );
+        Ok(GoalUserCommandOutcome {
+            receipt: GoalUserReceipt {
+                request_id: input.request_id,
+                result: GoalUserResult::Accepted {
+                    entry: Box::new(entry),
+                },
             },
+            committed_goal: Some(committed_goal),
         })
     }
 
@@ -521,22 +552,48 @@ impl Database {
         on_authority_lost: F,
         #[cfg(test)] cut: UserCommitCut,
     ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
-        self.control_goal_command(
-            input,
-            expected_transcript,
-            GoalControlAuthority::Owner,
-            clock,
-            host_gate_busy,
-            on_authority_lost,
-            #[cfg(test)]
-            cut,
-        )
-        .await
+        let result = self
+            .control_goal_command_with_notification(
+                input,
+                expected_transcript,
+                GoalControlAuthority::Owner,
+                clock,
+                host_gate_busy,
+                on_authority_lost,
+                #[cfg(test)]
+                cut,
+            )
+            .await;
+        Self::without_goal_notification(result)
+    }
+
+    fn notify_goal_command_outcome(
+        &self,
+        result: &LocalAuthorityResult<Result<GoalUserCommandOutcome>>,
+    ) {
+        if let LocalAuthorityResult::DurableFactEstablished(Ok(outcome)) = result {
+            if let Some(committed_goal) = &outcome.committed_goal {
+                self.notify_goal_versions_committed(std::slice::from_ref(committed_goal));
+            }
+        }
+    }
+
+    fn without_goal_notification(
+        result: LocalAuthorityResult<Result<GoalUserCommandOutcome>>,
+    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+        match result {
+            LocalAuthorityResult::DurableFactEstablished(result) => {
+                LocalAuthorityResult::DurableFactEstablished(result.map(|outcome| outcome.receipt))
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                LocalAuthorityResult::DurableFactUnclassified
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
     #[cfg_attr(test, allow(clippy::too_many_arguments))]
-    async fn control_goal_command<F: FnOnce()>(
+    async fn control_goal_command_with_notification<F: FnOnce()>(
         &self,
         input: &GoalUserCommand,
         expected_transcript: &str,
@@ -545,7 +602,7 @@ impl Database {
         host_gate_busy: bool,
         on_authority_lost: F,
         #[cfg(test)] cut: UserCommitCut,
-    ) -> LocalAuthorityResult<Result<GoalUserReceipt>> {
+    ) -> LocalAuthorityResult<Result<GoalUserCommandOutcome>> {
         let mut connection = match self.pool().acquire().await {
             Ok(connection) => connection,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
@@ -565,8 +622,9 @@ impl Database {
                 host_gate_busy,
             )
             .await;
-        let attempted = match result {
-            Ok(receipt) => {
+        let (attempted, committed_goal) = match result {
+            Ok(outcome) => {
+                let committed_goal = outcome.committed_goal.clone();
                 #[cfg(not(test))]
                 let committed = tx.commit().await;
                 #[cfg(test)]
@@ -595,9 +653,9 @@ impl Database {
                 match committed {
                     Ok(()) => {
                         authority.classified();
-                        return LocalAuthorityResult::DurableFactEstablished(Ok(receipt));
+                        return LocalAuthorityResult::DurableFactEstablished(Ok(outcome));
                     }
-                    Err(error) => GoalDbError::Sqlx(error),
+                    Err(error) => (GoalDbError::Sqlx(error), committed_goal),
                 }
             }
             Err(error) => {
@@ -609,7 +667,7 @@ impl Database {
                     authority.classified();
                     return LocalAuthorityResult::DurableFactEstablished(Err(error));
                 }
-                error
+                (error, None)
             }
         };
         let Ok(mut lookup) =
@@ -637,7 +695,10 @@ impl Database {
         match (retained, released) {
             (Ok(Some(receipt)), Ok(())) => {
                 authority.classified();
-                LocalAuthorityResult::DurableFactEstablished(Ok(receipt))
+                LocalAuthorityResult::DurableFactEstablished(Ok(GoalUserCommandOutcome {
+                    receipt,
+                    committed_goal,
+                }))
             }
             (Ok(None), Ok(())) => {
                 authority.classified();

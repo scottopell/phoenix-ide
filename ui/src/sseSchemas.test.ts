@@ -293,6 +293,35 @@ describe('parseEvent', () => {
       expect(v.safeParse(InputOriginSchema, { kind: 'human' }).success).toBe(false);
     });
 
+    it('validates remote provenance without weakening required source fields', () => {
+      const remoteOrigins = [
+        { kind: 'remote_api', instance_id: 'peer-1' },
+        {
+          kind: 'remote_conversation', instance_id: 'peer-1', product_conversation_id: 'product-1',
+          transcript_id: 'row-1', source_call: { message_id: 'message-1', tool_use_id: 'call-1' },
+        },
+        {
+          kind: 'remote_coordinator', instance_id: 'peer-2', product_conversation_id: 'coordinator-product',
+          transcript_id: 'coordinator-row', source_call: null,
+        },
+      ];
+      for (const origin of remoteOrigins) {
+        expect(v.parse(InputOriginSchema, origin)).toEqual(origin);
+        const { dispatch } = mockDispatch();
+        expect(parseEvent(
+          SseMessageDataSchema,
+          makeEvent({ opening: null, sequence_id: 5, message: { ...goodMsg, origin } }),
+          'message',
+          dispatch,
+        ).ok).toBe(true);
+      }
+      expect(v.safeParse(InputOriginSchema, { kind: 'remote_api' }).success).toBe(false);
+      expect(v.safeParse(InputOriginSchema, {
+        kind: 'remote_conversation', instance_id: 'peer-1',
+        product_conversation_id: 'product-1', transcript_id: 'row-1',
+      }).success).toBe(false);
+    });
+
     it('rejects a message whose sequence_id arrives as a string', () => {
       inProdMode(() => {
         const { dispatch, actions } = mockDispatch();
@@ -367,6 +396,14 @@ describe('parseEvent', () => {
     const { origin: _origin, ...withoutOrigin } = queued;
     expect(_origin.kind).toBe('internal_conversation');
     expect(v.safeParse(QueuedSteeringMessageSchema, withoutOrigin).success).toBe(false);
+    const remoteQueued = {
+      ...queued,
+      origin: {
+        kind: 'remote_coordinator', instance_id: 'peer-1', product_conversation_id: 'product-2',
+        transcript_id: 'row-2', source_call: null,
+      },
+    };
+    expect(v.parse(QueuedSteeringMessageSchema, remoteQueued).origin).toEqual(remoteQueued.origin);
   });
 
   describe('message_updated schema', () => {

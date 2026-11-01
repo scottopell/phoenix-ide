@@ -9,6 +9,14 @@ use futures::StreamExt as _;
 use phoenix_core::domain::instance_identity::{
     FederationCredentialVerifier, InstanceId, PeerTlsTrust,
 };
+use phoenix_core::domain::{
+    close::TranscriptConversationId,
+    conversation_goal::{GoalHistoryEntry, GoalVersion},
+    product_conversation::ProductConversationId,
+};
+use phoenix_db::conversation_goals::{
+    CoordinatorGoalWaitRequest, CoordinatorGoalWaitStatus, GoalDbError,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -23,6 +31,7 @@ static READ_ADMISSION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
 const REMOTE_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_REMOTE_RESPONSE_BYTES: usize = 65 * 1024;
+const MAX_REMOTE_GOAL_HISTORY_ENTRIES: usize = 100;
 const REMOTE_STABLE_CONTINUATION_ERROR: &str = "remote @conv continuation is not source-bound; read @conv at cursor 0, then continue with the exact @transcript:<id> shown in that page's evidence header";
 
 fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -64,6 +73,708 @@ pub struct ImportPeerConnectionResponse {
     pub peer_instance_id: InstanceId,
 }
 
+pub(crate) const MAX_REMOTE_MESSAGE_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_REMOTE_SEND_REQUEST_BODY_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RemoteMessageText(String);
+
+impl RemoteMessageText {
+    pub fn parse(text: String) -> Result<Self, &'static str> {
+        if text.trim().is_empty() || text.len() > MAX_REMOTE_MESSAGE_BYTES {
+            return Err("message must be nonblank and at most 32768 UTF-8 bytes");
+        }
+        Ok(Self(text))
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteMessageText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteSendTarget {
+    ProductConversation {
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+    },
+    Transcript {
+        transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+    },
+}
+
+impl RemoteSendTarget {
+    pub(crate) fn parse_tool_target(raw: &str) -> Result<Self, String> {
+        if raw != raw.trim() || raw.contains('#') {
+            return Err(
+                "send targets must be @conv:<id> or @transcript:<id> without a message fragment"
+                    .into(),
+            );
+        }
+        match RemoteConversationTarget::parse(raw).map_err(|error| error.to_string())? {
+            RemoteConversationTarget::ProductConversation {
+                product_conversation_id,
+            } => Ok(Self::ProductConversation {
+                product_conversation_id:
+                    phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                        product_conversation_id,
+                    )
+                    .map_err(|error| error.to_string())?,
+            }),
+            RemoteConversationTarget::ExactTranscript { transcript_id, .. } => {
+                Ok(Self::Transcript {
+                    transcript_id: phoenix_core::domain::close::TranscriptConversationId::parse(
+                        transcript_id,
+                    )
+                    .map_err(|error| error.to_string())?,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSourceToolCall {
+    message_id: RemoteSenderLocator,
+    tool_use_id: RemoteSenderLocator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct RemoteSenderLocator(String);
+
+impl RemoteSenderLocator {
+    fn parse(value: String) -> Result<Self, &'static str> {
+        if value.trim().is_empty() || value.len() > 1024 {
+            return Err("sender locator must be nonblank and at most 1024 bytes");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteSenderLocator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteSenderAttestation {
+    RemoteApi {},
+    Conversation {
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+        transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+        source_call: Option<RemoteSourceToolCall>,
+    },
+    Coordinator {
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+        transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+        source_call: Option<RemoteSourceToolCall>,
+    },
+}
+
+impl RemoteSenderAttestation {
+    pub(crate) fn from_conversation(
+        source: crate::db::Conversation,
+        call: phoenix_core::domain::db_schema::SourceToolCall,
+    ) -> Result<Self, String> {
+        let call = RemoteSourceToolCall {
+            message_id: RemoteSenderLocator::parse(call.message_id).map_err(str::to_string)?,
+            tool_use_id: RemoteSenderLocator::parse(call.tool_use_id).map_err(str::to_string)?,
+        };
+        let transcript_id = phoenix_core::domain::close::TranscriptConversationId::parse(source.id)
+            .map_err(|error| error.to_string())?;
+        let product_conversation_id = source.product_conversation_id;
+        Ok(
+            if source.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+                Self::Coordinator {
+                    product_conversation_id,
+                    transcript_id,
+                    source_call: Some(call),
+                }
+            } else {
+                Self::Conversation {
+                    product_conversation_id,
+                    transcript_id,
+                    source_call: Some(call),
+                }
+            },
+        )
+    }
+
+    fn into_origin(self, instance_id: InstanceId) -> phoenix_core::domain::db_schema::InputOrigin {
+        use phoenix_core::domain::db_schema::{InputOrigin, SourceToolCall};
+        let convert_call = |call: Option<RemoteSourceToolCall>| {
+            call.map(|call| {
+                Box::new(SourceToolCall {
+                    message_id: call.message_id.0,
+                    tool_use_id: call.tool_use_id.0,
+                })
+            })
+        };
+        match self {
+            Self::RemoteApi {} => InputOrigin::RemoteApi { instance_id },
+            Self::Conversation {
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            } => InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id,
+                transcript_id: transcript_id.to_string(),
+                source_call: convert_call(source_call),
+            },
+            Self::Coordinator {
+                product_conversation_id,
+                transcript_id,
+                source_call,
+            } => InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id,
+                transcript_id: transcript_id.to_string(),
+                source_call: convert_call(source_call),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSendMessageRequest {
+    pub destination_instance_id: InstanceId,
+    pub target: RemoteSendTarget,
+    pub message_id: uuid::Uuid,
+    pub message: RemoteMessageText,
+    pub sender: RemoteSenderAttestation,
+}
+
+impl RemoteSendMessageRequest {
+    fn locators_are_bounded(&self) -> bool {
+        let target_bounded = match &self.target {
+            RemoteSendTarget::ProductConversation {
+                product_conversation_id,
+            } => product_conversation_id.as_str().len() <= 1024,
+            RemoteSendTarget::Transcript { transcript_id } => transcript_id.as_str().len() <= 1024,
+        };
+        let sender_bounded = match &self.sender {
+            RemoteSenderAttestation::RemoteApi {} => true,
+            RemoteSenderAttestation::Conversation {
+                product_conversation_id,
+                transcript_id,
+                ..
+            }
+            | RemoteSenderAttestation::Coordinator {
+                product_conversation_id,
+                transcript_id,
+                ..
+            } => {
+                product_conversation_id.as_str().len() <= 1024
+                    && transcript_id.as_str().len() <= 1024
+            }
+        };
+        target_bounded && sender_bounded
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSendDisposition {
+    Delivered,
+    Queued,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteStableDestination {
+    pub instance_id: InstanceId,
+    pub product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteSendNavigation {
+    AppLocal { path: String },
+    Peer { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteMessageAcceptance {
+    pub admitted_message_id: String,
+    pub accepting_transcript: phoenix_core::domain::close::TranscriptConversationId,
+    pub stable_destination: RemoteStableDestination,
+    pub stable_navigation: RemoteSendNavigation,
+    pub accepting_transcript_navigation: RemoteSendNavigation,
+    pub accepting_message_navigation: RemoteSendNavigation,
+    pub disposition: RemoteSendDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSendRejectionCode {
+    DestinationMismatch,
+    InvalidTarget,
+    SenderNotAllowed,
+    TargetNotFound,
+    IdempotencyConflict,
+    TargetUnavailable,
+    AuthorityInactive,
+    AdmissionRejected,
+    Busy,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteSendReceipt {
+    Accepted {
+        acceptance: RemoteMessageAcceptance,
+    },
+    Duplicate {
+        acceptance: RemoteMessageAcceptance,
+    },
+    Rejected {
+        code: RemoteSendRejectionCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSendMessageResponse {
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub target: RemoteSendTarget,
+    pub operation_id: uuid::Uuid,
+    pub receipt: RemoteSendReceipt,
+}
+
+#[derive(Default)]
+pub(crate) struct RemoteMessageAdmissionGates {
+    gates: tokio::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+}
+
+impl RemoteMessageAdmissionGates {
+    async fn lock(&self, message_id: uuid::Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self.gates.lock().await;
+            if gates.len() >= 1024 {
+                gates.retain(|_, gate| gate.strong_count() > 0);
+            }
+            if let Some(gate) = gates.get(&message_id).and_then(std::sync::Weak::upgrade) {
+                gate
+            } else {
+                let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(message_id, std::sync::Arc::downgrade(&gate));
+                gate
+            }
+        };
+        gate.lock_owned().await
+    }
+}
+
+fn remote_admission_id(caller: InstanceId, operation_id: uuid::Uuid) -> uuid::Uuid {
+    const NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0xc3ae2bb7_152d_52f4_978a_21b027a4dc91);
+    let caller = uuid::Uuid::parse_str(&caller.to_string()).expect("typed instance UUID");
+    let mut name = [0_u8; 32];
+    name[..16].copy_from_slice(caller.as_bytes());
+    name[16..].copy_from_slice(operation_id.as_bytes());
+    uuid::Uuid::new_v5(&NAMESPACE, &name)
+}
+
+pub async fn send_conversation_message(
+    authenticated: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteSendMessageRequest>,
+) -> Response {
+    if !request.locators_are_bounded() {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let destination = match state.db.instance_id().await {
+        Ok(destination) => destination,
+        Err(error) => {
+            tracing::error!(%error, "failed to load federation send destination");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let caller = authenticated.caller_instance_id;
+    let authority = authenticated.send_authority;
+    let operation_id = request.message_id;
+    let target = request.target.clone();
+    let receipt = if request.destination_instance_id == destination {
+        // Admission outlives an HTTP disconnect, including its per-operation gate.
+        let admission = tokio::spawn(async move {
+            let admitted_id = remote_admission_id(caller, operation_id);
+            let _guard = state.remote_message_admission.lock(admitted_id).await;
+            admit_remote_message(&state, caller, admitted_id, &request, &authority).await
+        });
+        match admission.await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::error!(%error, "federation send admission task failed");
+                RemoteSendReceipt::Rejected {
+                    code: RemoteSendRejectionCode::Internal,
+                    message: "remote message admission failed".into(),
+                }
+            }
+        }
+    } else {
+        RemoteSendReceipt::Rejected {
+            code: RemoteSendRejectionCode::DestinationMismatch,
+            message: "destination instance identity mismatch".into(),
+        }
+    };
+    Json(RemoteSendMessageResponse {
+        destination_instance_id: destination,
+        caller_instance_id: caller,
+        target,
+        operation_id,
+        receipt,
+    })
+    .into_response()
+}
+
+async fn resolve_remote_send_target(
+    state: &AppState,
+    target: &RemoteSendTarget,
+) -> Result<crate::send_chat_service::SendChatTarget, RemoteSendReceipt> {
+    use crate::send_chat_service::SendChatTarget;
+    let rejected = |code, message: String| RemoteSendReceipt::Rejected {
+        code,
+        message: bounded_send_diagnostic(&message),
+    };
+    let raw = match target {
+        RemoteSendTarget::ProductConversation {
+            product_conversation_id,
+        } => format!("@conv:{product_conversation_id}"),
+        RemoteSendTarget::Transcript { transcript_id } => format!("@transcript:{transcript_id}"),
+    };
+    let service = crate::api::global_read::GlobalReadService::new(
+        state.db.clone(),
+        state.message_retriever.clone(),
+    );
+    match service
+        .resolve_message_target(&raw)
+        .await
+        .map_err(|error| rejected(RemoteSendRejectionCode::InvalidTarget, error.to_string()))?
+    {
+        crate::api::global_read::GlobalMessageTarget::StableProductConversation {
+            product_conversation_id,
+        } => Ok(SendChatTarget::StableProductConversation(
+            product_conversation_id.to_string(),
+        )),
+        crate::api::global_read::GlobalMessageTarget::ExactTranscript { transcript_id } => {
+            Ok(SendChatTarget::ExactTranscript(transcript_id.to_string()))
+        }
+    }
+}
+
+async fn admit_remote_message(
+    state: &AppState,
+    caller: InstanceId,
+    admitted_id: uuid::Uuid,
+    request: &RemoteSendMessageRequest,
+    authority: &phoenix_db::FederationSendAuthority,
+) -> RemoteSendReceipt {
+    use crate::send_chat_service::{
+        MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatReplay,
+        SendChatRequest, SendChatServiceError,
+    };
+    use sha2::Digest as _;
+    let message_id = admitted_id.to_string();
+    let owner = state.db.remote_send_message_owner(&message_id).await;
+    let target = match owner {
+        Ok(Some(owner)) => crate::send_chat_service::SendChatTarget::ExactTranscript(owner),
+        Ok(None) => match resolve_remote_send_target(state, &request.target).await {
+            Ok(target) => target,
+            Err(receipt) => return receipt,
+        },
+        Err(error) => {
+            return RemoteSendReceipt::Rejected {
+                code: RemoteSendRejectionCode::Internal,
+                message: bounded_send_diagnostic(&error.to_string()),
+            };
+        }
+    };
+    let target_fingerprint = sha2::Sha256::digest(
+        serde_json::to_vec(&request.target).expect("typed remote target serializes"),
+    )
+    .into();
+    let service = SendChatApplicationService::new(state.db.clone(), state.runtime.clone());
+    let admission = service
+        .send_federated_to_target_with_replay(
+            target,
+            SendChatRequest {
+                conversation_id: String::new(),
+                origin: request.sender.clone().into_origin(caller),
+                text: request.message.0.clone(),
+                message_id,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::RemoteLiteralText { target_fingerprint },
+            },
+            authority,
+        )
+        .await;
+    let (id, outcome, replay) = match admission {
+        Ok(result) => result,
+        Err(error) => {
+            let code = match &error {
+                SendChatServiceError::IdempotencyConflict => {
+                    RemoteSendRejectionCode::IdempotencyConflict
+                }
+                SendChatServiceError::NotFound(_) => RemoteSendRejectionCode::TargetNotFound,
+                SendChatServiceError::FederationSendAuthorityInactive => {
+                    RemoteSendRejectionCode::AuthorityInactive
+                }
+                SendChatServiceError::Busy => RemoteSendRejectionCode::Busy,
+                SendChatServiceError::CloseAdmissionFenced
+                | SendChatServiceError::HistoryUnavailable => {
+                    RemoteSendRejectionCode::TargetUnavailable
+                }
+                SendChatServiceError::AttachmentValidation(_)
+                | SendChatServiceError::Expansion { .. } => {
+                    RemoteSendRejectionCode::AdmissionRejected
+                }
+                SendChatServiceError::Internal(_) | SendChatServiceError::Dispatch(_) => {
+                    RemoteSendRejectionCode::Internal
+                }
+            };
+            return RemoteSendReceipt::Rejected {
+                code,
+                message: bounded_send_diagnostic(&error.to_string()),
+            };
+        }
+    };
+    if let SendChatOutcome::Rejected { message, .. } = outcome {
+        return RemoteSendReceipt::Rejected {
+            code: RemoteSendRejectionCode::AdmissionRejected,
+            message: bounded_send_diagnostic(&message),
+        };
+    }
+    let disposition =
+        if replay == SendChatReplay::Steering || outcome == SendChatOutcome::QueuedAsSteering {
+            RemoteSendDisposition::Queued
+        } else {
+            RemoteSendDisposition::Delivered
+        };
+    let acceptance =
+        match build_remote_message_acceptance(state, request, id, admitted_id, disposition).await {
+            Ok(acceptance) => acceptance,
+            Err(receipt) => return receipt,
+        };
+    if replay == SendChatReplay::New {
+        RemoteSendReceipt::Accepted { acceptance }
+    } else {
+        RemoteSendReceipt::Duplicate { acceptance }
+    }
+}
+
+async fn build_remote_message_acceptance(
+    state: &AppState,
+    request: &RemoteSendMessageRequest,
+    id: String,
+    admitted_id: uuid::Uuid,
+    disposition: RemoteSendDisposition,
+) -> Result<RemoteMessageAcceptance, RemoteSendReceipt> {
+    let conversation =
+        state
+            .db
+            .get_conversation(&id)
+            .await
+            .map_err(|error| RemoteSendReceipt::Rejected {
+                code: RemoteSendRejectionCode::Internal,
+                message: bounded_send_diagnostic(&error.to_string()),
+            })?;
+    let stable_path = if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        "/global".to_string()
+    } else {
+        super::product_conversations::product_route(
+            None,
+            conversation.product_conversation_id.as_str(),
+        )
+    };
+    let transcript = phoenix_core::domain::close::TranscriptConversationId::parse(id)
+        .expect("persisted transcript is nonempty");
+    let exact_path = super::global_read::exact_conversation_href(transcript.as_str(), None);
+    let message_id = accepting_message_id(&transcript, admitted_id, disposition);
+    Ok(RemoteMessageAcceptance {
+        admitted_message_id: message_id.clone(),
+        accepting_transcript: transcript,
+        stable_navigation: RemoteSendNavigation::AppLocal { path: stable_path },
+        accepting_transcript_navigation: RemoteSendNavigation::AppLocal {
+            path: exact_path.clone(),
+        },
+        accepting_message_navigation: RemoteSendNavigation::AppLocal {
+            path: format!(
+                "{exact_path}#message-{}",
+                super::product_conversations::percent_encode_route_segment(&message_id)
+            ),
+        },
+        stable_destination: RemoteStableDestination {
+            instance_id: request.destination_instance_id,
+            product_conversation_id: conversation.product_conversation_id,
+        },
+        disposition,
+    })
+}
+
+fn accepting_message_id(
+    transcript: &phoenix_core::domain::close::TranscriptConversationId,
+    message_id: uuid::Uuid,
+    disposition: RemoteSendDisposition,
+) -> String {
+    match disposition {
+        RemoteSendDisposition::Delivered => format!("{transcript}:{message_id}"),
+        RemoteSendDisposition::Queued => message_id.to_string(),
+    }
+}
+
+fn bounded_send_diagnostic(message: &str) -> String {
+    message.chars().take(512).collect()
+}
+
+pub async fn send_remote_conversation_message(
+    local_db: &crate::db::Database,
+    peer: &phoenix_db::FederationPeerConnection,
+    request: &RemoteSendMessageRequest,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    if !request.locators_are_bounded() {
+        return Err(FederationClientError::RemoteRejected(
+            "send locators exceed the request budget".into(),
+        ));
+    }
+    if request.destination_instance_id != peer.peer_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    let caller = local_db.instance_id().await?;
+    let endpoint = format!(
+        "{}api/federation/peer/send-conversation-message",
+        peer.base_url
+    );
+    let response = remote_query_client(&peer.tls_trust)?
+        .post(endpoint)
+        .bearer_auth(peer.bearer_credential.expose())
+        .json(request)
+        .send()
+        .await?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_response_chunk(&mut bytes, &chunk?, MAX_REMOTE_RESPONSE_BYTES)?;
+    }
+    let mut response = decode_remote_send_response(status, &bytes, caller, request)?;
+    if let RemoteSendReceipt::Accepted { acceptance }
+    | RemoteSendReceipt::Duplicate { acceptance } = &mut response.receipt
+    {
+        for navigation in [
+            &mut acceptance.stable_navigation,
+            &mut acceptance.accepting_transcript_navigation,
+            &mut acceptance.accepting_message_navigation,
+        ] {
+            let RemoteSendNavigation::AppLocal { path } = navigation else {
+                return Err(FederationClientError::SendProvenanceMismatch);
+            };
+            let url = format!("{}{}", peer.base_url, path.trim_start_matches('/'));
+            *navigation = RemoteSendNavigation::Peer { url };
+        }
+    }
+    Ok(response)
+}
+
+fn decode_remote_send_response(
+    status: StatusCode,
+    bytes: &[u8],
+    caller: InstanceId,
+    request: &RemoteSendMessageRequest,
+) -> Result<RemoteSendMessageResponse, FederationClientError> {
+    if !status.is_success() {
+        return Err(FederationClientError::RemoteRejected(format!(
+            "HTTP {status}"
+        )));
+    }
+    let response: RemoteSendMessageResponse = serde_json::from_slice(bytes)?;
+    if response.destination_instance_id != request.destination_instance_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.operation_id != request.message_id || response.target != request.target {
+        return Err(FederationClientError::SendProvenanceMismatch);
+    }
+    if let RemoteSendReceipt::Accepted { acceptance }
+    | RemoteSendReceipt::Duplicate { acceptance } = &response.receipt
+    {
+        if acceptance.stable_destination.instance_id != request.destination_instance_id {
+            return Err(FederationClientError::SendProvenanceMismatch);
+        }
+        let RemoteSendNavigation::AppLocal { path: stable_path } = &acceptance.stable_navigation
+        else {
+            return Err(FederationClientError::SendProvenanceMismatch);
+        };
+        let stable_shape = stable_path == "/global"
+            || stable_path
+                == &format!(
+                    "/c/{}",
+                    super::product_conversations::percent_encode_route_segment(
+                        acceptance
+                            .stable_destination
+                            .product_conversation_id
+                            .as_str()
+                    )
+                );
+        let stable_matches = stable_shape;
+        let exact_path = super::global_read::exact_conversation_href(
+            acceptance.accepting_transcript.as_str(),
+            None,
+        );
+        let message_id = accepting_message_id(
+            &acceptance.accepting_transcript,
+            remote_admission_id(caller, request.message_id),
+            acceptance.disposition,
+        );
+        let message_path = format!(
+            "{exact_path}#message-{}",
+            super::product_conversations::percent_encode_route_segment(&message_id)
+        );
+        if !stable_matches
+            || acceptance.admitted_message_id != message_id
+            || acceptance.accepting_transcript_navigation
+                != (RemoteSendNavigation::AppLocal { path: exact_path })
+            || acceptance.accepting_message_navigation
+                != (RemoteSendNavigation::AppLocal { path: message_path })
+        {
+            return Err(FederationClientError::SendProvenanceMismatch);
+        }
+        match &request.target {
+            RemoteSendTarget::ProductConversation {
+                product_conversation_id,
+            } if product_conversation_id
+                != &acceptance.stable_destination.product_conversation_id =>
+            {
+                return Err(FederationClientError::SendProvenanceMismatch)
+            }
+            RemoteSendTarget::Transcript { transcript_id }
+                if transcript_id != &acceptance.accepting_transcript =>
+            {
+                return Err(FederationClientError::SendProvenanceMismatch)
+            }
+            RemoteSendTarget::ProductConversation { .. } | RemoteSendTarget::Transcript { .. } => {}
+        }
+    }
+    Ok(response)
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct RemoteQueryDatabaseRequest {
     pub destination_instance_id: InstanceId,
@@ -79,12 +790,16 @@ pub struct RemoteQueryDatabaseResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FederationClientError {
+    #[error("remote send response provenance mismatch")]
+    SendProvenanceMismatch,
     #[error("peer connection not found")]
     PeerNotFound,
     #[error("peer display name is ambiguous")]
     PeerAmbiguous,
     #[error("peer selector must not be empty")]
     InvalidPeerSelector,
+    #[error("invalid Goal wait request: {0}")]
+    InvalidGoalWait(String),
     #[error("peer database lookup failed: {0}")]
     Database(#[from] phoenix_db::DbError),
     #[error("peer selection failed: {0}")]
@@ -320,6 +1035,91 @@ pub struct RemoteReadConversationResponse {
     pub content: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteGoalWaitRequest {
+    minimum_version: GoalVersion,
+    timeout_seconds: u64,
+}
+
+impl RemoteGoalWaitRequest {
+    fn from_coordinator_request(
+        request: CoordinatorGoalWaitRequest,
+    ) -> Result<Self, FederationClientError> {
+        let timeout = request.timeout();
+        if timeout.subsec_nanos() != 0 {
+            return Err(FederationClientError::InvalidGoalWait(
+                "timeout must use whole seconds".to_string(),
+            ));
+        }
+        Ok(Self {
+            minimum_version: request.minimum_version(),
+            timeout_seconds: timeout.as_secs(),
+        })
+    }
+
+    fn into_coordinator_request(
+        self,
+    ) -> Result<
+        CoordinatorGoalWaitRequest,
+        phoenix_db::conversation_goals::CoordinatorGoalWaitRequestError,
+    > {
+        CoordinatorGoalWaitRequest::new(
+            self.minimum_version,
+            std::time::Duration::from_secs(self.timeout_seconds),
+        )
+    }
+
+    const fn minimum_version(self) -> GoalVersion {
+        self.minimum_version
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteReadGoalRequest {
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub target: ProductConversationId,
+    pub after_version: GoalVersion,
+    #[serde(default)]
+    pub wait: Option<RemoteGoalWaitRequest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteGoalWaitStatus {
+    Immediate,
+    Satisfied,
+    TimedOut,
+}
+
+impl From<CoordinatorGoalWaitStatus> for RemoteGoalWaitStatus {
+    fn from(status: CoordinatorGoalWaitStatus) -> Self {
+        match status {
+            CoordinatorGoalWaitStatus::Satisfied => Self::Satisfied,
+            CoordinatorGoalWaitStatus::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteReadGoalResponse {
+    pub source_instance_id: InstanceId,
+    pub destination_instance_id: InstanceId,
+    pub caller_instance_id: InstanceId,
+    pub target: ProductConversationId,
+    pub exact_transcript_id: TranscriptConversationId,
+    pub after_version: GoalVersion,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub wait: Option<RemoteGoalWaitRequest>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub current: Option<GoalHistoryEntry>,
+    pub history: Vec<GoalHistoryEntry>,
+    pub wait_status: RemoteGoalWaitStatus,
+}
+
 pub async fn resolve_saved_peer_id(
     db: &crate::db::Database,
     selector: &str,
@@ -493,6 +1293,194 @@ pub async fn read_remote_conversation(
         ));
     }
     validate_remote_next_cursor(cursor, response.next_cursor)?;
+    Ok(response)
+}
+
+fn validate_remote_goal_response(
+    response: &RemoteReadGoalResponse,
+    peer_id: InstanceId,
+    caller: InstanceId,
+    request: &RemoteReadGoalRequest,
+) -> Result<(), FederationClientError> {
+    if response.source_instance_id != peer_id || response.destination_instance_id != peer_id {
+        return Err(FederationClientError::DestinationMismatch);
+    }
+    if response.caller_instance_id != caller {
+        return Err(FederationClientError::CallerMismatch);
+    }
+    if response.target != request.target {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "goal response changed the stable target".to_string(),
+        ));
+    }
+    if response.after_version != request.after_version {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "goal response changed the history cursor".to_string(),
+        ));
+    }
+    if response.wait != request.wait {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "goal response changed the wait request".to_string(),
+        ));
+    }
+    validate_remote_goal_history(response, request)
+}
+
+fn validate_remote_goal_history(
+    response: &RemoteReadGoalResponse,
+    request: &RemoteReadGoalRequest,
+) -> Result<(), FederationClientError> {
+    if response.history.len() > MAX_REMOTE_GOAL_HISTORY_ENTRIES {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "goal response exceeded the history page bound".to_string(),
+        ));
+    }
+    if response
+        .current
+        .iter()
+        .chain(response.history.iter())
+        .any(|entry| entry.snapshot().owner() != &request.target)
+    {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "goal response returned data for a different stable target".to_string(),
+        ));
+    }
+
+    let current_version = response
+        .current
+        .as_ref()
+        .map_or(GoalVersion::INITIAL, |entry| entry.snapshot().version());
+    let history_distance = if current_version > request.after_version {
+        current_version.get() - request.after_version.get()
+    } else {
+        0
+    };
+    let expected_history_len = usize::try_from(history_distance)
+        .unwrap_or(MAX_REMOTE_GOAL_HISTORY_ENTRIES)
+        .min(MAX_REMOTE_GOAL_HISTORY_ENTRIES);
+    if response.history.len() != expected_history_len {
+        return Err(FederationClientError::ProvenanceMismatch(
+            "goal response returned an incomplete history page".to_string(),
+        ));
+    }
+
+    let mut previous_version = request.after_version;
+    let mut previous_entry: Option<&GoalHistoryEntry> = None;
+    for entry in &response.history {
+        let expected_version = previous_version.get().checked_add(1).ok_or_else(|| {
+            FederationClientError::ProvenanceMismatch(
+                "goal response history version overflowed".to_string(),
+            )
+        })?;
+        if entry.snapshot().version().get() != expected_version {
+            return Err(FederationClientError::ProvenanceMismatch(
+                "goal response history was not contiguous after the requested cursor".to_string(),
+            ));
+        }
+        if let Some(previous_entry) = previous_entry {
+            match entry.mutation().advance(Some(previous_entry.snapshot())) {
+                Ok(snapshot) if &snapshot == entry.snapshot() => {}
+                _ => {
+                    return Err(FederationClientError::ProvenanceMismatch(
+                        "goal response history contained an impossible transition".to_string(),
+                    ));
+                }
+            }
+        } else if request.after_version == GoalVersion::INITIAL {
+            match entry.mutation().advance(None) {
+                Ok(snapshot) if &snapshot == entry.snapshot() => {}
+                _ => {
+                    return Err(FederationClientError::ProvenanceMismatch(
+                        "goal response history did not begin with a valid Goal creation"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        previous_version = entry.snapshot().version();
+        previous_entry = Some(entry);
+    }
+
+    if let (Some(current), Some(last)) = (response.current.as_ref(), response.history.last()) {
+        if current.snapshot().version() == last.snapshot().version() && current != last {
+            return Err(FederationClientError::ProvenanceMismatch(
+                "goal response current Goal differed from its history entry".to_string(),
+            ));
+        }
+    }
+
+    validate_remote_goal_wait_status(response, request)
+}
+
+fn validate_remote_goal_wait_status(
+    response: &RemoteReadGoalResponse,
+    request: &RemoteReadGoalRequest,
+) -> Result<(), FederationClientError> {
+    match (&request.wait, response.wait_status) {
+        (None, RemoteGoalWaitStatus::Immediate) => Ok(()),
+        (None, _) | (Some(_), RemoteGoalWaitStatus::Immediate) => {
+            Err(FederationClientError::ProvenanceMismatch(
+                "goal response returned an invalid wait status".to_string(),
+            ))
+        }
+        (Some(wait), RemoteGoalWaitStatus::Satisfied) => {
+            let version = response
+                .current
+                .as_ref()
+                .map_or(GoalVersion::INITIAL, |entry| entry.snapshot().version());
+            if version < wait.minimum_version() {
+                return Err(FederationClientError::ProvenanceMismatch(
+                    "goal response claimed satisfaction below the minimum version".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        (Some(wait), RemoteGoalWaitStatus::TimedOut) => {
+            let version = response
+                .current
+                .as_ref()
+                .map_or(GoalVersion::INITIAL, |entry| entry.snapshot().version());
+            if version >= wait.minimum_version() {
+                return Err(FederationClientError::ProvenanceMismatch(
+                    "goal response claimed timeout at or above the minimum version".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn read_remote_goal(
+    db: &crate::db::Database,
+    selector: &str,
+    target: &ProductConversationId,
+    after_version: GoalVersion,
+    wait: Option<CoordinatorGoalWaitRequest>,
+) -> Result<RemoteReadGoalResponse, FederationClientError> {
+    let peer_id = resolve_saved_peer_id(db, selector).await?;
+    let peer = db
+        .federation_peer_connection(peer_id)
+        .await?
+        .ok_or(FederationClientError::PeerNotFound)?;
+    let caller = db.instance_id().await?;
+    let wait = wait
+        .map(RemoteGoalWaitRequest::from_coordinator_request)
+        .transpose()?;
+    let request = RemoteReadGoalRequest {
+        destination_instance_id: peer_id,
+        caller_instance_id: caller,
+        target: target.clone(),
+        after_version,
+        wait,
+    };
+    let response: RemoteReadGoalResponse = send_bounded_peer_request(
+        format!("{}api/federation/peer/read-goal", peer.base_url),
+        peer.bearer_credential.expose(),
+        &peer.tls_trust,
+        &request,
+    )
+    .await?;
+    validate_remote_goal_response(&response, peer_id, caller, &request)?;
     Ok(response)
 }
 
@@ -767,6 +1755,119 @@ async fn read_conversation_with_limits(
     }
 }
 
+pub async fn read_goal(
+    peer: PeerAuthenticated,
+    State(state): State<AppState>,
+    Json(request): Json<RemoteReadGoalRequest>,
+) -> Response {
+    Box::pin(read_goal_with_limits(
+        peer,
+        state,
+        request,
+        &READ_ADMISSION,
+        REMOTE_READ_DEADLINE,
+    ))
+    .await
+}
+
+async fn read_goal_with_limits(
+    peer: PeerAuthenticated,
+    state: AppState,
+    request: RemoteReadGoalRequest,
+    admission: &std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: std::time::Duration,
+) -> Response {
+    let destination = match state.db.instance_id().await {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, "failed to read destination instance identity");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if request.destination_instance_id != destination {
+        return federation_error(StatusCode::CONFLICT, "destination instance mismatch");
+    }
+    if request.caller_instance_id != peer.caller_instance_id {
+        return federation_error(StatusCode::UNAUTHORIZED, "caller instance mismatch");
+    }
+
+    let db = state.db.clone();
+    let target = request.target.clone();
+    let after_version = request.after_version;
+    let wait = request.wait;
+    let effective_wait = match wait.map(RemoteGoalWaitRequest::into_coordinator_request) {
+        Some(Ok(wait)) => wait,
+        Some(Err(error)) => {
+            return federation_error(StatusCode::BAD_REQUEST, &error.to_string());
+        }
+        None => {
+            CoordinatorGoalWaitRequest::new(GoalVersion::INITIAL, std::time::Duration::from_secs(1))
+                .expect("one second is a valid coordinator goal wait timeout")
+        }
+    };
+    let authority = peer.send_authority.clone();
+    let read = execute_bounded_remote_read(admission, deadline, async move {
+        db.wait_for_federated_goals(&authority, &target, after_version, effective_wait)
+            .await
+    })
+    .await;
+
+    match read {
+        Err(error) => remote_read_limit_response(error),
+        Ok(Ok(result)) => {
+            let wait_status = wait.map_or(RemoteGoalWaitStatus::Immediate, |_| {
+                RemoteGoalWaitStatus::from(result.status())
+            });
+            Json(RemoteReadGoalResponse {
+                source_instance_id: destination,
+                destination_instance_id: destination,
+                caller_instance_id: peer.caller_instance_id,
+                target: request.target,
+                exact_transcript_id: result.destination_transcript_id().clone(),
+                after_version: request.after_version,
+                wait,
+                current: result.current().cloned(),
+                history: result.history().to_vec(),
+                wait_status,
+            })
+            .into_response()
+        }
+        Ok(Err(error)) => goal_read_error_response(error),
+    }
+}
+
+fn goal_read_error_response(error: GoalDbError) -> Response {
+    match error {
+        GoalDbError::Invalid(message) => federation_error(StatusCode::BAD_REQUEST, message),
+        GoalDbError::Admission(phoenix_db::DbError::FederationSendAuthorityInactive) => {
+            federation_error(
+                StatusCode::FORBIDDEN,
+                "Federation send authority is inactive.",
+            )
+        }
+        GoalDbError::Admission(error) => {
+            super::product_conversations::db_to_app(error).into_response()
+        }
+        error @ (GoalDbError::RetryConflict
+        | GoalDbError::TargetChanged
+        | GoalDbError::Busy
+        | GoalDbError::BindingConflict) => {
+            federation_error(StatusCode::CONFLICT, &error.to_string())
+        }
+        error @ GoalDbError::Domain(_) => {
+            federation_error(StatusCode::BAD_REQUEST, &error.to_string())
+        }
+        error @ (GoalDbError::AutoContinueDisabled
+        | GoalDbError::Control(_)
+        | GoalDbError::DuplicateGoalId
+        | GoalDbError::Sqlx(_)
+        | GoalDbError::Integrity(_)) => {
+            tracing::error!(%error, "remote goal read failed");
+            federation_error(StatusCode::INTERNAL_SERVER_ERROR, "remote goal read failed")
+        }
+    }
+}
+
 fn bounded_read_error_response(error: super::global_read::BoundedReadError) -> Response {
     match error {
         super::global_read::BoundedReadError::ScanBudgetExhausted { limit } => federation_error(
@@ -985,6 +2086,9 @@ pub async fn revoke_enrollment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod goal_read;
+    mod send;
 
     fn resolution(
         kind: super::super::global_read::ResolvedReferenceKind,
@@ -1296,9 +2400,13 @@ mod tests {
     async fn resolve_reference_with_limits_enforces_admission_before_resolution() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let destination_instance_id = state.db.instance_id().await.unwrap();
-        let peer = || PeerAuthenticated {
-            caller_instance_id: InstanceId::new(),
+        let peer = || {
+            let caller = InstanceId::new();
+            PeerAuthenticated {
+            send_authority: phoenix_db::FederationSendAuthority::new(caller, phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(b"peer-test")),
+            caller_instance_id: caller,
             caller_display_name: "peer".to_string(),
+        }
         };
         let request = || RemoteResolveReferenceRequest {
             destination_instance_id,
@@ -2328,9 +3436,11 @@ mod tests {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let destination_instance_id = state.db.instance_id().await.unwrap();
         let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let caller = InstanceId::new();
         let response = query_database_with_admission(
             PeerAuthenticated {
-                caller_instance_id: InstanceId::new(),
+                send_authority: phoenix_db::FederationSendAuthority::new(caller, phoenix_core::domain::instance_identity::FederationCredentialVerifier::from_bearer(b"peer-test")),
+                caller_instance_id: caller,
                 caller_display_name: "peer".to_string(),
             },
             state,
