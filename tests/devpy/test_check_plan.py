@@ -428,7 +428,7 @@ class RustSplitTests(unittest.TestCase):
         self.dev = load_devpy()
 
     def test_partition_parse_accepts_only_in_range_k_of_n(self):
-        self.assertEqual("hash:2/4", self.dev.RustPartition.parse("2/4").nextest_arg())
+        self.assertEqual("count:2/4", self.dev.RustPartition.parse("2/4").nextest_arg())
         for raw in ("0/4", "5/4", "2", "a/b", "1/0", " 1/4", "-1/4"):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 self.dev.RustPartition.parse(raw)
@@ -471,7 +471,7 @@ class RustSplitTests(unittest.TestCase):
             test[test.index("-E") + 1],
         )
         self.assertEqual("3", test[test.index("--test-threads") + 1])
-        self.assertEqual("hash:2/4", test[test.index("--partition") + 1])
+        self.assertEqual("count:2/4", test[test.index("--partition") + 1])
         self.assertIn("--no-tests=warn", test)
 
     def test_unpartitioned_full_workspace_test_phase_requires_tests(self):

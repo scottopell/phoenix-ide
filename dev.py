@@ -5359,7 +5359,9 @@ class RustPartition:
         return cls(int(match.group(1)), int(match.group(2)))
 
     def nextest_arg(self) -> str:
-        return f"hash:{self.index}/{self.total}"
+        # count: deals each test binary's tests round-robin, spreading a
+        # binary's expensive tests across shards; hash: clustered them.
+        return f"count:{self.index}/{self.total}"
 
 
 @dataclasses.dataclass(frozen=True)
