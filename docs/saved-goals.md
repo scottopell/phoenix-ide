@@ -7,11 +7,17 @@ metadata, not the runtime's execution state.
 
 ## Authenticate and choose a conversation
 
-Sign in to Phoenix as its owner, then use the browser's DevTools Console on that
-same Phoenix origin. These examples reuse the HttpOnly owner-session cookie;
-never paste credentials into a conversation. Share-link access is not owner
-access. Commands below change saved metadata: choose the intended conversation
-and edit the objective before running them.
+Use the browser's DevTools Console on the same Phoenix origin, over **HTTPS or
+localhost**. The write examples use `crypto.randomUUID()`, which requires a secure
+context and is unavailable on non-localhost HTTP origins.
+
+When password authentication is enabled (`PHOENIX_PASSWORD` is set), sign in as
+the owner first; these examples reuse the HttpOnly owner-session cookie.
+Share-link access is not owner access. When no password is configured, Phoenix
+treats incoming requests as owner-authenticated without a sign-in; these routes
+do not independently protect a passwordless server. Never paste credentials into
+a conversation. Commands below change saved metadata: choose the intended
+conversation and edit the objective before running them.
 
 ```js
 const api = async (path, body) => {
@@ -23,7 +29,10 @@ const api = async (path, body) => {
       body: JSON.stringify(body)
     })
   });
-  const data = await response.json();
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); }
+  catch { data = text; }
   if (!response.ok) {
     console.error(response.status, data);
     throw new Error(`Request refused (${response.status}); inspect the response above`);
@@ -45,18 +54,43 @@ Do not substitute its transcript UUID, slug, URL, or an `@conv:` reference.
 ```js
 const owner = 'PASTE_PRODUCT_CONVERSATION_ID';
 const goal = `/api/product-conversations/${encodeURIComponent(owner)}/goal`;
+const readHistory = async () => {
+  const entries = [];
+  let after = 0;
+  while (true) {
+    const page = await api(`${goal}/history?after=${after}`);
+    entries.push(...page);
+    if (page.length < 100) return entries;
+    after = page[page.length - 1].snapshot.version;
+  }
+};
 const before = await api(goal);
 console.log(before);
-console.log(await api(`${goal}/history?after=0`));
+console.log(await readHistory());
 ```
 
 Current state is `null` when there is no Goal history; otherwise it is an entry
 containing `snapshot.version`, `snapshot.goal_id`, `snapshot.objective`, and
 `snapshot.state`. History is an ordered array of entries; `after=N` returns
-versions strictly greater than N. Versions belong to the conversation's Goal
-aggregate, not separate counters for individual Goals.
+versions strictly greater than N, with at most **100 entries per response**.
+`readHistory()` advances `after` to the last returned version until a page has
+fewer than 100 entries (an exact multiple requires a final empty page). Versions
+belong to the conversation's Goal aggregate, not separate counters for individual
+Goals. Paging does not freeze history; later mutations can appear in later pages.
 
 ## Create a Goal
+
+Before creating or replacing a Goal, explicitly enable **automatic continuation**
+for that target conversation. Admission checks the persisted preference in the
+Goal-write transaction; OFF returns HTTP409 `goal_requires_auto_continue` without
+changing the Goal or enabling the preference. These examples do not change that
+setting.
+
+Disabling automatic continuation later preserves the existing Goal and history.
+Reads, progress/status updates on an active Goal, explicit Complete/Suspend/
+Exhausted safety exits, and exact retries of accepted commands remain available
+while OFF. Re-enabling the preference does not reactivate an inactive Goal or
+wake, resume, or dispatch work.
 
 This example deliberately stops if a Goal already exists; choose another
 conversation rather than inadvertently replacing someone else's objective.
@@ -94,13 +128,16 @@ const change = {
 };
 console.log(await api(`${goal}/state`, change));
 console.log(await api(goal));
-console.log(await api(`${goal}/history?after=0`));
+console.log(await readHistory());
 ```
 
 Disposition JSON is `"Underway"`, `{"Blocked":"reason"}`,
 `{"Suspended":"reason"}`, `{"Complete":"reason"}`, or
-`{"Exhausted":"reason"}`. Non-Underway reasons must be nonempty. Complete and
-Exhausted are terminal; a state-change request cannot reopen them.
+`{"Exhausted":"reason"}`. Non-Underway reasons must be nonempty. **Suspended,
+Complete, and Exhausted are terminal**; a state-change request cannot reopen them,
+even by setting `Underway`. Reactivating that work requires an explicit new Goal
+identity, with automatic continuation ON; the previous identity and history are
+retained.
 
 ## Retries and refusals
 
@@ -119,8 +156,26 @@ Exhausted are terminal; a state-change request cannot reopen them.
   reusing a request UUID with a different body or addressing a closed conversation.
   Inspect the response; do not assume every conflict appended a durable receipt.
 - Malformed IDs, invalid text or unknown JSON fields are request errors rather
-  than accepted Goal changes. Without owner authentication, requests are refused;
-  sign in normally rather than bypassing authentication.
+  than accepted Goal changes. With password authentication enabled, requests
+  without owner authentication are refused; sign in normally rather than
+  bypassing authentication. Without a configured password, the server admits
+  requests as owner-authenticated, as described above.
+
+## Native Coordinator tools
+
+The current Coordinator can use `read_goal`, `prepare_goal`, and `apply_goal` for
+ordinary conversation targets. Unlike the HTTP paths above, these tools require
+a stable `@conv:<product-conversation-id>` target. Preparation freezes the observed
+Goal/version and returns a server-issued `action_reference`; review it, then pass
+only that reference to `apply_goal`. Do not generate references or versions.
+Exact apply retries return the retained accepted or refused receipt; conflicts
+require explicit reconsideration, not automatic reprepare-and-overwrite.
+
+These tools do not dispatch work, Start/Stop execution, set Suspended, or
+reopen a Suspended identity in place. Explicit replacement creates a new identity
+and retains the old history. Create/replacement still requires automatic
+continuation ON; read/history and retained accepted replay do not. Preparation
+alone neither changes the Goal nor enables automatic continuation.
 
 The supported routes and request fields are defined in
 [`goal_commands.rs`](../crates/phoenix-ide/src/api/goal_commands.rs); disposition
