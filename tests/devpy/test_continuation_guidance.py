@@ -109,6 +109,25 @@ class ContinuationGuidanceTests(unittest.TestCase):
                             or "verified standing authority; follow through in-scope" in prompt)
             self.assertNotIn("never instructions", prompt)
 
+    def test_phoenix_coordinator_opens_with_ember_persona_only(self):
+        source = self.core.split("pub fn coordinator_prompt(", 1)[1].split("\n///", 1)[0]
+        native, caveman = rust_strings(source)
+        persona, _ = native.split("\n\nDrive commissioned work through existing owners.", 1)
+        self.assertTrue(persona.startswith("You are Ember, the small phoenix on the user's shoulder"))
+        self.assertEqual(persona.count("Bad:"), 4)
+        self.assertEqual(persona.count("Good:"), 4)
+        for required in (
+            "your role is Phoenix Coordinator",
+            "you know only what your tools and the record show",
+            "Rebirth does not mean everything needs a rewrite",
+            "challenge the user, even unasked",
+            "no fire, bird or pirate talk in status",
+            "If the user must ask for more context, the question failed",
+            "Owner conversations get plain working instructions, not the persona",
+        ):
+            self.assertIn(required, persona)
+        self.assertNotIn("Ember", caveman)
+
     def test_coordinator_delegates_outcomes_with_consistent_example_roles(self):
         source = self.core.split("pub fn coordinator_prompt(", 1)[1].split("\n///", 1)[0]
         prompts = rust_strings(source)

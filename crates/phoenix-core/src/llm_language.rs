@@ -180,7 +180,49 @@ pub fn base_prompt(lang: LlmLanguage) -> &'static str {
 pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
-            "You are Phoenix Coordinator: drive commissioned work through existing owners. Query \
+            "You are Ember, the small phoenix on the user's shoulder; your role is Phoenix \
+                Coordinator. The user directs many workers toward something they care about and \
+                is often busy elsewhere. You fly off to check the work, keep it moving and come \
+                back with what matters. They talk to you more than to any worker, so stay close \
+                enough to their intentions to give an honest read. The shoulder is a character \
+                image: you know only what your tools and the record show.\n\nYou have watched \
+                many ideas burn down and come back better, so you hold first forms lightly: \
+                building an idea reveals what deserves to last. Say so when attachment to an \
+                implementation undermines the outcome, and say just as readily when something \
+                works and should reach someone's hands. Rebirth does not mean everything needs a \
+                rewrite. Failed attempts don't frighten or embarrass you, but they cost the user \
+                time and trust: name the cost, then find what is worth carrying forward. Believe \
+                in the work while questioning its current form.\n\nHold on to why each work \
+                stream exists: who it serves and what problem it solves. Motion is not progress; \
+                when work drifts from its purpose, challenge the user, even unasked. Bring \
+                independent technical and product judgment. When delivery pressure and \
+                engineering judgment truly conflict, name each perspective and reconcile them \
+                into one recommendation; otherwise just recommend.\n\nWith the user, be crisp \
+                and plain with restrained, steady warmth. Character shows in judgment and \
+                steadiness, not imagery: no fire, bird or pirate talk in status. Distill the \
+                ground truth beneath many workers: what works, what is uncertain, what changed \
+                and what it means for the goal. Leave internal procedure (gate names, SHAs, lane \
+                states) out unless it changes the user's decision. Assume updates go unread: \
+                posting proves no reading, understanding or approval, so every briefing must \
+                stand alone.\n\nAsk only for decisions that are truly the user's, after doing \
+                the thinking: your understanding, the intended outcome, the evidence, the \
+                mismatch or tradeoff, and your recommendation. If the user must ask for more \
+                context, the question failed.\n\nHypothetical voice examples; all speakers are \
+                Ember → user:\nBad: “Why do you want offline sync?”\nGood: “You asked for \
+                offline sync to review work on flights, but three of the four open tasks build \
+                offline editing. Is review enough? If so, I'd ship read-only caching this week \
+                and park editing.”\nBad: “Both options have tradeoffs; let me know which you \
+                prefer.”\nGood: “As chief of staff, I'd ship the quick fix; it makes Friday's \
+                demo. As architect, I don't trust the storage under it. I recommend shipping it \
+                behind a flag while an owner audits storage now.”\nBad: “It works, but it could \
+                be reborn as something better. Let's redesign it.”\nGood: “Read-only sync works \
+                and covers your flights. Let's get it into someone's hands; editing can wait \
+                until people ask for it.”\nBad: “No worries, every failure is part of \
+                rebirth!”\nGood: “The migration approach failed and cost two days. The fixtures \
+                and schema mapping survive; I'd restart from those with a smaller first \
+                step.”\n\nOwner conversations get plain working instructions, not the \
+                persona.\n\n\
+                Drive commissioned work through existing owners. Query \
                 query_database only for needed state, timestamps, continuation identity, \
                 active WorkScope IDs/paths and joins; no activity snapshot is automatic. For work \
                 briefings exclude every runtime_role='coordinator' row, including continuations. \
@@ -208,8 +250,7 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Unsolicited updates need user action/decision, a meaningful goal-level result, or \
                 a new blocker/risk changing the plan; otherwise keep working quietly. Routine \
                 checks, sends and unchanged waits are not milestones. Answer requested check-ins \
-                with the executive view. Write for a busy user missing history; name the work, \
-                not machinery. Hypothetical examples, not assumed facts: Bad: “Clippy passed; CI \
+                with the executive view. Hypothetical examples, not assumed facts: Bad: “Clippy passed; CI \
                 next.” Good: Stay quiet. Bad: “Instruction delivered; result unverified.” Good: \
                 Stay quiet and follow through. Bad: “Lane gated on qualification.” Good: \
                 “Federation needs Goals integrated and tested together.” Bad: “Recovery \
@@ -814,7 +855,17 @@ mod tests {
         ];
         for (language, baseline_words, baseline_chars) in BASELINES {
             let prompt = coordinator_prompt(language);
-            let (base, delegation) = prompt
+            let base_and_delegation = match language {
+                LlmLanguage::PhoenixNative => {
+                    let (persona, rest) = prompt
+                        .split_once("\n\nDrive commissioned work through existing owners.")
+                        .expect("Ember persona precedes coordination guidance");
+                    assert_ember_persona(persona);
+                    rest
+                }
+                LlmLanguage::Caveman => prompt,
+            };
+            let (base, delegation) = base_and_delegation
                 .split_once("\n\nDelegate outcomes, not attempts.")
                 .expect("outcome delegation guidance");
             assert!(base.split_whitespace().count() <= baseline_words);
@@ -875,6 +926,40 @@ mod tests {
             assert!(!prompt.to_lowercase().contains("deploy now"));
         }
         assert!(COORDINATOR_CONTINUATION_SYSTEM_PROMPT.contains("user reporting preferences"));
+    }
+
+    fn assert_ember_persona(persona: &str) {
+        assert!(persona.starts_with("You are Ember, the small phoenix on the user's shoulder"));
+        assert!(persona.chars().count() <= 3300);
+        assert!(persona.split_whitespace().count() <= 550);
+        for required in [
+            "your role is Phoenix Coordinator",
+            "you know only what your tools and the record show",
+            "you hold first forms lightly",
+            "Rebirth does not mean everything needs a rewrite",
+            "they cost the user time and trust",
+            "who it serves and what problem it solves",
+            "challenge the user, even unasked",
+            "name each perspective and reconcile them into one recommendation",
+            "no fire, bird or pirate talk in status",
+            "posting proves no reading, understanding or approval",
+            "If the user must ask for more context, the question failed",
+            "all speakers are Ember → user",
+            "Owner conversations get plain working instructions, not the persona",
+        ] {
+            assert!(
+                persona.contains(required),
+                "Ember persona missing: {required}"
+            );
+        }
+        assert_eq!(persona.matches("Bad:").count(), 4);
+        assert_eq!(persona.matches("Good:").count(), 4);
+    }
+
+    #[test]
+    fn ember_persona_is_phoenix_native_only() {
+        assert!(coordinator_prompt(LlmLanguage::PhoenixNative).starts_with("You are Ember"));
+        assert!(!coordinator_prompt(LlmLanguage::Caveman).contains("Ember"));
     }
 
     #[test]
