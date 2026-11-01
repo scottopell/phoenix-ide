@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: bash-launch-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fault-tests:
     if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
@@ -30,12 +34,12 @@ jobs:
     # Cold macOS builds compile/link the native binary and large IDE test harness.
     timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 30 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - name: Generate wire contracts
         run: ./dev.py codegen
       - name: Build native launcher executable
@@ -60,7 +64,7 @@ jobs:
             coordinator_bash_executes_owned_home_with_zero_ordinary_conversations \
             real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay \
             conversation_runtime_dispatches_real_zero_and_normal_bash_waits
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: bash-wire-${{ matrix.os }}
