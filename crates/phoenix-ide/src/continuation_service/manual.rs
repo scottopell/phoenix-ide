@@ -1,6 +1,7 @@
 use crate::api::handlers::{map_admission_db_error, map_ordinary_mutation_admission, AppError};
 use crate::api::{ConflictErrorResponse, ContinueConversationResponse, ContinueConversationStatus};
 use crate::continuation_service::ContinuationApplicationService;
+use crate::db::{ContinueOutcome, DbError};
 use crate::send_chat_service::{SendChatApplicationService, SendChatOutcome, SendChatRequest};
 use crate::state_machine::ConvState;
 
@@ -111,7 +112,6 @@ pub(super) async fn continue_manual(
     req: crate::api::ContinueConversationRequest,
 ) -> Result<ContinueConversationResponse, AppError> {
     let id = parent_id;
-    use crate::db::{ContinueOutcome, DbError};
 
     let parent = service
         .runtime
@@ -340,7 +340,36 @@ pub(super) async fn continue_manual(
                     "continuation_not_allowed",
                 )))
             }
-            other => AppError::Internal(other.to_string()),
+            other @ (DbError::CoordinatorWorkScope(_)
+            | DbError::Sqlx(_)
+            | DbError::ConversationTitleInvalid
+            | DbError::CurrentCoordinatorRequired
+            | DbError::ProductCreationIntentInvalid(_)
+            | DbError::ConversationAlreadyExists(_)
+            | DbError::MessageNotFound(_)
+            | DbError::MessageConflict(_)
+            | DbError::SlugExists(_)
+            | DbError::TranscriptSnapshotChanged
+            | DbError::Serialization(_)
+            | DbError::CloseFoundationConflict(_)
+            | DbError::SteeringQueueFull
+            | DbError::ProductCreationClaimLost
+            | DbError::CloseFoundationPrecondition(_)
+            | DbError::CloseFoundationStaleLatest { .. }
+            | DbError::CloseFoundationRepairRequired(_)
+            | DbError::CloseFoundationNotFound(_)
+            | DbError::SubAgentLifecycleConflict(_)
+            | DbError::DirectTurnConflict(_)
+            | DbError::ForkProposalConflict(_)
+            | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+            | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+            | DbError::DormantGitRepositoryCatchupStaleOperation
+            | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+            | DbError::DormantGitRepositoryReadinessCatchupInProgress
+            | DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+            | DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
+                AppError::Internal(other.to_string())
+            }
         })?;
 
     if let Some(retry_phase) = automatic_retry_phase {

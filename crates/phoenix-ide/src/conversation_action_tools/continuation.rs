@@ -29,6 +29,10 @@ impl<'de> Deserialize<'de> for NonBlankString {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "identity field names are the exact deserialized tool-input contract"
+)]
 struct ContinueRequest {
     product_conversation_id: ProductConversationId,
     predecessor_transcript_id: NonBlankString,
@@ -92,11 +96,11 @@ impl Tool for ContinueConversation {
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         if self.0.local_authority_is_closed() {
-            std::future::pending().await
+            std::future::pending::<()>().await;
         }
         let result = self.run_inner(input, ctx).await;
         if self.0.local_authority_is_closed() {
-            std::future::pending().await
+            std::future::pending::<()>().await;
         }
         super::output(result)
     }

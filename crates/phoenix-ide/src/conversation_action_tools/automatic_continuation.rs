@@ -151,11 +151,11 @@ impl Tool for AutomaticContinuationTool {
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         if self.runtime.local_authority_is_closed() {
-            std::future::pending().await
+            std::future::pending::<()>().await;
         }
         let result = self.run_inner(input, ctx).await;
         if self.runtime.local_authority_is_closed() {
-            std::future::pending().await
+            std::future::pending::<()>().await;
         }
         super::output(result)
     }

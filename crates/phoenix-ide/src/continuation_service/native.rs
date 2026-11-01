@@ -11,6 +11,10 @@ use phoenix_db::{
 };
 use phoenix_workflow::ClientTurnKey;
 
+#[allow(
+    clippy::struct_field_names,
+    reason = "identity suffixes distinguish the native continuation request fields"
+)]
 pub(crate) struct NativeContinueRequest {
     pub source_transcript_id: String,
     pub product_conversation_id: ProductConversationId,
@@ -82,6 +86,10 @@ impl ContinuationApplicationService {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "preserve the sequential native continuation admission and dispatch transaction"
+    )]
     async fn continue_from_coordinator_owned(
         &self,
         request: NativeContinueRequest,

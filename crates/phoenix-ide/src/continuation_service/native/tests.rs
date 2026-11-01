@@ -337,8 +337,7 @@ async fn pending_replay_requires_current_successor_capacity_and_retains_winning_
     .await
     .expect("pending capacity review completes without a recursive mutation lock")
     .established()
-    .err()
-    .expect("empty registry has no provider for capacity review");
+    .expect_err("empty registry has no provider for capacity review");
     assert!(
         error.contains("unavailable through its selected connection"),
         "{error}"
@@ -397,12 +396,16 @@ impl phoenix_llm::LlmService for OpeningProvider {
         })
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "claude-sonnet-5"
     }
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "preserve the full sequential concurrent-opening integration test and settlement assertions"
+)]
 async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settlement() {
     use crate::runtime::SseEvent;
     use phoenix_db::ContinuationOpeningRead;
@@ -438,7 +441,7 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
             })
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "claude-sonnet-5"
         }
     }
@@ -667,7 +670,23 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
                     ..
                 }
                 | SseEvent::Error { .. } => panic!("fresh turn failed instead of settling"),
-                _ => {}
+                SseEvent::Init { .. }
+                | SseEvent::Message { .. }
+                | SseEvent::MessageUpdated { .. }
+                | SseEvent::StateChange { .. }
+                | SseEvent::Token { .. }
+                | SseEvent::LlmFirstByte { .. }
+                | SseEvent::LlmAttempt { .. }
+                | SseEvent::AgentDone { .. }
+                | SseEvent::ConversationBecameTerminal { .. }
+                | SseEvent::ConversationUpdate { .. }
+                | SseEvent::ConversationHardDeleted { .. }
+                | SseEvent::BrowserSessionState { .. }
+                | SseEvent::BashToolProgress { .. }
+                | SseEvent::SteerMessageQueued { .. }
+                | SseEvent::SteerMessageCancelled { .. }
+                | SseEvent::RateLimitSnapshot { .. }
+                | SseEvent::WorkScopeUpdate { .. } => {}
             }
         }
     })

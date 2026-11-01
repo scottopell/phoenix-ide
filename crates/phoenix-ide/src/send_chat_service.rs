@@ -1532,8 +1532,7 @@ mod tests {
             assert!(!runtime.fatal_local_authority_is_latched());
             assert!(runtime.acquire_local_authority_pass().is_ok());
             match classified.unwrap() {
-                Ok(42) => {}
-                Err("known") => {}
+                Ok(42) | Err("known") => {}
                 other => panic!("unexpected classified result: {other:?}"),
             }
         }

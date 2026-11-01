@@ -197,6 +197,10 @@ async fn preclosed_setting_adapter_produces_no_ordinary_tool_output() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "preserve the sequential source-registry integration test and all source assertions"
+)]
 async fn registry_excludes_ordinary_subagent_and_rotated_coordinator_sources() {
     let (runtime, db, source) = native_runtime().await;
     let ordinary = db
@@ -265,7 +269,10 @@ async fn registry_excludes_ordinary_subagent_and_rotated_coordinator_sources() {
     .unwrap();
     let successor = match db.continue_conversation(&source).await.unwrap() {
         phoenix_db::ContinueOutcome::Created(successor) => successor,
-        other => panic!("expected Coordinator rotation, got {other:?}"),
+        other @ (phoenix_db::ContinueOutcome::AlreadyContinued(_)
+        | phoenix_db::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+            panic!("expected Coordinator rotation, got {other:?}")
+        }
     };
     assert!(
         crate::conversation_action_tools::tools(runtime.clone(), &source)
