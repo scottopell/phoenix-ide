@@ -2514,66 +2514,132 @@ mod tests {
         run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
     }
 
-    #[test]
-    fn repository_fixtures_ignore_inherited_git_environment() {
-        const CHILD: &str = "PHOENIX_API_GIT_FIXTURE_CHILD";
-        if let Some(path) = std::env::var_os(CHILD) {
-            let environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
-            let command = phoenix_core::git::test_command(&[]);
-            assert_eq!(environment, std::env::vars_os().collect());
-            for name in environment
-                .keys()
-                .filter(|name| name.as_encoded_bytes().starts_with(b"GIT_CONFIG_"))
-            {
-                assert!(
-                    command
-                        .get_envs()
-                        .any(|(key, value)| key == name && value.is_none()),
-                    "inherited configuration selector survived: {name:?}"
-                );
-            }
-            let repo = std::path::PathBuf::from(path);
-            init_repo(&repo);
-            commit_file(&repo, "fixture.txt", "fixture\n", "fixture");
-            assert_eq!(
-                std::fs::canonicalize(run_git(&repo, &["rev-parse", "--show-toplevel"]).unwrap())
-                    .unwrap(),
-                std::fs::canonicalize(&repo).unwrap()
-            );
-            assert_eq!(
-                run_git(&repo, &["rev-list", "--count", "HEAD"]).unwrap(),
-                "2"
-            );
-            let clone = tempfile::tempdir().unwrap();
-            clone_repo(&repo, clone.path());
-            assert_eq!(
-                run_git(clone.path(), &["show", "HEAD:fixture.txt"]).unwrap(),
-                "fixture"
-            );
-            return;
-        }
+    const FIXTURE_CHILD_ENV: &str = "PHOENIX_API_GIT_FIXTURE_CHILD";
 
-        fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-            fn visit(
-                root: &Path,
-                dir: &Path,
-                files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
-            ) {
-                for entry in std::fs::read_dir(dir).unwrap() {
-                    let path = entry.unwrap().path();
-                    if path.is_dir() {
-                        visit(root, &path, files);
-                    } else {
-                        files.insert(
-                            path.strip_prefix(root).unwrap().to_owned(),
-                            std::fs::read(&path).unwrap(),
-                        );
-                    }
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            dir: &Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    );
                 }
             }
-            let mut files = std::collections::BTreeMap::new();
-            visit(root, root, &mut files);
-            files
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    fn exercise_isolated_fixture(path: std::ffi::OsString) {
+        let environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+        let command = phoenix_core::git::test_command(&[]);
+        assert_eq!(environment, std::env::vars_os().collect());
+        for name in environment
+            .keys()
+            .filter(|name| name.as_encoded_bytes().starts_with(b"GIT_CONFIG_"))
+        {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == name && value.is_none()),
+                "inherited configuration selector survived: {name:?}"
+            );
+        }
+        let repo = std::path::PathBuf::from(path);
+        init_repo(&repo);
+        commit_file(&repo, "fixture.txt", "fixture\n", "fixture");
+        assert_eq!(
+            std::fs::canonicalize(run_git(&repo, &["rev-parse", "--show-toplevel"]).unwrap())
+                .unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+        assert_eq!(
+            run_git(&repo, &["rev-list", "--count", "HEAD"]).unwrap(),
+            "2"
+        );
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(&repo, clone.path());
+        assert_eq!(
+            run_git(clone.path(), &["show", "HEAD:fixture.txt"]).unwrap(),
+            "fixture"
+        );
+    }
+
+    fn poisoned_fixture_child(
+        case: &str,
+        fixture: &Path,
+        git_dir: &Path,
+        linked: &Path,
+        common: &Path,
+    ) -> std::process::Command {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            "api::git_handlers::tests::repository_fixtures_ignore_inherited_git_environment",
+            "--nocapture",
+        ]);
+        child.env(FIXTURE_CHILD_ENV, fixture);
+        match case {
+            "routing" => {
+                child
+                    .env("GIT_DIR", git_dir)
+                    .env("GIT_WORK_TREE", linked)
+                    .env("GIT_COMMON_DIR", common)
+                    .env("GIT_INDEX_FILE", git_dir.join("index"))
+                    .env("GIT_OBJECT_DIRECTORY", common.join("objects"));
+            }
+            "indexed-config" | "malformed-config" => {
+                child
+                    .env(
+                        "GIT_CONFIG_COUNT",
+                        if case == "indexed-config" {
+                            "1"
+                        } else {
+                            "invalid"
+                        },
+                    )
+                    .env("GIT_CONFIG_KEY_0", "core.worktree")
+                    .env("GIT_CONFIG_VALUE_0", linked)
+                    .env("GIT_CONFIG_KEY_999", "core.worktree")
+                    .env("GIT_CONFIG_VALUE_999", linked)
+                    .env(
+                        "GIT_CONFIG_PARAMETERS",
+                        format!("'core.worktree={}'", linked.display()),
+                    );
+            }
+            "config-files" => {
+                child
+                    .env("GIT_CONFIG", common.join("config"))
+                    .env("GIT_CONFIG_GLOBAL", common.join("config"))
+                    .env("GIT_CONFIG_SYSTEM", common.join("config"));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStringExt;
+                    child.env(
+                        std::ffi::OsString::from_vec(b"GIT_CONFIG_\xff".to_vec()),
+                        "poison",
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
+        child
+    }
+
+    #[test]
+    fn repository_fixtures_ignore_inherited_git_environment() {
+        if let Some(path) = std::env::var_os(FIXTURE_CHILD_ENV) {
+            exercise_isolated_fixture(path);
+            return;
         }
 
         let temp = tempfile::tempdir().unwrap();
@@ -2609,57 +2675,7 @@ mod tests {
         ] {
             let fixture = temp.path().join(case);
             std::fs::create_dir(&fixture).unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-            child.args([
-                "--exact",
-                "api::git_handlers::tests::repository_fixtures_ignore_inherited_git_environment",
-                "--nocapture",
-            ]);
-            child.env(CHILD, &fixture);
-            match case {
-                "routing" => {
-                    child
-                        .env("GIT_DIR", &git_dir)
-                        .env("GIT_WORK_TREE", &linked)
-                        .env("GIT_COMMON_DIR", &common)
-                        .env("GIT_INDEX_FILE", git_dir.join("index"))
-                        .env("GIT_OBJECT_DIRECTORY", common.join("objects"));
-                }
-                "indexed-config" | "malformed-config" => {
-                    child
-                        .env(
-                            "GIT_CONFIG_COUNT",
-                            if case == "indexed-config" {
-                                "1"
-                            } else {
-                                "invalid"
-                            },
-                        )
-                        .env("GIT_CONFIG_KEY_0", "core.worktree")
-                        .env("GIT_CONFIG_VALUE_0", &linked)
-                        .env("GIT_CONFIG_KEY_999", "core.worktree")
-                        .env("GIT_CONFIG_VALUE_999", &linked)
-                        .env(
-                            "GIT_CONFIG_PARAMETERS",
-                            format!("'core.worktree={}'", linked.display()),
-                        );
-                }
-                "config-files" => {
-                    child
-                        .env("GIT_CONFIG", common.join("config"))
-                        .env("GIT_CONFIG_GLOBAL", common.join("config"))
-                        .env("GIT_CONFIG_SYSTEM", common.join("config"));
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::ffi::OsStringExt;
-                        child.env(
-                            std::ffi::OsString::from_vec(b"GIT_CONFIG_\xff".to_vec()),
-                            "poison",
-                        );
-                    }
-                }
-                _ => unreachable!(),
-            }
+            let child = poisoned_fixture_child(case, &fixture, &git_dir, &linked, &common);
             let output = crate::git_ops::run_git_test_command(
                 child,
                 &[case],
