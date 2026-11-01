@@ -145,7 +145,10 @@ impl ProductCreationOrigin {
             | InputOrigin::InternalConversation { .. }
             | InputOrigin::SystemGenerated
             | InputOrigin::SlackGateway { .. }
-            | InputOrigin::SubscriptionEvent { .. } => Err(sqlx::Error::Decode(
+            | InputOrigin::SubscriptionEvent { .. }
+            | InputOrigin::RemoteApi { .. }
+            | InputOrigin::RemoteConversation { .. }
+            | InputOrigin::RemoteCoordinator { .. } => Err(sqlx::Error::Decode(
                 "internal creation origin requires a source-call locator".into(),
             )),
         }

@@ -330,6 +330,32 @@ describe('user message provenance rendering', () => {
     expect(screen.queryByText('You')).not.toBeInTheDocument();
   });
 
+  it('presents remote inputs as peer activity without local source links', () => {
+    render(<MemoryRouter><>
+      <UserMessage message={userMessage('remote-api', 'API input', {
+        origin: { kind: 'remote_api', instance_id: 'peer-1' },
+      })} />
+      <UserMessage message={userMessage('remote-conversation', 'Conversation input', {
+        origin: {
+          kind: 'remote_conversation', instance_id: 'peer-1', product_conversation_id: 'source-product',
+          transcript_id: 'source-row', source_call: { message_id: 'source-message', tool_use_id: 'source-call' },
+        },
+      })} />
+      <UserMessage message={userMessage('remote-coordinator', 'Coordinator input', {
+        origin: {
+          kind: 'remote_coordinator', instance_id: 'peer-2', product_conversation_id: 'coordinator-product',
+          transcript_id: 'coordinator-row', source_call: null,
+        },
+      })} />
+    </></MemoryRouter>);
+
+    expect(screen.getByText('Remote API').closest('.message')).toHaveClass('meta');
+    expect(screen.getByText('From remote conversation').closest('.message')).toHaveClass('meta');
+    expect(screen.getByText('From remote Coordinator').closest('.message')).toHaveClass('meta');
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+  });
+
   it('renders system-generated input as meta without claiming human authorship', () => {
     const { container } = render(<MemoryRouter><UserMessage message={userMessage('automatic', 'System prompt', {
       origin: { kind: 'system_generated' },

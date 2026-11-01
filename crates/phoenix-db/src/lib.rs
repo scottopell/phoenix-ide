@@ -14,12 +14,14 @@ mod coordinator_query;
 mod coordinator_watches;
 mod coordinator_work_scope;
 mod federation_enrollment;
+pub use federation_enrollment::FederationSendAuthority;
 mod federation_peers;
 pub use coordinator_watches::{
     append_mandatory_close_failure_event_tx, CloseFailureStop, MandatoryCloseFailureSubject,
     PendingWatchEvent, WatchEventPresentation, WatchEventProvenance, WatchEventRoute, WatchOutcome,
     WatchSnapshot,
 };
+pub use federation_peers::FederationPeerConnection;
 mod ddl;
 mod request_capacity;
 pub use request_capacity::CapacityDiagnosticRow;
@@ -380,6 +382,12 @@ pub enum DbError {
     ProductConversationUnavailable(
         phoenix_core::domain::product_conversation::ProductConversationId,
     ),
+    #[error("federation send authority is no longer active")]
+    FederationSendAuthorityInactive,
+    #[error("federation send identity is already owned by another conversation")]
+    FederationSendIdentityConflict,
+    #[error("federation steering send exactly replays a prior admission")]
+    FederationSteeringDuplicate,
     #[error("steering queue is full")]
     SteeringQueueFull,
     #[error("product creation delivery claim was lost or is required")]
@@ -1706,6 +1714,8 @@ impl SteeringCapacityTestControl {
 pub struct Database {
     pool: SqlitePool,
     slack_gateway_wakeup: std::sync::Arc<tokio::sync::Notify>,
+    goal_version_committed:
+        tokio::sync::broadcast::Sender<conversation_goals::GoalVersionCommittedNotification>,
     goal_control_installation: conversation_goals::control::GoalControlInstallation,
     goal_execution_installation: conversation_goals::execution::GoalExecutionInstallation,
     goal_control_runtime: std::sync::Arc<conversation_goals::control::dispatch::GoalControlRuntime>,
@@ -1734,6 +1744,7 @@ impl Clone for Database {
         Self {
             pool: self.pool.clone(),
             slack_gateway_wakeup: self.slack_gateway_wakeup.clone(),
+            goal_version_committed: self.goal_version_committed.clone(),
             goal_control_installation: self.goal_control_installation,
             goal_execution_installation: self.goal_execution_installation,
             goal_control_runtime: self.goal_control_runtime.clone(),
@@ -1858,12 +1869,12 @@ fn parent_creation_values(
 }
 
 const PROMPT_TAIL_EMPTY_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
      FROM messages
      WHERE conversation_id = ?1
      ORDER BY sequence_id ASC";
 const PROMPT_TAIL_AFTER_SQL: &str =
-    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
      FROM messages
      WHERE conversation_id = ?1 AND sequence_id > ?2
      ORDER BY sequence_id ASC";
@@ -1969,6 +1980,7 @@ impl Database {
         Self {
             pool,
             slack_gateway_wakeup: std::sync::Arc::new(tokio::sync::Notify::new()),
+            goal_version_committed: tokio::sync::broadcast::channel(128).0,
             sqlite_workload_collector,
             path,
             goal_control_installation:
@@ -7819,6 +7831,40 @@ impl Database {
         entry: &phoenix_core::domain::sm_event::SteerEntry,
         request_fingerprint: &str,
     ) -> DbResult<usize> {
+        self.append_steering_entry_with_federation_authority(id, entry, request_fingerprint, None)
+            .await
+    }
+
+    /// Append one peer-authenticated steering entry atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the peer authority is inactive, the admitted
+    /// message identity conflicts with another journal or conversation, the
+    /// request is a durable replay, or the transaction cannot be committed.
+    pub async fn append_federated_steering_entry(
+        &self,
+        id: &str,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
+        authority: &FederationSendAuthority,
+    ) -> DbResult<usize> {
+        self.append_steering_entry_with_federation_authority(
+            id,
+            entry,
+            request_fingerprint,
+            Some(authority),
+        )
+        .await
+    }
+
+    async fn append_steering_entry_with_federation_authority(
+        &self,
+        id: &str,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
+        authority: Option<&FederationSendAuthority>,
+    ) -> DbResult<usize> {
         #[cfg(test)]
         if let Some(latch) = &self.steering_begin_test_latch {
             latch.before_begin.notify_waiters();
@@ -7826,6 +7872,32 @@ impl Database {
             latch.begin_called.notify_waiters();
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(authority) = authority {
+            federation_enrollment::require_federation_send_identity_owner_tx(
+                &mut tx,
+                &entry.message_id,
+                id,
+                federation_enrollment::FederationSendIdentityJournal::SteeringReceipt,
+            )
+            .await?;
+            let existing_fingerprint: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT request_fingerprint
+                 FROM steering_acceptance_receipts
+                 WHERE conversation_id = ?1 AND message_id = ?2",
+            )
+            .bind(id)
+            .bind(&entry.message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(existing_fingerprint) = existing_fingerprint {
+                return if existing_fingerprint.as_deref() == Some(request_fingerprint) {
+                    Err(DbError::FederationSteeringDuplicate)
+                } else {
+                    Err(DbError::FederationSendIdentityConflict)
+                };
+            }
+            federation_enrollment::require_federation_send_authority_tx(&mut tx, authority).await?;
+        }
         let requires_claim: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM product_creation_jobs creation
              JOIN conversations c ON c.product_conversation_id = creation.product_conversation_id
@@ -8474,6 +8546,22 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Find a remote send's admitted message in the existing turn/steering journals.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub async fn remote_send_message_owner(
+        &self,
+        admitted_message_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT owner FROM (
+                SELECT conversation_id AS owner FROM durable_turns WHERE client_turn_key = ?1
+                UNION SELECT conversation_id AS owner FROM steering_acceptance_receipts WHERE message_id = ?1
+             ) LIMIT 1"
+        ).bind(admitted_message_id).fetch_optional(&self.pool).await.map_err(Into::into)
+    }
+
     /// Report whether a conversation has any durable pending steering work.
     ///
     /// # Errors
@@ -8511,7 +8599,7 @@ impl Database {
 
         let rows = sqlx::query(
             "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir,
-                    origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal ASC",
         )
         .bind(id)
@@ -8568,6 +8656,7 @@ impl Database {
                     row.try_get("origin_product_conversation_id")?,
                     row.try_get("origin_transcript_id")?,
                     row.try_get("origin_subscription_event_id")?,
+                    row.try_get("origin_source_instance_id")?,
                     row.try_get("origin_slack_request_id")?,
                 )
                 .and_then(|origin| {
@@ -10451,7 +10540,11 @@ impl Database {
                 ));
             }
         }
-        let (results, replayed) = round::write_round_tx(
+        let round::RoundWriteOutcome {
+            results,
+            replayed,
+            committed_goals,
+        } = round::write_round_tx(
             &mut tx,
             conversation_id,
             assistant,
@@ -10488,6 +10581,7 @@ impl Database {
             ));
         }
         tx.commit().await?;
+        self.notify_goal_versions_committed(&committed_goals);
         if cut == TerminalEvidenceTransactionCut::AfterCommit {
             return Err(DbError::Serialization(
                 "injected after-commit cut".to_string(),
@@ -10577,7 +10671,7 @@ impl Database {
                     return Err(DbError::MessageNotFound(message_id.clone()));
                 }
                 let updated_message = sqlx::query(
-                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
                      FROM messages WHERE message_id = ?1",
                 )
                 .bind(message_id)
@@ -12695,7 +12789,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         if let Some(tool_id) = spawn_tool_id {
             let messages = sqlx::query(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
                  FROM messages WHERE conversation_id = ?1 AND message_type = 'tool'",
             )
             .bind(conversation_id)
@@ -12733,7 +12827,7 @@ impl Database {
             }
             let updated_message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type,
-                        content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                        content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -13410,7 +13504,7 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(mut existing) = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -13626,8 +13720,8 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )
         .bind(message_id)
         .bind(conversation_id)
@@ -13641,6 +13735,7 @@ impl Database {
         .bind(origin.db_parts().1)
         .bind(origin.db_parts().2)
         .bind(origin.db_parts().3)
+        .bind(origin.db_parts().4)
     .bind(origin.source_call().map(|call| call.message_id.as_str()))
     .bind(origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(origin.slack_request_id())
@@ -13778,7 +13873,7 @@ impl Database {
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::FullHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -13814,7 +13909,7 @@ impl Database {
             .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
             .and_then(PromptTranscriptGeneration::from_persisted)?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -13889,7 +13984,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
                  FROM messages
                  WHERE conversation_id = ?1
                    AND sequence_id >= (
@@ -13926,7 +14021,7 @@ impl Database {
     pub async fn get_recovery_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE conversation_id = ?1
                AND (
@@ -14012,7 +14107,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
@@ -14042,7 +14137,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE conversation_id = ?1
              ORDER BY sequence_id DESC
@@ -14118,7 +14213,7 @@ impl Database {
         limit: i64,
     ) -> DbResult<Vec<Message>> {
         let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -14149,7 +14244,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -14187,8 +14282,9 @@ impl Database {
             sqlx::query(
                 "SELECT m.message_id, m.sequence_id, m.message_type, \
                         substr(CAST(m.content AS BLOB), 1, ?4) AS content_prefix, \
-                        m.created_at, m.origin_kind, m.origin_product_conversation_id, \
-                        m.origin_transcript_id, m.origin_subscription_event_id, \
+                        m.created_at, m.origin_kind, m.origin_source_instance_id, \
+                        m.origin_product_conversation_id, m.origin_transcript_id, \
+                        m.origin_subscription_event_id, \
                         m.origin_source_message_id, m.origin_source_tool_use_id, \
                         m.origin_slack_request_id, \
                         CASE WHEN json_valid(m.display_data) \
@@ -14225,7 +14321,7 @@ impl Database {
     ) -> DbResult<Vec<Message>> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut rows = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id >= ?2 AND sequence_id <= ?3
              ORDER BY sequence_id ASC",
@@ -14259,7 +14355,7 @@ impl Database {
     ) -> DbResult<(Vec<Message>, Vec<Message>)> {
         self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
             let mut before = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
              ORDER BY sequence_id DESC
@@ -14274,7 +14370,7 @@ impl Database {
         before.reverse();
 
         let mut after = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
              ORDER BY sequence_id ASC
@@ -14335,8 +14431,9 @@ impl Database {
         sqlx::query(
             "SELECT m.message_id, m.sequence_id, m.message_type, \
                     substr(CAST(m.content AS BLOB), 1, ?3) AS content_prefix, \
-                    m.created_at, m.origin_kind, m.origin_product_conversation_id, \
-                    m.origin_transcript_id, m.origin_subscription_event_id, \
+                    m.created_at, m.origin_kind, m.origin_source_instance_id, \
+                    m.origin_product_conversation_id, m.origin_transcript_id, \
+                    m.origin_subscription_event_id, \
                     m.origin_source_message_id, m.origin_source_tool_use_id, \
                     m.origin_slack_request_id, \
                     CASE WHEN json_valid(m.display_data) \
@@ -14361,7 +14458,7 @@ impl Database {
         message_id: &str,
     ) -> DbResult<Message> {
         let mut message = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages
              WHERE message_id = ?1 AND (?2 IS NULL OR conversation_id = ?2)",
         )
@@ -14439,7 +14536,7 @@ impl Database {
         let body = async {
             let mut message = sqlx::query(
                 "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                        display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                        display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
                  FROM messages WHERE message_id = ?1",
             )
             .bind(message_id)
@@ -14549,7 +14646,7 @@ impl Database {
         // Re-index the mutated message so the retrieval index reflects the new
         // content (specs/conversation-retrieval/ REQ-RET-003).
         let updated: Option<Message> = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -15575,8 +15672,8 @@ async fn insert_steering_entry_tx(
     sqlx::query(
         "INSERT INTO steering_messages
             (message_id, conversation_id, ordinal, text, llm_text, user_agent,
-             skill_name, skill_body, skill_dir, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             skill_name, skill_body, skill_dir, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )
     .bind(&entry.message_id)
     .bind(conversation_id)
@@ -15591,6 +15688,7 @@ async fn insert_steering_entry_tx(
     .bind(entry.origin.db_parts().1)
     .bind(entry.origin.db_parts().2)
     .bind(entry.origin.db_parts().3)
+    .bind(entry.origin.db_parts().4)
     .bind(entry.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(entry.origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(entry.origin.slack_request_id())
@@ -16128,8 +16226,8 @@ async fn insert_message_tx(
         .map_err(|e| DbError::Serialization(e.to_string()))?;
 
     let inserted = sqlx::query(
-        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )
     .bind(&msg.message_id)
     .bind(&msg.conversation_id)
@@ -16143,6 +16241,7 @@ async fn insert_message_tx(
     .bind(msg.origin.db_parts().1)
     .bind(msg.origin.db_parts().2)
     .bind(msg.origin.db_parts().3)
+    .bind(msg.origin.db_parts().4)
     .bind(msg.origin.source_call().map(|call| call.message_id.as_str()))
     .bind(msg.origin.source_call().map(|call| call.tool_use_id.as_str()))
     .bind(msg.origin.slack_request_id())
@@ -16150,7 +16249,7 @@ async fn insert_message_tx(
     .await?;
     if inserted.rows_affected() == 0 {
         let Some(mut existing) = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE message_id = ?1",
         )
         .bind(&msg.message_id)
@@ -16207,7 +16306,7 @@ async fn steering_message_matches_tx(
     message: &Message,
 ) -> DbResult<Option<bool>> {
     let row = sqlx::query(
-        "SELECT conversation_id, message_type, content, display_data, usage_data, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+        "SELECT conversation_id, message_type, content, display_data, usage_data, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
          FROM messages WHERE message_id = ?1",
     )
     .bind(&message.message_id)
@@ -16569,6 +16668,7 @@ fn decode_origin(
         row.try_get("origin_product_conversation_id")?,
         row.try_get("origin_transcript_id")?,
         row.try_get("origin_subscription_event_id")?,
+        row.try_get("origin_source_instance_id")?,
         row.try_get("origin_slack_request_id")?,
     )
     .and_then(|origin| {
@@ -23074,6 +23174,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_reads_preserve_remote_origin() {
+        use phoenix_core::domain::instance_identity::InstanceId;
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("remote-bounded", "remote-bounded", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let instance_id = InstanceId::new();
+        db.add_message_with_seq_and_origin(
+            "remote-bounded-message",
+            "remote-bounded",
+            1,
+            &MessageContent::user("remote body"),
+            None,
+            None,
+            &InputOrigin::RemoteApi { instance_id },
+        )
+        .await
+        .unwrap();
+
+        let rows = db
+            .get_bounded_read_messages_after_limited(
+                "remote-bounded",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1_024).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].origin, InputOrigin::RemoteApi { instance_id });
+
+        let exact = db
+            .get_bounded_read_message_by_id_in_conversation(
+                "remote-bounded",
+                "remote-bounded-message",
+                NonZeroUsize::new(1_024).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.origin, InputOrigin::RemoteApi { instance_id });
+    }
+
+    #[tokio::test]
     async fn bounded_exact_message_lookup_is_scoped_to_its_conversation() {
         let db = Database::open_in_memory().await.unwrap();
         for conversation in ["scope-a", "scope-b"] {
@@ -23491,7 +23635,7 @@ mod tests {
 
         let mut parents = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content,
-                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
+                    display_data, usage_data, created_at, origin_kind, origin_product_conversation_id, origin_transcript_id, origin_subscription_event_id, origin_source_instance_id, origin_source_message_id, origin_source_tool_use_id, origin_slack_request_id
              FROM messages WHERE conversation_id = 'snapshot-tx' ORDER BY sequence_id",
         )
         .try_map(parse_prompt_message_row)
@@ -24232,6 +24376,194 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((parent_count, file_count, image_count), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn remote_origins_survive_peer_deletion_restart_and_steering_drain() {
+        use phoenix_core::domain::{
+            db_schema::{InputOrigin, SourceToolCall},
+            instance_identity::InstanceId,
+            product_conversation::ProductConversationId,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote-origins.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        let target = db
+            .create_conversation("remote-target", "remote-target", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let instance_id = InstanceId::new();
+        sqlx::query(
+            "INSERT INTO federation_peer_connections (peer_instance_id, peer_display_name, domain_or_ipv4_host, port, bearer_credential, created_at_us)
+             VALUES (?1, 'sender', 'peer.example', 443, ?2, 1)",
+        )
+        .bind(instance_id.to_string())
+        .bind(format!("phx_peer_{}", "a".repeat(43)))
+        .execute(db.pool()).await.unwrap();
+        let origins = [
+            InputOrigin::RemoteApi { instance_id },
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: ProductConversationId::parse("remote-product").unwrap(),
+                transcript_id: "remote-transcript".into(),
+                source_call: None,
+            },
+            InputOrigin::RemoteConversation {
+                instance_id,
+                product_conversation_id: ProductConversationId::parse("remote-product-with-call")
+                    .unwrap(),
+                transcript_id: "remote-transcript-with-call".into(),
+                source_call: Some(Box::new(SourceToolCall {
+                    message_id: "remote-conversation-assistant".into(),
+                    tool_use_id: "remote-conversation-send".into(),
+                })),
+            },
+            InputOrigin::RemoteCoordinator {
+                instance_id,
+                product_conversation_id: ProductConversationId::parse("remote-coordinator")
+                    .unwrap(),
+                transcript_id: "remote-coordinator-transcript".into(),
+                source_call: Some(Box::new(SourceToolCall {
+                    message_id: "remote-assistant".into(),
+                    tool_use_id: "remote-call".into(),
+                })),
+            },
+        ];
+        let mut entries = Vec::new();
+        let mut expected_messages = Vec::new();
+        for (index, origin) in origins.iter().enumerate() {
+            let message = db
+                .add_message_with_seq_and_origin(
+                    &format!("remote-message-{index}"),
+                    &target.id,
+                    i64::try_from(index + 1).unwrap(),
+                    &MessageContent::user("remote input"),
+                    None,
+                    None,
+                    origin,
+                )
+                .await
+                .unwrap();
+            let mut tx = db.pool().begin().await.unwrap();
+            insert_message_tx(&mut tx, &message).await.unwrap();
+            let mut changed = message.clone();
+            match &mut changed.origin {
+                InputOrigin::RemoteApi { instance_id }
+                | InputOrigin::RemoteConversation { instance_id, .. }
+                | InputOrigin::RemoteCoordinator { instance_id, .. } => {
+                    *instance_id = InstanceId::new();
+                }
+                InputOrigin::UnknownHistorical
+                | InputOrigin::UserApi
+                | InputOrigin::InternalConversation { .. }
+                | InputOrigin::SystemGenerated
+                | InputOrigin::SlackGateway { .. }
+                | InputOrigin::SubscriptionEvent { .. } => unreachable!(),
+            }
+            assert!(matches!(
+                insert_message_tx(&mut tx, &changed).await,
+                Err(DbError::Serialization(_))
+            ));
+            tx.rollback().await.unwrap();
+            expected_messages.push((format!("remote-message-{index}"), origin.clone()));
+            let mut entry = steering_entry(&format!("remote-steer-{index}"));
+            entry.origin = origin.clone();
+            entries.push(entry);
+        }
+        db.update_steering_queue(&target.id, &entries)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(db.get_steering_queue(&target.id).await.unwrap()).unwrap(),
+            serde_json::to_value(&entries).unwrap()
+        );
+        sqlx::query("DELETE FROM federation_peer_connections WHERE peer_instance_id = ?1")
+            .bind(instance_id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        drop(db);
+
+        let restarted = Database::open(path.to_str().unwrap()).await.unwrap();
+        let stored = restarted.get_messages(&target.id).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages
+        );
+        assert_eq!(
+            serde_json::to_value(restarted.get_steering_queue(&target.id).await.unwrap()).unwrap(),
+            serde_json::to_value(&entries).unwrap()
+        );
+        let drained: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut message = steering_drain_message(
+                    &target.id,
+                    &entry.message_id,
+                    i64::try_from(origins.len() + index + 1).unwrap(),
+                );
+                message.origin = entry.origin.clone();
+                message
+            })
+            .collect();
+        restarted
+            .commit_steering_drain(
+                &target.id,
+                &drained,
+                &ConvState::LlmRequesting { attempt: 0 },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(restarted
+            .get_steering_queue(&target.id)
+            .await
+            .unwrap()
+            .is_empty());
+        let snapshot = restarted
+            .load_hydrated_prompt_snapshot(&target.id)
+            .await
+            .unwrap();
+        let product_page = restarted
+            .get_product_conversation_messages_page(&target.product_conversation_id, None, 20)
+            .await
+            .unwrap();
+        expected_messages.extend(
+            drained
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone())),
+        );
+        assert_eq!(expected_messages.len(), origins.len() * 2);
+        let stored = restarted.get_messages(&target.id).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages
+        );
+        assert_eq!(
+            snapshot
+                .messages()
+                .iter()
+                .map(|message| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages
+        );
+        assert_eq!(
+            product_page
+                .iter()
+                .map(|(_, message)| (message.message_id.clone(), message.origin.clone()))
+                .collect::<Vec<_>>(),
+            expected_messages.iter().rev().cloned().collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

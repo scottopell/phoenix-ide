@@ -54,6 +54,48 @@ pub(crate) async fn fixture(count: usize) -> (Database, Vec<Message>) {
 }
 
 #[tokio::test]
+async fn remote_origins_never_receive_local_subscription_presentation() {
+    use phoenix_core::domain::{
+        instance_identity::InstanceId, product_conversation::ProductConversationId,
+    };
+    let (db, local) = fixture(1).await;
+    let mut remote = local[0].clone();
+    let instance_id = InstanceId::new();
+    let product_conversation_id = ProductConversationId::parse("event-0").unwrap();
+    let presentations = EventPresentations::load(&db, &local).await;
+    assert!(matches!(
+        presentations.for_message(&local[0]),
+        Some(EventPresentation::Available(_))
+    ));
+    db.pool().close().await;
+    for origin in [
+        InputOrigin::RemoteApi { instance_id },
+        InputOrigin::RemoteConversation {
+            instance_id,
+            product_conversation_id: product_conversation_id.clone(),
+            transcript_id: "event-0".into(),
+            source_call: None,
+        },
+        InputOrigin::RemoteCoordinator {
+            instance_id,
+            product_conversation_id,
+            transcript_id: "event-0".into(),
+            source_call: None,
+        },
+    ] {
+        remote.origin = origin;
+        assert!(presentations.for_message(&remote).is_none());
+        let remote_only = EventPresentations::load(&db, [&remote]).await;
+        assert!(remote_only.events.is_empty());
+        assert!(matches!(
+            remote_only.fallback,
+            EventPresentationUnavailableReason::Missing
+        ));
+        assert!(remote_only.for_message(&remote).is_none());
+    }
+}
+
+#[tokio::test]
 async fn caller_projects_every_event_across_400_boundary_and_historical_delivery_states() {
     let (db, messages) = fixture(401).await;
     for count in [400, 401] {

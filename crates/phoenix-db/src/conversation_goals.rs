@@ -14,6 +14,33 @@ use crate::Database;
 type GoalTx<'a> = Transaction<'a, Sqlite>;
 
 mod admission;
+mod goal_wait;
+
+pub use goal_wait::{
+    CoordinatorGoalWaitRequest, CoordinatorGoalWaitRequestError, CoordinatorGoalWaitResult,
+    CoordinatorGoalWaitStatus,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GoalVersionCommittedNotification {
+    owner: ProductConversationId,
+    version: GoalVersion,
+}
+
+impl GoalVersionCommittedNotification {
+    pub(crate) fn new(owner: ProductConversationId, version: GoalVersion) -> Self {
+        Self { owner, version }
+    }
+
+    fn owner(&self) -> &ProductConversationId {
+        &self.owner
+    }
+
+    fn version(&self) -> GoalVersion {
+        self.version
+    }
+}
+
 pub mod checkpoint;
 pub mod control;
 pub mod execution;
@@ -574,6 +601,7 @@ impl Database {
             .await?;
         }
         tx.commit().await?;
+        self.notify_goal_version_committed(mutation.owner.clone(), accepted.snapshot().version());
         Ok(accepted)
     }
 }

@@ -297,6 +297,7 @@ mod tests {
             db,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             credential_helper: None,
             password: Some(
                 phoenix_core::domain::instance_identity::OwnerPassword::parse(

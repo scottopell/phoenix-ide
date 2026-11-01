@@ -1,0 +1,533 @@
+-- allium: 3
+-- Federation behavior: REQ-FED-001 through REQ-FED-018.
+-- Domain services for send_conversation_message and read_goal are governed by
+-- their own specifications; this module models the federation boundary.
+
+use "../bedrock/bedrock.allium" as bedrock
+
+external entity Peer {
+    instance_id: String
+    trusted: Boolean
+}
+
+external entity CoordinatorNotification {
+    event_identity: String
+}
+
+entity RemoteMessageProvenance {
+    kind: RemoteApiProvenance | RemoteConversationProvenance | RemoteCoordinatorProvenance
+}
+
+variant RemoteApiProvenance : RemoteMessageProvenance {}
+
+variant RemoteConversationProvenance : RemoteMessageProvenance {
+    source_product_conversation_id: String
+    source_transcript_id: String
+    source_message_id: String?
+    source_tool_use_id: String?
+}
+
+variant RemoteCoordinatorProvenance : RemoteMessageProvenance {
+    source_product_conversation_id: String
+    source_transcript_id: String
+    source_message_id: String?
+    source_tool_use_id: String?
+}
+
+enum ToolKind {
+    send_conversation_message
+    | read_goal
+}
+
+enum SubscriptionState {
+    active
+    | unsubscribed
+    | revoked
+    | failed_gap
+}
+
+enum ConsumerEventState {
+    received
+    | admitted
+    | acknowledged
+}
+
+enum GapReason {
+    event_limit
+    | byte_limit
+    | disconnected_age
+}
+
+entity MessageTarget {
+    kind: StableMessageTarget | ExactMessageTarget
+}
+
+variant StableMessageTarget : MessageTarget {
+    conversation: bedrock/ProductConversation
+}
+
+variant ExactMessageTarget : MessageTarget {
+    transcript_id: String
+}
+
+entity ToolSelection {
+    tool: ToolKind
+    instance: String?
+    destination: Peer?
+    failed: Boolean
+}
+
+entity RemoteMessage {
+    source_instance_id: String
+    message_id: String
+    target: MessageTarget
+    content: String
+    source_provenance: RemoteMessageProvenance
+    stable_conversation_id: String
+    exact_transcript_id: String
+    durable_result: String
+}
+
+entity GoalRead {
+    source: Peer
+    target: bedrock/ProductConversation
+    requested_version: Integer
+    timeout: Duration
+    resolved_transcript_id: String
+    result: String
+}
+
+entity RemoteSubscription {
+    subscription_id: String
+    watcher: Peer
+    conversation: bedrock/ProductConversation
+    state: SubscriptionState
+    next_event_sequence: Integer
+    acknowledged_sequence: Integer
+    unacknowledged_events: Integer
+    unacknowledged_bytes: Integer
+    disconnected_since: Timestamp?
+
+    transitions state {
+        active -> unsubscribed
+        active -> revoked
+        active -> failed_gap
+        terminal: unsubscribed
+        terminal: revoked
+        terminal: failed_gap
+    }
+}
+
+entity RemoteEvent {
+    subscription: RemoteSubscription
+    sequence: Integer
+    stable_conversation_id: String
+    exact_transcript_id: String
+    payload_digest: String
+    payload_bytes: Integer
+}
+
+entity ConsumerEvent {
+    subscription_id: String
+    sequence: Integer
+    stable_conversation_id: String
+    exact_transcript_id: String
+    payload_digest: String
+    payload_bytes: Integer
+    state: ConsumerEventState
+
+    transitions state {
+        received -> admitted
+        admitted -> acknowledged
+        terminal: acknowledged
+    }
+}
+
+entity GapTombstone {
+    subscription_id: String
+    last_acknowledged_sequence: Integer
+    last_produced_sequence: Integer
+    reason: GapReason
+    failed_at: Timestamp
+}
+
+entity WatchClose {
+    subscription_id: String
+    last_acknowledged_sequence: Integer
+    state: SubscriptionState
+}
+
+config {
+    max_unacknowledged_events: Integer
+    max_unacknowledged_bytes: Integer
+    max_disconnected_age: Duration
+}
+
+-- saved_peer(instance) resolves exactly one saved peer or fails. The selected
+-- peer must be authenticated and destination identity-verified before dispatch.
+-- destination_send and destination_read_goal use the destination's ordinary
+-- domain admission and read services, respectively; they are not new tools.
+-- stable_destination_for(target: MessageTarget) -> String and
+-- exact_destination_for(target: MessageTarget) -> String return the accepted
+-- stable ProductConversation identity and exact transcript identity for either a
+-- stable or exact message target. Source provenance describes the authenticated peer's
+-- asserted source conversation and call; it is retained from first admission but
+-- does not change retry identity.
+-- ordered_events_after(subscription, sequence) returns a bounded ordered prefix
+-- of that subscription's durable events, strictly ascending from sequence + 1
+-- without gaps or duplicates.
+
+rule SelectLocalTool {
+    when: SelectTool(tool, instance)
+    requires: instance = null
+    ensures: ToolSelection.created(tool: tool, instance: instance, destination: null, failed: false)
+}
+
+rule SelectRemoteTool {
+    when: SelectTool(tool, instance)
+    requires: instance != null
+    requires: exists saved_peer(instance)
+    ensures: ToolSelection.created(tool: tool, instance: instance, destination: saved_peer(instance), failed: false)
+}
+
+rule RemoteSelectionFails {
+    when: SelectTool(tool, instance)
+    requires: instance != null
+    requires: not exists saved_peer(instance)
+    ensures: ToolSelection.created(tool: tool, instance: instance, destination: null, failed: true)
+    ensures: SelectionError(tool, instance)
+}
+
+rule LocalToolDispatch {
+    when: DispatchTool(selection)
+    requires: selection.instance = null
+    requires: not selection.failed
+    ensures: LocalToolExecution(selection.tool)
+}
+
+rule RemoteToolDispatch {
+    when: DispatchTool(selection)
+    requires: selection.instance != null
+    requires: selection.destination != null
+    requires: not selection.failed
+    requires: selection.destination.trusted
+    ensures: RemoteToolExecution(selection.tool, selection.destination)
+}
+
+rule UntrustedDestinationFails {
+    when: DispatchTool(selection)
+    requires: selection.instance != null
+    requires: selection.destination != null
+    requires: not selection.destination.trusted
+    ensures: RemoteToolError(selection.tool, selection.instance)
+    -- No local execution or substitution of a different peer.
+}
+
+rule RemoteDispatchFails {
+    when: RemoteExecutionFailed(selection)
+    requires: selection.instance != null
+    ensures: RemoteToolError(selection.tool, selection.instance)
+    -- No LocalToolExecution and no dispatch to another peer.
+}
+
+rule AdmitRemoteMessage {
+    when: SendRemoteMessage(source, message_id, target, content, provenance)
+    requires: source.trusted
+    requires: not exists RemoteMessage{source_instance_id: source.instance_id, message_id: message_id}
+    let stable_conversation_id = stable_destination_for(target)
+    let exact_transcript_id = exact_destination_for(target)
+    let result = destination_send(target, message_id, content)
+    ensures: RemoteMessage.created(
+        source_instance_id: source.instance_id,
+        message_id: message_id,
+        target: target,
+        content: content,
+        source_provenance: provenance,
+        stable_conversation_id: stable_conversation_id,
+        exact_transcript_id: exact_transcript_id,
+        durable_result: result
+    )
+    ensures: MessageResult(result, source.instance_id, stable_conversation_id, exact_transcript_id)
+    @guidance
+        -- Commit the destination's ordinary message admission, source-instance
+        -- attribution, request identity and durable result as one transaction.
+        -- Serialize concurrent attempts for the same source and message identity.
+}
+
+rule ReplayRemoteMessage {
+    when: SendRemoteMessage(source, message_id, target, content, provenance)
+    requires: source.trusted
+    let prior = RemoteMessage{source_instance_id: source.instance_id, message_id: message_id}
+    requires: exists prior
+    requires: prior.target = target and prior.content = content
+    ensures: MessageResult(prior.durable_result, prior.source_instance_id, prior.stable_conversation_id, prior.exact_transcript_id)
+    -- The stored result and first-admitted provenance are retained; provenance
+    -- supplied by a retry does not reattribute the message, and destination_send
+    -- is not called again.
+}
+
+rule RejectChangedMessageReplay {
+    when: SendRemoteMessage(source, message_id, target, content, provenance)
+    requires: source.trusted
+    let prior = RemoteMessage{source_instance_id: source.instance_id, message_id: message_id}
+    requires: exists prior
+    requires: prior.target != target or prior.content != content
+    ensures: MessageIdentityConflict(source.instance_id, message_id)
+    -- No message admission or mutation occurs.
+}
+
+rule RejectInactiveRemoteMessageAuthority {
+    when: SendRemoteMessage(source, message_id, target, content, provenance)
+    requires: not source.trusted
+    ensures: RemoteMessageAuthorityInactive(source.instance_id, message_id)
+    -- No message admission, replay or mutation occurs.
+}
+
+rule ReadRemoteGoal {
+    when: ReadRemoteGoal(source, target, requested_version, timeout)
+    requires: source.trusted
+    ensures: GoalRead.created(
+        source: source,
+        target: target,
+        requested_version: requested_version,
+        timeout: timeout,
+        resolved_transcript_id: destination_transcript_for(target),
+        result: destination_read_goal(target, requested_version, timeout)
+    )
+    @guidance
+        -- Resolve the stable conversation, wait for the requested version, and
+        -- apply the destination local read_goal timeout and result semantics.
+}
+
+rule CreateRemoteSubscription {
+    when: CreateRemoteSubscription(watcher, conversation, subscription_id)
+    requires: watcher.trusted
+    requires: not exists RemoteSubscription{subscription_id: subscription_id}
+    ensures: RemoteSubscription.created(
+        subscription_id: subscription_id,
+        watcher: watcher,
+        conversation: conversation,
+        state: active,
+        next_event_sequence: 1,
+        acknowledged_sequence: 0,
+        unacknowledged_events: 0,
+        unacknowledged_bytes: 0,
+        disconnected_since: null
+    )
+}
+
+rule AppendRemoteEvent {
+    when: AppendRemoteEvent(subscription, exact_transcript_id, payload_digest, payload_bytes)
+    requires: subscription.state = active
+    ensures: RemoteEvent.created(
+        subscription: subscription,
+        sequence: subscription.next_event_sequence,
+        stable_conversation_id: subscription.conversation.id,
+        exact_transcript_id: exact_transcript_id,
+        payload_digest: payload_digest,
+        payload_bytes: payload_bytes
+    )
+    ensures: subscription.next_event_sequence = subscription.next_event_sequence + 1
+    ensures: subscription.unacknowledged_events = subscription.unacknowledged_events + 1
+    ensures: subscription.unacknowledged_bytes = subscription.unacknowledged_bytes + payload_bytes
+}
+
+rule ObserveDisconnect {
+    when: WatchDisconnected(subscription)
+    requires: subscription.state = active
+    requires: subscription.disconnected_since = null
+    ensures: subscription.disconnected_since = now
+}
+
+rule ObserveReconnect {
+    when: WatchReconnected(subscription)
+    requires: subscription.state = active
+    requires: subscription.watcher.trusted
+    ensures: subscription.disconnected_since = null
+}
+
+rule PullOrderedEvents {
+    when: PullRemoteEvents(subscription, after_sequence)
+    requires: subscription.state = active
+    requires: subscription.watcher.trusted
+    requires: after_sequence = subscription.acknowledged_sequence
+    ensures: OrderedPullReturned(subscription, ordered_events_after(subscription, after_sequence))
+    @guidance
+        -- Return a bounded ordered prefix after the durable acknowledgement.
+        -- Re-pulling that cursor replays unacknowledged events without skipping.
+}
+
+rule ReceiveRemoteEvent {
+    when: ReceiveRemoteEvent(subscription, remote_event)
+    requires: subscription.state = active
+    requires: remote_event.subscription = subscription
+    requires: not exists ConsumerEvent{subscription_id: subscription.subscription_id, sequence: remote_event.sequence}
+    ensures: ConsumerEvent.created(
+        subscription_id: subscription.subscription_id,
+        sequence: remote_event.sequence,
+        stable_conversation_id: remote_event.stable_conversation_id,
+        exact_transcript_id: remote_event.exact_transcript_id,
+        payload_digest: remote_event.payload_digest,
+        payload_bytes: remote_event.payload_bytes,
+        state: received
+    )
+}
+
+rule ReplayIdenticalEvent {
+    when: ReceiveRemoteEvent(subscription, remote_event)
+    let prior = ConsumerEvent{subscription_id: subscription.subscription_id, sequence: remote_event.sequence}
+    requires: exists prior
+    requires: prior.stable_conversation_id = remote_event.stable_conversation_id
+    requires: prior.exact_transcript_id = remote_event.exact_transcript_id
+    requires: prior.payload_digest = remote_event.payload_digest
+    requires: prior.payload_bytes = remote_event.payload_bytes
+    ensures: EventAlreadyReceived(prior)
+    -- Do not admit another Coordinator notification.
+}
+
+rule RejectConflictingEventReplay {
+    when: ReceiveRemoteEvent(subscription, remote_event)
+    let prior = ConsumerEvent{subscription_id: subscription.subscription_id, sequence: remote_event.sequence}
+    requires: exists prior
+    requires: prior.stable_conversation_id != remote_event.stable_conversation_id or prior.exact_transcript_id != remote_event.exact_transcript_id or prior.payload_digest != remote_event.payload_digest or prior.payload_bytes != remote_event.payload_bytes
+    ensures: EventReplayConflict(subscription.subscription_id, remote_event.sequence)
+    -- Never replace the durable event or admit its conflicting payload.
+}
+
+rule AdmitCoordinatorNotification {
+    when: AdmitCoordinatorNotification(event)
+    requires: event.state = received
+    requires: not exists CoordinatorNotification{event_identity: event.subscription_id + ":" + event.sequence}
+    ensures: CoordinatorNotification.created(event_identity: event.subscription_id + ":" + event.sequence)
+    ensures: event.state = admitted
+    @guidance
+        -- Commit event deduplication and the Coordinator notification together.
+}
+
+rule AcknowledgeRemoteEvent {
+    when: AcknowledgeRemoteEvent(subscription, event)
+    requires: subscription.state = active
+    requires: subscription.watcher.trusted
+    requires: event.subscription_id = subscription.subscription_id
+    requires: event.state = admitted
+    requires: event.sequence = subscription.acknowledged_sequence + 1
+    requires: exists CoordinatorNotification{event_identity: event.subscription_id + ":" + event.sequence}
+    requires: exists RemoteEvent{subscription: subscription, sequence: event.sequence, payload_digest: event.payload_digest, payload_bytes: event.payload_bytes}
+    ensures: subscription.acknowledged_sequence = event.sequence
+    ensures: subscription.unacknowledged_events = subscription.unacknowledged_events - 1
+    ensures: subscription.unacknowledged_bytes = subscription.unacknowledged_bytes - event.payload_bytes
+    ensures: event.state = acknowledged
+}
+
+rule ReplayAcknowledgement {
+    when: AcknowledgeRemoteEvent(subscription, event)
+    requires: subscription.state = active
+    requires: subscription.watcher.trusted
+    requires: event.subscription_id = subscription.subscription_id
+    requires: event.state = acknowledged
+    requires: event.sequence <= subscription.acknowledged_sequence
+    ensures: AcknowledgementReturned(subscription.acknowledged_sequence)
+    -- No second counter decrement.
+}
+
+rule FailEventBacklog {
+    when: subscription: RemoteSubscription.unacknowledged_events > config.max_unacknowledged_events
+    requires: subscription.state = active
+    ensures: subscription.state = failed_gap
+    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: event_limit, failed_at: now)
+}
+
+rule FailByteBacklog {
+    when: subscription: RemoteSubscription.unacknowledged_bytes > config.max_unacknowledged_bytes
+    requires: subscription.state = active
+    ensures: subscription.state = failed_gap
+    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: byte_limit, failed_at: now)
+}
+
+rule FailDisconnectedWatch {
+    when: subscription: RemoteSubscription.disconnected_since + config.max_disconnected_age <= now
+    requires: subscription.state = active
+    requires: subscription.disconnected_since != null
+    ensures: subscription.state = failed_gap
+    ensures: GapTombstone.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, last_produced_sequence: subscription.next_event_sequence - 1, reason: disconnected_age, failed_at: now)
+}
+
+rule UnsubscribeRemoteWatch {
+    when: UnsubscribeRemoteWatch(subscription)
+    requires: subscription.state = active
+    requires: subscription.watcher.trusted
+    ensures: subscription.state = unsubscribed
+    ensures: WatchClose.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, state: unsubscribed)
+}
+
+rule RepeatUnsubscribe {
+    when: UnsubscribeRemoteWatch(subscription)
+    requires: subscription.watcher.trusted
+    requires: subscription.state = unsubscribed
+    let prior = WatchClose{subscription_id: subscription.subscription_id, state: unsubscribed}
+    ensures: WatchCloseReturned(prior)
+}
+
+rule PeerRevocationCommitted {
+    when: PeerRevocationCommitted(peer)
+    ensures: peer.trusted = false
+    ensures:
+        for subscription in RemoteSubscription where subscription.watcher = peer and subscription.state = active:
+            subscription.state = revoked
+            WatchClose.created(subscription_id: subscription.subscription_id, last_acknowledged_sequence: subscription.acknowledged_sequence, state: revoked)
+    @guidance
+        -- Gate admission of message and Goal operations, subscription creation,
+        -- pulls, acknowledgements and unsubscribe on authenticated trust at the
+        -- destination transaction boundary; admitted work may finish and is audited.
+}
+
+invariant RemoteSelectionNeverFallsBack {
+    for s in ToolSelections where s.instance != null:
+        s.destination != null or s.failed
+    -- Remote failures cannot trigger LocalToolExecution or another destination.
+}
+
+invariant WatchCursorAndBacklogStayConsistent {
+    for s in RemoteSubscriptions where s.state = active:
+        s.acknowledged_sequence < s.next_event_sequence
+        s.unacknowledged_events >= 0
+        s.unacknowledged_bytes >= 0
+    -- Acknowledgements reduce both counters for the acknowledged event.
+}
+
+invariant DurableAdmissionPrecedesAcknowledgement {
+    for e in ConsumerEvents where e.state = acknowledged:
+        exists CoordinatorNotification{event_identity: e.subscription_id + ":" + e.sequence}
+}
+
+actor TrustedPeer {
+    identified_by: Peer where trusted
+}
+
+surface FederationToolSurface {
+    facing peer: TrustedPeer
+    provides:
+        SendRemoteMessage(peer, message_id, target, content, provenance)
+        ReadRemoteGoal(peer, target, requested_version, timeout)
+    @guarantee DomainParity
+        -- Destination domain services enforce the same admission, stable
+        -- conversation resolution, version wait, timeout, and result semantics.
+}
+
+surface FederationWatchSurface {
+    facing peer: TrustedPeer
+    context subscription: RemoteSubscription
+    exposes:
+        subscription.state
+        subscription.acknowledged_sequence
+    provides:
+        CreateRemoteSubscription(peer, conversation, subscription_id)
+        PullRemoteEvents(subscription, after_sequence)
+        AcknowledgeRemoteEvent(subscription, event)
+        UnsubscribeRemoteWatch(subscription)
+    @guarantee DurableCursor
+        -- Watch state, ordered cursor and pending deliveries survive either
+        -- instance's restart; continuation retains the stable subscription.
+    @guarantee ExplicitTerminalGap
+        -- A terminal gap requires a current-state read and new subscription.
+}

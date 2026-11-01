@@ -1,10 +1,56 @@
 use super::*;
+use std::time::Duration as StdDuration;
+
+use phoenix_core::domain::instance_identity::{FederationCredentialVerifier, InstanceId};
 
 async fn receipt_count(db: &Database) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM canonical_tool_round_receipts")
         .fetch_one(db.pool())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn canonical_goal_report_wakes_federated_waiter_after_commit() {
+    let (db, owner, round) = report_fixture().await;
+    let caller = InstanceId::new();
+    let verifier = FederationCredentialVerifier::from_bearer(b"canonical-goal-waiter");
+    db.replace_federation_enrollment(caller, "canonical goal waiter", &verifier)
+        .await
+        .unwrap();
+    let authority = crate::FederationSendAuthority::new(caller, verifier);
+    let waiter_db = db.clone();
+    let waiter_owner = owner.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_db
+            .wait_for_federated_goals(
+                &authority,
+                &waiter_owner,
+                GoalVersion::INITIAL,
+                CoordinatorGoalWaitRequest::new(
+                    GoalVersion::parse(2).unwrap(),
+                    StdDuration::from_secs(2),
+                )
+                .unwrap(),
+            )
+            .await
+    });
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while db.goal_version_waiter_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("waiter subscribed");
+
+    let committed = round.commit(&db).await.unwrap();
+    assert!(!committed.replayed);
+    let waited = waiter.await.unwrap().unwrap();
+    assert_eq!(waited.status(), CoordinatorGoalWaitStatus::Satisfied);
+    assert_eq!(
+        waited.current().unwrap().snapshot().version(),
+        GoalVersion::parse(2).unwrap()
+    );
 }
 
 #[tokio::test]

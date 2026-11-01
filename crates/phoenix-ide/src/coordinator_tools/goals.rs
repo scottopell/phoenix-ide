@@ -5,6 +5,7 @@ use phoenix_core::domain::conversation_goal::GoalVersion;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::conversation_goals::prepared::GoalPreparationIntent;
 use phoenix_db::conversation_goals::user_commands::GoalUserResult;
+use phoenix_db::conversation_goals::CoordinatorGoalWaitRequest;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -22,17 +23,19 @@ enum Operation {
 
 struct GoalTool {
     service: GoalCommandService,
+    runtime: Arc<RuntimeManager>,
     operation: Operation,
 }
 
 pub(super) fn tools(runtime: Arc<RuntimeManager>) -> Vec<Arc<dyn Tool>> {
-    let service = GoalCommandService::new(runtime);
+    let service = GoalCommandService::new(Arc::clone(&runtime));
     [Operation::Read, Operation::Prepare, Operation::Apply]
         .into_iter()
         .map(|operation| {
             Arc::new(GoalTool {
                 service: service.clone(),
                 operation,
+                runtime: Arc::clone(&runtime),
             }) as Arc<dyn Tool>
         })
         .collect()
@@ -44,6 +47,29 @@ struct ReadInput {
     target: String,
     #[serde(default)]
     after_version: Option<i64>,
+    #[serde(default)]
+    instance: Option<String>,
+    #[serde(default)]
+    wait: Option<GoalWaitInput>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoalWaitInput {
+    minimum_version: i64,
+    timeout_seconds: u64,
+}
+
+impl GoalWaitInput {
+    fn into_request(self) -> Result<CoordinatorGoalWaitRequest, String> {
+        let minimum_version =
+            GoalVersion::parse(self.minimum_version).map_err(|error| error.to_string())?;
+        CoordinatorGoalWaitRequest::new(
+            minimum_version,
+            std::time::Duration::from_secs(self.timeout_seconds),
+        )
+        .map_err(|error| error.to_string())
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +108,7 @@ impl Tool for GoalTool {
     }
     fn description(&self) -> String {
         match self.operation {
-            Operation::Read => "Read an ordinary conversation's saved Goal and up to 100 ordered history entries. Coordinator only. Uses stable @conv targets and follows the current transcript. after_version is only a history cursor. Goal disposition is not active-execution state; this never dispatches work.",
+            Operation::Read => "Read an ordinary conversation's saved Goal and up to 100 ordered history entries. Coordinator only. Uses stable @conv targets and follows the current transcript. after_version is only a history cursor. Omit instance for this instance; an explicit saved-peer ID or unique display name reads exactly that peer and never falls back locally. Optional wait blocks for minimum_version for 1-25 seconds and returns an authoritative satisfied or timed_out snapshot. Goal disposition is not active-execution state; this never dispatches work.",
             Operation::Prepare => "Prepare an immutable Goal action against the observed saved Goal. Coordinator only. create refuses an existing Goal; replace is an explicit new Goal identity retaining old history; state updates disposition. Applying create/replace requires the target's persisted autoContinue preference to be explicitly enabled; preparation does not enable it. Returns a server-created action_reference and frozen expected version/Goal identity. Review this observation, then pass only action_reference to apply_goal. Never invent UUIDs or versions. A conflict requires deliberate reconsideration, NOT reread-and-overwrite/reprepare. No automatic scheduling, Start/Stop, Suspended disposition, or Suspended reactivation.",
             Operation::Apply => "Apply or reconcile a previously prepared Goal action by its server-issued action_reference. Coordinator only. Never accepts target, version, authority, or replacement content. Exact retries replay the immutable accepted or refused receipt, including across restart/Coordinator continuation. New create/replace requires the target's persisted autoContinue preference to be explicitly enabled; refusal does not enable it or dispatch work. On conflict or busy refusal do NOT blindly prepare another action; read Goal/history and reconsider explicitly. Does not dispatch or schedule work, Start/Stop, or reactivate Suspended Goals.",
         }.to_owned()
@@ -90,7 +116,7 @@ impl Tool for GoalTool {
     fn input_schema(&self) -> Value {
         match self.operation {
             Operation::Read => {
-                json!({"type":"object","properties":{"target":target_schema(),"after_version":{"type":"integer","minimum":0}},"required":["target"],"additionalProperties":false})
+                json!({"type":"object","properties":{"target":target_schema(),"after_version":{"type":"integer","minimum":0,"description":"History cursor only; entries at or before this Goal version are omitted."},"instance":{"type":"string","minLength":1,"description":"Exact saved-peer instance ID or unique saved display name. Explicit peer selection never falls back to the local instance."},"wait":{"type":"object","properties":{"minimum_version":{"type":"integer","minimum":0},"timeout_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["minimum_version","timeout_seconds"],"additionalProperties":false}},"required":["target"],"additionalProperties":false})
             }
             Operation::Apply => {
                 json!({"type":"object","properties":{"action_reference":{"type":"string","format":"uuid","description":"Copy the opaque reference returned by prepare_goal; do not generate one."}},"required":["action_reference"],"additionalProperties":false})
@@ -140,12 +166,38 @@ impl GoalTool {
                 let owner = target(&args.target)?;
                 let after = GoalVersion::parse(args.after_version.unwrap_or(0))
                     .map_err(|error| error.to_string())?;
-                let (current, history) = self
-                    .service
-                    .read_coordinator(&ctx.conversation_id, &owner, after)
-                    .await
-                    .map_err(refusal)?;
-                json!({"target":args.target,"current":current,"history":history,"history_page_size":100,"execution_state_included":false})
+                match (args.instance, args.wait) {
+                    (None, None) => {
+                        let (current, history) = self
+                            .service
+                            .read_coordinator(&ctx.conversation_id, &owner, after)
+                            .await
+                            .map_err(refusal)?;
+                        json!({"target":args.target,"current":current,"history":history,"history_page_size":100,"execution_state_included":false})
+                    }
+                    (None, Some(wait)) => {
+                        let wait = wait.into_request()?;
+                        let result = self
+                            .service
+                            .wait_coordinator(&ctx.conversation_id, &owner, after, wait)
+                            .await
+                            .map_err(refusal)?;
+                        json!({"target":args.target,"exact_transcript_id":result.destination_transcript_id(),"current":result.current(),"history":result.history(),"history_page_size":100,"execution_state_included":false,"wait_status":result.status()})
+                    }
+                    (Some(instance), wait) => {
+                        let wait = wait.map(GoalWaitInput::into_request).transpose()?;
+                        let response = crate::api::federation::read_remote_goal(
+                            self.runtime.db(),
+                            &instance,
+                            &owner,
+                            after,
+                            wait,
+                        )
+                        .await
+                        .map_err(|error| format!("read_goal remote read failed: {error}"))?;
+                        serde_json::to_value(response).map_err(|error| error.to_string())?
+                    }
+                }
             }
             Operation::Prepare => {
                 let args: PrepareInput = serde_json::from_value(input).map_err(bad_input)?;

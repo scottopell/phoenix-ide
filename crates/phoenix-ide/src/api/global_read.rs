@@ -1901,6 +1901,9 @@ pub(crate) fn attributed_role(
     match message_type {
         MessageType::User => match origin {
             InputOrigin::UserApi => "User API",
+            InputOrigin::RemoteApi { .. } => "Remote API",
+            InputOrigin::RemoteConversation { .. } => "Remote conversation",
+            InputOrigin::RemoteCoordinator { .. } => "Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Conversation",
             InputOrigin::SlackGateway { .. } => "Slack request",
             InputOrigin::SystemGenerated => "System input",
@@ -1914,6 +1917,9 @@ pub(crate) fn attributed_role(
         MessageType::Continuation => "Continuation",
         MessageType::Skill => match origin {
             InputOrigin::UserApi => "Skill · User API",
+            InputOrigin::RemoteApi { .. } => "Skill · Remote API",
+            InputOrigin::RemoteConversation { .. } => "Skill · Remote conversation",
+            InputOrigin::RemoteCoordinator { .. } => "Skill · Remote Coordinator",
             InputOrigin::InternalConversation { .. } => "Skill · Conversation",
             InputOrigin::SlackGateway { .. } => "Skill · Slack request",
             InputOrigin::SystemGenerated => "Skill · System input",
@@ -1932,6 +1938,13 @@ pub(crate) fn attributed_sender(origin: &phoenix_core::domain::db_schema::InputO
             ..
         } => format!(
             " from recorded product conversation {product_conversation_id} via @transcript:{transcript_id}"
+        ),
+        InputOrigin::RemoteApi { instance_id } => format!(" from authenticated instance {instance_id} (API channel)"),
+        InputOrigin::RemoteConversation { instance_id, product_conversation_id, transcript_id, .. } => format!(
+            " from recorded remote product conversation {product_conversation_id}, authenticated instance {instance_id}, transcript {transcript_id}"
+        ),
+        InputOrigin::RemoteCoordinator { instance_id, product_conversation_id, transcript_id, .. } => format!(
+            " from remote Coordinator {product_conversation_id}, authenticated instance {instance_id}, transcript {transcript_id}"
         ),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
@@ -1984,6 +1997,9 @@ async fn attributed_sender_with_cache(
                 ),
             })
         }
+        InputOrigin::RemoteApi { .. }
+        | InputOrigin::RemoteConversation { .. }
+        | InputOrigin::RemoteCoordinator { .. } => Ok(attributed_sender(origin)),
         InputOrigin::UnknownHistorical
         | InputOrigin::UserApi
         | InputOrigin::SlackGateway { .. }
@@ -2927,6 +2943,9 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::ForkProposalConflict(_)
         | DbError::DirectTurnConflict(_)
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | DbError::FederationSendAuthorityInactive
+        | DbError::FederationSendIdentityConflict
+        | DbError::FederationSteeringDuplicate
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | DbError::DormantGitRepositoryCatchupStaleOperation
         | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim

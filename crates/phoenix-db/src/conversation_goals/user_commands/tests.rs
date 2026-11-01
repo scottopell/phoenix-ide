@@ -48,6 +48,7 @@ async fn lost_acknowledgement_retains_receipt(busy: bool) {
         assert!(db.conversation_goal(&owner).await.unwrap().is_some());
     }
     let before = counts(&db).await;
+    let mut notifications = db.goal_version_committed.subscribe();
     let retry = db
         .apply_user_goal_command(
             &input,
@@ -61,6 +62,10 @@ async fn lost_acknowledgement_retains_receipt(busy: bool) {
         .unwrap();
     assert_eq!(retry, receipt);
     assert_eq!(counts(&db).await, before);
+    assert!(matches!(
+        notifications.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]

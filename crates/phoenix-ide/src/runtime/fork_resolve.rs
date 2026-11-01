@@ -1660,6 +1660,9 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::ConversationAlreadyExists(_)
         | DbError::DirectTurnConflict(_)
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | DbError::FederationSendAuthorityInactive
+        | DbError::FederationSendIdentityConflict
+        | DbError::FederationSteeringDuplicate
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | DbError::DormantGitRepositoryCatchupStaleOperation
         | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim

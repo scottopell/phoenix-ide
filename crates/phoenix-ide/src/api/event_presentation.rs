@@ -116,9 +116,18 @@ impl EventPresentations {
                 | InputOrigin::UserApi
                 | InputOrigin::InternalConversation { .. }
                 | InputOrigin::SlackGateway { .. }
+                | InputOrigin::RemoteApi { .. }
+                | InputOrigin::RemoteConversation { .. }
+                | InputOrigin::RemoteCoordinator { .. }
                 | InputOrigin::SystemGenerated => None,
             })
             .collect();
+        if ids.is_empty() {
+            return Self {
+                events: HashMap::new(),
+                fallback: EventPresentationUnavailableReason::Missing,
+            };
+        }
         match db.coordinator_watch_event_presentations(&ids).await {
             Ok(events) => Self {
                 events: events
@@ -152,6 +161,9 @@ impl EventPresentations {
             | InputOrigin::UserApi
             | InputOrigin::InternalConversation { .. }
             | InputOrigin::SlackGateway { .. }
+            | InputOrigin::RemoteApi { .. }
+            | InputOrigin::RemoteConversation { .. }
+            | InputOrigin::RemoteCoordinator { .. }
             | InputOrigin::SystemGenerated => None,
         }
     }

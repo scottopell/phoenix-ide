@@ -138,6 +138,7 @@ mod tests {
             message_retriever,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             sessions,
             credential_helper: None,
             password: Some(

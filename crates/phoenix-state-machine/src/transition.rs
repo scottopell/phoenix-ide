@@ -852,7 +852,7 @@ pub fn transition_core(
             CoreState::LlmRequesting { attempt: 1 },
         )
         .with_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload.as_ref().clone(),
+            payload: payload.clone(),
             authority: authority.clone(),
             idempotent: false,
         })

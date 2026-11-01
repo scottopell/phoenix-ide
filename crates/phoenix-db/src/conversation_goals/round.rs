@@ -44,6 +44,12 @@ pub(crate) enum ToolRoundWrite<'a> {
         results: &'a [ToolRoundResult],
     },
 }
+
+pub(crate) struct RoundWriteOutcome {
+    pub(crate) results: Vec<Message>,
+    pub(crate) replayed: bool,
+    pub(crate) committed_goals: Vec<super::GoalVersionCommittedNotification>,
+}
 pub(crate) fn db_error(error: GoalDbError) -> DbError {
     match error {
         GoalDbError::Sqlx(error) => DbError::Sqlx(error),
@@ -248,7 +254,7 @@ pub(super) fn result_message(
 }
 
 pub(crate) async fn retained_message_tx(tx: &mut GoalTx<'_>, id: &str) -> Result<Option<Message>> {
-    Ok(sqlx::query("SELECT message_id,conversation_id,sequence_id,message_type,content,display_data,usage_data,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_message_id,origin_source_tool_use_id,origin_slack_request_id FROM messages WHERE message_id=?")
+    Ok(sqlx::query("SELECT message_id,conversation_id,sequence_id,message_type,content,display_data,usage_data,created_at,origin_kind,origin_product_conversation_id,origin_transcript_id,origin_subscription_event_id,origin_source_instance_id,origin_source_message_id,origin_source_tool_use_id,origin_slack_request_id FROM messages WHERE message_id=?")
         .bind(id).try_map(crate::parse_message_row).fetch_optional(&mut **tx).await?)
 }
 
@@ -261,7 +267,7 @@ pub(crate) async fn write_round_tx(
     state: &ConvState,
     state_updated_at: DateTime<Utc>,
     policies: super::execution::GoalWritePolicies,
-) -> DbResult<(Vec<Message>, bool)> {
+) -> DbResult<RoundWriteOutcome> {
     if conversation_id != assistant.conversation_id {
         return Err(DbError::Serialization(
             "tool round transcript differs".into(),
@@ -270,10 +276,11 @@ pub(crate) async fn write_round_tx(
     match input {
         ToolRoundWrite::Finalized(results) => {
             let replayed = persist_finalized_round_tx(tx, assistant, results).await?;
-            Ok((
-                results.iter().map(|result| result.row().clone()).collect(),
+            Ok(RoundWriteOutcome {
+                results: results.iter().map(|result| result.row().clone()).collect(),
                 replayed,
-            ))
+                committed_goals: Vec::new(),
+            })
         }
         ToolRoundWrite::Pending { execution, results } => finalize_round_tx(
             tx,
@@ -397,13 +404,18 @@ async fn finalize_round_tx(
     tx: &mut GoalTx<'_>,
     checkpoint: &GoalRoundCheckpoint<'_>,
     policies: super::execution::GoalWritePolicies,
-) -> Result<(Vec<Message>, bool)> {
+) -> Result<RoundWriteOutcome> {
     if let Some(retained) = retained_round_tx(tx, checkpoint).await? {
-        return Ok((retained, true));
+        return Ok(RoundWriteOutcome {
+            results: retained,
+            replayed: true,
+            committed_goals: Vec::new(),
+        });
     }
     let assistant = checkpoint.assistant;
     crate::insert_message_tx(tx, assistant).await?;
     let mut messages = Vec::with_capacity(checkpoint.results.len());
+    let mut committed_goals = Vec::new();
     for (ordinal, result) in checkpoint.results.iter().enumerate() {
         let resolved = match result {
             ToolRoundResult::Finalized(result) => result.clone(),
@@ -411,7 +423,7 @@ async fn finalize_round_tx(
                 report,
                 duration_ms,
             } => {
-                super::checkpoint::finalize_report_tx(
+                let finalized = super::checkpoint::finalize_report_tx(
                     tx,
                     assistant,
                     checkpoint.execution,
@@ -420,14 +432,22 @@ async fn finalize_round_tx(
                     GoalTimestampUs::parse(checkpoint.state_updated_at.timestamp_micros())?,
                     policies,
                 )
-                .await?
+                .await?;
+                if let Some(committed_goal) = finalized.committed_goal {
+                    committed_goals.push(committed_goal);
+                }
+                finalized.result
             }
         };
         let candidate = result_message(assistant, ordinal, &resolved)?;
         crate::insert_message_tx(tx, &candidate).await?;
         messages.push(candidate);
     }
-    Ok((messages, false))
+    Ok(RoundWriteOutcome {
+        results: messages,
+        replayed: false,
+        committed_goals,
+    })
 }
 
 fn message_matches(existing: &Message, expected: &Message) -> bool {
@@ -587,6 +607,56 @@ mod tests {
             vec![ToolRoundResult::Finalized(result)],
             ConvState::Idle,
         )
+    }
+
+    #[tokio::test]
+    async fn retained_message_preserves_remote_origin_provenance() {
+        let db = Database::open_in_memory().await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        db.create_conversation(
+            "transcript-round",
+            "transcript-round",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let origin = InputOrigin::RemoteConversation {
+            instance_id: phoenix_core::domain::instance_identity::InstanceId::new(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::new(),
+            transcript_id: "source-transcript".into(),
+            source_call: Some(Box::new(phoenix_core::domain::db_schema::SourceToolCall {
+                message_id: "source-message".into(),
+                tool_use_id: "source-call".into(),
+            })),
+        };
+        let message = Message {
+            message_id: "remote-round-message".into(),
+            conversation_id: "transcript-round".into(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::User(phoenix_core::domain::db_schema::UserContent::new(
+                "remote input",
+            )),
+            display_data: None,
+            usage_data: None,
+            origin: origin.clone(),
+            created_at: Utc::now(),
+        };
+        let mut tx = db.pool().begin().await.unwrap();
+        crate::insert_message_tx(&mut tx, &message).await.unwrap();
+
+        let retained = retained_message_tx(&mut tx, &message.message_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(retained.origin, origin);
     }
 
     #[test]

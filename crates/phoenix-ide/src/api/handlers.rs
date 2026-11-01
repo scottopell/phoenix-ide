@@ -679,6 +679,17 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
         )
         .route(
+            "/api/federation/peer/read-goal",
+            post(super::federation::read_goal)
+                .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/api/federation/peer/send-conversation-message",
+            post(super::federation::send_conversation_message).layer(DefaultBodyLimit::max(
+                super::federation::MAX_REMOTE_SEND_REQUEST_BODY_BYTES,
+            )),
+        )
+        .route(
             "/api/federation/peer/resolve-reference",
             post(super::federation::resolve_reference)
                 .layer(DefaultBodyLimit::max(MAX_REMOTE_QUERY_REQUEST_BODY_BYTES)),
@@ -5489,6 +5500,9 @@ async fn send_chat(
                     "message_id was already used for a different target or payload".to_string(),
                     "idempotency_conflict",
                 )))
+            }
+            crate::send_chat_service::SendChatServiceError::FederationSendAuthorityInactive => {
+                AppError::Forbidden("Federation send authority is inactive.".to_string())
             }
             crate::send_chat_service::SendChatServiceError::Internal(message) => {
                 AppError::Internal(message)
@@ -10870,6 +10884,17 @@ pub(crate) mod hard_delete_cascade_tests {
         llm: Arc<dyn phoenix_llm::LlmService>,
     ) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
+        make_test_state_with_db_and_llm(db, llm)
+    }
+
+    pub(crate) fn make_test_state_with_db(db: Database) -> AppState {
+        make_test_state_with_db_and_llm(db, Arc::new(TestLlm))
+    }
+
+    fn make_test_state_with_db_and_llm(
+        db: Database,
+        llm: Arc<dyn phoenix_llm::LlmService>,
+    ) -> AppState {
         let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm));
         let platform = PlatformCapability::None {
             details: "test".into(),
@@ -10903,6 +10928,7 @@ pub(crate) mod hard_delete_cascade_tests {
             message_retriever,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17412,6 +17438,7 @@ mod regenerate_conversation_name_tests {
             message_retriever,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -17870,6 +17897,7 @@ mod upgrade_model_state_guard_tests {
             message_retriever,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -18347,6 +18375,7 @@ mod file_read_tests {
             message_retriever,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -19135,6 +19164,7 @@ mod chat_authority_tests {
             message_retriever,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
@@ -19921,6 +19951,7 @@ mod lifecycle_handler_tests {
             message_retriever,
             federation_tls_trust:
                 phoenix_core::domain::instance_identity::PeerTlsTrust::PlatformRoots,
+            remote_message_admission: Arc::default(),
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
