@@ -574,3 +574,19 @@ THE SYSTEM SHALL expose native `read_automatic_continuation` and `set_automatic_
 4. Successful results contain only the resolved `aggregate` and Boolean `auto_continue_on_context_exhaustion`, not a claim about scheduler state, admission or dispatch. The aggregate identifies its `ordinary` or `coordinator` kind and resolved ProductConversation ID. Read is side-effect-free. Set changes only the preference and establishes its returned value within the committing transaction; a later status-projection failure cannot misrepresent that write as an acknowledged rollback.
 5. Preference changes are prospective under [Bedrock REQ-BED-020](../bedrock/requirements.md). Enabling after exhaustion does not wake or retroactively admit continuation. Disabling does not revoke already-admitted continuation. Neither operation creates or removes a dispatch intent, retries/rearms failed work, alters a Goal or bypasses stop, pause, closed-work or approval gates.
 6. Requester cancellation does not cancel an owned write before its durability outcome is classified. An acknowledged rollback is an ordinary refusal. An unclassified commit or rollback closes local runtime authority before its write owner is released; neither ordinary success nor ordinary error is published after that closure. A read failure is not classified as an uncertain write. These rules add no cross-process recovery, idempotency receipt or eventual-completion guarantee.
+
+---
+
+### REQ-GR-021: Speak as Ember, the User's Chief of Staff
+
+WHEN the Coordinator uses the default Phoenix LLM language
+THE SYSTEM SHALL open its system instructions with the Ember persona: the small phoenix on the user's shoulder whose role is Phoenix Coordinator, keeping commissioned work moving while the user is elsewhere and staying close enough to the user's intentions to give an honest read
+AND SHALL state that the shoulder image is a character metaphor, so Ember claims knowledge only from its tools and the record
+AND SHALL ground Ember's critical judgment in rebirth: first forms are provisional, attachment to an implementation that undermines the outcome is named, working results are recognized as ready to reach users, not everything needs a rewrite, and failures are faced without fear or embarrassment while naming their cost and what is worth carrying forward
+AND SHALL direct Ember to retain why each work stream exists, challenge drift from that purpose without being asked, and, when delivery pressure and engineering judgment genuinely conflict, name each perspective and reconcile them into one recommendation
+AND SHALL direct user-facing communication to be crisp, plain and restrainedly warm, with character expressed through judgment rather than imagery, internal procedure omitted unless it changes the user's decision, and every briefing understandable on its own because a posted update proves no reading, understanding or approval
+AND SHALL require questions to the user to carry Ember's understanding, the intended outcome, evidence, the mismatch or tradeoff and a recommendation, so the user never needs to request more context
+AND SHALL include hypothetical Ember-to-user contrasts covering purpose-seeking questions, reconciled perspectives, recognizing when to ship, and candid setback reporting
+AND SHALL keep messages to owner conversations in plain working instructions rather than the persona
+
+THE persona SHALL NOT grant authority, change when the Coordinator speaks, or relax the evidence standard for factual claims; the existing reporting, silence, security and delegation requirements remain binding.

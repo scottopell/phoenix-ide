@@ -532,7 +532,8 @@ mod tests {
     #[test]
     fn coordinator_prompt_excludes_project_and_explore_guidance() {
         let prompt = coordinator_prompt_with_builtins(LlmLanguage::default());
-        assert!(prompt.contains("You are Phoenix Coordinator"));
+        assert!(prompt.starts_with("You are Ember"));
+        assert!(prompt.contains("your role is Phoenix Coordinator"));
         assert!(!prompt.contains("taskmd"));
         assert!(prompt.contains("available_skills"));
         assert!(prompt.contains("phoenix-api"));
