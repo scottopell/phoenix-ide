@@ -612,6 +612,14 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/codex/quota", get(super::codex_login::codex_quota))
         .route(
+            "/api/codex/rate-limit-resets",
+            get(super::codex_login::codex_rate_limit_resets),
+        )
+        .route(
+            "/api/codex/rate-limit-resets/consume",
+            post(super::codex_login::codex_rate_limit_reset_consume),
+        )
+        .route(
             "/api/codex/login/pkce/start",
             post(super::codex_login::pkce_start),
         )

@@ -6,6 +6,7 @@ pub mod active_pr_selection;
 pub mod bash_progress;
 pub mod bash_types;
 pub mod close;
+pub mod codex_reset_credits;
 pub mod conversation_goal;
 pub mod creation_protocol;
 pub mod db_schema;

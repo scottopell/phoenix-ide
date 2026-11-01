@@ -4,6 +4,7 @@ import { api, type CodexLoginPreflight, type LlmLanguageSetting, type Notificati
 import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
+import { CodexResetAction } from './CodexResetAction';
 import {
   getBrowserNotificationPermission,
   useNotificationSettings,
@@ -357,6 +358,7 @@ function CodexSection({
       </div>
       {error && <div className="settings-section__error">{error}</div>}
       {quota && <CodexQuotaBlock quota={quota} />}
+      <CodexResetAction key={preflight.account_id ?? 'signed-out'} surface="settings" />
     </section>
   );
 }
