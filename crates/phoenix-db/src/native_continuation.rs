@@ -6,8 +6,8 @@ use phoenix_workflow::ClientTurnKey;
 use sqlx::{Connection, Row};
 
 use crate::{
-    workflow::LocalAuthorityResult, ContinuationDispatchIntent, ContinueOutcome, Database, DbError,
-    DbResult, MessageContent, MessageType, NewContinuationDispatchIntent,
+    workflow::LocalAuthorityResult, ContinuationDispatchIntent, ContinueOutcome, ConvState,
+    Database, DbError, DbResult, MessageContent, MessageType, NewContinuationDispatchIntent,
 };
 
 pub struct CurrentCoordinatorContinuationRequest<'a> {
@@ -45,6 +45,7 @@ impl Database {
             .await
     }
 
+    #[allow(clippy::too_many_lines)] // Ordered validation and commit classification share one transaction.
     async fn continue_from_current_coordinator_with_commit(
         &self,
         request: CurrentCoordinatorContinuationRequest<'_>,
@@ -98,8 +99,29 @@ impl Database {
                 ));
             }
             let expected_summary = match &parent.state {
-                crate::ConvState::ContextExhausted { summary } if !summary.trim().is_empty() => summary,
-                _ => {
+                ConvState::ContextExhausted { summary } if !summary.trim().is_empty() => summary,
+                ConvState::Idle
+                | ConvState::LlmRequesting { .. }
+                | ConvState::ServerOverloadRetrying { .. }
+                | ConvState::SeededLlmRequesting { .. }
+                | ConvState::Provisioning { .. }
+                | ConvState::CreationCancelled { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::CancellingSubAgents { .. }
+                | ConvState::Completed { .. }
+                | ConvState::Failed { .. }
+                | ConvState::CreationFailed { .. }
+                | ConvState::Error { .. }
+                | ConvState::AwaitingRecovery { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::RecoverableContinuationFailure { .. }
+                | ConvState::AwaitingTaskApproval { .. }
+                | ConvState::AwaitingUserResponse { .. }
+                | ConvState::ContextExhausted { .. }
+                | ConvState::HandedOff { .. }
+                | ConvState::Terminal => {
                     return Err(DbError::ContinuationPrecondition(
                         "predecessor must be strictly ContextExhausted with a nonempty summary".to_string(),
                     ));
@@ -179,7 +201,7 @@ impl Database {
                     ));
                 }
             }
-            let read = Self::read_continuation_opening_on(&mut *tx, successor_id).await?;
+            let read = Self::read_continuation_opening_on(&mut tx, successor_id).await?;
             let (edge, opening) = match read {
                 crate::ContinuationOpeningRead::Pending {
                     edge,
@@ -202,7 +224,9 @@ impl Database {
                     opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
                     presentation: _,
                 } => (edge, CoordinatorContinuationOpening::Accepted { accepted_message_id }),
-                _ => {
+                crate::ContinuationOpeningRead::None
+                | crate::ContinuationOpeningRead::Pending { .. }
+                | crate::ContinuationOpeningRead::Accepted { .. } => {
                     return Err(DbError::ContinuationPrecondition(
                         "continuation lacks an exact generated-context opening".to_string(),
                     ));

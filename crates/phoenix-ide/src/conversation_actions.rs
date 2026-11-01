@@ -819,7 +819,9 @@ mod tests {
             vec![
                 "rename_conversation",
                 "create_conversation",
-                "continue_conversation"
+                "continue_conversation",
+                "read_automatic_continuation",
+                "set_automatic_continuation"
             ]
         );
         assert!(crate::conversation_action_tools::tools(manager, "missing")

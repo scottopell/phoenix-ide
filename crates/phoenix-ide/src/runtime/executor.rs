@@ -29633,9 +29633,8 @@ mod tool_generation_guard_tests {
         for _ in 0..2 {
             let (received_generation, outcome) = rt
                 .tool_outcome_rx
-                .recv()
-                .await
-                .expect("queued outcome is received");
+                .try_recv()
+                .expect("previously sent outcome is already queued");
             assert_eq!(received_generation, generation);
             assert!(!rt.tool_outcome_is_stale(received_generation));
             assert_eq!(

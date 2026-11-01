@@ -176,7 +176,10 @@ async fn coordinator_rotation_invalidates_old_source_for_read_and_set() {
     .unwrap();
     let successor = match db.continue_conversation(&coordinator.id).await.unwrap() {
         crate::ContinueOutcome::Created(successor) => successor,
-        other => panic!("expected a Coordinator successor, got {other:?}"),
+        other @ (crate::ContinueOutcome::AlreadyContinued(_)
+        | crate::ContinueOutcome::ParentNotContextExhausted { .. }) => {
+            panic!("expected a Coordinator successor, got {other:?}")
+        }
     };
 
     assert!(matches!(
@@ -278,6 +281,7 @@ async fn failed_update_trigger_rolls_back_without_changing_preference() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Compares both initial settings through the same summary-commit sequence.
 async fn native_setting_changes_are_prospective_at_summary_commit() {
     use chrono::Utc;
     use phoenix_core::domain::db_schema::{InputOrigin, MessageContent};
@@ -389,6 +393,7 @@ async fn native_setting_changes_are_prospective_at_summary_commit() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Retains source, subagent target, and unpublished target checks together.
 async fn native_settings_reject_subagent_sources_targets_and_unpublished_products() {
     let db = Database::open_in_memory().await.unwrap();
     let coordinator = db

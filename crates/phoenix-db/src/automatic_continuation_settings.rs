@@ -87,6 +87,7 @@ impl Database {
     /// Panics if another native settings acknowledgement pause is already armed.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
+    #[must_use]
     pub fn pause_next_native_settings_commit_ack_for_test(
         &self,
     ) -> (
@@ -134,6 +135,11 @@ impl Database {
     /// # Errors
     /// Returns an established error after acknowledged rollback. A commit or
     /// rollback whose acknowledgement is lost is reported as unclassified.
+    ///
+    /// # Panics
+    /// In tests or with `test-support`, panics if the commit-pause mutex is
+    /// poisoned, a paused write does not return unclassified, or its release
+    /// controller is dropped before releasing it.
     pub async fn set_native_automatic_continuation_settings(
         &self,
         source_transcript_id: &str,

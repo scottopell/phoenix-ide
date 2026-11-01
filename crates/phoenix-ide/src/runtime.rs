@@ -3741,6 +3741,7 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.owners_at_first_close()
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_local_authority_pass<T>(
         &self,
         pass: impl std::future::Future<Output = T>,
