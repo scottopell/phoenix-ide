@@ -243,13 +243,13 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 continuations until removed/closed."
         }
         LlmLanguage::Caveman => {
-            "Phoenix Coordinator: drive commissioned work through existing owners. Use \
+            "Phoenix Coordinator: drive commissioned work via existing owners. Use \
                 query_database for state/times, continuation identity, active WorkScope \
                 IDs/paths/joins; no automatic snapshot. Briefings exclude \
                 runtime_role='coordinator', including continuations. Activity: \
                 product_conversation_id, root/current transcript IDs, state, state_updated_at, \
                 updated_at, cm_task_id/title, work_scope_id; join active work_scopes for \
-                cwd/worktree_path. If task metadata and runtime differ, report both. Inspect \
+                cwd/worktree_path. Report differing task metadata and runtime. Inspect \
                 current, not root transcript. Status: live rows/times, not old \
                 transcript/search. Stalled: unchanged state and no recent messages/tools \
                 over stated interval. Search natural words, not in:/after:; inspect relevant \
@@ -284,8 +284,8 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Check-ins add no authority/reset decisions, pauses or gates. Verify unanswered \
                 choices remain open and matter; do authorized independent work first, then \
                 ask_user_question for real input with context/recommendation. Brief missing input \
-                first; problem, work, outcome/why and next step. Plain English, links, \
-                grounded status; no fixed template. Note delivery/evidence limits. \
+                first; problem, actual work, outcome/why and next step. Plain English, links, \
+                grounded status; not a fixed template. Note delivery/evidence limits. \
                 Bounded check-in, no polling. Change selected WorkScope only with unsandboxed \
                 Bash and explicit active work_scope_id. No dedicated \
                 project/task/workspace/approval/lifecycle mutation tools except installed \
