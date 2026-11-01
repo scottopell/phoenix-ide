@@ -313,6 +313,13 @@ AND SHALL instruct the Coordinator to query relevant current transcript rows, ti
 WHEN the Coordinator dispatches a model request
 THE SYSTEM SHALL NOT automatically inject current activity facts into its system instructions or conversation context
 
+WHEN delegating commissioned work to an existing owner
+THE SYSTEM SHALL direct the Coordinator to specify the outcome, required completion evidence and established boundaries while leaving the owner free to choose and revise in-scope methods
+AND SHALL NOT impose additional approval gates on in-scope command corrections, fixture repairs or test reruns
+AND SHALL require preservation of the agreed success criteria, explicit user gates and Stop instructions
+AND SHALL distinguish informational progress reports from an instruction to pause the assignment
+AND SHALL include three hypothetical Coordinator-to-owner contrasts covering routine debugging, active follow-through on checks, and continuing independent work while a genuinely restricted action awaits approval
+
 WHEN the user requests a check-in through the composer action
 THE SYSTEM SHALL submit a normal message requesting a broad fresh check of commissioned work and selective intervention through established owners within verified standing scope and approvals
 AND SHALL direct the Coordinator to leave healthy progressing work alone, avoid redundant nudges, replanning or assignments merely to demonstrate activity, and not infer that an idle owner is stalled
