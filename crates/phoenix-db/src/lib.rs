@@ -41,8 +41,17 @@ pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
     PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
+mod automatic_continuation_settings;
 pub mod conversation_goals;
 mod conversation_name;
+pub use automatic_continuation_settings::{
+    AutomaticContinuationSettings, AutomaticContinuationTarget,
+    ResolvedAutomaticContinuationAggregate,
+};
+mod native_continuation;
+pub use native_continuation::{
+    CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
+};
 mod product_conversation_rename;
 pub use product_conversation_rename::{
     NormalizedConversationTitle, ProductConversationRenameCommand, ProductConversationRenameDetail,
@@ -1726,6 +1735,10 @@ pub struct Database {
     #[cfg(test)]
     steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
     #[cfg(any(test, feature = "test-support"))]
+    native_settings_commit_test_pause: std::sync::Arc<
+        std::sync::Mutex<Option<automatic_continuation_settings::SettingsCommitTestPause>>,
+    >,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) steering_capacity_test_control: SteeringCapacityTestControl,
 }
 
@@ -1752,6 +1765,8 @@ impl Clone for Database {
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
             #[cfg(test)]
             steering_drain_test_latch: self.steering_drain_test_latch.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            native_settings_commit_test_pause: self.native_settings_commit_test_pause.clone(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: self.steering_capacity_test_control.clone(),
         }
@@ -1989,6 +2004,8 @@ impl Database {
             steering_begin_test_latch: None,
             #[cfg(test)]
             steering_drain_test_latch: None,
+            #[cfg(any(test, feature = "test-support"))]
+            native_settings_commit_test_pause: std::sync::Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: SteeringCapacityTestControl::default(),
         }
@@ -4833,13 +4850,23 @@ impl Database {
         &self,
         parent_id: &str,
     ) -> DbResult<Option<ContinuationDispatchIntent>> {
+        Self::continuation_dispatch_intent_on(&self.pool, parent_id).await
+    }
+
+    async fn continuation_dispatch_intent_on<'e, E>(
+        executor: E,
+        parent_id: &str,
+    ) -> DbResult<Option<ContinuationDispatchIntent>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let row = sqlx::query(
             "SELECT parent_conversation_id, successor_conversation_id, message_id,
                     handoff, user_agent, opening_authority
              FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
         )
         .bind(parent_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
         row.map(|row| {
             Ok(ContinuationDispatchIntent {
@@ -4902,7 +4929,15 @@ impl Database {
         let observation = self
             .sqlite_workload_collector
             .start_read_family(SqliteReadFamily::ConversationGet);
-        let result = sqlx::query(
+        let result = Self::get_conversation_on(&self.pool, id).await;
+        observation.complete(result)
+    }
+
+    async fn get_conversation_on<'e, E>(executor: E, id: &str) -> DbResult<Conversation>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        sqlx::query(
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
@@ -4914,7 +4949,7 @@ impl Database {
         )
         .bind(id)
         .try_map(parse_conversation_row)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await
         .map_err(|e| {
             if matches!(e, sqlx::Error::RowNotFound) {
@@ -4922,8 +4957,7 @@ impl Database {
             } else {
                 DbError::Sqlx(e)
             }
-        });
-        observation.complete(result)
+        })
     }
 
     /// Get conversation by slug
@@ -6999,16 +7033,12 @@ impl Database {
         &self,
         product_conversation_id: &ProductConversationId,
     ) -> DbResult<AutoContinueOnContextExhaustion> {
-        let enabled: Option<i64> = sqlx::query_scalar(
-            "SELECT auto_continue_on_context_exhaustion
-             FROM product_conversations WHERE id = ?1",
+        let mut connection = self.pool.acquire().await?;
+        automatic_continuation_settings::read_preference_on(
+            &mut connection,
+            product_conversation_id,
         )
-        .bind(product_conversation_id.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-        enabled
-            .map(|value| AutoContinueOnContextExhaustion::from(value != 0))
-            .ok_or_else(|| DbError::ProductConversationUnavailable(product_conversation_id.clone()))
+        .await
     }
 
     /// Persist the aggregate-scoped automatic-continuation preference.
@@ -7022,21 +7052,13 @@ impl Database {
         product_conversation_id: &ProductConversationId,
         preference: AutoContinueOnContextExhaustion,
     ) -> DbResult<()> {
-        let updated = sqlx::query(
-            "UPDATE product_conversations
-             SET auto_continue_on_context_exhaustion = ?1
-             WHERE id = ?2",
+        let mut connection = self.pool.acquire().await?;
+        automatic_continuation_settings::write_preference_on(
+            &mut connection,
+            product_conversation_id,
+            preference,
         )
-        .bind(i64::from(bool::from(preference)))
-        .bind(product_conversation_id.as_str())
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(DbError::ProductConversationUnavailable(
-                product_conversation_id.clone(),
-            ));
-        }
-        Ok(())
+        .await
     }
 
     /// Return the automatic continuation admitted for this predecessor, if any.
@@ -9473,22 +9495,76 @@ impl Database {
         Ok((outcome, accepted))
     }
 
-    #[allow(clippy::too_many_lines)] // one transaction owns creation, transfer, and intent
     async fn continue_conversation_inner(
         &self,
         parent_id: &str,
         intent: Option<&NewContinuationDispatchIntent>,
     ) -> DbResult<ContinueOutcome> {
-        // Fetch parent outside the transaction — the subsequent INSERT+UPDATE
-        // guards against concurrent continuation via the parent's
-        // `continued_in_conv_id` still being NULL at UPDATE time.
-        let parent = self.get_conversation(parent_id).await?;
+        #[cfg(test)]
+        if let Some(ContinuationTestHook::PreReservationBarrier(barrier)) =
+            self.continuation_test_hook.as_deref()
+        {
+            let parent = self.get_conversation(parent_id).await?;
+            if parent.continued_in_conv_id.is_none()
+                && parent.runtime_role != RuntimeRole::SubAgent
+                && (matches!(parent.state, ConvState::ContextExhausted { .. })
+                    || (intent.is_some()
+                        && matches!(&parent.state,
+                            ConvState::RecoverableContinuationFailure { failure }
+                                if failure.error_kind == ErrorKind::ContextCapacityConflict)))
+            {
+                barrier.wait().await;
+            }
+        }
+        let mut conn = self.pool.acquire().await?;
+        let begin_immediate = Box::pin(conn.begin_with("BEGIN IMMEDIATE"));
+        #[cfg(test)]
+        let mut begin_immediate = begin_immediate;
+        #[cfg(test)]
+        if let Some(ContinuationTestHook::ContendedBeginImmediate { attempted }) =
+            self.continuation_test_hook.as_deref()
+        {
+            std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
+                std::task::Poll::Pending => {
+                    attempted.notify_waiters();
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Ready(_) => {
+                    panic!("test expected BEGIN IMMEDIATE to contend with Close")
+                }
+            })
+            .await;
+        }
+        let mut tx = begin_immediate.await?;
+        match self
+            .continue_conversation_tx(&mut tx, parent_id, intent)
+            .await
+        {
+            Ok(outcome) => {
+                tx.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // one transaction owns creation, transfer, and intent
+    async fn continue_conversation_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        parent_id: &str,
+        intent: Option<&NewContinuationDispatchIntent>,
+    ) -> DbResult<ContinueOutcome> {
+        let parent = Self::get_conversation_on(&mut **tx, parent_id).await?;
 
         let lifecycle = sqlx::query_scalar::<_, Option<String>>(
             "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
         )
         .bind(parent.product_conversation_id.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await?;
         if matches!(lifecycle.as_deref(), Some("history")) {
             return Err(DbError::ProductConversationUnavailable(
@@ -9503,7 +9579,7 @@ impl Database {
                 existing_continuation = %existing_id,
                 "continue_conversation: idempotent return of existing continuation",
             );
-            let existing = self.get_conversation(existing_id).await?;
+            let existing = Self::get_conversation_on(&mut **tx, existing_id).await?;
             return Ok(ContinueOutcome::AlreadyContinued(existing));
         }
 
@@ -9525,13 +9601,6 @@ impl Database {
             ));
         }
 
-        #[cfg(test)]
-        if let Some(ContinuationTestHook::PreReservationBarrier(barrier)) =
-            self.continuation_test_hook.as_deref()
-        {
-            barrier.wait().await;
-        }
-
         let new_id = uuid::Uuid::new_v4().to_string();
 
         // Sequential slug: walk to chain root, count existing members, then
@@ -9540,12 +9609,13 @@ impl Database {
         // handled by the UNIQUE-violation retry loop below (mirroring
         // `create_conversation`); `rows_affected() == 0` on the UPDATE remains
         // the definitive TOCTOU guard.
-        let root_id = self
-            .chain_root_of(parent_id)
+        let root_id = Self::chain_root_of_on(&mut **tx, parent_id)
             .await?
             .unwrap_or_else(|| parent_id.to_string());
-        let root = self.get_conversation(&root_id).await?;
-        let chain_len = self.chain_members_forward(&root_id).await?.len();
+        let root = Self::get_conversation_on(&mut **tx, &root_id).await?;
+        let chain_len = Self::chain_members_forward_on(&mut **tx, &root_id)
+            .await?
+            .len();
         let root_slug = root.slug.as_deref().unwrap_or("conversation");
         let base_n = chain_len + 1;
         let mut candidate_slug = format!("{root_slug}-{base_n}");
@@ -9556,30 +9626,7 @@ impl Database {
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(&parent.conv_mode);
 
-        // Atomic INSERT + UPDATE. On any error before `commit()`, the
-        // transaction guard drops and SQLite rolls back.
-        let mut conn = self.pool.acquire().await?;
-        let begin_immediate = Box::pin(conn.begin_with("BEGIN IMMEDIATE"));
-        #[cfg(test)]
-        let mut begin_immediate = begin_immediate;
-        #[cfg(test)]
-        if let Some(ContinuationTestHook::ContendedBeginImmediate { attempted }) =
-            self.continuation_test_hook.as_deref()
-        {
-            std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
-                std::task::Poll::Pending => {
-                    attempted.notify_waiters();
-                    std::task::Poll::Ready(())
-                }
-                std::task::Poll::Ready(_) => {
-                    panic!("test expected BEGIN IMMEDIATE to contend with Close")
-                }
-            })
-            .await;
-        }
-        let mut tx = begin_immediate.await?;
-
-        require_product_conversation_admission_tx(&mut tx, parent_id).await?;
+        require_product_conversation_admission_tx(tx, parent_id).await?;
         if revised_capacity_handoff {
             let intent = intent.expect("revised capacity handoff requires explicit intent");
             let ConvState::RecoverableContinuationFailure { failure } = &parent.state else {
@@ -9589,7 +9636,7 @@ impl Database {
                 "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
             )
             .bind(parent_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             let content = MessageContent::continuation(intent.handoff.clone());
             let boundary = Message {
@@ -9601,10 +9648,10 @@ impl Database {
                 },
                 message_type: content.message_type(), content, display_data: None, usage_data: None, created_at: now,
             };
-            insert_message_tx(&mut tx, &boundary).await?;
+            insert_message_tx(tx, &boundary).await?;
         }
         sqlx::query("PRAGMA defer_foreign_keys = ON")
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         let reservation = sqlx::query(
             "INSERT INTO product_continuation_reservations (
@@ -9619,15 +9666,13 @@ impl Database {
         .bind(parent_id)
         .bind(&new_id)
         .bind(parent.product_conversation_id.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if reservation.rows_affected() == 0 {
-            drop(tx);
-            drop(conn);
-            let refetched = self.get_conversation(parent_id).await?;
+            let refetched = Self::get_conversation_on(&mut **tx, parent_id).await?;
             if let Some(existing_id) = refetched.continued_in_conv_id {
                 return Ok(ContinueOutcome::AlreadyContinued(
-                    self.get_conversation(&existing_id).await?,
+                    Self::get_conversation_on(&mut **tx, &existing_id).await?,
                 ));
             }
             return Err(DbError::ContinuationPrecondition(
@@ -9643,7 +9688,7 @@ impl Database {
             .bind(&new_id)
             .bind(&now_str)
             .bind(parent_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
         } else {
             sqlx::query(
@@ -9653,23 +9698,17 @@ impl Database {
             .bind(&new_id)
             .bind(&now_str)
             .bind(parent_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
         };
         if reserved.rows_affected() == 0 {
-            drop(tx);
-            drop(conn);
-            let refetched = self.get_conversation(parent_id).await?;
-            if let Some(existing_id) = refetched.continued_in_conv_id {
-                return Ok(ContinueOutcome::AlreadyContinued(
-                    self.get_conversation(&existing_id).await?,
-                ));
-            }
-            return Err(DbError::ConversationNotFound(parent_id.to_string()));
+            return Err(DbError::ContinuationPrecondition(
+                "continuation predecessor was not reserved".to_string(),
+            ));
         }
 
         let continuation_work_scope_id = if parent.runtime_role == RuntimeRole::Coordinator {
-            let owned = Self::coordinator_work_scope_tx(&mut tx)
+            let owned = Self::coordinator_work_scope_tx(tx)
                 .await?
                 .map(|record| record.work_scope_id);
             if owned != parent.attached_work_scope_id {
@@ -9720,7 +9759,7 @@ impl Database {
             .bind::<Option<&str>>(None)
             .bind(parent.service_tier.as_wire_name())
             .bind(parent.product_conversation_id.as_str())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await;
 
             match result {
@@ -9744,7 +9783,7 @@ impl Database {
              WHERE predecessor_conversation_id = ?1",
         )
         .bind(parent_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         sqlx::query(
@@ -9754,7 +9793,7 @@ impl Database {
         )
         .bind(parent_id)
         .bind(&new_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         sqlx::query(
             "UPDATE steering_acceptance_receipts
@@ -9767,7 +9806,7 @@ impl Database {
         )
         .bind(parent_id)
         .bind(&new_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         if let Some(intent) = intent {
@@ -9784,11 +9823,9 @@ impl Database {
             .bind(intent.user_agent.as_deref())
             .bind(intent.opening_authority.as_str())
             .bind(&now_str)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
-
-        tx.commit().await?;
 
         let title_str = schema::title_from_slug(&actual_slug);
         let new_conversation = Conversation {
@@ -9842,6 +9879,13 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_members_forward(&self, root_id: &str) -> DbResult<Vec<String>> {
+        Self::chain_members_forward_on(&self.pool, root_id).await
+    }
+
+    async fn chain_members_forward_on<'e, E>(executor: E, root_id: &str) -> DbResult<Vec<String>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let rows = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, next_id, depth) AS (
                 SELECT id, continued_in_conv_id, 0
@@ -9855,7 +9899,7 @@ impl Database {
             SELECT id FROM chain ORDER BY depth",
         )
         .bind(root_id)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows)
     }
@@ -9999,6 +10043,13 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_root_of(&self, conv_id: &str) -> DbResult<Option<String>> {
+        Self::chain_root_of_on(&self.pool, conv_id).await
+    }
+
+    async fn chain_root_of_on<'e, E>(executor: E, conv_id: &str) -> DbResult<Option<String>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let row = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, depth) AS (
                 SELECT id, 0
@@ -10012,7 +10063,7 @@ impl Database {
             SELECT id FROM chain ORDER BY depth DESC LIMIT 1",
         )
         .bind(conv_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row)
     }
@@ -30728,6 +30779,8 @@ mod tests {
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")
@@ -30775,6 +30828,8 @@ mod tests {
                 accepted_at: phoenix_workflow::Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected created turn")

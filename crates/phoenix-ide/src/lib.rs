@@ -9,6 +9,7 @@ mod opening_qualifier;
 
 mod analytics;
 mod api;
+mod automatic_continuation_settings;
 mod chain_qa;
 mod chain_runtime;
 mod continuation_service;

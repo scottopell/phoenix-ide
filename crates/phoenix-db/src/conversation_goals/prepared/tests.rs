@@ -62,6 +62,8 @@ async fn coordinator_source(
         .workflow_repository()
         .accept_authoritative_turn(&runtime_input(&caller, key))
         .await
+        .established()
+        .expect("Goal preparation fixture turn admission must have an established durable fact")
         .unwrap();
     let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
         panic!("expected fresh coordinator Runtime turn");

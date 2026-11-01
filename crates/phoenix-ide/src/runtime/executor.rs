@@ -3005,7 +3005,7 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    let result = self.review_handoff_with_authority(review.handoff, review.shorten, review.source_candidate_id, review.opening_authority).await;
+                    let result = self.review_handoff_input(review.input).await;
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
                         return RuntimeExitDisposition::CoordinatedShutdown;
@@ -3373,6 +3373,10 @@ where
     /// are logged and discarded — state unchanged.
     #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        if self.fatal_local_authority_fence.is_closed() {
+            return Err("runtime processing closed after fatal local authority loss".to_string());
+        }
+
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
         // is the live timer firing. Its task has run to completion, leaving the
@@ -9795,7 +9799,7 @@ where
         self.review_handoff_with_authority(handoff, shorten, source_candidate_id, phoenix_core::domain::product_conversation::ContinuationOpeningAuthority::GeneratedPredecessorContext).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     async fn review_handoff_with_authority(
         &mut self,
         handoff: String,
@@ -9803,24 +9807,69 @@ where
         source_candidate_id: Option<String>,
         opening_authority: phoenix_core::domain::product_conversation::ContinuationOpeningAuthority,
     ) -> Result<super::HandoffReviewResponse, String> {
-        if !matches!(
-            self.state,
-            ConvState::ContextExhausted { .. } | ConvState::RecoverableContinuationFailure { .. }
-        ) {
+        self.review_handoff_input(super::HandoffReviewInput::ProspectiveSuccessor {
+            handoff,
+            shorten,
+            source_candidate_id,
+            opening_authority,
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn review_handoff_input(
+        &mut self,
+        input: super::HandoffReviewInput,
+    ) -> Result<super::HandoffReviewResponse, String> {
+        use phoenix_core::domain::product_conversation::ContinuationOpeningAuthority;
+
+        let reserved_opening = matches!(
+            &input,
+            super::HandoffReviewInput::ReservedGeneratedOpening(_)
+        );
+        let (handoff, shorten, source_candidate_id, opening_authority) = match input {
+            super::HandoffReviewInput::ProspectiveSuccessor {
+                handoff,
+                shorten,
+                source_candidate_id,
+                opening_authority,
+            } => (handoff, shorten, source_candidate_id, opening_authority),
+            super::HandoffReviewInput::ReservedGeneratedOpening(intent) => {
+                if intent.successor_conversation_id != self.context.conversation_id
+                    || intent.opening_authority
+                        != ContinuationOpeningAuthority::GeneratedPredecessorContext
+                    || intent.user_agent.is_some()
+                    || !matches!(self.state, ConvState::Idle)
+                {
+                    return Err(
+                        "Generated opening review requires its idle reserved successor".to_string(),
+                    );
+                }
+                (intent.handoff, false, None, intent.opening_authority)
+            }
+        };
+        if !reserved_opening
+            && !matches!(
+                self.state,
+                ConvState::ContextExhausted { .. }
+                    | ConvState::RecoverableContinuationFailure { .. }
+            )
+        {
             return Err("Handoff review requires an exhausted conversation or retained continuation failure".to_string());
         }
         let source_revision = match &self.state {
             ConvState::RecoverableContinuationFailure { failure } => {
-                crate::db::ContinuationSourceRevision::Operation {
+                Some(crate::db::ContinuationSourceRevision::Operation {
                     operation_id: failure.request.operation_id.clone(),
                     attempt: failure.request.attempt,
-                }
+                })
             }
             ConvState::ContextExhausted { .. } => {
-                crate::db::ContinuationSourceRevision::ExhaustedState {
+                Some(crate::db::ContinuationSourceRevision::ExhaustedState {
                     state_updated_at: self.state_updated_at,
-                }
+                })
             }
+            _ if reserved_opening => None,
             _ => unreachable!("review state guarded above"),
         };
         let retained_source = if shorten && !handoff.trim().is_empty() {
@@ -9855,7 +9904,9 @@ where
                         id: id.clone(),
                         conversation_id: self.context.conversation_id.clone(),
                         origin: crate::db::ContinuationCandidateOrigin::ReviewInput {
-                            revision: source_revision.clone(),
+                            revision: source_revision
+                                .clone()
+                                .ok_or("shortening requires a predecessor revision")?,
                         },
                         source,
                         text: handoff.clone(),
@@ -9868,7 +9919,11 @@ where
         } else {
             crate::db::ContinuationCandidateSource::UnattributedInput
         };
-        let (system, tools) = self.prepare_successor_overhead().await?;
+        let (system, tools) = if reserved_opening {
+            self.prepare_ordinary_overhead().await?
+        } else {
+            self.prepare_successor_overhead().await?
+        };
         let client = self
             .llm_client
             .clone()
@@ -10092,7 +10147,8 @@ where
                                 id: candidate_id.clone(),
                                 conversation_id: self.context.conversation_id.clone(),
                                 origin: crate::db::ContinuationCandidateOrigin::AiShortening {
-                                    revision: source_revision,
+                                    revision: source_revision
+                                        .ok_or("shortening requires a predecessor revision")?,
                                 },
                                 source: retained_source,
                                 text: candidate.clone(),
@@ -29446,6 +29502,12 @@ mod overload_startup_tests {
     }
 }
 
+#[cfg(test)]
+mod native_action_fatal_tests;
+
+#[cfg(test)]
+mod native_setting_uncertainty_tests;
+
 /// The tool path's generation guard mirrors the LLM path's. An intentional
 /// `Effect::AbortTool` / `CancellingTool` backstop teardown drops the aborted
 /// tool task's outcome sender; the forwarder maps that drop to a synthetic
@@ -29525,6 +29587,99 @@ mod tool_generation_guard_tests {
             event_tx_dup,
             broadcaster,
         )
+    }
+
+    #[tokio::test]
+    async fn queued_tool_outcomes_are_rejected_after_fatal_authority_close() {
+        assert_queued_tool_outcomes_rejected(false).await;
+    }
+
+    #[tokio::test]
+    async fn queued_tool_outcomes_cannot_borrow_retained_handoff_authority() {
+        assert_queued_tool_outcomes_rejected(true).await;
+    }
+
+    async fn assert_queued_tool_outcomes_rejected(retain_handoff_owner: bool) {
+        let mut rt = runtime_tool_executing("X");
+        let generation = rt.tool_execution.begin_dispatch(CancellationToken::new());
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut broadcast_rx = rt.broadcast_tx.subscribe();
+        if retain_handoff_owner {
+            // Construct a retained owner beside a tool round to test the entry boundary.
+            rt.handoff_completion_authority = Some(fence.try_acquire().unwrap());
+        }
+        let (state_tx, state_rx) = watch::channel(rt.state.clone());
+        rt.state_watcher = Some(state_tx);
+
+        // These current-generation outcomes are already queued when fatal authority closes.
+        for outcome in [
+            ToolExecOutcome::Completed(ToolResult::success("X".to_string(), "ok".to_string())),
+            ToolExecOutcome::Completed(ToolResult::error("X".to_string(), "refused".to_string())),
+        ] {
+            rt.tool_outcome_tx
+                .send((generation, outcome))
+                .await
+                .expect("outcome queue remains open");
+        }
+        fence.close("test_queued_tool_outcomes");
+
+        let initial_state = rt.state.clone();
+        assert!(rt.storage.recorded_messages().is_empty());
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        for _ in 0..2 {
+            let (received_generation, outcome) = rt
+                .tool_outcome_rx
+                .try_recv()
+                .expect("previously sent outcome is already queued");
+            assert_eq!(received_generation, generation);
+            assert!(!rt.tool_outcome_is_stale(received_generation));
+            assert_eq!(
+                rt.process_outcome(EffectOutcome::Tool(outcome)).await,
+                Err("runtime processing closed after fatal local authority loss".to_string())
+            );
+        }
+
+        assert_eq!(rt.state, initial_state);
+        assert_eq!(*state_rx.borrow(), initial_state);
+        assert!(rt.storage.recorded_messages().is_empty());
+        assert!(rt.storage.get_current_state("conv-tool-gen").is_none());
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert!(rt.llm_task_handle.is_none());
+        assert!(!state_rx.has_changed().unwrap());
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            rt.handoff_completion_authority.is_some(),
+            retain_handoff_owner
+        );
+        assert_eq!(
+            fence.owners_at_first_close(),
+            Some(usize::from(retain_handoff_owner))
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tool_result_persistence_is_rejected_after_fatal_authority_close() {
+        let mut rt = runtime_tool_executing("X");
+        let fence = Arc::clone(&rt.fatal_local_authority_fence);
+        fence.close("test_fresh_tool_result_persistence");
+
+        let result = rt
+            .execute_effect(Effect::PersistToolResults {
+                results: vec![ToolResult::success("X".to_string(), "fresh".to_string())],
+            })
+            .await;
+
+        assert!(result
+            .expect_err("fresh persistence must not borrow closed authority")
+            .contains("runtime persistence closed after fatal local authority loss"));
+        assert!(rt.storage.get_all_messages("conv-tool-gen").is_empty());
     }
 
     /// `Effect::AbortTool` must NOT bump the tool generation: it only cancels

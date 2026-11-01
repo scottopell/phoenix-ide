@@ -3916,6 +3916,8 @@ mod product_creation_tests {
                 accepted_at: Timestamp(1),
             })
             .await
+            .established()
+            .expect("acceptance durability is established")
             .unwrap();
         let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("expected new authoritative turn");

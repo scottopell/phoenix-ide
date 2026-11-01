@@ -56,6 +56,8 @@ impl Fixture {
             .workflow_repository()
             .accept_authoritative_turn(&runtime_input(&caller, "native-goal-source"))
             .await
+            .established()
+            .expect("native Goal fixture turn admission must have an established durable fact")
             .unwrap();
         let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
             panic!("fresh runtime turn");
@@ -189,6 +191,9 @@ async fn native_goal_discovery_prepare_apply_read_and_replay_without_dispatch() 
         "apply_goal",
         "create_conversation",
         "rename_conversation",
+        "continue_conversation",
+        "read_automatic_continuation",
+        "set_automatic_continuation",
     ] {
         assert_eq!(
             definitions.iter().filter(|tool| tool.name == name).count(),
