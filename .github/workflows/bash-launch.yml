@@ -62,20 +62,30 @@ jobs:
         run: |
           cargo build -p phoenix_ide --bin phoenix_ide
           test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
-      # Both runs select the same packages and targets, so the second reuses
-      # the first's build.
+      # One invocation, one compile: the build scripts embed git dirty state,
+      # and a second cargo run after tests dirty the checkout recompiles.
       - name: Launch and identity fault regressions
         run: |
-          cargo nextest run -p phoenix-core -p phoenix-tools -p phoenix_ide --lib \
-            --success-output final -E '
+          cat > "$RUNNER_TEMP/nextest.toml" <<'TOML'
+          [profile.default]
+          fail-fast = false
+
+          [test-groups]
+          serial-runtime = { max-threads = 1 }
+
+          [[profile.default.overrides]]
+          filter = 'package(phoenix_ide)'
+          test-group = 'serial-runtime'
+          TOML
+          cargo nextest --config-file "$RUNNER_TEMP/nextest.toml" run \
+            -p phoenix-core -p phoenix-tools -p phoenix_ide --lib --success-output final -E '
               (package(phoenix-core) and (test(process_identity::tests) or test(domain::tool_wire::bash_tmux_wire_tests)))
               or (package(phoenix-tools) and (test(bash::operations::tests) or test(bash::launch_protocol::tests)
-                or test(bash::ring::tests) or test(bash::registry::tests) or test(bash::reaper::tests)))'
-      - name: Runtime launch regressions (serial)
-        run: |
-          cargo nextest run -p phoenix-core -p phoenix-tools -p phoenix_ide --lib \
-            --success-output final --test-threads 1 -E '
-              package(phoenix_ide) and (test(browser_retirement)
+                or test(bash::ring::tests) or test(bash::registry::tests) or test(bash::reaper::tests)))
+              or (package(phoenix_ide) and (test(browser_retirement)
                 or test(coordinator_bash_executes_owned_home_with_zero_ordinary_conversations)
                 or test(real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay)
-                or test(conversation_runtime_dispatches_real_zero_and_normal_bash_waits))'
+                or test(conversation_runtime_dispatches_real_zero_and_normal_bash_waits)))'
+      - name: Report checkout files left by tests
+        if: always()
+        run: git status --porcelain --untracked-files=normal
