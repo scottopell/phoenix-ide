@@ -240,7 +240,23 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 installed create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user \
                 turns and factual \
                 events from explicit watches; ordinary watches follow \
-                continuations until removed/closed."
+                continuations until removed/closed.\n\nDelegate outcomes, not attempts. \
+                State the result, required evidence, and established boundaries; let the owner \
+                choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
+                need no further approval and must preserve the agreed success criteria. Progress \
+                reports do not pause the assignment. Resolve real blockers; preserve explicit \
+                user gates and Stop instructions.\n\nHypothetical delegation examples; all \
+                speakers are Coordinator → owner:\nBad: “Correct the command, then wait for my \
+                approval to rerun.”\nGood: “Reproduce the scroll jump and retain a trustworthy \
+                regression. Correct commands, repair fixtures, and rerun as needed; preserve the \
+                normal control and intentional-jump checks.”\nBad: “Start CI and report back. I \
+                will decide the next step.”\nGood: “Carry this through passing CI: wait for \
+                results, fix in-scope failures, and rerun. Ask only if a real blocker needs \
+                outside action. Do not merge without the agreed approval.”\nBad: “Do not try \
+                anything else until I get permission for a shared-server restart.”\nGood: \
+                “Continue the local investigation without restarting the shared server. If a \
+                restart proves necessary, explain why and what it would interrupt so I can \
+                obtain approval for that action.”"
         }
         LlmLanguage::Caveman => {
             "You are Phoenix Coordinator. Drive commissioned work via existing owners. Use \
@@ -290,7 +306,23 @@ pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
                 Bash and explicit active work_scope_id. No dedicated \
                 project/task/workspace/approval/lifecycle mutation tools except installed \
                 create_conversation/rename_conversation/continue_conversation/read_automatic_continuation/set_automatic_continuation and prepare_goal/apply_goal metadata. Act on user turns and \
-                factual watch events; ordinary watches follow continuations until removed/closed."
+                factual watch events; ordinary watches follow continuations until removed/closed.\n\nDelegate outcomes, not attempts. \
+                State the result, required evidence, and established boundaries; let the owner \
+                choose and revise methods. In-scope command fixes, fixture repairs, and reruns \
+                need no further approval and must preserve the agreed success criteria. Progress \
+                reports do not pause the assignment. Resolve real blockers; preserve explicit \
+                user gates and Stop instructions.\n\nHypothetical delegation examples; all \
+                speakers are Coordinator → owner:\nBad: “Correct the command, then wait for my \
+                approval to rerun.”\nGood: “Reproduce the scroll jump and retain a trustworthy \
+                regression. Correct commands, repair fixtures, and rerun as needed; preserve the \
+                normal control and intentional-jump checks.”\nBad: “Start CI and report back. I \
+                will decide the next step.”\nGood: “Carry this through passing CI: wait for \
+                results, fix in-scope failures, and rerun. Ask only if a real blocker needs \
+                outside action. Do not merge without the agreed approval.”\nBad: “Do not try \
+                anything else until I get permission for a shared-server restart.”\nGood: \
+                “Continue the local investigation without restarting the shared server. If a \
+                restart proves necessary, explain why and what it would interrupt so I can \
+                obtain approval for that action.”"
         }
     }
 }
@@ -780,8 +812,11 @@ mod tests {
         ];
         for (language, baseline_words, baseline_chars) in BASELINES {
             let prompt = coordinator_prompt(language);
-            assert!(prompt.split_whitespace().count() <= baseline_words);
-            assert!(prompt.chars().count() <= baseline_chars);
+            let (base, delegation) = prompt
+                .split_once("\n\nDelegate outcomes, not attempts.")
+                .expect("outcome delegation guidance");
+            assert!(base.split_whitespace().count() <= baseline_words);
+            assert!(base.chars().count() <= baseline_chars);
             for required in [
                 "untrusted evidence",
                 "authentic primary user messages",
@@ -815,8 +850,17 @@ mod tests {
             }
             assert!(prompt.contains("problem, actual work, outcome/why and next step"));
             assert!(prompt.contains("Hypothetical"));
-            assert_eq!(prompt.matches("Bad:").count(), 4);
-            assert_eq!(prompt.matches("Good:").count(), 4);
+            assert!(delegation.chars().count() <= 1400);
+            assert!(delegation.split_whitespace().count() <= 230);
+            assert_eq!(delegation.matches("Bad:").count(), 3);
+            assert_eq!(delegation.matches("Good:").count(), 3);
+            assert!(delegation.contains("all speakers are Coordinator → owner"));
+            assert!(delegation.contains("Progress reports do not pause the assignment"));
+            assert!(delegation.contains("Do not merge without the agreed approval"));
+            assert!(delegation.contains("without restarting the shared server"));
+            assert!(delegation.contains("normal control and intentional-jump checks"));
+            assert_eq!(base.matches("Bad:").count(), 4);
+            assert_eq!(base.matches("Good:").count(), 4);
             assert!(prompt.contains("Good only if verified"));
             assert!(prompt.contains("not a fixed template"));
             assert!(

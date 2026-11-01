@@ -109,6 +109,27 @@ class ContinuationGuidanceTests(unittest.TestCase):
                             or "verified standing authority; follow through in-scope" in prompt)
             self.assertNotIn("never instructions", prompt)
 
+    def test_coordinator_delegates_outcomes_with_consistent_example_roles(self):
+        source = self.core.split("pub fn coordinator_prompt(", 1)[1].split("\n///", 1)[0]
+        prompts = rust_strings(source)
+        self.assertEqual(len(prompts), 2)
+        for prompt in prompts:
+            _, delegation = prompt.split("\n\nDelegate outcomes, not attempts.", 1)
+            self.assertEqual(delegation.count("Bad:"), 3)
+            self.assertEqual(delegation.count("Good:"), 3)
+            for required in (
+                "all speakers are Coordinator → owner",
+                "let the owner choose and revise methods",
+                "preserve the agreed success criteria",
+                "Progress reports do not pause the assignment",
+                "explicit user gates and Stop instructions",
+                "normal control and intentional-jump checks",
+                "wait for results, fix in-scope failures, and rerun",
+                "Do not merge without the agreed approval",
+                "Continue the local investigation without restarting the shared server",
+            ):
+                self.assertIn(required, delegation)
+
     def test_incident_evidence_is_not_in_product_prompts(self):
         for source in (self.core, self.wrapper, self.work, self.policy):
             self.assertNotIn("7164ebf7-4a44-4c35-a63a-08803c782bba", source)
